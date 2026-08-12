@@ -66,16 +66,15 @@ Review prompts retain two lifecycle dispositions because `quorum submit` still a
 blocking count. Every substantive finding is first assigned technical impact, then independently
 assigned merge disposition.
 
-A finding is BLOCKING only when the reviewer demonstrates a concrete failure and at least one of:
+A finding is BLOCKING only when merging the exact change would leave the assigned primary
+outcome false, violate an applicable repository invariant, or introduce or materially worsen
+supported behavior, and its assumptions fit the established operating or threat model.
 
-1. the failure violates the current task's desired outcome or acceptance boundary;
-2. the failure violates an applicable repository invariant or established supported behavior; or
-3. the Proposed Change introduced or materially worsened the failure.
-
-The scenario must also fit the documented operating or threat model. A real issue that is
-pre-existing and not worsened, outside the task outcome, defense-in-depth, future behavior, or
-dependent on a materially stronger threat model is FOLLOW-UP unless another explicit repository
-contract makes it current scope.
+Real pre-existing, adjacent, defense-in-depth, future, or stronger-threat-model concerns are
+FOLLOW-UP unless an explicit current contract makes them blocking. For documentation changes,
+reviewers require the smallest accurate statement of supported behavior rather than an exhaustive
+inventory of implementation exceptions; pre-existing edge behavior merely revealed by the change
+stays FOLLOW-UP when the primary outcome can remain accurate without cataloguing or fixing it.
 
 Resource exhaustion, data loss, corruption, security-boundary failures, and stuck processing are
 presumptively `major` or `critical` technical impact. Their category alone does not decide merge

@@ -671,20 +671,25 @@ conversation. Concretely:
   sibling and negative paths together; this does not require speculative
   findings or exhaustive proof over unrelated code. Re-reviews verify prior
   fixes and re-audit the full current diff and relevant sibling paths, rather
-  than only the most recent remediation commit. Reviewers respond to author
-  pushback on the PR itself.
+  than only the most recent remediation commit. A new blocker in unchanged
+  behavior must explain why it was not reasonably discoverable in the prior
+  complete audit. Reviewers respond to author pushback on the PR itself.
   Encouraged GitHub operations are normal comments, inline comments, and review
   summary comments. Formal APPROVE and REQUEST_CHANGES reviews remain daemon-owned
   because managed reviewers use the same GitHub account as PR authors.
   Reviewers classify technical impact independently from merge disposition. A
-  concrete finding is BLOCKING only when it violates the current task outcome,
-  an applicable repository invariant or supported behavior, or a failure
-  introduced/materially worsened by the PR, and its assumptions fit the
-  established operating/threat model. Real pre-existing, adjacent,
-  defense-in-depth, future, or stronger-threat-model concerns are FOLLOW-UP
-  unless an explicit current contract makes them blocking. Follow-ups are
-  recorded on the PR but never increase `--blocking` or prevent an otherwise
-  valid approval.
+  concrete finding is BLOCKING only when merging the exact change would leave
+  the assigned primary outcome false, violate an applicable repository
+  invariant, or introduce/materially worsen supported behavior, and its
+  assumptions fit the established operating/threat model. Real pre-existing,
+  adjacent, defense-in-depth, future, or stronger-threat-model concerns are
+  FOLLOW-UP unless an explicit current contract makes them blocking. For
+  documentation changes, reviewers require the smallest accurate statement of
+  supported behavior rather than an exhaustive inventory of implementation
+  exceptions; pre-existing edge behavior merely revealed by the change stays
+  FOLLOW-UP when the primary outcome can remain accurate without cataloguing or
+  fixing it. Follow-ups are recorded on the PR but never increase `--blocking`
+  or prevent an otherwise valid approval.
 - **Author/rework agents** address findings on the PR. If disagreeing with a finding,
   the author replies to it on the PR with concrete evidence rather than silently
   ignoring it. The final PR history must let a later collector determine, for each
@@ -771,13 +776,14 @@ approval path merges; when it requires R2, the following dual-review flow applie
 No new lifecycle states were added. R2 uses the existing `InReview ⇄ Rework` transitions.
 
 **Severity and disposition contract** — both R1 and R2 prompts classify
-technical impact separately from merge disposition. Concrete resource
-exhaustion, unbounded growth, network calls in DB transactions, data loss,
-corruption, security-boundary failures, and stuck paths are presumptively major
-or critical impact. They are BLOCKING only when the demonstrated failure also
-belongs to the current task/repository contract and supported operating or threat
-model. Each blocker explains why this PR cannot merge; each follow-up explains
-why deferral is safe.
+technical impact separately from merge disposition using the reviewer
+classification contract above: a finding is BLOCKING only when merging the
+exact change would leave the assigned primary outcome false, violate an
+applicable repository invariant, or introduce/materially worsen supported
+behavior. Concrete resource exhaustion, unbounded growth, network calls in
+DB transactions, data loss, corruption, security-boundary failures, and
+stuck paths are presumptively major or critical impact, but their category
+alone never decides merge disposition.
 
 ### Daemon-owned pre-review CI gate
 
