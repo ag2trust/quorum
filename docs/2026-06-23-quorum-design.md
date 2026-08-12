@@ -2284,21 +2284,25 @@ fast-forward merge, rebuild via `./dev-install.sh`, and relaunch. Any other
 exit code propagates and stops the supervisor loop — a crash is not an
 upgrade signal.
 
-Two independent triggers reach exit 75, with different urgency and shutdown
-behavior:
+Three triggers reach exit 75, with different urgency and shutdown behavior.
+Triggers 1 and 3 enter the same `DrainState` machine used for signal-triggered
+shutdown (Ctrl-C, `DrainSource::Signal`, exits 0) but tagged
+`DrainSource::SelfUpdate`; trigger 2 bypasses the drain machine entirely:
 
-1. **Build staleness (graceful drain-then-exit).** With `--self-update-drain`
+1. **Build staleness (bounded drain-then-exit).** With `--self-update-drain`
    set, the tick loop periodically (`sha_poll_interval_secs`, default 600s)
    shells out to a bounded `git ls-remote origin <base_branch>` and compares
    the result against the running binary's build SHA. A mismatch means
    origin's base branch has advanced past this build. The daemon does not
-   exit immediately: it enters drain mode (blocks new claims/spawns, lets
-   in-flight workers and reviewers finish normally) and exits 75 only once
-   the roster is empty or `drain_timeout_secs` elapses, whichever comes
-   first — at timeout, remaining agents are force-killed rather than left to
-   block the upgrade indefinitely. This is the same drain state machine used
-   for signal-triggered shutdown (Ctrl-C), except the signal path exits 0
-   and this path exits 75.
+   exit immediately: it enters drain mode, which blocks new claims/spawns
+   and tears down each in-flight worker/reviewer as soon as its *current
+   turn* completes — not once its task reaches a terminal state. Torn-down
+   workers are marked `AgentFailed` ("daemon draining") and parked for
+   journal-based recovery by the next (relaunched) daemon; this is a shallow
+   drain, not "finish the task normally". The daemon exits 75 once the
+   roster is empty or `drain_timeout_secs` elapses, whichever comes first —
+   at timeout, any remaining agents are force-killed rather than left to
+   block the upgrade indefinitely.
 2. **Schema-too-new (immediate force-kill, no drain).** If a tick returns
    `QuorumError::SchemaTooNew` — the on-disk DB was migrated by a newer
    binary than the one running — retrying can never succeed, since this
@@ -2307,10 +2311,17 @@ behavior:
    in-flight worker/reviewer/planner/classifier process immediately and
    exits 75 without waiting. Tasks are re-adopted from the journal by the
    relaunched daemon on restart.
+3. **Successful self-repo merge (bounded drain-then-exit).** When
+   `self_update_drain` and `self_repo` are both configured, a successful
+   merge of a PR against the daemon's own repo enters the same bounded drain
+   as trigger 1 (`DrainState::start_drain`, source `SelfUpdate`) immediately
+   after firing `MergeSucceeded` — the daemon's own source moved, so the
+   running binary is now stale by construction and does not wait for the
+   next SHA poll.
 
-Both triggers share the exit code so the supervisor needs only one branch to
-handle either case; they differ only in whether existing agents get a chance
-to finish before the process exits.
+All three triggers share the exit code so the supervisor needs only one
+branch to handle any of them; they differ in whether existing agents get a
+turn to finish (triggers 1 and 3) or are force-killed outright (trigger 2).
 
 ### Run identity and capability enforcement
 
