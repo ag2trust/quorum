@@ -140,6 +140,7 @@ pub fn validate_for_source(
     source_title: &str,
     source_body: Option<&str>,
 ) -> Result<(), PlannerParseError> {
+    validate_plan_tasks(tasks)?;
     let allowed: HashSet<i64> = source_dependency_ids.iter().copied().collect();
     for task in tasks {
         for prerequisite in &task.prerequisites {
@@ -298,6 +299,15 @@ pub fn parse_response(text: &str) -> Result<PlannerResponse, PlannerParseError> 
         .map_err(|e| PlannerParseError::Provider(format!("invalid closed JSON: {e}")))?;
     validate_semantics(&response)?;
     Ok(response)
+}
+
+/// Validate a plan restored from durable storage before it can resume any
+/// downstream phase. Serde defaults preserve compatibility with older stored
+/// proposals, but never make missing newly-required fields admissible.
+pub fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> {
+    validate_semantics(&PlannerResponse::Plan {
+        tasks: tasks.to_vec(),
+    })
 }
 
 fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseError> {
@@ -737,6 +747,31 @@ mod tests {
                 Err(PlannerParseError::Semantic(_))
             ));
         }
+    }
+
+    #[test]
+    fn durable_legacy_plan_defaults_are_rejected_before_resume() {
+        let legacy = serde_json::json!([
+            {
+                "key": "a", "title": "a", "observable_outcome": "a works",
+                "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
+                "verification_expectations": ["tests"], "prerequisites": []
+            },
+            {
+                "key": "b", "title": "b", "observable_outcome": "b works",
+                "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
+                "verification_expectations": ["tests"], "prerequisites": ["a"]
+            }
+        ]);
+        let tasks: Vec<ProposedTask> = serde_json::from_value(legacy).unwrap();
+        assert!(tasks
+            .iter()
+            .all(|task| task.implementation_delta.is_empty()));
+        assert!(matches!(
+            validate_plan_tasks(&tasks),
+            Err(PlannerParseError::Semantic(message))
+                if message.contains("implementation delta must not be empty")
+        ));
     }
 
     #[test]

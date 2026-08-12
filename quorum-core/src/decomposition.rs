@@ -532,6 +532,31 @@ pub fn set_frozen_phase(
     Ok(changed == 1)
 }
 
+/// Reject a durable accepted proposal and atomically return its freeze-owning
+/// aggregate to planning. A later planner turn must never inherit the rejected
+/// JSON after a restart.
+pub fn reset_accepted_proposal_to_planning(
+    conn: &mut Connection,
+    graph_id: i64,
+    expected: &str,
+    now: i64,
+) -> Result<bool> {
+    if !matches!(expected, "validating" | "preclassifying") {
+        return Err(QuorumError::Usage(
+            "accepted proposal may only be reset from validation phases".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE task_decompositions
+         SET state='planning',planner_session_id=NULL,accepted_proposal_json=NULL,updated_at=?3
+         WHERE id=?1 AND state=?2 AND freeze_active=1 AND active=0",
+        params![graph_id, expected, now],
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed == 1)
+}
+
 /// Durably accept one bounded provider proposal before leaving planning. This
 /// makes validating and preclassifying restart-resumable without charging a
 /// semantic rejection budget.

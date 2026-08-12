@@ -283,6 +283,11 @@ not preservation-field requirements, because no valid proposal can carry them wi
 planner response and durable proposal. Source authors should use those explicit forms whenever
 spelling is load-bearing and fits both bounds.
 
+Durable accepted proposals are revalidated against the complete closed-plan semantic contract
+before a restart resumes validating or preclassifying. Compatibility defaults for newly added
+fields never admit an older stored proposal with empty required fields; it returns to planning as
+a deterministic semantic rejection.
+
 A syntactically valid blocker that lacks a supported category, concrete evidence, required
 decision, or the explanation of why no safe split exists is a semantic rejection, not a valid
 blocker and not a provider failure.
