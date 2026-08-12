@@ -16,7 +16,7 @@ pub const CLAUDE_PLANNER_MODEL: &str = "claude-opus-4-6";
 pub const PLANNER_EFFORT: &str = "high";
 pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
-pub const MAX_STDOUT_BYTES: usize = 256 * 1024;
+pub const MAX_STDOUT_BYTES: usize = 128 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
@@ -37,15 +37,23 @@ pub enum PlannerResponse {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposedTask {
     pub key: String,
     pub title: String,
+    #[serde(default)]
+    pub implementation_delta: String,
+    #[serde(default)]
+    pub affected_paths: Vec<String>,
     pub observable_outcome: String,
     pub acceptance_criteria: Vec<String>,
     pub source_constraints: Vec<String>,
     pub verification_expectations: Vec<String>,
+    #[serde(default)]
+    pub non_goals: Vec<String>,
+    #[serde(default)]
+    pub preserved_literals: Vec<String>,
     #[serde(default)]
     pub prerequisites: Vec<String>,
 }
@@ -73,14 +81,31 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
     )
     .expect("rejection summaries serialize");
     format!(
-        "You are Quorum's bounded decomposition planner. Split the source outcome into one \
+        "You are Quorum's repository-grounded implementation-boundary planner. Produce one \
          closed DAG of 2-8 independently deliverable implementation tasks, each size S or M. \
-         Preserve every source constraint. Do not create synthetic integration work, recursive \
-         planning, or unrelated scope. Dependencies must be real delivery prerequisites and may \
+         Identify concrete implementation deltas and split at real code or ownership seams; do \
+         not turn each desired product outcome into a separate task. Preserved behavior, \
+         compatibility requirements, and regression-only expectations belong in acceptance \
+         criteria or non_goals, not standalone implementation tasks. Multiple files may belong \
+         to one child when they implement one coherent seam; split a child when it combines \
+         independently deliverable changes across layers or components. The execution-size \
+         rubric is: S = focused/local; M = bounded coherent work; L = broad cross-component \
+         coherent delivery; XL = compound work needing decomposition. Do not estimate human time. \
+         Inspect the repository only to ground the plan: start with source-named paths and symbols, \
+         use targeted Grep or Glob, read focused excerpts, follow observed calls at most one hop, \
+         and stop once each child has a concrete delta and path set. Use at most 5 Grep/Glob calls \
+         and 10 Read calls. Do not browse unrelated directories or read whole large files. \
+         Preserve every source constraint. Copy exact required text, literals, commands, schemas, \
+         labels, tags, messages, identifiers, and other verbatim source material byte-for-byte \
+         without normalization or paraphrase. Put each such value in preserved_literals on at \
+         least one child. Every source requirement must be represented by a child delta, criterion, \
+         constraint, verification expectation, or non-goal. Do not create synthetic integration \
+         work, recursive planning, no-op/regression-only tasks, or unrelated scope. Dependencies \
+         must be real delivery prerequisites and may \
          reference another task key or source:<dependency-id>. Return exactly one valid JSON \
          object, with no markdown or commentary. The object must be exactly one of these closed \
          shapes: do not omit, rename, or add fields.\n\
-         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"observable_outcome\":\"<observable-outcome>\",\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
+         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"implementation_delta\":\"<new-code-or-documentation-change>\",\"affected_paths\":[\"<repo-relative-path-or-narrow-pattern>\"],\"observable_outcome\":\"<observable-outcome>\",\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"non_goals\":[\"<preserved-or-explicitly-excluded-behavior>\"],\"preserved_literals\":[\"<exact-source-literal>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
          BLOCKER={{\"outcome\":\"blocker\",\"category\":\"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>\",\"evidence\":[\"<evidence>\"],\"required_decision\":\"<decision>\",\"why_no_safe_split\":\"<reason>\"}}\n\
          `outcome` must be exactly `plan` or `blocker`; use PLAN only when it has 2-8 tasks. \
          PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
@@ -105,6 +130,8 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 pub fn validate_for_source(
     tasks: &[ProposedTask],
     source_dependency_ids: &[i64],
+    source_title: &str,
+    source_body: Option<&str>,
 ) -> Result<(), PlannerParseError> {
     let allowed: HashSet<i64> = source_dependency_ids.iter().copied().collect();
     for task in tasks {
@@ -126,7 +153,93 @@ pub fn validate_for_source(
             return semantic("synthetic integration work is not permitted");
         }
     }
+    let source_text = format!("{source_title}\n{}", source_body.unwrap_or_default());
+    let preserved: HashSet<&str> = tasks
+        .iter()
+        .flat_map(|task| task.preserved_literals.iter().map(String::as_str))
+        .collect();
+    for literal in &preserved {
+        if !source_text.contains(literal) {
+            return semantic("preserved literal must match source bytes exactly");
+        }
+    }
+    for (index, literal) in required_source_literals(&source_text)
+        .into_iter()
+        .enumerate()
+    {
+        if !preserved.contains(literal.as_str()) {
+            return semantic(&format!(
+                "missing byte-exact source literal at source marker {}",
+                index + 1
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Extract source-marked literals that can be checked without asking a model
+/// to decide which spelling is authoritative. Markdown inline/fenced code is
+/// explicit literal syntax. Quoted values immediately associated with the
+/// words literal, label, tag, or message receive the same protection.
+fn required_source_literals(source: &str) -> Vec<String> {
+    let mut literals = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative) = source[cursor..].find('`') {
+        let start = cursor + relative;
+        let fence = if source[start..].starts_with("```") {
+            3
+        } else {
+            1
+        };
+        let content_start = start + fence;
+        let Some(end_relative) = source[content_start..].find(if fence == 3 { "```" } else { "`" })
+        else {
+            break;
+        };
+        let end = content_start + end_relative;
+        if end > content_start {
+            literals.push(source[content_start..end].to_string());
+        }
+        cursor = end + fence;
+    }
+
+    let lower = source.to_ascii_lowercase();
+    for keyword in ["literal", "label", "tag", "message"] {
+        let mut search_from = 0;
+        while let Some(relative) = lower[search_from..].find(keyword) {
+            let after_keyword = search_from + relative + keyword.len();
+            let bytes = source.as_bytes();
+            let mut open = after_keyword;
+            if bytes.get(open) == Some(&b'"') {
+                open += 1;
+            }
+            while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
+                open += 1;
+            }
+            if matches!(bytes.get(open), Some(b':') | Some(b'=')) {
+                open += 1;
+                while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
+                    open += 1;
+                }
+            }
+            if bytes.get(open) != Some(&b'"') || open.saturating_sub(after_keyword) > 24 {
+                search_from = after_keyword;
+                continue;
+            }
+            let value_start = open + 1;
+            let Some(close_relative) = source[value_start..].find('"') else {
+                break;
+            };
+            let value_end = value_start + close_relative;
+            if value_end > value_start {
+                literals.push(source[value_start..value_end].to_string());
+            }
+            search_from = value_end + 1;
+        }
+    }
+    literals.sort();
+    literals.dedup();
+    literals
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +307,8 @@ fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseErro
                     return semantic("task keys must be unique");
                 }
                 validate_text("title", &task.title)?;
+                validate_text("implementation delta", &task.implementation_delta)?;
+                validate_list("affected paths", &task.affected_paths, 1)?;
                 validate_text("observable outcome", &task.observable_outcome)?;
                 validate_list("acceptance criteria", &task.acceptance_criteria, 1)?;
                 validate_list("source constraints", &task.source_constraints, 1)?;
@@ -202,6 +317,8 @@ fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseErro
                     &task.verification_expectations,
                     1,
                 )?;
+                validate_list("non-goals", &task.non_goals, 1)?;
+                validate_list("preserved literals", &task.preserved_literals, 0)?;
                 if task.prerequisites.len() > MAX_LIST_ITEMS {
                     return semantic("too many prerequisites");
                 }
@@ -435,16 +552,18 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
             Ok(Ok(Some(raw))) => raw,
             Ok(Ok(None)) => break,
             Ok(Err(_)) => {
-                return Some(PlannerPoll::ProviderFailed(
-                    "planner stdout exceeded 256 KiB".into(),
-                ));
+                return Some(PlannerPoll::ProviderFailed(format!(
+                    "planner stdout exceeded {} KiB",
+                    MAX_STDOUT_BYTES / 1024
+                )));
             }
         };
         slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
         if slot.stdout_bytes > MAX_STDOUT_BYTES {
-            return Some(PlannerPoll::ProviderFailed(
-                "planner stdout exceeded 256 KiB".into(),
-            ));
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner stdout exceeded {} KiB",
+                MAX_STDOUT_BYTES / 1024
+            )));
         }
         if slot.proc.kind() == AgentKind::Claude {
             if let Some(super::stream::Event::Result {
@@ -521,10 +640,14 @@ mod tests {
         serde_json::json!({
             "key": key,
             "title": format!("Implement {key}"),
+            "implementation_delta": format!("change the {key} implementation seam"),
+            "affected_paths": [format!("src/{key}.rs")],
             "observable_outcome": format!("{key} works"),
             "acceptance_criteria": ["behavior is covered"],
             "source_constraints": ["preserve atomicity"],
             "verification_expectations": ["focused tests pass"],
+            "non_goals": ["do not change adjacent behavior"],
+            "preserved_literals": [],
             "prerequisites": prerequisites,
         })
     }
@@ -573,6 +696,22 @@ mod tests {
             parse_response(&cycle.to_string()),
             Err(PlannerParseError::Semantic(_))
         ));
+    }
+
+    #[test]
+    fn plan_rejects_missing_repository_grounding_fields() {
+        for field in ["implementation_delta", "affected_paths", "non_goals"] {
+            let mut first = task("a", &[]);
+            first.as_object_mut().unwrap().remove(field);
+            let plan = serde_json::json!({
+                "outcome": "plan",
+                "tasks": [first, task("b", &["a"])]
+            });
+            assert!(matches!(
+                parse_response(&plan.to_string()),
+                Err(PlannerParseError::Semantic(_))
+            ));
+        }
     }
 
     #[test]
@@ -757,9 +896,10 @@ mod tests {
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["tests".into()],
             prerequisites: vec!["source:9".into()],
+            ..Default::default()
         };
         assert!(matches!(
-            validate_for_source(&[foreign], &[7]),
+            validate_for_source(&[foreign], &[7], "source", None),
             Err(PlannerParseError::Semantic(_))
         ));
         let synthetic = ProposedTask {
@@ -770,9 +910,10 @@ mod tests {
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["tests".into()],
             prerequisites: vec![],
+            ..Default::default()
         };
         assert!(matches!(
-            validate_for_source(&[synthetic], &[]),
+            validate_for_source(&[synthetic], &[], "source", None),
             Err(PlannerParseError::Semantic(_))
         ));
     }
@@ -789,13 +930,49 @@ mod tests {
         };
         let prompt = build_prompt(&source, &[]);
         assert!(prompt.contains("do not omit, rename, or add fields"));
-        assert!(prompt.contains(
-            r#"PLAN={"outcome":"plan","tasks":[{"key":"<lowercase-ascii-key>","title":"<title>","observable_outcome":"<observable-outcome>","acceptance_criteria":["<criterion>"],"source_constraints":["<constraint>"],"verification_expectations":["<verification>"],"prerequisites":["<task-key-or-source:positive-id>"]}]}"#
-        ));
+        assert!(prompt.contains(r#""implementation_delta":"<new-code-or-documentation-change>""#));
+        assert!(prompt.contains(r#""affected_paths":["<repo-relative-path-or-narrow-pattern>"]"#));
+        assert!(prompt.contains(r#""non_goals":["<preserved-or-explicitly-excluded-behavior>"]"#));
+        assert!(prompt.contains(r#""preserved_literals":["<exact-source-literal>"]"#));
         assert!(prompt.contains(
             r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#
         ));
         assert!(prompt.contains("`outcome` must be exactly `plan` or `blocker`"));
+        assert!(prompt.contains("S = focused/local; M = bounded coherent work"));
+        assert!(prompt.contains("Use at most 5 Grep/Glob calls and 10 Read calls"));
+        assert!(prompt.contains("labels, tags, messages, identifiers"));
+    }
+
+    #[test]
+    fn source_validation_requires_marked_literals_byte_for_byte() {
+        let title = "Keep label \"review-ready\"";
+        let source = "Keep `type:feature`, tag \"security\", literal \"EXACT\", and message \"Merge ready\" exactly.";
+        let mut proposed = ProposedTask {
+            key: "routing".into(),
+            title: "Change routing".into(),
+            implementation_delta: "change one routing seam".into(),
+            affected_paths: vec!["src/routing.rs".into()],
+            observable_outcome: "routing works".into(),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["preserve literals".into()],
+            verification_expectations: vec!["tests pass".into()],
+            non_goals: vec!["no unrelated changes".into()],
+            preserved_literals: vec![
+                "type:feature".into(),
+                "security".into(),
+                "EXACT".into(),
+                "Merge ready".into(),
+                "review-ready".into(),
+            ],
+            prerequisites: vec![],
+        };
+        assert!(validate_for_source(&[proposed.clone()], &[], title, Some(source)).is_ok());
+        proposed.preserved_literals[3] = "merge ready".into();
+        assert!(matches!(
+            validate_for_source(&[proposed], &[], title, Some(source)),
+            Err(PlannerParseError::Semantic(message))
+                if message.contains("match source bytes exactly")
+        ));
     }
 
     #[test]

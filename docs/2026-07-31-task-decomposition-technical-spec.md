@@ -238,7 +238,10 @@ The planner runs against the frozen base revision with:
 - a read-only repository view;
 - no network namespace access;
 - no Quorum binary, database path, run capability, or coordination environment;
-- bounded stdout, stderr, response bytes, and wall-clock time;
+- source-directed inspection guidance capped at five Grep/Glob calls and ten focused Read calls;
+- a provider-enforced USD 3.00 turn ceiling, 128 KiB streamed-stdout ceiling, 64 KiB response
+  ceiling, and 600-second wall-clock ceiling;
+- bounded stderr diagnostics;
 - process-group kill and reap on timeout/cancellation.
 
 This requires a planner-specific provider spawn boundary. Worker commands and any Codex path
@@ -257,11 +260,22 @@ or:
 {"outcome":"blocker","category":"...","evidence":["..."],"required_decision":"...","why_no_safe_split":"..."}
 ```
 
-A plan contains 2–8 uniquely keyed tasks. Each task has title, observable outcome, acceptance
-criteria, applicable source constraints, verification expectations, and prerequisite local keys
-or source dependency IDs. A blocker must be concrete. Markdown wrappers, unknown fields,
+A plan contains 2–8 uniquely keyed tasks. Each task has a title, concrete implementation delta,
+affected repository paths, observable outcome, acceptance criteria, applicable source constraints,
+verification expectations, explicit non-goals, byte-exact preserved literals, and prerequisite
+local keys or source dependency IDs. The planner receives the same S/M execution-size rubric as
+the classifier. It inspects from source-named paths and symbols under bounded search/read guidance,
+and separates independently deliverable code or ownership seams rather than turning preserved
+outcomes into standalone work. A blocker must be concrete. Markdown wrappers, unknown fields,
 multiple outcomes, oversized output, malformed JSON, and sandbox violations are provider
 failures.
+
+Literal preservation is byte-exact. Inline/fenced Markdown code and quoted values attached to the
+words `literal`, `label`, `tag`, or `message` are deterministically extracted from the source title
+and body. Every extracted value must appear unchanged in at least one child's
+`preserved_literals`; every planner-declared preserved literal must occur in the source bytes.
+Missing or normalized values reject the proposal before classification. Source authors should use
+those explicit forms whenever spelling is load-bearing.
 
 A syntactically valid blocker that lacks a supported category, concrete evidence, required
 decision, or the explanation of why no safe split exists is a semantic rejection, not a valid
@@ -277,11 +291,10 @@ Deterministic validation rejects the complete proposal for:
 
 - fewer than two or more than eight tasks;
 - duplicate keys, self-edges, cycles, or unknown dependencies;
-- empty/no-op work or synthetic integration work;
-- missing source outcome/constraint coverage;
-- unrelated scope or weakened source constraints;
+- empty required fields or synthetic integration work;
+- missing or modified byte-exact source-marked literals;
 - dependencies that are not real delivery prerequisites;
-- duplication of existing work.
+- classifier-reported duplication of existing work.
 
 Duplicate authority is fail-closed: any child classifier duplicate reference rejects the whole
 plan; deterministic exact/normalized identity checks may reject earlier but never modify the

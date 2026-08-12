@@ -45,6 +45,10 @@ pub struct AgentProc {
 /// (#206) — without it the Skill call is silently denied and the review
 /// degrades to an unstructured read.
 pub(crate) const ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,Skill";
+/// Hard provider-side spend ceiling for one repository-grounded planning turn.
+/// The planner also has wall-clock and streamed-output limits; this closes the
+/// remaining cost boundary when repeated read/search calls expand context.
+pub(crate) const PLANNER_MAX_BUDGET_USD: &str = "3.00";
 
 /// Build a stream-json user turn. The claude CLI requires `message.role` and
 /// exits 1 on the first message without it — every turn fed to an agent MUST
@@ -181,7 +185,10 @@ impl AgentProc {
                 })
                 .arg("--no-session-persistence");
             if restricted == RestrictedMode::Planner {
-                cmd.arg("--add-dir").arg(&spec.worktree);
+                cmd.arg("--add-dir")
+                    .arg(&spec.worktree)
+                    .arg("--max-budget-usd")
+                    .arg(PLANNER_MAX_BUDGET_USD);
             }
         } else {
             cmd.arg("--add-dir").arg(&spec.worktree);
@@ -668,6 +675,44 @@ mod tests {
             event.is_some(),
             "claude rejected the planner argument boundary before authentication"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_launch_passes_hard_provider_budget() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let args_path = tmp.path().join("args");
+        let fake = tmp.path().join("claude");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nwhile IFS= read -r _line; do :; done\n",
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut spec = classifier_spec(tmp.path(), false);
+        spec.model = "claude-opus-4-6".into();
+        spec.effort = "high".into();
+        spec.allowed_tools = "Read,Glob,Grep".into();
+
+        let proc = AgentProc::spawn_planner(&spec, fake.to_str()).unwrap();
+        for _ in 0..100 {
+            if args_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let args = std::fs::read_to_string(&args_path)
+            .expect("fake planner did not capture its bounded argument surface");
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair == ["--max-budget-usd", PLANNER_MAX_BUDGET_USD] }));
+        let _ = proc.kill_and_reap().await;
     }
 
     /// Negative control pinning the #297 failure mode: a non-UUID session id

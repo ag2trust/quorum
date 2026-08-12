@@ -4082,6 +4082,7 @@ const CHILD_REJECTION_READY_WRAPPER_BYTES: usize =
 const CHILD_REJECTION_SIZE_MAX_BYTES: usize = "size=".len() + "XL".len();
 const CHILD_REJECTION_DUPLICATE_LABEL_BYTES: usize = "duplicate_of=".len();
 const CHILD_REJECTION_SEPARATORS_MAX_BYTES: usize = 2 * "; ".len();
+const CHILD_REJECTION_CONTEXT_MAX_BYTES: usize = 272;
 // Keep the complete combined rejection within the planner retry-feedback
 // consumer's bound. Reserve fixed space for every dimension, then divide the
 // variable space between the readiness reason and duplicate task IDs.
@@ -4193,7 +4194,7 @@ fn bounded_duplicate_ids(ids: &[i64], limit: usize) -> String {
 }
 
 fn child_preclassification_rejection(
-    task_key: &str,
+    task: &planner::ProposedTask,
     result: &quorum_core::classify::TaskClassification,
 ) -> Option<String> {
     let mut failed_dimensions = Vec::new();
@@ -4211,20 +4212,39 @@ fn child_preclassification_rejection(
         failed_dimensions.push(format!("size={}", result.size));
     }
     if !result.duplicate_of.is_empty() {
+        let duplicate_limit = if !matches!(result.size.as_str(), "S" | "M")
+            && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty())
+        {
+            CHILD_REJECTION_DUPLICATES_MAX_BYTES.saturating_sub(CHILD_REJECTION_CONTEXT_MAX_BYTES)
+        } else {
+            CHILD_REJECTION_DUPLICATES_MAX_BYTES
+        };
         failed_dimensions.push(format!(
             "duplicate_of={}",
-            bounded_duplicate_ids(&result.duplicate_of, CHILD_REJECTION_DUPLICATES_MAX_BYTES)
+            bounded_duplicate_ids(&result.duplicate_of, duplicate_limit)
         ));
     }
     if failed_dimensions.is_empty() {
         return None;
     }
-    let summary = format!(
-        "child {task_key} rejected by preclassification: {}",
+    let mut summary = format!(
+        "child {} rejected by preclassification: {}",
+        task.key,
         failed_dimensions.join("; ")
     );
-    debug_assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
-    Some(summary)
+    if !matches!(result.size.as_str(), "S" | "M")
+        && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty())
+    {
+        let paths = bounded_with_ellipsis(&task.affected_paths.join(", "), 96);
+        let delta = bounded_with_ellipsis(&task.implementation_delta, 128);
+        summary.push_str(&format!(
+            "; rejected_delta={delta}; affected_paths=[{paths}]"
+        ));
+    }
+    Some(bounded_with_ellipsis(
+        &summary,
+        planner::MAX_REJECTION_SUMMARY_BYTES,
+    ))
 }
 
 async fn reset_decomposition_to_planning(
@@ -4263,10 +4283,14 @@ fn proposed_classifier_tasks(
                 title: task.title.clone(),
                 body: Some(
                     serde_json::json!({
+                        "implementation_delta": task.implementation_delta,
+                        "affected_paths": task.affected_paths,
                         "observable_outcome": task.observable_outcome,
                         "acceptance_criteria": task.acceptance_criteria,
                         "source_constraints": task.source_constraints,
                         "verification_expectations": task.verification_expectations,
+                        "non_goals": task.non_goals,
+                        "preserved_literals": task.preserved_literals,
                     })
                     .to_string(),
                 ),
@@ -4293,7 +4317,7 @@ fn planned_children(
             let result = by_id
                 .get(&id)
                 .ok_or_else(|| format!("missing classification for {}", task.key))?;
-            if let Some(summary) = child_preclassification_rejection(&task.key, result) {
+            if let Some(summary) = child_preclassification_rejection(task, result) {
                 return Err(summary);
             }
             let mut prerequisite_keys = Vec::new();
@@ -4312,10 +4336,14 @@ fn planned_children(
                 local_key: task.key.clone(),
                 title: task.title.clone(),
                 body: serde_json::json!({
+                    "implementation_delta": task.implementation_delta,
+                    "affected_paths": task.affected_paths,
                     "observable_outcome": task.observable_outcome,
                     "acceptance_criteria": task.acceptance_criteria,
                     "source_constraints": task.source_constraints,
                     "verification_expectations": task.verification_expectations,
+                    "non_goals": task.non_goals,
+                    "preserved_literals": task.preserved_literals,
                 })
                 .to_string(),
                 labels: Some("[\"type:implementation\",\"generated:decomposition\"]".into()),
@@ -4727,7 +4755,12 @@ async fn tick_decomposition(
                 "validating decomposition lacks its durable accepted proposal".into(),
             ));
         };
-        match planner::validate_for_source(proposal, &snapshot.dependencies) {
+        match planner::validate_for_source(
+            proposal,
+            &snapshot.dependencies,
+            &snapshot.title,
+            snapshot.body.as_deref(),
+        ) {
             Err(error) => {
                 reset_decomposition_to_planning(config, snapshot.graph_id, "validating").await?;
                 record_decomposition_attempt(
@@ -20309,10 +20342,14 @@ mod tests {
             planner::ProposedTask {
                 key: "a".into(),
                 title: "a".into(),
+                implementation_delta: "change layer a".into(),
+                affected_paths: vec!["src/a.rs".into()],
                 observable_outcome: "a works".into(),
                 acceptance_criteria: vec!["a".into()],
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
+                non_goals: vec!["do not change b".into()],
+                preserved_literals: vec!["EXACT_LABEL".into()],
                 prerequisites: vec![],
             },
             planner::ProposedTask {
@@ -20323,6 +20360,7 @@ mod tests {
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
                 prerequisites: vec!["a".into()],
+                ..Default::default()
             },
         ];
         let valid = vec![
@@ -20347,6 +20385,14 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].local_key, "a");
         assert_eq!(children[1].prerequisite_keys, ["a"]);
+        let body: serde_json::Value = serde_json::from_str(&children[0].body).unwrap();
+        assert_eq!(body["implementation_delta"], "change layer a");
+        assert_eq!(body["affected_paths"], serde_json::json!(["src/a.rs"]));
+        assert_eq!(body["non_goals"], serde_json::json!(["do not change b"]));
+        assert_eq!(
+            body["preserved_literals"],
+            serde_json::json!(["EXACT_LABEL"])
+        );
 
         let mut not_ready = valid.clone();
         not_ready[0].ready = false;
@@ -20379,7 +20425,7 @@ mod tests {
         combined[0].duplicate_of = vec![301, 302];
         assert_eq!(
             planned_children(&proposal, &combined).unwrap_err(),
-            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL; duplicate_of=[301, 302]"
+            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL; duplicate_of=[301, 302]; rejected_delta=change layer a; affected_paths=[src/a.rs]"
         );
 
         assert_eq!(
@@ -20393,11 +20439,14 @@ mod tests {
         let proposal = vec![planner::ProposedTask {
             key: "bounded-child".into(),
             title: "bounded child".into(),
+            implementation_delta: "change the bounded planner seam".into(),
+            affected_paths: vec!["src/bounded.rs".into()],
             observable_outcome: "bounded evidence persists".into(),
             acceptance_criteria: vec!["bounded".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["test".into()],
             prerequisites: vec![],
+            ..Default::default()
         }];
         let classifications = vec![quorum_core::classify::TaskClassification {
             task_id: -1,
@@ -20414,7 +20463,11 @@ mod tests {
         assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
         assert!(summary.contains("ready=false (not_ready_reason: é"));
         assert!(summary.contains("…); size=XL; duplicate_of=[1, 2"));
-        assert!(summary.ends_with("...]"), "{summary}");
+        assert!(summary.contains("rejected_delta=change the bounded planner seam"));
+        assert!(
+            summary.ends_with("affected_paths=[src/bounded.rs]"),
+            "{summary}"
+        );
 
         let source = planner::PlanningSource {
             task_id: 301,
@@ -20441,6 +20494,7 @@ mod tests {
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["test".into()],
             prerequisites: vec![],
+            ..Default::default()
         }];
         let classifications = vec![quorum_core::classify::TaskClassification {
             task_id: -1,
@@ -20703,6 +20757,7 @@ mod tests {
                         source_constraints: vec!["a".into()],
                         verification_expectations: vec!["a".into()],
                         prerequisites: vec![],
+                        ..Default::default()
                     },
                     planner::ProposedTask {
                         key: "b".into(),
@@ -20712,6 +20767,7 @@ mod tests {
                         source_constraints: vec!["b".into()],
                         verification_expectations: vec!["b".into()],
                         prerequisites: vec!["a".into()],
+                        ..Default::default()
                     },
                 ])
                 .unwrap();

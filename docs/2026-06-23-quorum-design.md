@@ -1782,8 +1782,11 @@ with `cx_est` 1–3 violates the classification rubric and is parked with an exp
 reclassify-or-rescope reason.
 
 Planning uses the profile selected from the planner routing pool. The planner receives a
-read-only repository view and bounded source
-context but no network, database, coordination command, or delivery authority. A separate
+read-only repository view and bounded source context but no network, database, coordination
+command, or delivery authority. Planning is source-directed: repository inspection starts from
+paths and symbols named by the source, follows observed calls by at most one hop, and has bounded
+search/read guidance. The provider process has a hard spend ceiling in addition to its wall-clock,
+response, and streamed-output limits. A separate
 planner spawn boundary enforces those restrictions and accepts only one bounded, closed plan or
 blocker response; a provider whose transport cannot be separated from model-generated network or
 filesystem access is refused fail-closed. The view is an archive of the recorded frozen base SHA,
@@ -1795,12 +1798,17 @@ not yet provide that isolation boundary. A repository configured to plan with Co
 bounded provider failure and releases or parks the source under the normal retry policy; use the
 Claude runner for daemon-managed decomposition until an enforceable Codex boundary exists.
 
-A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Before any
-task row is created, the complete proposal is validated for scope coverage, real delivery
-boundaries, references, cycles, and duplicates, then classified as one batch. Every child must be
-admission-ready, nonduplicate, and size S or M. Admission readiness means the scope is sufficiently
-clear for delivery; it is distinct from runtime readiness, which still requires dependencies to
-be done.
+A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Each child
+names its concrete implementation delta, affected paths, non-goals, and any byte-exact source
+literals it carries. Tasks follow independently deliverable code or ownership seams; preserved
+behavior and regression-only expectations remain criteria or non-goals rather than synthetic
+implementation work. Before any task row is created, deterministic validation checks the closed
+shape, references, cycles, prohibited synthetic integration work, and byte-exact coverage of
+source-marked literals (Markdown code plus quoted literal/label/tag/message values), then
+classifies the complete proposal as one batch. Every child must be
+admission-ready, nonduplicate, and size S or M under the same execution-size rubric given to the
+planner. Admission readiness means the scope is sufficiently clear for delivery; it is distinct
+from runtime readiness, which still requires dependencies to be done.
 
 Semantic proposal rejections and provider/protocol failures have independent caps of three per
 unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
