@@ -513,6 +513,24 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     );
 }
 
+/// Initial worker submissions deliberately omit `--pr`: the daemon creates
+/// that PR. A sticky rework worker may only echo the daemon-owned PR back.
+fn quorum_submit_existing_worker_pr(home: &std::path::Path, agent: &str, pr: &str) {
+    let run_id = resolve_run_id(home, agent, "worker");
+    let out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", &run_id)
+        .args(["submit", "--agent", agent, "--pr", pr])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rework submit with daemon-owned PR failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn approve_flow_tears_down_both_agents() {
     let home = tempfile::tempdir().unwrap();
@@ -1444,14 +1462,23 @@ fn rework_resignal_feeds_rereview_turn() {
         handle.lines
     );
 
-    // Worker re-signals done with PR (rework pushed)
-    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+    // Rework explicitly confirms the daemon-created PR. This used to be
+    // rejected after the sticky slot discarded its PR identity.
+    quorum_submit_existing_worker_pr(home.path(), &worker_name, "1");
 
     // ResumeReviewer feeds a re-review turn to the existing reviewer
     // (no teardown + respawn — the reviewer keeps its session context).
     assert!(
         handle.wait_for("fed re-review turn", 15),
         "reviewer not fed re-review turn after rework re-signal. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("daemon_push_rejected")),
+        "a matching rework PR must not be rejected: {:?}",
         handle.lines
     );
 
@@ -1469,6 +1496,20 @@ fn rework_resignal_feeds_rereview_turn() {
     assert_eq!(
         reviewer_spawns, 1,
         "expected 1 reviewer spawn (original only, re-review is feed_turn), got {reviewer_spawns}. Lines: {:?}",
+        handle.lines
+    );
+
+    // A later mismatched rework signal must still fail closed before it can
+    // publish to a worker-selected PR.
+    quorum_submit_existing_worker_pr(home.path(), &worker_name, "2");
+    assert!(
+        handle.wait_for("daemon publish rejected", 15),
+        "mismatched rework PR was not rejected: {:?}",
+        handle.lines
+    );
+    assert!(
+        wait_for_task_status(home.path(), 1, "failed", 15),
+        "mismatched rework PR must park the task: {:?}",
         handle.lines
     );
 
