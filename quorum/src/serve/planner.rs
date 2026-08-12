@@ -1026,10 +1026,29 @@ mod tests {
             ],
             prerequisites: vec![],
         };
-        assert!(validate_for_source(&[proposed.clone()], &[], title, Some(source)).is_ok());
+        let companion = ProposedTask {
+            key: "verification".into(),
+            title: "Verify routing".into(),
+            implementation_delta: "add focused routing verification".into(),
+            affected_paths: vec!["tests/routing.rs".into()],
+            observable_outcome: "routing verification works".into(),
+            acceptance_criteria: vec!["verification is covered".into()],
+            source_constraints: vec!["preserve literals".into()],
+            verification_expectations: vec!["tests pass".into()],
+            non_goals: vec!["no unrelated changes".into()],
+            preserved_literals: vec![],
+            prerequisites: vec!["routing".into()],
+        };
+        assert!(validate_for_source(
+            &[proposed.clone(), companion.clone()],
+            &[],
+            title,
+            Some(source)
+        )
+        .is_ok());
         proposed.preserved_literals[3] = "merge ready".into();
         assert!(matches!(
-            validate_for_source(&[proposed], &[], title, Some(source)),
+            validate_for_source(&[proposed, companion], &[], title, Some(source)),
             Err(PlannerParseError::Semantic(message))
                 if message.contains("match source bytes exactly")
         ));
@@ -1058,6 +1077,19 @@ mod tests {
             preserved_literals: vec![],
             prerequisites: vec![],
         };
+        let companion = ProposedTask {
+            key: "verification".into(),
+            title: "Verify routing".into(),
+            implementation_delta: "add focused routing verification".into(),
+            affected_paths: vec!["tests/routing.rs".into()],
+            observable_outcome: "routing verification works".into(),
+            acceptance_criteria: vec!["verification is covered".into()],
+            source_constraints: vec!["preserve behavior".into()],
+            verification_expectations: vec!["tests pass".into()],
+            non_goals: vec!["no unrelated changes".into()],
+            preserved_literals: vec![],
+            prerequisites: vec!["routing".into()],
+        };
 
         for source in [
             format!("Keep this inline literal exactly: `{literal}`"),
@@ -1065,7 +1097,7 @@ mod tests {
         ] {
             assert!(required_source_literals(&source).is_empty());
             assert!(validate_for_source(
-                std::slice::from_ref(&proposed),
+                &[proposed.clone(), companion.clone()],
                 &[],
                 "source",
                 Some(&source)
