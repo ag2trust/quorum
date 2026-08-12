@@ -2290,117 +2290,35 @@ fast-forward merge, rebuild via `./dev-install.sh`, and relaunch. Any other
 exit code propagates and stops the supervisor loop — a crash is not an
 upgrade signal.
 
-Three triggers reach exit 75, with different urgency and shutdown behavior.
-Triggers 1 and 3 enter the same `DrainState` machine used for signal-triggered
-shutdown (Ctrl-C, `DrainSource::Signal`, exits 0) but tagged
-`DrainSource::SelfUpdate`; trigger 2 bypasses the drain machine entirely:
+`EXIT_SELF_UPDATE` has three supported triggers:
 
-1. **Build staleness (bounded drain-then-exit).** With `--self-update-drain`
-   set, the tick loop periodically (`sha_poll_interval_secs`, default 600s)
-   shells out to a bounded `git ls-remote origin <base_branch>` and compares
-   the result against the running binary's build SHA. A mismatch means
-   origin's base branch has advanced past this build. The daemon does not
-   exit immediately: it enters drain mode, which blocks new worker/reviewer
-   claims and spawns (gated on `!drain_state.draining`, e.g.
-   `quorum/src/serve/mod.rs:9927`, `:10523`, `:10695`) and tears down each
-   in-flight worker/reviewer as soon as its *current turn* completes — not
-   once its task reaches a terminal state. Drain is not a total no-spawn
-   barrier, though: `tick_decomposition` runs unconditionally at the top of
-   every tick (`quorum/src/serve/mod.rs:6296-6309`, called before any drain
-   check) and can still launch a new planner or classifier provider process
-   (`:4664-4736` planner, `:4788-4831` classifier) while the daemon is
-   draining. Torn-down agents are marked `AgentFailed` ("daemon draining"),
-   and `cleanup_slot`
-   deletes their journal row immediately (`journal::delete`) — the journal is
-   not what carries the task across the restart. What happens to the task
-   depends on its status and whether it is `review_only`:
-   - A plain (non-`review_only`) `working` or `rework` task's `AgentFailed`
-     always bounces it to `Open` (`quorum-core/src/lifecycle.rs:267-277` for
-     `working`, `:411-421` for `rework`), a non-terminal status the tick loop
-     reclaims on its own on the next daemon. (Staying in `Rework` is a
-     distinct, narrower exception inside crash-recovery's own retry-queued
-     check — `quorum/src/serve/recovery.rs:190-245` — not a possible outcome
-     of the `AgentFailed` event drain fires here.)
-   - A `review_only` remediation task (this task's own kind) in `Rework`
-     hitting `AgentFailed` is parked to the *terminal* `Failed` status
-     instead — `quorum-core/src/lifecycle.rs:391-410` deliberately does not
-     bounce a lost remediation worker back to review (that would burn a
-     rework round re-judging an unchanged PR head with no fix applied).
-     Recovering it requires an explicit `quorum task-retry`; the relaunched
-     daemon's crash recovery does not resurrect it on its own.
-   - An idle `in-review` task is left as-is (`quorum/src/serve/recovery.rs:11`,
-     `:175`) — never reset, but still non-terminal, so the relaunched
-     daemon's normal tick loop spawns a reviewer for it.
-   This is a shallow drain: the current turn completes, then the agent is
-   torn down and the task's fate is decided by the lifecycle rule for its
-   exact status, not by a uniform "finish the task normally" or "always
-   reclaimed" contract. The daemon exits 75 once the roster is empty or
-   `drain_timeout_secs` elapses, whichever comes first — at timeout, any
-   remaining workers/reviewers/classifier/planner processes are force-killed
-   rather than left to block the upgrade indefinitely
-   (`quorum/src/serve/mod.rs:6127-6157`). That force-kill list does not
-   include `doctor_slot` (see trigger 2's note below) — a live doctor
-   investigation is not torn down by drain timeout either.
-2. **Schema-too-new (immediate force-kill, no drain).** If a tick returns
-   `QuorumError::SchemaTooNew` — the on-disk DB was migrated by a newer
-   binary than the one running — retrying can never succeed, since this
-   binary cannot read the schema. There is no graceful path: teardown itself
-   writes to the DB, which would also fail. The daemon force-kills every
-   in-flight worker/reviewer/planner/classifier process immediately without
-   calling `cleanup_slot`, so their journal rows are left intact
-   (`quorum/src/serve/mod.rs:6240-6264`). Neither this force-kill nor the
-   drain-timeout force-kill (trigger 1) reaches `doctor_slot`
-   (`quorum/src/serve/mod.rs:5818`, spawned at `:10901`) — it is absent from
-   both cleanup blocks, and `doctor::spawn_doctor`
-   (`quorum/src/serve/doctor.rs:91-121`) never writes a journal row for it
-   either, so a live doctor process is neither killed on exit nor re-adopted
-   by the next daemon's crash recovery; it is orphaned until it exits on its
-   own. Recovery does not replay journaled agents, though: on the relaunched
-   daemon's startup,
-   `recovery::recover` (`quorum/src/serve/recovery.rs`, module doc at `:1-13`)
-   uses the surviving journal only to find and kill each stale process's PID
-   (Phase 1, `:80-115`), then unconditionally deletes every journal row
-   (Phase 2, `:149-162`, `journal::delete_all`), then drives recovery purely
-   from durable task status (Phase 4, `:172-355`) — `working`/`rework` →
-   `AgentFailed` → `Open` (or terminal `Failed` for `review_only` rework, per
-   the same lifecycle rule as trigger 1), `merging` → `AgentFailed` →
-   `in-review` unless a durable full approval is already recorded, and
-   `in-review` left unchanged.
-3. **Successful merge via the *normal tick* merge executor while
-   self-update-drain is configured (bounded drain-then-exit).** When
-   `self_update_drain` and `self_repo` are both configured, a PR merge
-   *performed by the tick loop's own merge-executor call* enters the same
-   bounded drain as trigger 1 (`DrainState::start_drain`, source
-   `SelfUpdate`) immediately after firing `MergeSucceeded`
-   (`quorum/src/serve/mod.rs:8265-8279`). The code does not check the merged
-   task's repo against `self_repo`; it treats `self_repo` being configured
-   at all as sufficient grounds to assume the daemon's own source may have
-   moved. A daemon configured with `self_repo` pointing at a different repo
-   than the one it primarily manages (`config.repo`) will drain on merges in
-   *either* repo, not just `self_repo`'s.
+1. **Build staleness.** With `--self-update-drain`, the tick loop periodically
+   (`sha_poll_interval_secs`, default 600 seconds) runs bounded
+   `git ls-remote origin <base_branch>` outside DB work. When the remote base
+   SHA does not match the running build SHA, it requests a self-update drain.
+   An unavailable remote or an unidentifiable build SHA is logged and leaves
+   the daemon serving.
+2. **Schema too new.** A tick reporting `QuorumError::SchemaTooNew` means the
+   on-disk DB is newer than the binary can read. The daemon cannot safely
+   perform DB-backed cleanup, so it force-kills managed in-flight processes
+   and exits 75 for a rebuild and relaunch.
+3. **Normal-tick merge.** When both `self_update_drain` and `self_repo` are
+   configured, a successful merge performed by the normal tick merge executor
+   requests the same self-update drain immediately after `MergeSucceeded`.
 
-   This trigger is narrower than "any successful merge," though — two other
-   classes of supported merge-executor call do not start drain:
-   - **Already-merged detection.** A pre-merge mergeability check finding
-     the PR already merged externally (`:7069-7093`), the same detection for
-     a worker awaiting review (`:9988-9995`), and for an orphaned in-review
-     task (`:10252-10259`) fire `MergeSucceeded` or `PrFoundMerged` and clean
-     up the slot, but none of them call `start_drain` — they observe a merge
-     rather than perform one.
-   - **Startup approval recovery.** `run_serve` calls `approvals::recover`
-     during startup (`:5864-5871`), before the tick loop's `DrainState`
-     exists, to merge a PR whose durable approval survived a crash. That
-     path calls `exec.merge` directly and closes the task
-     (`quorum/src/serve/approvals.rs:348-396`) — a real merge-executor merge,
-     unlike the detection paths above — but has no `DrainState` to signal at
-     all. If this merge is in `self_repo`, the running binary is stale
-     immediately, yet the daemon keeps serving until the next
-     `sha_poll_interval_secs` tick notices origin has moved; it does not
-     drain right away the way trigger 3's normal-tick path does.
+A self-update drain is bounded and shallow: ordinary worker/reviewer
+provisioning respects the drain state, and the daemon drains its
+worker/reviewer roster without waiting for their tasks to finish. The daemon
+exits 75 when that roster becomes empty or `drain_timeout_secs` expires; at
+timeout it force-kills the remaining managed slots. Restart recovery then
+applies the normal durable lifecycle rules. This is deliberately not a
+guarantee that every task reaches a terminal state before handoff.
 
-All three triggers share the exit code so the supervisor needs only one
-branch to handle any of them; they differ in whether existing agents get a
-turn to finish (triggers 1 and 3) or are force-killed outright (trigger 2).
+The supervisor handles exit 75 by fetching `origin/<base>`, fast-forwarding
+the checkout, running `./dev-install.sh` (with its bounded build timeout), and
+relaunching. A failed fast-forward or build alerts and relaunches the existing
+binary; its restart-thrash guard is bounded. Other daemon exit codes propagate
+and stop the supervisor, so a crash is never treated as an upgrade signal.
 
 ### Run identity and capability enforcement
 
