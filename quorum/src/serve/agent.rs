@@ -45,11 +45,6 @@ pub struct AgentProc {
 /// (#206) — without it the Skill call is silently denied and the review
 /// degrades to an unstructured read.
 pub(crate) const ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,Skill";
-/// Hard provider-side spend ceiling for one repository-grounded planning turn.
-/// The planner also has wall-clock and streamed-output limits; this closes the
-/// remaining cost boundary when repeated read/search calls expand context.
-pub(crate) const PLANNER_MAX_BUDGET_USD: &str = "3.00";
-
 /// Build a stream-json user turn. The claude CLI requires `message.role` and
 /// exits 1 on the first message without it — every turn fed to an agent MUST
 /// go through this helper (first live run died instantly on a role-less turn).
@@ -185,10 +180,7 @@ impl AgentProc {
                 })
                 .arg("--no-session-persistence");
             if restricted == RestrictedMode::Planner {
-                cmd.arg("--add-dir")
-                    .arg(&spec.worktree)
-                    .arg("--max-budget-usd")
-                    .arg(PLANNER_MAX_BUDGET_USD);
+                cmd.arg("--add-dir").arg(&spec.worktree);
             }
         } else {
             cmd.arg("--add-dir").arg(&spec.worktree);
@@ -679,7 +671,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn planner_launch_passes_hard_provider_budget() {
+    async fn planner_launch_passes_no_provider_budget() {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -709,9 +701,8 @@ mod tests {
         let args = std::fs::read_to_string(&args_path)
             .expect("fake planner did not capture its bounded argument surface");
         let args: Vec<&str> = args.lines().collect();
-        assert!(args
-            .windows(2)
-            .any(|pair| { pair == ["--max-budget-usd", PLANNER_MAX_BUDGET_USD] }));
+        // Owner decision: no provider spend ceiling on planning turns for now.
+        assert!(!args.contains(&"--max-budget-usd"));
         let _ = proc.kill_and_reap().await;
     }
 

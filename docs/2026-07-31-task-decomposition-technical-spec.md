@@ -239,8 +239,8 @@ The planner runs against the frozen base revision with:
 - no network namespace access;
 - no Quorum binary, database path, run capability, or coordination environment;
 - source-directed inspection guidance capped at five Grep/Glob calls and ten focused Read calls;
-- a provider-enforced USD 3.00 turn ceiling, 128 KiB streamed-stdout ceiling, 64 KiB response
-  ceiling, and 600-second wall-clock ceiling;
+- a 128 KiB streamed-stdout ceiling, 64 KiB response ceiling, and 600-second wall-clock
+  ceiling; no provider USD ceiling is set;
 - bounded stderr diagnostics;
 - process-group kill and reap on timeout/cancellation.
 

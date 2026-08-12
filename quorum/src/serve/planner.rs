@@ -231,6 +231,13 @@ fn required_source_literals(source: &str) -> Vec<String> {
                 break;
             };
             let value_end = value_start + close_relative;
+            // A quoted label/tag/message never spans lines; a newline before the
+            // closing quote means the opening quote was unpaired. Skip it so a
+            // stray quote cannot manufacture an unsatisfiable required literal.
+            if source[value_start..value_end].contains('\n') {
+                search_from = value_start;
+                continue;
+            }
             if value_end > value_start {
                 literals.push(source[value_start..value_end].to_string());
             }
@@ -973,6 +980,13 @@ mod tests {
             Err(PlannerParseError::Semantic(message))
                 if message.contains("match source bytes exactly")
         ));
+    }
+
+    #[test]
+    fn unpaired_quote_does_not_manufacture_required_literal() {
+        let source = "A stray label \"unclosed\ntag \"three\" stays protected.";
+        let literals = required_source_literals(source);
+        assert_eq!(literals, vec!["three".to_string()]);
     }
 
     #[test]

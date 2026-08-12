@@ -1785,8 +1785,8 @@ Planning uses the profile selected from the planner routing pool. The planner re
 read-only repository view and bounded source context but no network, database, coordination
 command, or delivery authority. Planning is source-directed: repository inspection starts from
 paths and symbols named by the source, follows observed calls by at most one hop, and has bounded
-search/read guidance. The provider process has a hard spend ceiling in addition to its wall-clock,
-response, and streamed-output limits. A separate
+search/read guidance. The provider process has wall-clock, response, and streamed-output
+limits; no provider spend ceiling is set. A separate
 planner spawn boundary enforces those restrictions and accepts only one bounded, closed plan or
 blocker response; a provider whose transport cannot be separated from model-generated network or
 filesystem access is refused fail-closed. The view is an archive of the recorded frozen base SHA,
