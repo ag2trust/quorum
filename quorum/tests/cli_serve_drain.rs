@@ -608,6 +608,61 @@ fn build_sha_matching_origin_does_not_drain() {
     handle.stop();
 }
 
+/// Trigger B's idle path: the daemon starts at build SHA A, origin/main
+/// advances to B, then the empty roster completes the self-update drain.
+/// The exit status, rather than a log line, is the supervisor handoff contract.
+#[test]
+fn build_sha_advance_drains_and_exits_75() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &["--self-update-drain", "--sha-poll-interval-secs", "1"],
+    );
+
+    assert!(
+        handle.wait_for("decision=Current", 15),
+        "did not observe initial current build SHA: {:?}",
+        handle.lines
+    );
+
+    let repo = repo_dir.path().to_string_lossy().to_string();
+    Command::new("git")
+        .args(["-C", &repo, "commit", "--allow-empty", "-m", "advance main"])
+        .status()
+        .unwrap();
+
+    assert!(
+        handle.wait_for("decision=Behind", 15),
+        "did not observe build SHA advancement: {:?}",
+        handle.lines
+    );
+    let status = handle
+        .wait_exit(10)
+        .expect("serve did not exit after self-update drain");
+    assert_eq!(
+        status.code(),
+        Some(75),
+        "self-update drain must hand off to the supervisor with exit 75; lines: {:?}",
+        handle.lines
+    );
+}
+
 /// A failed staleness check is explicitly non-fatal so offline supervisors do
 /// not enter a restart loop.
 #[test]

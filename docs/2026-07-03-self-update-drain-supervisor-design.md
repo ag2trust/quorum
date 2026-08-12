@@ -33,6 +33,24 @@ Once draining:
 
 `draining` is idempotent — N merges during one drain window produce one restart. The supervisor re-checks the sha before relaunch, so improvements that landed mid-drain are included in the same rebuild.
 
+### Build-SHA drain shutdown matrix
+
+The SHA poll is a drain *request*, never an in-tick lifecycle transition. The
+tick loop owns the transition before its next dispatch, and the source controls
+the eventual exit code.
+
+| SHA-poll outcome / live state | Daemon action | Process exit | Regression coverage |
+|---|---|---:|---|
+| Build SHA A equals origin/main A; idle | Keep serving | none | `build_sha_matching_origin_does_not_drain` |
+| Build SHA A, origin unavailable; idle | Warn and keep serving | none | `unreachable_origin_logs_warning_and_daemon_keeps_running` |
+| Build SHA A, origin/main advances to B; no live slots | Complete the empty self-update drain | 75 | `build_sha_advance_drains_and_exits_75` |
+| Build SHA A, origin/main advances to B; active worker and queued task | Stop new claims, tear down the drained/expired worker, leave queued work recoverable | 75 | `drain_timeout_force_kills_and_exits_75` |
+| Signal drain while merge checks are waiting | Interrupt the wait and drain without requesting a rebuild | 0 | `drain_timeout_honored_during_merge_checks` |
+
+Exit **75** is the explicit daemon-to-supervisor handoff: it means
+rebuild-and-relaunch. A signal drain exits 0, and every other exit code is
+propagated by the supervisor without a rebuild.
+
 ## Component 2 — supervisor (`scripts/serve-supervisor.sh`)
 
 A ~40-line shell loop, deliberately dumb:
