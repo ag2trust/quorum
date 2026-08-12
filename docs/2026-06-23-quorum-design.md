@@ -2297,11 +2297,17 @@ shutdown (Ctrl-C, `DrainSource::Signal`, exits 0) but tagged
    exit immediately: it enters drain mode, which blocks new claims/spawns
    and tears down each in-flight worker/reviewer as soon as its *current
    turn* completes — not once its task reaches a terminal state. Torn-down
-   workers are marked `AgentFailed` ("daemon draining") and parked for
-   journal-based recovery by the next (relaunched) daemon; this is a shallow
-   drain, not "finish the task normally". The daemon exits 75 once the
-   roster is empty or `drain_timeout_secs` elapses, whichever comes first —
-   at timeout, any remaining agents are force-killed rather than left to
+   workers are marked `AgentFailed` ("daemon draining"), and `cleanup_slot`
+   deletes their journal row immediately (`journal::delete`) — the journal is
+   not what carries them across the restart. Their task is left in its
+   non-terminal durable status; the *next* (relaunched) daemon's startup
+   crash recovery (`recovery::recover`) resets any non-terminal task for the
+   tick loop to reclaim. This is a shallow drain — the current turn is
+   completed, then the agent is torn down and its task recovered from durable
+   task/PR state, not "finish the task normally". The daemon exits 75 once
+   the roster is empty or `drain_timeout_secs` elapses, whichever comes
+   first — at timeout, any remaining agents are force-killed rather than
+   left to
    block the upgrade indefinitely.
 2. **Schema-too-new (immediate force-kill, no drain).** If a tick returns
    `QuorumError::SchemaTooNew` — the on-disk DB was migrated by a newer
