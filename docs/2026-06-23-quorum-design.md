@@ -561,7 +561,8 @@ only through an explicit outside request)
 
 - **Author/reviewer separation:** ReviewerAttached is rejected if the agent is the author.
   The daemon enforces #206: the deliverer (who signaled `submit`) cannot review.
-- **Rework cap:** `REWORK_CAP = 5`. When `rework_round >= 5` and VerdictChanges fires,
+- **Rework cap:** `REWORK_CAP = 7`. When `rework_round >= 7` and an actionable rework
+  event (VerdictChanges, ChecksFailed, or MergeConflict) fires,
   the task goes to Failed (not Rework). Rounds are consumed only by review verdicts,
   CI failures, and merge conflicts on delivered work — never by infrastructure
   failures (provisioning, worker death, lease lapse), which park the task instead.
