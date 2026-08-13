@@ -592,6 +592,23 @@ pub enum Command {
         #[arg(long)]
         by: String,
     },
+    /// Explicitly adopt one completed managed continuation as the exact
+    /// delivery of the final failed member of an active decomposition. This
+    /// operator-only incident recovery requires durable publication, managed
+    /// approval, exact approved-head, and merge evidence; it never infers a
+    /// relationship from task text or a shared PR alone. Replay or any
+    /// mismatched evidence is a clean negative (exit 1).
+    DecompositionAdoptRecovery {
+        /// Exact failed generated child to complete.
+        #[arg(long = "original-child-id")]
+        original_child_id: i64,
+        /// Exact completed continuation whose delivery is being adopted.
+        #[arg(long = "recovery-task-id")]
+        recovery_task_id: i64,
+        /// Coordinator/operator identity recorded in durable recovery provenance.
+        #[arg(long)]
+        by: String,
+    },
     /// Hard-terminate a daemon-managed agent. Writes a kill request to the
     /// mailbox; the daemon consumes it and SIGTERM→SIGKILL the child process,
     /// releases the slot, and runs the post-mortem ladder on any held task.

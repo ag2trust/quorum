@@ -154,6 +154,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Classify { .. } => "classify",
         cli::Command::TaskClose { .. } => "task-close",
         cli::Command::TaskRetry { .. } => "task-retry",
+        cli::Command::DecompositionAdoptRecovery { .. } => "decomposition-adopt-recovery",
         cli::Command::Kill { .. } => "kill",
         cli::Command::ReviewInterpret { .. } => "review-interpret",
         cli::Command::Upgrade { .. } => "upgrade",
@@ -1071,6 +1072,39 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     }));
                     Ok(1)
                 }
+            }
+        }
+        cli::Command::DecompositionAdoptRecovery {
+            original_child_id,
+            recovery_task_id,
+            by,
+        } => {
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let adopted = quorum_core::decomposition::adopt_explicit_recovery_delivery(
+                &mut conn,
+                &quorum_core::decomposition::ExplicitRecoveryAdoption {
+                    original_child_id,
+                    recovery_task_id,
+                    authorized_by: &by,
+                    now,
+                },
+            )?;
+            if adopted {
+                output::emit(&serde_json::json!({
+                    "ok": true,
+                    "original_child_id": original_child_id,
+                    "recovery_task_id": recovery_task_id,
+                    "authorized_by": by,
+                }));
+                Ok(0)
+            } else {
+                output::emit(&serde_json::json!({
+                    "ok": false,
+                    "reason": "exact recovery pair is ineligible, stale, or already adopted",
+                    "original_child_id": original_child_id,
+                    "recovery_task_id": recovery_task_id,
+                }));
+                Ok(1)
             }
         }
         cli::Command::Kill {

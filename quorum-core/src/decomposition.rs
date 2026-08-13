@@ -80,6 +80,26 @@ pub struct GraphBlocker<'a> {
 
 pub const GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION: &str = "boundary-violation";
 
+/// Operator-selected authority for adopting one already-merged continuation
+/// as the delivery of a failed generated child. The IDs are deliberately
+/// exact inputs: no title, label, note, or shared-PR discovery is permitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitRecoveryAdoption<'a> {
+    pub original_child_id: i64,
+    pub recovery_task_id: i64,
+    pub authorized_by: &'a str,
+    pub now: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryDelivery {
+    graph_id: i64,
+    decomposition_source_id: i64,
+    source_revision: i64,
+    pr_number: i64,
+    merged_head_sha: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StartupReconcileResult {
     pub healthy: usize,
@@ -1347,9 +1367,10 @@ pub fn adopt_recovery_delivery(
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
-    let delivery: Option<(i64, String)> = tx
+    let delivery: Option<RecoveryDelivery> = tx
         .query_row(
-            "SELECT recovery_target.pr_number,recovery_target.head_sha
+            "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
+                    recovery_target.pr_number,recovery_target.head_sha
              FROM task_graph_members member
              JOIN task_decompositions graph ON graph.id=member.graph_id
              JOIN tasks source ON source.id=graph.source_task_id
@@ -1450,20 +1471,262 @@ pub fn adopt_recovery_delivery(
                     WHERE merging.subject='task#' || recovery.id
                       AND merging.kind='task_merging'
                       AND merging.expires_at>?3
-               )",
+            )",
             params![original_child_id, recovery_task_id, now],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok(RecoveryDelivery {
+                    graph_id: row.get(0)?,
+                    decomposition_source_id: row.get(1)?,
+                    source_revision: row.get(2)?,
+                    pr_number: row.get(3)?,
+                    merged_head_sha: row.get(4)?,
+                })
+            },
         )
         .optional()?;
-    let Some((pr_number, merged_head_sha)) = delivery else {
+    let Some(delivery) = delivery else {
         tx.commit().map_err(map_sql_err)?;
         return Ok(false);
     };
 
+    finalize_recovery_delivery(
+        &tx,
+        original_child_id,
+        recovery_task_id,
+        &delivery,
+        None,
+        now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
+/// Explicitly authorize the exact durable delivery of a completed managed
+/// continuation for the final failed member of an active decomposition.
+///
+/// This is the operator recovery path for a known pair, not a discovery
+/// mechanism and not general task equivalence. It substitutes durable daemon
+/// evidence for the automatic path's short-lived events: a completed managed
+/// worker must precede the persisted final PR target, an approved managed
+/// reviewer must be bound to that exact target head, and daemon-owned merged
+/// completion provenance must close the chain. Conflicting `source_task`
+/// metadata is rejected; absent metadata grants no authority beyond this
+/// explicit call. Every predicate and the final lifecycle transition are
+/// serialized by one `BEGIN IMMEDIATE` transaction.
+pub fn adopt_explicit_recovery_delivery(
+    conn: &mut Connection,
+    input: &ExplicitRecoveryAdoption<'_>,
+) -> Result<bool> {
+    let authorized_by = input.authorized_by.trim();
+    if input.original_child_id <= 0 || input.recovery_task_id <= 0 {
+        return Err(QuorumError::Usage(
+            "recovery task IDs must be positive".into(),
+        ));
+    }
+    if authorized_by.is_empty() || authorized_by.len() > 128 {
+        return Err(QuorumError::Usage(
+            "recovery operator identity must be 1-128 bytes".into(),
+        ));
+    }
+    if authorized_by.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "recovery operator identity contains NUL".into(),
+        ));
+    }
+
+    let tx = begin_immediate(conn)?;
+    let delivery: Option<RecoveryDelivery> = tx
+        .query_row(
+            "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
+                    recovery_target.pr_number,recovery_target.head_sha
+             FROM task_graph_members member
+             JOIN task_decompositions graph ON graph.id=member.graph_id
+             JOIN tasks source ON source.id=graph.source_task_id
+             JOIN tasks original ON original.id=member.task_id
+             JOIN tasks recovery ON recovery.id=?2
+             JOIN pr_targets original_target ON original_target.task_id=original.id
+             JOIN pr_targets recovery_target ON recovery_target.task_id=recovery.id
+             JOIN r2_sampling_decisions sampling
+               ON sampling.pr_number=recovery_target.pr_number
+              AND sampling.head_sha=recovery_target.head_sha
+              AND sampling.task_id=recovery.id
+             WHERE original.id=?1 AND original.id!=recovery.id
+               AND original.status='failed'
+               AND member.active=1 AND member.plan_revision=graph.accepted_plan_revision
+               AND graph.state='active' AND graph.active=1
+               AND source.status='decomposed'
+               AND NOT EXISTS (
+                    SELECT 1 FROM task_graph_members sibling
+                    JOIN tasks sibling_task ON sibling_task.id=sibling.task_id
+                    WHERE sibling.graph_id=graph.id AND sibling.active=1
+                      AND sibling.task_id!=original.id
+                      AND sibling_task.status!='done'
+               )
+               AND json_valid(original.refs)
+               AND json_type(original.refs,'$.pr')='integer'
+               AND json_extract(original.refs,'$.pr')=original_target.pr_number
+               AND original_target.pr_number=recovery_target.pr_number
+               AND original_target.head_ref!=''
+               AND original_target.head_ref=recovery_target.head_ref
+               AND length(original_target.head_sha) IN (40,64)
+               AND original_target.head_sha NOT GLOB '*[^0-9A-Fa-f]*'
+               AND recovery.status='done' AND recovery.review_only=0
+               AND recovery.completion_provenance=?3
+               AND recovery.continue_pr=recovery_target.pr_number
+               AND json_valid(recovery.refs)
+               AND json_type(recovery.refs,'$.pr')='integer'
+               AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number
+               AND (
+                    json_type(recovery.refs,'$.source_task') IS NULL
+                    OR (
+                        json_type(recovery.refs,'$.source_task')='integer'
+                        AND json_extract(recovery.refs,'$.source_task')=original.id
+                    )
+               )
+               AND json_type(recovery.refs,'$.daemon_publication') IS NULL
+               AND (
+                    (json_type(original.refs,'$.repo') IS NULL
+                     AND json_type(recovery.refs,'$.repo') IS NULL)
+                    OR
+                    (json_type(original.refs,'$.repo')='text'
+                     AND json_type(recovery.refs,'$.repo')='text'
+                     AND json_extract(original.refs,'$.repo')=
+                         json_extract(recovery.refs,'$.repo'))
+               )
+               AND recovery_target.head_ref!=''
+               AND length(recovery_target.head_sha) IN (40,64)
+               AND recovery_target.head_sha NOT GLOB '*[^0-9A-Fa-f]*'
+               AND EXISTS (
+                    SELECT 1 FROM agent_runs worker
+                    JOIN role_assignments assignment
+                      ON assignment.id=worker.role_assignment_id
+                    WHERE worker.task_id=recovery.id AND worker.role='worker'
+                      AND worker.sub_role IS NULL AND worker.ended_at IS NOT NULL
+                      AND worker.end_reason='completed'
+                      AND worker.ended_at<=recovery_target.resolved_at
+                      AND worker.id=(
+                           SELECT MAX(latest_worker.id) FROM agent_runs latest_worker
+                           WHERE latest_worker.task_id=recovery.id
+                             AND latest_worker.role='worker'
+                             AND latest_worker.sub_role IS NULL
+                      )
+                      AND assignment.task_id=recovery.id
+                      AND assignment.role='worker'
+                      AND assignment.pr_number IS NULL
+               )
+               AND EXISTS (
+                    SELECT 1 FROM agent_runs reviewer
+                    JOIN role_assignments assignment
+                      ON assignment.id=reviewer.role_assignment_id
+                    WHERE reviewer.task_id=recovery.id AND reviewer.role='reviewer'
+                      AND reviewer.ended_at IS NOT NULL
+                      AND reviewer.end_reason='verdict:approved'
+                      AND reviewer.spawned_at>=recovery_target.resolved_at
+                      AND reviewer.ended_at<=recovery.updated_at
+                      AND reviewer.id=(
+                           SELECT MAX(latest_reviewer.id) FROM agent_runs latest_reviewer
+                           WHERE latest_reviewer.task_id=recovery.id
+                             AND latest_reviewer.role='reviewer'
+                      )
+                      AND reviewer.review_pr=recovery_target.pr_number
+                      AND reviewer.review_head_sha=recovery_target.head_sha
+                      AND assignment.task_id=recovery.id
+                      AND assignment.pr_number=recovery_target.pr_number
+                      AND assignment.role='reviewer'
+                      AND ((sampling.required=0 AND reviewer.sub_role IS NULL
+                            AND assignment.review_stage='r1')
+                           OR (sampling.required=1 AND reviewer.sub_role='r2'
+                            AND assignment.review_stage='r2'))
+               )",
+            params![
+                input.original_child_id,
+                input.recovery_task_id,
+                crate::tasks::COMPLETION_PROVENANCE_MERGED
+            ],
+            |row| {
+                Ok(RecoveryDelivery {
+                    graph_id: row.get(0)?,
+                    decomposition_source_id: row.get(1)?,
+                    source_revision: row.get(2)?,
+                    pr_number: row.get(3)?,
+                    merged_head_sha: row.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(delivery) = delivery else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    };
+
+    let ordinal: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(ordinal),0)+1 FROM decomposition_attempts
+         WHERE graph_id=?1 AND source_revision=?2 AND kind='recovery'",
+        params![delivery.graph_id, delivery.source_revision],
+        |row| row.get(0),
+    )?;
+    let summary = serde_json::json!({
+        "authority": "explicit-operator",
+        "authorized_by": authorized_by,
+        "decomposition_source": delivery.decomposition_source_id,
+        "original_child": input.original_child_id,
+        "recovery_task": input.recovery_task_id,
+        "pr": delivery.pr_number,
+        "merged_head_sha": delivery.merged_head_sha,
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
+             reason_code,summary,created_at)
+         VALUES (?1,?2,'recovery',?3,'explicit-delivery-adoption',?4,?5)",
+        params![
+            delivery.graph_id,
+            delivery.source_revision,
+            ordinal,
+            summary,
+            input.now
+        ],
+    )?;
+
+    finalize_recovery_delivery(
+        &tx,
+        input.original_child_id,
+        input.recovery_task_id,
+        &delivery,
+        Some(authorized_by),
+        input.now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
+fn finalize_recovery_delivery(
+    tx: &Transaction<'_>,
+    original_child_id: i64,
+    recovery_task_id: i64,
+    delivery: &RecoveryDelivery,
+    explicit_authority: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let mut recovery_provenance = serde_json::json!({
+        "source_task": original_child_id,
+        "recovery_task": recovery_task_id,
+        "pr": delivery.pr_number,
+        "merged_head_sha": delivery.merged_head_sha,
+        "adopted_at": now,
+    });
+    if let Some(authorized_by) = explicit_authority {
+        recovery_provenance["authority"] = serde_json::json!("explicit-operator");
+        recovery_provenance["authorized_by"] = serde_json::json!(authorized_by);
+        recovery_provenance["decomposition_source"] =
+            serde_json::json!(delivery.decomposition_source_id);
+    }
+    let recovery_provenance = recovery_provenance.to_string();
+
     let changed = tx.execute(
         "UPDATE tasks
          SET status='done',assignee=NULL,updated_at=?2,
-             completion_provenance=?6,
+             completion_provenance=?3,
              refs=json_set(
                  json_remove(refs,
                      '$.daemon_parked',
@@ -1471,38 +1734,32 @@ pub fn adopt_recovery_delivery(
                      '$.daemon_resume_status',
                      '$.daemon_publication'),
                  '$.recovery_delivery',
-                 json_object(
-                     'source_task',?1,
-                     'recovery_task',?3,
-                     'pr',?4,
-                     'merged_head_sha',?5,
-                     'adopted_at',?2))
+                 json(?4))
          WHERE id=?1 AND status='failed'",
         params![
             original_child_id,
             now,
-            recovery_task_id,
-            pr_number,
-            merged_head_sha,
-            crate::tasks::COMPLETION_PROVENANCE_MERGED
+            crate::tasks::COMPLETION_PROVENANCE_MERGED,
+            recovery_provenance
         ],
     )?;
     if changed != 1 {
-        tx.commit().map_err(map_sql_err)?;
-        return Ok(false);
+        return Err(QuorumError::Io(
+            "recovery child changed during adoption transaction".into(),
+        ));
     }
     crate::events::emit(
-        &tx,
+        tx,
         "task_done",
         &format!("task#{original_child_id}"),
         &format!(
-            "adopted recovery task #{recovery_task_id} for PR #{pr_number} at {merged_head_sha}"
+            "adopted recovery task #{recovery_task_id} for PR #{} at {}",
+            delivery.pr_number, delivery.merged_head_sha
         ),
         now,
     )?;
-    complete_graph_if_final_child(&tx, original_child_id, now)?;
-    tx.commit().map_err(map_sql_err)?;
-    Ok(true)
+    complete_graph_if_final_child(tx, original_child_id, now)?;
+    Ok(())
 }
 
 /// Fold graph completion into the transaction that marks a generated child
@@ -2104,6 +2361,37 @@ mod tests {
 
         fn adoption(&mut self) -> bool {
             adopt_recovery_delivery(&mut self.conn, self.original, self.recovery, 50).unwrap()
+        }
+
+        fn make_explicit_eligible(&mut self) {
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET completion_provenance=?2,
+                         refs=json_remove(refs,'$.source_task')
+                     WHERE id=?1",
+                    params![self.recovery, crate::tasks::COMPLETION_PROVENANCE_MERGED],
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "UPDATE pr_targets SET resolved_at=20 WHERE task_id=?1",
+                    [self.recovery],
+                )
+                .unwrap();
+        }
+
+        fn explicit_adoption(&mut self, now: i64) -> bool {
+            adopt_explicit_recovery_delivery(
+                &mut self.conn,
+                &ExplicitRecoveryAdoption {
+                    original_child_id: self.original,
+                    recovery_task_id: self.recovery,
+                    authorized_by: "operator",
+                    now,
+                },
+            )
+            .unwrap()
         }
     }
 
@@ -3688,6 +3976,320 @@ mod tests {
     }
 
     #[test]
+    fn explicit_recovery_adopts_durable_delivery_after_event_expiry() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+
+        // The automatic path remains bound to live event evidence. The
+        // explicit operator path must not revive that discovery mechanism; it
+        // authorizes only this exact pair from the durable managed chain.
+        assert!(!adopt_recovery_delivery(
+            &mut fixture.conn,
+            fixture.original,
+            fixture.recovery,
+            90_000,
+        )
+        .unwrap());
+        assert!(fixture.explicit_adoption(90_000));
+
+        assert_graph_completed(
+            &fixture.conn,
+            fixture.graph,
+            1,
+            &[
+                fixture.siblings[0],
+                fixture.siblings[1],
+                fixture.siblings[2],
+                fixture.original,
+            ],
+        );
+        assert!(
+            crate::tasks::get(&fixture.conn, fixture.dependent)
+                .unwrap()
+                .unwrap()
+                .ready
+        );
+
+        let refs: String = fixture
+            .conn
+            .query_row(
+                "SELECT refs FROM tasks WHERE id=?1",
+                [fixture.original],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["recovery_delivery"]["authority"], "explicit-operator");
+        assert_eq!(refs["recovery_delivery"]["authorized_by"], "operator");
+        assert_eq!(refs["recovery_delivery"]["decomposition_source"], 1);
+        assert_eq!(refs["recovery_delivery"]["merged_head_sha"], RECOVERY_HEAD);
+
+        let (reason, summary): (String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT reason_code,summary FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='recovery'",
+                [fixture.graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, "explicit-delivery-adoption");
+        let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(summary["decomposition_source"], 1);
+        assert_eq!(summary["original_child"], fixture.original);
+        assert_eq!(summary["recovery_task"], fixture.recovery);
+        assert_eq!(summary["authorized_by"], "operator");
+
+        assert!(!fixture.explicit_adoption(90_001));
+        let audit_count: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT count(*) FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='recovery'
+                   AND reason_code='explicit-delivery-adoption'",
+                [fixture.graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 1, "replay must not duplicate provenance");
+    }
+
+    #[test]
+    fn explicit_recovery_fails_closed_for_inconsistent_durable_evidence() {
+        let cases: Vec<(&str, RecoveryEvidenceMutation)> = vec![
+            (
+                "non-failed child",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET status='open' WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "recovery task not completed",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET status='failed' WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "conflicting source provenance",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.source_task',999)
+                             WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "wrong PR",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET continue_pr=?2 WHERE id=?1",
+                            params![fixture.recovery, RECOVERY_PR + 1],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "wrong repository",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.repo','owner/repo')
+                             WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.repo','other/repo')
+                             WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "missing publication",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET end_reason='failed'
+                             WHERE task_id=?1 AND role='worker'",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "wrong approved head",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET review_head_sha=?2
+                             WHERE task_id=?1 AND role='reviewer'",
+                            params![fixture.recovery, "cccccccccccccccccccccccccccccccccccccccc"],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "missing managed approval",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET end_reason='completed'
+                             WHERE task_id=?1 AND role='reviewer'",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "missing merge evidence",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET completion_provenance=NULL WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "unfinished sibling",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET status='open' WHERE id=?1",
+                            [fixture.siblings[0]],
+                        )
+                        .unwrap();
+                }),
+            ),
+        ];
+
+        for (name, mutate) in cases {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_explicit_eligible();
+            mutate(&mut fixture);
+            assert!(
+                !fixture.explicit_adoption(90_000),
+                "{name} unexpectedly adopted"
+            );
+            let state: (String, String, String, i64) = fixture
+                .conn
+                .query_row(
+                    "SELECT child.status,graph.state,source.status,
+                            (SELECT count(*) FROM decomposition_attempts
+                             WHERE graph_id=graph.id AND kind='recovery'
+                               AND reason_code='explicit-delivery-adoption')
+                     FROM tasks child
+                     JOIN task_graph_members member ON member.task_id=child.id
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     JOIN tasks source ON source.id=graph.source_task_id
+                     WHERE child.id=?1",
+                    [fixture.original],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(state.1, "active", "{name} mutated graph state");
+            assert_eq!(state.2, "decomposed", "{name} mutated source state");
+            assert_eq!(state.3, 0, "{name} persisted recovery authority");
+        }
+    }
+
+    #[test]
+    fn explicit_recovery_rejects_nonmember() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,refs)
+                 VALUES ('not a member','failed','owner',1,1,?1)",
+                [serde_json::json!({"pr": RECOVERY_PR}).to_string()],
+            )
+            .unwrap();
+        let nonmember = fixture.conn.last_insert_rowid();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (?1,?2,'daemon/original',?3,0,8)",
+                params![nonmember, RECOVERY_PR, ORIGINAL_HEAD],
+            )
+            .unwrap();
+
+        assert!(!adopt_explicit_recovery_delivery(
+            &mut fixture.conn,
+            &ExplicitRecoveryAdoption {
+                original_child_id: nonmember,
+                recovery_task_id: fixture.recovery,
+                authorized_by: "operator",
+                now: 90_000,
+            },
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn explicit_recovery_rejects_invalid_operator_identity_without_mutation() {
+        for identity in ["", "operator\0forged"] {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_explicit_eligible();
+            assert!(adopt_explicit_recovery_delivery(
+                &mut fixture.conn,
+                &ExplicitRecoveryAdoption {
+                    original_child_id: fixture.original,
+                    recovery_task_id: fixture.recovery,
+                    authorized_by: identity,
+                    now: 90_000,
+                },
+            )
+            .is_err());
+            let state: (String, String, i64) = fixture
+                .conn
+                .query_row(
+                    "SELECT child.status,graph.state,
+                            (SELECT count(*) FROM decomposition_attempts
+                             WHERE graph_id=graph.id AND kind='recovery')
+                     FROM tasks child
+                     JOIN task_graph_members member ON member.task_id=child.id
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     WHERE child.id=?1",
+                    [fixture.original],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("failed".into(), "active".into(), 0));
+        }
+    }
+
+    #[test]
     fn continuation_adoption_rejects_inconsistent_or_incomplete_evidence_without_mutation() {
         let cases: Vec<(&str, RecoveryEvidenceMutation)> = vec![
             (
@@ -3977,6 +4579,59 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 1, "round {round}");
+        }
+    }
+
+    #[test]
+    fn concurrent_explicit_recovery_adopters_have_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..8 {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_explicit_eligible();
+            let barrier = Arc::new(Barrier::new(3));
+            let mut handles = Vec::new();
+            for operator in ["operator-a", "operator-b"] {
+                let path = fixture.db_path.clone();
+                let barrier = Arc::clone(&barrier);
+                let original = fixture.original;
+                let recovery = fixture.recovery;
+                handles.push(std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    adopt_explicit_recovery_delivery(
+                        &mut conn,
+                        &ExplicitRecoveryAdoption {
+                            original_child_id: original,
+                            recovery_task_id: recovery,
+                            authorized_by: operator,
+                            now: 90_000,
+                        },
+                    )
+                    .unwrap()
+                }));
+            }
+            barrier.wait();
+            let outcomes: Vec<bool> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            assert_eq!(
+                outcomes.iter().filter(|outcome| **outcome).count(),
+                1,
+                "round {round}: {outcomes:?}"
+            );
+            let provenance_count: i64 = fixture
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM decomposition_attempts
+                     WHERE graph_id=?1 AND kind='recovery'
+                       AND reason_code='explicit-delivery-adoption'",
+                    [fixture.graph],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(provenance_count, 1, "round {round}");
         }
     }
 
