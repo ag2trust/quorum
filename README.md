@@ -1,5 +1,11 @@
 # Quorum
 
+> [!WARNING]
+> **Experimental — not ready for production.** Quorum is under active development,
+> has sharp edges, and may change its commands, configuration, schemas, and behavior
+> without notice. Do not rely on it for production delivery workflows or unattended
+> critical repositories.
+
 Quorum is a local Git/GitHub agent pipeline. A repository-local `quorum serve`
 daemon owns task lifecycle and uses SQLite as its source of truth; agents provide
 implementation, review, and analysis turns, but their messages and signals do
@@ -8,26 +14,40 @@ not themselves transition or merge tasks.
 The short version is not just `task → worker → review → merge`. A submitted
 task can cause several provider calls:
 
-```text
-intake → classifier ──┬─→ worker → R1 → R2 → daemon merge → collector
-                      │                ↖       │
-                      │                  rework│
-                      └─→ planner → classify proposed S/M children → dependency-ordered workers
-                                                               └──────→ qualified follow-up planning, when activated
+```mermaid
+flowchart LR
+    C[Classifier] --> W[Worker]
+    C --> P[Planner]
+    P --> CC[Classifier]
+    CC --> WS[Workers]
+    WS --> R1[R1]
+    W --> R1
+    R1 --> R2[R2]
+    R1 --> W
+    R2 --> W
+    R2 --> M[Daemon merge]
+    M --> CO[Collector]
 ```
 
-The planner, decomposition, rework, R2 sampling, collection, follow-up work,
-and doctor are conditional. This README describes the managed path and its
-provider consumption; it is not a release promise or a guarantee that every
-task visits every branch. In particular, the repository has bounded
-follow-up-planning foundations, but their lifecycle activation remains separate
-from the completed task's merge path.
+The direct path sends classified work to a worker. Qualifying larger work first
+passes through the planner, whose proposed children are classified before they
+reach dependency-ordered workers. Blocking findings from either review stage
+return the existing Proposed Change to its worker for rework; the updated head
+then returns to the responsible review stage.
 
-This is not a polished or stable product. It follows my own workflow, assumes
+Some stages run only when their lifecycle conditions or configured policy call
+for them: planning/decomposition depends on task classification, rework depends
+on review or verification findings, and R2 participation follows review policy.
+"Conditional" does not mean every stage has an independent on/off switch in the
+current configuration. Collection is part of the current post-merge path;
+follow-up activation and doctor work have their own eligibility rules. This
+README describes provider consumption, not a guarantee that every task visits
+every branch.
+
+Quorum follows my own workflow, assumes
 Git, GitHub, local credentials, and capable coding agents, and has sharp edges.
-Commands, prompts, configuration, database schemas, and existing behavior may
-change without notice. If it is useful to you, great—but there are no
-compatibility or support guarantees.
+If it is useful to you, great—but there are no compatibility or support
+guarantees.
 
 ## What it does
 
