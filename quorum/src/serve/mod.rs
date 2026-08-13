@@ -12717,7 +12717,7 @@ async fn spawn_worker(
                 let reason = format!("continue PR #{pr} provisioning rejected: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "open").await;
-                name_pool.release(&agent_name);
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
         }
@@ -12728,7 +12728,7 @@ async fn spawn_worker(
                 let reason = format!("parked rework publication provisioning rejected: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "rework").await;
-                name_pool.release(&agent_name);
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
         };
@@ -12743,7 +12743,8 @@ async fn spawn_worker(
                         );
                         persist_provisioning_failure(&db_path, task.id, &reason).await;
                         park_task(&db_path, task.id, &reason, "rework").await;
-                        name_pool.release(&agent_name);
+                        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id)
+                            .await;
                         return Ok(false);
                     }
                 }
@@ -12812,7 +12813,7 @@ async fn spawn_worker(
                 let reason = format!("branch provenance resolution failed: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "open").await;
-                name_pool.release(&agent_name);
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
         };
@@ -12855,7 +12856,7 @@ async fn spawn_worker(
                 "open",
             )
             .await;
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
             return Ok(false);
         }
     }
@@ -12909,9 +12910,9 @@ async fn spawn_worker(
                     resume_status,
                 )
                 .await;
-                name_pool.release(&agent_name);
                 wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
             let strikes = poison_tracker.record_strike(task.id);
@@ -12920,7 +12921,7 @@ async fn spawn_worker(
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             return Ok(false);
         }
@@ -12939,9 +12940,9 @@ async fn spawn_worker(
         } else {
             release_task(&db_path, &agent_name, task.id).await;
         }
-        name_pool.release(&agent_name);
         wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
         return Ok(false);
     }
 
@@ -13095,9 +13096,9 @@ async fn spawn_worker(
             // Initial open task: poison — this won't resolve on retry.
             poison_task(&db_path, &agent_name, task.id, MAX_POISON_STRIKES, None).await;
         }
-        name_pool.release(&agent_name);
         wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
         return Ok(false);
     }
 
@@ -13237,9 +13238,9 @@ async fn spawn_worker(
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
-            name_pool.release(&agent_name);
             wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
             return Ok(false);
         }
     }
@@ -14298,7 +14299,7 @@ async fn spawn_remediation_worker(
                      lease release also failed: {release_error}"
                 ));
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Err(error);
         }
     };
@@ -14338,7 +14339,7 @@ async fn spawn_remediation_worker(
                      lease release also failed: {release_error}"
                 ));
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Err(error);
         }
     }
@@ -14356,7 +14357,7 @@ async fn spawn_remediation_worker(
                 tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
             })
             .await;
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: "structural: remediation PR target is unavailable and no safe fallback branch exists".into(),
             });
@@ -14461,7 +14462,7 @@ async fn spawn_remediation_worker(
                 })
                 .await;
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: classified_provisioning_cause(&cause),
             });
@@ -14640,9 +14641,9 @@ async fn spawn_remediation_worker(
                         .await;
                         cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id)
                             .await;
-                        name_pool.release(&agent_name);
                         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                         wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                        guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
                         return Ok(RemediationSpawnOutcome::ProvisionFailed {
                             cause: classified_provisioning_cause(&format!(
                                 "remediation provider recovery failed: {error}"
@@ -14664,9 +14665,9 @@ async fn spawn_remediation_worker(
                 })
                 .await;
                 cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-                name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
                 return Ok(RemediationSpawnOutcome::ProvisionFailed {
                     cause: classified_provisioning_cause(&format!(
                         "remediation provider recovery failed: {error}"
@@ -14714,9 +14715,9 @@ async fn spawn_remediation_worker(
         })
         .await;
         cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-        name_pool.release(&agent_name);
         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(task_repo_dir, &branch).await;
+        guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
         return Ok(RemediationSpawnOutcome::ProvisionFailed {
             cause: "remediation provider policy rejected launch: Codex cannot report USD cost while max_*_cost_usd is configured".into(),
         });
@@ -14764,9 +14765,9 @@ async fn spawn_remediation_worker(
             })
             .await;
             cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-            name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: classified_provisioning_cause(&format!(
                     "remediation continuation recovery failed: {error}"
@@ -14886,9 +14887,9 @@ async fn spawn_remediation_worker(
                 .await;
             }
             cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-            name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: classified_provisioning_cause(&format!(
                     "remediation worker process launch failed: {e}"
