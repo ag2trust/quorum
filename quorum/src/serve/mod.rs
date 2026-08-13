@@ -9440,20 +9440,8 @@ async fn tick(
     // firing AgentFailed (#176).
     let mut idle_workers: Vec<usize> = Vec::new();
     for (i, w) in workers.iter().enumerate() {
-        if w.draining || w.error_turn_count > 0 {
-            continue;
-        }
-        // Dormant sticky slots have no live process to zombify; they exist to
-        // hold the exact continuation until the reviewer produces a verdict.
-        // Reaping them here would silently release the awaiting-review slot
-        // Phase 5 provisions a reviewer for.
-        if matches!(w.proc, SlotProcess::Dormant { .. }) {
-            continue;
-        }
-        if let Some(ended) = w.turn_ended_at {
-            if ended.elapsed().as_secs() > idle_timeout {
-                idle_workers.push(i);
-            }
+        if slot_is_idle_zombie_candidate(w, idle_timeout) {
+            idle_workers.push(i);
         }
     }
     for &i in idle_workers.iter().rev() {
@@ -10151,12 +10139,7 @@ async fn tick(
             .iter()
             .enumerate()
             .filter_map(|(i, w)| {
-                if let Some(pr) = w.pr {
-                    if !w.draining && !reviewers.iter().any(|r| r.task_id == w.task_id) {
-                        return Some((pr, w.task_id, i));
-                    }
-                }
-                None
+                slot_needs_reviewer_provisioning(w, reviewers).map(|pr| (pr, w.task_id, i))
             })
             .collect();
         if !needs_reviewer_from_workers.is_empty() {
@@ -11458,6 +11441,13 @@ async fn dispose_dead_turn_runner_worker(
 /// is reaped and its captured output persisted; the sticky slot retains its
 /// name, active claim, journal, worktree, branch, PR, and continuation so
 /// Phase 4d renews its lease and Phase 5 provisions a reviewer for it.
+///
+/// A failure to persist the `awaiting-review` journal row (SQLite busy/IO,
+/// blocking-task join failure, or an upsert error) is surfaced to the caller
+/// so the fallback path can fully release the slot instead of retaining a
+/// dormant worker whose crash-recovery row still advertises the reaped process
+/// PID and a stale phase — restart recovery trusts that PID and would call
+/// `killpg` on whatever process group has since reused it.
 async fn park_worker_slot_dormant(db_path: &Path, slot: &mut SlotState) -> std::io::Result<()> {
     let old = slot.become_dormant()?;
     let captured = old.kill_and_reap().await;
@@ -11468,13 +11458,46 @@ async fn park_worker_slot_dormant(db_path: &Path, slot: &mut SlotState) -> std::
     slot.last_error_text = None;
     let entry = slot_journal_entry(slot, "worker", "awaiting-review");
     let p = db_path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let upsert = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
         journal::upsert(&mut conn, &entry)
     })
     .await
-    .ok();
+    .map_err(|join| std::io::Error::other(format!("park journal join failed: {join}")))?;
+    upsert.map_err(|err| std::io::Error::other(format!("park journal upsert failed: {err}")))?;
     Ok(())
+}
+
+/// Phase 5 spawns a reviewer for every worker slot that has published a PR
+/// and finished its turn, without a reviewer already paired for the same
+/// task. Extracted so the production decision is testable: a dormant sticky
+/// slot with its PR retained and `draining=false` must remain eligible.
+fn slot_needs_reviewer_provisioning(slot: &SlotState, reviewers: &[SlotState]) -> Option<i64> {
+    let pr = slot.pr?;
+    if slot.draining {
+        return None;
+    }
+    if reviewers.iter().any(|r| r.task_id == slot.task_id) {
+        return None;
+    }
+    Some(pr)
+}
+
+/// The idle watchdog reaps workers that sit between turns for longer than the
+/// operator-configured limit. Extracted so the production decision is
+/// testable: a regression that lets the watchdog kill a dormant awaiting-
+/// review slot must break the same predicate the tick loop consults.
+fn slot_is_idle_zombie_candidate(slot: &SlotState, idle_timeout_secs: u64) -> bool {
+    if slot.draining || slot.error_turn_count > 0 {
+        return false;
+    }
+    // Dormant sticky slots have no live process to zombify; they exist to
+    // hold the exact continuation until the reviewer produces a verdict.
+    if matches!(slot.proc, SlotProcess::Dormant { .. }) {
+        return false;
+    }
+    slot.turn_ended_at
+        .is_some_and(|t| t.elapsed().as_secs() > idle_timeout_secs)
 }
 
 async fn persist_runner_provider_block(
@@ -16599,6 +16622,201 @@ mod tests {
         slot.kill_and_reap().await;
     }
 
+    #[tokio::test]
+    async fn park_worker_slot_dormant_surfaces_journal_write_failure() {
+        // The DB path points at a directory, so `db::open` and therefore
+        // `journal::upsert` will fail. The park helper must surface that
+        // failure instead of returning Ok — otherwise the caller retains a
+        // dormant worker whose stale journal row still advertises the reaped
+        // process PID, and restart recovery would `killpg` a reused group.
+        let worktree = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let unwritable_db = db_dir.path().to_path_buf();
+
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = Some("provider-thread-42".into());
+        slot.pr = Some(1);
+
+        let err = park_worker_slot_dormant(&unwritable_db, &mut slot)
+            .await
+            .expect_err("an unwritable journal DB must not be reported as a successful park");
+        assert!(
+            err.to_string().contains("park journal"),
+            "the surfaced error must identify the park-time journal write, got: {err}"
+        );
+        // Process was already reaped inside `become_dormant`; the caller now
+        // owns the dormant slot and must run cleanup_slot to release the
+        // name/worktree/branch and delete the stale journal row.
+        assert!(matches!(&slot.proc, SlotProcess::Dormant { .. }));
+    }
+
+    #[tokio::test]
+    async fn slot_needs_reviewer_provisioning_covers_dormant_running_and_paired_slots() {
+        // Regression guard: production Phase 5 consults this exact predicate.
+        // Removing the `!draining` gate or the paired-reviewer check must
+        // break this test.
+        let worktree = tempfile::tempdir().unwrap();
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.agent_name = "Delivered".into();
+        slot.task_id = 42;
+        slot.pr = Some(777);
+        slot.continuation_id = Some("thread".into());
+
+        // No PR yet → not eligible.
+        let empty: Vec<SlotState> = Vec::new();
+        slot.pr = None;
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &empty), None);
+        slot.pr = Some(777);
+
+        // Draining mid-turn → not eligible.
+        slot.draining = true;
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &empty), None);
+        slot.draining = false;
+
+        // Running slot with PR and no reviewer → eligible.
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &empty), Some(777));
+
+        // Dormant awaiting-review slot with PR → still eligible.
+        let old = slot.become_dormant().unwrap();
+        old.kill_and_reap().await;
+        assert_eq!(
+            slot_needs_reviewer_provisioning(&slot, &empty),
+            Some(777),
+            "dormant sticky slot must remain reviewer-eligible after delivery"
+        );
+
+        // Reviewer already paired → not eligible even for a dormant slot.
+        let paired_worktree = tempfile::tempdir().unwrap();
+        let mut paired = slot_with_process(launch_test_codex(paired_worktree.path(), None).await);
+        paired.task_id = slot.task_id;
+        let reviewers = vec![paired];
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &reviewers), None);
+        for r in reviewers {
+            r.kill_and_reap().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_recorded_park_survives_watchdog_reviewer_capacity_and_lease_visibility() {
+        // Integration coverage for the DeliveryRecorded → park path. Drives
+        // the same disposition classifier the production tick calls, parks
+        // through the shared helper, and then asserts the four surfaces the
+        // task requires: workers-vec retention (capacity), the idle
+        // watchdog exemption, Phase 5 reviewer eligibility, and Phase 4d
+        // lease renewal seeing the parked (name, task_id) pair.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("delivery-parks.db");
+        let repo = dir.path().join("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Seed a task in-review with PR 443 for agent "Spool" so that
+        // dispose_dead_turn_runner classifies the exit as DeliveryRecorded.
+        create_active_task(&db_path, "Spool", "working");
+        fire_event_result(
+            &db_path,
+            "Spool",
+            1,
+            &Event::SignaledDone { pr: "443".into() },
+        )
+        .await
+        .unwrap();
+
+        let disposition = dispose_dead_turn_runner_worker(
+            &db_path,
+            1,
+            "Spool",
+            "process exited",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            disposition,
+            tasks::DeadTurnRunnerDisposition::DeliveryRecorded,
+            "production classifier must still route a normal Codex exit through DeliveryRecorded"
+        );
+
+        let dead_proc = launch_test_codex(&repo, None).await;
+        let mut dead = slot_with_process(dead_proc);
+        dead.agent_name = "Spool".into();
+        dead.task_id = 1;
+        dead.pr = Some(443);
+        dead.branch = "daemon/spool-t1".into();
+        dead.remote_branch = "daemon/spool-t1".into();
+        dead.continuation_id = Some("thread-parked".into());
+        dead.draining = true;
+        dead.worktree_path = repo.clone();
+
+        park_worker_slot_dormant(&db_path, &mut dead).await.unwrap();
+        let mut workers = vec![dead];
+
+        // Workers-vec retention (capacity accounting): the parked slot still
+        // counts against the worker cap.
+        assert_eq!(workers.len(), 1);
+        assert_eq!(available_worker_slots(1, workers.len()), 0);
+        assert_eq!(available_worker_slots(2, workers.len()), 1);
+
+        // Idle watchdog exemption using the production predicate.
+        workers[0].turn_ended_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3600));
+        assert!(
+            !slot_is_idle_zombie_candidate(&workers[0], 300),
+            "watchdog must not reap a dormant awaiting-review slot"
+        );
+
+        // Phase 5 reviewer eligibility using the production predicate.
+        let no_reviewers: Vec<SlotState> = Vec::new();
+        assert_eq!(
+            slot_needs_reviewer_provisioning(&workers[0], &no_reviewers),
+            Some(443),
+            "parked slot must still ask Phase 5 for a reviewer"
+        );
+
+        // Phase 4d lease renewal iterates the workers vec verbatim; a parked
+        // slot must therefore be visible with its exact (name, task_id).
+        let active_pairs: Vec<(String, i64)> = workers
+            .iter()
+            .map(|w| (w.agent_name.clone(), w.task_id))
+            .collect();
+        assert_eq!(active_pairs, vec![("Spool".to_string(), 1)]);
+
+        // Assigned lifecycle contract: no duplicate lifecycle transition on
+        // exit-time park — the mailbox-driven Done handling already fired
+        // the task_in_review row; park itself must not re-fire it.
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let in_review_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE subject='task#1' AND kind='task_in_review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            in_review_events, 1,
+            "park must not emit a second in-review event"
+        );
+
+        // Journal contract: awaiting-review phase and pid=None so restart
+        // recovery does not target the reaped process group.
+        let entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent, "Spool");
+        assert_eq!(entries[0].phase, "awaiting-review");
+        assert_eq!(entries[0].pr, Some(443));
+        assert!(entries[0].pid.is_none());
+
+        // Task-level survival: name/claim/PR retained on the row.
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.author.as_deref(), Some("Spool"));
+        assert_eq!(tasks::extract_pr_number(&task.refs), Some(443));
+
+        for w in workers {
+            w.kill_and_reap().await;
+        }
+    }
+
     fn pre_review_ci_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
         let profile = crate::serve_config::ModelProfile {
             runner: "claude".into(),
@@ -17189,10 +17407,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_timeout_ignores_dormant_awaiting_review_slot() {
-        // A dormant sticky slot has no live process and exists to hold the
-        // exact continuation until the reviewer produces a verdict. The idle
-        // watchdog must skip it even though its turn ended long ago.
+    async fn slot_is_idle_zombie_candidate_excludes_dormant_awaiting_review_slot() {
+        // Regression guard: the production idle watchdog consults this exact
+        // predicate. Removing the dormancy exclusion inside
+        // `slot_is_idle_zombie_candidate` must break this test.
         let worktree = tempfile::tempdir().unwrap();
         let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
         slot.continuation_id = Some("thread-parked".into());
@@ -17202,17 +17420,26 @@ mod tests {
         slot.error_turn_count = 0;
         slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
 
-        let timeout = 300u64;
-        let reaped_by_watchdog = !slot.draining
-            && slot.error_turn_count == 0
-            && !matches!(slot.proc, SlotProcess::Dormant { .. })
-            && slot
-                .turn_ended_at
-                .is_some_and(|t| t.elapsed().as_secs() > timeout);
         assert!(
-            !reaped_by_watchdog,
+            !slot_is_idle_zombie_candidate(&slot, 300),
             "dormant awaiting-review slot must survive the idle watchdog"
         );
+    }
+
+    #[test]
+    fn slot_is_idle_zombie_candidate_matches_watchdog_shape_for_running_slot() {
+        // Sanity: a running slot past its idle limit still counts as a zombie
+        // so removing the dormancy branch cannot flip this into a green test.
+        let mut slot = make_dummy_slot();
+        slot.draining = false;
+        slot.error_turn_count = 0;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+        assert!(slot_is_idle_zombie_candidate(&slot, 300));
+        slot.draining = true;
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
+        slot.draining = false;
+        slot.error_turn_count = 1;
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
     }
 
     #[test]
