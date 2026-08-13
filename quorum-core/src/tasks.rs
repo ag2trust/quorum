@@ -1195,6 +1195,31 @@ pub fn clear_reviewer_provision_reservations(conn: &mut Connection) -> Result<us
     Ok(changed)
 }
 
+/// Daemon-private: check whether `agent` still holds an active, unexpired task
+/// lease on `task#<id>`. Used by the final worker teardown to guard the
+/// name-pool release: while the lease is live, the identity is still authoritative
+/// and must not be recycled. Idempotent read; returns `false` once the lease has
+/// been deactivated (released/transferred) or expired.
+pub fn worker_lease_active_for(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let target = lease_target(id);
+    let active = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM claims
+              WHERE target=?1 AND holder=?2 AND active=1 AND expires_at > ?3
+         )",
+        params![target, agent, now],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(active)
+}
+
 /// Daemon-private: revalidate that a remediation worker still owns the exact
 /// live rework lease it acquired before an awaited provisioning prerequisite.
 ///
@@ -10114,5 +10139,57 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn worker_lease_active_for_flags_live_claim() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+
+        assert!(
+            worker_lease_active_for(&mut c, "W1", id, 1001).unwrap(),
+            "live worker lease must block name-pool release"
+        );
+        // Idempotent: same-holder repeat check does not change state.
+        assert!(worker_lease_active_for(&mut c, "W1", id, 1002).unwrap());
+    }
+
+    #[test]
+    fn worker_lease_active_for_rejects_different_holder() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+
+        // A retired worker name (W2) never held this lease; the guard must not
+        // treat a sibling holder's claim as a reason to retain a different name.
+        assert!(!worker_lease_active_for(&mut c, "W2", id, 1001).unwrap());
+    }
+
+    #[test]
+    fn worker_lease_active_for_ignores_expired_and_deactivated() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], 100, 1000).unwrap();
+        // Past expiry.
+        assert!(!worker_lease_active_for(&mut c, "W1", id, 2000).unwrap());
+
+        let id2 = create(&mut c, "boss", "u", None, 0, None, None, None, None, 3000).unwrap();
+        claim(&mut c, "W2", Some(id2), &[], TTL, 3000).unwrap();
+        // Terminal handoff would deactivate the lease.
+        c.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND holder=?2",
+            params![lease_target(id2), "W2"],
+        )
+        .unwrap();
+        assert!(!worker_lease_active_for(&mut c, "W2", id2, 3001).unwrap());
+    }
+
+    #[test]
+    fn worker_lease_active_for_missing_claim_is_false() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        // No claim was ever taken (e.g., worker died before insert).
+        assert!(!worker_lease_active_for(&mut c, "W1", id, 1001).unwrap());
     }
 }
