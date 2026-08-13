@@ -79,9 +79,11 @@ hosted service or a general-purpose workflow system.
    mandatory, while deterministic R2 sampling can be configured for later
    steady-state coverage. Neither reviewer is the author or merge authority.
 5. **Rework and renewed review.** Blocking review feedback returns the same
-   Proposed Change to the worker for a rework turn. The updated PR head receives
-   a fresh review path (R1, then R2 when required for that head); prior approval
-   is not reused for changed code.
+   Proposed Change to a rework turn. The reviewer responsible for the changes
+   verdict re-reviews the updated head in that same stage: R1 resumes R1, while
+   R2-originated rework resumes R2 directly rather than restarting at R1. For a
+   review-only task with no managed worker, the daemon provisions a remediation
+   worker. Prior approval is not reused for changed code.
 6. **Merge and collection.** Once the daemon has the required approvals and
    merge gates, it performs the merge. A detached collector then records
    post-merge review analytics. Collection failures are visible and have a
@@ -92,8 +94,9 @@ hosted service or a general-purpose workflow system.
    investigate a stalled task with no active worker or reviewer. It reports
    evidence; it does not take lifecycle authority.
 
-Review-only tasks (`--review-pr`) intentionally skip managed implementation.
-If they need code changes, their outside author must update the PR.
+Review-only tasks (`--review-pr`) intentionally skip initial managed
+implementation. If blocking feedback requires code changes, the daemon enters
+rework and provisions managed remediation for the existing PR.
 
 ## Managed roles
 
@@ -264,8 +267,9 @@ EOF
 ```
 
 `--continue-pr` creates a managed worker from the recorded PR head. `--review-pr` skips the
-worker and starts with review. They are mutually exclusive. If a review-only PR needs code
-changes, its outside author must update it; Quorum has no managed worker for that task.
+initial worker and starts with review. They are mutually exclusive. If a review-only PR
+receives blocking feedback, the daemon enters rework and provisions a managed remediation
+worker for that existing PR.
 
 Give implementation tasks a concrete outcome, relevant constraints, and a way to verify
 the result. The daemon chooses complexity, model, and effort. Managed agents receive their
