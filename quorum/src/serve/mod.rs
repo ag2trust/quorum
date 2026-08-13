@@ -2417,7 +2417,7 @@ fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry
             .session_log
             .as_ref()
             .map(|l| l.dir().to_string_lossy().into()),
-        pid: slot.proc.pid(),
+        pid: slot.pid(),
         pr: slot.pr,
         rework_count: slot.rework_count as i32,
     }
@@ -2626,9 +2626,125 @@ impl LiveStats {
     }
 }
 
+/// The runner transport currently attached to a worker slot.
+///
+/// Turn-oriented providers finish and exit after each turn. A sticky worker
+/// may therefore remain assigned while its provider process is dormant between
+/// turns, but only after receiving the provider-issued continuation identity
+/// needed to launch the next exact turn.
+enum SlotProcess {
+    Running(Box<runner::RunnerProc>),
+    // Dormancy is intentionally represented before the exit/rework paths
+    // begin producing it in a follow-up change.
+    #[allow(dead_code)]
+    Dormant {
+        kind: runner::AgentKind,
+        continuation_id: String,
+    },
+}
+
+impl SlotProcess {
+    fn running(proc: runner::RunnerProc) -> Self {
+        Self::Running(Box::new(proc))
+    }
+
+    #[allow(dead_code)]
+    fn dormant(kind: runner::AgentKind, continuation_id: Option<&str>) -> std::io::Result<Self> {
+        if kind.turn_mode() != runner::TurnMode::RespawnPerTurn {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{kind} cannot be dormant because it requires a persistent child"),
+            ));
+        }
+        let continuation_id = continuation_id.filter(|id| !id.is_empty()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("dormant {kind} slot is missing its exact persisted continuation"),
+            )
+        })?;
+        Ok(Self::Dormant {
+            kind,
+            continuation_id: continuation_id.to_owned(),
+        })
+    }
+
+    fn kind(&self) -> runner::AgentKind {
+        match self {
+            Self::Running(proc) => proc.kind(),
+            Self::Dormant { kind, .. } => *kind,
+        }
+    }
+
+    fn pid(&self) -> Option<i32> {
+        match self {
+            Self::Running(proc) => proc.pid(),
+            Self::Dormant { .. } => None,
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Running(proc) => proc.try_wait(),
+            Self::Dormant { .. } => Ok(None),
+        }
+    }
+
+    fn running_mut(&mut self) -> std::io::Result<&mut runner::RunnerProc> {
+        match self {
+            Self::Running(proc) => Ok(proc),
+            Self::Dormant {
+                kind,
+                continuation_id,
+            } => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "dormant {kind} slot ({continuation_id}) has no live process; launch a continuation turn first"
+                ),
+            )),
+        }
+    }
+
+    fn continuation_id(&self) -> Option<&str> {
+        match self {
+            Self::Running(_) => None,
+            Self::Dormant {
+                continuation_id, ..
+            } => Some(continuation_id),
+        }
+    }
+
+    fn replace_with_launched_turn(
+        &mut self,
+        proc: runner::RunnerProc,
+    ) -> std::io::Result<Option<runner::RunnerProc>> {
+        let expected = self.kind();
+        if proc.kind() != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "launched {actual} turn cannot replace a {expected} slot",
+                    actual = proc.kind(),
+                ),
+            ));
+        }
+        let old = std::mem::replace(self, Self::Running(Box::new(proc)));
+        Ok(match old {
+            Self::Running(old) => Some(*old),
+            Self::Dormant { .. } => None,
+        })
+    }
+
+    async fn kill_and_reap(self) -> Vec<runner::CapturedOutput> {
+        match self {
+            Self::Running(proc) => proc.kill_and_reap().await,
+            Self::Dormant { .. } => Vec::new(),
+        }
+    }
+}
+
 pub(crate) struct SlotState {
     agent_name: String,
-    proc: runner::RunnerProc,
+    proc: SlotProcess,
     task_id: i64,
     session_id: String,
     /// Exact provider selection for this run. Continuations must never
@@ -2673,6 +2789,62 @@ pub(crate) struct SlotState {
     continuation_id: Option<String>,
     pending_prompt: String,
     pending_turn_kind: String,
+}
+
+impl SlotState {
+    fn process_kind(&self) -> runner::AgentKind {
+        self.proc.kind()
+    }
+
+    fn pid(&self) -> Option<i32> {
+        self.proc.pid()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.proc.try_wait()
+    }
+
+    fn live_process_mut(&mut self) -> std::io::Result<&mut runner::RunnerProc> {
+        self.proc.running_mut()
+    }
+
+    fn continuation_id_for_launch(&self) -> Option<&str> {
+        self.proc
+            .continuation_id()
+            .or(self.continuation_id.as_deref())
+    }
+
+    /// Park a completed turn-oriented runner while retaining its sticky worker
+    /// slot. The caller owns reaping the returned completed process.
+    #[allow(dead_code)]
+    fn become_dormant(&mut self) -> std::io::Result<runner::RunnerProc> {
+        if matches!(&self.proc, SlotProcess::Dormant { .. }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot park an already dormant slot",
+            ));
+        }
+        let dormant = SlotProcess::dormant(self.process_kind(), self.continuation_id.as_deref())?;
+        let old = std::mem::replace(&mut self.proc, dormant);
+        match old {
+            SlotProcess::Running(proc) => Ok(*proc),
+            SlotProcess::Dormant { .. } => unreachable!("dormant slots returned above"),
+        }
+    }
+
+    /// Install the process launched for the next turn. A dormant slot has no
+    /// old process to reap; a running respawn-per-turn slot retains the
+    /// established replacement behavior until callers begin parking it.
+    fn replace_with_launched_turn(
+        &mut self,
+        proc: runner::RunnerProc,
+    ) -> std::io::Result<Option<runner::RunnerProc>> {
+        self.proc.replace_with_launched_turn(proc)
+    }
+
+    async fn kill_and_reap(self) -> Vec<runner::CapturedOutput> {
+        self.proc.kill_and_reap().await
+    }
 }
 
 fn worker_done_event(rework_count: u32, pr: i64) -> Event {
@@ -5456,16 +5628,18 @@ async fn resume_reviewer_after_ci(
         )));
     }
     if let Err(error) = reviewers[reviewer_index]
-        .proc
+        .live_process_mut()
+        .map_err(|error| QuorumError::Io(format!("reviewer has no live process: {error}")))?
         .feed_turn(&rereview_turn)
         .await
     {
-        let reason =
-            if reviewers[reviewer_index].proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
-                "codex_rereview"
-            } else {
-                "failed"
-            };
+        let reason = if reviewers[reviewer_index].process_kind().turn_mode()
+            == runner::TurnMode::RespawnPerTurn
+        {
+            "codex_rereview"
+        } else {
+            "failed"
+        };
         log(&format!(
             "ResumeReviewer: feed_turn failed for task #{task_id}: {error} \
              — tearing down ({reason})"
@@ -6040,12 +6214,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     slot.kill_and_reap().await;
                 }
                 for r in reviewers.drain(..) {
-                    let _terminal_output = r.proc.kill_and_reap().await;
-                    name_pool.release(&r.agent_name);
+                    let agent_name = r.agent_name.clone();
+                    let _terminal_output = r.kill_and_reap().await;
+                    name_pool.release(&agent_name);
                 }
                 for w in workers.drain(..) {
-                    let _terminal_output = w.proc.kill_and_reap().await;
-                    name_pool.release(&w.agent_name);
+                    let agent_name = w.agent_name.clone();
+                    let _terminal_output = w.kill_and_reap().await;
+                    name_pool.release(&agent_name);
                 }
                 return Ok(1);
             }
@@ -6254,12 +6430,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                         slot.kill_and_reap().await;
                     }
                     for r in reviewers.drain(..) {
-                        let _terminal_output = r.proc.kill_and_reap().await;
-                        name_pool.release(&r.agent_name);
+                        let agent_name = r.agent_name.clone();
+                        let _terminal_output = r.kill_and_reap().await;
+                        name_pool.release(&agent_name);
                     }
                     for w in workers.drain(..) {
-                        let _terminal_output = w.proc.kill_and_reap().await;
-                        name_pool.release(&w.agent_name);
+                        let agent_name = w.agent_name.clone();
+                        let _terminal_output = w.kill_and_reap().await;
+                        name_pool.release(&agent_name);
                     }
                     return Ok(EXIT_SELF_UPDATE);
                 }
@@ -9376,8 +9554,8 @@ async fn tick(
     }
     for &i in error_failed.iter().rev() {
         let dead = workers.remove(i);
-        if dead.proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
-            let provider = dead.proc.kind().to_string();
+        if dead.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
+            let provider = dead.process_kind().to_string();
             let reason = dead
                 .last_error_text
                 .as_deref()
@@ -9516,7 +9694,7 @@ async fn tick(
     // its stdout open. `try_wait` is the authoritative signal.
     let mut dead_workers = Vec::new();
     for (i, w) in workers.iter_mut().enumerate() {
-        match w.proc.try_wait() {
+        match w.try_wait() {
             Ok(Some(status)) => {
                 log(&format!(
                     "worker {} process exited (task #{}, status={:?}) — classifying lifecycle outcome",
@@ -9532,14 +9710,14 @@ async fn tick(
     }
     for &(i, status) in dead_workers.iter().rev() {
         let dead = workers.remove(i);
-        if dead.proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
+        if dead.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
             let reason = dead
                 .last_error_text
                 .as_deref()
                 .unwrap_or("turn-oriented runner exited before task submission")
                 .to_string();
             let retry = PendingTurn {
-                provider: dead.proc.kind().to_string(),
+                provider: dead.process_kind().to_string(),
                 model: dead.model.clone(),
                 effort: dead.effort.clone(),
                 prompt: dead.pending_prompt.clone(),
@@ -9704,7 +9882,7 @@ async fn tick(
 
     let mut dead_reviewers: Vec<usize> = Vec::new();
     for (i, r) in reviewers.iter_mut().enumerate() {
-        match r.proc.try_wait() {
+        match r.try_wait() {
             Ok(Some(status)) => {
                 log(&format!(
                     "reviewer {} process exited (task #{}, status={:?}) — classifying lifecycle outcome",
@@ -11077,7 +11255,7 @@ async fn feed_worker_turn(
     raw_prompt: &str,
     config: &ServeConfig,
 ) -> std::io::Result<()> {
-    if slot.proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
+    if slot.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
         if should_replace_pending_prompt(raw_prompt) {
             slot.pending_prompt = raw_prompt.to_string();
             slot.pending_turn_kind = if slot.pr.is_some() {
@@ -11104,21 +11282,22 @@ async fn feed_worker_turn(
                 environment: &env_vars,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: runner_continuation_id(
-                    slot.proc.kind(),
+                    slot.process_kind(),
                     &slot.session_id,
-                    slot.continuation_id.as_deref(),
+                    slot.continuation_id_for_launch(),
                 ),
             },
             &runner_adapter_config(config, config.agent_bin.as_deref()),
         )
         .await?;
 
-        let old = std::mem::replace(&mut slot.proc, new_proc);
-        tokio::spawn(async move { old.kill_and_reap().await });
+        if let Some(old) = slot.replace_with_launched_turn(new_proc)? {
+            tokio::spawn(async move { old.kill_and_reap().await });
+        }
         Ok(())
     } else {
         let turn = agent::user_turn(raw_prompt);
-        slot.proc.feed_turn(&turn).await
+        slot.live_process_mut()?.feed_turn(&turn).await
     }
 }
 
@@ -11133,7 +11312,7 @@ fn runner_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str
             "runner continuation missing its resolved model/effort identity",
         ));
     }
-    let expected = slot.proc.kind();
+    let expected = slot.process_kind();
     match runner::AgentKind::for_model(&slot.model) {
         Ok(actual) if actual == expected => Ok((&slot.model, &slot.effort)),
         Ok(actual) => Err(std::io::Error::new(
@@ -11350,11 +11529,20 @@ async fn drain_events(
     role: &str,
     limits: &CostLimits,
 ) -> Result<Option<LimitBreached>> {
-    persist_diagnostics(slot);
-    while let Ok(Some(raw_line)) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), slot.proc.next_raw_line()).await
+    persist_diagnostics(slot).map_err(|error| {
+        QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
+    })?;
+    while let Ok(Some(raw_line)) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        slot.live_process_mut()
+            .map_err(|error| {
+                QuorumError::Io(format!("slot event drain requires a live process: {error}"))
+            })?
+            .next_raw_line(),
+    )
+    .await
     {
-        let events = runner::normalize_line(slot.proc.kind(), &raw_line);
+        let events = runner::normalize_line(slot.process_kind(), &raw_line);
 
         if let Some(ref mut sl) = slot.session_log {
             sl.log_raw_and_normalized(&raw_line, &events);
@@ -11372,7 +11560,7 @@ async fn drain_events(
                     persist_runner_continuation(
                         db_path,
                         slot.task_id,
-                        &slot.proc.kind().to_string(),
+                        &slot.process_kind().to_string(),
                         thread_id,
                         continuation_slot,
                     )
@@ -11505,18 +11693,21 @@ async fn drain_events(
                 }
             }
         }
-        persist_diagnostics(slot);
+        persist_diagnostics(slot).map_err(|error| {
+            QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
+        })?;
     }
     Ok(None)
 }
 
-fn persist_diagnostics(slot: &mut SlotState) {
-    for output in slot.proc.drain_diagnostics() {
+fn persist_diagnostics(slot: &mut SlotState) -> std::io::Result<()> {
+    for output in slot.live_process_mut()?.drain_diagnostics() {
         if let Some(ref mut sl) = slot.session_log {
             let line = output.session_line();
             sl.log_raw_and_normalized(&line, &[]);
         }
     }
+    Ok(())
 }
 
 fn persist_terminal_output(
@@ -12465,7 +12656,7 @@ async fn provision_reviewer_reserved(
             let now_instant = std::time::Instant::now();
             reviewers.push(SlotState {
                 agent_name: reviewer_name.clone(),
-                proc,
+                proc: SlotProcess::running(proc),
                 task_id: worker.task_id,
                 session_id,
                 model: reviewer_model,
@@ -13188,7 +13379,7 @@ async fn spawn_worker(
             let now_instant = std::time::Instant::now();
             workers.push(SlotState {
                 agent_name,
-                proc,
+                proc: SlotProcess::running(proc),
                 task_id: task.id,
                 session_id,
                 model: resolved_model,
@@ -14762,7 +14953,7 @@ async fn spawn_remediation_worker(
             let now_instant = std::time::Instant::now();
             workers.push(SlotState {
                 agent_name: agent_name.clone(),
-                proc,
+                proc: SlotProcess::running(proc),
                 task_id,
                 session_id,
                 model: remediation_model.clone(),
@@ -15556,7 +15747,7 @@ mod tests {
         assert_eq!(claim, ("live-worker".into(), 1));
 
         let worker = workers.remove(0);
-        worker.proc.kill_and_reap().await;
+        worker.kill_and_reap().await;
     }
 
     #[tokio::test]
@@ -15577,8 +15768,13 @@ mod tests {
         assert_eq!(entries[0].pr, Some(571));
         assert_eq!(entries[0].rework_count, 1);
 
-        worker.proc.feed_turn("done").await.unwrap();
-        worker.proc.kill_and_reap().await;
+        worker
+            .live_process_mut()
+            .unwrap()
+            .feed_turn("done")
+            .await
+            .unwrap();
+        worker.kill_and_reap().await;
     }
 
     #[test]
@@ -16121,7 +16317,6 @@ mod tests {
     }
 
     fn make_dummy_slot() -> SlotState {
-        use std::time::Instant;
         use tokio::io::BufReader;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -16136,10 +16331,14 @@ mod tests {
         let stdout = child.stdout.take().unwrap();
         let reader = BufReader::new(stdout);
         let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(child, stdin, reader));
-        let now = Instant::now();
+        slot_with_process(proc)
+    }
+
+    fn slot_with_process(proc: runner::RunnerProc) -> SlotState {
+        let now = std::time::Instant::now();
         SlotState {
             agent_name: "Test-1".into(),
-            proc,
+            proc: SlotProcess::running(proc),
             task_id: 1,
             session_id: "sess".into(),
             model: "test-model".into(),
@@ -16168,6 +16367,97 @@ mod tests {
             pending_prompt: "test prompt".into(),
             pending_turn_kind: "initial".into(),
         }
+    }
+
+    async fn launch_test_codex(
+        worktree: &Path,
+        continuation_id: Option<&str>,
+    ) -> runner::RunnerProc {
+        runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "medium",
+                worktree,
+                prompt: "test",
+                environment: &[],
+                mode: runner::LaunchMode::Normal,
+                continuation_id,
+            },
+            &runner::AdapterConfig {
+                executable: Some("true"),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn running_claude_slot_exposes_its_process_kind_pid_and_wait_status() {
+        let mut slot = make_dummy_slot();
+
+        assert!(matches!(slot.proc, SlotProcess::Running(_)));
+        assert_eq!(slot.process_kind(), runner::AgentKind::Claude);
+        assert!(slot.pid().is_some());
+        assert!(slot.try_wait().is_ok());
+    }
+
+    #[tokio::test]
+    async fn running_codex_slot_exposes_its_process_kind_pid_and_wait_status() {
+        let worktree = tempfile::tempdir().unwrap();
+        let proc = launch_test_codex(worktree.path(), None).await;
+        let mut slot = slot_with_process(proc);
+
+        assert!(matches!(slot.proc, SlotProcess::Running(_)));
+        assert_eq!(slot.process_kind(), runner::AgentKind::Codex);
+        assert!(slot.pid().is_some());
+        let _ = slot.try_wait().unwrap();
+        slot.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn dormant_codex_slot_has_no_process_and_accepts_a_matching_new_turn() {
+        let worktree = tempfile::tempdir().unwrap();
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = Some("provider-thread-42".into());
+
+        let old = slot.become_dormant().unwrap();
+        assert!(matches!(
+            &slot.proc,
+            SlotProcess::Dormant {
+                continuation_id, ..
+            } if continuation_id == "provider-thread-42"
+        ));
+        assert_eq!(slot.process_kind(), runner::AgentKind::Codex);
+        assert_eq!(slot.pid(), None);
+        assert_eq!(slot.try_wait().unwrap(), None);
+
+        let new_proc = launch_test_codex(worktree.path(), Some("provider-thread-42")).await;
+        assert!(slot.replace_with_launched_turn(new_proc).unwrap().is_none());
+        assert!(matches!(slot.proc, SlotProcess::Running(_)));
+        old.kill_and_reap().await;
+        slot.kill_and_reap().await;
+    }
+
+    #[test]
+    fn dormant_slot_rejects_missing_continuation() {
+        let Err(error) = SlotProcess::dormant(runner::AgentKind::Codex, None) else {
+            panic!("dormant Codex slot unexpectedly accepted no continuation");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exact persisted continuation"));
+    }
+
+    #[test]
+    fn dormant_slot_rejects_persistent_child_provider() {
+        let Err(error) = SlotProcess::dormant(runner::AgentKind::Claude, Some("session")) else {
+            panic!("dormant Claude slot unexpectedly accepted a persistent child");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("persistent child"));
     }
 
     fn pre_review_ci_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
@@ -16239,11 +16529,11 @@ mod tests {
         let now = std::time::Instant::now();
         SlotState {
             agent_name: "live-worker".into(),
-            proc: runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+            proc: SlotProcess::running(runner::RunnerProc::Claude(agent::AgentProc::from_parts(
                 child,
                 stdin,
                 BufReader::new(stdout),
-            )),
+            ))),
             task_id,
             session_id: agent::new_session_id(),
             model: "claude-sonnet-5".into(),

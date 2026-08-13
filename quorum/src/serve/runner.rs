@@ -338,10 +338,6 @@ impl RunnerProc {
         }
     }
 
-    pub fn turn_mode(&self) -> TurnMode {
-        self.kind().turn_mode()
-    }
-
     pub fn drain_diagnostics(&mut self) -> Vec<CapturedOutput> {
         match self {
             Self::Claude(proc) => proc.drain_diagnostics(),

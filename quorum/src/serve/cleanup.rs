@@ -236,7 +236,7 @@ async fn kill_matching_live_slot(
     for slots in [&mut *live.workers, &mut *live.reviewers] {
         if let Some(index) = slots
             .iter()
-            .position(|slot| slot.proc.pid() == Some(identity.pid))
+            .position(|slot| slot.pid() == Some(identity.pid))
         {
             let slot = &slots[index];
             if slot.task_id != task_id
@@ -247,7 +247,7 @@ async fn kill_matching_live_slot(
             }
             let slot = slots.swap_remove(index);
             live.names.release(&slot.agent_name);
-            slot.proc.kill_and_reap().await;
+            slot.kill_and_reap().await;
             return Ok(true);
         }
     }
