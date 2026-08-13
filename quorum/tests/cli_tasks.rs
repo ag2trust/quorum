@@ -29,6 +29,50 @@ fn task_claim_cli_rejected_at_parse() {
 }
 
 #[test]
+fn explicit_decomposition_recovery_requires_an_exact_eligible_pair() {
+    let home = tempfile::tempdir().unwrap();
+
+    quorum(home.path())
+        .args([
+            "decomposition-adopt-recovery",
+            "--original-child-id",
+            "400",
+            "--recovery-task-id",
+            "418",
+            "--by",
+            "operator",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicates::str::contains("\"ok\":false"))
+        .stdout(predicates::str::contains(
+            "ineligible, stale, or already adopted",
+        ));
+
+    quorum(home.path())
+        .args([
+            "decomposition-adopt-recovery",
+            "--original-child-id",
+            "0",
+            "--recovery-task-id",
+            "418",
+            "--by",
+            "operator",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("task IDs must be positive"));
+
+    quorum(home.path())
+        .args(["decomposition-adopt-recovery", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("operator-only incident recovery"))
+        .stdout(predicates::str::contains("--original-child-id"))
+        .stdout(predicates::str::contains("--recovery-task-id"));
+}
+
+#[test]
 fn legacy_claim_commands_all_rejected() {
     // All legacy claim entry points (claim, release, renew, claims, task-claim) removed by
     // PR #85 and #161 — verify they all fail at parse (exit 2).

@@ -1840,17 +1840,33 @@ affected child and blocks the graph without consuming ordinary rework. The sourc
 decomposed and the blocked graph remains active until source cancellation; recovery requires a
 replacement source, not automatic replanning after delivery has begun.
 
-A separate, explicit incident-recovery primitive may adopt the exact merged delivery of a done
-managed continuation task for the final failed member of an otherwise complete active graph.
-This is not graph-blocker recovery: blocked graphs still require cancellation and replacement.
-The immediate transaction requires the same repository and PR, creator-selected `continue_pr`,
+A narrow incident-recovery primitive may adopt the exact merged delivery of a done managed
+continuation task for the final failed member of an otherwise complete active graph. This is not
+graph-blocker recovery: blocked graphs still require cancellation and replacement. The automatic
+path's immediate transaction requires the same repository and PR, creator-selected `continue_pr`,
 explicit `source_task` provenance, live daemon publication and merge events (`expires_at > now`),
 immutable managed-review authority, and one consistent PR target/approved head SHA. It changes
 only the failed child, records recovery provenance while preserving the PR, then invokes ordinary
 final-child completion. Missing or expired evidence, replay, and losing concurrent callers are
-clean no-ops with no events; the winner emits bounded completion events once. After graph
-consistency reconciliation and before generic stateless lifecycle recovery or provisioning, the
-daemon automatically discovers eligible deliveries at startup and on ordinary ticks. Discovery
+clean no-ops with no events; the winner emits bounded completion events once.
+
+For a coordinator/operator-selected incident pair, `quorum decomposition-adopt-recovery
+--original-child-id <child> --recovery-task-id <continuation> --by <operator>` is the sole explicit
+recovery-authority surface. The same `BEGIN IMMEDIATE` transaction rechecks active membership,
+failed/final-child state, repository and PR identity, creator-selected continuation authority,
+and exact target/head agreement. It permits absent `source_task` metadata because the caller has
+named the exact pair, but rejects conflicting metadata. Instead of expiring feed events it requires
+the durable daemon chain: a completed assigned worker before the persisted final PR target, an
+assigned approved reviewer bound to that exact target head and sampling decision, and merged
+completion provenance. Success writes the operator, source, child, recovery task, PR, and head to
+the decomposition recovery ledger and child recovery projection before invoking the same ordinary
+final-child completion. It does not discover candidates, infer equivalence, or weaken the automatic
+path's event rules. A rejected pair, replay, or concurrent loser is a clean negative with no
+provenance or lifecycle event.
+
+After graph consistency reconciliation and before generic stateless lifecycle recovery or
+provisioning, the daemon automatically discovers eligible event-backed deliveries at startup and
+on ordinary ticks. Discovery
 consumes at most eight physical rows from the durable lifecycle-event sequence in ascending `seq` order,
 then resolves explicit `source_task`, graph membership, PR targets, and live publication/merge
 evidence using short reads only. It never scans terminal-task history or performs network I/O.

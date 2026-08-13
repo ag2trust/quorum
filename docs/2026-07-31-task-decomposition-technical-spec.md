@@ -54,18 +54,32 @@ unsafe recovered state. A materialized graph blocker does not move the source ou
 and a replacement source can normally recover a graph after generated delivery has started.
 
 There is one narrow incident-recovery exception for a failed generated child whose exact work
-was subsequently delivered by a separate managed continuation task. An explicit core call may
+was subsequently delivered by a separate managed continuation task. The automatic core call may
 adopt that delivery only when the failed task is the final unfinished member of the still-active
 graph; both tasks identify the same repository and PR; the continuation has creator-selected
 `continue_pr` authority and explicit `source_task` provenance; and its daemon publication,
 managed approval, merge transition, PR target, and approved head SHA all agree. Publication and
 merge events are short-lived evidence: every required event must be live at the transaction's
 `now` (`expires_at > now`), so an event at its expiry boundary is rejected regardless of whether
-housekeeping has swept it. One `BEGIN IMMEDIATE` transaction rechecks all evidence, marks only
-the failed child done with explicit recovery provenance, preserves its PR association, and runs
-ordinary final-child graph completion. The continuation row remains unchanged. No match, replay,
-or losing concurrent caller changes state or emits an event; the winner emits the ordinary
-bounded child and graph completion events exactly once.
+housekeeping has swept it.
+
+One operator-only command may authorize a known exact child/continuation pair without granting
+automatic discovery any new authority: `quorum decomposition-adopt-recovery
+--original-child-id <child> --recovery-task-id <continuation> --by <operator>`. Its single
+`BEGIN IMMEDIATE` transaction requires the same active graph and final failed-child predicates,
+the same repository, PR, continuation, target, and approved-head agreement, and no conflicting
+`source_task` metadata. In place of live feed events, it requires durable daemon evidence: a
+completed assigned worker preceding final PR-target persistence, an assigned approved reviewer
+bound to that target head and its sampling decision, and `merged` completion provenance. The
+explicit pair supplies the missing relationship only when `source_task` is absent; it never
+overrides a conflicting source and never infers from task text or shared PR equality. Success
+records the exact operator/source/child/recovery/PR/head tuple in the decomposition recovery
+ledger and child projection.
+
+Both paths use the same transaction-scoped finalizer: mark only the failed child done, preserve
+its PR association, and run ordinary final-child graph completion. The continuation row remains
+unchanged. No match, replay, or losing concurrent caller changes state or emits an event; the
+winner emits the ordinary bounded child and graph completion events exactly once.
 
 The daemon invokes this primitive automatically after graph consistency reconciliation and before
 generic stateless lifecycle recovery or provisioning, once at startup and once per ordinary tick.
@@ -397,7 +411,9 @@ Decomposition reconciliation runs before generic lifecycle recovery or provision
   replacement except for the exact-continuation adoption predicate described under Lifecycle.
   After consistency checks, startup and tick reconciliation discover that case through the
   bounded monotonic event cursor and invoke the guarded transaction; no shared-PR or inferred
-  provenance match is sufficient.
+  provenance match is sufficient. A coordinator/operator may instead invoke the exact-pair
+  command above when durable evidence is complete; that command does not scan or create automatic
+  recovery authority.
 - Generic recovery must not reset planning/decomposed sources or treat children as unrelated.
 - Pre-feature unrelated tasks enter the current admission policy when next eligible. A complete
   existing graph resumes; incomplete/inconsistent graphs are held with a visible reason.
