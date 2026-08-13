@@ -248,7 +248,11 @@ impl WorktreeManager {
     }
 
     #[cfg(test)]
-    fn with_config(git_bin: PathBuf, fetch_timeout: Duration, local_timeout: Duration) -> Self {
+    pub(crate) fn with_config(
+        git_bin: PathBuf,
+        fetch_timeout: Duration,
+        local_timeout: Duration,
+    ) -> Self {
         Self {
             lock: Mutex::new(()),
             git_bin,
@@ -1163,6 +1167,62 @@ impl WorktreeManager {
         }
 
         Ok(())
+    }
+
+    /// Verify that `repo_dir` still registers the exact canonical worktree
+    /// path and local branch. The Git boundary is bounded by the manager's
+    /// normal local timeout/output limit and explicitly kills/reaps failures.
+    pub(crate) async fn verify_exact_registration(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let expected_path = std::fs::canonicalize(worktree_dir)
+            .map_err(|error| format!("cannot canonicalize worktree path: {error}"))?;
+        let expected_ref = format!("refs/heads/{branch}");
+        let mut list = self.git_cmd(repo_dir);
+        list.args(["worktree", "list", "--porcelain"]);
+        let out = run_git(list, self.local_timeout, "git worktree list for recovery").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "git worktree list failed: {}",
+                git_stderr(&out.stderr)
+            ));
+        }
+
+        let mut matching_branches = Vec::new();
+        let mut listed_path = None;
+        let mut listed_branch = None;
+        for line in std::str::from_utf8(&out.stdout)
+            .map_err(|error| format!("git worktree list returned invalid UTF-8: {error}"))?
+            .lines()
+            .chain(std::iter::once(""))
+        {
+            if let Some(value) = line.strip_prefix("worktree ") {
+                listed_path = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("branch ") {
+                listed_branch = Some(value.to_string());
+            } else if line.is_empty() {
+                if listed_path.as_deref().is_some_and(|path| {
+                    std::fs::canonicalize(path).ok().as_ref() == Some(&expected_path)
+                }) {
+                    matching_branches.push(listed_branch.clone());
+                }
+                listed_path = None;
+                listed_branch = None;
+            }
+        }
+
+        match matching_branches.as_slice() {
+            [] => Err("worktree path exists without exact git registration".into()),
+            [actual] if actual.as_deref() == Some(expected_ref.as_str()) => Ok(()),
+            [actual] => Err(format!(
+                "worktree identity mismatch: expected {expected_ref}, found {actual:?}"
+            )),
+            _ => Err("worktree path has multiple git registrations".into()),
+        }
     }
 
     /// Remove only when git still reports the exact path/branch binding captured

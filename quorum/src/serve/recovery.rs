@@ -233,7 +233,11 @@ fn validate_dormant_recovery(
     })
 }
 
-async fn verify_dormant_worktree(config: &ServeConfig, recovery: &DormantRecovery) -> Result<()> {
+async fn verify_dormant_worktree(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    recovery: &DormantRecovery,
+) -> Result<()> {
     let invalid = |detail: String| dormant_recovery_error(&recovery.entry.agent, detail);
     let worktree = PathBuf::from(recovery.entry.worktree.as_deref().unwrap_or_default());
     let canonical_base = std::fs::canonicalize(&config.worktree_base)
@@ -246,30 +250,14 @@ async fn verify_dormant_worktree(config: &ServeConfig, recovery: &DormantRecover
             worktree.display()
         )));
     }
-    let output = tokio::process::Command::new("git")
-        .args([
-            "-C",
-            canonical_worktree.to_string_lossy().as_ref(),
-            "symbolic-ref",
-            "--short",
-            "HEAD",
-        ])
-        .output()
+    wt_mgr
+        .verify_exact_registration(
+            &config.repo_dir,
+            &canonical_worktree,
+            &recovery.local_branch,
+        )
         .await
-        .map_err(|error| invalid(format!("cannot inspect worktree branch: {error}")))?;
-    if !output.status.success() {
-        return Err(invalid(format!(
-            "worktree branch inspection failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if actual != recovery.local_branch {
-        return Err(invalid(format!(
-            "artifact mismatch: worktree is on '{actual}', expected '{}'",
-            recovery.local_branch
-        )));
-    }
+        .map_err(|error| invalid(format!("artifact mismatch: {error}")))?;
     Ok(())
 }
 
@@ -520,7 +508,7 @@ pub(crate) async fn recover(
         .map_err(|error| QuorumError::Io(format!("dormant recovery join: {error}")))??
     };
     for recovery in &recoveries {
-        verify_dormant_worktree(config, recovery).await?;
+        verify_dormant_worktree(config, wt_mgr, recovery).await?;
     }
 
     // ── Phase 1b: Revoke run capabilities for stale agents (#130) ──────
@@ -1108,6 +1096,113 @@ mod tests {
                 (1, 1, 1),
                 "failure must retain exact identity evidence"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn replaced_checkout_on_expected_branch_is_not_a_registered_worktree() {
+        let fixture = dormant_fixture();
+        let worktree = fixture.worktree.to_string_lossy().into_owned();
+        run_git(
+            &fixture.config.repo_dir,
+            &["worktree", "remove", &worktree, "--force"],
+        );
+        std::fs::create_dir_all(&fixture.worktree).unwrap();
+        run_git(&fixture.worktree, &["init", "-b", "daemon/dormant-t1"]);
+        run_git(
+            &fixture.worktree,
+            &["config", "user.email", "test@example.com"],
+        );
+        run_git(&fixture.worktree, &["config", "user.name", "Replacement"]);
+        run_git(
+            &fixture.worktree,
+            &["commit", "--allow-empty", "-m", "replacement"],
+        );
+
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        let error = recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("without exact git registration"),
+            "unexpected error: {error}"
+        );
+        assert!(workers.is_empty());
+        assert!(names.acquire_named("Dormant").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dormant_git_inspection_bounds_silent_and_continuous_processes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (name, body, expected, timeout) in [
+            (
+                "silent-git",
+                "exec sleep 3600",
+                "timed out",
+                std::time::Duration::from_millis(300),
+            ),
+            (
+                "noisy-git",
+                "while :; do printf 0123456789; printf abcdefghij >&2; done",
+                "exceeded",
+                std::time::Duration::from_secs(5),
+            ),
+        ] {
+            let fixture = dormant_fixture();
+            let shim = fixture._dir.path().join(name);
+            let pid_file = fixture._dir.path().join(format!("{name}.pid"));
+            std::fs::write(
+                &shim,
+                format!("#!/bin/sh\necho $$ > '{}'\n{body}\n", pid_file.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let wt_mgr =
+                WorktreeManager::with_config(shim, std::time::Duration::from_secs(60), timeout);
+            let mut names = super::super::names::Pool::new_generated();
+            let mut workers = Vec::new();
+            let mut roster = LifetimeRoster::new();
+            let started = std::time::Instant::now();
+            let error = recover(
+                &fixture.config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut roster,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected {name} error: {error}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "{name} was not bounded"
+            );
+            let pid = std::fs::read_to_string(&pid_file).unwrap();
+            assert!(
+                !std::process::Command::new("kill")
+                    .args(["-0", pid.trim()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "{name} subprocess {pid:?} was not reaped"
+            );
+            assert!(workers.is_empty());
+            assert!(names.acquire_named("Dormant").is_none());
         }
     }
 
