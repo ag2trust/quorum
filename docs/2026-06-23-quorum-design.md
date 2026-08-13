@@ -972,7 +972,7 @@ The following must remain intact throughout the wait and across restarts:
 
 #### Restart reconciliation
 
-On daemon startup, before stateless recovery:
+On daemon startup, before generic crash recovery:
 
 1. **#228 approval recovery** runs first: scans `approvals` table, validates each role's
    verdict against the current PR head SHA via `next_missing_review_role(conn, pr, sha)`.
@@ -984,6 +984,14 @@ On daemon startup, before stateless recovery:
    `AgentFailed`, so the tick loop provisions the first missing role (#191).
 3. **Phase 5b** (orphan in-review tasks) checks for existing valid R1 approvals: if R1 is
    approved for the current PR SHA, it spawns R2 directly instead of re-running R1 (#191).
+
+A delivered respawn-per-turn worker is not an orphan while its review is pending. Its
+`awaiting-review` journal row has no PID and durably binds the agent/task, provider and exact
+continuation, worktree, local and publication branches, and PR. Startup preserves that row and
+worktree, verifies the live task claim plus task/run/capability/publication bindings, reserves the
+same name, and reconstructs a dormant capacity slot without launching a provider turn. Missing or
+mismatched identity is fatal recovery corruption; the row and name authority are not converted
+into a fresh worker assignment. Startup accepts PID omission only for this explicit dormant shape.
 
 Head-SHA invalidation on restart: the approval record stores `approved_head_sha`. On
 re-entry, `head_sha()` is queried and compared. If different, the approval is stale —
@@ -1372,8 +1380,9 @@ Do not mirror any CLI's complete schema. Preserve each raw JSON line in
 `stream.jsonl`, parse only fields Quorum consumes, render a compact normalized
 transcript, and ignore unknown events without advancing lifecycle state.
 
-`journal.session_id` becomes an opaque **runner continuation ID** while retaining its
-column name for schema compatibility:
+Task refs and dormant journal rows persist an opaque **runner continuation ID**. The journal's
+`session_id` remains the daemon session identity; a dormant row uses the provider-tagged
+`provider` and `continuation_id` fields so restart never infers one from the other:
 
 - Claude receives a Quorum-generated UUID before spawn.
 - Codex issues a thread ID in `thread.started`; Quorum persists it before relying on

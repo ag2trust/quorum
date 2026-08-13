@@ -1,10 +1,10 @@
 //! Recovery acceptance tests: after a daemon restart, in-review tasks must
 //! get reviewers provisioned (via Phase 5b) without re-executing the worker.
 //!
-//! Stateless recovery (2026-07-09 refactor) kills stale processes, wipes the
-//! journal, GCs worktrees, and resets non-terminal tasks. In-review tasks are
-//! left as-is — the normal tick loop's Phase 5b queries the DB for in-review
-//! tasks with a PR but no live worker/reviewer and provisions a reviewer.
+//! Generic recovery kills stale processes, wipes their journal rows, GCs their
+//! worktrees, and resets non-terminal tasks. Explicit dormant awaiting-review
+//! workers are reconstructed separately. Other in-review tasks are left as-is
+//! so Phase 5b can provision a reviewer without re-executing the worker.
 
 use std::env;
 use std::io::{BufRead, BufReader, Write};
@@ -768,9 +768,12 @@ fn exit75_in_review_recovered_without_worker_respawn() {
             agent_state: None,
             cost_usd: 0.01,
             log_dir: None,
-            pid: None,
+            pid: Some(999_999),
             pr: Some(99),
             rework_count: 0,
+            provider: None,
+            continuation_id: None,
+            local_branch: None,
         };
         quorum_core::journal::upsert(&mut conn, &entry).unwrap();
     }
@@ -1030,9 +1033,12 @@ fn make_journal_entry(
         agent_state: None,
         cost_usd: 0.01,
         log_dir: None,
-        pid: None,
+        pid: Some(999_999),
         pr,
         rework_count: 0,
+        provider: None,
+        continuation_id: None,
+        local_branch: None,
     }
 }
 

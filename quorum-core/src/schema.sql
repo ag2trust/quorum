@@ -387,6 +387,12 @@ CREATE TABLE IF NOT EXISTS journal (
     pr              INTEGER,
     -- M7 crash recovery: rework round counter for limit enforcement across restarts.
     rework_count    INTEGER NOT NULL DEFAULT 0,
+    -- Restart-safe dormant turn identity. Nullable for ordinary running rows
+    -- and legacy journal history; awaiting-review dormant rows require all
+    -- three values and validate them before reconstruction.
+    provider        TEXT,
+    continuation_id TEXT,
+    local_branch    TEXT,
     updated_at      INTEGER NOT NULL
 );
 

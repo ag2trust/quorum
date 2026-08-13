@@ -2420,6 +2420,9 @@ fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry
         pid: slot.pid(),
         pr: slot.pr,
         rework_count: slot.rework_count as i32,
+        provider: Some(slot.process_kind().to_string()),
+        continuation_id: slot.continuation_id_for_launch().map(str::to_string),
+        local_branch: Some(slot.branch.clone()),
     }
 }
 
@@ -4187,6 +4190,9 @@ async fn journal_decomposition_process(
         pid,
         pr: None,
         rework_count: 0,
+        provider: None,
+        continuation_id: None,
+        local_branch: None,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
@@ -6001,11 +6007,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         // A frozen restart must first terminate stale managed processes and
         // empty the journal. Late completion and approval/network recovery are
         // deliberately deferred to later ticks after planning releases authority.
-        if let Err(e) = recovery::recover(config, &wt_mgr).await {
-            log(&format!(
-                "frozen decomposition recovery failed: {e} — starting fresh"
-            ));
-        }
+        recovery::recover(
+            config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut lifetime_roster,
+        )
+        .await?;
     }
 
     // Fold outcomes that were committed by a managed process just before the
@@ -6045,12 +6054,18 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
 
     reconcile_merged_continuations(&config.db_path, MergedContinuationTrigger::Startup).await?;
 
-    // M7: stateless crash recovery — kill stale processes, wipe journal,
-    // GC worktrees, and reset non-terminal tasks for the tick loop to handle.
+    // Crash recovery: reconstruct validated dormant workers, kill stale
+    // processes, wipe the remaining journal rows, GC orphaned worktrees, and
+    // reset non-terminal tasks for the tick loop to handle.
     if !recovered_frozen_decomposition {
-        if let Err(e) = recovery::recover(config, &wt_mgr).await {
-            log(&format!("recovery failed: {e} — starting fresh"));
-        }
+        recovery::recover(
+            config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut lifetime_roster,
+        )
+        .await?;
     }
     match reconcile_publication_source_refs(config, &wt_mgr, publication_ref_reconcile_cursor).await
     {
@@ -12351,6 +12366,9 @@ async fn provision_reviewer_reserved(
         pid: None,
         pr: Some(pr),
         rework_count: 0,
+        provider: Some(reviewer_kind.to_string()),
+        continuation_id: reviewer_continuation_id.clone(),
+        local_branch: Some(branch.clone()),
     };
     let journal_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -12520,6 +12538,9 @@ async fn provision_reviewer_reserved(
                     pid: spawn_pid,
                     pr: Some(pr),
                     rework_count: 0,
+                    provider: Some(reviewer_kind.to_string()),
+                    continuation_id: reviewer_continuation_id.clone(),
+                    local_branch: Some(branch.clone()),
                 };
                 let pid_journal = tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -13259,6 +13280,9 @@ async fn spawn_worker(
         pid: None,
         pr: continuation_pr,
         rework_count: continuation_rework_count,
+        provider: None,
+        continuation_id: None,
+        local_branch: Some(branch.clone()),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -13427,6 +13451,11 @@ async fn spawn_worker(
                     pid: spawn_pid,
                     pr: continuation_pr,
                     rework_count: continuation_rework_count,
+                    provider: Some(resolved_kind.to_string()),
+                    continuation_id: retry_turn
+                        .as_ref()
+                        .and_then(|retry| retry.continuation_id.clone()),
+                    local_branch: Some(branch.clone()),
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -14785,6 +14814,9 @@ async fn spawn_remediation_worker(
             pid: None,
             pr: Some(pr),
             rework_count: 0,
+            provider: None,
+            continuation_id: None,
+            local_branch: Some(branch.clone()),
         };
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&p)?;
@@ -16683,6 +16715,12 @@ mod tests {
         assert_eq!(entries[0].phase, "awaiting-review");
         assert_eq!(entries[0].task_id, Some(4242));
         assert_eq!(entries[0].pr, Some(999));
+        assert_eq!(entries[0].provider.as_deref(), Some("codex"));
+        assert_eq!(
+            entries[0].continuation_id.as_deref(),
+            Some("provider-thread-777")
+        );
+        assert_eq!(entries[0].local_branch.as_deref(), Some("daemon/delivered"));
         assert!(
             entries[0].pid.is_none(),
             "dormant journal entry must not advertise a live pid"
@@ -20533,6 +20571,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -21346,6 +21387,9 @@ mod tests {
                     pid: Some(999_999),
                     pr: Some(1),
                     rework_count: 0,
+                    provider: None,
+                    continuation_id: None,
+                    local_branch: None,
                 },
             )
             .unwrap();
@@ -21703,6 +21747,9 @@ mod tests {
                         pid: Some(pid),
                         pr: None,
                         rework_count: 0,
+                        provider: None,
+                        continuation_id: None,
+                        local_branch: None,
                     },
                 )
                 .unwrap();

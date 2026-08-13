@@ -3849,6 +3849,9 @@ mod tests {
                 pid: None,
                 pr,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -3897,6 +3900,9 @@ mod tests {
                 pid: None,
                 pr: Some(42),
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();

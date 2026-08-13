@@ -26,6 +26,9 @@ pub struct JournalEntry {
     pub pid: Option<i32>,
     pub pr: Option<i64>,
     pub rework_count: i32,
+    pub provider: Option<String>,
+    pub continuation_id: Option<String>,
+    pub local_branch: Option<String>,
 }
 
 fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
@@ -44,6 +47,9 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
         pid: r.get(11)?,
         pr: r.get(12)?,
         rework_count: r.get(13)?,
+        provider: r.get(14)?,
+        continuation_id: r.get(15)?,
+        local_branch: r.get(16)?,
     })
 }
 
@@ -51,8 +57,8 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
     let now = clock::now();
     let tx = begin_immediate(conn)?;
     tx.execute(
-        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count, provider, continuation_id, local_branch, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(agent) DO UPDATE SET
              role = excluded.role,
              task_id = excluded.task_id,
@@ -67,6 +73,9 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
              pid = excluded.pid,
              pr = excluded.pr,
              rework_count = excluded.rework_count,
+             provider = excluded.provider,
+             continuation_id = excluded.continuation_id,
+             local_branch = excluded.local_branch,
              updated_at = excluded.updated_at",
         params![
             entry.agent,
@@ -83,6 +92,9 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
             entry.pid,
             entry.pr,
             entry.rework_count,
+            entry.provider,
+            entry.continuation_id,
+            entry.local_branch,
             now,
         ],
     )?;
@@ -92,7 +104,7 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
 
 pub fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count
+        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count, provider, continuation_id, local_branch
          FROM journal
          ORDER BY agent",
     )?;
@@ -145,6 +157,9 @@ mod tests {
             pid: None,
             pr: None,
             rework_count: 0,
+            provider: None,
+            continuation_id: None,
+            local_branch: None,
         }
     }
 
@@ -283,6 +298,29 @@ mod tests {
         assert_eq!(entries[0].pid, Some(99999));
         assert_eq!(entries[0].pr, None);
         assert_eq!(entries[0].rework_count, 3);
+    }
+
+    #[test]
+    fn dormant_awaiting_review_identity_persists_and_updates() {
+        let (mut conn, _dir) = test_conn();
+        let mut entry = sample_entry("Dormant");
+        entry.phase = "awaiting-review".into();
+        entry.provider = Some("codex".into());
+        entry.continuation_id = Some("thread-1".into());
+        entry.local_branch = Some("daemon/dormant-t42".into());
+        upsert(&mut conn, &entry).unwrap();
+
+        let stored = list_in_flight(&conn).unwrap().pop().unwrap();
+        assert_eq!(stored.provider.as_deref(), Some("codex"));
+        assert_eq!(stored.continuation_id.as_deref(), Some("thread-1"));
+        assert_eq!(stored.local_branch.as_deref(), Some("daemon/dormant-t42"));
+
+        entry.continuation_id = Some("thread-2".into());
+        entry.local_branch = Some("daemon/local-rework".into());
+        upsert(&mut conn, &entry).unwrap();
+        let stored = list_in_flight(&conn).unwrap().pop().unwrap();
+        assert_eq!(stored.continuation_id.as_deref(), Some("thread-2"));
+        assert_eq!(stored.local_branch.as_deref(), Some("daemon/local-rework"));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 48;
+pub const SCHEMA_VERSION: i64 = 49;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -742,6 +742,21 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                      ON review_followup_assessments(source_task_id);",
             )?;
         }
+        // v49 = restart-safe dormant turn-oriented workers. These fields make
+        // the awaiting-review journal row a complete, provider-bound recovery
+        // record instead of forcing startup to infer a continuation or local
+        // checkout identity from mutable task/config state.
+        if current < 49 {
+            if !column_exists(conn, "journal", "provider")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN provider TEXT", [])?;
+            }
+            if !column_exists(conn, "journal", "continuation_id")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN continuation_id TEXT", [])?;
+            }
+            if !column_exists(conn, "journal", "local_branch")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN local_branch TEXT", [])?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -832,6 +847,46 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn populated_v48_migration_adds_dormant_journal_identity_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v48-dormant-journal.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO journal(agent,role,task_id,session_id,phase,updated_at)
+                 VALUES ('legacy','worker',7,'session','working',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE journal DROP COLUMN provider;
+                 ALTER TABLE journal DROP COLUMN continuation_id;
+                 ALTER TABLE journal DROP COLUMN local_branch;
+                 PRAGMA user_version=48;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        for column in ["provider", "continuation_id", "local_branch"] {
+            assert!(column_exists(&conn, "journal", column).unwrap());
+        }
+        let legacy: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT provider,continuation_id,local_branch FROM journal WHERE agent='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (None, None, None));
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
     }
 
     #[test]
