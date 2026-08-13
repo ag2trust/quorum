@@ -2634,9 +2634,6 @@ impl LiveStats {
 /// needed to launch the next exact turn.
 enum SlotProcess {
     Running(Box<runner::RunnerProc>),
-    // Dormancy is intentionally represented before the exit/rework paths
-    // begin producing it in a follow-up change.
-    #[allow(dead_code)]
     Dormant {
         kind: runner::AgentKind,
         continuation_id: String,
@@ -2648,7 +2645,6 @@ impl SlotProcess {
         Self::Running(Box::new(proc))
     }
 
-    #[allow(dead_code)]
     fn dormant(kind: runner::AgentKind, continuation_id: Option<&str>) -> std::io::Result<Self> {
         if kind.turn_mode() != runner::TurnMode::RespawnPerTurn {
             return Err(std::io::Error::new(
@@ -2816,7 +2812,6 @@ impl SlotState {
 
     /// Park a completed turn-oriented runner while retaining its sticky worker
     /// slot. The caller owns reaping the returned completed process.
-    #[allow(dead_code)]
     fn become_dormant(&mut self) -> std::io::Result<runner::RunnerProc> {
         if matches!(&self.proc, SlotProcess::Dormant { .. }) {
             return Err(std::io::Error::new(
@@ -9448,6 +9443,13 @@ async fn tick(
         if w.draining || w.error_turn_count > 0 {
             continue;
         }
+        // Dormant sticky slots have no live process to zombify; they exist to
+        // hold the exact continuation until the reviewer produces a verdict.
+        // Reaping them here would silently release the awaiting-review slot
+        // Phase 5 provisions a reviewer for.
+        if matches!(w.proc, SlotProcess::Dormant { .. }) {
+            continue;
+        }
         if let Some(ended) = w.turn_ended_at {
             if ended.elapsed().as_secs() > idle_timeout {
                 idle_workers.push(i);
@@ -9587,7 +9589,23 @@ async fn tick(
                     workers.insert(i, dead);
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
-                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+                    let mut dead = dead;
+                    match park_worker_slot_dormant(&db_path, &mut dead).await {
+                        Ok(()) => {
+                            log(&format!(
+                                "worker {} parked dormant after task #{} delivered — awaiting reviewer",
+                                dead.agent_name, dead.task_id
+                            ));
+                            workers.insert(i, dead);
+                        }
+                        Err(error) => {
+                            log(&format!(
+                                "worker {} cannot park dormant for task #{} ({error}); cleaning up completed run",
+                                dead.agent_name, dead.task_id
+                            ));
+                            cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+                        }
+                    }
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
                     cleanup_slot(
@@ -9741,11 +9759,23 @@ async fn tick(
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
-                    log(&format!(
-                        "worker {} exited normally after delivering task #{} — cleaning up completed run",
-                        dead.agent_name, dead.task_id
-                    ));
-                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+                    let mut dead = dead;
+                    match park_worker_slot_dormant(&db_path, &mut dead).await {
+                        Ok(()) => {
+                            log(&format!(
+                                "worker {} parked dormant after delivering task #{} — awaiting reviewer",
+                                dead.agent_name, dead.task_id
+                            ));
+                            workers.insert(i, dead);
+                        }
+                        Err(error) => {
+                            log(&format!(
+                                "worker {} cannot park dormant for task #{} ({error}); cleaning up completed run",
+                                dead.agent_name, dead.task_id
+                            ));
+                            cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+                        }
+                    }
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
@@ -11422,6 +11452,29 @@ async fn dispose_dead_turn_runner_worker(
             QuorumError::Io(format!("dead runner disposition join failed: {error}"))
         })?;
     disposition
+}
+
+/// Park a delivered turn-oriented worker slot in place. The completed process
+/// is reaped and its captured output persisted; the sticky slot retains its
+/// name, active claim, journal, worktree, branch, PR, and continuation so
+/// Phase 4d renews its lease and Phase 5 provisions a reviewer for it.
+async fn park_worker_slot_dormant(db_path: &Path, slot: &mut SlotState) -> std::io::Result<()> {
+    let old = slot.become_dormant()?;
+    let captured = old.kill_and_reap().await;
+    persist_terminal_output(&mut slot.session_log, captured);
+    slot.draining = false;
+    slot.turn_ended_at = Some(std::time::Instant::now());
+    slot.error_turn_count = 0;
+    slot.last_error_text = None;
+    let entry = slot_journal_entry(slot, "worker", "awaiting-review");
+    let p = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        journal::upsert(&mut conn, &entry)
+    })
+    .await
+    .ok();
+    Ok(())
 }
 
 async fn persist_runner_provider_block(
@@ -16460,6 +16513,92 @@ mod tests {
         assert!(error.to_string().contains("persistent child"));
     }
 
+    #[tokio::test]
+    async fn park_delivered_codex_slot_becomes_dormant_and_journals_awaiting_review() {
+        let worktree = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("park-delivered.db");
+        // Materialize the schema so journal::upsert can run against a real DB.
+        let _ = quorum_core::db::open(&db_path).unwrap();
+
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.agent_name = "Delivered".into();
+        slot.task_id = 4242;
+        slot.pr = Some(999);
+        slot.remote_branch = "daemon/delivered".into();
+        slot.branch = "daemon/delivered".into();
+        slot.continuation_id = Some("provider-thread-777".into());
+        slot.draining = true;
+        slot.error_turn_count = 3;
+        slot.last_error_text = Some("prior transient failure".into());
+
+        park_worker_slot_dormant(&db_path, &mut slot).await.unwrap();
+
+        // Live process torn down, logical slot preserved.
+        assert!(matches!(
+            &slot.proc,
+            SlotProcess::Dormant {
+                continuation_id, ..
+            } if continuation_id == "provider-thread-777"
+        ));
+        assert!(
+            !slot.draining,
+            "delivered turn must clear the drain flag so a reviewer can be provisioned"
+        );
+        assert_eq!(
+            slot.pr,
+            Some(999),
+            "publication identity must survive parking"
+        );
+        assert_eq!(slot.continuation_id.as_deref(), Some("provider-thread-777"));
+        assert_eq!(slot.agent_name, "Delivered");
+        assert_eq!(slot.remote_branch, "daemon/delivered");
+        assert_eq!(
+            slot.error_turn_count, 0,
+            "delivery clears the auto-refeed retry budget"
+        );
+        assert!(slot.last_error_text.is_none());
+        assert!(
+            slot.turn_ended_at.is_some(),
+            "watchdog must see the turn end time"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent, "Delivered");
+        assert_eq!(entries[0].role, "worker");
+        assert_eq!(entries[0].phase, "awaiting-review");
+        assert_eq!(entries[0].task_id, Some(4242));
+        assert_eq!(entries[0].pr, Some(999));
+        assert!(
+            entries[0].pid.is_none(),
+            "dormant journal entry must not advertise a live pid"
+        );
+    }
+
+    #[tokio::test]
+    async fn park_worker_slot_dormant_rejects_missing_continuation() {
+        let worktree = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("park-missing-continuation.db");
+        let _ = quorum_core::db::open(&db_path).unwrap();
+
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = None;
+        slot.pr = Some(1);
+
+        let err = park_worker_slot_dormant(&db_path, &mut slot)
+            .await
+            .expect_err("park must refuse a Codex slot without its provider-issued thread id");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            matches!(&slot.proc, SlotProcess::Running(_)),
+            "the slot must remain in its running state so the caller can fall back to cleanup"
+        );
+        slot.kill_and_reap().await;
+    }
+
     fn pre_review_ci_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
         let profile = crate::serve_config::ModelProfile {
             runner: "claude".into(),
@@ -17047,6 +17186,33 @@ mod tests {
                 .turn_ended_at
                 .is_some_and(|t| t.elapsed().as_secs() > timeout);
         assert!(!is_zombie);
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_ignores_dormant_awaiting_review_slot() {
+        // A dormant sticky slot has no live process and exists to hold the
+        // exact continuation until the reviewer produces a verdict. The idle
+        // watchdog must skip it even though its turn ended long ago.
+        let worktree = tempfile::tempdir().unwrap();
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = Some("thread-parked".into());
+        let old = slot.become_dormant().unwrap();
+        old.kill_and_reap().await;
+        slot.draining = false;
+        slot.error_turn_count = 0;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+
+        let timeout = 300u64;
+        let reaped_by_watchdog = !slot.draining
+            && slot.error_turn_count == 0
+            && !matches!(slot.proc, SlotProcess::Dormant { .. })
+            && slot
+                .turn_ended_at
+                .is_some_and(|t| t.elapsed().as_secs() > timeout);
+        assert!(
+            !reaped_by_watchdog,
+            "dormant awaiting-review slot must survive the idle watchdog"
+        );
     }
 
     #[test]
