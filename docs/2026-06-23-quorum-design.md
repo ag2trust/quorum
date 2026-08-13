@@ -1384,6 +1384,16 @@ column name for schema compatibility:
 Missing required continuation identity is an abnormal startup failure. Assistant
 prose is never task completion.
 
+A delivered turn-oriented worker remains a dormant logical slot while review is
+in flight. If review requests rework, the daemon first atomically installs a new
+task lease for that same agent, then revalidates the persisted continuation,
+model/effort, worktree, PR, journal, prior run, and capability before launching
+the next exact provider turn. Each resumed process receives a fresh agent-run row
+and run capability; the completed turn's identities are retired. Codex resumes
+only with `codex exec resume`. A missing or mismatched continuation never falls
+back to a new thread, and launch failure stores the unchanged pending turn in the
+existing durable provider-retry state before the slot is torn down.
+
 Task refs persist runner recovery state as provider-tagged JSON objects. New writes use
 `runner_continuation` (or the role-scoped `runner_reviewer_r1_continuation` /
 `runner_reviewer_r2_continuation`), `runner_provider_block`, and `runner_retry`.

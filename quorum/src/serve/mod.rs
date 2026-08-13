@@ -5465,22 +5465,34 @@ async fn handle_pre_review_checks_failure(
                             "pre-review CI rework feed failed for task #{task_id}: {error}; \
                          preserving durable remediation intent"
                         ));
-                        let worker = workers.remove(worker_index);
-                        let p = config.db_path.clone();
-                        let agent = worker.agent_name.clone();
-                        tokio::task::spawn_blocking(move || {
-                            if let Ok(mut conn) = quorum_core::db::open(&p) {
-                                let _ = tasks::release_remediation_lease(
-                                    &mut conn,
-                                    &agent,
-                                    task_id,
-                                    now_unix(),
-                                );
-                            }
-                        })
+                        if !handle_dormant_worker_feed_failure(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            workers,
+                            worker_index,
+                            &error,
+                        )
                         .await
-                        .ok();
-                        cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+                        {
+                            let worker = workers.remove(worker_index);
+                            let p = config.db_path.clone();
+                            let agent = worker.agent_name.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Ok(mut conn) = quorum_core::db::open(&p) {
+                                    let _ = tasks::release_remediation_lease(
+                                        &mut conn,
+                                        &agent,
+                                        task_id,
+                                        now_unix(),
+                                    );
+                                }
+                            })
+                            .await
+                            .ok();
+                            cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed")
+                                .await;
+                        }
                     } else {
                         let worker = &mut workers[worker_index];
                         begin_sticky_worker_rework(worker, &config.db_path).await;
@@ -7382,25 +7394,33 @@ async fn tick(
                                                 log(&format!(
                                                 "conflict rework feed failed: {e} — cleaning up"
                                             ));
-                                                let w = workers.remove(wi);
-                                                fire_event(
-                                                    &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
-                                                    },
+                                                if !handle_dormant_worker_feed_failure(
+                                                    config, wt_mgr, name_pool, workers, wi, &e,
                                                 )
-                                                .await;
-                                                cleanup_slot(
-                                                    config,
-                                                    wt_mgr,
-                                                    name_pool,
-                                                    w,
-                                                    None,
-                                                    "agent_failed",
-                                                )
-                                                .await;
+                                                .await
+                                                {
+                                                    let w = workers.remove(wi);
+                                                    fire_event(
+                                                        &db_path,
+                                                        &w.agent_name,
+                                                        w.task_id,
+                                                        &Event::AgentFailed {
+                                                            reason: format!(
+                                                                "rework feed failed: {e}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    cleanup_slot(
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        w,
+                                                        None,
+                                                        "agent_failed",
+                                                    )
+                                                    .await;
+                                                }
                                             } else {
                                                 let w = &mut workers[wi];
                                                 begin_sticky_worker_rework(w, &db_path).await;
@@ -7665,25 +7685,33 @@ async fn tick(
                                                 log(&format!(
                                                 "checks-failure rework feed failed: {e} — cleaning up"
                                             ));
-                                                let w = workers.remove(wi);
-                                                fire_event(
-                                                    &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
-                                                    },
+                                                if !handle_dormant_worker_feed_failure(
+                                                    config, wt_mgr, name_pool, workers, wi, &e,
                                                 )
-                                                .await;
-                                                cleanup_slot(
-                                                    config,
-                                                    wt_mgr,
-                                                    name_pool,
-                                                    w,
-                                                    None,
-                                                    "agent_failed",
-                                                )
-                                                .await;
+                                                .await
+                                                {
+                                                    let w = workers.remove(wi);
+                                                    fire_event(
+                                                        &db_path,
+                                                        &w.agent_name,
+                                                        w.task_id,
+                                                        &Event::AgentFailed {
+                                                            reason: format!(
+                                                                "rework feed failed: {e}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    cleanup_slot(
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        w,
+                                                        None,
+                                                        "agent_failed",
+                                                    )
+                                                    .await;
+                                                }
                                             } else {
                                                 let w = &mut workers[wi];
                                                 begin_sticky_worker_rework(w, &db_path).await;
@@ -7878,27 +7906,33 @@ async fn tick(
                                                         "timeout-conflict rework feed failed: \
                                                      {e} — cleaning up"
                                                     ));
-                                                    let w = workers.remove(wi);
-                                                    fire_event(
-                                                        &db_path,
-                                                        &w.agent_name,
-                                                        w.task_id,
-                                                        &Event::AgentFailed {
-                                                            reason: format!(
-                                                                "rework feed failed: {e}"
-                                                            ),
-                                                        },
+                                                    if !handle_dormant_worker_feed_failure(
+                                                        config, wt_mgr, name_pool, workers, wi, &e,
                                                     )
-                                                    .await;
-                                                    cleanup_slot(
-                                                        config,
-                                                        wt_mgr,
-                                                        name_pool,
-                                                        w,
-                                                        None,
-                                                        "agent_failed",
-                                                    )
-                                                    .await;
+                                                    .await
+                                                    {
+                                                        let w = workers.remove(wi);
+                                                        fire_event(
+                                                            &db_path,
+                                                            &w.agent_name,
+                                                            w.task_id,
+                                                            &Event::AgentFailed {
+                                                                reason: format!(
+                                                                    "rework feed failed: {e}"
+                                                                ),
+                                                            },
+                                                        )
+                                                        .await;
+                                                        cleanup_slot(
+                                                            config,
+                                                            wt_mgr,
+                                                            name_pool,
+                                                            w,
+                                                            None,
+                                                            "agent_failed",
+                                                        )
+                                                        .await;
+                                                    }
                                                 } else {
                                                     let w = &mut workers[wi];
                                                     begin_sticky_worker_rework(w, &db_path).await;
@@ -8222,25 +8256,33 @@ async fn tick(
                                                     "pre-merge conflict rework feed failed: \
                                                  {e} — cleaning up"
                                                 ));
-                                                let w = workers.remove(wi);
-                                                fire_event(
-                                                    &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
-                                                    },
+                                                if !handle_dormant_worker_feed_failure(
+                                                    config, wt_mgr, name_pool, workers, wi, &e,
                                                 )
-                                                .await;
-                                                cleanup_slot(
-                                                    config,
-                                                    wt_mgr,
-                                                    name_pool,
-                                                    w,
-                                                    None,
-                                                    "agent_failed",
-                                                )
-                                                .await;
+                                                .await
+                                                {
+                                                    let w = workers.remove(wi);
+                                                    fire_event(
+                                                        &db_path,
+                                                        &w.agent_name,
+                                                        w.task_id,
+                                                        &Event::AgentFailed {
+                                                            reason: format!(
+                                                                "rework feed failed: {e}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    cleanup_slot(
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        w,
+                                                        None,
+                                                        "agent_failed",
+                                                    )
+                                                    .await;
+                                                }
                                             } else {
                                                 let w = &mut workers[wi];
                                                 begin_sticky_worker_rework(w, &db_path).await;
@@ -8610,27 +8652,34 @@ async fn tick(
                                                         log(&format!(
                                                     "merge-failure rework feed failed: {e} — cleaning up"
                                                 ));
-                                                        let w = workers.remove(wi);
-                                                        fire_event(
-                                                            &db_path,
-                                                            &w.agent_name,
-                                                            w.task_id,
-                                                            &Event::AgentFailed {
-                                                                reason: format!(
-                                                                    "rework feed failed: {e}"
-                                                                ),
-                                                            },
+                                                        if !handle_dormant_worker_feed_failure(
+                                                            config, wt_mgr, name_pool, workers, wi,
+                                                            &e,
                                                         )
-                                                        .await;
-                                                        cleanup_slot(
-                                                            config,
-                                                            wt_mgr,
-                                                            name_pool,
-                                                            w,
-                                                            None,
-                                                            "agent_failed",
-                                                        )
-                                                        .await;
+                                                        .await
+                                                        {
+                                                            let w = workers.remove(wi);
+                                                            fire_event(
+                                                                &db_path,
+                                                                &w.agent_name,
+                                                                w.task_id,
+                                                                &Event::AgentFailed {
+                                                                    reason: format!(
+                                                                        "rework feed failed: {e}"
+                                                                    ),
+                                                                },
+                                                            )
+                                                            .await;
+                                                            cleanup_slot(
+                                                                config,
+                                                                wt_mgr,
+                                                                name_pool,
+                                                                w,
+                                                                None,
+                                                                "agent_failed",
+                                                            )
+                                                            .await;
+                                                        }
                                                     } else {
                                                         let w = &mut workers[wi];
                                                         begin_sticky_worker_rework(w, &db_path)
@@ -8879,25 +8928,31 @@ async fn tick(
                                             .await
                                     {
                                         log(&format!("rework feed_turn failed: {e} — cleaning up"));
-                                        let w = workers.remove(wi);
-                                        fire_event(
-                                            &db_path,
-                                            &w.agent_name,
-                                            w.task_id,
-                                            &Event::AgentFailed {
-                                                reason: format!("rework feed failed: {e}"),
-                                            },
+                                        if !handle_dormant_worker_feed_failure(
+                                            config, wt_mgr, name_pool, workers, wi, &e,
                                         )
-                                        .await;
-                                        cleanup_slot(
-                                            config,
-                                            wt_mgr,
-                                            name_pool,
-                                            w,
-                                            None,
-                                            "agent_failed",
-                                        )
-                                        .await;
+                                        .await
+                                        {
+                                            let w = workers.remove(wi);
+                                            fire_event(
+                                                &db_path,
+                                                &w.agent_name,
+                                                w.task_id,
+                                                &Event::AgentFailed {
+                                                    reason: format!("rework feed failed: {e}"),
+                                                },
+                                            )
+                                            .await;
+                                            cleanup_slot(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                w,
+                                                None,
+                                                "agent_failed",
+                                            )
+                                            .await;
+                                        }
                                     } else {
                                         let w = &mut workers[wi];
                                         begin_sticky_worker_rework(w, &db_path).await;
@@ -11234,15 +11289,24 @@ async fn feed_worker_turn(
             };
         }
         let (model, effort) = runner_continuation_identity(slot)?;
+        let dormant_authority = if matches!(&slot.proc, SlotProcess::Dormant { .. }) {
+            Some(prepare_dormant_worker_turn(slot, config).await?)
+        } else {
+            None
+        };
         let mut env_vars: Vec<(String, String)> = vec![
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), slot.agent_name.clone()),
         ];
-        if let Some(ref rid) = slot.cap_run_id {
+        let launch_capability = dormant_authority
+            .as_ref()
+            .map(|authority| &authority.cap_run_id)
+            .or(slot.cap_run_id.as_ref());
+        if let Some(rid) = launch_capability {
             env_vars.push(("QUORUM_RUN_ID".into(), rid.clone()));
         }
 
-        let new_proc = runner::RunnerProc::launch(
+        let launch = runner::RunnerProc::launch(
             &runner::LaunchRequest {
                 model,
                 effort,
@@ -11258,7 +11322,31 @@ async fn feed_worker_turn(
             },
             &runner_adapter_config(config, config.agent_bin.as_deref()),
         )
-        .await?;
+        .await;
+        let new_proc = match launch {
+            Ok(proc) => proc,
+            Err(error) => {
+                if let Some(authority) = dormant_authority {
+                    abort_dormant_worker_turn(&config.db_path, &authority.cap_run_id).await;
+                }
+                return Err(error);
+            }
+        };
+
+        if let Some(authority) = dormant_authority {
+            let new_run_id = match finalize_dormant_worker_turn(slot, config, &authority).await {
+                Ok(run_id) => run_id,
+                Err(error) => {
+                    let _ = new_proc.kill_and_reap().await;
+                    abort_dormant_worker_turn(&config.db_path, &authority.cap_run_id).await;
+                    return Err(error);
+                }
+            };
+            slot.agent_run_id = Some(new_run_id);
+            slot.cap_run_id = Some(authority.cap_run_id);
+            slot.live_stats = LiveStats::new();
+            slot.turn_ended_at = None;
+        }
 
         if let Some(old) = slot.replace_with_launched_turn(new_proc)? {
             tokio::spawn(async move { old.kill_and_reap().await });
@@ -11268,6 +11356,393 @@ async fn feed_worker_turn(
         let turn = agent::user_turn(raw_prompt);
         slot.live_process_mut()?.feed_turn(&turn).await
     }
+}
+
+#[derive(Debug)]
+struct DormantWorkerTurnAuthority {
+    cap_run_id: String,
+    assignment: Option<quorum_core::role_assignments::RoleAssignment>,
+}
+
+fn dormant_worker_continuation(slot: &SlotState) -> std::io::Result<Option<&str>> {
+    let SlotProcess::Dormant {
+        kind,
+        continuation_id,
+    } = &slot.proc
+    else {
+        return Ok(None);
+    };
+    if *kind != slot.process_kind() || kind.turn_mode() != runner::TurnMode::RespawnPerTurn {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dormant worker process kind is not a turn-oriented runner",
+        ));
+    }
+    if slot.continuation_id.as_deref() != Some(continuation_id.as_str()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dormant worker continuation does not match the slot's persisted continuation",
+        ));
+    }
+    Ok(Some(continuation_id))
+}
+
+/// Prepare the daemon-owned identity for one dormant worker turn.
+///
+/// The transaction revalidates the exact live task lease, durable continuation,
+/// publication/worktree journal binding, and prior run layout before revoking
+/// the completed turn's capability and issuing the next one. The provider is
+/// not launched until this commits.
+async fn prepare_dormant_worker_turn(
+    slot: &SlotState,
+    config: &ServeConfig,
+) -> std::io::Result<DormantWorkerTurnAuthority> {
+    let continuation_id = dormant_worker_continuation(slot)?
+        .ok_or_else(|| std::io::Error::other("worker slot is not dormant"))?
+        .to_string();
+    let old_run_id = slot.agent_run_id.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dormant worker is missing its completed agent_run identity",
+        )
+    })?;
+    let old_cap_run_id = slot.cap_run_id.clone().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dormant worker is missing its completed run capability",
+        )
+    })?;
+    let pr = slot.pr.filter(|pr| *pr > 0).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dormant worker rework is missing its daemon-owned PR binding",
+        )
+    })?;
+    let cap_run_id = uuid::Uuid::new_v4().to_string();
+    let path = config.db_path.clone();
+    let agent = slot.agent_name.clone();
+    let task_id = slot.task_id;
+    let provider = slot.process_kind().to_string();
+    let model = slot.model.clone();
+    let effort = slot.effort.clone();
+    let worktree = slot.worktree_path.to_string_lossy().into_owned();
+    let remote_branch = slot.remote_branch.clone();
+    let next_capability = cap_run_id.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<DormantWorkerTurnAuthority> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let now = now_unix();
+        let task = tasks::get(&tx, task_id)?
+            .ok_or_else(|| QuorumError::Io(format!("dormant task #{task_id} disappeared")))?;
+        if task.status != "rework" || task.assignee.as_deref() != Some(agent.as_str()) {
+            return Err(QuorumError::Io(format!(
+                "dormant task #{task_id} is not in rework under agent {agent}"
+            )));
+        }
+        let target = format!("task#{task_id}");
+        let owns_live_lease: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM claims
+             WHERE target=?1 AND holder=?2 AND active=1 AND expires_at>?3)",
+            rusqlite::params![target, agent, now],
+            |row| row.get(0),
+        )?;
+        if !owns_live_lease {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} does not durably own task #{task_id} before launch"
+            )));
+        }
+
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .ok_or_else(|| QuorumError::Io(format!("task #{task_id} has invalid durable refs")))?;
+        let persisted = runner_state::continuation(&refs, ContinuationSlot::Worker, &provider)
+            .ok_or_else(|| {
+                QuorumError::Io(format!(
+                    "task #{task_id} is missing its persisted {provider} continuation"
+                ))
+            })?;
+        if persisted.id != continuation_id {
+            return Err(QuorumError::Io(format!(
+                "task #{task_id} persisted continuation does not match dormant worker {agent}"
+            )));
+        }
+        if tasks::extract_pr_number(&task.refs) != Some(pr) {
+            return Err(QuorumError::Io(format!(
+                "task #{task_id} PR binding does not match dormant worker {agent}"
+            )));
+        }
+
+        let journal_matches: bool = tx
+            .query_row(
+                "SELECT role='worker' AND task_id=?2 AND worktree=?3 AND branch=?4
+                        AND phase='awaiting-review' AND pid IS NULL AND pr=?5
+                 FROM journal WHERE agent=?1",
+                rusqlite::params![agent, task_id, worktree, remote_branch, pr],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !journal_matches {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} does not match its awaiting-review journal binding"
+            )));
+        }
+
+        let old_run = quorum_core::agent_runs::runs_for_task(&tx, task_id)?
+            .into_iter()
+            .find(|run| run.id == old_run_id)
+            .ok_or_else(|| {
+                QuorumError::Io(format!(
+                    "dormant worker {agent} references missing agent_run {old_run_id}"
+                ))
+            })?;
+        if old_run.agent != agent
+            || old_run.role != "worker"
+            || (old_run.ended_at.is_some()
+                && old_run.end_reason.as_deref() != Some("turn-completed"))
+            || old_run.model != model
+            || old_run.effort != effort
+            || old_run.provider.as_deref() != Some(provider.as_str())
+        {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} does not match completed agent_run {old_run_id}"
+            )));
+        }
+        let old_run_was_open = old_run.ended_at.is_none();
+        let layout = recover_original_remediation_layout(&tx, task_id, old_run)?;
+        if layout.model != model || layout.effort != effort || layout.kind.to_string() != provider {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} execution layout changed before rework"
+            )));
+        }
+
+        let old_cap_matches: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_capabilities
+             WHERE run_id=?1 AND task_id=?2 AND agent=?3 AND role='worker')",
+            rusqlite::params![old_cap_run_id, task_id, agent],
+            |row| row.get(0),
+        )?;
+        if !old_cap_matches {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} completed capability does not match task #{task_id}"
+            )));
+        }
+        tx.execute(
+            "UPDATE run_capabilities SET revoked_at=?2
+             WHERE run_id=?1 AND revoked_at IS NULL",
+            rusqlite::params![old_cap_run_id, now],
+        )?;
+        tx.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+             VALUES (?1,?2,?3,'worker',?4)",
+            rusqlite::params![next_capability, task_id, agent, now],
+        )?;
+        let closed = tx.execute(
+            "UPDATE agent_runs SET ended_at=?2,end_reason='turn-completed'
+             WHERE id=?1 AND ended_at IS NULL",
+            rusqlite::params![old_run_id, now],
+        )?;
+        if closed != 1 && old_run_was_open {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} could not close completed agent_run {old_run_id}"
+            )));
+        }
+        tx.commit()?;
+        Ok(DormantWorkerTurnAuthority {
+            cap_run_id: next_capability,
+            assignment: layout.assignment,
+        })
+    })
+    .await
+    .map_err(|join| std::io::Error::other(format!("dormant turn prepare join failed: {join}")))?
+    .map_err(|error| std::io::Error::other(format!("dormant turn prepare failed: {error}")))
+}
+
+async fn finalize_dormant_worker_turn(
+    slot: &SlotState,
+    config: &ServeConfig,
+    authority: &DormantWorkerTurnAuthority,
+) -> std::io::Result<i64> {
+    let path = config.db_path.clone();
+    let task_id = slot.task_id;
+    let agent = slot.agent_name.clone();
+    let model = slot.model.clone();
+    let effort = slot.effort.clone();
+    let provider = slot.process_kind().to_string();
+    let cap_run_id = authority.cap_run_id.clone();
+    let assignment = authority.assignment.clone();
+    tokio::task::spawn_blocking(move || -> Result<i64> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let now = now_unix();
+        let owns_live_lease: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM claims c JOIN tasks t
+             ON c.target='task#' || t.id
+             WHERE t.id=?1 AND t.status='rework' AND t.assignee=?2
+               AND c.holder=?2 AND c.active=1 AND c.expires_at>?3)",
+            rusqlite::params![task_id, agent, now],
+            |row| row.get(0),
+        )?;
+        let owns_capability: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_capabilities
+             WHERE run_id=?1 AND task_id=?2 AND agent=?3 AND role='worker'
+               AND revoked_at IS NULL)",
+            rusqlite::params![cap_run_id, task_id, agent],
+            |row| row.get(0),
+        )?;
+        if !owns_live_lease || !owns_capability {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} lost task/capability authority before run installation"
+            )));
+        }
+        let run_id = match assignment {
+            Some(ref assignment) => quorum_core::agent_runs::insert_worker_with_assignment(
+                &tx,
+                task_id,
+                &agent,
+                &assignment.responsibility_key,
+                &model,
+                &effort,
+                &provider,
+                &provider,
+                Some(assignment.id),
+                now,
+            )?,
+            None => quorum_core::agent_runs::insert(
+                &tx, task_id, &agent, "worker", &model, &effort, &provider, now,
+            )?,
+        };
+        tx.commit()?;
+        Ok(run_id)
+    })
+    .await
+    .map_err(|join| std::io::Error::other(format!("dormant turn finalize join failed: {join}")))?
+    .map_err(|error| std::io::Error::other(format!("dormant turn finalize failed: {error}")))
+}
+
+async fn abort_dormant_worker_turn(db_path: &Path, cap_run_id: &str) {
+    let path = db_path.to_path_buf();
+    let cap_run_id = cap_run_id.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::capabilities::revoke(&mut conn, &cap_run_id, now_unix())?;
+        Ok(())
+    })
+    .await;
+}
+
+async fn settle_dormant_worker_turn_identity(
+    db_path: &Path,
+    agent_run_id: Option<i64>,
+    cap_run_id: Option<&str>,
+    end_reason: &str,
+) {
+    let path = db_path.to_path_buf();
+    let cap_run_id = cap_run_id.map(str::to_string);
+    let end_reason = end_reason.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let now = now_unix();
+        if let Some(run_id) = agent_run_id {
+            tx.execute(
+                "UPDATE agent_runs SET ended_at=COALESCE(ended_at,?2),
+                     end_reason=COALESCE(end_reason,?3) WHERE id=?1",
+                rusqlite::params![run_id, now, end_reason],
+            )?;
+        }
+        if let Some(cap_run_id) = cap_run_id {
+            tx.execute(
+                "UPDATE run_capabilities SET revoked_at=COALESCE(revoked_at,?2)
+                 WHERE run_id=?1",
+                rusqlite::params![cap_run_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await;
+}
+
+/// Preserve a failed dormant turn through the same durable provider-block
+/// classifier used after bounded turn-oriented runtime failures. Returns
+/// `false` for a live-process slot so the caller can retain the existing
+/// persistent-Claude failure path unchanged.
+async fn handle_dormant_worker_feed_failure(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    worker_index: usize,
+    error: &std::io::Error,
+) -> bool {
+    let (provider, continuation_id) = match &workers[worker_index].proc {
+        SlotProcess::Dormant {
+            kind,
+            continuation_id,
+        } => (kind.to_string(), continuation_id.clone()),
+        SlotProcess::Running(_) => return false,
+    };
+    let pending = PendingTurn {
+        provider,
+        model: workers[worker_index].model.clone(),
+        effort: workers[worker_index].effort.clone(),
+        prompt: workers[worker_index].pending_prompt.clone(),
+        turn_kind: workers[worker_index].pending_turn_kind.clone(),
+        continuation_id: Some(continuation_id),
+        requested: false,
+    };
+    let task_id = workers[worker_index].task_id;
+    let agent = workers[worker_index].agent_name.clone();
+    let reason = format!("dormant continuation launch failed: {error}");
+    match dispose_dead_turn_runner_worker(&config.db_path, task_id, &agent, &reason, &pending).await
+    {
+        Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
+            let worker = workers.remove(worker_index);
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                worker.agent_run_id,
+                worker.cap_run_id.as_deref(),
+                "provider_blocked",
+            )
+            .await;
+            cleanup_slot(config, wt_mgr, name_pool, worker, None, "provider_blocked").await;
+        }
+        Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
+            let worker = workers.remove(worker_index);
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                worker.agent_run_id,
+                worker.cap_run_id.as_deref(),
+                "ownership_transferred",
+            )
+            .await;
+            cleanup_slot(
+                config,
+                wt_mgr,
+                name_pool,
+                worker,
+                None,
+                "ownership_transferred",
+            )
+            .await;
+        }
+        Ok(tasks::DeadTurnRunnerDisposition::DonePending)
+        | Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
+            log(&format!(
+                "dormant worker {agent} feed failure raced a durable delivery for task #{task_id}; retaining slot"
+            ));
+        }
+        Err(classification_error) => {
+            log(&format!(
+                "FATAL: dormant worker {agent} feed failed for task #{task_id} and exact turn could not be parked: {classification_error}; retaining slot"
+            ));
+        }
+    }
+    true
 }
 
 fn should_replace_pending_prompt(prompt: &str) -> bool {
@@ -16605,6 +17080,476 @@ mod tests {
         assert!(matches!(slot.proc, SlotProcess::Running(_)));
         old.kill_and_reap().await;
         slot.kill_and_reap().await;
+    }
+
+    fn dormant_codex_rework_fixture(
+        db_path: &Path,
+        worktree: &Path,
+        persisted_continuation: Option<&str>,
+        slot_continuation: &str,
+    ) -> (SlotState, i64, String) {
+        let now = now_unix();
+        let (task_id, old_run_id, old_capability) = {
+            let mut conn = quorum_core::db::open(db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "dormant Codex rework",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            let mut refs = serde_json::json!({
+                "cx_est": 3,
+                "cx_size": "M",
+                "cx_ready": true,
+                "cx_not_ready_reason": null,
+                "cx_by": "test:v2"
+            });
+            if let Some(continuation) = persisted_continuation {
+                runner_state::set_continuation(
+                    &mut refs,
+                    ContinuationSlot::Worker,
+                    &ContinuationIdentity {
+                        provider: "codex".into(),
+                        id: continuation.into(),
+                    },
+                );
+            }
+            tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now).unwrap();
+            tasks::claim(&mut conn, "Dormant", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("initial worker claim");
+            let old_run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "Dormant",
+                "worker",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now,
+            )
+            .unwrap();
+            let old_capability = "completed-turn-capability".to_string();
+            quorum_core::capabilities::issue(
+                &mut conn,
+                &old_capability,
+                task_id,
+                "Dormant",
+                "worker",
+                now,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Dormant",
+                task_id,
+                &Event::SignaledDone { pr: "443".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Reviewer",
+                task_id,
+                &Event::ReviewerAttached {
+                    agent: "Reviewer".into(),
+                },
+                now + 2,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Reviewer",
+                task_id,
+                &Event::VerdictChanges,
+                now + 3,
+            )
+            .unwrap();
+            let entry = JournalEntry {
+                agent: "Dormant".into(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "logical-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/dormant-t1".into()),
+                phase: "awaiting-review".into(),
+                cost_tokens: 17,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(443),
+                rework_count: 0,
+            };
+            journal::upsert(&mut conn, &entry).unwrap();
+            (task_id, old_run_id, old_capability)
+        };
+
+        let now_instant = std::time::Instant::now();
+        (
+            SlotState {
+                agent_name: "Dormant".into(),
+                proc: SlotProcess::dormant(runner::AgentKind::Codex, Some(slot_continuation))
+                    .unwrap(),
+                task_id,
+                session_id: "logical-session".into(),
+                model: "gpt-5.6-terra".into(),
+                effort: "high".into(),
+                worktree_path: worktree.to_path_buf(),
+                branch: "daemon/dormant-t1".into(),
+                remote_branch: "daemon/dormant-t1".into(),
+                draining: false,
+                pr: Some(443),
+                rework_count: 0,
+                cost_tokens: 17,
+                cost_usd: 0.0,
+                task_started_at: now_instant,
+                turn_started_at: now_instant,
+                turn_ended_at: Some(now_instant),
+                agent_state: None,
+                session_log: None,
+                live_stats: LiveStats::new(),
+                error_turn_count: 0,
+                last_error_text: None,
+                agent_run_id: Some(old_run_id),
+                cap_run_id: Some(old_capability.clone()),
+                r2_origin: false,
+                reviewed_head_sha: None,
+                continuation_id: Some(slot_continuation.into()),
+                pending_prompt: "initial delivery".into(),
+                pending_turn_kind: "initial".into(),
+            },
+            old_run_id,
+            old_capability,
+        )
+    }
+
+    fn dormant_codex_test_config(
+        db_path: PathBuf,
+        worktree: PathBuf,
+        agent_bin: Option<String>,
+    ) -> ServeConfig {
+        let mut config = pre_review_ci_test_config(db_path, worktree);
+        config.model_profiles.get_mut("test").unwrap().runner = "codex".into();
+        config.model_profiles.get_mut("test").unwrap().model = "gpt-5.6-terra".into();
+        config.model_profiles.get_mut("test").unwrap().effort = "high".into();
+        config.agent_bin = agent_bin;
+        config
+    }
+
+    #[cfg(unix)]
+    fn fake_codex_resume_program(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join("fake-codex-resume.sh");
+        let args = dir.join("args.txt");
+        let env = dir.join("env.txt");
+        let cwd = dir.join("cwd.txt");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n%s\\n' \"$QUORUM_AGENT\" \"$QUORUM_RUN_ID\" > '{}'\npwd > '{}'\nexec sleep 30\n",
+                args.display(),
+                env.display(),
+                cwd.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (program, args, env, cwd)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dormant_codex_rework_reacquires_lease_and_resumes_exact_turn_with_rotated_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dormant-rework.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (program, args_path, env_path, cwd_path) = fake_codex_resume_program(dir.path());
+        let (mut slot, old_run_id, old_capability) =
+            dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
+        let config = dormant_codex_test_config(
+            db_path.clone(),
+            worktree.clone(),
+            Some(program.to_string_lossy().into_owned()),
+        );
+        let prompt = "Fix the exact reviewer finding and retain PR #443.";
+
+        let error = feed_worker_turn(&mut slot, prompt, &config)
+            .await
+            .expect_err("a dormant worker must never launch before reacquiring its lease");
+        assert!(error.to_string().contains("does not durably own"));
+        assert!(
+            !args_path.exists(),
+            "provider launched before the task lease existed"
+        );
+
+        assert!(
+            install_live_worker_remediation_lease(
+                &config,
+                slot.agent_name.clone(),
+                slot.task_id,
+                443,
+                "exact reviewer finding",
+            )
+            .await,
+            "same logical worker must reacquire the rework lease"
+        );
+        feed_worker_turn(&mut slot, prompt, &config)
+            .await
+            .expect("exact dormant continuation resumes");
+        begin_sticky_worker_rework(&mut slot, &db_path).await;
+
+        for _ in 0..1000 {
+            if args_path.exists() && env_path.exists() && cwd_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            args_path.exists() && env_path.exists() && cwd_path.exists(),
+            "fake Codex process did not reach its capture boundary"
+        );
+        let args = std::fs::read_to_string(&args_path).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(&args[..3], ["exec", "resume", "thread-exact"]);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "gpt-5.6-terra"]));
+        assert!(args.contains(&"model_reasoning_effort=high"));
+        assert_eq!(args.last().copied(), Some(prompt));
+        assert_eq!(
+            std::fs::canonicalize(std::fs::read_to_string(&cwd_path).unwrap().trim()).unwrap(),
+            std::fs::canonicalize(&worktree).unwrap()
+        );
+        let env = std::fs::read_to_string(&env_path).unwrap();
+        let env: Vec<&str> = env.lines().collect();
+        assert_eq!(env.first().copied(), Some("Dormant"));
+        let new_capability = env.get(1).expect("rotated QUORUM_RUN_ID");
+        assert_ne!(*new_capability, old_capability);
+        assert_eq!(slot.cap_run_id.as_deref(), Some(*new_capability));
+        assert_eq!(slot.agent_name, "Dormant");
+        assert_eq!(slot.pr, Some(443));
+        assert!(matches!(slot.proc, SlotProcess::Running(_)));
+        assert!(slot.draining);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let claim_holder: String = conn
+            .query_row(
+                "SELECT holder FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{}", slot.task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim_holder, "Dormant");
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, slot.task_id).unwrap();
+        assert_eq!(runs.len(), 2, "one agent_run per provider turn");
+        let old_run = runs.iter().find(|run| run.id == old_run_id).unwrap();
+        assert_eq!(old_run.end_reason.as_deref(), Some("turn-completed"));
+        let new_run = runs.iter().find(|run| run.id != old_run_id).unwrap();
+        assert_eq!(new_run.agent, "Dormant");
+        assert_eq!(new_run.model, "gpt-5.6-terra");
+        assert_eq!(new_run.effort, "high");
+        assert_eq!(new_run.provider.as_deref(), Some("codex"));
+        assert!(new_run.ended_at.is_none());
+        let capabilities: Vec<(String, Option<i64>)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT run_id,revoked_at FROM run_capabilities
+                     WHERE task_id=?1 AND agent='Dormant' ORDER BY created_at,run_id",
+                )
+                .unwrap();
+            statement
+                .query_map([slot.task_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(capabilities.len(), 2);
+        assert!(capabilities
+            .iter()
+            .any(|(run_id, revoked)| run_id == &old_capability && revoked.is_some()));
+        assert!(capabilities
+            .iter()
+            .any(|(run_id, revoked)| run_id == *new_capability && revoked.is_none()));
+        let task = tasks::get(&conn, slot.task_id).unwrap().unwrap();
+        assert_eq!(task.author.as_deref(), Some("Dormant"));
+        assert_eq!(tasks::extract_pr_number(&task.refs), Some(443));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "resume must not create a replacement task or duplicate PR binding"
+        );
+        let journal = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].agent, "Dormant");
+        assert_eq!(journal[0].phase, "working");
+        assert_eq!(journal[0].pr, Some(443));
+        assert!(journal[0].pid.is_some());
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dormant_codex_rework_missing_or_mismatched_durable_continuation_fails_closed() {
+        for (label, persisted) in [("missing", None), ("mismatched", Some("thread-other"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("{label}.db"));
+            let worktree = dir.path().join("worktree");
+            std::fs::create_dir_all(&worktree).unwrap();
+            let (program, args_path, _, _) = fake_codex_resume_program(dir.path());
+            let (mut slot, old_run_id, old_capability) =
+                dormant_codex_rework_fixture(&db_path, &worktree, persisted, "thread-exact");
+            let config = dormant_codex_test_config(
+                db_path.clone(),
+                worktree,
+                Some(program.to_string_lossy().into_owned()),
+            );
+            assert!(
+                install_live_worker_remediation_lease(
+                    &config,
+                    slot.agent_name.clone(),
+                    slot.task_id,
+                    443,
+                    "review feedback",
+                )
+                .await
+            );
+            let error = feed_worker_turn(&mut slot, "review feedback", &config)
+                .await
+                .expect_err("invalid durable continuation must not launch");
+            assert!(error.to_string().contains("persisted"), "{label}: {error}");
+            assert!(
+                !args_path.exists(),
+                "{label}: provider unexpectedly launched"
+            );
+            assert!(matches!(slot.proc, SlotProcess::Dormant { .. }));
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let old_run = quorum_core::agent_runs::runs_for_task(&conn, slot.task_id)
+                .unwrap()
+                .into_iter()
+                .find(|run| run.id == old_run_id)
+                .unwrap();
+            assert!(
+                old_run.ended_at.is_none(),
+                "{label}: run rotated before validation"
+            );
+            let old_cap = quorum_core::capabilities::validate(
+                &conn,
+                &old_capability,
+                "Dormant",
+                "worker",
+                Some(slot.task_id),
+            );
+            assert!(
+                old_cap.is_ok(),
+                "{label}: capability rotated before validation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dormant_codex_launch_failure_parks_the_exact_pending_rework_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("launch-failure.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (slot, _old_run_id, _old_capability) =
+            dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
+        let config = dormant_codex_test_config(
+            db_path.clone(),
+            worktree,
+            Some(
+                dir.path()
+                    .join("missing-codex")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+        assert!(
+            install_live_worker_remediation_lease(
+                &config,
+                slot.agent_name.clone(),
+                slot.task_id,
+                443,
+                "exact launch-failure feedback",
+            )
+            .await
+        );
+        let task_id = slot.task_id;
+        let mut workers = vec![slot];
+        let prompt = "Exact feedback that must survive a failed codex exec resume.";
+        let error = feed_worker_turn(&mut workers[0], prompt, &config)
+            .await
+            .expect_err("missing provider executable must fail launch");
+        assert_eq!(workers[0].pending_prompt, prompt);
+        assert_eq!(workers[0].pending_turn_kind, "rework");
+        assert!(matches!(workers[0].proc, SlotProcess::Dormant { .. }));
+
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Dormant").unwrap();
+        assert!(
+            handle_dormant_worker_feed_failure(
+                &config,
+                &wt_mgr,
+                &mut name_pool,
+                &mut workers,
+                0,
+                &error,
+            )
+            .await
+        );
+        assert!(workers.is_empty());
+
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        let retry: PendingTurn = serde_json::from_value(refs[runner_state::RETRY_REF].clone())
+            .expect("exact turn was parked");
+        assert_eq!(retry.provider, "codex");
+        assert_eq!(retry.model, "gpt-5.6-terra");
+        assert_eq!(retry.effort, "high");
+        assert_eq!(retry.prompt, prompt);
+        assert_eq!(retry.turn_kind, "rework");
+        assert_eq!(retry.continuation_id.as_deref(), Some("thread-exact"));
+        assert!(!retry.requested);
+        let active_caps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_capabilities
+                 WHERE task_id=?1 AND agent='Dormant' AND revoked_at IS NULL",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_caps, 0);
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1,
+            "failed launch must not install a phantom agent_run"
+        );
+        let retried = tasks::retry_provider_blocked(&mut conn, task_id, "operator", now_unix())
+            .unwrap()
+            .expect("existing provider retry path accepts the parked turn");
+        assert_eq!(retried.status, "rework");
+        let retried_refs: serde_json::Value =
+            serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+        let requested = runner_state::requested_retry(&retried_refs, "codex").unwrap();
+        assert_eq!(requested.prompt, prompt);
+        assert_eq!(requested.continuation_id.as_deref(), Some("thread-exact"));
     }
 
     #[test]
