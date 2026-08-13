@@ -12998,7 +12998,7 @@ async fn spawn_worker(
                 let reason = format!("continue PR #{pr} provisioning rejected: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "open").await;
-                name_pool.release(&agent_name);
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
         }
@@ -13009,7 +13009,7 @@ async fn spawn_worker(
                 let reason = format!("parked rework publication provisioning rejected: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "rework").await;
-                name_pool.release(&agent_name);
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
         };
@@ -13024,7 +13024,8 @@ async fn spawn_worker(
                         );
                         persist_provisioning_failure(&db_path, task.id, &reason).await;
                         park_task(&db_path, task.id, &reason, "rework").await;
-                        name_pool.release(&agent_name);
+                        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id)
+                            .await;
                         return Ok(false);
                     }
                 }
@@ -13093,7 +13094,7 @@ async fn spawn_worker(
                 let reason = format!("branch provenance resolution failed: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "open").await;
-                name_pool.release(&agent_name);
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
         };
@@ -13136,7 +13137,7 @@ async fn spawn_worker(
                 "open",
             )
             .await;
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
             return Ok(false);
         }
     }
@@ -13190,9 +13191,9 @@ async fn spawn_worker(
                     resume_status,
                 )
                 .await;
-                name_pool.release(&agent_name);
                 wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
             let strikes = poison_tracker.record_strike(task.id);
@@ -13201,7 +13202,7 @@ async fn spawn_worker(
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             return Ok(false);
         }
@@ -13220,9 +13221,9 @@ async fn spawn_worker(
         } else {
             release_task(&db_path, &agent_name, task.id).await;
         }
-        name_pool.release(&agent_name);
         wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
         return Ok(false);
     }
 
@@ -13376,9 +13377,9 @@ async fn spawn_worker(
             // Initial open task: poison — this won't resolve on retry.
             poison_task(&db_path, &agent_name, task.id, MAX_POISON_STRIKES, None).await;
         }
-        name_pool.release(&agent_name);
         wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
         return Ok(false);
     }
 
@@ -13518,9 +13519,9 @@ async fn spawn_worker(
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
-            name_pool.release(&agent_name);
             wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
             return Ok(false);
         }
     }
@@ -14000,6 +14001,80 @@ async fn lookup_task_refs(db_path: &std::path::Path, task_id: i64) -> Option<Str
     .flatten()
 }
 
+/// Guarded release of a worker's daemon-issued identity back to the name pool.
+///
+/// Names are shared authority: an identity that is still tied to a live task
+/// lease can be re-acquired by the next spawn and race the still-active claim.
+/// This helper is the ONLY sanctioned path for returning a worker name after
+/// teardown — it verifies inside a `BEGIN IMMEDIATE` snapshot that no active,
+/// unexpired lease on `task#<id>` is still held by this agent before the pool
+/// release. If the lease is still live, or the DB check itself fails, the name
+/// is intentionally leaked (retained in `in_use`) and the abnormal condition is
+/// recorded — a leaked name is strictly safer than one recycled under an active
+/// claim. Filesystem and process cleanup is done by the caller before invoking
+/// this guard so the DB check/settlement stays a short transaction.
+async fn guarded_worker_name_release(
+    db_path: &Path,
+    name_pool: &mut Pool,
+    agent: &str,
+    task_id: i64,
+) {
+    let p = db_path.to_path_buf();
+    let agent_owned = agent.to_string();
+    let check = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::worker_lease_active_for(&mut conn, &agent_owned, task_id, now_unix())
+    })
+    .await;
+
+    let active = match check {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            let detail = format!(
+                "worker name release retained: DB error checking task#{task_id} claim for {agent}: {e}"
+            );
+            log(&detail);
+            persist_name_release_error(db_path, agent, task_id, &detail).await;
+            return;
+        }
+        Err(e) => {
+            let detail = format!(
+                "worker name release retained: spawn error checking task#{task_id} claim for {agent}: {e}"
+            );
+            log(&detail);
+            persist_name_release_error(db_path, agent, task_id, &detail).await;
+            return;
+        }
+    };
+
+    if active {
+        let detail =
+            format!("worker name release retained: task#{task_id} claim still active for {agent}");
+        log(&detail);
+        persist_name_release_error(db_path, agent, task_id, &detail).await;
+        return;
+    }
+
+    name_pool.release(agent);
+}
+
+async fn persist_name_release_error(db_path: &Path, agent: &str, task_id: i64, detail: &str) {
+    let path = db_path.to_path_buf();
+    let agent_owned = agent.to_string();
+    let detail = detail.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = quorum_core::db::open(&path) {
+            quorum_core::errlog::log_error(
+                &conn,
+                now_unix(),
+                "name_release",
+                &format!("task #{task_id} agent {agent_owned}: {detail}"),
+            );
+        }
+    })
+    .await;
+}
+
 /// Clean up a worker slot's resources without updating task status.
 /// Used when `apply_event` has already transitioned the task state.
 async fn cleanup_slot(
@@ -14065,7 +14140,7 @@ async fn cleanup_slot_inner(
         wt_mgr.delete_branch(repo_dir, &state.branch).await;
     }
 
-    name_pool.release(&state.agent_name);
+    guarded_worker_name_release(&config.db_path, name_pool, &state.agent_name, state.task_id).await;
 }
 
 /// Tear down a worker agent: kill process, update task, clean up journal/worktree/name.
@@ -14167,7 +14242,7 @@ async fn teardown_worker_with_body(
     wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
     wt_mgr.delete_branch(repo_dir, &state.branch).await;
 
-    name_pool.release(&state.agent_name);
+    guarded_worker_name_release(&config.db_path, name_pool, &state.agent_name, state.task_id).await;
     log(&format!("worker {} torn down", state.agent_name));
 }
 
@@ -14505,7 +14580,7 @@ async fn spawn_remediation_worker(
                      lease release also failed: {release_error}"
                 ));
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Err(error);
         }
     };
@@ -14545,7 +14620,7 @@ async fn spawn_remediation_worker(
                      lease release also failed: {release_error}"
                 ));
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Err(error);
         }
     }
@@ -14563,7 +14638,7 @@ async fn spawn_remediation_worker(
                 tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
             })
             .await;
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: "structural: remediation PR target is unavailable and no safe fallback branch exists".into(),
             });
@@ -14668,7 +14743,7 @@ async fn spawn_remediation_worker(
                 })
                 .await;
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: classified_provisioning_cause(&cause),
             });
@@ -14847,9 +14922,9 @@ async fn spawn_remediation_worker(
                         .await;
                         cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id)
                             .await;
-                        name_pool.release(&agent_name);
                         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                         wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                        guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
                         return Ok(RemediationSpawnOutcome::ProvisionFailed {
                             cause: classified_provisioning_cause(&format!(
                                 "remediation provider recovery failed: {error}"
@@ -14871,9 +14946,9 @@ async fn spawn_remediation_worker(
                 })
                 .await;
                 cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-                name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
                 return Ok(RemediationSpawnOutcome::ProvisionFailed {
                     cause: classified_provisioning_cause(&format!(
                         "remediation provider recovery failed: {error}"
@@ -14921,9 +14996,9 @@ async fn spawn_remediation_worker(
         })
         .await;
         cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-        name_pool.release(&agent_name);
         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(task_repo_dir, &branch).await;
+        guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
         return Ok(RemediationSpawnOutcome::ProvisionFailed {
             cause: "remediation provider policy rejected launch: Codex cannot report USD cost while max_*_cost_usd is configured".into(),
         });
@@ -14971,9 +15046,9 @@ async fn spawn_remediation_worker(
             })
             .await;
             cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-            name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: classified_provisioning_cause(&format!(
                     "remediation continuation recovery failed: {error}"
@@ -15093,9 +15168,9 @@ async fn spawn_remediation_worker(
                 .await;
             }
             cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-            name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: classified_provisioning_cause(&format!(
                     "remediation worker process launch failed: {e}"
@@ -22080,5 +22155,131 @@ mod tests {
                 && error.detail.contains("PR #37")
                 && error.detail.contains("index.lock")
         }));
+    }
+
+    /// The daemon-owned name-release guard is the seam that stops a delivered
+    /// identity from being recycled while its task lease is still live. The
+    /// three tests below cover the disposition set from #427: active lease
+    /// (retain), released/terminal ownership (permit exactly one release),
+    /// and a DB failure at check time (retain).
+    fn seed_task_with_worker_claim(db_path: &Path, task_id: i64, agent: &str) {
+        // Lease `expires_at` must sit ahead of the wall clock the async guard
+        // observes via `now_unix()`; a hardcoded epoch would already look
+        // expired and defeat the "live claim retains name" contract.
+        let now = now_unix();
+        let ttl = 3_600_i64;
+        let conn = quorum_core::db::open(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,assignee,created_by,created_at,updated_at)
+                 VALUES (?1,'t','working',?2,'owner',?3,?3)",
+            rusqlite::params![task_id, agent, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+                 VALUES (?1,?2,?3,?4,1)",
+            rusqlite::params![
+                quorum_core::tasks::lease_target(task_id),
+                agent,
+                now,
+                now + ttl,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guard_retains_name_while_worker_claim_is_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+        seed_task_with_worker_claim(&db_path, 42, &agent);
+
+        guarded_worker_name_release(&db_path, &mut pool, &agent, 42).await;
+
+        assert_eq!(
+            pool.in_use_count(),
+            1,
+            "an active task lease must prevent recycling the delivered identity"
+        );
+        // Re-acquisition must not return this name.
+        let next = pool.acquire().into_name();
+        assert_ne!(next, agent);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='name_release'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 1,
+            "abnormal name-release retention must be surfaced as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_releases_name_after_claim_is_deactivated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+        seed_task_with_worker_claim(&db_path, 7, &agent);
+
+        // Terminal disposition would deactivate the lease before teardown.
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND holder=?2",
+            rusqlite::params![quorum_core::tasks::lease_target(7), agent],
+        )
+        .unwrap();
+        drop(conn);
+
+        guarded_worker_name_release(&db_path, &mut pool, &agent, 7).await;
+        assert_eq!(
+            pool.in_use_count(),
+            0,
+            "released lease must return the name"
+        );
+
+        // Idempotent: repeating the guarded release on a name that is already
+        // out of the in-use set is a no-op — no double-release, no error row.
+        guarded_worker_name_release(&db_path, &mut pool, &agent, 7).await;
+        assert_eq!(pool.in_use_count(), 0);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='name_release'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 0,
+            "clean teardown must not emit a name-release error"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_retains_name_when_claim_check_fails() {
+        // A DB open failure at check time must NEVER be treated as "no active
+        // claim" — the safe default is to leak the identity, not silently
+        // recycle it.
+        let dir = tempfile::tempdir().unwrap();
+        let missing_db = dir.path().join("does-not-exist").join("q.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+
+        guarded_worker_name_release(&missing_db, &mut pool, &agent, 99).await;
+
+        assert_eq!(
+            pool.in_use_count(),
+            1,
+            "a DB failure during the guard must retain the name"
+        );
     }
 }
