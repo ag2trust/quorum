@@ -2634,9 +2634,6 @@ impl LiveStats {
 /// needed to launch the next exact turn.
 enum SlotProcess {
     Running(Box<runner::RunnerProc>),
-    // Dormancy is intentionally represented before the exit/rework paths
-    // begin producing it in a follow-up change.
-    #[allow(dead_code)]
     Dormant {
         kind: runner::AgentKind,
         continuation_id: String,
@@ -2648,7 +2645,6 @@ impl SlotProcess {
         Self::Running(Box::new(proc))
     }
 
-    #[allow(dead_code)]
     fn dormant(kind: runner::AgentKind, continuation_id: Option<&str>) -> std::io::Result<Self> {
         if kind.turn_mode() != runner::TurnMode::RespawnPerTurn {
             return Err(std::io::Error::new(
@@ -2816,7 +2812,6 @@ impl SlotState {
 
     /// Park a completed turn-oriented runner while retaining its sticky worker
     /// slot. The caller owns reaping the returned completed process.
-    #[allow(dead_code)]
     fn become_dormant(&mut self) -> std::io::Result<runner::RunnerProc> {
         if matches!(&self.proc, SlotProcess::Dormant { .. }) {
             return Err(std::io::Error::new(
@@ -9445,13 +9440,8 @@ async fn tick(
     // firing AgentFailed (#176).
     let mut idle_workers: Vec<usize> = Vec::new();
     for (i, w) in workers.iter().enumerate() {
-        if w.draining || w.error_turn_count > 0 {
-            continue;
-        }
-        if let Some(ended) = w.turn_ended_at {
-            if ended.elapsed().as_secs() > idle_timeout {
-                idle_workers.push(i);
-            }
+        if slot_is_idle_zombie_candidate(w, idle_timeout) {
+            idle_workers.push(i);
         }
     }
     for &i in idle_workers.iter().rev() {
@@ -9587,7 +9577,10 @@ async fn tick(
                     workers.insert(i, dead);
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
-                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+                    park_or_cleanup_delivered_worker_slot(
+                        config, wt_mgr, name_pool, workers, i, dead,
+                    )
+                    .await;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
                     cleanup_slot(
@@ -9741,11 +9734,10 @@ async fn tick(
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
-                    log(&format!(
-                        "worker {} exited normally after delivering task #{} — cleaning up completed run",
-                        dead.agent_name, dead.task_id
-                    ));
-                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+                    park_or_cleanup_delivered_worker_slot(
+                        config, wt_mgr, name_pool, workers, i, dead,
+                    )
+                    .await;
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
@@ -10078,25 +10070,7 @@ async fn tick(
     // ── Phase 4d: Renew task leases for active workers (#130) ───────────
     // The daemon explicitly renews the exact lease for each active worker's
     // task. External writes (sync, post, etc.) no longer auto-renew leases.
-    {
-        let p = db_path.clone();
-        let active_pairs: Vec<(String, i64)> = workers
-            .iter()
-            .map(|w| (w.agent_name.clone(), w.task_id))
-            .collect();
-        if !active_pairs.is_empty() {
-            tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = quorum_core::db::open(&p) {
-                    let now = now_unix();
-                    for (agent, task_id) in &active_pairs {
-                        let _ = quorum_core::agents::renew_task_lease(&conn, agent, *task_id, now);
-                    }
-                }
-            })
-            .await
-            .ok();
-        }
-    }
+    renew_active_worker_task_leases(&db_path, workers).await;
 
     // ── Phase 5: Spawn reviewers for workers with PRs ──────────────────
     // Each worker that has a PR and no paired reviewer (and is not draining)
@@ -10121,12 +10095,7 @@ async fn tick(
             .iter()
             .enumerate()
             .filter_map(|(i, w)| {
-                if let Some(pr) = w.pr {
-                    if !w.draining && !reviewers.iter().any(|r| r.task_id == w.task_id) {
-                        return Some((pr, w.task_id, i));
-                    }
-                }
-                None
+                slot_needs_reviewer_provisioning(w, reviewers).map(|pr| (pr, w.task_id, i))
             })
             .collect();
         if !needs_reviewer_from_workers.is_empty() {
@@ -11422,6 +11391,127 @@ async fn dispose_dead_turn_runner_worker(
             QuorumError::Io(format!("dead runner disposition join failed: {error}"))
         })?;
     disposition
+}
+
+/// Park a delivered turn-oriented worker slot in place. The completed process
+/// is reaped and its captured output persisted; the sticky slot retains its
+/// name, active claim, journal, worktree, branch, PR, and continuation so
+/// Phase 4d renews its lease and Phase 5 provisions a reviewer for it.
+///
+/// A failure to persist the `awaiting-review` journal row (SQLite busy/IO,
+/// blocking-task join failure, or an upsert error) is surfaced to the caller
+/// so the fallback path can fully release the slot instead of retaining a
+/// dormant worker whose crash-recovery row still advertises the reaped process
+/// PID and a stale phase — restart recovery trusts that PID and would call
+/// `killpg` on whatever process group has since reused it.
+async fn park_worker_slot_dormant(db_path: &Path, slot: &mut SlotState) -> std::io::Result<()> {
+    let old = slot.become_dormant()?;
+    let captured = old.kill_and_reap().await;
+    persist_terminal_output(&mut slot.session_log, captured);
+    slot.draining = false;
+    slot.turn_ended_at = Some(std::time::Instant::now());
+    slot.error_turn_count = 0;
+    slot.last_error_text = None;
+    let entry = slot_journal_entry(slot, "worker", "awaiting-review");
+    let p = db_path.to_path_buf();
+    let upsert = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        journal::upsert(&mut conn, &entry)
+    })
+    .await
+    .map_err(|join| std::io::Error::other(format!("park journal join failed: {join}")))?;
+    upsert.map_err(|err| std::io::Error::other(format!("park journal upsert failed: {err}")))?;
+    Ok(())
+}
+
+/// Phase 5 spawns a reviewer for every worker slot that has published a PR
+/// and finished its turn, without a reviewer already paired for the same
+/// task. Extracted so the production decision is testable: a dormant sticky
+/// slot with its PR retained and `draining=false` must remain eligible.
+fn slot_needs_reviewer_provisioning(slot: &SlotState, reviewers: &[SlotState]) -> Option<i64> {
+    let pr = slot.pr?;
+    if slot.draining {
+        return None;
+    }
+    if reviewers.iter().any(|r| r.task_id == slot.task_id) {
+        return None;
+    }
+    Some(pr)
+}
+
+/// Route a delivered turn-oriented worker exit through the sticky-dormant
+/// park; on any journal failure, fall through to the full-cleanup path that
+/// releases the name/worktree/branch and deletes the stale journal row.
+/// Extracted so both `DeliveryRecorded` call sites (ordinary exit and bounded
+/// error-exhaustion) execute the exact same reinsertion logic — a regression
+/// that drops the reinsertion at either site must fail the shared regression
+/// test.
+async fn park_or_cleanup_delivered_worker_slot(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    slot_index: usize,
+    mut dead: SlotState,
+) {
+    let db_path = config.db_path.clone();
+    match park_worker_slot_dormant(&db_path, &mut dead).await {
+        Ok(()) => {
+            log(&format!(
+                "worker {} parked dormant after delivering task #{} — awaiting reviewer",
+                dead.agent_name, dead.task_id
+            ));
+            workers.insert(slot_index, dead);
+        }
+        Err(error) => {
+            log(&format!(
+                "worker {} cannot park dormant for task #{} ({error}); cleaning up completed run",
+                dead.agent_name, dead.task_id
+            ));
+            cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+        }
+    }
+}
+
+/// Extend each active worker's task claim so a long review wait cannot let a
+/// task expire out from under a live or parked slot. Extracted so Phase 4d's
+/// tick loop and the state-machine regression test drive the same code path.
+async fn renew_active_worker_task_leases(db_path: &Path, workers: &[SlotState]) {
+    let active_pairs: Vec<(String, i64)> = workers
+        .iter()
+        .map(|w| (w.agent_name.clone(), w.task_id))
+        .collect();
+    if active_pairs.is_empty() {
+        return;
+    }
+    let p = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = quorum_core::db::open(&p) {
+            let now = now_unix();
+            for (agent, task_id) in &active_pairs {
+                let _ = quorum_core::agents::renew_task_lease(&conn, agent, *task_id, now);
+            }
+        }
+    })
+    .await
+    .ok();
+}
+
+/// The idle watchdog reaps workers that sit between turns for longer than the
+/// operator-configured limit. Extracted so the production decision is
+/// testable: a regression that lets the watchdog kill a dormant awaiting-
+/// review slot must break the same predicate the tick loop consults.
+fn slot_is_idle_zombie_candidate(slot: &SlotState, idle_timeout_secs: u64) -> bool {
+    if slot.draining || slot.error_turn_count > 0 {
+        return false;
+    }
+    // Dormant sticky slots have no live process to zombify; they exist to
+    // hold the exact continuation until the reviewer produces a verdict.
+    if matches!(slot.proc, SlotProcess::Dormant { .. }) {
+        return false;
+    }
+    slot.turn_ended_at
+        .is_some_and(|t| t.elapsed().as_secs() > idle_timeout_secs)
 }
 
 async fn persist_runner_provider_block(
@@ -16535,6 +16625,355 @@ mod tests {
         assert!(error.to_string().contains("persistent child"));
     }
 
+    #[tokio::test]
+    async fn park_delivered_codex_slot_becomes_dormant_and_journals_awaiting_review() {
+        let worktree = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("park-delivered.db");
+        // Materialize the schema so journal::upsert can run against a real DB.
+        let _ = quorum_core::db::open(&db_path).unwrap();
+
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.agent_name = "Delivered".into();
+        slot.task_id = 4242;
+        slot.pr = Some(999);
+        slot.remote_branch = "daemon/delivered".into();
+        slot.branch = "daemon/delivered".into();
+        slot.continuation_id = Some("provider-thread-777".into());
+        slot.draining = true;
+        slot.error_turn_count = 3;
+        slot.last_error_text = Some("prior transient failure".into());
+
+        park_worker_slot_dormant(&db_path, &mut slot).await.unwrap();
+
+        // Live process torn down, logical slot preserved.
+        assert!(matches!(
+            &slot.proc,
+            SlotProcess::Dormant {
+                continuation_id, ..
+            } if continuation_id == "provider-thread-777"
+        ));
+        assert!(
+            !slot.draining,
+            "delivered turn must clear the drain flag so a reviewer can be provisioned"
+        );
+        assert_eq!(
+            slot.pr,
+            Some(999),
+            "publication identity must survive parking"
+        );
+        assert_eq!(slot.continuation_id.as_deref(), Some("provider-thread-777"));
+        assert_eq!(slot.agent_name, "Delivered");
+        assert_eq!(slot.remote_branch, "daemon/delivered");
+        assert_eq!(
+            slot.error_turn_count, 0,
+            "delivery clears the auto-refeed retry budget"
+        );
+        assert!(slot.last_error_text.is_none());
+        assert!(
+            slot.turn_ended_at.is_some(),
+            "watchdog must see the turn end time"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent, "Delivered");
+        assert_eq!(entries[0].role, "worker");
+        assert_eq!(entries[0].phase, "awaiting-review");
+        assert_eq!(entries[0].task_id, Some(4242));
+        assert_eq!(entries[0].pr, Some(999));
+        assert!(
+            entries[0].pid.is_none(),
+            "dormant journal entry must not advertise a live pid"
+        );
+    }
+
+    #[tokio::test]
+    async fn park_worker_slot_dormant_rejects_missing_continuation() {
+        let worktree = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("park-missing-continuation.db");
+        let _ = quorum_core::db::open(&db_path).unwrap();
+
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = None;
+        slot.pr = Some(1);
+
+        let err = park_worker_slot_dormant(&db_path, &mut slot)
+            .await
+            .expect_err("park must refuse a Codex slot without its provider-issued thread id");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            matches!(&slot.proc, SlotProcess::Running(_)),
+            "the slot must remain in its running state so the caller can fall back to cleanup"
+        );
+        slot.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn park_worker_slot_dormant_surfaces_journal_write_failure() {
+        // The DB path points at a directory, so `db::open` and therefore
+        // `journal::upsert` will fail. The park helper must surface that
+        // failure instead of returning Ok — otherwise the caller retains a
+        // dormant worker whose stale journal row still advertises the reaped
+        // process PID, and restart recovery would `killpg` a reused group.
+        let worktree = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let unwritable_db = db_dir.path().to_path_buf();
+
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = Some("provider-thread-42".into());
+        slot.pr = Some(1);
+
+        let err = park_worker_slot_dormant(&unwritable_db, &mut slot)
+            .await
+            .expect_err("an unwritable journal DB must not be reported as a successful park");
+        assert!(
+            err.to_string().contains("park journal"),
+            "the surfaced error must identify the park-time journal write, got: {err}"
+        );
+        // Process was already reaped inside `become_dormant`; the caller now
+        // owns the dormant slot and must run cleanup_slot to release the
+        // name/worktree/branch and delete the stale journal row.
+        assert!(matches!(&slot.proc, SlotProcess::Dormant { .. }));
+    }
+
+    #[tokio::test]
+    async fn slot_needs_reviewer_provisioning_covers_dormant_running_and_paired_slots() {
+        // Regression guard: production Phase 5 consults this exact predicate.
+        // Removing the `!draining` gate or the paired-reviewer check must
+        // break this test.
+        let worktree = tempfile::tempdir().unwrap();
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.agent_name = "Delivered".into();
+        slot.task_id = 42;
+        slot.pr = Some(777);
+        slot.continuation_id = Some("thread".into());
+
+        // No PR yet → not eligible.
+        let empty: Vec<SlotState> = Vec::new();
+        slot.pr = None;
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &empty), None);
+        slot.pr = Some(777);
+
+        // Draining mid-turn → not eligible.
+        slot.draining = true;
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &empty), None);
+        slot.draining = false;
+
+        // Running slot with PR and no reviewer → eligible.
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &empty), Some(777));
+
+        // Dormant awaiting-review slot with PR → still eligible.
+        let old = slot.become_dormant().unwrap();
+        old.kill_and_reap().await;
+        assert_eq!(
+            slot_needs_reviewer_provisioning(&slot, &empty),
+            Some(777),
+            "dormant sticky slot must remain reviewer-eligible after delivery"
+        );
+
+        // Reviewer already paired → not eligible even for a dormant slot.
+        let paired_worktree = tempfile::tempdir().unwrap();
+        let mut paired = slot_with_process(launch_test_codex(paired_worktree.path(), None).await);
+        paired.task_id = slot.task_id;
+        let reviewers = vec![paired];
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &reviewers), None);
+        for r in reviewers {
+            r.kill_and_reap().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_recorded_park_survives_watchdog_reviewer_capacity_and_lease_visibility() {
+        // End-to-end regression for the DeliveryRecorded → park lifecycle.
+        // Drives the real disposition classifier, the shared park-or-cleanup
+        // helper the two tick branches call, the shared Phase 4d lease
+        // renewal helper, and the shared watchdog and reviewer-eligibility
+        // predicates. A regression that drops the reinsertion at either
+        // production call site, breaks the dormant exemption, or breaks the
+        // lease renewal query must break this test.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("delivery-parks.db");
+        let repo = dir.path().join("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Seed a task in-review with PR 443 for agent "Spool" so that
+        // dispose_dead_turn_runner classifies the exit as DeliveryRecorded.
+        create_active_task(&db_path, "Spool", "working");
+        fire_event_result(
+            &db_path,
+            "Spool",
+            1,
+            &Event::SignaledDone { pr: "443".into() },
+        )
+        .await
+        .unwrap();
+
+        // Force the claim to expire soon so lease renewal is observable —
+        // otherwise `create_active_task` already stamped `now + 3600`, which
+        // `renew_task_lease`'s `MAX(...)` cannot advance.
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE claims SET expires_at = ?1 \
+                 WHERE holder = 'Spool' AND target = 'task#1' AND active = 1",
+                rusqlite::params![now_unix() + 60],
+            )
+            .unwrap();
+        }
+        let expires_before_renewal: i64 = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT expires_at FROM claims \
+                 WHERE holder = 'Spool' AND target = 'task#1' AND active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let disposition = dispose_dead_turn_runner_worker(
+            &db_path,
+            1,
+            "Spool",
+            "process exited",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            disposition,
+            tasks::DeadTurnRunnerDisposition::DeliveryRecorded,
+            "production classifier must still route a normal Codex exit through DeliveryRecorded"
+        );
+
+        // Build a live Codex slot so the shared park-or-cleanup helper reaps
+        // a real turn process and installs the dormant continuation.
+        let dead_proc = launch_test_codex(&repo, None).await;
+        let mut dead = slot_with_process(dead_proc);
+        dead.agent_name = "Spool".into();
+        dead.task_id = 1;
+        dead.pr = Some(443);
+        dead.branch = "daemon/spool-t1".into();
+        dead.remote_branch = "daemon/spool-t1".into();
+        dead.continuation_id = Some("thread-parked".into());
+        dead.draining = true;
+        dead.worktree_path = repo.clone();
+
+        let config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Spool").unwrap();
+        let mut workers: Vec<SlotState> = Vec::new();
+
+        // Drive the exact helper both `DeliveryRecorded` tick branches call.
+        // A regression that stops reinserting the parked slot must leave
+        // `workers` empty here.
+        park_or_cleanup_delivered_worker_slot(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            dead,
+        )
+        .await;
+        assert_eq!(
+            workers.len(),
+            1,
+            "the DeliveryRecorded helper must reinsert the parked slot into the real workers collection"
+        );
+        assert!(
+            matches!(workers[0].proc, SlotProcess::Dormant { .. }),
+            "the reinserted slot must be dormant"
+        );
+        assert_eq!(workers[0].pr, Some(443));
+
+        // Capacity accounting: the parked slot still consumes a worker cap
+        // slot through the exact production accounting function.
+        assert_eq!(available_worker_slots(1, workers.len()), 0);
+        assert_eq!(available_worker_slots(2, workers.len()), 1);
+
+        // Idle watchdog exemption via the production predicate.
+        workers[0].turn_ended_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3600));
+        assert!(
+            !slot_is_idle_zombie_candidate(&workers[0], 300),
+            "watchdog must not reap a dormant awaiting-review slot"
+        );
+
+        // Phase 5 reviewer eligibility via the production predicate.
+        let no_reviewers: Vec<SlotState> = Vec::new();
+        assert_eq!(
+            slot_needs_reviewer_provisioning(&workers[0], &no_reviewers),
+            Some(443),
+            "parked slot must still ask Phase 5 for a reviewer"
+        );
+
+        // Phase 4d lease renewal via the shared production helper. A
+        // regression that filters dormant slots out of the renewal set — or
+        // that stops iterating the workers vec — must leave the claim
+        // expires_at short of the renewed baseline.
+        renew_active_worker_task_leases(&db_path, &workers).await;
+        let expires_after_renewal: i64 = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT expires_at FROM claims \
+                 WHERE holder = 'Spool' AND target = 'task#1' AND active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            expires_after_renewal > expires_before_renewal,
+            "Phase 4d must advance the claim expiry for a dormant awaiting-review slot \
+             ({expires_after_renewal} !> {expires_before_renewal})"
+        );
+        assert!(
+            expires_after_renewal >= now_unix() + quorum_core::tasks::DEFAULT_LEASE_TTL_SECS - 5,
+            "renewed expiry must reach the default TTL baseline"
+        );
+
+        // Assigned lifecycle contract: no duplicate lifecycle transition on
+        // exit-time park — the mailbox-driven Done handling already fired
+        // the task_in_review row; park itself must not re-fire it.
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let in_review_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE subject='task#1' AND kind='task_in_review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            in_review_events, 1,
+            "park must not emit a second in-review event"
+        );
+
+        // Journal contract: awaiting-review phase and pid=None so restart
+        // recovery does not target the reaped process group.
+        let entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent, "Spool");
+        assert_eq!(entries[0].phase, "awaiting-review");
+        assert_eq!(entries[0].pr, Some(443));
+        assert!(entries[0].pid.is_none());
+
+        // Task-level survival: PR/author retained on the row.
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.author.as_deref(), Some("Spool"));
+        assert_eq!(tasks::extract_pr_number(&task.refs), Some(443));
+
+        for w in workers {
+            w.kill_and_reap().await;
+        }
+    }
+
     fn pre_review_ci_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
         let profile = crate::serve_config::ModelProfile {
             runner: "claude".into(),
@@ -17122,6 +17561,42 @@ mod tests {
                 .turn_ended_at
                 .is_some_and(|t| t.elapsed().as_secs() > timeout);
         assert!(!is_zombie);
+    }
+
+    #[tokio::test]
+    async fn slot_is_idle_zombie_candidate_excludes_dormant_awaiting_review_slot() {
+        // Regression guard: the production idle watchdog consults this exact
+        // predicate. Removing the dormancy exclusion inside
+        // `slot_is_idle_zombie_candidate` must break this test.
+        let worktree = tempfile::tempdir().unwrap();
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = Some("thread-parked".into());
+        let old = slot.become_dormant().unwrap();
+        old.kill_and_reap().await;
+        slot.draining = false;
+        slot.error_turn_count = 0;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+
+        assert!(
+            !slot_is_idle_zombie_candidate(&slot, 300),
+            "dormant awaiting-review slot must survive the idle watchdog"
+        );
+    }
+
+    #[test]
+    fn slot_is_idle_zombie_candidate_matches_watchdog_shape_for_running_slot() {
+        // Sanity: a running slot past its idle limit still counts as a zombie
+        // so removing the dormancy branch cannot flip this into a green test.
+        let mut slot = make_dummy_slot();
+        slot.draining = false;
+        slot.error_turn_count = 0;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+        assert!(slot_is_idle_zombie_candidate(&slot, 300));
+        slot.draining = true;
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
+        slot.draining = false;
+        slot.error_turn_count = 1;
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
     }
 
     #[test]
