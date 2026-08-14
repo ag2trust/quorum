@@ -7,8 +7,9 @@
 
 use super::codex_stream::{self, Event};
 use super::runner::{
-    capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, CapturedOutput,
-    DiagnosticBuffer, LaunchMode, LaunchRequest, NormalizedLine, TokenUsage,
+    capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
+    CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation, FailureTracker,
+    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
 };
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -124,7 +125,8 @@ pub struct CodexProc {
     reader: BufReader<tokio::process::ChildStdout>,
     line_buffer: Vec<u8>,
     diagnostics: DiagnosticBuffer,
-    stderr_task: tokio::task::JoinHandle<()>,
+    failures: FailureTracker,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CodexProc {
@@ -174,6 +176,92 @@ impl CodexProc {
         }
     }
 
+    pub(super) fn failure_observation(raw: &str) -> FailureObservation {
+        if raw.is_empty() {
+            return FailureObservation::inert();
+        }
+        let Some(event) = codex_stream::parse_line(raw) else {
+            return FailureObservation::classified(
+                FailureDisposition::NonFailover,
+                "Codex emitted malformed JSONL protocol",
+            );
+        };
+        match event {
+            Event::TurnCompleted { .. } => FailureObservation::success(),
+            Event::TurnFailed { error } => {
+                let message = error.map(|error| error.message).unwrap_or_default();
+                classify_codex_error_text(&message).unwrap_or_else(|| {
+                    FailureObservation::unknown_failure(
+                        "Codex turn.failed did not match a bounded provider signal",
+                    )
+                })
+            }
+            Event::Error { message } => classify_codex_error_text(&message).unwrap_or_else(|| {
+                FailureObservation::unknown_failure(
+                    "Codex error event did not match a bounded provider signal",
+                )
+            }),
+            _ => FailureObservation::inert(),
+        }
+    }
+
+    pub(super) fn stderr_failure_observation(text: &str) -> FailureObservation {
+        if text.len() > 16 * 1024 {
+            return FailureObservation::unknown_failure(
+                "Codex stderr exceeded classification bound",
+            );
+        }
+        if text.starts_with("error: unexpected argument")
+            || text.starts_with("error: invalid value")
+            || text.starts_with("error: unrecognized option")
+            || text.starts_with("Usage: codex exec")
+        {
+            return FailureObservation::classified(
+                FailureDisposition::NonFailover,
+                "Codex rejected the execution protocol or arguments",
+            );
+        }
+        // Authentication and availability are classified from Codex's JSONL
+        // error records, not its timestamped tracing stderr.
+        if text.is_empty() {
+            FailureObservation::inert()
+        } else {
+            FailureObservation::unknown_failure(
+                "Codex stderr did not match a bounded provider signal",
+            )
+        }
+    }
+
+    pub fn classify_pre_authoritative_exit(
+        &self,
+        status: std::process::ExitStatus,
+    ) -> Option<RunnerFailure> {
+        self.failures.classify_exit(status)
+    }
+
+    pub fn observed_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
+        self.failures.observed_failure()
+    }
+
+    pub(super) fn failure_tracker(&self) -> FailureTracker {
+        self.failures.clone()
+    }
+
+    pub(super) async fn finish_stderr_until(&mut self, deadline: tokio::time::Instant) -> bool {
+        let Some(mut task) = self.stderr_task.take() else {
+            return true;
+        };
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                false
+            }
+        }
+    }
+
     /// Read-only, single-turn planner boundary. Kept separate from worker
     /// spawning so future worker flags cannot silently weaken planning.
     pub fn spawn_planner(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
@@ -198,7 +286,8 @@ impl CodexProc {
         }
         let mut child = cmd.spawn()?;
         let reader = BufReader::new(child.stdout.take().expect("stdout was piped"));
-        let diagnostics = DiagnosticBuffer::default();
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
+        let failures = diagnostics.failures();
         let stderr_diagnostics = diagnostics.clone();
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
         let stderr_task =
@@ -208,7 +297,8 @@ impl CodexProc {
             reader,
             line_buffer: Vec::new(),
             diagnostics,
-            stderr_task,
+            failures,
+            stderr_task: Some(stderr_task),
         })
     }
 
@@ -236,7 +326,8 @@ impl CodexProc {
         }
         let mut child = cmd.spawn()?;
         let reader = BufReader::new(child.stdout.take().expect("stdout was piped"));
-        let diagnostics = DiagnosticBuffer::default();
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
+        let failures = diagnostics.failures();
         let stderr_diagnostics = diagnostics.clone();
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
         let stderr_task =
@@ -246,7 +337,8 @@ impl CodexProc {
             reader,
             line_buffer: Vec::new(),
             diagnostics,
-            stderr_task,
+            failures,
+            stderr_task: Some(stderr_task),
         })
     }
 
@@ -286,7 +378,8 @@ impl CodexProc {
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
-        let diagnostics = DiagnosticBuffer::default();
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
+        let failures = diagnostics.failures();
         let stderr_diagnostics = diagnostics.clone();
         let stderr_task =
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
@@ -296,7 +389,8 @@ impl CodexProc {
             reader,
             line_buffer: Vec::new(),
             diagnostics,
-            stderr_task,
+            failures,
+            stderr_task: Some(stderr_task),
         })
     }
 
@@ -326,7 +420,8 @@ impl CodexProc {
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
-        let diagnostics = DiagnosticBuffer::default();
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
+        let failures = diagnostics.failures();
         let stderr_diagnostics = diagnostics.clone();
         let stderr_task =
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
@@ -336,7 +431,8 @@ impl CodexProc {
             reader,
             line_buffer: Vec::new(),
             diagnostics,
-            stderr_task,
+            failures,
+            stderr_task: Some(stderr_task),
         })
     }
 
@@ -407,12 +503,19 @@ impl CodexProc {
             self.line_buffer.pop();
         }
         let bytes = std::mem::take(&mut self.line_buffer);
-        String::from_utf8(bytes).map(Some).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Codex stdout is not UTF-8: {error}"),
-            )
-        })
+        String::from_utf8(bytes)
+            .map(|line| {
+                self.failures.observe_stdout(&line);
+                Some(line)
+            })
+            .map_err(|error| {
+                self.failures
+                    .observe_protocol_read_error(format!("Codex stdout is not UTF-8: {error}"));
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Codex stdout is not UTF-8: {error}"),
+                )
+            })
     }
 
     pub fn pid(&self) -> Option<i32> {
@@ -439,10 +542,74 @@ impl CodexProc {
             terminal.push(CapturedOutput::Stdout(line));
         }
         let diagnostics = self.diagnostics.clone();
-        let _ = self.stderr_task.await;
+        if let Some(stderr_task) = self.stderr_task.take() {
+            let _ = stderr_task.await;
+        }
         terminal.extend(diagnostics.drain());
         terminal
     }
+}
+
+fn classify_codex_error_text(message: &str) -> Option<FailureObservation> {
+    if message.is_empty() || message.len() > 16 * 1024 {
+        return None;
+    }
+    if (message.contains("401 Unauthorized")
+        && message.contains("Missing bearer or basic authentication in header"))
+        || message.contains("Incorrect API key provided")
+        || message == "Not logged in"
+    {
+        return Some(FailureObservation::classified(
+            FailureDisposition::ProviderUnavailable,
+            "Codex reported provider authentication unavailable",
+        ));
+    }
+    if message.contains("model")
+        && (message.contains("does not exist or you do not have access")
+            || message.contains("model_not_found")
+            || message.contains("not available for this account"))
+    {
+        return Some(FailureObservation::classified(
+            FailureDisposition::ProfileUnavailable,
+            "Codex reported the selected model unavailable",
+        ));
+    }
+    if message.contains("429 Too Many Requests")
+        && (message.contains("insufficient_quota") || message.contains("billing_hard_limit"))
+    {
+        return Some(FailureObservation::classified(
+            FailureDisposition::ProviderUnavailable,
+            "Codex reported account quota unavailable",
+        ));
+    }
+    if [
+        "500 Internal Server Error",
+        "502 Bad Gateway",
+        "503 Service Unavailable",
+    ]
+    .iter()
+    .any(|signal| message.contains(signal))
+    {
+        return Some(FailureObservation::classified(
+            FailureDisposition::ProviderUnavailable,
+            "Codex reported a provider outage",
+        ));
+    }
+    if [
+        "connection reset by peer",
+        "error sending request",
+        "connection timed out",
+        "operation timed out",
+    ]
+    .iter()
+    .any(|signal| message.to_ascii_lowercase().contains(signal))
+    {
+        return Some(FailureObservation::classified(
+            FailureDisposition::RetryableSameRoute,
+            "Codex reported a retryable transport failure",
+        ));
+    }
+    None
 }
 
 fn codex_line_limit_error(limit: usize) -> std::io::Error {
@@ -537,7 +704,8 @@ mod tests {
         let mut child = command.spawn().unwrap();
         let reader = BufReader::new(child.stdout.take().unwrap());
         let stderr = BufReader::new(child.stderr.take().unwrap());
-        let diagnostics = DiagnosticBuffer::default();
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
+        let failures = diagnostics.failures();
         let stderr_diagnostics = diagnostics.clone();
         let stderr_task =
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
@@ -546,8 +714,22 @@ mod tests {
             reader,
             line_buffer: Vec::new(),
             diagnostics,
-            stderr_task,
+            failures,
+            stderr_task: Some(stderr_task),
         }
+    }
+
+    async fn wait_for_exit(proc: &mut CodexProc) -> std::process::ExitStatus {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(status) = proc.try_wait().unwrap() {
+                    return status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture process did not exit")
     }
 
     fn test_spec() -> CodexSpec {
@@ -1020,6 +1202,192 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
                 "codex rejected resume argument shape: {stderr}"
             );
         }
+    }
+
+    #[test]
+    fn real_codex_auth_fixture_is_provider_wide() {
+        // Captured from codex-cli 0.145.0 with an empty CODEX_HOME/API key.
+        let fixture = r#"{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses"}}"#;
+        assert_eq!(
+            CodexProc::failure_observation(fixture).disposition,
+            Some(FailureDisposition::ProviderUnavailable)
+        );
+    }
+
+    #[test]
+    fn codex_model_unavailable_fixture_is_profile_scoped() {
+        let fixture = r#"{"type":"turn.failed","error":{"message":"The model `gpt-future` does not exist or you do not have access to it."}}"#;
+        assert_eq!(
+            CodexProc::failure_observation(fixture).disposition,
+            Some(FailureDisposition::ProfileUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_nonzero_malformed_early_eof_and_unknown_are_bounded() {
+        let mut nonzero = shell_proc("exit 7").await;
+        assert!(nonzero.next_raw_line().await.is_none());
+        let status = wait_for_exit(&mut nonzero).await;
+        assert!(
+            nonzero
+                .finish_stderr_until(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                )
+                .await
+        );
+        assert_eq!(
+            nonzero
+                .classify_pre_authoritative_exit(status)
+                .unwrap()
+                .disposition(),
+            FailureDisposition::NonFailover
+        );
+
+        let mut ordinary =
+            shell_proc("echo 'error: unexpected argument --future' >&2; exit 2").await;
+        assert!(ordinary.next_raw_line().await.is_none());
+        let status = wait_for_exit(&mut ordinary).await;
+        assert!(
+            ordinary
+                .finish_stderr_until(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                )
+                .await
+        );
+        assert_eq!(
+            ordinary
+                .classify_pre_authoritative_exit(status)
+                .unwrap()
+                .disposition(),
+            FailureDisposition::NonFailover
+        );
+
+        let mut malformed = shell_proc("printf '%s\\n' 'not-json'").await;
+        while malformed.next_raw_line().await.is_some() {}
+        let status = wait_for_exit(&mut malformed).await;
+        assert_eq!(
+            malformed
+                .classify_pre_authoritative_exit(status)
+                .unwrap()
+                .disposition(),
+            FailureDisposition::NonFailover
+        );
+
+        let mut early_eof = shell_proc(
+            "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}'",
+        )
+        .await;
+        while early_eof.next_raw_line().await.is_some() {}
+        let status = wait_for_exit(&mut early_eof).await;
+        assert_eq!(
+            early_eof
+                .classify_pre_authoritative_exit(status)
+                .unwrap()
+                .disposition(),
+            FailureDisposition::RetryableSameRoute
+        );
+
+        let mut unknown = shell_proc("echo 'future provider diagnostic' >&2; exit 1").await;
+        assert!(unknown.next_raw_line().await.is_none());
+        let status = wait_for_exit(&mut unknown).await;
+        assert!(
+            unknown
+                .finish_stderr_until(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                )
+                .await
+        );
+        let failure = unknown.classify_pre_authoritative_exit(status).unwrap();
+        assert_eq!(failure.disposition(), FailureDisposition::Unclassified);
+    }
+
+    #[tokio::test]
+    async fn exit_finalization_drains_past_tick_cap_and_joins_stderr() {
+        let prefix = "i=0; while [ $i -lt 70 ]; do printf '%s\\n' \
+            '{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}'; \
+            i=$((i+1)); done;";
+
+        let mut failed = shell_proc(&format!(
+            "{prefix} printf '%s\\n' \
+             '{{\"type\":\"turn.failed\",\"error\":{{\"message\":\"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header\"}}}}'; exit 1"
+        ))
+        .await;
+        for _ in 0..64 {
+            assert!(failed.next_raw_line().await.is_some());
+        }
+        let failed_status = wait_for_exit(&mut failed).await;
+        let mut failed = crate::serve::runner::RunnerProc::Codex(failed);
+        let terminal = failed.finalize_pre_authoritative_evidence().await;
+        assert!(!terminal.is_empty());
+        assert_eq!(
+            failed
+                .classify_pre_authoritative_exit(failed_status)
+                .unwrap()
+                .disposition(),
+            FailureDisposition::ProviderUnavailable
+        );
+        failed.kill_and_reap().await;
+
+        let mut succeeded = shell_proc(&format!(
+            "{prefix} printf '%s\\n' '{{\"type\":\"turn.completed\"}}'"
+        ))
+        .await;
+        for _ in 0..64 {
+            assert!(succeeded.next_raw_line().await.is_some());
+        }
+        let succeeded_status = wait_for_exit(&mut succeeded).await;
+        let mut succeeded = crate::serve::runner::RunnerProc::Codex(succeeded);
+        succeeded.finalize_pre_authoritative_evidence().await;
+        assert!(succeeded
+            .classify_pre_authoritative_exit(succeeded_status)
+            .is_none());
+        succeeded.kill_and_reap().await;
+
+        let mut delayed_stderr = shell_proc(&format!("{prefix} exit 1")).await;
+        if let Some(task) = delayed_stderr.stderr_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        let delayed_failures = delayed_stderr.failures.clone();
+        delayed_stderr.stderr_task = Some(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            delayed_failures.observe_stderr("future stderr boundary");
+        }));
+        for _ in 0..64 {
+            assert!(delayed_stderr.next_raw_line().await.is_some());
+        }
+        let stderr_status = wait_for_exit(&mut delayed_stderr).await;
+        assert_eq!(
+            delayed_stderr
+                .classify_pre_authoritative_exit(stderr_status)
+                .unwrap()
+                .disposition(),
+            FailureDisposition::RetryableSameRoute,
+            "fixture must reproduce the pre-finalization stderr race"
+        );
+        let mut delayed_stderr = crate::serve::runner::RunnerProc::Codex(delayed_stderr);
+        delayed_stderr.finalize_pre_authoritative_evidence().await;
+        assert_eq!(
+            delayed_stderr
+                .classify_pre_authoritative_exit(stderr_status)
+                .unwrap()
+                .disposition(),
+            FailureDisposition::Unclassified
+        );
+        delayed_stderr.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn semantic_failures_and_review_text_cannot_be_runner_failures() {
+        let script = "printf '%s\\n' \
+            '{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}' \
+            '{\"type\":\"item.completed\",\"item\":{\"id\":\"cmd\",\"type\":\"command_execution\",\"command\":\"cargo test\",\"aggregated_output\":\"test failed\",\"exit_code\":1,\"status\":\"failed\"}}' \
+            '{\"type\":\"item.completed\",\"item\":{\"id\":\"msg\",\"type\":\"agent_message\",\"text\":\"reported failed blocked needs-info; BLOCKING review finding\"}}' \
+            '{\"type\":\"turn.completed\"}'";
+        let mut proc = shell_proc(script).await;
+        while proc.next_raw_line().await.is_some() {}
+        let status = wait_for_exit(&mut proc).await;
+        assert!(proc.classify_pre_authoritative_exit(status).is_none());
     }
 
     #[tokio::test]
