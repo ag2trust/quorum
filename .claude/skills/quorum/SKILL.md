@@ -68,9 +68,10 @@ Use a review-only task only when an existing delivery needs review and merge, no
 quorum task-create --created-by <You> --title "Review PR #<PR>" --review-pr <PR> --body-stdin
 ```
 
-`--continue-pr` and `--review-pr` are mutually exclusive. A review-only task has no
-implementation worker: a changes verdict fails the task and the outside PR author must repair
-the branch. Create a continuation instead when Quorum must make the repairs.
+`--continue-pr` and `--review-pr` are mutually exclusive. A review-only task skips the initial
+implementation worker. A changes verdict starts bounded daemon-managed remediation against the
+existing PR, then returns to review; use a continuation when implementation work is needed from
+the outset.
 
 The classifier uses this shared complexity rubric:
 

@@ -261,8 +261,8 @@ fn init_installs_current_embedded_recovery_skill() {
     );
     assert!(
         skill.contains("--continue-pr <PR>")
-            && skill.contains("review-only task has no")
-            && skill.contains("changes verdict fails"),
+            && skill.contains("review-only task skips the initial")
+            && skill.contains("bounded daemon-managed remediation"),
         "fresh installs must distinguish continuations from review-only tasks"
     );
     assert!(
