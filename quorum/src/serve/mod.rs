@@ -2590,11 +2590,13 @@ pub struct CostLimits {
     pub max_task_tokens: Option<i64>,
     pub max_turn_cost_usd: Option<f64>,
     pub max_task_cost_usd: Option<f64>,
+    /// Legacy alias for max_idle_secs.
     pub max_turn_wall_secs: Option<u64>,
+    /// Max seconds an active worker/reviewer may go without emitting an
+    /// event. Default: 900.
+    pub max_idle_secs: Option<u64>,
     pub max_task_wall_secs: Option<u64>,
-    /// Max seconds a worker/reviewer may sit idle between turns (draining=false)
-    /// before the watchdog kills it. Catches zombies that asked a question no one
-    /// can answer (e.g. permission denied in dontAsk mode). Default: 300.
+    /// Legacy idle limit retained for compatibility. Prefer max_idle_secs.
     pub idle_timeout_secs: Option<u64>,
 }
 
@@ -2922,6 +2924,9 @@ pub(crate) struct SlotState {
     cost_usd: f64,
     task_started_at: std::time::Instant,
     turn_started_at: std::time::Instant,
+    /// Updated whenever the provider emits a normalized event for this slot.
+    /// The watchdog uses it to distinguish a live turn from a silent one.
+    last_event_at: std::time::Instant,
     /// Set when `draining` flips to false (turn completed). Used by the idle
     /// watchdog to detect zombies sitting between turns indefinitely.
     turn_ended_at: Option<std::time::Instant>,
@@ -3019,7 +3024,9 @@ async fn begin_sticky_worker_rework(slot: &mut SlotState, db_path: &Path) {
     );
     slot.draining = true;
     slot.rework_count += 1;
-    slot.turn_started_at = std::time::Instant::now();
+    let now = std::time::Instant::now();
+    slot.turn_started_at = now;
+    slot.last_event_at = now;
     if let Some(ref mut session_log) = slot.session_log {
         session_log.log_rework(slot.rework_count);
     }
@@ -5827,7 +5834,9 @@ async fn resume_reviewer_after_ci(
             reviewers[reviewer_index].agent_name
         ));
         reviewers[reviewer_index].draining = true;
-        reviewers[reviewer_index].turn_started_at = std::time::Instant::now();
+        let now = std::time::Instant::now();
+        reviewers[reviewer_index].turn_started_at = now;
+        reviewers[reviewer_index].last_event_at = now;
         reviewers[reviewer_index].reviewed_head_sha = Some(gated_head_sha);
     }
     pre_review_checks.remove(&task_id);
@@ -9580,7 +9589,11 @@ async fn tick(
     }
 
     // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
-    let idle_timeout = config.limits.idle_timeout_secs.unwrap_or(300);
+    let idle_timeout = config
+        .limits
+        .max_idle_secs
+        .or(config.limits.idle_timeout_secs)
+        .unwrap_or(900);
     let mut idle_reviewers: Vec<usize> = Vec::new();
     for (i, r) in reviewers.iter().enumerate() {
         if r.draining {
@@ -9752,7 +9765,9 @@ async fn tick(
         match feed_worker_turn(w, &raw_prompt, config).await {
             Ok(()) => {
                 w.draining = true;
-                w.turn_started_at = std::time::Instant::now();
+                let now = std::time::Instant::now();
+                w.turn_started_at = now;
+                w.last_event_at = now;
                 log(&format!(
                     "auto-refeed worker {} after error (attempt {}/{})",
                     w.agent_name, w.error_turn_count, MAX_ERROR_RETRIES
@@ -10266,7 +10281,9 @@ async fn tick(
                 match feed_worker_turn(&mut workers[wi], &raw_prompt, config).await {
                     Ok(()) => {
                         workers[wi].draining = true;
-                        workers[wi].turn_started_at = std::time::Instant::now();
+                        let now = std::time::Instant::now();
+                        workers[wi].turn_started_at = now;
+                        workers[wi].last_event_at = now;
                         log(&format!(
                             "delivered message from {} to {} (task #{})",
                             msg_row.agent, target, workers[wi].task_id,
@@ -11330,7 +11347,7 @@ enum LimitBreached {
     TurnCostUsd { turn: f64, max: f64 },
     TurnCostUsdMissing { max: f64 },
     TaskCostUsd { total: f64, max: f64 },
-    TurnWallSecs { elapsed: u64, max: u64 },
+    IdleSecs { elapsed: u64, max: u64 },
     TaskWallSecs { elapsed: u64, max: u64 },
 }
 
@@ -11352,8 +11369,8 @@ impl std::fmt::Display for LimitBreached {
             Self::TaskCostUsd { total, max } => {
                 write!(f, "task cost ${total:.4} exceeded limit ${max:.4}")
             }
-            Self::TurnWallSecs { elapsed, max } => {
-                write!(f, "turn wall-clock {elapsed}s exceeded limit {max}s")
+            Self::IdleSecs { elapsed, max } => {
+                write!(f, "idle {elapsed}s exceeded limit {max}s")
             }
             Self::TaskWallSecs { elapsed, max } => {
                 write!(f, "task wall-clock {elapsed}s exceeded limit {max}s")
@@ -11409,10 +11426,13 @@ fn check_post_result_limits(
             });
         }
     }
-    if let Some(max) = limits.max_turn_wall_secs {
-        let elapsed = slot.turn_started_at.elapsed().as_secs();
-        if elapsed > max {
-            return Some(LimitBreached::TurnWallSecs { elapsed, max });
+    if let Some(max_idle_secs) = max_idle_secs(limits) {
+        let elapsed = slot.last_event_at.elapsed().as_secs();
+        if elapsed > max_idle_secs {
+            return Some(LimitBreached::IdleSecs {
+                elapsed,
+                max: max_idle_secs,
+            });
         }
     }
     if let Some(max) = limits.max_task_wall_secs {
@@ -11426,10 +11446,13 @@ fn check_post_result_limits(
 
 /// Check wall-clock limits only (called each tick for slots still draining).
 fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<LimitBreached> {
-    if let Some(max) = limits.max_turn_wall_secs {
-        let elapsed = slot.turn_started_at.elapsed().as_secs();
-        if elapsed > max {
-            return Some(LimitBreached::TurnWallSecs { elapsed, max });
+    if let Some(max_idle_secs) = max_idle_secs(limits) {
+        let elapsed = slot.last_event_at.elapsed().as_secs();
+        if elapsed > max_idle_secs {
+            return Some(LimitBreached::IdleSecs {
+                elapsed,
+                max: max_idle_secs,
+            });
         }
     }
     if let Some(max) = limits.max_task_wall_secs {
@@ -11439,6 +11462,12 @@ fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<Limi
         }
     }
     None
+}
+
+/// Prefer the explicit idle ceiling while accepting the retired turn-wall
+/// option as a compatibility alias with the new event-based semantics.
+fn max_idle_secs(limits: &CostLimits) -> Option<u64> {
+    limits.max_idle_secs.or(limits.max_turn_wall_secs)
 }
 
 /// Feed a worker turn according to the adapter's declared process lifetime.
@@ -12284,6 +12313,7 @@ async fn drain_events(
         }
 
         for agent_event in &events {
+            slot.last_event_at = std::time::Instant::now();
             match agent_event {
                 runner::AgentEvent::ThreadStarted { thread_id } => {
                     slot.continuation_id = Some(thread_id.clone());
@@ -13435,6 +13465,7 @@ async fn provision_reviewer_reserved(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: None,
                 agent_state: None,
                 session_log: reviewer_session_log,
@@ -14163,6 +14194,7 @@ async fn spawn_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
@@ -15806,6 +15838,7 @@ async fn spawn_remediation_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
@@ -17191,6 +17224,7 @@ mod tests {
             cost_usd: 0.01,
             task_started_at: now,
             turn_started_at: now,
+            last_event_at: now,
             turn_ended_at: None,
             agent_state: None,
             session_log: None,
@@ -17204,6 +17238,47 @@ mod tests {
             continuation_id: None,
             pending_prompt: "test prompt".into(),
             pending_turn_kind: "initial".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_events_advances_last_event_at_for_worker_and_reviewer() {
+        use tokio::io::BufReader;
+
+        for role in ["worker", "reviewer"] {
+            let mut child = tokio::process::Command::new("sh")
+                .args([
+                    "-c",
+                    r#"printf '%s\n' '{"type":"tool_use","name":"Bash","input":{"command":"true"}}'"#,
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+                child,
+                stdin,
+                BufReader::new(stdout),
+            ));
+            let mut slot = slot_with_process(proc);
+            slot.last_event_at = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap();
+            let previous = slot.last_event_at;
+            let tempdir = tempfile::tempdir().unwrap();
+
+            assert!(
+                drain_events(&mut slot, tempdir.path(), role, &CostLimits::default())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                slot.last_event_at > previous,
+                "{role} liveness stamp was not advanced by the tool event"
+            );
         }
     }
 
@@ -17410,6 +17485,7 @@ mod tests {
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: Some(now_instant),
                 agent_state: None,
                 session_log: None,
@@ -18205,6 +18281,7 @@ mod tests {
             cost_usd: 0.0,
             task_started_at: now,
             turn_started_at: now,
+            last_event_at: now,
             turn_ended_at: None,
             agent_state: None,
             session_log: None,
@@ -18626,6 +18703,62 @@ mod tests {
     }
 
     #[test]
+    fn actively_emitting_slot_is_not_reaped_after_old_turn_wall_limit() {
+        let mut slot = make_dummy_slot();
+        let now = std::time::Instant::now();
+        slot.turn_started_at = now - std::time::Duration::from_secs(2_701);
+        slot.last_event_at = now;
+        let limits = CostLimits {
+            max_idle_secs: Some(60),
+            ..Default::default()
+        };
+
+        assert!(check_wall_clock_limits(&limits, &slot).is_none());
+        assert!(check_post_result_limits(&limits, 0, 0, Some(0.0), 0.0, &slot).is_none());
+    }
+
+    #[test]
+    fn stale_event_breaches_idle_limit_in_both_limit_checks() {
+        let mut slot = make_dummy_slot();
+        slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        let limits = CostLimits {
+            max_idle_secs: Some(60),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            check_wall_clock_limits(&limits, &slot),
+            Some(LimitBreached::IdleSecs { max: 60, .. })
+        ));
+        assert!(matches!(
+            check_post_result_limits(&limits, 0, 0, Some(0.0), 0.0, &slot),
+            Some(LimitBreached::IdleSecs { max: 60, .. })
+        ));
+    }
+
+    #[test]
+    fn task_wall_limit_breaches_independently_of_idle_state() {
+        let mut slot = make_dummy_slot();
+        let now = std::time::Instant::now();
+        slot.task_started_at = now - std::time::Duration::from_secs(61);
+        slot.last_event_at = now;
+        let limits = CostLimits {
+            max_idle_secs: Some(60),
+            max_task_wall_secs: Some(60),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            check_wall_clock_limits(&limits, &slot),
+            Some(LimitBreached::TaskWallSecs { max: 60, .. })
+        ));
+        assert!(matches!(
+            check_post_result_limits(&limits, 0, 0, Some(0.0), 0.0, &slot),
+            Some(LimitBreached::TaskWallSecs { max: 60, .. })
+        ));
+    }
+
+    #[test]
     fn limit_breached_display_all_variants() {
         let cases: Vec<LimitBreached> = vec![
             LimitBreached::TurnTokens { turn: 100, max: 50 },
@@ -18641,7 +18774,7 @@ mod tests {
                 total: 1.0,
                 max: 0.5,
             },
-            LimitBreached::TurnWallSecs {
+            LimitBreached::IdleSecs {
                 elapsed: 120,
                 max: 60,
             },
@@ -18670,6 +18803,7 @@ mod tests {
         assert!(limits.max_turn_cost_usd.is_none());
         assert!(limits.max_task_cost_usd.is_none());
         assert!(limits.max_turn_wall_secs.is_none());
+        assert!(limits.max_idle_secs.is_none());
         assert!(limits.max_task_wall_secs.is_none());
         assert!(limits.idle_timeout_secs.is_none());
     }

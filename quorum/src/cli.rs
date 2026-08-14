@@ -446,14 +446,16 @@ pub enum Command {
         /// Max cumulative USD cost per task.
         #[arg(long)]
         max_task_cost_usd: Option<f64>,
-        /// Max wall-clock seconds per single turn.
+        /// Legacy alias for max_idle_secs.
         #[arg(long)]
         max_turn_wall_secs: Option<u64>,
+        /// Max seconds an active worker/reviewer may go without emitting an event.
+        #[arg(long)]
+        max_idle_secs: Option<u64>,
         /// Max wall-clock seconds per task (across all turns).
         #[arg(long)]
         max_task_wall_secs: Option<u64>,
-        /// Max seconds a worker/reviewer may sit idle between turns before
-        /// the watchdog kills it (default: 300). Catches zombies.
+        /// Legacy idle limit. Prefer max_idle_secs (default: 900).
         #[arg(long)]
         idle_timeout_secs: Option<u64>,
         /// Comma-separated tool allowlist for spawned agents (overrides built-in default).

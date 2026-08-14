@@ -140,6 +140,7 @@ declare_serve_file_config! {
     max_turn_cost_usd: Option<f64>,
     max_task_cost_usd: Option<f64>,
     max_turn_wall_secs: Option<u64>,
+    max_idle_secs: Option<u64>,
     max_task_wall_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
     allowed_tools: Option<String>,
@@ -214,6 +215,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("max_turn_cost_usd", ConfigKeyDisposition::Runtime),
     ("max_task_cost_usd", ConfigKeyDisposition::Runtime),
     ("max_turn_wall_secs", ConfigKeyDisposition::Runtime),
+    ("max_idle_secs", ConfigKeyDisposition::Runtime),
     ("max_task_wall_secs", ConfigKeyDisposition::Runtime),
     ("idle_timeout_secs", ConfigKeyDisposition::Runtime),
     ("allowed_tools", ConfigKeyDisposition::Runtime),
@@ -975,6 +977,7 @@ pub struct BannerData<'a> {
     pub self_update_drain: &'a Sourced<bool>,
     pub drain_timeout_secs: &'a Sourced<u64>,
     pub max_turn_wall_secs: &'a Sourced<Option<u64>>,
+    pub max_idle_secs: &'a Sourced<Option<u64>>,
     pub max_task_wall_secs: &'a Sourced<Option<u64>>,
     pub idle_timeout_secs: &'a Sourced<Option<u64>>,
     pub max_turn_tokens: &'a Sourced<Option<i64>>,
@@ -1052,6 +1055,13 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!(
         "  max_turn_wall_secs:        {}",
         opt_u64(d.max_turn_wall_secs)
+    ));
+    lines.push(format!(
+        "  max_idle_secs:             {}",
+        match d.max_idle_secs.value {
+            Some(v) => format!("{v} ({src})", src = d.max_idle_secs.source),
+            None => format!("900 ({src})", src = d.max_idle_secs.source),
+        }
     ));
     lines.push(format!(
         "  max_task_wall_secs:        {}",
@@ -1279,6 +1289,7 @@ primary = 100
                 r#"
 cap = 8
 max_turn_wall_secs = 2700
+max_idle_secs = 900
 max_task_wall_secs = 14400
 repo = "ag2trust/quorum"
 repo_dir = "/home/user/dev/quorum"
@@ -1295,6 +1306,7 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
             "high"
         );
         assert_eq!(cfg.max_turn_wall_secs, Some(2700));
+        assert_eq!(cfg.max_idle_secs, Some(900));
         assert!(cfg.doctor_enabled.is_none());
     }
 
@@ -1913,6 +1925,10 @@ worktree_base = "/tmp/wt"
                 value: Some(2700),
                 source: Source::File,
             },
+            max_idle_secs: &Sourced {
+                value: None,
+                source: Source::Default,
+            },
             max_task_wall_secs: &Sourced {
                 value: None,
                 source: Source::Default,
@@ -1963,6 +1979,10 @@ worktree_base = "/tmp/wt"
         assert!(
             b.contains("2700 (file)"),
             "wall secs should show file source: {b}"
+        );
+        assert!(
+            b.contains("max_idle_secs:             900 (default)"),
+            "max_idle_secs should default to 900: {b}"
         );
         assert!(b.contains("(default)"), "defaults should be labeled: {b}");
     }
