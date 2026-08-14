@@ -18,6 +18,7 @@ pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_STDOUT_BYTES: usize = 256 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
+pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigned worktree and repository are writable. This defense-in-depth guidance does not itself enforce that boundary.";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
@@ -77,9 +78,10 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          closed DAG of 2-8 independently deliverable implementation tasks, each size S or M. \
          Preserve every source constraint. Do not create synthetic integration work, recursive \
          planning, or unrelated scope. Dependencies must be real delivery prerequisites and may \
-         reference another task key or source:<dependency-id>. Worker guidance: only the assigned \
-         worktree and repository are writable; this defense-in-depth guidance does not itself \
-         enforce that boundary. Return exactly one valid JSON \
+         reference another task key or source:<dependency-id>. Every PLAN task's \
+         `source_constraints` must include this worker-facing guidance: \
+         \"{WORKER_WRITABILITY_GUIDANCE}\". The daemon adds it deterministically, so it is \
+         guidance rather than an enforcement claim. Return exactly one valid JSON \
          object, with no markdown or commentary. The object must be exactly one of these closed \
          shapes: do not omit, rename, or add fields.\n\
          PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"observable_outcome\":\"<observable-outcome>\",\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
@@ -89,6 +91,19 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          to {MAX_REJECTION_SUMMARY_BYTES} bytes. On retry, use only those summaries to correct \
          the cited semantic defect; do not discuss them or request more context.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
     )
+}
+
+/// Add the worker-facing defense-in-depth guidance to every generated child,
+/// independent of the planner's response.
+pub fn with_worker_writability_guidance(source_constraints: &[String]) -> Vec<String> {
+    let mut constraints = source_constraints.to_vec();
+    if !constraints
+        .iter()
+        .any(|constraint| constraint == WORKER_WRITABILITY_GUIDANCE)
+    {
+        constraints.push(WORKER_WRITABILITY_GUIDANCE.into());
+    }
+    constraints
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -798,11 +813,10 @@ mod tests {
             r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#
         ));
         assert!(prompt.contains("`outcome` must be exactly `plan` or `blocker`"));
-        assert!(prompt
-            .contains("Worker guidance: only the assigned worktree and repository are writable"));
-        assert!(
-            prompt.contains("this defense-in-depth guidance does not itself enforce that boundary")
-        );
+        assert!(prompt.contains(&format!(
+            "Every PLAN task's `source_constraints` must include this worker-facing guidance: \"{WORKER_WRITABILITY_GUIDANCE}\""
+        )));
+        assert!(prompt.contains("The daemon adds it deterministically"));
     }
 
     #[test]
@@ -833,6 +847,21 @@ mod tests {
         )));
         assert!(prompt
             .contains("On retry, use only those summaries to correct the cited semantic defect"));
+    }
+
+    #[test]
+    fn worker_writability_guidance_is_added_without_trusting_the_planner() {
+        let constraints = vec!["preserve atomicity".into()];
+        let with_guidance = with_worker_writability_guidance(&constraints);
+        assert_eq!(with_guidance.len(), 2);
+        assert_eq!(with_guidance[0], "preserve atomicity");
+        assert_eq!(with_guidance[1], WORKER_WRITABILITY_GUIDANCE);
+
+        let already_present = vec![WORKER_WRITABILITY_GUIDANCE.into()];
+        assert_eq!(
+            with_worker_writability_guidance(&already_present),
+            already_present
+        );
     }
 
     #[test]

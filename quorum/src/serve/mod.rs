@@ -4656,7 +4656,9 @@ fn proposed_classifier_tasks(
                     serde_json::json!({
                         "observable_outcome": task.observable_outcome,
                         "acceptance_criteria": task.acceptance_criteria,
-                        "source_constraints": task.source_constraints,
+                        "source_constraints": planner::with_worker_writability_guidance(
+                            &task.source_constraints,
+                        ),
                         "verification_expectations": task.verification_expectations,
                     })
                     .to_string(),
@@ -4705,7 +4707,9 @@ fn planned_children(
                 body: serde_json::json!({
                     "observable_outcome": task.observable_outcome,
                     "acceptance_criteria": task.acceptance_criteria,
-                    "source_constraints": task.source_constraints,
+                    "source_constraints": planner::with_worker_writability_guidance(
+                        &task.source_constraints,
+                    ),
                     "verification_expectations": task.verification_expectations,
                 })
                 .to_string(),
@@ -22713,6 +22717,15 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].local_key, "a");
         assert_eq!(children[1].prerequisite_keys, ["a"]);
+        let child_body: serde_json::Value = serde_json::from_str(&children[0].body).unwrap();
+        assert!(child_body["source_constraints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|constraint| constraint == planner::WORKER_WRITABILITY_GUIDANCE));
+        let worker_prompt =
+            reviewer::build_worker_prompt("worker", 7, &children[0].title, &children[0].body, None);
+        assert!(worker_prompt.contains(planner::WORKER_WRITABILITY_GUIDANCE));
 
         let mut not_ready = valid.clone();
         not_ready[0].ready = false;
