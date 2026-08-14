@@ -81,8 +81,9 @@ primary = 100
 # max_turn_cost_usd = 5.0
 # max_task_cost_usd = 50.0
 # max_turn_wall_secs = 2700
+# max_idle_secs = 900
 # max_task_wall_secs = 14400
-# idle_timeout_secs = 300
+# idle_timeout_secs = 300 # legacy alias for max_idle_secs
 
 ## Merge
 # merge_token_file = \"/path/to/token\"
@@ -1150,6 +1151,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             max_turn_cost_usd,
             max_task_cost_usd,
             max_turn_wall_secs,
+            max_idle_secs,
             max_task_wall_secs,
             idle_timeout_secs,
             allowed_tools,
@@ -1248,6 +1250,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r_max_task_cost.value,
             )?;
             let r_max_turn_wall = resolve_opt(max_turn_wall_secs, file_cfg.max_turn_wall_secs);
+            let r_max_idle = resolve_opt(max_idle_secs, file_cfg.max_idle_secs);
             let r_max_task_wall = resolve_opt(max_task_wall_secs, file_cfg.max_task_wall_secs);
             let r_idle_timeout = resolve_opt(idle_timeout_secs, file_cfg.idle_timeout_secs);
             let r_allowed_tools =
@@ -1318,6 +1321,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 self_update_drain: &r_self_update,
                 drain_timeout_secs: &r_drain_timeout,
                 max_turn_wall_secs: &r_max_turn_wall,
+                max_idle_secs: &r_max_idle,
                 max_task_wall_secs: &r_max_task_wall,
                 idle_timeout_secs: &r_idle_timeout,
                 max_turn_tokens: &r_max_turn_tokens,
@@ -1387,6 +1391,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     max_turn_cost_usd: r_max_turn_cost.value,
                     max_task_cost_usd: r_max_task_cost.value,
                     max_turn_wall_secs: r_max_turn_wall.value,
+                    max_idle_secs: r_max_idle.value,
                     max_task_wall_secs: r_max_task_wall.value,
                     idle_timeout_secs: r_idle_timeout.value,
                 },
