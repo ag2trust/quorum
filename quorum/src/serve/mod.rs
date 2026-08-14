@@ -3817,7 +3817,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
     let source_bytes = usize::try_from(source_bytes)
         .map_err(|_| QuorumError::Io("invalid planning source byte count".into()))?;
     let accepted_proposal = accepted_proposal_json
-        .map(|json| serde_json::from_str(&json))
+        .map(|json| planner::parse_accepted_proposal(&json))
         .transpose()
         .map_err(|error| QuorumError::Io(format!("invalid durable accepted proposal: {error}")))?;
     let mut statement = conn.prepare(
@@ -3898,7 +3898,7 @@ fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupD
         let raw = proposal.ok_or_else(|| {
             QuorumError::Io(format!("{state} decomposition lacks accepted proposal"))
         })?;
-        serde_json::from_str::<Vec<planner::ProposedTask>>(&raw).map_err(|error| {
+        planner::parse_accepted_proposal(&raw).map_err(|error| {
             QuorumError::Io(format!(
                 "{state} decomposition proposal is invalid: {error}"
             ))
@@ -4655,6 +4655,7 @@ fn proposed_classifier_tasks(
                 body: Some(
                     serde_json::json!({
                         "observable_outcome": task.observable_outcome,
+                        "deliverables": task.deliverables,
                         "acceptance_criteria": task.acceptance_criteria,
                         "source_constraints": planner::with_worker_writability_guidance(
                             &task.source_constraints,
@@ -4706,6 +4707,7 @@ fn planned_children(
                 title: task.title.clone(),
                 body: serde_json::json!({
                     "observable_outcome": task.observable_outcome,
+                    "deliverables": task.deliverables,
                     "acceptance_criteria": task.acceptance_criteria,
                     "source_constraints": planner::with_worker_writability_guidance(
                         &task.source_constraints,
@@ -15972,6 +15974,12 @@ mod tests {
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    fn writable_deliverables(path: &str) -> quorum_core::decomposition::ChildDeliverables {
+        quorum_core::decomposition::ChildDeliverables(vec![
+            quorum_core::decomposition::ChildDeliverable::Write { path: path.into() },
+        ])
+    }
+
     struct TimedOutPreReviewChecks;
 
     impl merge::MergeExecutor for TimedOutPreReviewChecks {
@@ -22680,6 +22688,7 @@ mod tests {
                 key: "a".into(),
                 title: "a".into(),
                 observable_outcome: "a works".into(),
+                deliverables: writable_deliverables("src/a.rs"),
                 acceptance_criteria: vec!["a".into()],
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
@@ -22689,6 +22698,7 @@ mod tests {
                 key: "b".into(),
                 title: "b".into(),
                 observable_outcome: "b works".into(),
+                deliverables: writable_deliverables("src/b.rs"),
                 acceptance_criteria: vec!["b".into()],
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
@@ -22773,6 +22783,7 @@ mod tests {
             key: "bounded-child".into(),
             title: "bounded child".into(),
             observable_outcome: "bounded evidence persists".into(),
+            deliverables: writable_deliverables("src/bounded.rs"),
             acceptance_criteria: vec!["bounded".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["test".into()],
@@ -22816,6 +22827,7 @@ mod tests {
             key: "readiness".into(),
             title: "readiness".into(),
             observable_outcome: "readiness is observable".into(),
+            deliverables: writable_deliverables("src/readiness.rs"),
             acceptance_criteria: vec!["readiness".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["test".into()],
@@ -23078,6 +23090,7 @@ mod tests {
                         key: "a".into(),
                         title: "a".into(),
                         observable_outcome: "a".into(),
+                        deliverables: writable_deliverables("src/a.rs"),
                         acceptance_criteria: vec!["a".into()],
                         source_constraints: vec!["a".into()],
                         verification_expectations: vec!["a".into()],
@@ -23087,6 +23100,7 @@ mod tests {
                         key: "b".into(),
                         title: "b".into(),
                         observable_outcome: "b".into(),
+                        deliverables: writable_deliverables("src/b.rs"),
                         acceptance_criteria: vec!["b".into()],
                         source_constraints: vec!["b".into()],
                         verification_expectations: vec!["b".into()],
