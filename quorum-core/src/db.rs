@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 48;
+pub const SCHEMA_VERSION: i64 = 49;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -742,6 +742,9 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                      ON review_followup_assessments(source_task_id);",
             )?;
         }
+        // v49 adds immutable responsibility-scoped routing-attempt evidence.
+        // The table, assignment guard, immutability triggers, and read index are
+        // all additive and created idempotently by SCHEMA_SQL above.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -807,6 +810,7 @@ mod tests {
             "agent_runs",
             "role_assignments",
             "routing_cursors",
+            "routing_attempts",
             "task_messages",
             "task_message_deliveries",
         ] {
@@ -832,6 +836,91 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn populated_v48_migration_adds_immutable_routing_attempts_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v48.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE role_assignments (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     responsibility_key TEXT NOT NULL UNIQUE,
+                     task_id INTEGER,
+                     pr_number INTEGER,
+                     role TEXT NOT NULL,
+                     review_stage TEXT,
+                     complexity TEXT,
+                     profile_id TEXT NOT NULL,
+                     provider TEXT NOT NULL,
+                     runner TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     effort TEXT NOT NULL,
+                     pool_key TEXT NOT NULL,
+                     policy_generation TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,role,complexity,profile_id,provider,
+                     runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (9,'worker:task:9',9,'worker','M','opus','claude','claude',
+                         'claude-opus-4-8','high','worker.M','generation-1',10);
+                 PRAGMA user_version=48;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT responsibility_key,profile_id FROM role_assignments WHERE id=9",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            ("worker:task:9".into(), "opus".into())
+        );
+        for object in [
+            "routing_attempts",
+            "routing_attempts_responsibility",
+            "routing_attempts_assignment_guard",
+            "routing_attempts_no_update",
+            "routing_attempts_no_delete",
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name=?1",
+                    [object],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "missing migrated object {object}"
+            );
+        }
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM role_assignments", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
