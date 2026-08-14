@@ -51,14 +51,20 @@ open -> planning -> decomposed -> done
 used for a valid Planning Blocker, exhausted proposal attempts, exhausted provider failures, or
 unsafe recovered state. A materialized graph blocker does not move the source out of
 `decomposed`; it marks the graph blocked and fails the affected child. Only source cancellation
-and a replacement source can normally recover a graph after generated delivery has started.
+and a replacement source can normally recover a graph after generated delivery has started. The
+only exception is exact, evidence-bound adoption of an already merged continuation; it does not
+unblock, replan, or otherwise repair the blocked graph.
 
 There is one narrow incident-recovery exception for a failed generated child whose exact work
 was subsequently delivered by a separate managed continuation task. The automatic core call may
-adopt that delivery only when the failed task is the final unfinished member of the still-active
-graph; both tasks identify the same repository and PR; the continuation has creator-selected
-`continue_pr` authority and explicit `source_task` provenance; and its daemon publication,
-managed approval, merge transition, PR target, and approved head SHA all agree. Publication and
+adopt that delivery only when the failed task is the final unfinished member of a live graph
+(`state` active or blocked, with `active=1`); both tasks identify the same repository and PR; the
+continuation has creator-selected `continue_pr` authority and explicit `source_task` provenance;
+and its daemon publication, managed approval, merge transition, PR target, and approved head SHA
+all agree. On a blocked graph, this is limited to marking that exact failed child done and
+recording its recovery provenance: the graph remains blocked and active, its source remains
+decomposed, no new child gains execution authority, and no graph completion/dependent release is
+emitted. Cancellation and replacement remain necessary to resolve the graph. Publication and
 merge events are short-lived evidence: every required event must be live at the transaction's
 `now` (`expires_at > now`), so an event at its expiry boundary is rejected regardless of whether
 housekeeping has swept it.
@@ -76,16 +82,19 @@ overrides a conflicting source and never infers from task text or shared PR equa
 records the exact operator/source/child/recovery/PR/head tuple in the decomposition recovery
 ledger and child projection.
 
-Both paths use the same transaction-scoped finalizer: mark only the failed child done, preserve
-its PR association, and run ordinary final-child graph completion. The continuation row remains
-unchanged. No match, replay, or losing concurrent caller changes state or emits an event; the
-winner emits the ordinary bounded child and graph completion events exactly once.
+Both paths use the same transaction-scoped finalizer: mark only the failed child done and preserve
+its PR association. The automatic path then runs ordinary final-child graph completion only for
+an active graph; on a blocked graph completion is intentionally skipped, leaving the graph blocked
+and active and the source decomposed. The explicit path retains its active-graph predicate. The
+continuation row remains unchanged. No match, replay, or losing concurrent caller changes state or
+emits an event; the winner emits the bounded child-completion event once and emits graph
+completion only for an active graph.
 
 The daemon invokes this primitive automatically after graph consistency reconciliation and before
 generic stateless lifecycle recovery or provisioning, once at startup and once per ordinary tick.
 Discovery reads at most eight physical lifecycle-event rows in ascending sequence order from a
 dedicated persisted cursor. It filters for a live terminal `task_done` record, then resolves the candidate's
-explicit `source_task`, active graph membership, PR targets, and live publication/merge evidence
+explicit `source_task`, live graph membership, PR targets, and live publication/merge evidence
 through primary-key/subject-indexed short reads. It neither scans all done tasks nor performs
 network I/O. The read connection closes before any guarded core write begins.
 
@@ -94,7 +103,7 @@ and retry-marker write returns successfully. The short read also records whether
 sibling is unfinished. If that snapshot is partial and the guarded call remains a clean negative,
 the daemon records one idempotent, TTL-bounded event marker for the exact child/recovery pair. A
 later sibling `task_done` event drains live markers in ascending event sequence through bounded
-active-graph and subject-indexed reads. A second monotonic cursor advances after each settled pair;
+live-graph and subject-indexed reads. A second monotonic cursor advances after each settled pair;
 at most eight pairs are applied per pass, and a full batch retains the sibling trigger so the next
 pass continues with the next-oldest marker. If another sibling remains unfinished, the trigger is
 consumed without advancing pending markers and the next sibling completion retries them. Every
@@ -102,9 +111,10 @@ settled page advances rather than letting a stalled graph starve later deliverie
 application leaves the cursor unchanged; a crash after the core, marker, or pending-cursor commit
 but before acknowledgement replays an idempotent no-op. A startup-pass error is logged and does not
 block other recovery, while a normal-tick error follows the ordinary tick error policy; neither
-advances the page. Candidate discovery grants no authority beyond the guarded core predicate and
-cannot recover a `blocked` graph: graph-blocker scope defects still require source cancellation
-and a replacement source.
+advances the page. Candidate discovery grants no authority beyond the guarded core predicate. It
+may settle one exact evidence-complete delivery on a `blocked` graph, but cannot unblock it,
+start new work, complete the graph, or release dependents; graph-blocker scope defects still
+require source cancellation and a replacement source for resolution.
 
 Every event transition that marks a generated child done, including the final child merge, and
 every permitted manual child close checks graph completion in the same transaction. If every
