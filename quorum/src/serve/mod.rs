@@ -71,6 +71,8 @@ const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 const MAX_CI_REMEDIATION_PROVISION_STRIKES: i64 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
+/// Limit per-slot stream work so one noisy provider cannot starve other slots.
+const MAX_STREAM_LINES_PER_TICK: usize = 64;
 const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLICATION_GH_PIPE_LIMIT: usize = 1024 * 1024;
 const SELF_UPDATE_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2590,8 +2592,6 @@ pub struct CostLimits {
     pub max_task_tokens: Option<i64>,
     pub max_turn_cost_usd: Option<f64>,
     pub max_task_cost_usd: Option<f64>,
-    /// Legacy alias for max_idle_secs.
-    pub max_turn_wall_secs: Option<u64>,
     /// Max seconds an active worker/reviewer may go without emitting an
     /// event. Default: 900.
     pub max_idle_secs: Option<u64>,
@@ -9552,16 +9552,9 @@ async fn tick(
         if !r.draining {
             continue;
         }
-        // Wall-clock watchdog (checked each tick, even before result arrives)
-        if let Some(breach) = check_wall_clock_limits(&config.limits, r) {
-            log(&format!(
-                "WATCHDOG: reviewer {} killed — {}",
-                r.agent_name, breach
-            ));
-            reviewers_to_kill.push(i);
-            continue;
-        }
-        if let Some(breach) = drain_events(r, &db_path, "reviewer", &config.limits).await? {
+        if let Some(breach) =
+            check_active_slot_limits(r, &db_path, "reviewer", &config.limits).await?
+        {
             log(&format!(
                 "WATCHDOG: reviewer {} killed — {}",
                 r.agent_name, breach
@@ -9640,15 +9633,9 @@ async fn tick(
         if !w.draining {
             continue;
         }
-        if let Some(breach) = check_wall_clock_limits(&config.limits, w) {
-            log(&format!(
-                "WATCHDOG: worker {} killed (task #{}) — {}",
-                w.agent_name, w.task_id, breach
-            ));
-            workers_to_kill.push(i);
-            continue;
-        }
-        if let Some(breach) = drain_events(w, &db_path, "worker", &config.limits).await? {
+        if let Some(breach) =
+            check_active_slot_limits(w, &db_path, "worker", &config.limits).await?
+        {
             log(&format!(
                 "WATCHDOG: worker {} killed (task #{}) — {}",
                 w.agent_name, w.task_id, breach
@@ -11466,10 +11453,7 @@ fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<Limi
 /// option as a compatibility alias with the new event-based semantics. Active
 /// slots always have a liveness watchdog, even when neither setting is given.
 fn max_idle_secs(limits: &CostLimits) -> u64 {
-    limits
-        .max_idle_secs
-        .or(limits.max_turn_wall_secs)
-        .unwrap_or(900)
+    limits.max_idle_secs.unwrap_or(900)
 }
 
 /// Feed a worker turn according to the adapter's declared process lifetime.
@@ -12298,16 +12282,19 @@ async fn drain_events(
     persist_diagnostics(slot).map_err(|error| {
         QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
     })?;
-    while let Ok(Some(raw_line)) = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        slot.live_process_mut()
-            .map_err(|error| {
-                QuorumError::Io(format!("slot event drain requires a live process: {error}"))
-            })?
-            .next_raw_line(),
-    )
-    .await
-    {
+    for _ in 0..MAX_STREAM_LINES_PER_TICK {
+        let Ok(Some(raw_line)) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            slot.live_process_mut()
+                .map_err(|error| {
+                    QuorumError::Io(format!("slot event drain requires a live process: {error}"))
+                })?
+                .next_raw_line(),
+        )
+        .await
+        else {
+            break;
+        };
         let events = runner::normalize_line(slot.process_kind(), &raw_line);
 
         if let Some(ref mut sl) = slot.session_log {
@@ -12465,6 +12452,20 @@ async fn drain_events(
         })?;
     }
     Ok(None)
+}
+
+/// Consume a bounded batch of queued provider events before judging liveness.
+/// A provider may have emitted fresh events that this tick has not observed yet.
+async fn check_active_slot_limits(
+    slot: &mut SlotState,
+    db_path: &std::path::Path,
+    role: &str,
+    limits: &CostLimits,
+) -> Result<Option<LimitBreached>> {
+    if let Some(breach) = drain_events(slot, db_path, role, limits).await? {
+        return Ok(Some(breach));
+    }
+    Ok(check_wall_clock_limits(limits, slot))
 }
 
 fn persist_diagnostics(slot: &mut SlotState) -> std::io::Result<()> {
@@ -17244,7 +17245,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_events_advances_last_event_at_for_worker_and_reviewer() {
+    async fn active_slot_check_drains_queued_events_before_liveness_for_both_roles() {
         use tokio::io::BufReader;
 
         for role in ["worker", "reviewer"] {
@@ -17265,23 +17266,57 @@ mod tests {
                 BufReader::new(stdout),
             ));
             let mut slot = slot_with_process(proc);
-            slot.last_event_at = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(1))
-                .unwrap();
-            let previous = slot.last_event_at;
+            slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(61);
             let tempdir = tempfile::tempdir().unwrap();
+            let limits = CostLimits {
+                max_idle_secs: Some(60),
+                ..Default::default()
+            };
 
             assert!(
-                drain_events(&mut slot, tempdir.path(), role, &CostLimits::default())
+                check_active_slot_limits(&mut slot, tempdir.path(), role, &limits)
                     .await
                     .unwrap()
                     .is_none()
             );
             assert!(
-                slot.last_event_at > previous,
-                "{role} liveness stamp was not advanced by the tool event"
+                slot.last_event_at.elapsed() < std::time::Duration::from_secs(60),
+                "{role} queued event was not consumed before its liveness check"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn drain_events_bounds_noisy_slot_work_per_tick() {
+        use tokio::io::BufReader;
+
+        let command = format!(
+            "i=0; while [ \"$i\" -lt {} ]; do printf '%s\\n' '{{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{{\"command\":\"true\"}}}}'; i=$((i+1)); done",
+            MAX_STREAM_LINES_PER_TICK + 1
+        );
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", &command])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+            child,
+            stdin,
+            BufReader::new(stdout),
+        ));
+        let mut slot = slot_with_process(proc);
+        let tempdir = tempfile::tempdir().unwrap();
+
+        assert!(
+            drain_events(&mut slot, tempdir.path(), "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(slot.live_stats.tool_count, MAX_STREAM_LINES_PER_TICK as u32);
     }
 
     async fn launch_test_codex(
@@ -18809,13 +18844,12 @@ mod tests {
     }
 
     #[test]
-    fn cost_limits_default_is_unlimited() {
+    fn cost_limits_default_leaves_optional_limits_unset() {
         let limits = CostLimits::default();
         assert!(limits.max_turn_tokens.is_none());
         assert!(limits.max_task_tokens.is_none());
         assert!(limits.max_turn_cost_usd.is_none());
         assert!(limits.max_task_cost_usd.is_none());
-        assert!(limits.max_turn_wall_secs.is_none());
         assert!(limits.max_idle_secs.is_none());
         assert!(limits.max_task_wall_secs.is_none());
         assert!(limits.idle_timeout_secs.is_none());
@@ -21388,7 +21422,7 @@ mod tests {
     fn codex_usd_guard_allows_token_and_wall_limits() {
         let limits = CostLimits {
             max_task_tokens: Some(100_000),
-            max_turn_wall_secs: Some(600),
+            max_idle_secs: Some(600),
             ..Default::default()
         };
         let kind = runner::AgentKind::Codex;

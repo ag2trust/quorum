@@ -923,6 +923,30 @@ pub fn resolve_opt<T: Copy>(flag: Option<T>, file: Option<T>) -> Sourced<Option<
     }
 }
 
+/// Resolve the modern idle ceiling and its legacy turn-wall alias without
+/// losing the normal CLI-over-file precedence between the two names.
+pub fn resolve_idle_limit<T: Copy>(
+    max_idle_flag: Option<T>,
+    max_turn_wall_flag: Option<T>,
+    max_idle_file: Option<T>,
+    max_turn_wall_file: Option<T>,
+) -> Sourced<Option<T>> {
+    for (value, source) in [
+        (max_idle_flag, Source::Flag),
+        (max_turn_wall_flag, Source::Flag),
+        (max_idle_file, Source::File),
+        (max_turn_wall_file, Source::File),
+    ] {
+        if value.is_some() {
+            return Sourced { value, source };
+        }
+    }
+    Sourced {
+        value: None,
+        source: Source::Default,
+    }
+}
+
 pub fn resolve_opt_str(flag: Option<&str>, file: Option<&str>) -> Sourced<Option<String>> {
     if let Some(v) = flag {
         return Sourced {
@@ -1228,6 +1252,25 @@ primary = 100
             msg.contains("not found"),
             "error should say not found: {msg}"
         );
+    }
+
+    #[test]
+    fn resolve_idle_limit_preserves_source_precedence_across_aliases() {
+        let modern_flag = resolve_idle_limit(Some(900), Some(60), Some(300), Some(120));
+        assert_eq!(modern_flag.value, Some(900));
+        assert_eq!(modern_flag.source, Source::Flag);
+
+        let legacy_flag_over_file = resolve_idle_limit(None, Some(60), Some(900), Some(120));
+        assert_eq!(legacy_flag_over_file.value, Some(60));
+        assert_eq!(legacy_flag_over_file.source, Source::Flag);
+
+        let modern_file = resolve_idle_limit(None, None, Some(900), Some(120));
+        assert_eq!(modern_file.value, Some(900));
+        assert_eq!(modern_file.source, Source::File);
+
+        let default = resolve_idle_limit::<u64>(None, None, None, None);
+        assert_eq!(default.value, None);
+        assert_eq!(default.source, Source::Default);
     }
 
     #[test]
