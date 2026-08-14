@@ -440,9 +440,12 @@ task authority, and handles the resulting failure through the normal lifecycle r
 path. This detects a genuinely stalled process without treating a long, active turn as
 stalled.
 
-`max_task_wall_secs` remains an optional hard wall-clock cap measured from task start
-across all turns and continuations. It is independent of event activity: a task that
-continues emitting events still fails when this ceiling is exceeded.
+`max_task_wall_secs` remains an optional hard wall-clock cap for one live worker,
+reviewer, or remediation slot. It spans all turns and continuations handled by that
+slot and is independent of event activity: a slot that continues emitting events still
+fails when this ceiling is exceeded. The in-memory clock resets when the slot is
+replaced, when the lifecycle moves to another slot, or when the daemon restarts, so this
+setting is not an end-to-end wall-clock cap for the full task lifecycle.
 
 `max_turn_wall_secs` is deprecated and is no longer enforced as a per-turn wall-clock
 limit. Existing configurations may retain it as a compatibility alias for the idle
