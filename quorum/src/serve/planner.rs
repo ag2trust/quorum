@@ -77,7 +77,9 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          closed DAG of 2-8 independently deliverable implementation tasks, each size S or M. \
          Preserve every source constraint. Do not create synthetic integration work, recursive \
          planning, or unrelated scope. Dependencies must be real delivery prerequisites and may \
-         reference another task key or source:<dependency-id>. Return exactly one valid JSON \
+         reference another task key or source:<dependency-id>. Worker guidance: only the assigned \
+         worktree and repository are writable; this defense-in-depth guidance does not itself \
+         enforce that boundary. Return exactly one valid JSON \
          object, with no markdown or commentary. The object must be exactly one of these closed \
          shapes: do not omit, rename, or add fields.\n\
          PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"observable_outcome\":\"<observable-outcome>\",\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
@@ -796,6 +798,11 @@ mod tests {
             r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#
         ));
         assert!(prompt.contains("`outcome` must be exactly `plan` or `blocker`"));
+        assert!(prompt
+            .contains("Worker guidance: only the assigned worktree and repository are writable"));
+        assert!(
+            prompt.contains("this defense-in-depth guidance does not itself enforce that boundary")
+        );
     }
 
     #[test]
