@@ -73,6 +73,43 @@ pub enum WritableDeliverablePath {
     Escaping,
 }
 
+/// Reject paths that are already outside the configured repository without
+/// touching the filesystem. This gate must run before canonicalization so an
+/// absolute planner-controlled NFS/autofs/FUSE path cannot trigger I/O.
+pub fn writable_deliverable_is_lexically_external(repo_root: &Path, declared_path: &str) -> bool {
+    let path = Path::new(declared_path);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return true;
+    }
+    let Ok(absolute_repo) = std::path::absolute(repo_root) else {
+        return true;
+    };
+    let absolute_repo = lexical_normalize(&absolute_repo);
+    let candidate = if path.is_absolute() {
+        lexical_normalize(path)
+    } else {
+        lexical_normalize(&absolute_repo.join(path))
+    };
+    !candidate.starts_with(&absolute_repo)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 /// Classify one requested write against the managed repository boundary.
 ///
 /// Parent traversal is rejected before filesystem resolution. For paths whose
@@ -80,16 +117,15 @@ pub enum WritableDeliverablePath {
 /// canonicalized and the remaining components are reapplied. This detects an
 /// in-repository symlink that redirects a future file into a sibling or other
 /// external directory without requiring the deliverable itself to exist.
-/// Filesystem inspection failures are fail-closed.
-pub fn classify_writable_deliverable_path(
+/// Filesystem inspection failures are fail-closed. This function performs
+/// blocking filesystem I/O for lexically in-repository paths; async callers
+/// must isolate it on a blocking thread behind a timeout.
+pub fn classify_writable_deliverable_path_blocking(
     repo_root: &Path,
     declared_path: &str,
 ) -> WritableDeliverablePath {
     let path = Path::new(declared_path);
-    if path
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
+    if writable_deliverable_is_lexically_external(repo_root, declared_path) {
         return WritableDeliverablePath::Escaping;
     }
 
@@ -2142,8 +2178,12 @@ mod tests {
             "src/../../sibling/output.rs".to_string(),
             sibling.join("output.rs").to_string_lossy().into_owned(),
         ] {
+            assert!(
+                writable_deliverable_is_lexically_external(&repo, &path),
+                "{path}"
+            );
             assert_eq!(
-                classify_writable_deliverable_path(&repo, &path),
+                classify_writable_deliverable_path_blocking(&repo, &path),
                 WritableDeliverablePath::Escaping,
                 "{path}"
             );
@@ -2154,8 +2194,12 @@ mod tests {
             "new/nested/output.rs".to_string(),
             repo.join("src/output.rs").to_string_lossy().into_owned(),
         ] {
+            assert!(
+                !writable_deliverable_is_lexically_external(&repo, &path),
+                "{path}"
+            );
             assert_eq!(
-                classify_writable_deliverable_path(&repo, &path),
+                classify_writable_deliverable_path_blocking(&repo, &path),
                 WritableDeliverablePath::Permitted,
                 "{path}"
             );
@@ -2177,15 +2221,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            classify_writable_deliverable_path(&repo, "external-link/new/output.rs"),
+            classify_writable_deliverable_path_blocking(&repo, "external-link/new/output.rs"),
             WritableDeliverablePath::Escaping
         );
         assert_eq!(
-            classify_writable_deliverable_path(&repo, "dangling-external-link/new/output.rs"),
+            classify_writable_deliverable_path_blocking(
+                &repo,
+                "dangling-external-link/new/output.rs",
+            ),
             WritableDeliverablePath::Escaping
         );
         assert_eq!(
-            classify_writable_deliverable_path(&repo, "internal-link/new/output.rs"),
+            classify_writable_deliverable_path_blocking(&repo, "internal-link/new/output.rs"),
             WritableDeliverablePath::Permitted
         );
     }

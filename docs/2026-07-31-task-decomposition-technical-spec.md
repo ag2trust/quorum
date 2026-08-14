@@ -316,7 +316,9 @@ existing task.
 Each child declares a bounded structured deliverables manifest that distinguishes requested
 writes from read-only contextual references. Repository containment validation inspects only the
 requested writes; an external read-only reference does not grant write authority and is permitted.
-This is deterministic proposal admission, not a general filesystem sandbox or a planner
+Lexically external absolute writes are rejected without filesystem access. Inspection needed for
+in-repository symlinks runs off the serial daemon tick behind a hard timeout and fails closed as an
+escape. This is deterministic proposal admission, not a general filesystem sandbox or a planner
 self-attestation check.
 
 All proposed children are classified together before any child row exists. Classification uses

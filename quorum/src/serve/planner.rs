@@ -18,6 +18,7 @@ pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_STDOUT_BYTES: usize = 256 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
+const WRITABLE_PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
@@ -107,19 +108,47 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 
 /// Recheck proposal dependencies against the authoritative source snapshot.
 /// Shape/cycle/text validation has already run in `parse_response`.
-pub fn validate_for_source(
+pub async fn validate_for_source(
     tasks: &[ProposedTask],
     source_dependency_ids: &[i64],
     repo_root: &Path,
 ) -> Result<(), PlannerParseError> {
+    validate_for_source_with_resolver(
+        tasks,
+        source_dependency_ids,
+        repo_root,
+        WRITABLE_PATH_RESOLUTION_TIMEOUT,
+        |repo_root, paths| {
+            paths.iter().all(|path| {
+                quorum_core::decomposition::classify_writable_deliverable_path_blocking(
+                    &repo_root, path,
+                ) == quorum_core::decomposition::WritableDeliverablePath::Permitted
+            })
+        },
+    )
+    .await
+}
+
+async fn validate_for_source_with_resolver<F>(
+    tasks: &[ProposedTask],
+    source_dependency_ids: &[i64],
+    repo_root: &Path,
+    resolution_timeout: Duration,
+    resolver: F,
+) -> Result<(), PlannerParseError>
+where
+    F: FnOnce(std::path::PathBuf, Vec<String>) -> bool + Send + 'static,
+{
     let allowed: HashSet<i64> = source_dependency_ids.iter().copied().collect();
+    let mut writable_paths = Vec::new();
     for task in tasks {
         for path in task.deliverables.writable_paths() {
-            if quorum_core::decomposition::classify_writable_deliverable_path(repo_root, path)
-                == quorum_core::decomposition::WritableDeliverablePath::Escaping
-            {
+            if quorum_core::decomposition::writable_deliverable_is_lexically_external(
+                repo_root, path,
+            ) {
                 return semantic("writable deliverable escapes the managed repository");
             }
+            writable_paths.push(path.to_owned());
         }
         for prerequisite in &task.prerequisites {
             if let Some(raw) = prerequisite.strip_prefix("source:") {
@@ -139,7 +168,20 @@ pub fn validate_for_source(
             return semantic("synthetic integration work is not permitted");
         }
     }
-    Ok(())
+    let repo_root = repo_root.to_path_buf();
+    let permitted = matches!(
+        tokio::time::timeout(
+            resolution_timeout,
+            tokio::task::spawn_blocking(move || resolver(repo_root, writable_paths)),
+        )
+        .await,
+        Ok(Ok(true))
+    );
+    if permitted {
+        Ok(())
+    } else {
+        semantic("writable deliverable escapes the managed repository")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -849,8 +891,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn source_validation_rejects_foreign_dependencies_and_synthetic_integration() {
+    #[tokio::test]
+    async fn source_validation_rejects_foreign_dependencies_and_synthetic_integration() {
         let foreign = ProposedTask {
             key: "a".into(),
             title: "Implement a".into(),
@@ -866,7 +908,7 @@ mod tests {
             prerequisites: vec!["source:9".into()],
         };
         assert!(matches!(
-            validate_for_source(&[foreign], &[7], Path::new(".")),
+            validate_for_source(&[foreign], &[7], Path::new(".")).await,
             Err(PlannerParseError::Semantic(_))
         ));
         let synthetic = ProposedTask {
@@ -884,13 +926,13 @@ mod tests {
             prerequisites: vec![],
         };
         assert!(matches!(
-            validate_for_source(&[synthetic], &[], Path::new(".")),
+            validate_for_source(&[synthetic], &[], Path::new(".")).await,
             Err(PlannerParseError::Semantic(_))
         ));
     }
 
-    #[test]
-    fn source_validation_inspects_only_requested_writes() {
+    #[tokio::test]
+    async fn source_validation_inspects_only_requested_writes() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         let sibling = root.path().join("sibling");
@@ -916,12 +958,12 @@ mod tests {
             prerequisites: vec![],
         };
 
-        assert_eq!(validate_for_source(&[task], &[], &repo), Ok(()));
+        assert_eq!(validate_for_source(&[task], &[], &repo).await, Ok(()));
     }
 
     #[cfg(unix)]
-    #[test]
-    fn source_validation_rejects_every_repository_escape_shape() {
+    #[tokio::test]
+    async fn source_validation_rejects_every_repository_escape_shape() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         let sibling = root.path().join("sibling");
@@ -949,13 +991,88 @@ mod tests {
             };
             assert!(
                 matches!(
-                    validate_for_source(&[task], &[], &repo),
+                    validate_for_source(&[task], &[], &repo).await,
                     Err(PlannerParseError::Semantic(ref error))
                         if error == "writable deliverable escapes the managed repository"
                 ),
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn source_validation_times_out_blocking_filesystem_resolution() {
+        let repo = tempfile::tempdir().unwrap();
+        let task = ProposedTask {
+            key: "bounded".into(),
+            title: "Implement bounded change".into(),
+            observable_outcome: "bounded change works".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: "src/in_repo.rs".into(),
+                },
+            ]),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["bounded".into()],
+            verification_expectations: vec!["tests".into()],
+            prerequisites: vec![],
+        };
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let outcome = validate_for_source_with_resolver(
+            &[task],
+            &[],
+            repo.path(),
+            Duration::from_millis(25),
+            move |_, _| {
+                release_rx.recv().unwrap();
+                true
+            },
+        )
+        .await;
+        release_tx.send(()).unwrap();
+
+        assert!(
+            matches!(outcome, Err(PlannerParseError::Semantic(ref error))
+                if error == "writable deliverable escapes the managed repository")
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn source_validation_rejects_absolute_external_path_before_resolver() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let external = root.path().join("unavailable-mount/output.rs");
+        std::fs::create_dir(&repo).unwrap();
+        let task = ProposedTask {
+            key: "external".into(),
+            title: "Implement external change".into(),
+            observable_outcome: "external change works".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: external.to_string_lossy().into_owned(),
+                },
+            ]),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["bounded".into()],
+            verification_expectations: vec!["tests".into()],
+            prerequisites: vec![],
+        };
+
+        let outcome = validate_for_source_with_resolver(
+            &[task],
+            &[],
+            &repo,
+            Duration::from_secs(1),
+            |_, _| panic!("lexically external path reached filesystem resolver"),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            Err(PlannerParseError::Semantic(ref error))
+                if error == "writable deliverable escapes the managed repository"
+        ));
     }
 
     #[test]
