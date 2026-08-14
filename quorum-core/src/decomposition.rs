@@ -8,6 +8,7 @@
 use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 pub const MAX_PROPOSAL_ATTEMPTS: i64 = 3;
@@ -15,6 +16,52 @@ pub const MAX_PROVIDER_FAILURES: i64 = 3;
 pub const MIN_CHILDREN: usize = 2;
 pub const MAX_CHILDREN: usize = 8;
 const MAX_CLEANUP_ARTIFACT_BYTES: usize = 4096;
+
+/// The explicit file-level contract attached to one generated child.  This is
+/// deliberately a small manifest rather than an inference from task prose: a
+/// later boundary check can inspect only [`Self::writable_paths`] and leave
+/// contextual references out of its write authority.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct ChildDeliverables(pub Vec<ChildDeliverable>);
+
+impl ChildDeliverables {
+    /// Paths the child was explicitly asked to modify.
+    pub fn writable_paths(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().filter_map(ChildDeliverable::writable_path)
+    }
+
+    /// Paths named solely as contextual, read-only references.
+    pub fn reference_paths(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().filter_map(ChildDeliverable::reference_path)
+    }
+}
+
+/// One declared child-deliverable path and its authority class.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChildDeliverable {
+    /// A path the generated child is expected to write.
+    Write { path: String },
+    /// A path supplied only for context; it grants no write authority.
+    ReadOnlyReference { path: String },
+}
+
+impl ChildDeliverable {
+    pub fn writable_path(&self) -> Option<&str> {
+        match self {
+            Self::Write { path } => Some(path),
+            Self::ReadOnlyReference { .. } => None,
+        }
+    }
+
+    pub fn reference_path(&self) -> Option<&str> {
+        match self {
+            Self::Write { .. } => None,
+            Self::ReadOnlyReference { path } => Some(path),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeginPlanning<'a> {
@@ -1964,6 +2011,26 @@ pub fn recovery_reset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_deliverables_keep_writes_distinct_from_context_references() {
+        let deliverables: ChildDeliverables = serde_json::from_str(
+            r#"[
+                {"kind":"write","path":"quorum-core/src/decomposition.rs"},
+                {"kind":"read_only_reference","path":"docs/decomposition.md"}
+            ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            deliverables.writable_paths().collect::<Vec<_>>(),
+            ["quorum-core/src/decomposition.rs"]
+        );
+        assert_eq!(
+            deliverables.reference_paths().collect::<Vec<_>>(),
+            ["docs/decomposition.md"]
+        );
+    }
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
