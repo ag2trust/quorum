@@ -11426,14 +11426,13 @@ fn check_post_result_limits(
             });
         }
     }
-    if let Some(max_idle_secs) = max_idle_secs(limits) {
-        let elapsed = slot.last_event_at.elapsed().as_secs();
-        if elapsed > max_idle_secs {
-            return Some(LimitBreached::IdleSecs {
-                elapsed,
-                max: max_idle_secs,
-            });
-        }
+    let max_idle_secs = max_idle_secs(limits);
+    let elapsed = slot.last_event_at.elapsed().as_secs();
+    if elapsed > max_idle_secs {
+        return Some(LimitBreached::IdleSecs {
+            elapsed,
+            max: max_idle_secs,
+        });
     }
     if let Some(max) = limits.max_task_wall_secs {
         let elapsed = slot.task_started_at.elapsed().as_secs();
@@ -11446,14 +11445,13 @@ fn check_post_result_limits(
 
 /// Check wall-clock limits only (called each tick for slots still draining).
 fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<LimitBreached> {
-    if let Some(max_idle_secs) = max_idle_secs(limits) {
-        let elapsed = slot.last_event_at.elapsed().as_secs();
-        if elapsed > max_idle_secs {
-            return Some(LimitBreached::IdleSecs {
-                elapsed,
-                max: max_idle_secs,
-            });
-        }
+    let max_idle_secs = max_idle_secs(limits);
+    let elapsed = slot.last_event_at.elapsed().as_secs();
+    if elapsed > max_idle_secs {
+        return Some(LimitBreached::IdleSecs {
+            elapsed,
+            max: max_idle_secs,
+        });
     }
     if let Some(max) = limits.max_task_wall_secs {
         let elapsed = slot.task_started_at.elapsed().as_secs();
@@ -11465,9 +11463,13 @@ fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<Limi
 }
 
 /// Prefer the explicit idle ceiling while accepting the retired turn-wall
-/// option as a compatibility alias with the new event-based semantics.
-fn max_idle_secs(limits: &CostLimits) -> Option<u64> {
-    limits.max_idle_secs.or(limits.max_turn_wall_secs)
+/// option as a compatibility alias with the new event-based semantics. Active
+/// slots always have a liveness watchdog, even when neither setting is given.
+fn max_idle_secs(limits: &CostLimits) -> u64 {
+    limits
+        .max_idle_secs
+        .or(limits.max_turn_wall_secs)
+        .unwrap_or(900)
 }
 
 /// Feed a worker turn according to the adapter's declared process lifetime.
@@ -18733,6 +18735,17 @@ mod tests {
         assert!(matches!(
             check_post_result_limits(&limits, 0, 0, Some(0.0), 0.0, &slot),
             Some(LimitBreached::IdleSecs { max: 60, .. })
+        ));
+    }
+
+    #[test]
+    fn default_idle_limit_reaps_a_silent_active_slot() {
+        let mut slot = make_dummy_slot();
+        slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(901);
+
+        assert!(matches!(
+            check_wall_clock_limits(&CostLimits::default(), &slot),
+            Some(LimitBreached::IdleSecs { max: 900, .. })
         ));
     }
 
