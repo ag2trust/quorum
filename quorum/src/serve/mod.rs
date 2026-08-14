@@ -692,19 +692,6 @@ fn parse_pr_target(pr: i64, stdout: &[u8]) -> Option<PrTarget> {
     })
 }
 
-fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<PrTarget> {
-    let args = pr_target_args(pr, gh_repo);
-    let output = std::process::Command::new("gh")
-        .args(&args)
-        .current_dir(repo_dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_pr_target(pr, &output.stdout)
-}
-
 /// Run one publication-owned GitHub command with cancellation-safe process
 /// ownership. A timeout explicitly kills and reaps the child; kill-on-drop
 /// covers daemon shutdown or future cancellation while the command is live.
@@ -1492,38 +1479,217 @@ fn orphan_worker_branch(author: &str, task_id: i64, review_only: bool) -> Option
     }
 }
 
-/// Resolve PR target from GitHub, persist on success, fall back to
-/// persisted target when GitHub is unavailable.
-fn resolve_or_load_pr_target(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewerPrTargetSource {
+    Live,
+    Persisted,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedReviewerPrTarget {
+    target: PrTarget,
+    source: ReviewerPrTargetSource,
+}
+
+/// Resolve reviewer metadata without granting it durable authority. GitHub is
+/// queried through the bounded publication runner; an unavailable live target
+/// may only fall back to the task's previously accepted durable tuple.
+async fn resolve_or_load_reviewer_pr_target(
     pr: i64,
     task_id: i64,
     db_path: &Path,
     repo_dir: &Path,
     gh_repo: Option<&str>,
-) -> Option<PrTarget> {
-    if let Some(target) = resolve_pr_target(pr, repo_dir, gh_repo) {
-        if let Ok(mut conn) = quorum_core::db::open(db_path) {
-            let _ = pr_targets::upsert(
-                &mut conn,
-                task_id,
-                target.pr,
-                &target.head_ref,
-                &target.head_sha,
-                target.is_fork,
-            );
+) -> Result<Option<ResolvedReviewerPrTarget>> {
+    match resolve_publication_pr_target(pr, repo_dir, gh_repo).await {
+        Ok(target) => Ok(Some(ResolvedReviewerPrTarget {
+            target,
+            source: ReviewerPrTargetSource::Live,
+        })),
+        Err(error) => {
+            log(&format!(
+                "reviewer: live PR #{pr} target unavailable ({error}); trying accepted durable target"
+            ));
+            let path = db_path.to_path_buf();
+            tokio::task::spawn_blocking(move || -> Result<Option<ResolvedReviewerPrTarget>> {
+                let conn = quorum_core::db::open(&path)?;
+                let Some(stored) = pr_targets::get(&conn, task_id, pr)? else {
+                    return Ok(None);
+                };
+                Ok(Some(ResolvedReviewerPrTarget {
+                    target: PrTarget {
+                        pr: stored.pr_number,
+                        head_ref: stored.head_ref,
+                        head_sha: stored.head_sha,
+                        is_fork: stored.is_fork,
+                        base_ref: None,
+                        state: None,
+                    },
+                    source: ReviewerPrTargetSource::Persisted,
+                }))
+            })
+            .await
+            .map_err(|join_error| {
+                QuorumError::Io(format!(
+                    "reviewer persisted PR target read join for task #{task_id}: {join_error}"
+                ))
+            })?
         }
-        return Some(target);
     }
-    let conn = quorum_core::db::open(db_path).ok()?;
-    let stored = pr_targets::get(&conn, task_id, pr).ok()??;
-    Some(PrTarget {
-        pr: stored.pr_number,
-        head_ref: stored.head_ref,
-        head_sha: stored.head_sha,
-        is_fork: stored.is_fork,
-        base_ref: None,
-        state: None,
-    })
+}
+
+fn validate_reviewer_pr_target(
+    resolved: &ResolvedReviewerPrTarget,
+    expected_pr: i64,
+    gated_head_sha: &str,
+    base_branch: &str,
+) -> std::result::Result<(), String> {
+    let target = &resolved.target;
+    if target.pr != expected_pr {
+        return Err(format!(
+            "PR identity changed: expected #{expected_pr}, got #{}",
+            target.pr
+        ));
+    }
+    if target.head_sha != gated_head_sha {
+        return Err(format!(
+            "PR #{expected_pr} resolved target moved after CI gate (gated {gated_head_sha}, current {})",
+            target.head_sha
+        ));
+    }
+    if resolved.source == ReviewerPrTargetSource::Live {
+        if target.state.as_deref() != Some("OPEN") {
+            return Err(format!("PR #{expected_pr} is not open"));
+        }
+        if target.base_ref.as_deref() != Some(base_branch) {
+            return Err(format!(
+                "PR #{expected_pr} targets base {:?}, expected {base_branch}",
+                target.base_ref
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Persist one reviewer target only while the exact reservation still owns an
+/// eligible in-review task. Live resolution may advance the accepted head, but
+/// it may never rotate PR/ref/fork identity. Persisted fallback is read-only.
+fn persist_reviewer_pr_target(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    reservation: &str,
+    role: &str,
+    resolved: &ResolvedReviewerPrTarget,
+    gated_head_sha: &str,
+) -> Result<bool> {
+    if resolved.target.head_sha != gated_head_sha {
+        return Err(QuorumError::Usage(format!(
+            "reviewer target for task #{task_id} does not match gated head"
+        )));
+    }
+
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let reservation_active: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM reviewer_provision_reservations
+             WHERE task_id=?1 AND token=?2 AND role=?3
+         )",
+        rusqlite::params![task_id, reservation, role],
+        |row| row.get(0),
+    )?;
+    let Some(task) = tasks::get(&tx, task_id)? else {
+        tx.commit()?;
+        return Ok(false);
+    };
+    let planning_frozen: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !reservation_active
+        || task.status != "in-review"
+        || planning_frozen
+        || !tasks::classification_is_dispatchable(&task.refs, task.review_only, task.continue_pr)
+    {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    let existing = tx
+        .query_row(
+            "SELECT pr_number,head_ref,head_sha,is_fork,resolved_at
+             FROM pr_targets WHERE task_id=?1",
+            [task_id],
+            |row| {
+                Ok(pr_targets::PersistedPrTarget {
+                    pr_number: row.get(0)?,
+                    head_ref: row.get(1)?,
+                    head_sha: row.get(2)?,
+                    is_fork: row.get::<_, i64>(3)? != 0,
+                    resolved_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+
+    if let Some(existing) = &existing {
+        if existing.pr_number != resolved.target.pr
+            || existing.head_ref != resolved.target.head_ref
+            || existing.is_fork != resolved.target.is_fork
+        {
+            return Err(QuorumError::Usage(format!(
+                "reviewer PR target identity changed for task #{task_id} (expected #{} {} fork={}, got #{} {} fork={})",
+                existing.pr_number,
+                existing.head_ref,
+                existing.is_fork,
+                resolved.target.pr,
+                resolved.target.head_ref,
+                resolved.target.is_fork,
+            )));
+        }
+    } else if resolved.source == ReviewerPrTargetSource::Persisted {
+        return Err(QuorumError::Usage(format!(
+            "reviewer durable target disappeared for task #{task_id}"
+        )));
+    }
+
+    if resolved.source == ReviewerPrTargetSource::Persisted {
+        if existing
+            .as_ref()
+            .is_none_or(|target| target.head_sha != gated_head_sha)
+        {
+            return Err(QuorumError::Usage(format!(
+                "reviewer durable target for task #{task_id} does not match gated head"
+            )));
+        }
+        tx.commit()?;
+        return Ok(true);
+    }
+
+    if !task.review_only && resolved.target.is_fork {
+        return Err(QuorumError::Usage(format!(
+            "reviewer PR #{} unexpectedly changed to a fork target",
+            resolved.target.pr
+        )));
+    }
+    tx.execute(
+        "INSERT INTO pr_targets
+           (task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+         VALUES (?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(task_id) DO UPDATE SET
+           head_sha=excluded.head_sha,
+           resolved_at=excluded.resolved_at",
+        rusqlite::params![
+            task_id,
+            resolved.target.pr,
+            resolved.target.head_ref,
+            resolved.target.head_sha,
+            resolved.target.is_fork as i64,
+            now_unix(),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Resolve a remediation PR through the bounded, kill-and-reap GitHub runner,
@@ -6960,23 +7126,22 @@ async fn tick(
                                 } else {
                                     let pr_val = pr_num;
                                     let tid = reviewer_task_id;
-                                    let dbp = db_path.clone();
-                                    let repo_dir = config.repo_dir.clone();
-                                    let gh_repo = config.repo.clone();
-                                    let resolved = tokio::task::spawn_blocking(move || {
-                                        resolve_or_load_pr_target(
-                                            pr_val,
-                                            tid,
-                                            &dbp,
-                                            &repo_dir,
-                                            Some(&gh_repo),
-                                        )
-                                    })
+                                    let resolved = resolve_or_load_reviewer_pr_target(
+                                        pr_val,
+                                        tid,
+                                        &config.db_path,
+                                        &config.repo_dir,
+                                        Some(&config.repo),
+                                    )
                                     .await
                                     .ok()
                                     .flatten();
                                     resolved.map(|target| {
-                                        ("external".to_string(), reviewer_task_id, target.head_ref)
+                                        (
+                                            "external".to_string(),
+                                            reviewer_task_id,
+                                            target.target.head_ref,
+                                        )
                                     })
                                 }
                             };
@@ -10635,33 +10800,33 @@ async fn tick(
                     } else {
                         ReviewRole::R1
                     };
-                    let branch = if let Some(b) =
-                        orphan_worker_branch(author, *task_id, *review_only)
-                    {
-                        b
-                    } else {
-                        let pr_num = *pr;
-                        let tid = *task_id;
-                        let dbp = config.db_path.clone();
-                        let repo_dir = config.repo_dir.clone();
-                        let gh_repo = config.repo.clone();
-                        let resolved = tokio::task::spawn_blocking(move || {
-                            resolve_or_load_pr_target(pr_num, tid, &dbp, &repo_dir, Some(&gh_repo))
-                        })
-                        .await
-                        .ok()
-                        .flatten();
-                        match resolved {
-                            Some(target) => target.head_ref,
-                            None => {
-                                log(&format!(
-                                    "orphan in-review task #{task_id} PR #{pr}: \
+                    let branch =
+                        if let Some(b) = orphan_worker_branch(author, *task_id, *review_only) {
+                            b
+                        } else {
+                            let pr_num = *pr;
+                            let tid = *task_id;
+                            let resolved = resolve_or_load_reviewer_pr_target(
+                                pr_num,
+                                tid,
+                                &config.db_path,
+                                &config.repo_dir,
+                                Some(&config.repo),
+                            )
+                            .await
+                            .ok()
+                            .flatten();
+                            match resolved {
+                                Some(target) => target.target.head_ref,
+                                None => {
+                                    log(&format!(
+                                        "orphan in-review task #{task_id} PR #{pr}: \
                                          could not resolve PR head ref — skipping"
-                                ));
-                                continue;
+                                    ));
+                                    continue;
+                                }
                             }
-                        }
-                    };
+                        };
                     let counterpart = ReviewCounterpart {
                         agent_name: if author.is_empty() {
                             "external"
@@ -12465,6 +12630,7 @@ async fn provision_reviewer(
         role,
         head_sha,
         recover_interrupted,
+        &reservation,
     )
     .await;
     let path = config.db_path.clone();
@@ -12494,6 +12660,7 @@ async fn provision_reviewer_reserved(
     role: &ReviewRole,
     head_sha: &str,
     recover_interrupted: bool,
+    reservation: &str,
 ) -> Result<()> {
     // The check result is meaningful only for the exact PR head that was
     // gated. Re-resolve through the configured executor immediately before
@@ -12521,38 +12688,63 @@ async fn provision_reviewer_reserved(
         return Ok(());
     }
 
-    // Resolve/fetch metadata before acquisition too. Production gets the
-    // authoritative GitHub target; command-executor tests can fall back to
-    // their managed branch, whose fetched HEAD is still verified below.
-    let pr_target = {
-        let pr_num = pr;
+    // Resolution is deliberately complete before the short guarded
+    // persistence transaction. A live target has no durable authority until
+    // its complete identity and exact gated head pass validation.
+    let resolved_target = resolve_or_load_reviewer_pr_target(
+        pr,
+        worker.task_id,
+        &config.db_path,
+        &config.repo_dir,
+        Some(&config.repo),
+    )
+    .await?;
+    if let Some(resolved) = &resolved_target {
+        if let Err(reason) =
+            validate_reviewer_pr_target(resolved, pr, head_sha, &config.base_branch)
+        {
+            log(&format!(
+                "{}: {reason} — reviewer not acquired or spawned",
+                role.as_str().to_uppercase()
+            ));
+            return Ok(());
+        }
+        let path = config.db_path.clone();
+        let persisted = resolved.clone();
+        let token = reservation.to_string();
+        let role_name = role.as_str().to_string();
+        let gated = head_sha.to_string();
         let task_id = worker.task_id;
-        let repo_dir = config.repo_dir.clone();
-        let gh_repo = config.repo.clone();
-        let db_path = config.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            resolve_or_load_pr_target(pr_num, task_id, &db_path, &repo_dir, Some(&gh_repo))
+        let accepted = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&path)?;
+            persist_reviewer_pr_target(&mut conn, task_id, &token, &role_name, &persisted, &gated)
         })
         .await
-        .ok()
-        .flatten()
-    };
-    if pr_target
-        .as_ref()
-        .is_some_and(|target| target.head_sha != head_sha)
-    {
-        log(&format!(
-            "{}: PR #{pr} resolved target moved after CI gate (gated {}, current {}) — \
-             reviewer not acquired or spawned",
-            role.as_str().to_uppercase(),
-            head_sha,
-            pr_target
-                .as_ref()
-                .map(|target| target.head_sha.as_str())
-                .unwrap_or("<missing>")
-        ));
-        return Ok(());
+        .map_err(|error| {
+            QuorumError::Io(format!(
+                "reviewer target persistence join for task #{task_id}: {error}"
+            ))
+        })?;
+        match accepted {
+            Ok(true) => {}
+            Ok(false) => {
+                log(&format!(
+                    "{}: task #{task_id} lost lifecycle or reservation authority before target persistence — reviewer not acquired or spawned",
+                    role.as_str().to_uppercase()
+                ));
+                return Ok(());
+            }
+            Err(QuorumError::Usage(reason)) => {
+                log(&format!(
+                    "{}: {reason} — reviewer not acquired or spawned",
+                    role.as_str().to_uppercase()
+                ));
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
     }
+    let pr_target = resolved_target.map(|resolved| resolved.target);
 
     let recovery = if recover_interrupted {
         let p = config.db_path.clone();
@@ -20096,123 +20288,189 @@ mod tests {
         assert_eq!(task.status, "in-review");
     }
 
-    // ── resolve_or_load_pr_target (persisted fallback) ───────────────────
+    // ── reviewer PR target acceptance ────────────────────────────────────
 
     fn open_test_db(dir: &std::path::Path) -> quorum_core::Connection {
         quorum_core::db::open(&dir.join("q.db")).unwrap()
     }
 
-    #[test]
-    fn persisted_target_reused_when_gh_unavailable() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 10, 42, "daemon/lever-t10", "abc123", false).unwrap();
-        drop(conn);
+    fn seed_reserved_review_task(conn: &mut quorum_core::Connection, pr: i64, token: &str) -> i64 {
+        let task_id = tasks::create(
+            conn,
+            "owner",
+            "review target guard",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null}"#),
+            None,
+            Some(pr),
+            100,
+        )
+        .unwrap();
+        assert!(tasks::reserve_reviewer_provision(conn, task_id, token, "r1", 101).unwrap());
+        task_id
+    }
 
-        // gh will fail (fake repo_dir), so fallback kicks in
-        let result = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo"));
-        let t = result.unwrap();
-        assert_eq!(t.pr, 42);
-        assert_eq!(t.head_ref, "daemon/lever-t10");
-        assert_eq!(t.head_sha, "abc123");
-        assert!(!t.is_fork);
+    fn live_reviewer_target(pr: i64, branch: &str, sha: &str) -> ResolvedReviewerPrTarget {
+        ResolvedReviewerPrTarget {
+            target: PrTarget {
+                pr,
+                head_ref: branch.into(),
+                head_sha: sha.into(),
+                is_fork: false,
+                base_ref: Some("main".into()),
+                state: Some("OPEN".into()),
+            },
+            source: ReviewerPrTargetSource::Live,
+        }
     }
 
     #[test]
-    fn persisted_fork_target_reused() {
+    fn matching_gated_reviewer_target_persists_under_exact_reservation() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
         let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 10, 42, "fix-bug", "def456", true).unwrap();
-        drop(conn);
+        let task_id = seed_reserved_review_task(&mut conn, 42, "winner");
+        let resolved = live_reviewer_target(42, "feature/review", "gated-sha");
 
-        let t = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).unwrap();
-        assert!(t.is_fork);
-        assert_eq!(t.head_ref, "fix-bug");
+        validate_reviewer_pr_target(&resolved, 42, "gated-sha", "main").unwrap();
+        assert!(persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "winner",
+            "r1",
+            &resolved,
+            "gated-sha",
+        )
+        .unwrap());
+
+        let stored = pr_targets::get(&conn, task_id, 42).unwrap().unwrap();
+        assert_eq!(stored.head_ref, "feature/review");
+        assert_eq!(stored.head_sha, "gated-sha");
+        assert!(!stored.is_fork);
     }
 
     #[test]
-    fn persisted_target_wrong_pr_returns_none() {
+    fn reviewer_target_identity_mismatches_leave_durable_tuple_byte_for_byte_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
         let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 10, 42, "branch", "sha1", false).unwrap();
-        drop(conn);
+        let task_id = seed_reserved_review_task(&mut conn, 42, "winner");
+        pr_targets::upsert(
+            &mut conn,
+            task_id,
+            42,
+            "feature/review",
+            "accepted-sha",
+            false,
+        )
+        .unwrap();
+        let before = pr_targets::get(&conn, task_id, 42).unwrap().unwrap();
 
-        // PR 99 doesn't match persisted PR 42
-        assert!(
-            resolve_or_load_pr_target(99, 10, &db_path, dir.path(), Some("fake/repo")).is_none()
+        for mut moved in [
+            live_reviewer_target(42, "wrong-branch", "gated-sha"),
+            live_reviewer_target(42, "feature/review", "gated-sha"),
+        ] {
+            if moved.target.head_ref == "feature/review" {
+                moved.target.is_fork = true;
+            }
+            validate_reviewer_pr_target(&moved, 42, "gated-sha", "main").unwrap();
+            assert!(matches!(
+                persist_reviewer_pr_target(&mut conn, task_id, "winner", "r1", &moved, "gated-sha",),
+                Err(QuorumError::Usage(_))
+            ));
+            assert_eq!(
+                pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+                before
+            );
+        }
+
+        for invalid in [
+            live_reviewer_target(42, "feature/review", "moved-sha"),
+            live_reviewer_target(99, "feature/review", "gated-sha"),
+        ] {
+            assert!(validate_reviewer_pr_target(&invalid, 42, "gated-sha", "main").is_err());
+            assert_eq!(
+                pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+                before
+            );
+        }
+        let mut wrong_base = live_reviewer_target(42, "feature/review", "gated-sha");
+        wrong_base.target.base_ref = Some("release".into());
+        assert!(validate_reviewer_pr_target(&wrong_base, 42, "gated-sha", "main").is_err());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+            before
         );
     }
 
     #[test]
-    fn no_persisted_target_no_gh_returns_none() {
+    fn reviewer_target_authority_loss_reservation_loss_and_replay_do_not_mutate_target() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let _conn = open_test_db(dir.path());
+        let mut conn = open_test_db(dir.path());
+        let task_id = seed_reserved_review_task(&mut conn, 42, "winner");
+        pr_targets::upsert(
+            &mut conn,
+            task_id,
+            42,
+            "feature/review",
+            "accepted-sha",
+            false,
+        )
+        .unwrap();
+        let before = pr_targets::get(&conn, task_id, 42).unwrap().unwrap();
+        let advanced = live_reviewer_target(42, "feature/review", "next-gated-sha");
 
-        // No persisted target, gh will fail
-        assert!(
-            resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).is_none()
+        conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [task_id])
+            .unwrap();
+        assert!(!persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "winner",
+            "r1",
+            &advanced,
+            "next-gated-sha",
+        )
+        .unwrap());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+            before
         );
-    }
 
-    #[test]
-    fn persisted_target_stale_head_still_returned() {
-        // Stale head_sha is returned — SHA verification happens downstream
-        // at worktree checkout, not here
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 10, 42, "branch", "old_sha", false).unwrap();
-        drop(conn);
-
-        let t = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).unwrap();
-        assert_eq!(t.head_sha, "old_sha");
-    }
-
-    #[test]
-    fn review_only_no_gh_no_persisted_returns_none() {
-        // Review-only tasks: orphan_worker_branch returns None AND no persisted
-        // target → no worker spawned (the fail-safe)
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let _conn = open_test_db(dir.path());
-
-        assert!(orphan_worker_branch("Anvil", 15, true).is_none());
-        assert!(
-            resolve_or_load_pr_target(42, 15, &db_path, dir.path(), Some("fake/repo")).is_none()
+        conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [task_id])
+            .unwrap();
+        let mut concurrent = open_test_db(dir.path());
+        assert!(tasks::release_reviewer_provision(&mut concurrent, task_id, "winner").unwrap());
+        drop(concurrent);
+        assert!(!persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "winner",
+            "r1",
+            &advanced,
+            "next-gated-sha",
+        )
+        .unwrap());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+            before
         );
-    }
 
-    #[test]
-    fn review_only_with_persisted_target_succeeds() {
-        // Review-only tasks with a persisted target CAN spawn
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 15, 42, "external/pr-branch", "sha999", false).unwrap();
-        drop(conn);
-
-        assert!(orphan_worker_branch("Anvil", 15, true).is_none());
-        let t = resolve_or_load_pr_target(42, 15, &db_path, dir.path(), Some("fake/repo")).unwrap();
-        assert_eq!(t.head_ref, "external/pr-branch");
-    }
-
-    #[test]
-    fn persisted_target_updated_on_upsert() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 10, 42, "old-branch", "sha1", false).unwrap();
-        pr_targets::upsert(&mut conn, 10, 42, "new-branch", "sha2", true).unwrap();
-        drop(conn);
-
-        let t = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).unwrap();
-        assert_eq!(t.head_ref, "new-branch");
-        assert_eq!(t.head_sha, "sha2");
-        assert!(t.is_fork);
+        assert!(tasks::reserve_reviewer_provision(&mut conn, task_id, "next", "r1", 102).unwrap());
+        assert!(tasks::release_reviewer_provision(&mut conn, task_id, "next").unwrap());
+        assert!(!persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "next",
+            "r1",
+            &advanced,
+            "next-gated-sha",
+        )
+        .unwrap());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+            before,
+            "released-token replay must be read-only"
+        );
     }
 
     // ── per-task provider routing (#195/#203) ────────────────────────────
