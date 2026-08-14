@@ -10373,8 +10373,18 @@ async fn tick(
     // ── Phase 5: Spawn reviewers for workers with PRs ──────────────────
     // Each worker that has a PR and no paired reviewer (and is not draining)
     // gets a reviewer spawned. Reviewers don't consume worker capacity.
-    // Skip during drain — no new work, let existing agents finish.
-    if !drain_state.draining && !decomposition_freeze {
+    // Skip during shutdown drain — no new work, let existing agents finish.
+    //
+    // A decomposition freeze must NOT skip this. Phase 5 only ever serves
+    // workers that already exist (phase 6 spawns none during the freeze), and
+    // the freeze's own drain predicate (decomposition_drain_ready) requires
+    // reviewers==0 && workers==0. Gating reviewer provisioning on the freeze
+    // strands a retained worker awaiting review: it keeps the drain predicate
+    // false forever, and the freeze keeps its reviewer from spawning — a
+    // deadlock against the very drain the freeze waits for. Letting the
+    // reviewer run lets the retained worker settle and drives workers/reviewers
+    // toward zero, which is exactly what the frozen-base capture waits for.
+    if !drain_state.draining {
         let active_in_review = {
             let p = db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
@@ -12719,7 +12729,7 @@ async fn provision_reviewer(
     };
     if !reserved {
         log(&format!(
-            "{}: task #{} has no reviewer provisioning authority (phase, classification, reservation, or planning freeze)",
+            "{}: task #{} has no reviewer provisioning authority (phase, classification, or reservation)",
             role.as_str().to_uppercase(),
             worker.task_id
         ));
