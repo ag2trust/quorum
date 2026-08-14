@@ -1852,17 +1852,23 @@ A reviewer may submit a capability-bound, closed graph-blocker verdict for a dec
 After validating the current run, head, membership, and evidence, the daemon atomically fails the
 affected child and blocks the graph without consuming ordinary rework. The source remains
 decomposed and the blocked graph remains active until source cancellation; recovery requires a
-replacement source, not automatic replanning after delivery has begun.
+replacement source, not automatic replanning after delivery has begun. The only exception is the
+evidence-bound adoption of an already merged continuation described below; it does not unblock,
+replan, or otherwise repair a blocked graph.
 
 A narrow incident-recovery primitive may adopt the exact merged delivery of a done managed
-continuation task for the final failed member of an otherwise complete active graph. This is not
-graph-blocker recovery: blocked graphs still require cancellation and replacement. The automatic
-path's immediate transaction requires the same repository and PR, creator-selected `continue_pr`,
-explicit `source_task` provenance, live daemon publication and merge events (`expires_at > now`),
-immutable managed-review authority, and one consistent PR target/approved head SHA. It changes
-only the failed child, records recovery provenance while preserving the PR, then invokes ordinary
-final-child completion. Missing or expired evidence, replay, and losing concurrent callers are
-clean no-ops with no events; the winner emits bounded completion events once.
+continuation task for the final failed member of an otherwise complete live graph (`state` active
+or blocked, with `active=1`). On a blocked graph this is deliberately only exact,
+evidence-bound delivery adoption: the graph remains blocked and active, the source remains
+decomposed, no new execution authority is granted, and no graph-completion event or dependent
+release occurs. Cancellation and replacement remain required to resolve or replace the blocked
+graph. The automatic path's immediate transaction requires the same repository and PR,
+creator-selected `continue_pr`, explicit `source_task` provenance, live daemon publication and
+merge events (`expires_at > now`), immutable managed-review authority, and one consistent PR
+target/approved head SHA. It changes only the failed child and records recovery provenance while
+preserving the PR; ordinary final-child completion runs only for an active graph. Missing or
+expired evidence, replay, and losing concurrent callers are clean no-ops with no events; the
+winner emits bounded child-completion events once.
 
 For a coordinator/operator-selected incident pair, `quorum decomposition-adopt-recovery
 --original-child-id <child> --recovery-task-id <continuation> --by <operator>` is the sole explicit
@@ -1923,10 +1929,12 @@ resumes first. Complete graphs resume without recreation. Incomplete or inconsis
 nothing; an unstarted graph may reset and replan within budget through the normal freeze/drain
 path, while any delivery evidence requires cancellation and replacement except for the
 evidence-complete exact-continuation case above. Its automatic daemon discovery is a bounded
-reconciliation action on a consistent active graph; the core transaction remains fail-closed and
-does not broaden graph-blocker recovery. Read-only status exposes bounded membership, edges,
-progress, attempts, provenance, and blockers. The complete storage, protocol, and recovery
-contract is in
+reconciliation action on a consistent live graph. On a blocked graph it may only settle that exact
+evidence-complete delivery; it leaves the graph blocked and source decomposed, grants no new work
+authority, and does not complete the graph. The core transaction remains fail-closed and does not
+broaden graph-blocker repair or replacement authority. Read-only status exposes bounded
+membership, edges, progress, attempts, provenance, and blockers. The complete storage, protocol,
+and recovery contract is in
 `docs/2026-07-31-task-decomposition-technical-spec.md`.
 
 **Classifier-owned per-run model selection.** Task creators describe the outcome,
