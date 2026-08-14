@@ -430,6 +430,27 @@ A second daemon on the same DB:
 On clean shutdown the lease is released (row deleted). A crash leaves a stale row that
 the next daemon takes over.
 
+### Daemon limits and stall detection
+
+Managed worker and reviewer processes use an idle-based stall guard. `max_idle_secs` is
+the maximum time an active process may go without emitting an observable runner event;
+each provider event resets the idle clock. The default is 900 seconds (15 minutes).
+When the limit is exceeded, the daemon kills and reaps the process group, releases the
+task authority, and handles the resulting failure through the normal lifecycle recovery
+path. This detects a genuinely stalled process without treating a long, active turn as
+stalled.
+
+`max_task_wall_secs` remains an optional hard wall-clock cap for one live worker,
+reviewer, or remediation slot. It spans all turns and continuations handled by that
+slot and is independent of event activity: a slot that continues emitting events still
+fails when this ceiling is exceeded. The in-memory clock resets when the slot is
+replaced, when the lifecycle moves to another slot, or when the daemon restarts, so this
+setting is not an end-to-end wall-clock cap for the full task lifecycle.
+
+`max_turn_wall_secs` is deprecated and is no longer enforced as a per-turn wall-clock
+limit. Existing configurations may retain it as a compatibility alias for the idle
+setting, but new configurations must use `max_idle_secs`.
+
 ### Cutover recipe (lifecycle refactor)
 
 The lifecycle refactor (parts 1–3) changed the task status vocabulary and eliminated
