@@ -1828,8 +1828,6 @@ pub(crate) fn complete_graph_if_final_child(
 /// park, graph blocker, event, and owner alert become visible together. A
 /// staged retry/remediation keeps the graph active because the failed child
 /// still has daemon-owned continuation authority.
-// The dependent terminal-park tasks wire this shared primitive into their
-// respective transactions after this task lands.
 pub(crate) fn block_graph_if_child_failed(
     conn: &Connection,
     task_id: i64,
@@ -1861,11 +1859,7 @@ pub(crate) fn block_graph_if_child_failed(
     if let Some(refs) = refs {
         let refs: serde_json::Value = serde_json::from_str(&refs)
             .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?;
-        let runner_retry_requested = refs
-            .get(crate::runner_state::RETRY_REF)
-            .and_then(|retry| retry.get("requested"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
+        let runner_retry_requested = crate::runner_state::retry_requested(&refs);
         let daemon_rework_retry_requested = refs
             .get(crate::tasks::PARKED_REWORK_RETRY_REF)
             .and_then(serde_json::Value::as_bool)
@@ -3734,6 +3728,7 @@ mod tests {
     fn failed_child_with_retry_or_remediation_marker_keeps_graph_active() {
         for refs in [
             serde_json::json!({"runner_retry": {"requested": true}}),
+            serde_json::json!({"codex_retry_requested": true}),
             serde_json::json!({"daemon_rework_retry_requested": true}),
             serde_json::json!({"ci_remediation_requested": true}),
         ] {

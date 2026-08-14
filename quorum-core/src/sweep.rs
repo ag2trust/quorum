@@ -483,6 +483,7 @@ fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
              WHERE id=?4",
             params![reason, resume_status, now, task_id],
         )?;
+        crate::decomposition::block_graph_if_child_failed(conn, *task_id, &reason, now)?;
         conn.execute(
             "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
             params![target],
@@ -1105,6 +1106,161 @@ mod tests {
             "park alert uses the default message TTL"
         );
         assert_eq!(alert.5, "owner");
+    }
+
+    fn active_graph_with_dependency_park_child(
+        c: &mut Connection,
+        child_refs: Option<&str>,
+    ) -> (i64, i64, i64) {
+        let source =
+            crate::tasks::create(c, "owner", "source", None, 0, None, None, None, None, 100)
+                .unwrap();
+        c.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        let dependency = crate::tasks::create(
+            c,
+            "owner",
+            "failed dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let child = crate::tasks::create(
+            c,
+            "owner",
+            "generated child",
+            None,
+            0,
+            None,
+            child_refs,
+            Some(&format!("[{dependency}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        let sibling = crate::tasks::create(
+            c,
+            "owner",
+            "generated sibling",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,created_at,updated_at)
+             VALUES (?1,'active',1,0,1,1,1,100,100)",
+            [source],
+        )
+        .unwrap();
+        let graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'child',1,1),(?1,?3,'sibling',1,1)",
+            params![graph, child, sibling],
+        )
+        .unwrap();
+        (graph, child, dependency)
+    }
+
+    #[test]
+    fn dependency_park_blocks_active_generated_child_graph_in_same_transaction() {
+        let (_d, mut c) = open_tmp();
+        let (graph, child, dependency) = active_graph_with_dependency_park_child(&mut c, None);
+        c.execute(
+            "UPDATE tasks SET status='failed',updated_at=200 WHERE id=?1",
+            [dependency],
+        )
+        .unwrap();
+
+        assert_eq!(cascade_dead_deps(&c, 300, SWEEP_LIMIT).unwrap(), 1);
+
+        let reason = format!("dependency #{dependency} is terminal-not-done");
+        let aggregate: (String, String, String, i64) = c
+            .query_row(
+                "SELECT state,hold_code,hold_summary,updated_at
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(aggregate.0, "blocked");
+        assert_eq!(aggregate.1, "generated-child-failed");
+        assert!(aggregate.2.contains(&format!("task #{child}")));
+        assert!(aggregate.2.contains(&reason));
+        assert_eq!(aggregate.3, 300);
+        let event: (String, String, String) = c
+            .query_row(
+                "SELECT kind,subject,body FROM events WHERE kind='task_graph_blocked'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(event.0, "task_graph_blocked");
+        assert_eq!(event.1, format!("task#{child}"));
+        assert!(event.2.contains(&reason));
+        let graph_alerts: i64 = c
+            .query_row(
+                "SELECT count(*) FROM messages
+                 WHERE author='daemon' AND kind='alert' AND recipient='owner'
+                   AND refs=?1 AND body LIKE '%task graph blocked%'",
+                [format!("task:{child}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(graph_alerts, 1);
+    }
+
+    #[test]
+    fn dependency_park_with_active_retry_keeps_generated_child_graph_active() {
+        for refs in [
+            r#"{"runner_retry":{"requested":true}}"#,
+            r#"{"codex_retry_requested":true}"#,
+        ] {
+            let (_d, mut c) = open_tmp();
+            let (graph, child, dependency) =
+                active_graph_with_dependency_park_child(&mut c, Some(refs));
+            c.execute(
+                "UPDATE tasks SET status='rework',updated_at=200 WHERE id=?1",
+                [child],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='failed',updated_at=200 WHERE id=?1",
+                [dependency],
+            )
+            .unwrap();
+
+            assert_eq!(cascade_dead_deps(&c, 300, SWEEP_LIMIT).unwrap(), 1);
+
+            let state: (String, Option<String>, Option<String>) = c
+                .query_row(
+                    "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("active".into(), None, None));
+            let transitions: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM events WHERE kind='task_graph_blocked'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(transitions, 0);
+        }
     }
 
     #[test]
