@@ -5120,7 +5120,7 @@ async fn tick_decomposition(
                 "validating decomposition lacks its durable accepted proposal".into(),
             ));
         };
-        match planner::validate_for_source(proposal, &snapshot.dependencies) {
+        match planner::validate_for_source(proposal, &snapshot.dependencies, &config.repo_dir) {
             Err(error) => {
                 reset_decomposition_to_planning(config, snapshot.graph_id, "validating").await?;
                 record_decomposition_attempt(

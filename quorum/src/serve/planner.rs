@@ -110,9 +110,17 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 pub fn validate_for_source(
     tasks: &[ProposedTask],
     source_dependency_ids: &[i64],
+    repo_root: &Path,
 ) -> Result<(), PlannerParseError> {
     let allowed: HashSet<i64> = source_dependency_ids.iter().copied().collect();
     for task in tasks {
+        for path in task.deliverables.writable_paths() {
+            if quorum_core::decomposition::classify_writable_deliverable_path(repo_root, path)
+                == quorum_core::decomposition::WritableDeliverablePath::Escaping
+            {
+                return semantic("writable deliverable escapes the managed repository");
+            }
+        }
         for prerequisite in &task.prerequisites {
             if let Some(raw) = prerequisite.strip_prefix("source:") {
                 let id = raw
@@ -858,7 +866,7 @@ mod tests {
             prerequisites: vec!["source:9".into()],
         };
         assert!(matches!(
-            validate_for_source(&[foreign], &[7]),
+            validate_for_source(&[foreign], &[7], Path::new(".")),
             Err(PlannerParseError::Semantic(_))
         ));
         let synthetic = ProposedTask {
@@ -876,9 +884,78 @@ mod tests {
             prerequisites: vec![],
         };
         assert!(matches!(
-            validate_for_source(&[synthetic], &[]),
+            validate_for_source(&[synthetic], &[], Path::new(".")),
             Err(PlannerParseError::Semantic(_))
         ));
+    }
+
+    #[test]
+    fn source_validation_inspects_only_requested_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let external = sibling.join("context.rs").to_string_lossy().into_owned();
+        let task = ProposedTask {
+            key: "bounded".into(),
+            title: "Implement bounded change".into(),
+            observable_outcome: "bounded change works".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: "src/in_repo.rs".into(),
+                },
+                quorum_core::decomposition::ChildDeliverable::ReadOnlyReference { path: external },
+                quorum_core::decomposition::ChildDeliverable::ReadOnlyReference {
+                    path: "../sibling/other-context.rs".into(),
+                },
+            ]),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["bounded".into()],
+            verification_expectations: vec!["tests".into()],
+            prerequisites: vec![],
+        };
+
+        assert_eq!(validate_for_source(&[task], &[], &repo), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_validation_rejects_every_repository_escape_shape() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        std::os::unix::fs::symlink(&sibling, repo.join("external-link")).unwrap();
+
+        for path in [
+            "../sibling/output.rs".to_string(),
+            "nested/../../sibling/output.rs".to_string(),
+            sibling.join("output.rs").to_string_lossy().into_owned(),
+            "external-link/new/output.rs".to_string(),
+        ] {
+            let task = ProposedTask {
+                key: "escaping".into(),
+                title: "Implement escaping change".into(),
+                observable_outcome: "escaping change works".into(),
+                deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                    quorum_core::decomposition::ChildDeliverable::Write { path: path.clone() },
+                ]),
+                acceptance_criteria: vec!["covered".into()],
+                source_constraints: vec!["bounded".into()],
+                verification_expectations: vec!["tests".into()],
+                prerequisites: vec![],
+            };
+            assert!(
+                matches!(
+                    validate_for_source(&[task], &[], &repo),
+                    Err(PlannerParseError::Semantic(ref error))
+                        if error == "writable deliverable escapes the managed repository"
+                ),
+                "{path}"
+            );
+        }
     }
 
     #[test]

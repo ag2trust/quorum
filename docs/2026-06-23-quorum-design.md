@@ -1871,6 +1871,13 @@ admission-ready, nonduplicate, and size S or M. Admission readiness means the sc
 clear for delivery; it is distinct from runtime readiness, which still requires dependencies to
 be done.
 
+Each proposed child also carries a bounded structured deliverables manifest that distinguishes
+requested writes from read-only contextual references. Deterministic validation rejects a write
+using parent traversal or resolving outside the canonical managed repository, including an
+in-repository symlink escape. External read-only references remain permitted because they grant no
+write authority. This admission check neither trusts planner self-attestation nor redesigns the
+worker filesystem sandbox.
+
 Semantic proposal rejections and provider/protocol failures have independent caps of three per
 unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
 the freeze during backoff, and retry drains again. Full prompts and transcripts are not persisted;

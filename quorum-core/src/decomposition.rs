@@ -10,6 +10,7 @@ use crate::error::{QuorumError, Result};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 pub const MAX_PROPOSAL_ATTEMPTS: i64 = 3;
 pub const MAX_PROVIDER_FAILURES: i64 = 3;
@@ -59,6 +60,102 @@ impl ChildDeliverable {
         match self {
             Self::Write { .. } => None,
             Self::ReadOnlyReference { path } => Some(path),
+        }
+    }
+}
+
+/// Deterministic repository-containment result for a requested write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritableDeliverablePath {
+    /// The requested write resolves within the managed repository.
+    Permitted,
+    /// The requested write traverses or resolves outside the managed repository.
+    Escaping,
+}
+
+/// Classify one requested write against the managed repository boundary.
+///
+/// Parent traversal is rejected before filesystem resolution. For paths whose
+/// final components do not exist yet, the nearest existing ancestor is
+/// canonicalized and the remaining components are reapplied. This detects an
+/// in-repository symlink that redirects a future file into a sibling or other
+/// external directory without requiring the deliverable itself to exist.
+/// Filesystem inspection failures are fail-closed.
+pub fn classify_writable_deliverable_path(
+    repo_root: &Path,
+    declared_path: &str,
+) -> WritableDeliverablePath {
+    let path = Path::new(declared_path);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return WritableDeliverablePath::Escaping;
+    }
+
+    let Ok(canonical_repo) = std::fs::canonicalize(repo_root) else {
+        return WritableDeliverablePath::Escaping;
+    };
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        canonical_repo.join(path)
+    };
+    let Some(resolved) = resolve_with_nearest_existing_ancestor(&candidate) else {
+        return WritableDeliverablePath::Escaping;
+    };
+    if resolved.starts_with(&canonical_repo) {
+        WritableDeliverablePath::Permitted
+    } else {
+        WritableDeliverablePath::Escaping
+    }
+}
+
+fn resolve_with_nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    resolve_with_nearest_existing_ancestor_inner(path, 0)
+}
+
+fn resolve_with_nearest_existing_ancestor_inner(
+    path: &Path,
+    symlink_depth: usize,
+) -> Option<PathBuf> {
+    const MAX_SYMLINK_DEPTH: usize = 40;
+    let mut ancestor = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&ancestor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(_) => match std::fs::symlink_metadata(&ancestor) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    if symlink_depth >= MAX_SYMLINK_DEPTH {
+                        return None;
+                    }
+                    let target = std::fs::read_link(&ancestor).ok()?;
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        ancestor.parent()?.join(target)
+                    };
+                    let mut resolved =
+                        resolve_with_nearest_existing_ancestor_inner(&target, symlink_depth + 1)?;
+                    for component in missing.iter().rev() {
+                        resolved.push(component);
+                    }
+                    return Some(resolved);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(ancestor.file_name()?.to_os_string());
+                    if !ancestor.pop() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
         }
     }
 }
@@ -2029,6 +2126,67 @@ mod tests {
         assert_eq!(
             deliverables.reference_paths().collect::<Vec<_>>(),
             ["docs/decomposition.md"]
+        );
+    }
+
+    #[test]
+    fn writable_deliverable_classifier_rejects_external_and_traversing_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+
+        for path in [
+            "../sibling/output.rs".to_string(),
+            "src/../../sibling/output.rs".to_string(),
+            sibling.join("output.rs").to_string_lossy().into_owned(),
+        ] {
+            assert_eq!(
+                classify_writable_deliverable_path(&repo, &path),
+                WritableDeliverablePath::Escaping,
+                "{path}"
+            );
+        }
+
+        for path in [
+            "src/output.rs".to_string(),
+            "new/nested/output.rs".to_string(),
+            repo.join("src/output.rs").to_string_lossy().into_owned(),
+        ] {
+            assert_eq!(
+                classify_writable_deliverable_path(&repo, &path),
+                WritableDeliverablePath::Permitted,
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_deliverable_classifier_resolves_symlink_escapes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let sibling = root.path().join("sibling");
+        let absent_external = root.path().join("absent-external");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        std::os::unix::fs::symlink(&sibling, repo.join("external-link")).unwrap();
+        std::os::unix::fs::symlink(&absent_external, repo.join("dangling-external-link")).unwrap();
+        std::os::unix::fs::symlink(repo.join("absent-internal"), repo.join("internal-link"))
+            .unwrap();
+
+        assert_eq!(
+            classify_writable_deliverable_path(&repo, "external-link/new/output.rs"),
+            WritableDeliverablePath::Escaping
+        );
+        assert_eq!(
+            classify_writable_deliverable_path(&repo, "dangling-external-link/new/output.rs"),
+            WritableDeliverablePath::Escaping
+        );
+        assert_eq!(
+            classify_writable_deliverable_path(&repo, "internal-link/new/output.rs"),
+            WritableDeliverablePath::Permitted
         );
     }
 
