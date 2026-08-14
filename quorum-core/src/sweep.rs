@@ -1160,40 +1160,43 @@ mod tests {
 
     #[test]
     fn dependency_park_with_active_retry_keeps_generated_child_graph_active() {
-        let (_d, mut c) = open_tmp();
-        let (graph, child, dependency) = active_graph_with_dependency_park_child(
-            &mut c,
-            Some(r#"{"runner_retry":{"requested":true}}"#),
-        );
-        c.execute(
-            "UPDATE tasks SET status='rework',updated_at=200 WHERE id=?1",
-            [child],
-        )
-        .unwrap();
-        c.execute(
-            "UPDATE tasks SET status='failed',updated_at=200 WHERE id=?1",
-            [dependency],
-        )
-        .unwrap();
-
-        assert_eq!(cascade_dead_deps(&c, 300, SWEEP_LIMIT).unwrap(), 1);
-
-        let state: (String, Option<String>, Option<String>) = c
-            .query_row(
-                "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
-                [graph],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        for refs in [
+            r#"{"runner_retry":{"requested":true}}"#,
+            r#"{"codex_retry_requested":true}"#,
+        ] {
+            let (_d, mut c) = open_tmp();
+            let (graph, child, dependency) =
+                active_graph_with_dependency_park_child(&mut c, Some(refs));
+            c.execute(
+                "UPDATE tasks SET status='rework',updated_at=200 WHERE id=?1",
+                [child],
             )
             .unwrap();
-        assert_eq!(state, ("active".into(), None, None));
-        let transitions: i64 = c
-            .query_row(
-                "SELECT count(*) FROM events WHERE kind='task_graph_blocked'",
-                [],
-                |row| row.get(0),
+            c.execute(
+                "UPDATE tasks SET status='failed',updated_at=200 WHERE id=?1",
+                [dependency],
             )
             .unwrap();
-        assert_eq!(transitions, 0);
+
+            assert_eq!(cascade_dead_deps(&c, 300, SWEEP_LIMIT).unwrap(), 1);
+
+            let state: (String, Option<String>, Option<String>) = c
+                .query_row(
+                    "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("active".into(), None, None));
+            let transitions: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM events WHERE kind='task_graph_blocked'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(transitions, 0);
+        }
     }
 
     #[test]
