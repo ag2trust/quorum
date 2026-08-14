@@ -18,6 +18,7 @@ pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_STDOUT_BYTES: usize = 256 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
+pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigned worktree and repository are writable. This defense-in-depth guidance does not itself enforce that boundary.";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
@@ -80,8 +81,11 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          closed DAG of 2-8 independently deliverable implementation tasks, each size S or M. \
          Preserve every source constraint. Do not create synthetic integration work, recursive \
          planning, or unrelated scope. Dependencies must be real delivery prerequisites and may \
-         reference another task key or source:<dependency-id>. Return exactly one valid JSON \
-         object. For each task, declare every file-level deliverable in `deliverables`: use \
+         reference another task key or source:<dependency-id>. Every PLAN task's \
+         `source_constraints` must include this worker-facing guidance: \
+         \"{WORKER_WRITABILITY_GUIDANCE}\". The daemon adds it deterministically, so it is \
+         guidance rather than an enforcement claim. Return exactly one valid JSON object. For \
+         each task, declare every file-level deliverable in `deliverables`: use \
          `write` only for requested changes and `read_only_reference` only for context. Use no \
          markdown or commentary. The object must be exactly one of these closed \
          shapes: do not omit, rename, or add fields.\n\
@@ -92,6 +96,22 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          to {MAX_REJECTION_SUMMARY_BYTES} bytes. On retry, use only those summaries to correct \
          the cited semantic defect; do not discuss them or request more context.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
     )
+}
+
+/// Add the worker-facing defense-in-depth guidance to every generated child,
+/// independent of the planner's response.
+pub fn with_worker_writability_guidance(source_constraints: &[String]) -> Vec<String> {
+    let mut constraints = source_constraints.to_vec();
+    if !contains_worker_writability_guidance(source_constraints) {
+        constraints.push(WORKER_WRITABILITY_GUIDANCE.into());
+    }
+    constraints
+}
+
+fn contains_worker_writability_guidance(source_constraints: &[String]) -> bool {
+    source_constraints
+        .iter()
+        .any(|constraint| constraint == WORKER_WRITABILITY_GUIDANCE)
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -172,8 +192,11 @@ pub fn parse_response(text: &str) -> Result<PlannerResponse, PlannerParseError> 
 /// deliverables manifest always has the same explicit write/reference shape
 /// before deterministic source validation runs.
 pub fn parse_accepted_proposal(text: &str) -> Result<Vec<ProposedTask>, PlannerParseError> {
-    serde_json::from_str(text)
-        .map_err(|error| PlannerParseError::Provider(format!("invalid accepted proposal: {error}")))
+    let tasks: Vec<ProposedTask> = serde_json::from_str(text).map_err(|error| {
+        PlannerParseError::Provider(format!("invalid accepted proposal: {error}"))
+    })?;
+    validate_plan_tasks(&tasks)?;
+    Ok(tasks)
 }
 
 fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseError> {
@@ -197,47 +220,54 @@ fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseErro
             validate_text("required decision", required_decision)?;
             validate_text("why no safe split", why_no_safe_split)?;
         }
-        PlannerResponse::Plan { tasks } => {
-            if !(2..=8).contains(&tasks.len()) {
-                return semantic("plan must contain between 2 and 8 tasks");
-            }
-            let mut keys = HashSet::new();
-            for task in tasks {
-                validate_key(&task.key)?;
-                if !keys.insert(task.key.as_str()) {
-                    return semantic("task keys must be unique");
-                }
-                validate_text("title", &task.title)?;
-                validate_text("observable outcome", &task.observable_outcome)?;
-                validate_deliverables(&task.deliverables)?;
-                validate_list("acceptance criteria", &task.acceptance_criteria, 1)?;
-                validate_list("source constraints", &task.source_constraints, 1)?;
-                validate_list(
-                    "verification expectations",
-                    &task.verification_expectations,
-                    1,
-                )?;
-                if task.prerequisites.len() > MAX_LIST_ITEMS {
-                    return semantic("too many prerequisites");
-                }
-            }
-            for task in tasks {
-                for prerequisite in &task.prerequisites {
-                    validate_text("prerequisite", prerequisite)?;
-                    if prerequisite == &task.key {
-                        return semantic("task cannot depend on itself");
-                    }
-                    if !keys.contains(prerequisite.as_str())
-                        && !valid_source_dependency(prerequisite)
-                    {
-                        return semantic("prerequisite must be a task key or source:<positive-id>");
-                    }
-                }
-            }
-            reject_cycles(tasks)?;
-        }
+        PlannerResponse::Plan { tasks } => validate_plan_tasks(tasks)?,
     }
     Ok(())
+}
+
+fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> {
+    if !(2..=8).contains(&tasks.len()) {
+        return semantic("plan must contain between 2 and 8 tasks");
+    }
+    let mut keys = HashSet::new();
+    for task in tasks {
+        validate_key(&task.key)?;
+        if !keys.insert(task.key.as_str()) {
+            return semantic("task keys must be unique");
+        }
+        validate_text("title", &task.title)?;
+        validate_text("observable outcome", &task.observable_outcome)?;
+        validate_deliverables(&task.deliverables)?;
+        validate_list("acceptance criteria", &task.acceptance_criteria, 1)?;
+        validate_list("source constraints", &task.source_constraints, 1)?;
+        if task.source_constraints.len() == MAX_LIST_ITEMS
+            && !contains_worker_writability_guidance(&task.source_constraints)
+        {
+            return semantic(
+                "source constraints at maximum size must include worker writability guidance",
+            );
+        }
+        validate_list(
+            "verification expectations",
+            &task.verification_expectations,
+            1,
+        )?;
+        if task.prerequisites.len() > MAX_LIST_ITEMS {
+            return semantic("too many prerequisites");
+        }
+    }
+    for task in tasks {
+        for prerequisite in &task.prerequisites {
+            validate_text("prerequisite", prerequisite)?;
+            if prerequisite == &task.key {
+                return semantic("task cannot depend on itself");
+            }
+            if !keys.contains(prerequisite.as_str()) && !valid_source_dependency(prerequisite) {
+                return semantic("prerequisite must be a task key or source:<positive-id>");
+            }
+        }
+    }
+    reject_cycles(tasks)
 }
 
 fn validate_deliverables(
@@ -616,19 +646,22 @@ mod tests {
 
     #[test]
     fn accepted_proposal_json_rehydrates_structured_deliverables() {
-        let accepted = serde_json::json!([{
-            "key": "core",
-            "title": "Implement core boundary",
-            "observable_outcome": "core boundary works",
-            "deliverables": [
-                {"kind": "write", "path": "quorum-core/src/decomposition.rs"},
-                {"kind": "read_only_reference", "path": "docs/decomposition.md"}
-            ],
-            "acceptance_criteria": ["boundary is covered"],
-            "source_constraints": ["preserve atomicity"],
-            "verification_expectations": ["focused tests pass"],
-            "prerequisites": []
-        }]);
+        let accepted = serde_json::json!([
+            {
+                "key": "core",
+                "title": "Implement core boundary",
+                "observable_outcome": "core boundary works",
+                "deliverables": [
+                    {"kind": "write", "path": "quorum-core/src/decomposition.rs"},
+                    {"kind": "read_only_reference", "path": "docs/decomposition.md"}
+                ],
+                "acceptance_criteria": ["boundary is covered"],
+                "source_constraints": ["preserve atomicity"],
+                "verification_expectations": ["focused tests pass"],
+                "prerequisites": []
+            },
+            task("other", &[])
+        ]);
         let tasks = parse_accepted_proposal(&accepted.to_string()).unwrap();
         assert_eq!(
             tasks[0].deliverables.writable_paths().collect::<Vec<_>>(),
@@ -667,6 +700,43 @@ mod tests {
             parse_response(&cycle.to_string()),
             Err(PlannerParseError::Semantic(_))
         ));
+    }
+
+    #[test]
+    fn maximum_source_constraints_without_worker_guidance_are_semantically_rejected() {
+        let mut maximum = task("maximum", &[]);
+        let constraints: Vec<String> = (0..MAX_LIST_ITEMS)
+            .map(|index| format!("constraint {index}"))
+            .collect();
+        maximum["source_constraints"] = serde_json::to_value(constraints).unwrap();
+        let plan = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [maximum, task("other", &[])],
+        });
+        assert_eq!(
+            parse_response(&plan.to_string()),
+            Err(PlannerParseError::Semantic(
+                "source constraints at maximum size must include worker writability guidance"
+                    .into(),
+            ))
+        );
+    }
+
+    #[test]
+    fn durable_maximum_source_constraints_without_worker_guidance_are_rejected() {
+        let mut maximum = task("maximum", &[]);
+        let constraints: Vec<String> = (0..MAX_LIST_ITEMS)
+            .map(|index| format!("constraint {index}"))
+            .collect();
+        maximum["source_constraints"] = serde_json::to_value(constraints).unwrap();
+        let accepted = serde_json::json!([maximum, task("other", &[])]);
+        assert_eq!(
+            parse_accepted_proposal(&accepted.to_string()),
+            Err(PlannerParseError::Semantic(
+                "source constraints at maximum size must include worker writability guidance"
+                    .into(),
+            ))
+        );
     }
 
     #[test]
@@ -900,6 +970,10 @@ mod tests {
             r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#
         ));
         assert!(prompt.contains("`outcome` must be exactly `plan` or `blocker`"));
+        assert!(prompt.contains(&format!(
+            "Every PLAN task's `source_constraints` must include this worker-facing guidance: \"{WORKER_WRITABILITY_GUIDANCE}\""
+        )));
+        assert!(prompt.contains("The daemon adds it deterministically"));
     }
 
     #[test]
@@ -930,6 +1004,30 @@ mod tests {
         )));
         assert!(prompt
             .contains("On retry, use only those summaries to correct the cited semantic defect"));
+    }
+
+    #[test]
+    fn worker_writability_guidance_is_added_without_trusting_the_planner() {
+        let constraints = vec!["preserve atomicity".into()];
+        let with_guidance = with_worker_writability_guidance(&constraints);
+        assert_eq!(with_guidance.len(), 2);
+        assert_eq!(with_guidance[0], "preserve atomicity");
+        assert_eq!(with_guidance[1], WORKER_WRITABILITY_GUIDANCE);
+
+        let mut maximum_with_guidance: Vec<String> = (0..MAX_LIST_ITEMS - 1)
+            .map(|index| format!("constraint {index}"))
+            .collect();
+        maximum_with_guidance.push(WORKER_WRITABILITY_GUIDANCE.into());
+        assert_eq!(
+            with_worker_writability_guidance(&maximum_with_guidance),
+            maximum_with_guidance
+        );
+
+        let already_present = vec![WORKER_WRITABILITY_GUIDANCE.into()];
+        assert_eq!(
+            with_worker_writability_guidance(&already_present),
+            already_present
+        );
     }
 
     #[test]
