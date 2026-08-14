@@ -883,6 +883,16 @@ fn deprecated_turn_wall_cli_alias_does_not_kill_active_worker() {
         "deprecated turn wall alias must not reap an active turn. Lines: {:?}",
         handle.lines
     );
+    assert_eq!(
+        handle
+            .lines
+            .iter()
+            .filter(|line| line.contains("WARNING: max_turn_wall_secs is deprecated"))
+            .count(),
+        1,
+        "CLI use of the deprecated alias must emit one warning. Lines: {:?}",
+        handle.lines
+    );
 
     handle.stop();
 }

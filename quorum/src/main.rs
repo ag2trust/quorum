@@ -1250,7 +1250,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             )?;
             let r_max_turn_wall = resolve_opt(max_turn_wall_secs, file_cfg.max_turn_wall_secs);
             let mut r_max_idle = resolve_opt(max_idle_secs, file_cfg.max_idle_secs);
-            if file_cfg.max_turn_wall_secs.is_some() {
+            if r_max_turn_wall.value.is_some() {
                 eprintln!(
                     "quorum serve: WARNING: max_turn_wall_secs is deprecated; it now sets the max_idle_secs idle timeout when max_idle_secs is unset"
                 );
