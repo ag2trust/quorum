@@ -2922,6 +2922,9 @@ pub(crate) struct SlotState {
     cost_usd: f64,
     task_started_at: std::time::Instant,
     turn_started_at: std::time::Instant,
+    /// Updated whenever the provider emits a normalized event for this slot.
+    /// The watchdog uses it to distinguish a live turn from a silent one.
+    last_event_at: std::time::Instant,
     /// Set when `draining` flips to false (turn completed). Used by the idle
     /// watchdog to detect zombies sitting between turns indefinitely.
     turn_ended_at: Option<std::time::Instant>,
@@ -3019,7 +3022,9 @@ async fn begin_sticky_worker_rework(slot: &mut SlotState, db_path: &Path) {
     );
     slot.draining = true;
     slot.rework_count += 1;
-    slot.turn_started_at = std::time::Instant::now();
+    let now = std::time::Instant::now();
+    slot.turn_started_at = now;
+    slot.last_event_at = now;
     if let Some(ref mut session_log) = slot.session_log {
         session_log.log_rework(slot.rework_count);
     }
@@ -5827,7 +5832,9 @@ async fn resume_reviewer_after_ci(
             reviewers[reviewer_index].agent_name
         ));
         reviewers[reviewer_index].draining = true;
-        reviewers[reviewer_index].turn_started_at = std::time::Instant::now();
+        let now = std::time::Instant::now();
+        reviewers[reviewer_index].turn_started_at = now;
+        reviewers[reviewer_index].last_event_at = now;
         reviewers[reviewer_index].reviewed_head_sha = Some(gated_head_sha);
     }
     pre_review_checks.remove(&task_id);
@@ -9752,7 +9759,9 @@ async fn tick(
         match feed_worker_turn(w, &raw_prompt, config).await {
             Ok(()) => {
                 w.draining = true;
-                w.turn_started_at = std::time::Instant::now();
+                let now = std::time::Instant::now();
+                w.turn_started_at = now;
+                w.last_event_at = now;
                 log(&format!(
                     "auto-refeed worker {} after error (attempt {}/{})",
                     w.agent_name, w.error_turn_count, MAX_ERROR_RETRIES
@@ -10266,7 +10275,9 @@ async fn tick(
                 match feed_worker_turn(&mut workers[wi], &raw_prompt, config).await {
                     Ok(()) => {
                         workers[wi].draining = true;
-                        workers[wi].turn_started_at = std::time::Instant::now();
+                        let now = std::time::Instant::now();
+                        workers[wi].turn_started_at = now;
+                        workers[wi].last_event_at = now;
                         log(&format!(
                             "delivered message from {} to {} (task #{})",
                             msg_row.agent, target, workers[wi].task_id,
@@ -12284,6 +12295,7 @@ async fn drain_events(
         }
 
         for agent_event in &events {
+            slot.last_event_at = std::time::Instant::now();
             match agent_event {
                 runner::AgentEvent::ThreadStarted { thread_id } => {
                     slot.continuation_id = Some(thread_id.clone());
@@ -13435,6 +13447,7 @@ async fn provision_reviewer_reserved(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: None,
                 agent_state: None,
                 session_log: reviewer_session_log,
@@ -14163,6 +14176,7 @@ async fn spawn_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
@@ -15806,6 +15820,7 @@ async fn spawn_remediation_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
@@ -17191,6 +17206,7 @@ mod tests {
             cost_usd: 0.01,
             task_started_at: now,
             turn_started_at: now,
+            last_event_at: now,
             turn_ended_at: None,
             agent_state: None,
             session_log: None,
@@ -17204,6 +17220,47 @@ mod tests {
             continuation_id: None,
             pending_prompt: "test prompt".into(),
             pending_turn_kind: "initial".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_events_advances_last_event_at_for_worker_and_reviewer() {
+        use tokio::io::BufReader;
+
+        for role in ["worker", "reviewer"] {
+            let mut child = tokio::process::Command::new("sh")
+                .args([
+                    "-c",
+                    r#"printf '%s\n' '{"type":"tool_use","name":"Bash","input":{"command":"true"}}'"#,
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+                child,
+                stdin,
+                BufReader::new(stdout),
+            ));
+            let mut slot = slot_with_process(proc);
+            slot.last_event_at = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap();
+            let previous = slot.last_event_at;
+            let tempdir = tempfile::tempdir().unwrap();
+
+            assert!(
+                drain_events(&mut slot, tempdir.path(), role, &CostLimits::default())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                slot.last_event_at > previous,
+                "{role} liveness stamp was not advanced by the tool event"
+            );
         }
     }
 
@@ -17410,6 +17467,7 @@ mod tests {
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: Some(now_instant),
                 agent_state: None,
                 session_log: None,
@@ -18205,6 +18263,7 @@ mod tests {
             cost_usd: 0.0,
             task_started_at: now,
             turn_started_at: now,
+            last_event_at: now,
             turn_ended_at: None,
             agent_state: None,
             session_log: None,
