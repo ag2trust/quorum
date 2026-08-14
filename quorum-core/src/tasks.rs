@@ -3165,6 +3165,7 @@ pub fn park(
     )?;
     crate::events::emit(&tx, "task_parked", &lease_target(id), reason, now)?;
     alert_owner_of_park(&tx, id, reason, now)?;
+    crate::decomposition::block_graph_if_child_failed(&tx, id, reason, now)?;
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -8358,6 +8359,173 @@ mod tests {
         assert_eq!(alert.3, format!("task:{task_id}"));
         assert_eq!(alert.4, 11 + crate::feed::DEFAULT_MESSAGE_TTL_SECS);
         assert_eq!(alert.5, "owner");
+    }
+
+    #[test]
+    fn daemon_push_rejection_park_blocks_parent_graph() {
+        let (_dir, mut conn) = open_tmp();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('parent','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph = crate::decomposition::begin_planning(
+            &mut conn,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(crate::decomposition::set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            2
+        )
+        .unwrap());
+        let child = |key: &str| {
+            crate::decomposition::PlannedChild {
+            local_key: key.into(),
+            title: key.into(),
+            body: format!("deliver {key}"),
+            labels: None,
+            classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+            prerequisite_keys: vec![],
+            source_dependency_ids: vec![],
+        }
+        };
+        let ids = crate::decomposition::materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a"), child("b")],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        let reason = "daemon-owned push rejected: non-fast-forward";
+
+        park(&mut conn, ids[0], reason, "open", 10)
+            .unwrap()
+            .expect("child must park");
+
+        let (state, hold_code, hold_summary): (String, String, String) = conn
+            .query_row(
+                "SELECT state,hold_code,hold_summary
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "blocked");
+        assert_eq!(hold_code, "generated-child-failed");
+        assert!(hold_summary.contains(&format!("#{}", ids[0])));
+        assert!(hold_summary.contains(reason));
+
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='task_graph_blocked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+
+        let graph_alert: String = conn
+            .query_row(
+                "SELECT body FROM messages
+                 WHERE kind='alert' AND recipient='owner'
+                   AND body LIKE '%task graph blocked%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("graph-blocked alert must exist");
+        assert!(graph_alert.contains("task graph blocked"));
+        assert!(graph_alert.contains(reason));
+    }
+
+    #[test]
+    fn daemon_push_rejection_park_skips_graph_block_with_retry_marker() {
+        let (_dir, mut conn) = open_tmp();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('parent','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph = crate::decomposition::begin_planning(
+            &mut conn,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(crate::decomposition::set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            2
+        )
+        .unwrap());
+        let child = |key: &str| {
+            crate::decomposition::PlannedChild {
+            local_key: key.into(),
+            title: key.into(),
+            body: format!("deliver {key}"),
+            labels: None,
+            classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+            prerequisite_keys: vec![],
+            source_dependency_ids: vec![],
+        }
+        };
+        let ids = crate::decomposition::materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a"), child("b")],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            rusqlite::params![ids[0], r#"{"runner_retry":{"requested":true}}"#,],
+        )
+        .unwrap();
+        let reason = "daemon-owned push rejected: non-fast-forward";
+
+        park(&mut conn, ids[0], reason, "open", 10)
+            .unwrap()
+            .expect("child must park");
+
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM task_decompositions WHERE id=?1",
+                [graph],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state, "active",
+            "graph stays active when retry marker present"
+        );
     }
 
     #[test]

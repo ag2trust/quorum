@@ -1828,7 +1828,6 @@ pub(crate) fn complete_graph_if_final_child(
 /// still has daemon-owned continuation authority.
 // The dependent terminal-park tasks wire this shared primitive into their
 // respective transactions after this task lands.
-#[allow(dead_code)]
 pub(crate) fn block_graph_if_child_failed(
     tx: &Transaction<'_>,
     task_id: i64,
