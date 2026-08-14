@@ -20752,12 +20752,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = open_test_db(dir.path());
         let task_id = seed_reserved_review_task(&mut conn, 42, "winner");
+        // The freeze belongs to a SEPARATE decomposition source task (status
+        // 'decomposed'), not the in-review task under test — this models the
+        // real scenario: an unrelated graph draining must not block this PR's
+        // reviewer target from persisting.
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('decomp source','decomposed','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let source_task_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO task_decompositions(
                  source_task_id,state,active,freeze_active,planned_source_revision,
                  created_at,updated_at)
              VALUES (?1,'draining',0,1,1,1,1)",
-            [task_id],
+            [source_task_id],
         )
         .unwrap();
         let resolved = live_reviewer_target(42, "feature/review", "gated-sha");
