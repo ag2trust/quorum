@@ -5645,7 +5645,7 @@ async fn handle_pre_review_checks_failure(
     match transition {
         Some(ref result) if result.task.status == "rework" => {
             if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
-                if !install_live_worker_remediation_lease(
+                if !install_sticky_remediation_lease_and_baseline(
                     config,
                     workers[worker_index].agent_name.clone(),
                     task_id,
@@ -7572,7 +7572,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        if !install_live_worker_remediation_lease(
+                                        if !install_sticky_remediation_lease_and_baseline(
                                             config,
                                             workers[wi].agent_name.clone(),
                                             reviewer_task_id,
@@ -7863,7 +7863,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        if !install_live_worker_remediation_lease(
+                                        if !install_sticky_remediation_lease_and_baseline(
                                             config,
                                             workers[wi].agent_name.clone(),
                                             reviewer_task_id,
@@ -8083,7 +8083,7 @@ async fn tick(
                                             .iter()
                                             .position(|w| w.task_id == reviewer_task_id)
                                         {
-                                            if !install_live_worker_remediation_lease(
+                                            if !install_sticky_remediation_lease_and_baseline(
                                                 config,
                                                 workers[wi].agent_name.clone(),
                                                 reviewer_task_id,
@@ -8433,7 +8433,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        if !install_live_worker_remediation_lease(
+                                        if !install_sticky_remediation_lease_and_baseline(
                                             config,
                                             workers[wi].agent_name.clone(),
                                             reviewer_task_id,
@@ -8829,7 +8829,7 @@ async fn tick(
                                                 .iter()
                                                 .position(|w| w.task_id == reviewer_task_id)
                                             {
-                                                if !install_live_worker_remediation_lease(
+                                                if !install_sticky_remediation_lease_and_baseline(
                                                     config,
                                                     workers[wi].agent_name.clone(),
                                                     reviewer_task_id,
@@ -9111,7 +9111,7 @@ async fn tick(
                                     ));
                                     0
                                 });
-                                if !install_live_worker_remediation_lease(
+                                if !install_sticky_remediation_lease_and_baseline(
                                     config,
                                     workers[wi].agent_name.clone(),
                                     reviewer_task_id,
@@ -15228,6 +15228,247 @@ async fn install_live_worker_remediation_lease(
     }
 }
 
+/// One shared entry point for every sticky-worker remediation call site: install
+/// the fresh remediation lease AND durably bind the exact daemon-owned PR head
+/// as the pre-turn baseline, in that order. Feed the pending turn only after
+/// both operations succeed under guarded authority.
+///
+/// Task #448 root cause: initial publication legitimately records an intent
+/// with `expected_remote_sha = NULL` (new branch push). Without binding the
+/// exact head before the next remediation turn, the subsequent existing-PR
+/// push cannot prove its compare-and-swap baseline and fails safe. Every
+/// sticky call site now goes through this helper.
+async fn install_sticky_remediation_lease_and_baseline(
+    config: &ServeConfig,
+    agent: String,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) -> bool {
+    if !install_live_worker_remediation_lease(config, agent.clone(), task_id, pr, feedback).await {
+        return false;
+    }
+    if pr <= 0 {
+        log(&format!(
+            "sticky remediation: task #{task_id} has no PR to bind — releasing lease and parking"
+        ));
+        release_sticky_remediation_lease(&config.db_path, &agent, task_id).await;
+        let cause = classified_provisioning_cause(
+            "sticky remediation baseline binding failed: no PR identity",
+        );
+        park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
+        return false;
+    }
+    if let Err(error) = bind_sticky_remediation_pr_baseline(config, task_id, pr).await {
+        log(&format!(
+            "sticky remediation: baseline bind failed for task #{task_id} PR #{pr}: {error} \
+             — releasing lease and parking"
+        ));
+        release_sticky_remediation_lease(&config.db_path, &agent, task_id).await;
+        let cause = classified_provisioning_cause(&format!(
+            "sticky remediation baseline binding failed: {error}"
+        ));
+        park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
+        return false;
+    }
+    true
+}
+
+async fn release_sticky_remediation_lease(db_path: &Path, agent: &str, task_id: i64) {
+    let p = db_path.to_path_buf();
+    let name = agent.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!(
+            "sticky remediation: lease release failed for task #{task_id}: {error}"
+        )),
+        Err(error) => log(&format!(
+            "sticky remediation: lease release join failed for task #{task_id}: {error}"
+        )),
+    }
+}
+
+/// Resolve the exact daemon-owned PR target and atomically persist it as the
+/// durable baseline used by the next publication push. The spawn-time
+/// `pr_targets` row is IMMUTABLE authority: when it already exists, no live
+/// GitHub lookup is needed and the intent's `expected_remote_sha` is filled
+/// from it. Only when the durable row is missing (the #447 initial-publication
+/// gap) does this helper hit `gh pr view` to bootstrap the baseline.
+///
+/// No network call runs inside the DB transaction. A moved head, closed PR,
+/// cross-repo fork, or unavailable lookup returns Err and does not touch
+/// state; the caller releases the lease and parks.
+async fn bind_sticky_remediation_pr_baseline(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+) -> std::result::Result<(), String> {
+    let persisted = load_publication_pr_baseline(&config.db_path, task_id, pr).await?;
+    if let Some(row) = persisted {
+        if row.is_fork {
+            return Err(format!(
+                "PR #{pr} durable baseline is a fork head; daemon has no supported safe push mechanism"
+            ));
+        }
+        let db_path = config.db_path.clone();
+        let sha = row.head_sha.clone();
+        return tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&db_path)?;
+            fill_intent_baseline_from_persisted(&mut conn, task_id, pr, &sha)
+        })
+        .await
+        .map_err(|error| format!("sticky baseline fill join failure: {error}"))?
+        .map_err(|error| format!("sticky baseline fill failed: {error}"));
+    }
+
+    let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo))
+        .await
+        .map_err(|error| format!("live PR #{pr} target lookup failed: {error}"))?;
+    if target.pr != pr {
+        return Err(format!(
+            "PR identity changed: expected #{pr}, got #{}",
+            target.pr
+        ));
+    }
+    if target.state.as_deref() != Some("OPEN") {
+        return Err(format!("PR #{pr} is not open"));
+    }
+    if target.is_fork {
+        return Err(format!(
+            "PR #{pr} is a fork head; daemon has no supported safe push mechanism"
+        ));
+    }
+    if target.base_ref.as_deref() != Some(&config.base_branch) {
+        return Err(format!(
+            "PR #{pr} targets base {:?}, expected {}",
+            target.base_ref, config.base_branch
+        ));
+    }
+
+    let db_path = config.db_path.clone();
+    let target_owned = target.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target_owned)
+    })
+    .await
+    .map_err(|error| format!("sticky baseline persistence join failure: {error}"))?
+    .map_err(|error| format!("sticky baseline persistence failed: {error}"))
+}
+
+/// Guarded write for the short-circuit path: the durable `pr_targets` row is
+/// already set, so simply ensure the publication intent's `expected_remote_sha`
+/// matches the persisted spawn-time head. Never overwrites a differing intent
+/// baseline; a conflict is a loud error that surfaces external head movement.
+fn fill_intent_baseline_from_persisted(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    pr: i64,
+    persisted_sha: &str,
+) -> Result<()> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let task = tasks::get(&tx, task_id)?
+        .ok_or_else(|| QuorumError::Usage(format!("task #{task_id} no longer exists")))?;
+    if task.status != "rework" {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} is not in rework (status={})",
+            task.status
+        )));
+    }
+    if tasks::extract_pr_number(&task.refs) != Some(pr) {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} is not bound to PR #{pr}"
+        )));
+    }
+    if let Some(mut intent) = publication_intent_from_refs(task.refs.as_deref()) {
+        if intent.pr == Some(pr) {
+            if let Some(existing) = intent.expected_remote_sha.as_deref() {
+                if existing != persisted_sha {
+                    return Err(QuorumError::Usage(format!(
+                        "PR #{pr} intent baseline {existing} conflicts with durable {persisted_sha}"
+                    )));
+                }
+            } else {
+                intent.expected_remote_sha = Some(persisted_sha.to_string());
+                let json = serde_json::to_string(&intent).map_err(|error| {
+                    QuorumError::Io(format!("publication intent JSON: {error}"))
+                })?;
+                tasks::set_publication_intent(&tx, task_id, &json, now_unix())?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Guarded write: upsert the durable `pr_targets` baseline and, if the current
+/// publication intent still carries no `expected_remote_sha`, install the exact
+/// live PR head as that immutable baseline. Never overwrites an existing intent
+/// baseline (immutability of spawn-time authority) and never rewrites the
+/// durable `pr_targets` row when it already contradicts the live head — that
+/// contradiction means the head moved outside our lease and must fail loudly.
+fn persist_sticky_remediation_baseline(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    pr: i64,
+    target: &PrTarget,
+) -> Result<()> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let task = tasks::get(&tx, task_id)?
+        .ok_or_else(|| QuorumError::Usage(format!("task #{task_id} no longer exists")))?;
+    if task.status != "rework" {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} is not in rework (status={})",
+            task.status
+        )));
+    }
+    if tasks::extract_pr_number(&task.refs) != Some(pr) {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} is not bound to PR #{pr}"
+        )));
+    }
+    if let Some(existing) = pr_targets::get(&tx, task_id, pr)? {
+        if existing.is_fork != target.is_fork
+            || existing.head_ref != target.head_ref
+            || existing.head_sha != target.head_sha
+        {
+            return Err(QuorumError::Usage(format!(
+                "PR #{pr} moved outside its durable baseline (recorded {}@{}, live {}@{})",
+                existing.head_ref, existing.head_sha, target.head_ref, target.head_sha
+            )));
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO pr_targets
+               (task_id, pr_number, head_ref, head_sha, is_fork, resolved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                task_id,
+                pr,
+                target.head_ref.as_str(),
+                target.head_sha.as_str(),
+                target.is_fork as i64,
+                now_unix(),
+            ),
+        )?;
+    }
+    if let Some(mut intent) = publication_intent_from_refs(task.refs.as_deref()) {
+        if intent.pr == Some(pr) && intent.expected_remote_sha.is_none() {
+            intent.expected_remote_sha = Some(target.head_sha.clone());
+            let json = serde_json::to_string(&intent)
+                .map_err(|error| QuorumError::Io(format!("publication intent JSON: {error}")))?;
+            tasks::set_publication_intent(&tx, task_id, &json, now_unix())?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 async fn retain_blocked_remediation_retry_for_spawn(
     db_path: PathBuf,
     task_id: i64,
@@ -16656,6 +16897,18 @@ mod tests {
                 task_id,
                 &Event::SignaledDone { pr: "553".into() },
                 now + 1,
+            )
+            .unwrap();
+            // Seed the durable spawn-time PR baseline so the sticky remediation
+            // baseline binding takes the short-circuit path and skips the live
+            // `gh pr view` lookup that would fail in a hermetic test.
+            pr_targets::upsert(
+                &mut conn,
+                task_id,
+                553,
+                "daemon/live-worker-t553",
+                "0123456789abcdef0123456789abcdef01234567",
+                false,
             )
             .unwrap();
             task_id
@@ -20209,6 +20462,350 @@ mod tests {
         assert!(existing_pr_lease_baseline(&legacy_intent, &target, "main")
             .unwrap_err()
             .contains("no durable spawn-time"));
+    }
+
+    fn seed_sticky_rework_task(
+        conn: &mut quorum_core::Connection,
+        pr: i64,
+        intent_baseline: Option<&str>,
+    ) -> i64 {
+        let now = now_unix();
+        let task_id = tasks::create(
+            conn,
+            "owner",
+            "sticky rework fixture",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        tasks::update_refs_daemon(
+            conn,
+            task_id,
+            r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            now,
+        )
+        .unwrap();
+        tasks::claim(conn, "live-worker", Some(task_id), &[], 3600, now)
+            .unwrap()
+            .expect("worker must claim");
+        tasks::apply_event(
+            conn,
+            "live-worker",
+            task_id,
+            &Event::SignaledDone { pr: pr.to_string() },
+            now + 1,
+        )
+        .unwrap();
+        tasks::apply_event(
+            conn,
+            "reviewer",
+            task_id,
+            &Event::ReviewerAttached {
+                agent: "reviewer".into(),
+            },
+            now + 2,
+        )
+        .unwrap();
+        tasks::apply_event(conn, "reviewer", task_id, &Event::VerdictChanges, now + 3).unwrap();
+        let intent = PublicationIntent {
+            branch: format!("daemon/live-worker-t{pr}"),
+            local_sha: "local-sha".into(),
+            pr: Some(pr),
+            stage: "verified".into(),
+            expected_remote_sha: intent_baseline.map(str::to_string),
+        };
+        let json = serde_json::to_string(&intent).unwrap();
+        tasks::set_publication_intent(conn, task_id, &json, now_unix()).unwrap();
+        task_id
+    }
+
+    fn load_intent_baseline(conn: &quorum_core::Connection, task_id: i64) -> Option<String> {
+        let task = tasks::get(conn, task_id).unwrap().unwrap();
+        publication_intent_from_refs(task.refs.as_deref())
+            .and_then(|intent| intent.expected_remote_sha)
+    }
+
+    fn sticky_baseline_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
+        pre_review_ci_test_config(db_path, repo_dir)
+    }
+
+    #[tokio::test]
+    async fn sticky_baseline_shortcircuits_on_persisted_target_and_fills_missing_intent() {
+        // #448 regression: initial publication left intent.expected_remote_sha
+        // unset, but the durable pr_targets baseline from a prior spawn is
+        // authoritative. The helper fills the intent from it and never touches
+        // the network.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shortcircuit.db");
+        let pr: i64 = 597;
+        let baseline_sha = "018904b901234567deadbeefcafebabe01234567";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, None);
+            pr_targets::upsert(
+                &mut conn,
+                id,
+                pr,
+                "daemon/live-worker-t597",
+                baseline_sha,
+                false,
+            )
+            .unwrap();
+            id
+        };
+
+        let config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect("persisted baseline is authoritative");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(baseline_sha)
+        );
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, baseline_sha);
+    }
+
+    #[tokio::test]
+    async fn sticky_baseline_shortcircuits_and_leaves_matching_intent_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shortcircuit-match.db");
+        let pr: i64 = 598;
+        let baseline_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(baseline_sha));
+            pr_targets::upsert(
+                &mut conn,
+                id,
+                pr,
+                "daemon/live-worker-t598",
+                baseline_sha,
+                false,
+            )
+            .unwrap();
+            id
+        };
+
+        let config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect("matching intent baseline must be idempotent");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(baseline_sha)
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_baseline_fails_loudly_on_intent_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shortcircuit-conflict.db");
+        let pr: i64 = 599;
+        let baseline_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let intent_sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(intent_sha));
+            pr_targets::upsert(
+                &mut conn,
+                id,
+                pr,
+                "daemon/live-worker-t599",
+                baseline_sha,
+                false,
+            )
+            .unwrap();
+            id
+        };
+
+        let config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("intent baseline vs durable pr_targets mismatch must fail");
+        assert!(error.contains("conflicts"), "unexpected error: {error}");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(intent_sha)
+        );
+    }
+
+    #[tokio::test]
+    async fn sticky_baseline_rejects_persisted_fork_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shortcircuit-fork.db");
+        let pr: i64 = 600;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, None);
+            pr_targets::upsert(&mut conn, id, pr, "fork-branch", "abc", true).unwrap();
+            id
+        };
+        let config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("fork PR must not be pushed by the daemon");
+        assert!(error.contains("fork"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn install_sticky_remediation_lease_and_baseline_releases_lease_on_bind_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("lease-release.db");
+        let pr: i64 = 601;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_sticky_rework_task(&mut conn, pr, None)
+        };
+
+        // No pr_targets seeded → short-circuit misses → gh lookup fires against
+        // a bogus repo and fails; the wrapper must release the lease it just
+        // installed and park the task before the caller can feed a turn.
+        let config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        let installed = install_sticky_remediation_lease_and_baseline(
+            &config,
+            "live-worker".to_string(),
+            task_id,
+            pr,
+            "fix the failing check",
+        )
+        .await;
+        assert!(
+            !installed,
+            "baseline bind failure must reject the sticky turn"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        // Lease must be released (no active claim after park).
+        let active_claim: Option<String> = conn
+            .query_row(
+                "SELECT holder FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .ok();
+        assert!(
+            active_claim.is_none(),
+            "lease must be released after bind failure, got {:?}",
+            active_claim
+        );
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked"], true);
+        assert!(refs["daemon_parked_reason"]
+            .as_str()
+            .unwrap()
+            .contains("sticky remediation baseline"));
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_inserts_missing_row_and_fills_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-insert.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let pr: i64 = 610;
+        let target_sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let task_id = seed_sticky_rework_task(&mut conn, pr, None);
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t610".into(),
+            head_sha: target_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target).unwrap();
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, target_sha);
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(target_sha)
+        );
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_rejects_moved_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-moved.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let pr: i64 = 611;
+        let old_sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let new_sha = "ffffffffffffffffffffffffffffffffffffffff";
+        let task_id = seed_sticky_rework_task(&mut conn, pr, None);
+        pr_targets::upsert(
+            &mut conn,
+            task_id,
+            pr,
+            "daemon/live-worker-t611",
+            old_sha,
+            false,
+        )
+        .unwrap();
+        let live = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t611".into(),
+            head_sha: new_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let error = persist_sticky_remediation_baseline(&mut conn, task_id, pr, &live)
+            .expect_err("head movement outside baseline must fail");
+        assert!(error.to_string().contains("moved outside"));
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(
+            stored.head_sha, old_sha,
+            "durable baseline must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_rejects_non_rework_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-status.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let now = now_unix();
+        let pr: i64 = 612;
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "wrong status",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET refs = json_set(COALESCE(refs, '{}'), '$.pr', ?2), status='open' WHERE id=?1",
+            rusqlite::params![task_id, pr],
+        )
+        .unwrap();
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/x".into(),
+            head_sha: "1234".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let error = persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target)
+            .expect_err("only rework tasks may receive a sticky baseline");
+        assert!(error.to_string().contains("not in rework"));
     }
 
     #[cfg(unix)]
