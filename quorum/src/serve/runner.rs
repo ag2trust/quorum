@@ -29,31 +29,7 @@ const EXIT_EVIDENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 ///
 /// This is evidence only. It does not authorize route selection, assignment
 /// replacement, lifecycle mutation, or recovery accounting by itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureDisposition {
-    /// Authentication, account credit/quota, or a proved provider outage.
-    ProviderUnavailable,
-    /// The selected model/profile is unavailable; the provider may still work.
-    ProfileUnavailable,
-    /// A transport/startup interruption that may retry the exact same route.
-    RetryableSameRoute,
-    /// An execution or protocol boundary failure that must not trigger failover.
-    NonFailover,
-    /// Evidence is insufficient or internal; fail safe and grant no fallback.
-    Unclassified,
-}
-
-impl std::fmt::Display for FailureDisposition {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::ProviderUnavailable => "provider-unavailable",
-            Self::ProfileUnavailable => "profile-unavailable",
-            Self::RetryableSameRoute => "retryable-same-route",
-            Self::NonFailover => "non-failover",
-            Self::Unclassified => "unclassified",
-        })
-    }
-}
+pub use quorum_core::routing_attempts::FailureDisposition;
 
 /// Classified runner-boundary failure plus a bounded, non-authoritative
 /// diagnostic. Lifecycle callers may report this value but must independently
