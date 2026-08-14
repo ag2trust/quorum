@@ -20,6 +20,265 @@ use tokio::io::AsyncReadExt;
 const DIAGNOSTIC_CAPACITY: usize = 256;
 const DIAGNOSTIC_LINE_BYTES: usize = 16 * 1024;
 
+/// Closed, provider-neutral classification for runner failures observed before
+/// a managed agent has produced an authoritative task or review outcome.
+///
+/// This is evidence only. It does not authorize route selection, assignment
+/// replacement, lifecycle mutation, or recovery accounting by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    /// Authentication, account credit/quota, or a proved provider outage.
+    ProviderUnavailable,
+    /// The selected model/profile is unavailable; the provider may still work.
+    ProfileUnavailable,
+    /// A transport/startup interruption that may retry the exact same route.
+    RetryableSameRoute,
+    /// An execution or protocol boundary failure that must not trigger failover.
+    NonFailover,
+    /// Evidence is insufficient or internal; fail safe and grant no fallback.
+    Unclassified,
+}
+
+impl std::fmt::Display for FailureDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ProviderUnavailable => "provider-unavailable",
+            Self::ProfileUnavailable => "profile-unavailable",
+            Self::RetryableSameRoute => "retryable-same-route",
+            Self::NonFailover => "non-failover",
+            Self::Unclassified => "unclassified",
+        })
+    }
+}
+
+/// Classified runner-boundary failure plus a bounded, non-authoritative
+/// diagnostic. Lifecycle callers may report this value but must independently
+/// prove that no managed task/review outcome exists before acting on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerFailure {
+    disposition: FailureDisposition,
+    detail: String,
+    io_kind: std::io::ErrorKind,
+}
+
+impl RunnerFailure {
+    const DETAIL_BYTES: usize = 512;
+
+    fn new(disposition: FailureDisposition, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        let detail = if detail.len() <= Self::DETAIL_BYTES {
+            detail
+        } else {
+            let mut end = Self::DETAIL_BYTES;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", &detail[..end])
+        };
+        Self {
+            disposition,
+            detail,
+            io_kind: std::io::ErrorKind::Other,
+        }
+    }
+
+    fn with_io_kind(mut self, kind: std::io::ErrorKind) -> Self {
+        self.io_kind = kind;
+        self
+    }
+
+    pub fn disposition(&self) -> FailureDisposition {
+        self.disposition
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.io_kind
+    }
+}
+
+impl std::fmt::Display for RunnerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.disposition, self.detail)
+    }
+}
+
+impl std::error::Error for RunnerFailure {}
+
+impl From<RunnerFailure> for std::io::Error {
+    fn from(error: RunnerFailure) -> Self {
+        std::io::Error::new(error.io_kind, error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FailureObservation {
+    pub disposition: Option<FailureDisposition>,
+    pub detail: Option<String>,
+    pub terminal_success: bool,
+    pub unknown_failure: bool,
+}
+
+impl FailureObservation {
+    pub fn inert() -> Self {
+        Self {
+            disposition: None,
+            detail: None,
+            terminal_success: false,
+            unknown_failure: false,
+        }
+    }
+
+    pub fn classified(disposition: FailureDisposition, detail: impl Into<String>) -> Self {
+        Self {
+            disposition: Some(disposition),
+            detail: Some(detail.into()),
+            terminal_success: false,
+            unknown_failure: false,
+        }
+    }
+
+    pub fn unknown_failure(detail: impl Into<String>) -> Self {
+        Self {
+            disposition: None,
+            detail: Some(detail.into()),
+            terminal_success: false,
+            unknown_failure: true,
+        }
+    }
+
+    pub fn success() -> Self {
+        Self {
+            terminal_success: true,
+            ..Self::inert()
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct FailureTracker(Arc<Mutex<FailureTrackerState>>);
+
+#[derive(Default)]
+struct FailureTrackerState {
+    kind: Option<AgentKind>,
+    classified: Option<RunnerFailure>,
+    conflicting: bool,
+    terminal_success: bool,
+    saw_protocol_line: bool,
+    unknown_failure: Option<String>,
+}
+
+impl FailureTracker {
+    pub fn for_kind(kind: AgentKind) -> Self {
+        Self(Arc::new(Mutex::new(FailureTrackerState {
+            kind: Some(kind),
+            ..FailureTrackerState::default()
+        })))
+    }
+
+    pub fn observe_stdout(&self, raw: &str) {
+        let kind = self.0.lock().expect("failure tracker poisoned").kind;
+        let observation = match kind {
+            Some(AgentKind::Claude) => AgentProc::failure_observation(raw),
+            Some(AgentKind::Codex) => CodexProc::failure_observation(raw),
+            Some(AgentKind::Grok) => GrokProc::failure_observation(raw),
+            None => return,
+        };
+        self.record(observation, true);
+    }
+
+    pub fn observe_stderr(&self, text: &str) {
+        let kind = self.0.lock().expect("failure tracker poisoned").kind;
+        let observation = match kind {
+            Some(AgentKind::Claude) => AgentProc::stderr_failure_observation(text),
+            Some(AgentKind::Codex) => CodexProc::stderr_failure_observation(text),
+            Some(AgentKind::Grok) => GrokProc::stderr_failure_observation(text),
+            None => return,
+        };
+        self.record(observation, false);
+    }
+
+    pub fn observe_protocol_read_error(&self, detail: impl Into<String>) {
+        self.record(
+            FailureObservation::classified(FailureDisposition::NonFailover, detail),
+            false,
+        );
+    }
+
+    fn record(&self, observation: FailureObservation, protocol_line: bool) {
+        let mut state = self.0.lock().expect("failure tracker poisoned");
+        state.saw_protocol_line |= protocol_line;
+        state.terminal_success |= observation.terminal_success;
+        if observation.unknown_failure && state.unknown_failure.is_none() {
+            state.unknown_failure = observation.detail.clone();
+        }
+        let Some(disposition) = observation.disposition else {
+            return;
+        };
+        let failure = RunnerFailure::new(
+            disposition,
+            observation
+                .detail
+                .unwrap_or_else(|| "provider failure".into()),
+        );
+        match &state.classified {
+            None => state.classified = Some(failure),
+            Some(existing) if existing.disposition == disposition => {}
+            Some(_) => state.conflicting = true,
+        }
+    }
+
+    pub fn classify_exit(&self, status: std::process::ExitStatus) -> Option<RunnerFailure> {
+        let state = self.0.lock().expect("failure tracker poisoned");
+        if let Some(failure) = observed_failure(&state) {
+            return Some(failure);
+        }
+        if state.terminal_success {
+            return None;
+        }
+        if status.success() || state.saw_protocol_line {
+            return Some(RunnerFailure::new(
+                FailureDisposition::RetryableSameRoute,
+                "provider reached EOF before a terminal protocol event",
+            ));
+        }
+        Some(RunnerFailure::new(
+            FailureDisposition::NonFailover,
+            format!("provider exited with {status} without other failure evidence"),
+        ))
+    }
+
+    pub fn observed_failure(&self) -> Option<RunnerFailure> {
+        let state = self.0.lock().expect("failure tracker poisoned");
+        observed_failure(&state)
+    }
+}
+
+fn observed_failure(state: &FailureTrackerState) -> Option<RunnerFailure> {
+    if state.terminal_success {
+        return None;
+    }
+    if state.conflicting {
+        return Some(RunnerFailure::new(
+            FailureDisposition::Unclassified,
+            "provider emitted conflicting failure evidence",
+        ));
+    }
+    if let Some(failure) = &state.classified {
+        return Some(failure.clone());
+    }
+    if let Some(detail) = &state.unknown_failure {
+        return Some(RunnerFailure::new(
+            FailureDisposition::Unclassified,
+            detail.clone(),
+        ));
+    }
+    None
+}
+
 pub enum CapturedOutput {
     Stdout(String),
     StdoutTruncated { dropped: usize },
@@ -55,7 +314,10 @@ impl CapturedOutput {
 }
 
 #[derive(Clone, Default)]
-pub struct DiagnosticBuffer(Arc<Mutex<DiagnosticState>>);
+pub struct DiagnosticBuffer {
+    state: Arc<Mutex<DiagnosticState>>,
+    failures: FailureTracker,
+}
 
 #[derive(Default)]
 struct DiagnosticState {
@@ -65,8 +327,20 @@ struct DiagnosticState {
 }
 
 impl DiagnosticBuffer {
+    pub(super) fn for_kind(kind: AgentKind) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DiagnosticState::default())),
+            failures: FailureTracker::for_kind(kind),
+        }
+    }
+
+    pub(super) fn failures(&self) -> FailureTracker {
+        self.failures.clone()
+    }
+
     pub fn push(&self, line: String) {
-        let mut state = self.0.lock().expect("diagnostic buffer poisoned");
+        self.failures.observe_stderr(&line);
+        let mut state = self.state.lock().expect("diagnostic buffer poisoned");
         if state.lines.len() == DIAGNOSTIC_CAPACITY {
             state.lines.pop_front();
             state.dropped += 1;
@@ -75,7 +349,7 @@ impl DiagnosticBuffer {
     }
 
     pub fn drain(&self) -> Vec<CapturedOutput> {
-        let mut state = self.0.lock().expect("diagnostic buffer poisoned");
+        let mut state = self.state.lock().expect("diagnostic buffer poisoned");
         let mut output = Vec::with_capacity(
             state.lines.len()
                 + usize::from(state.dropped > 0)
@@ -98,7 +372,7 @@ impl DiagnosticBuffer {
     }
 
     fn note_dropped_bytes(&self, count: usize) {
-        let mut state = self.0.lock().expect("diagnostic buffer poisoned");
+        let mut state = self.state.lock().expect("diagnostic buffer poisoned");
         state.dropped_bytes = state.dropped_bytes.saturating_add(count);
     }
 }
@@ -218,14 +492,17 @@ impl RunnerProc {
     pub async fn launch(
         request: &LaunchRequest<'_>,
         config: &AdapterConfig<'_>,
-    ) -> std::io::Result<Self> {
-        let kind = AgentKind::for_model(request.model)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        match kind {
+    ) -> Result<Self, RunnerFailure> {
+        let kind = AgentKind::for_model(request.model).map_err(|error| {
+            RunnerFailure::new(FailureDisposition::Unclassified, error)
+                .with_io_kind(std::io::ErrorKind::InvalidInput)
+        })?;
+        let result = match kind {
             AgentKind::Claude => AgentProc::launch(request, config).await.map(Self::Claude),
             AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
             AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
-        }
+        };
+        result.map_err(|error| classify_launch_error(kind, error))
     }
 
     /// Restricted classifier launch whose deadline covers Claude's initial
@@ -235,28 +512,33 @@ impl RunnerProc {
         request: &LaunchRequest<'_>,
         config: &AdapterConfig<'_>,
         deadline: tokio::time::Instant,
-    ) -> std::io::Result<Self> {
+    ) -> Result<Self, RunnerFailure> {
         if request.mode != LaunchMode::Restricted {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(RunnerFailure::new(
+                FailureDisposition::NonFailover,
                 "bounded restricted launch requires restricted mode",
-            ));
+            )
+            .with_io_kind(std::io::ErrorKind::InvalidInput));
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
+            return Err(RunnerFailure::new(
+                FailureDisposition::RetryableSameRoute,
                 "restricted provider launch timed out",
-            ));
+            )
+            .with_io_kind(std::io::ErrorKind::TimedOut));
         }
-        let kind = AgentKind::for_model(request.model)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        match kind {
+        let kind = AgentKind::for_model(request.model).map_err(|error| {
+            RunnerFailure::new(FailureDisposition::Unclassified, error)
+                .with_io_kind(std::io::ErrorKind::InvalidInput)
+        })?;
+        let result = match kind {
             AgentKind::Claude => AgentProc::launch_restricted_until(request, config, deadline)
                 .await
                 .map(Self::Claude),
             AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
             AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
-        }
+        };
+        result.map_err(|error| classify_launch_error(kind, error))
     }
 
     pub fn kind(&self) -> AgentKind {
@@ -288,6 +570,28 @@ impl RunnerProc {
             Self::Claude(proc) => proc.try_wait(),
             Self::Codex(proc) => proc.try_wait(),
             Self::Grok(proc) => proc.try_wait(),
+        }
+    }
+
+    /// Return pre-authoritative runner evidence for an exited process. The
+    /// lifecycle must call this only after independently proving there is no
+    /// completion, submission, agent reaction, or review verdict.
+    pub fn classify_pre_authoritative_exit(
+        &self,
+        status: std::process::ExitStatus,
+    ) -> Option<RunnerFailure> {
+        match self {
+            Self::Claude(proc) => proc.classify_pre_authoritative_exit(status),
+            Self::Codex(proc) => proc.classify_pre_authoritative_exit(status),
+            Self::Grok(proc) => proc.classify_pre_authoritative_exit(status),
+        }
+    }
+
+    pub fn observed_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
+        match self {
+            Self::Claude(proc) => proc.observed_pre_authoritative_failure(),
+            Self::Codex(proc) => proc.observed_pre_authoritative_failure(),
+            Self::Grok(proc) => proc.observed_pre_authoritative_failure(),
         }
     }
 
@@ -345,6 +649,29 @@ impl RunnerProc {
             Self::Grok(proc) => proc.drain_diagnostics(),
         }
     }
+}
+
+fn classify_launch_error(kind: AgentKind, error: std::io::Error) -> RunnerFailure {
+    let disposition = match error.kind() {
+        std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionRefused => FailureDisposition::RetryableSameRoute,
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::PermissionDenied
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::Unsupported => FailureDisposition::NonFailover,
+        _ => FailureDisposition::Unclassified,
+    };
+    RunnerFailure::new(
+        disposition,
+        format!("{kind} runner startup failed: {error}"),
+    )
+    .with_io_kind(error.kind())
 }
 
 impl AgentKind {
@@ -789,6 +1116,50 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("unknown model"));
+        assert_eq!(error.disposition(), FailureDisposition::Unclassified);
+    }
+
+    #[tokio::test]
+    async fn missing_runner_binary_is_non_failover_startup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match RunnerProc::launch(
+            &LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "medium",
+                worktree: dir.path(),
+                prompt: "prompt",
+                environment: &[],
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &AdapterConfig {
+                executable: Some("/definitely/not/a/runner"),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "read-only",
+                grok: Default::default(),
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("missing binary unexpectedly launched"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.disposition(), FailureDisposition::NonFailover);
+    }
+
+    #[test]
+    fn failure_disposition_is_a_closed_five_way_contract() {
+        let dispositions = [
+            FailureDisposition::ProviderUnavailable,
+            FailureDisposition::ProfileUnavailable,
+            FailureDisposition::RetryableSameRoute,
+            FailureDisposition::NonFailover,
+            FailureDisposition::Unclassified,
+        ];
+        assert_eq!(dispositions.len(), 5);
+        assert_eq!(FailureDisposition::Unclassified.to_string(), "unclassified");
     }
 
     #[cfg(unix)]

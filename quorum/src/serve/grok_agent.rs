@@ -6,8 +6,9 @@
 //! Claude/Codex flags.
 
 use super::runner::{
-    capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, CapturedOutput,
-    DiagnosticBuffer, LaunchMode, LaunchRequest, NormalizedLine, TokenUsage,
+    capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
+    CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation, FailureTracker,
+    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -260,6 +261,7 @@ pub struct GrokProc {
     process_group_id: libc::pid_t,
     reader: BoundedStdout,
     diagnostics: DiagnosticBuffer,
+    failures: FailureTracker,
     stderr_task: tokio::task::JoinHandle<()>,
 }
 
@@ -329,7 +331,8 @@ impl GrokProc {
             .ok_or_else(|| std::io::Error::other("spawned Grok process has no process-group ID"))?
             as libc::pid_t;
         let reader = BoundedStdout::new(child.stdout.take().expect("stdout was piped"));
-        let diagnostics = DiagnosticBuffer::default();
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Grok);
+        let failures = diagnostics.failures();
         let stderr_diagnostics = diagnostics.clone();
         let stderr = child.stderr.take().expect("stderr was piped");
         let stderr_task =
@@ -339,6 +342,7 @@ impl GrokProc {
             process_group_id,
             reader,
             diagnostics,
+            failures,
             stderr_task,
         })
     }
@@ -350,8 +354,60 @@ impl GrokProc {
         }
     }
 
+    pub(super) fn failure_observation(raw: &str) -> FailureObservation {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return FailureObservation::classified(
+                FailureDisposition::NonFailover,
+                "Grok emitted malformed streaming-json",
+            );
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("end")
+                if value
+                    .get("sessionId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| !id.trim().is_empty()) =>
+            {
+                FailureObservation::success()
+            }
+            Some("end" | "provider.stdout_invalid_utf8") => FailureObservation::classified(
+                FailureDisposition::NonFailover,
+                "Grok terminal protocol was invalid",
+            ),
+            Some("error") => FailureObservation::unknown_failure(
+                "Grok terminal error has no enabled availability classifier",
+            ),
+            _ => FailureObservation::inert(),
+        }
+    }
+
+    pub(super) fn stderr_failure_observation(text: &str) -> FailureObservation {
+        if text.is_empty() {
+            FailureObservation::inert()
+        } else {
+            FailureObservation::unknown_failure(
+                "Grok stderr has no enabled availability classifier",
+            )
+        }
+    }
+
+    pub fn classify_pre_authoritative_exit(
+        &self,
+        status: std::process::ExitStatus,
+    ) -> Option<RunnerFailure> {
+        self.failures.classify_exit(status)
+    }
+
+    pub fn observed_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
+        self.failures.observed_failure()
+    }
+
     pub async fn next_raw_line(&mut self) -> Option<String> {
-        self.reader.next_line().await
+        let line = self.reader.next_line().await;
+        if let Some(raw) = &line {
+            self.failures.observe_stdout(raw);
+        }
+        line
     }
 
     pub fn pid(&self) -> Option<i32> {
@@ -737,7 +793,8 @@ mod tests {
         let mut child = command.spawn().unwrap();
         let process_group_id = child.id().unwrap() as libc::pid_t;
         let reader = BoundedStdout::new(child.stdout.take().unwrap());
-        let diagnostics = DiagnosticBuffer::default();
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Grok);
+        let failures = diagnostics.failures();
         let stderr_diagnostics = diagnostics.clone();
         let stderr = child.stderr.take().unwrap();
         let stderr_task =
@@ -747,6 +804,7 @@ mod tests {
             process_group_id,
             reader,
             diagnostics,
+            failures,
             stderr_task,
         }
     }

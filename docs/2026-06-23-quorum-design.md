@@ -1356,6 +1356,28 @@ enum AgentEvent {
 }
 ```
 
+Before an authoritative managed-agent outcome, the runner boundary may also
+attach one closed, provider-neutral failure disposition to proved startup or
+early-exit evidence:
+
+```rust
+enum FailureDisposition {
+    ProviderUnavailable, // authentication, account credit/quota, provider outage
+    ProfileUnavailable,  // selected model/profile only
+    RetryableSameRoute,  // transport/startup interruption
+    NonFailover,         // execution/protocol boundary
+    Unclassified,        // insufficient/internal evidence; fail safe
+}
+```
+
+Provider adapters own any structured-code or bounded provider-specific message
+classification. Unknown text remains `Unclassified`; conflicting evidence also
+fails closed. A terminal provider success, managed completion/submission,
+agent-reported failed/blocked/needs-info outcome, or review verdict prevents the
+taxonomy from being applied. The disposition is evidence only at this stage: it
+does not select a route, replace an assignment, consume an allocation, or change
+lifecycle/recovery accounting.
+
 The boundary resolves `model` through the closed `AgentKind` enum and explicitly
 dispatches to one built-in adapter. It does not accept a caller-selected kind/model pair,
 fall back between adapters, or expose a provider trait. Installed executable and existing

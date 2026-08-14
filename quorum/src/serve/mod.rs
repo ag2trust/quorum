@@ -2964,6 +2964,23 @@ impl SlotState {
         self.proc.try_wait()
     }
 
+    fn classify_pre_authoritative_exit(
+        &self,
+        status: std::process::ExitStatus,
+    ) -> Option<runner::RunnerFailure> {
+        match &self.proc {
+            SlotProcess::Running(proc) => proc.classify_pre_authoritative_exit(status),
+            SlotProcess::Dormant { .. } => None,
+        }
+    }
+
+    fn observed_pre_authoritative_failure(&self) -> Option<runner::RunnerFailure> {
+        match &self.proc {
+            SlotProcess::Running(proc) => proc.observed_pre_authoritative_failure(),
+            SlotProcess::Dormant { .. } => None,
+        }
+    }
+
     fn live_process_mut(&mut self) -> std::io::Result<&mut runner::RunnerProc> {
         self.proc.running_mut()
     }
@@ -9821,6 +9838,12 @@ async fn tick(
                     .await;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
+                    if let Some(failure) = dead.observed_pre_authoritative_failure() {
+                        log(&format!(
+                            "worker {} pre-authoritative runner failure classified as {failure}",
+                            dead.agent_name
+                        ));
+                    }
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
                 }
                 Err(error) => {
@@ -9984,6 +10007,12 @@ async fn tick(
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
+                    if let Some(failure) = dead.classify_pre_authoritative_exit(status) {
+                        log(&format!(
+                            "worker {} pre-authoritative runner failure classified as {failure}",
+                            dead.agent_name
+                        ));
+                    }
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
                     continue;
                 }
@@ -10010,6 +10039,7 @@ async fn tick(
             continue;
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
+        let runner_failure = classify_managed_pre_authoritative_exit(&dead, status, &disposition);
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -10052,6 +10082,12 @@ async fn tick(
                 continue;
             }
             tasks::ManagedExitDisposition::AgentFailed(_) => {}
+        }
+        if let Some(failure) = runner_failure {
+            log(&format!(
+                "worker {} pre-authoritative runner failure classified as {failure}",
+                dead.agent_name
+            ));
         }
         log(&format!(
             "worker {} died mid-task after classification proved no submission and active ownership (task #{}, status={status:?}) — recovering worker",
@@ -10099,7 +10135,7 @@ async fn tick(
         }
     }
 
-    let mut dead_reviewers: Vec<usize> = Vec::new();
+    let mut dead_reviewers = Vec::new();
     for (i, r) in reviewers.iter_mut().enumerate() {
         match r.try_wait() {
             Ok(Some(status)) => {
@@ -10107,7 +10143,7 @@ async fn tick(
                     "reviewer {} process exited (task #{}, status={:?}) — classifying lifecycle outcome",
                     r.agent_name, r.task_id, status
                 ));
-                dead_reviewers.push(i);
+                dead_reviewers.push((i, status));
             }
             Ok(None) => {}
             Err(e) => {
@@ -10115,7 +10151,7 @@ async fn tick(
             }
         }
     }
-    for &i in dead_reviewers.iter().rev() {
+    for &(i, status) in dead_reviewers.iter().rev() {
         let disposition = dispose_managed_process_exit(
             &db_path,
             tasks::ManagedRunRole::Reviewer,
@@ -10132,6 +10168,8 @@ async fn tick(
             continue;
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
+        let runner_failure =
+            classify_managed_pre_authoritative_exit(&reviewers[i], status, &disposition);
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -10171,6 +10209,12 @@ async fn tick(
             }
             tasks::ManagedExitDisposition::AgentFailed(_) => {
                 let dead = reviewers.remove(i);
+                if let Some(failure) = runner_failure {
+                    log(&format!(
+                        "reviewer {} pre-authoritative runner failure classified as {failure}",
+                        dead.agent_name
+                    ));
+                }
                 log(&format!(
                     "reviewer {} died after classification proved no verdict and active ownership of task #{} — recovering review",
                     dead.agent_name, dead.task_id
@@ -11514,7 +11558,7 @@ async fn feed_worker_turn(
                 if let Some(authority) = dormant_authority {
                     abort_dormant_worker_turn(&config.db_path, &authority.cap_run_id).await;
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
 
@@ -14521,6 +14565,19 @@ fn managed_exit_end_reason(disposition: &tasks::ManagedExitDisposition) -> Optio
         tasks::ManagedExitDisposition::OwnershipTransferred => Some("ownership_transferred"),
         tasks::ManagedExitDisposition::AgentFailed(_) => Some("crashed"),
     }
+}
+
+/// The DB disposition is the authority gate for this taxonomy. Pending or
+/// recorded submissions/verdicts and transferred/terminal ownership are
+/// semantic managed outcomes, regardless of process output or exit status.
+fn classify_managed_pre_authoritative_exit(
+    slot: &SlotState,
+    status: std::process::ExitStatus,
+    disposition: &tasks::ManagedExitDisposition,
+) -> Option<runner::RunnerFailure> {
+    matches!(disposition, tasks::ManagedExitDisposition::AgentFailed(_))
+        .then(|| slot.classify_pre_authoritative_exit(status))
+        .flatten()
 }
 
 /// Gather task context from the DB and persist a structured lifecycle diagnostic.
@@ -21504,6 +21561,28 @@ mod tests {
             turn_kind: "initial".into(),
             continuation_id: Some("thread-live".into()),
             requested: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authoritative_managed_outcomes_gate_runner_failure_taxonomy() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let slot = make_dummy_slot();
+        let status = std::process::ExitStatus::from_raw(1 << 8);
+        // OutcomePending/Recorded cover worker submissions and reviewer
+        // verdicts/findings. OwnershipTransferred covers authoritative agent
+        // failed/blocked/needs-info reactions and already-advanced tasks.
+        for disposition in [
+            tasks::ManagedExitDisposition::OutcomePending,
+            tasks::ManagedExitDisposition::OutcomeRecorded,
+            tasks::ManagedExitDisposition::OwnershipTransferred,
+        ] {
+            assert!(
+                classify_managed_pre_authoritative_exit(&slot, status, &disposition).is_none(),
+                "authoritative outcome entered runner failure taxonomy"
+            );
         }
     }
 
