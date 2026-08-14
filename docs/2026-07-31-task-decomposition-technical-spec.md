@@ -317,9 +317,11 @@ Each child declares a bounded structured deliverables manifest that distinguishe
 writes from read-only contextual references. Repository containment validation inspects only the
 requested writes; an external read-only reference does not grant write authority and is permitted.
 Lexically external absolute writes are rejected without filesystem access. Inspection needed for
-in-repository symlinks runs off the serial daemon tick behind a hard timeout and fails closed as an
-escape. This is deterministic proposal admission, not a general filesystem sandbox or a planner
-self-attestation check.
+in-repository symlinks runs off the serial daemon tick on at most one dedicated OS resolver thread
+with no queued retry. A hard timeout fails closed as an escape, and while the resolver remains
+stuck its occupied slot rejects later proposals without consuming Tokio's shared blocking pool or
+delaying database work. This is deterministic proposal admission, not a general filesystem sandbox
+or a planner self-attestation check.
 
 All proposed children are classified together before any child row exists. Classification uses
 temporary proposal keys, not task IDs. Every result must be present, admission-ready,

@@ -9,6 +9,8 @@ use super::runner::{AgentEvent, AgentKind, RunnerProc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const CODEX_PLANNER_MODEL: &str = "gpt-5.6-sol";
@@ -23,6 +25,68 @@ const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
+
+/// Process-local admission gate for filesystem-backed write-path resolution.
+///
+/// The resolver runs on at most one dedicated OS thread, never Tokio's shared
+/// blocking pool. A timed-out filesystem call retains this single slot until
+/// it really returns; later requests fail closed without spawning or queueing
+/// more work.
+#[derive(Clone, Default)]
+pub struct WritablePathResolver {
+    active: Arc<AtomicBool>,
+}
+
+struct WritablePathResolutionGuard(Arc<AtomicBool>);
+
+impl Drop for WritablePathResolutionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl WritablePathResolver {
+    async fn resolve_with<F>(
+        &self,
+        repo_root: std::path::PathBuf,
+        writable_paths: Vec<String>,
+        resolution_timeout: Duration,
+        resolver: F,
+    ) -> bool
+    where
+        F: FnOnce(std::path::PathBuf, Vec<String>) -> bool + Send + 'static,
+    {
+        if self
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+
+        let guard = WritablePathResolutionGuard(Arc::clone(&self.active));
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("quorum-write-path-resolver".into())
+            .spawn(move || {
+                let _guard = guard;
+                let _ = result_tx.send(resolver(repo_root, writable_paths));
+            });
+        if spawned.is_err() {
+            return false;
+        }
+
+        matches!(
+            tokio::time::timeout(resolution_timeout, result_rx).await,
+            Ok(Ok(true))
+        )
+    }
+
+    #[cfg(test)]
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "outcome", rename_all = "lowercase", deny_unknown_fields)]
@@ -112,11 +176,13 @@ pub async fn validate_for_source(
     tasks: &[ProposedTask],
     source_dependency_ids: &[i64],
     repo_root: &Path,
+    path_resolver: &WritablePathResolver,
 ) -> Result<(), PlannerParseError> {
     validate_for_source_with_resolver(
         tasks,
         source_dependency_ids,
         repo_root,
+        path_resolver,
         WRITABLE_PATH_RESOLUTION_TIMEOUT,
         |repo_root, paths| {
             paths.iter().all(|path| {
@@ -133,6 +199,7 @@ async fn validate_for_source_with_resolver<F>(
     tasks: &[ProposedTask],
     source_dependency_ids: &[i64],
     repo_root: &Path,
+    path_resolver: &WritablePathResolver,
     resolution_timeout: Duration,
     resolver: F,
 ) -> Result<(), PlannerParseError>
@@ -168,15 +235,17 @@ where
             return semantic("synthetic integration work is not permitted");
         }
     }
-    let repo_root = repo_root.to_path_buf();
-    let permitted = matches!(
-        tokio::time::timeout(
+    if writable_paths.is_empty() {
+        return Ok(());
+    }
+    let permitted = path_resolver
+        .resolve_with(
+            repo_root.to_path_buf(),
+            writable_paths,
             resolution_timeout,
-            tokio::task::spawn_blocking(move || resolver(repo_root, writable_paths)),
+            resolver,
         )
-        .await,
-        Ok(Ok(true))
-    );
+        .await;
     if permitted {
         Ok(())
     } else {
@@ -893,6 +962,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_validation_rejects_foreign_dependencies_and_synthetic_integration() {
+        let path_resolver = WritablePathResolver::default();
         let foreign = ProposedTask {
             key: "a".into(),
             title: "Implement a".into(),
@@ -908,7 +978,7 @@ mod tests {
             prerequisites: vec!["source:9".into()],
         };
         assert!(matches!(
-            validate_for_source(&[foreign], &[7], Path::new(".")).await,
+            validate_for_source(&[foreign], &[7], Path::new("."), &path_resolver).await,
             Err(PlannerParseError::Semantic(_))
         ));
         let synthetic = ProposedTask {
@@ -926,13 +996,14 @@ mod tests {
             prerequisites: vec![],
         };
         assert!(matches!(
-            validate_for_source(&[synthetic], &[], Path::new(".")).await,
+            validate_for_source(&[synthetic], &[], Path::new("."), &path_resolver).await,
             Err(PlannerParseError::Semantic(_))
         ));
     }
 
     #[tokio::test]
     async fn source_validation_inspects_only_requested_writes() {
+        let path_resolver = WritablePathResolver::default();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         let sibling = root.path().join("sibling");
@@ -958,12 +1029,16 @@ mod tests {
             prerequisites: vec![],
         };
 
-        assert_eq!(validate_for_source(&[task], &[], &repo).await, Ok(()));
+        assert_eq!(
+            validate_for_source(&[task], &[], &repo, &path_resolver).await,
+            Ok(())
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn source_validation_rejects_every_repository_escape_shape() {
+        let path_resolver = WritablePathResolver::default();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         let sibling = root.path().join("sibling");
@@ -991,7 +1066,7 @@ mod tests {
             };
             assert!(
                 matches!(
-                    validate_for_source(&[task], &[], &repo).await,
+                    validate_for_source(&[task], &[], &repo, &path_resolver).await,
                     Err(PlannerParseError::Semantic(ref error))
                         if error == "writable deliverable escapes the managed repository"
                 ),
@@ -1002,6 +1077,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_validation_times_out_blocking_filesystem_resolution() {
+        let path_resolver = WritablePathResolver::default();
         let repo = tempfile::tempdir().unwrap();
         let task = ProposedTask {
             key: "bounded".into(),
@@ -1023,6 +1099,7 @@ mod tests {
             &[task],
             &[],
             repo.path(),
+            &path_resolver,
             Duration::from_millis(25),
             move |_, _| {
                 release_rx.recv().unwrap();
@@ -1037,10 +1114,101 @@ mod tests {
                 if error == "writable deliverable escapes the managed repository")
         );
         assert!(started.elapsed() < Duration::from_millis(500));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while path_resolver.is_active() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released resolver exits");
+    }
+
+    #[test]
+    fn repeated_resolution_timeouts_do_not_queue_or_starve_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let path_resolver = WritablePathResolver::default();
+            let repo = tempfile::tempdir().unwrap();
+            let db_path = repo.path().join("quorum.db");
+            drop(quorum_core::db::open(&db_path).unwrap());
+            let task = ProposedTask {
+                key: "bounded".into(),
+                title: "Implement bounded change".into(),
+                observable_outcome: "bounded change works".into(),
+                deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                    quorum_core::decomposition::ChildDeliverable::Write {
+                        path: "src/in_repo.rs".into(),
+                    },
+                ]),
+                acceptance_criteria: vec!["covered".into()],
+                source_constraints: vec!["bounded".into()],
+                verification_expectations: vec!["tests".into()],
+                prerequisites: vec![],
+            };
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_in_resolver = Arc::clone(&calls);
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let first = validate_for_source_with_resolver(
+                std::slice::from_ref(&task),
+                &[],
+                repo.path(),
+                &path_resolver,
+                Duration::from_millis(10),
+                move |_, _| {
+                    calls_in_resolver.fetch_add(1, Ordering::SeqCst);
+                    release_rx.recv().unwrap();
+                    true
+                },
+            )
+            .await;
+            assert!(matches!(first, Err(PlannerParseError::Semantic(_))));
+
+            for _ in 0..16 {
+                let outcome = validate_for_source_with_resolver(
+                    std::slice::from_ref(&task),
+                    &[],
+                    repo.path(),
+                    &path_resolver,
+                    Duration::from_millis(10),
+                    |_, _| panic!("occupied resolver slot queued another job"),
+                )
+                .await;
+                assert!(matches!(outcome, Err(PlannerParseError::Semantic(_))));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(path_resolver.is_active());
+
+            let db_style_work = tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::task::spawn_blocking(move || {
+                    let conn = quorum_core::db::open(&db_path).unwrap();
+                    conn.query_row("SELECT 42", [], |row| row.get::<_, i64>(0))
+                        .unwrap()
+                }),
+            )
+            .await
+            .expect("resolver must not starve Tokio's blocking pool")
+            .expect("DB-style blocking work joins");
+            assert_eq!(db_style_work, 42);
+
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while path_resolver.is_active() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("released resolver exits");
+        });
     }
 
     #[tokio::test]
     async fn source_validation_rejects_absolute_external_path_before_resolver() {
+        let path_resolver = WritablePathResolver::default();
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("repo");
         let external = root.path().join("unavailable-mount/output.rs");
@@ -1064,6 +1232,7 @@ mod tests {
             &[task],
             &[],
             &repo,
+            &path_resolver,
             Duration::from_secs(1),
             |_, _| panic!("lexically external path reached filesystem resolver"),
         )

@@ -3684,6 +3684,7 @@ struct DecompositionCoordinator {
     planner_slot: Option<planner::PlannerSlot>,
     classifier_slot: Option<classifier::ClassifierSlot>,
     planner_view: Option<tempfile::TempDir>,
+    writable_path_resolver: planner::WritablePathResolver,
 }
 
 #[derive(Clone)]
@@ -5120,7 +5121,13 @@ async fn tick_decomposition(
                 "validating decomposition lacks its durable accepted proposal".into(),
             ));
         };
-        match planner::validate_for_source(proposal, &snapshot.dependencies, &config.repo_dir).await
+        match planner::validate_for_source(
+            proposal,
+            &snapshot.dependencies,
+            &config.repo_dir,
+            &coordinator.writable_path_resolver,
+        )
+        .await
         {
             Err(error) => {
                 reset_decomposition_to_planning(config, snapshot.graph_id, "validating").await?;
@@ -23313,6 +23320,7 @@ mod tests {
             planner_slot: Some(planner_slot),
             classifier_slot: Some(classifier_slot),
             planner_view: None,
+            writable_path_resolver: planner::WritablePathResolver::default(),
         };
 
         // An accepted pre-materialization edit removes the aggregate, so the
