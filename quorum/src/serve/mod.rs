@@ -1596,14 +1596,13 @@ fn persist_reviewer_pr_target(
         tx.commit()?;
         return Ok(false);
     };
-    let planning_frozen: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
-        [],
-        |row| row.get(0),
-    )?;
+    // A decomposition freeze deliberately does NOT block reviewer target
+    // persistence for an already-in-review PR: the reviewer is in-flight
+    // continuation the freeze's drain predicate waits on (workers==0 &&
+    // reviewers==0). Gating here would strand the reviewer and deadlock the
+    // freeze against its own drain — the same class as the reserve/claim gates.
     if !reservation_active
         || task.status != "in-review"
-        || planning_frozen
         || !tasks::classification_is_dispatchable(&task.refs, task.review_only, task.continue_pr)
     {
         tx.commit()?;
@@ -20742,6 +20741,44 @@ mod tests {
         assert_eq!(stored.head_ref, "feature/review");
         assert_eq!(stored.head_sha, "gated-sha");
         assert!(!stored.is_fork);
+    }
+
+    #[test]
+    fn reviewer_target_persists_under_active_decomposition_freeze() {
+        // Deadlock regression: an in-review PR's reviewer target MUST persist
+        // while an unrelated decomposition freeze is draining. The freeze's
+        // drain predicate waits for reviewers==0; blocking persistence here
+        // would strand the reviewer and deadlock the freeze against its drain.
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_test_db(dir.path());
+        let task_id = seed_reserved_review_task(&mut conn, 42, "winner");
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,1,1)",
+            [task_id],
+        )
+        .unwrap();
+        let resolved = live_reviewer_target(42, "feature/review", "gated-sha");
+
+        validate_reviewer_pr_target(&resolved, 42, "gated-sha", "main").unwrap();
+        assert!(persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "winner",
+            "r1",
+            &resolved,
+            "gated-sha",
+        )
+        .unwrap());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            "gated-sha"
+        );
     }
 
     #[test]
