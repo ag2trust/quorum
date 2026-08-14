@@ -301,6 +301,8 @@ Deterministic validation rejects the complete proposal for:
 
 - fewer than two or more than eight tasks;
 - duplicate keys, self-edges, cycles, or unknown dependencies;
+- a requested-write deliverable that uses parent traversal or resolves outside the canonical
+  managed repository, including through an in-repository symlink;
 - empty/no-op work or synthetic integration work;
 - missing source outcome/constraint coverage;
 - unrelated scope or weakened source constraints;
@@ -310,6 +312,16 @@ Deterministic validation rejects the complete proposal for:
 Duplicate authority is fail-closed: any child classifier duplicate reference rejects the whole
 plan; deterministic exact/normalized identity checks may reject earlier but never modify the
 existing task.
+
+Each child declares a bounded structured deliverables manifest that distinguishes requested
+writes from read-only contextual references. Repository containment validation inspects only the
+requested writes; an external read-only reference does not grant write authority and is permitted.
+Lexically external absolute writes are rejected without filesystem access. Inspection needed for
+in-repository symlinks runs off the serial daemon tick on at most one dedicated OS resolver thread
+with no queued retry. A hard timeout fails closed as an escape, and while the resolver remains
+stuck its occupied slot rejects later proposals without consuming Tokio's shared blocking pool or
+delaying database work. This is deterministic proposal admission, not a general filesystem sandbox
+or a planner self-attestation check.
 
 All proposed children are classified together before any child row exists. Classification uses
 temporary proposal keys, not task IDs. Every result must be present, admission-ready,
