@@ -1820,6 +1820,90 @@ pub(crate) fn complete_graph_if_final_child(
     Ok(true)
 }
 
+/// Fold a terminal generated-child park into its active graph aggregate.
+///
+/// Callers own the surrounding `BEGIN IMMEDIATE` transaction so the child
+/// park, graph blocker, event, and owner alert become visible together. A
+/// staged retry/remediation keeps the graph active because the failed child
+/// still has daemon-owned continuation authority.
+// The dependent terminal-park tasks wire this shared primitive into their
+// respective transactions after this task lands.
+#[allow(dead_code)]
+pub(crate) fn block_graph_if_child_failed(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    reason: &str,
+    now: i64,
+) -> Result<bool> {
+    if reason.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "embedded NUL in graph child failure reason".into(),
+        ));
+    }
+    let graph: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT d.id,child.refs
+             FROM task_graph_members m
+             JOIN task_decompositions d ON d.id=m.graph_id
+             JOIN tasks child ON child.id=m.task_id
+             WHERE m.task_id=?1 AND m.active=1
+               AND d.state='active' AND d.active=1
+               AND child.status='failed'",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((graph_id, refs)) = graph else {
+        return Ok(false);
+    };
+
+    if let Some(refs) = refs {
+        let refs: serde_json::Value = serde_json::from_str(&refs)
+            .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?;
+        let runner_retry_requested = refs
+            .get(crate::runner_state::RETRY_REF)
+            .and_then(|retry| retry.get("requested"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let daemon_rework_retry_requested = refs
+            .get(crate::tasks::PARKED_REWORK_RETRY_REF)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let ci_remediation_requested = refs
+            .get(crate::tasks::CI_REMEDIATION_REQUESTED_REF)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if runner_retry_requested || daemon_rework_retry_requested || ci_remediation_requested {
+            return Ok(false);
+        }
+    }
+
+    let summary = format!("generated child task #{task_id} failed: {reason}");
+    let graph_changed = tx.execute(
+        "UPDATE task_decompositions
+         SET state='blocked',hold_code='generated-child-failed',hold_summary=?2,updated_at=?3
+         WHERE id=?1 AND state='active' AND active=1",
+        params![graph_id, summary, now],
+    )?;
+    if graph_changed != 1 {
+        return Ok(false);
+    }
+    crate::events::emit(
+        tx,
+        "task_graph_blocked",
+        &format!("task#{task_id}"),
+        &summary,
+        now,
+    )?;
+    crate::tasks::alert_owner_of_park(
+        tx,
+        task_id,
+        &format!("task graph blocked after generated child failed: {reason}"),
+        now,
+    )?;
+    Ok(true)
+}
+
 /// Fail-safe recovery reset. It is refused once any member has durable delivery
 /// evidence. History stays attached to the same aggregate and plan revision.
 pub fn recovery_reset(
@@ -3574,6 +3658,154 @@ mod tests {
             })
             .unwrap();
         assert_eq!(first_status, "working", "active sibling keeps authority");
+    }
+
+    #[test]
+    fn failed_child_blocks_active_graph_and_alerts_owner_atomically() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        let reason = "push rejected after protected-branch update";
+        let tx = begin_immediate(&mut conn).unwrap();
+        tx.execute(
+            "UPDATE tasks SET status='failed',refs=?2,updated_at=5 WHERE id=?1",
+            params![
+                ids[0],
+                serde_json::json!({
+                    "daemon_parked": true,
+                    "daemon_parked_reason": reason,
+                    "daemon_resume_status": "rework"
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+        assert!(block_graph_if_child_failed(&tx, ids[0], reason, 5).unwrap());
+        tx.commit().unwrap();
+
+        let aggregate: (String, i64, String, String) = conn
+            .query_row(
+                "SELECT state,active,hold_code,hold_summary
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            aggregate,
+            (
+                "blocked".into(),
+                1,
+                "generated-child-failed".into(),
+                format!("generated child task #{} failed: {reason}", ids[0]),
+            )
+        );
+        let event: (String, String, String) = conn
+            .query_row(
+                "SELECT kind,subject,body FROM events
+                 WHERE kind='task_graph_blocked'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(event.0, "task_graph_blocked");
+        assert_eq!(event.1, format!("task#{}", ids[0]));
+        assert!(event.2.contains(&format!("task #{}", ids[0])));
+        assert!(event.2.contains(reason));
+        let alert: (String, String, String, String) = conn
+            .query_row(
+                "SELECT kind,recipient,refs,body FROM messages
+                 WHERE kind='alert' AND recipient='owner'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(alert.0, "alert");
+        assert_eq!(alert.1, "owner");
+        assert_eq!(alert.2, format!("task:{}", ids[0]));
+        assert!(alert.3.contains("task graph blocked"));
+        assert!(alert.3.contains(reason));
+    }
+
+    #[test]
+    fn failed_child_with_retry_or_remediation_marker_keeps_graph_active() {
+        for refs in [
+            serde_json::json!({"runner_retry": {"requested": true}}),
+            serde_json::json!({"daemon_rework_retry_requested": true}),
+            serde_json::json!({"ci_remediation_requested": true}),
+        ] {
+            let mut conn = setup();
+            let graph = begin(&mut conn);
+            let ids =
+                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+                    .unwrap()
+                    .unwrap();
+            let tx = begin_immediate(&mut conn).unwrap();
+            tx.execute(
+                "UPDATE tasks SET status='failed',refs=?2,updated_at=5 WHERE id=?1",
+                params![ids[0], refs.to_string()],
+            )
+            .unwrap();
+            assert!(!block_graph_if_child_failed(&tx, ids[0], "retry staged", 5).unwrap());
+            tx.commit().unwrap();
+
+            let state: (String, i64, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT state,active,hold_code,hold_summary
+                     FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("active".into(), 1, None, None));
+            let side_effects: (i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT count(*) FROM events WHERE kind='task_graph_blocked'),
+                         (SELECT count(*) FROM messages
+                          WHERE kind='alert' AND recipient='owner')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(side_effects, (0, 0));
+        }
+    }
+
+    #[test]
+    fn failed_child_graph_block_is_idempotent() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='failed',refs='{}',updated_at=5 WHERE id=?1",
+            [ids[0]],
+        )
+        .unwrap();
+
+        let tx = begin_immediate(&mut conn).unwrap();
+        assert!(block_graph_if_child_failed(&tx, ids[0], "terminal park", 5).unwrap());
+        tx.commit().unwrap();
+        let replay = begin_immediate(&mut conn).unwrap();
+        assert!(!block_graph_if_child_failed(&replay, ids[0], "terminal park", 6).unwrap());
+        replay.commit().unwrap();
+
+        let state: (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT state,updated_at,
+                        (SELECT count(*) FROM events WHERE kind='task_graph_blocked'),
+                        (SELECT count(*) FROM messages
+                         WHERE kind='alert' AND recipient='owner')
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("blocked".into(), 5, 1, 1));
     }
 
     #[test]
