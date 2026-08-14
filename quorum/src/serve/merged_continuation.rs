@@ -210,7 +210,7 @@ fn select_event_page(conn: &Connection, now: i64) -> Result<EventPage> {
 }
 
 /// A graph member's `task_done` event is the bounded retry trigger for a
-/// recovery that arrived before all siblings were done. The active graph is
+/// recovery that arrived before all siblings were done. The live graph is
 /// globally unique and contains at most eight members; the marker lookup uses
 /// the `(subject, seq)` event index and then re-enters the exact candidate
 /// prefilter by primary key.
@@ -236,7 +236,7 @@ fn select_pending_candidates(
              WHERE completed.task_id=?1
                AND completed.active=1
                AND completed.plan_revision=graph.accepted_plan_revision
-               AND graph.state='active' AND graph.active=1
+               AND graph.state IN ('active','blocked') AND graph.active=1
                AND original.status='failed'
                AND pending.kind=?2 AND pending.expires_at>?3
                AND pending.seq>?4
@@ -337,7 +337,7 @@ fn select_candidate(
            AND original.status='failed'
            AND member.active=1
            AND member.plan_revision=graph.accepted_plan_revision
-           AND graph.state='active' AND graph.active=1
+           AND graph.state IN ('active','blocked') AND graph.active=1
            AND source.status='decomposed'
            AND json_type(recovery.refs,'$.pr')='integer'
            AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number
@@ -755,6 +755,72 @@ mod tests {
         let completed = reconcile(fixture.db_path.clone(), NOW + 2).await.unwrap();
         assert_eq!(completed.adopted, 1);
         assert_incident_released(&fixture);
+    }
+
+    #[tokio::test]
+    async fn blocked_graph_recovery_is_discovered_and_retried_after_sibling_completion() {
+        let fixture = IncidentFixture::new();
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute(
+            "UPDATE task_decompositions SET state='blocked' WHERE id=4",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='working' WHERE id=304", [])
+            .unwrap();
+        drop(conn);
+
+        // The recovery's own terminal event discovers a blocked graph and
+        // persists its retry marker because sibling #304 is still unfinished.
+        let partial = reconcile(fixture.db_path.clone(), NOW).await.unwrap();
+        assert_eq!(partial.examined, 1);
+        assert_eq!(partial.adopted, 0);
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        let pending: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind=?1 AND subject='task#307' AND body='task#320'",
+                [PENDING_EVENT_KIND],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+        drop(conn);
+
+        // The sibling's terminal event cannot itself be a recovery delivery;
+        // it must find #320 through the pending-marker lookup on this same
+        // blocked graph and then invoke the guarded core adoption.
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=304", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO events(ts,kind,subject,body,expires_at)
+             VALUES (?1,'task_done','task#304','by system',?2)",
+            params![NOW + 1, LIVE_UNTIL],
+        )
+        .unwrap();
+        drop(conn);
+
+        let completed = reconcile(fixture.db_path.clone(), NOW + 1).await.unwrap();
+        assert_eq!(completed.adopted, 1);
+
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        let state: (String, String, i64, String) = conn
+            .query_row(
+                "SELECT original.status,graph.state,graph.active,source.status
+                 FROM tasks original
+                 JOIN task_graph_members member ON member.task_id=original.id
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks source ON source.id=graph.source_task_id
+                 WHERE original.id=307",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("done".into(), "blocked".into(), 1, "decomposed".into())
+        );
     }
 
     #[tokio::test]
