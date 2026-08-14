@@ -83,8 +83,8 @@ The classifier uses this shared complexity rubric:
 Do not encode PR workflow or lifecycle authority in generic `refs`, titles, labels, or task
 body. In particular, this shipped CLI has no public successor-task creation interface for
 durable `source_task` provenance. Do not manufacture `refs.source_task`; `--continue-pr` alone
-preserves a PR but cannot establish successor lineage for recovery adoption. Escalate or wait
-for the shipped interface before attempting that recovery path.
+preserves a PR but does not create automatic provenance-backed recovery discovery. A named,
+evidence-gated `decomposition-adopt-recovery` remains available for the exact pair.
 
 ### Recover without losing authority or PR work
 
@@ -104,8 +104,10 @@ quorum task-retry --task-id <N> --by <You>
 ```
 
 For a failed generated graph child, do not infer equivalence from matching text or a shared PR.
-Only after the exact managed continuation is completed and merged, and only when its durable
-source provenance and exact PR/head evidence agree, may an operator adopt that delivery:
+Only after the exact managed continuation is completed and merged may an operator adopt that
+named pair. The command rechecks final-child graph membership, repository, PR, head, managed
+worker/reviewer, and merged-completion evidence. `source_task` provenance must agree when
+present, but may be absent because the operator names the exact child and recovery task:
 
 ```sh
 quorum decomposition-adopt-recovery \
@@ -113,8 +115,8 @@ quorum decomposition-adopt-recovery \
 ```
 
 This is a one-pair, evidence-gated recovery operation, not a way to create a continuation or
-skip review. In this build, the missing public successor interface prevents safely preparing
-that continuation; do not bypass the guard with refs.
+skip review. The missing public successor interface does not block this explicit path; do not
+bypass the guard by inventing refs.
 
 Use `task-close` only for a documented manual resolution: work merged by hand, fixed elsewhere,
 or obsolete (including a failed task whose PR later landed). Supply a durable reason. It records

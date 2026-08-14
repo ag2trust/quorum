@@ -273,8 +273,9 @@ fn init_installs_current_embedded_recovery_skill() {
     );
     assert!(
         skill.contains("no public successor-task creation interface")
-            && skill.contains("Do not manufacture `refs.source_task`"),
-        "until task-create ships source-task, the skill must reject invented provenance"
+            && skill.contains("Do not manufacture `refs.source_task`")
+            && skill.contains("does not block this explicit path"),
+        "the skill must reject invented provenance while preserving exact-pair adoption"
     );
 }
 
