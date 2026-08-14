@@ -2061,6 +2061,17 @@ parallel statistics subsystem. Unknown models, unavailable runners, missing cont
 metadata, or a profile snapshot that cannot be executed fail loudly through the existing
 bounded retry or parked-task path, never by silent substitution.
 
+Each distinct configured route attempted for a responsibility may add one immutable evidence
+row linked to, but never replacing, the original role assignment. The row snapshots the exact
+profile and optionally records the closed pre-authoritative failure disposition. Replay is
+idempotent by assignment and profile, and the eligible pool bounds the total distinct rows.
+Exclusions are derived rather than separately granted: `ProviderUnavailable` excludes every
+profile on that provider for the responsibility, while `ProfileUnavailable` excludes only that
+profile. `RetryableSameRoute`, `NonFailover`, `Unclassified`, and an attempt with no classified
+runner failure grant no alternate-route authority. Recording does not advance allocation,
+`rework_round`, task recovery attempts, or lifecycle state. Alternate selection and launch are
+not yet activated.
+
 ### Verification gates
 
 Before Codex is production-selectable:
