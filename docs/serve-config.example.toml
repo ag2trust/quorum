@@ -64,9 +64,6 @@ opus = 100
 opus = 100
 
 # ── cost ceilings ────────────────────────────────────────────────────
-# A turn longer than 45 min is almost certainly stuck; #56's auto-refeed
-# handles legitimate interruptions.
-max_turn_wall_secs = 2700       # 45 min
 max_idle_secs = 900              # 15 min between turns
 max_task_wall_secs = 14400      # 4h
 # max_turn_tokens  = 500000

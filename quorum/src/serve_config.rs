@@ -976,7 +976,6 @@ pub struct BannerData<'a> {
     pub no_bare_agent: &'a Sourced<bool>,
     pub self_update_drain: &'a Sourced<bool>,
     pub drain_timeout_secs: &'a Sourced<u64>,
-    pub max_turn_wall_secs: &'a Sourced<Option<u64>>,
     pub max_idle_secs: &'a Sourced<Option<u64>>,
     pub max_task_wall_secs: &'a Sourced<Option<u64>>,
     pub idle_timeout_secs: &'a Sourced<Option<u64>>,
@@ -1052,10 +1051,6 @@ pub fn banner(d: &BannerData<'_>) -> String {
             None => format!("unlimited ({src})", src = s.source),
         }
     }
-    lines.push(format!(
-        "  max_turn_wall_secs:        {}",
-        opt_u64(d.max_turn_wall_secs)
-    ));
     lines.push(format!(
         "  max_idle_secs:             {}",
         match d.max_idle_secs.value {
@@ -1920,10 +1915,6 @@ worktree_base = "/tmp/wt"
             drain_timeout_secs: &Sourced {
                 value: 900,
                 source: Source::Default,
-            },
-            max_turn_wall_secs: &Sourced {
-                value: Some(2700),
-                source: Source::File,
             },
             max_idle_secs: &Sourced {
                 value: None,

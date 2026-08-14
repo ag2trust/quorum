@@ -837,7 +837,7 @@ fn cumulative_cost_usd_is_high_water_mark_not_summed() {
 }
 
 #[test]
-fn turn_wall_clock_limit_kills_worker_and_releases_task() {
+fn deprecated_turn_wall_cli_alias_does_not_kill_active_worker() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -852,9 +852,10 @@ fn turn_wall_clock_limit_kills_worker_and_releases_task() {
         .status()
         .unwrap();
 
-    seed_task(home.path(), "Task for turn wall-clock limit test");
+    seed_task(home.path(), "Task for deprecated turn-wall alias test");
 
-    // fake-agent delays 3s before emitting result; turn ceiling is 1s.
+    // The deprecated alias resolves to the idle timeout. It must not reap an
+    // active turn even though the fake agent takes longer than one second.
     let mut handle = ServeHandle::start_with_limits_and_env(
         home.path(),
         repo_dir.path(),
@@ -871,32 +872,19 @@ fn turn_wall_clock_limit_kills_worker_and_releases_task() {
     );
 
     assert!(
-        handle.wait_for("WATCHDOG", 15),
-        "watchdog kill not seen. Lines: {:?}",
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
         handle.lines
     );
 
     let saw_turn_wall = handle.lines.iter().any(|l| l.contains("turn wall-clock"));
     assert!(
-        saw_turn_wall,
-        "turn wall-clock limit message not seen. Lines: {:?}",
+        !saw_turn_wall,
+        "deprecated turn wall alias must not reap an active turn. Lines: {:?}",
         handle.lines
     );
 
     handle.stop();
-
-    let get_out = Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home.path())
-        .env("QUORUM_REPO", "test/repo")
-        .args(["task-get", "--task-id", "1"])
-        .output()
-        .unwrap();
-    assert!(get_out.status.success());
-    let stdout = String::from_utf8_lossy(&get_out.stdout);
-    assert!(
-        stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
-        "task should be released to open after turn wall-clock limit, got: {stdout}"
-    );
 }
 
 #[test]

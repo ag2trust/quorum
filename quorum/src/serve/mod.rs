@@ -2590,7 +2590,6 @@ pub struct CostLimits {
     pub max_task_tokens: Option<i64>,
     pub max_turn_cost_usd: Option<f64>,
     pub max_task_cost_usd: Option<f64>,
-    pub max_turn_wall_secs: Option<u64>,
     /// Max seconds a worker/reviewer may sit idle between turns. Default: 900.
     pub max_idle_secs: Option<u64>,
     pub max_task_wall_secs: Option<u64>,
@@ -11345,7 +11344,6 @@ enum LimitBreached {
     TurnCostUsd { turn: f64, max: f64 },
     TurnCostUsdMissing { max: f64 },
     TaskCostUsd { total: f64, max: f64 },
-    TurnWallSecs { elapsed: u64, max: u64 },
     TaskWallSecs { elapsed: u64, max: u64 },
 }
 
@@ -11366,9 +11364,6 @@ impl std::fmt::Display for LimitBreached {
             }
             Self::TaskCostUsd { total, max } => {
                 write!(f, "task cost ${total:.4} exceeded limit ${max:.4}")
-            }
-            Self::TurnWallSecs { elapsed, max } => {
-                write!(f, "turn wall-clock {elapsed}s exceeded limit {max}s")
             }
             Self::TaskWallSecs { elapsed, max } => {
                 write!(f, "task wall-clock {elapsed}s exceeded limit {max}s")
@@ -11424,12 +11419,6 @@ fn check_post_result_limits(
             });
         }
     }
-    if let Some(max) = limits.max_turn_wall_secs {
-        let elapsed = slot.turn_started_at.elapsed().as_secs();
-        if elapsed > max {
-            return Some(LimitBreached::TurnWallSecs { elapsed, max });
-        }
-    }
     if let Some(max) = limits.max_task_wall_secs {
         let elapsed = slot.task_started_at.elapsed().as_secs();
         if elapsed > max {
@@ -11441,12 +11430,6 @@ fn check_post_result_limits(
 
 /// Check wall-clock limits only (called each tick for slots still draining).
 fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<LimitBreached> {
-    if let Some(max) = limits.max_turn_wall_secs {
-        let elapsed = slot.turn_started_at.elapsed().as_secs();
-        if elapsed > max {
-            return Some(LimitBreached::TurnWallSecs { elapsed, max });
-        }
-    }
     if let Some(max) = limits.max_task_wall_secs {
         let elapsed = slot.task_started_at.elapsed().as_secs();
         if elapsed > max {
@@ -18704,10 +18687,6 @@ mod tests {
                 total: 1.0,
                 max: 0.5,
             },
-            LimitBreached::TurnWallSecs {
-                elapsed: 120,
-                max: 60,
-            },
             LimitBreached::TaskWallSecs {
                 elapsed: 3600,
                 max: 1800,
@@ -18732,7 +18711,6 @@ mod tests {
         assert!(limits.max_task_tokens.is_none());
         assert!(limits.max_turn_cost_usd.is_none());
         assert!(limits.max_task_cost_usd.is_none());
-        assert!(limits.max_turn_wall_secs.is_none());
         assert!(limits.max_idle_secs.is_none());
         assert!(limits.max_task_wall_secs.is_none());
         assert!(limits.idle_timeout_secs.is_none());
@@ -21305,7 +21283,7 @@ mod tests {
     fn codex_usd_guard_allows_token_and_wall_limits() {
         let limits = CostLimits {
             max_task_tokens: Some(100_000),
-            max_turn_wall_secs: Some(600),
+            max_idle_secs: Some(600),
             ..Default::default()
         };
         let kind = runner::AgentKind::Codex;
