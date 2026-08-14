@@ -12255,15 +12255,6 @@ async fn persist_initial_grok_worker_session(
             .transpose()
             .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?
             .unwrap_or_else(|| serde_json::json!({}));
-        if refs.get(runner_state::CONTINUATION_REF).is_some()
-            || refs
-                .get(runner_state::INITIAL_WORKER_SESSION_REF)
-                .is_some()
-        {
-            return Err(QuorumError::Io(
-                "Grok emitted a duplicate or conflicting terminal session identity".into(),
-            ));
-        }
         let handoff = InitialWorkerSession {
             task_id,
             role_assignment_id: durable.assignment_id,
@@ -12277,6 +12268,33 @@ async fn persist_initial_grok_worker_session(
             pending_turn,
             session_id: session_id.clone(),
         };
+        let existing_handoff = runner_state::initial_worker_session(&refs);
+        let existing_continuation = runner_state::continuation(
+            &refs,
+            ContinuationSlot::Worker,
+            "grok",
+        );
+        if refs.get(runner_state::CONTINUATION_REF).is_some()
+            || refs
+                .get(runner_state::INITIAL_WORKER_SESSION_REF)
+                .is_some()
+        {
+            if existing_handoff.as_ref() == Some(&handoff)
+                && existing_continuation
+                    .as_ref()
+                    .is_some_and(|identity| identity.id == session_id)
+            {
+                // The DB commit may have completed immediately before the
+                // async caller was cancelled. Replaying the identical exact
+                // handoff is safe; duplicate provider records are rejected by
+                // the process-evidence gate before this transaction begins.
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(QuorumError::Io(
+                "Grok emitted a duplicate or conflicting terminal session identity".into(),
+            ));
+        }
         runner_state::set_initial_worker_session(&mut refs, &handoff);
         runner_state::set_continuation(
             &mut refs,
@@ -12570,11 +12588,16 @@ async fn drain_events(
     role: &str,
     limits: &CostLimits,
 ) -> Result<Option<LimitBreached>> {
+    enum DrainedLine {
+        Raw(String),
+        AuthorizedGrokTerminal(String),
+    }
+
     persist_diagnostics(slot).map_err(|error| {
         QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
     })?;
     for _ in 0..MAX_STREAM_LINES_PER_TICK {
-        let Ok(Some(raw_line)) = tokio::time::timeout(
+        let read = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             slot.live_process_mut()
                 .map_err(|error| {
@@ -12582,15 +12605,55 @@ async fn drain_events(
                 })?
                 .next_raw_line(),
         )
-        .await
-        else {
-            break;
+        .await;
+        let drained = match read {
+            Ok(Some(raw_line)) => DrainedLine::Raw(raw_line),
+            Ok(None) => {
+                let terminal = slot
+                    .live_process_mut()
+                    .map_err(|error| {
+                        QuorumError::Io(format!(
+                            "slot terminal authorization requires a live process: {error}"
+                        ))
+                    })?
+                    .authorized_grok_terminal()
+                    .await;
+                let Some(raw_line) = terminal else {
+                    let pending = slot
+                        .live_process_mut()
+                        .map_err(|error| {
+                            QuorumError::Io(format!(
+                                "slot terminal evidence check requires a live process: {error}"
+                            ))
+                        })?
+                        .grok_terminal_evidence_pending();
+                    if pending {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        continue;
+                    }
+                    break;
+                };
+                DrainedLine::AuthorizedGrokTerminal(raw_line)
+            }
+            Err(_) => break,
         };
-        let events = runner::normalize_line(slot.process_kind(), &raw_line);
-
-        if let Some(ref mut sl) = slot.session_log {
-            sl.log_raw_and_normalized(&raw_line, &events);
-        }
+        let events = match drained {
+            DrainedLine::Raw(raw_line) => {
+                let events = slot
+                    .live_process_mut()
+                    .map_err(|error| {
+                        QuorumError::Io(format!(
+                            "slot stream normalization requires a live process: {error}"
+                        ))
+                    })?
+                    .normalize_stream_line(&raw_line);
+                if let Some(ref mut sl) = slot.session_log {
+                    sl.log_raw_and_normalized(&raw_line, &events);
+                }
+                events
+            }
+            DrainedLine::AuthorizedGrokTerminal(raw_line) => runner::normalize_grok_line(&raw_line),
+        };
 
         for agent_event in &events {
             slot.last_event_at = std::time::Instant::now();
@@ -17795,6 +17858,18 @@ mod tests {
         slot.pending_prompt = "preserve the exact internal initial prompt".into();
         slot.pending_turn_kind = "initial".into();
         slot.draining = true;
+        slot.session_log = Some(
+            session_log::SessionLog::create(
+                &dir.join("logs"),
+                "Internal-grok",
+                "worker",
+                Some(task_id),
+                "internal-grok-log",
+                "internal-grok-branch",
+                now,
+            )
+            .unwrap(),
+        );
         assert!(assignment_id > 0);
         (db_path, slot, task_id)
     }
@@ -17864,16 +17939,53 @@ mod tests {
     #[tokio::test]
     async fn internal_grok_worker_rejects_incomplete_and_ambiguous_terminal_processes() {
         let fixtures = [
-            ("early-eof", "printf '%s\\n' '{\"type\":\"text\",\"data\":\"partial\"}'"),
-            ("nonzero-exit", "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}'; exit 7"),
-            ("malformed-terminal", "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":'"),
-            ("missing-session", "printf '%s\\n' '{\"type\":\"end\"}'"),
-            ("duplicate-session", "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-a\"}'"),
-            ("conflicting-session", "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-b\"}'"),
-            ("trailing-outcome", "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"text\",\"data\":\"late\"}'"),
+            (
+                "early-eof",
+                "printf '%s\\n' '{\"type\":\"text\",\"data\":\"partial\"}'",
+                vec![r#"{"type":"text","data":"partial"}"#],
+            ),
+            (
+                "nonzero-exit",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}'; exit 7",
+                vec![r#"{"type":"end","sessionId":"session-a"}"#],
+            ),
+            (
+                "malformed-terminal",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":'",
+                vec![r#"{"type":"end","sessionId":"#],
+            ),
+            (
+                "missing-session",
+                "printf '%s\\n' '{\"type\":\"end\"}'",
+                vec![r#"{"type":"end"}"#],
+            ),
+            (
+                "duplicate-session",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-a\"}'",
+                vec![
+                    r#"{"type":"end","sessionId":"session-a"}"#,
+                    r#"{"type":"end","sessionId":"session-a"}"#,
+                ],
+            ),
+            (
+                "conflicting-session",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-b\"}'",
+                vec![
+                    r#"{"type":"end","sessionId":"session-a"}"#,
+                    r#"{"type":"end","sessionId":"session-b"}"#,
+                ],
+            ),
+            (
+                "trailing-outcome",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"text\",\"data\":\"late\"}'",
+                vec![
+                    r#"{"type":"end","sessionId":"session-a"}"#,
+                    r#"{"type":"text","data":"late"}"#,
+                ],
+            ),
         ];
 
-        for (name, body) in fixtures {
+        for (name, body, expected_raw) in fixtures {
             let dir = tempfile::tempdir().unwrap();
             let (db_path, mut slot, task_id) = initial_grok_worker_fixture(dir.path(), body).await;
             let result = drain_events(&mut slot, &db_path, "worker", &CostLimits::default()).await;
@@ -17901,9 +18013,177 @@ mod tests {
                 refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none(),
                 "{name}: terminal handoff was persisted"
             );
+            let stream_path = slot
+                .session_log
+                .as_ref()
+                .unwrap()
+                .dir()
+                .join("stream.jsonl");
+            let stream = std::fs::read_to_string(stream_path).unwrap();
+            assert_eq!(
+                stream.lines().collect::<Vec<_>>(),
+                expected_raw,
+                "{name}: every provider stdout record must remain verbatim"
+            );
             drop(conn);
             slot.kill_and_reap().await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_keeps_terminal_identity_across_drain_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = r#"{"type":"end","sessionId":"delayed-zero-exit"}"#;
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"delayed-zero-exit\"}'; sleep 6",
+        )
+        .await;
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(
+            slot.continuation_id.is_none(),
+            "the first five-second poll must not authorize a running child"
+        );
+        assert!(slot.draining);
+        let stream_path = slot
+            .session_log
+            .as_ref()
+            .unwrap()
+            .dir()
+            .join("stream.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(&stream_path).unwrap(),
+            format!("{terminal}\n")
+        );
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(slot.continuation_id.as_deref(), Some("delayed-zero-exit"));
+        assert!(!slot.draining);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "delayed-zero-exit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stream_path).unwrap(),
+            format!("{terminal}\n")
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_read_error_after_terminal_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = r#"{"type":"end","sessionId":"read-error-session"}"#;
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"read-error-session\"}'",
+        )
+        .await;
+        slot.live_process_mut()
+            .unwrap()
+            .inject_grok_stdout_read_error_after_lines(1);
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.draining);
+        assert!(slot
+            .observed_pre_authoritative_failure()
+            .unwrap()
+            .to_string()
+            .contains("stdout evidence could not be read"));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| serde_json::json!({}));
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
+        assert!(refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none());
+        let stream_path = slot
+            .session_log
+            .as_ref()
+            .unwrap()
+            .dir()
+            .join("stream.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(stream_path).unwrap(),
+            format!("{terminal}\n")
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_finalizes_stderr_before_terminal_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = r#"{"type":"end","sessionId":"stderr-session"}"#;
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"stderr-session\"}'; exec 1>&-; sleep 1; printf '%s\\n' 'late stderr failure' >&2",
+        )
+        .await;
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(slot.continuation_id.is_none());
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.draining);
+        assert!(slot
+            .observed_pre_authoritative_failure()
+            .unwrap()
+            .to_string()
+            .contains("Grok stderr"));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| serde_json::json!({}));
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
+        assert!(refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none());
+        let stream_path = slot
+            .session_log
+            .as_ref()
+            .unwrap()
+            .dir()
+            .join("stream.jsonl");
+        let stream = std::fs::read_to_string(stream_path).unwrap();
+        let mut lines = stream.lines();
+        assert_eq!(lines.next(), Some(terminal));
+        let diagnostic: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(diagnostic["type"], "provider.stderr");
+        assert_eq!(diagnostic["text"], "late stderr failure");
+        assert!(lines.next().is_none());
+        drop(conn);
+        slot.kill_and_reap().await;
     }
 
     #[cfg(unix)]

@@ -836,6 +836,34 @@ impl RunnerProc {
         }
     }
 
+    /// Normalize a line for immediate stream delivery. Grok terminal records
+    /// are raw evidence first; their lifecycle events are exposed separately
+    /// only after the adapter proves terminal process evidence is complete.
+    pub fn normalize_stream_line(&self, raw: &str) -> Vec<AgentEvent> {
+        match self {
+            Self::Grok(_) => GrokProc::normalize_stream_line(raw),
+            Self::Claude(_) | Self::Codex(_) => normalize_line(self.kind(), raw),
+        }
+    }
+
+    pub async fn authorized_grok_terminal(&mut self) -> Option<String> {
+        match self {
+            Self::Grok(proc) => proc.authorized_terminal().await,
+            Self::Claude(_) | Self::Codex(_) => None,
+        }
+    }
+
+    pub fn grok_terminal_evidence_pending(&self) -> bool {
+        matches!(self, Self::Grok(proc) if proc.terminal_evidence_pending())
+    }
+
+    #[cfg(test)]
+    pub fn inject_grok_stdout_read_error_after_lines(&mut self, lines: usize) {
+        if let Self::Grok(proc) = self {
+            proc.inject_stdout_read_error_after_lines(lines);
+        }
+    }
+
     /// Read one line with a hard boundary on bytes accumulated before a line
     /// terminator. Classifier and planner roles use this cancellation-safe
     /// boundary before accepting provider output into role-owned buffers.

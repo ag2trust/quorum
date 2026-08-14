@@ -180,6 +180,12 @@ struct BoundedStdout {
     line: Vec<u8>,
     dropped: usize,
     eof: bool,
+    clean_eof: bool,
+    read_error: Option<String>,
+    #[cfg(test)]
+    lines_returned: usize,
+    #[cfg(test)]
+    injected_read_error_after_lines: Option<usize>,
 }
 
 impl BoundedStdout {
@@ -192,6 +198,12 @@ impl BoundedStdout {
             line: Vec::new(),
             dropped: 0,
             eof: false,
+            clean_eof: false,
+            read_error: None,
+            #[cfg(test)]
+            lines_returned: 0,
+            #[cfg(test)]
+            injected_read_error_after_lines: None,
         }
     }
 
@@ -217,8 +229,26 @@ impl BoundedStdout {
                 return Some(self.finish_line());
             }
 
+            #[cfg(test)]
+            if self
+                .injected_read_error_after_lines
+                .is_some_and(|lines| self.lines_returned >= lines)
+            {
+                self.injected_read_error_after_lines = None;
+                self.read_error = Some("injected Grok stdout read error".into());
+                self.eof = true;
+                continue;
+            }
+
             match self.reader.read(&mut self.chunk[..]).await {
-                Ok(0) | Err(_) => self.eof = true,
+                Ok(0) => {
+                    self.eof = true;
+                    self.clean_eof = true;
+                }
+                Err(error) => {
+                    self.eof = true;
+                    self.read_error = Some(error.to_string());
+                }
                 Ok(read) => {
                     self.position = 0;
                     self.filled = read;
@@ -228,6 +258,10 @@ impl BoundedStdout {
     }
 
     fn finish_line(&mut self) -> String {
+        #[cfg(test)]
+        {
+            self.lines_returned = self.lines_returned.saturating_add(1);
+        }
         if self.line.last() == Some(&b'\r') {
             self.line.pop();
         }
@@ -255,6 +289,19 @@ impl BoundedStdout {
         self.line.clear();
         line
     }
+
+    fn reached_clean_eof(&self) -> bool {
+        self.clean_eof
+    }
+
+    fn take_read_error(&mut self) -> Option<String> {
+        self.read_error.take()
+    }
+
+    #[cfg(test)]
+    fn inject_read_error_after_lines(&mut self, lines: usize) {
+        self.injected_read_error_after_lines = Some(lines);
+    }
 }
 
 pub struct GrokProc {
@@ -265,6 +312,9 @@ pub struct GrokProc {
     failures: FailureTracker,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
     pending_terminal: Option<String>,
+    terminal_rejected: bool,
+    stdout_complete: bool,
+    terminal_exit_status: Option<std::process::ExitStatus>,
     worker_request: Option<Box<WorkerTurnRequest>>,
 }
 
@@ -348,6 +398,9 @@ impl GrokProc {
             failures,
             stderr_task: Some(stderr_task),
             pending_terminal: None,
+            terminal_rejected: false,
+            stdout_complete: false,
+            terminal_exit_status: None,
             worker_request: None,
         })
     }
@@ -405,11 +458,14 @@ impl GrokProc {
         &self,
         status: std::process::ExitStatus,
     ) -> Option<RunnerFailure> {
+        if let Some(failure) = self.failures.observed_strict_failure() {
+            return Some(failure);
+        }
         self.failures.classify_exit(status)
     }
 
     pub fn observed_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
-        self.failures.observed_failure()
+        self.failures.observed_strict_failure()
     }
 
     pub(super) fn failure_tracker(&self) -> FailureTracker {
@@ -441,50 +497,111 @@ impl GrokProc {
     }
 
     pub async fn next_raw_line(&mut self) -> Option<String> {
-        loop {
-            let Some(raw) = self.reader.next_line().await else {
-                let pending = self.pending_terminal.take()?;
-                let status = match self.child.wait().await {
-                    Ok(status) => status,
-                    Err(error) => {
-                        self.failures.note_incomplete_evidence(format!(
-                            "Grok terminal process status was unavailable: {error}"
-                        ));
-                        return None;
-                    }
-                };
-                if !status.success() {
-                    self.failures.note_incomplete_evidence(format!(
-                        "Grok emitted terminal success but exited with {status}"
-                    ));
-                    return None;
-                }
-                if self.failures.observed_strict_failure().is_some() {
-                    return None;
-                }
-                return Some(pending);
-            };
-            self.failures.observe_stdout(&raw);
-
-            if self.pending_terminal.is_some() {
-                let detail = match terminal_session_id(&raw) {
-                    Some(_) => "Grok emitted a duplicate or conflicting terminal session ID",
-                    None => "Grok emitted output after its terminal session event",
-                };
-                self.failures.note_incomplete_evidence(detail);
-                continue;
-            }
-
-            if terminal_session_id(&raw).is_some() {
-                // Grok issues its continuation identity at terminal end. Do
-                // not expose completion until EOF and zero exit prove there
-                // is no duplicate/conflicting ID, trailing outcome, or late
-                // non-zero process status.
-                self.pending_terminal = Some(raw);
-                continue;
-            }
-            return Some(raw);
+        let line = self.reader.next_line().await;
+        if let Some(error) = self.reader.take_read_error() {
+            self.failures.note_incomplete_evidence(format!(
+                "Grok terminal stdout evidence could not be read: {error}"
+            ));
+            self.terminal_rejected = true;
         }
+        let Some(raw) = line else {
+            self.stdout_complete = self.reader.reached_clean_eof();
+            return None;
+        };
+
+        self.failures.observe_stdout(&raw);
+        if self.pending_terminal.is_some() {
+            let detail = match terminal_session_id(&raw) {
+                Some(_) => "Grok emitted a duplicate or conflicting terminal session ID",
+                None => "Grok emitted output after its terminal session event",
+            };
+            self.failures.note_incomplete_evidence(detail);
+            self.terminal_rejected = true;
+        } else if terminal_session_id(&raw).is_some() {
+            // Preserve the raw terminal record immediately. Lifecycle events
+            // remain withheld until `authorized_terminal` proves clean
+            // EOF, zero exit, and complete stderr evidence.
+            self.pending_terminal = Some(raw.clone());
+        }
+        Some(raw)
+    }
+
+    /// Return a buffered Grok terminal record only after every source of
+    /// contradictory process evidence is complete. This method never waits
+    /// on a running child or stderr task, so polling cancellation cannot lose
+    /// the pending provider identity.
+    pub(super) async fn authorized_terminal(&mut self) -> Option<String> {
+        if self.pending_terminal.is_none() || self.terminal_rejected || !self.stdout_complete {
+            return None;
+        }
+
+        if self.terminal_exit_status.is_none() {
+            match self.child.try_wait() {
+                Ok(Some(status)) => self.terminal_exit_status = Some(status),
+                Ok(None) => return None,
+                Err(error) => {
+                    self.failures.note_incomplete_evidence(format!(
+                        "Grok terminal process status was unavailable: {error}"
+                    ));
+                    self.terminal_rejected = true;
+                    return None;
+                }
+            }
+        }
+        let status = self
+            .terminal_exit_status
+            .expect("terminal exit status was checked above");
+        if !status.success() {
+            self.failures.note_incomplete_evidence(format!(
+                "Grok emitted terminal success but exited with {status}"
+            ));
+            self.terminal_rejected = true;
+            return None;
+        }
+
+        if self
+            .stderr_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return None;
+        }
+        if let Some(task) = self.stderr_task.take() {
+            if let Err(error) = task.await {
+                self.failures.note_incomplete_evidence(format!(
+                    "Grok terminal stderr evidence could not be finalized: {error}"
+                ));
+                self.terminal_rejected = true;
+                return None;
+            }
+        }
+
+        if self.failures.observed_strict_failure().is_some() {
+            self.terminal_rejected = true;
+            return None;
+        }
+        // Keep the candidate until slot teardown. A caller may be cancelled
+        // or encounter a persistence error after this pure authorization
+        // decision; retaining the exact provider record makes that handoff
+        // retryable instead of silently losing the identity.
+        self.pending_terminal.clone()
+    }
+
+    pub(super) fn terminal_evidence_pending(&self) -> bool {
+        self.pending_terminal.is_some() && !self.terminal_rejected && self.stdout_complete
+    }
+
+    pub(super) fn normalize_stream_line(raw: &str) -> Vec<AgentEvent> {
+        if terminal_session_id(raw).is_some() {
+            Vec::new()
+        } else {
+            normalize_grok_line(raw)
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_stdout_read_error_after_lines(&mut self, lines: usize) {
+        self.reader.inject_read_error_after_lines(lines);
     }
 
     pub async fn next_raw_line_bounded(
@@ -922,6 +1039,9 @@ mod tests {
             failures,
             stderr_task: Some(stderr_task),
             pending_terminal: None,
+            terminal_rejected: false,
+            stdout_complete: false,
+            terminal_exit_status: None,
             worker_request: None,
         }
     }
