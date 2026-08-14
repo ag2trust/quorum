@@ -233,7 +233,7 @@ where
             if quorum_core::decomposition::writable_deliverable_is_lexically_external(
                 repo_root, path,
             ) {
-                return semantic("writable deliverable escapes the managed repository");
+                return escaping_write(task, path);
             }
             writable_paths.push(path.to_owned());
         }
@@ -269,8 +269,32 @@ where
     if permitted {
         Ok(())
     } else {
-        semantic("writable deliverable escapes the managed repository")
+        semantic(
+            "a writable deliverable resolves outside the managed repository; use an \
+             in-repository write path or declare external context as read_only_reference",
+        )
     }
+}
+
+fn escaping_write<T>(task: &ProposedTask, path: &str) -> Result<T, PlannerParseError> {
+    const MAX_PATH_BYTES: usize = 512;
+    const ELLIPSIS: &str = "…";
+    let path = if path.len() > MAX_PATH_BYTES {
+        format!(
+            "{}{}",
+            truncate_utf8(path, MAX_PATH_BYTES - ELLIPSIS.len()),
+            ELLIPSIS
+        )
+    } else {
+        path.to_owned()
+    };
+    let message = format!(
+        "child {} writable deliverable `{path}` escapes the managed repository; use an \
+         in-repository write path or declare external context as read_only_reference",
+        task.key
+    );
+    debug_assert!(message.len() <= MAX_REJECTION_SUMMARY_BYTES);
+    semantic(&message)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1138,7 +1162,9 @@ mod tests {
                 matches!(
                     validate_for_source(&[task], &[], &repo, &path_resolver).await,
                     Err(PlannerParseError::Semantic(ref error))
-                        if error == "writable deliverable escapes the managed repository"
+                        if error.contains("writable deliverable")
+                            && error.contains("managed repository")
+                            && error.contains("read_only_reference")
                 ),
                 "{path}"
             );
@@ -1181,7 +1207,7 @@ mod tests {
 
         assert!(
             matches!(outcome, Err(PlannerParseError::Semantic(ref error))
-                if error == "writable deliverable escapes the managed repository")
+                if error == "a writable deliverable resolves outside the managed repository; use an in-repository write path or declare external context as read_only_reference")
         );
         assert!(started.elapsed() < Duration::from_millis(500));
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -1310,7 +1336,9 @@ mod tests {
         assert!(matches!(
             outcome,
             Err(PlannerParseError::Semantic(ref error))
-                if error == "writable deliverable escapes the managed repository"
+                if error.contains("child external writable deliverable")
+                    && error.contains("unavailable-mount/output.rs")
+                    && error.contains("read_only_reference")
         ));
     }
 

@@ -4619,26 +4619,30 @@ fn child_preclassification_rejection(
     Some(summary)
 }
 
-async fn reset_decomposition_to_planning(
+async fn reject_decomposition_proposal(
     config: &ServeConfig,
     graph_id: i64,
     from: &'static str,
+    code: &str,
+    summary: &str,
 ) -> Result<()> {
     let path = config.db_path.clone();
+    let code = code.to_string();
+    let summary = truncate_utf8_bytes(summary, DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES).to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
-        quorum_core::decomposition::set_frozen_phase(
+        quorum_core::decomposition::reject_frozen_proposal(
             &mut conn,
             graph_id,
             from,
-            "planning",
-            None,
+            &code,
+            &summary,
             now_unix(),
         )?;
         Ok(())
     })
     .await
-    .map_err(|error| QuorumError::Io(format!("decomposition phase join: {error}")))??;
+    .map_err(|error| QuorumError::Io(format!("proposal rejection join: {error}")))??;
     Ok(())
 }
 
@@ -4858,12 +4862,10 @@ async fn tick_decomposition(
                     );
                     match result {
                         Err(summary) => {
-                            reset_decomposition_to_planning(config, graph_id, "preclassifying")
-                                .await?;
-                            record_decomposition_attempt(
+                            reject_decomposition_proposal(
                                 config,
                                 graph_id,
-                                "proposal",
+                                "preclassifying",
                                 "child-preclassification",
                                 &summary,
                             )
@@ -5134,11 +5136,10 @@ async fn tick_decomposition(
         .await
         {
             Err(error) => {
-                reset_decomposition_to_planning(config, snapshot.graph_id, "validating").await?;
-                record_decomposition_attempt(
+                reject_decomposition_proposal(
                     config,
                     snapshot.graph_id,
-                    "proposal",
+                    "validating",
                     "deterministic-validation",
                     &error.to_string(),
                 )
@@ -22903,6 +22904,169 @@ mod tests {
                 "child readiness rejected by preclassification: ready=false (not_ready_reason: owner must select the storage format)".into(),
             )
         );
+    }
+
+    #[tokio::test]
+    async fn escaping_later_child_rejects_proposal_before_any_activation_or_provisioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("repo");
+        let sibling_dir = dir.path().join("sibling");
+        std::fs::create_dir(&repo_dir).unwrap();
+        std::fs::create_dir(&sibling_dir).unwrap();
+        let db_path = dir.path().join("escaping-proposal.db");
+        let proposal = vec![
+            planner::ProposedTask {
+                key: "permitted-first".into(),
+                title: "permitted first child".into(),
+                observable_outcome: "the first child remains inside the repository".into(),
+                deliverables: writable_deliverables("src/permitted.rs"),
+                acceptance_criteria: vec!["permitted child works".into()],
+                source_constraints: vec!["preserve atomic activation".into()],
+                verification_expectations: vec!["focused test passes".into()],
+                prerequisites: vec![],
+            },
+            planner::ProposedTask {
+                key: "escaping-second".into(),
+                title: "escaping second child".into(),
+                observable_outcome: "the second child writes outside the repository".into(),
+                deliverables: writable_deliverables("../sibling/escaped.rs"),
+                acceptance_criteria: vec!["escaping child is rejected".into()],
+                source_constraints: vec!["preserve atomic activation".into()],
+                verification_expectations: vec!["negative path is durable".into()],
+                prerequisites: vec!["permitted-first".into()],
+            },
+        ];
+
+        let (source_id, graph_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source_id = tasks::create(
+                &mut conn,
+                "owner",
+                "large source",
+                Some("split this source safely"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph_id = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id: source_id,
+                    expected_revision: 1,
+                    provider: "claude",
+                    model: "opus",
+                    frozen_base_sha: "0123456789abcdef0123456789abcdef01234567",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph_id,
+                "freeze-requested",
+                "planning",
+                None,
+                3,
+            )
+            .unwrap();
+            let proposal_json = serde_json::to_string(&proposal).unwrap();
+            assert!(quorum_core::decomposition::accept_proposal(
+                &mut conn,
+                graph_id,
+                &proposal_json,
+                4,
+            )
+            .unwrap());
+            (source_id, graph_id)
+        };
+
+        let config = pre_review_checks_config(db_path.clone(), repo_dir);
+        let mut coordinator = DecompositionCoordinator {
+            graph_id: Some(graph_id),
+            proposal: Some(proposal),
+            ..DecompositionCoordinator::default()
+        };
+        assert!(tick_decomposition(
+            &config,
+            &mut coordinator,
+            &[],
+            &[],
+            DecompositionLiveWork::default(),
+        )
+        .await
+        .unwrap());
+        assert!(coordinator.proposal.is_none());
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let lifecycle: (String, bool, bool, i64, Option<String>, String) = conn
+            .query_row(
+                "SELECT d.state,d.freeze_active,d.active,d.proposal_attempts,
+                        d.accepted_proposal_json,t.status
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            ("planning".into(), true, false, 1, None, "planning".into())
+        );
+
+        let attempt: (String, String) = conn
+            .query_row(
+                "SELECT reason_code,summary FROM decomposition_attempts WHERE graph_id=?1",
+                [graph_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt.0, "deterministic-validation");
+        assert!(attempt.1.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
+        assert!(attempt.1.contains("child escaping-second"), "{}", attempt.1);
+        assert!(attempt.1.contains("../sibling/escaped.rs"), "{}", attempt.1);
+        assert!(
+            attempt.1.contains("in-repository write path"),
+            "{}",
+            attempt.1
+        );
+
+        let authority: (i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM tasks WHERE id<>?1),
+                    (SELECT count(*) FROM tasks WHERE status='open'),
+                    (SELECT count(*) FROM task_graph_members),
+                    (SELECT count(*) FROM role_assignments),
+                    (SELECT count(*) FROM agent_runs),
+                    (SELECT count(*) FROM journal)",
+                [source_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(authority, (0, 0, 0, 0, 0, 0));
     }
 
     #[test]

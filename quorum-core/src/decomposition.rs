@@ -683,6 +683,87 @@ pub fn record_attempt(
     Ok(Some(ordinal))
 }
 
+/// Reject a durable proposal from one of its post-planner validation phases.
+///
+/// The attempt evidence and retry/hold transition are committed together so a
+/// rejected proposal can never become runnable or lose its actionable reason
+/// across a crash. `Ok(false)` is a clean loss of graph or source authority.
+pub fn reject_frozen_proposal(
+    conn: &mut Connection,
+    graph_id: i64,
+    expected_phase: &str,
+    reason_code: &str,
+    summary: &str,
+    now: i64,
+) -> Result<bool> {
+    if !matches!(expected_phase, "validating" | "preclassifying") {
+        return Err(QuorumError::Usage(
+            "invalid proposal rejection phase".into(),
+        ));
+    }
+    if summary.len() > 2048 || reason_code.is_empty() || reason_code.len() > 128 {
+        return Err(QuorumError::Usage(
+            "invalid bounded decomposition attempt".into(),
+        ));
+    }
+
+    let tx = begin_immediate(conn)?;
+    let row: Option<(i64, i64, i64)> = tx
+        .query_row(
+            "SELECT d.source_task_id,d.planned_source_revision,d.proposal_attempts
+             FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+             WHERE d.id=?1 AND d.state=?2 AND d.freeze_active=1 AND d.active=0
+               AND t.status='planning' AND t.revision=d.planned_source_revision",
+            params![graph_id, expected_phase],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((source_id, source_revision, attempts)) = row else {
+        return Ok(false);
+    };
+    if attempts >= MAX_PROPOSAL_ATTEMPTS {
+        return Ok(false);
+    }
+
+    let ordinal = attempts + 1;
+    tx.execute(
+        "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
+             reason_code,summary,created_at) VALUES (?1,?2,'proposal',?3,?4,?5,?6)",
+        params![
+            graph_id,
+            source_revision,
+            ordinal,
+            reason_code,
+            summary,
+            now
+        ],
+    )?;
+    if ordinal == MAX_PROPOSAL_ATTEMPTS {
+        tx.execute(
+            "UPDATE task_decompositions SET state='held',freeze_active=0,
+                 proposal_attempts=?2,accepted_proposal_json=NULL,
+                 planner_session_id=NULL,hold_code='proposal-attempts-exhausted',
+                 hold_summary=?3,updated_at=?4
+             WHERE id=?1",
+            params![graph_id, ordinal, summary, now],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET status='failed',updated_at=?2
+             WHERE id=?1 AND status='planning'",
+            params![source_id, now],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE task_decompositions SET state='planning',proposal_attempts=?2,
+                 accepted_proposal_json=NULL,planner_session_id=NULL,updated_at=?3
+             WHERE id=?1",
+            params![graph_id, ordinal, now],
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
 /// Reacquire the freeze before retrying a provider failure or resuming a
 /// recovery-reset aggregate. The partial unique index is the repository-wide
 /// race authority. `Ok(false)` is a normal loss.
@@ -3075,6 +3156,97 @@ mod tests {
             "SELECT state,freeze_active,proposal_attempts,provider_failures FROM task_decompositions WHERE id=?1",
             [graph], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(state, ("held".into(), 0, 0, 0));
+    }
+
+    #[test]
+    fn frozen_proposal_rejection_atomically_retries_then_holds() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+
+        for ordinal in 1..=MAX_PROPOSAL_ATTEMPTS {
+            let phase = if ordinal == 1 {
+                "preclassifying"
+            } else {
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "planning",
+                    "validating",
+                    None,
+                    ordinal * 10,
+                )
+                .unwrap());
+                conn.execute(
+                    "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                    [graph],
+                )
+                .unwrap();
+                "validating"
+            };
+            let summary = format!("bounded rejection {ordinal}");
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "deterministic-validation",
+                &summary,
+                ordinal * 10 + 1,
+            )
+            .unwrap());
+
+            let state: (String, i64, i64, Option<String>, String, i64) = conn
+                .query_row(
+                    "SELECT d.state,d.freeze_active,d.proposal_attempts,
+                            d.accepted_proposal_json,t.status,
+                            (SELECT count(*) FROM decomposition_attempts WHERE graph_id=d.id)
+                     FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                     WHERE d.id=?1",
+                    [graph],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            if ordinal < MAX_PROPOSAL_ATTEMPTS {
+                assert_eq!(
+                    state,
+                    (
+                        "planning".into(),
+                        1,
+                        ordinal,
+                        None,
+                        "planning".into(),
+                        ordinal
+                    )
+                );
+            } else {
+                assert_eq!(
+                    state,
+                    ("held".into(), 0, ordinal, None, "failed".into(), ordinal)
+                );
+            }
+        }
+
+        let authority: (i64, i64) = conn
+            .query_row(
+                "SELECT count(*),(SELECT count(*) FROM task_graph_members) FROM tasks",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(authority, (1, 0));
     }
 
     #[test]
