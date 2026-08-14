@@ -97,13 +97,16 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
 /// independent of the planner's response.
 pub fn with_worker_writability_guidance(source_constraints: &[String]) -> Vec<String> {
     let mut constraints = source_constraints.to_vec();
-    if !constraints
-        .iter()
-        .any(|constraint| constraint == WORKER_WRITABILITY_GUIDANCE)
-    {
+    if !contains_worker_writability_guidance(source_constraints) {
         constraints.push(WORKER_WRITABILITY_GUIDANCE.into());
     }
     constraints
+}
+
+fn contains_worker_writability_guidance(source_constraints: &[String]) -> bool {
+    source_constraints
+        .iter()
+        .any(|constraint| constraint == WORKER_WRITABILITY_GUIDANCE)
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -214,6 +217,13 @@ fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseErro
                 validate_text("observable outcome", &task.observable_outcome)?;
                 validate_list("acceptance criteria", &task.acceptance_criteria, 1)?;
                 validate_list("source constraints", &task.source_constraints, 1)?;
+                if task.source_constraints.len() == MAX_LIST_ITEMS
+                    && !contains_worker_writability_guidance(&task.source_constraints)
+                {
+                    return semantic(
+                        "source constraints at maximum size must include worker writability guidance",
+                    );
+                }
                 validate_list(
                     "verification expectations",
                     &task.verification_expectations,
@@ -593,6 +603,26 @@ mod tests {
     }
 
     #[test]
+    fn maximum_source_constraints_without_worker_guidance_are_semantically_rejected() {
+        let mut maximum = task("maximum", &[]);
+        let constraints: Vec<String> = (0..MAX_LIST_ITEMS)
+            .map(|index| format!("constraint {index}"))
+            .collect();
+        maximum["source_constraints"] = serde_json::to_value(constraints).unwrap();
+        let plan = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [maximum, task("other", &[])],
+        });
+        assert_eq!(
+            parse_response(&plan.to_string()),
+            Err(PlannerParseError::Semantic(
+                "source constraints at maximum size must include worker writability guidance"
+                    .into(),
+            ))
+        );
+    }
+
+    #[test]
     fn polling_result_preserves_independent_failure_budgets() {
         assert!(matches!(
             parsed_poll("not json"),
@@ -856,6 +886,15 @@ mod tests {
         assert_eq!(with_guidance.len(), 2);
         assert_eq!(with_guidance[0], "preserve atomicity");
         assert_eq!(with_guidance[1], WORKER_WRITABILITY_GUIDANCE);
+
+        let mut maximum_with_guidance: Vec<String> = (0..MAX_LIST_ITEMS - 1)
+            .map(|index| format!("constraint {index}"))
+            .collect();
+        maximum_with_guidance.push(WORKER_WRITABILITY_GUIDANCE.into());
+        assert_eq!(
+            with_worker_writability_guidance(&maximum_with_guidance),
+            maximum_with_guidance
+        );
 
         let already_present = vec![WORKER_WRITABILITY_GUIDANCE.into()];
         assert_eq!(
