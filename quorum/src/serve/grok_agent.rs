@@ -8,7 +8,7 @@
 use super::runner::{
     capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
     CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation, FailureTracker,
-    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
+    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage, WorkerTurnRequest,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -28,6 +28,7 @@ const RESTRICTED_PERMISSION_MODE: &str = "dontAsk";
 const RESTRICTED_MAX_TURNS: u32 = 8;
 const STDOUT_LINE_BYTES: usize = 1024 * 1024;
 const TERMINAL_STDOUT_LINES: usize = 256;
+const MAX_SESSION_ID_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GrokAdapterConfig<'a> {
@@ -158,8 +159,8 @@ pub fn headless_args(spec: &GrokSpec, mode: LaunchMode) -> std::io::Result<Vec<S
 /// supplies the same validated configuration on every turn.
 pub fn resume_args(session_id: &str, spec: &GrokSpec) -> std::io::Result<Vec<String>> {
     spec.validate()?;
-    if session_id.trim().is_empty() {
-        return Err(invalid_input("Grok continuation session ID is empty"));
+    if !valid_session_id(session_id) {
+        return Err(invalid_input("Grok continuation session ID is malformed"));
     }
     let mut args = vec!["--resume".into(), session_id.into()];
     args.extend(common_args(
@@ -263,6 +264,8 @@ pub struct GrokProc {
     diagnostics: DiagnosticBuffer,
     failures: FailureTracker,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+    pending_terminal: Option<String>,
+    worker_request: Option<Box<WorkerTurnRequest>>,
 }
 
 impl GrokProc {
@@ -344,6 +347,8 @@ impl GrokProc {
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
+            pending_terminal: None,
+            worker_request: None,
         })
     }
 
@@ -369,7 +374,7 @@ impl GrokProc {
                 if value
                     .get("sessionId")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|id| !id.trim().is_empty()) =>
+                    .is_some_and(valid_session_id) =>
             {
                 FailureObservation::success()
             }
@@ -411,6 +416,15 @@ impl GrokProc {
         self.failures.clone()
     }
 
+    #[allow(dead_code)] // dormant internal boundary; managed Grok routing is still rejected
+    pub(super) fn set_worker_request(&mut self, request: WorkerTurnRequest) {
+        self.worker_request = Some(Box::new(request));
+    }
+
+    pub(super) fn worker_request(&self) -> Option<&WorkerTurnRequest> {
+        self.worker_request.as_deref()
+    }
+
     pub(super) async fn finish_stderr_until(&mut self, deadline: tokio::time::Instant) -> bool {
         let Some(mut task) = self.stderr_task.take() else {
             return true;
@@ -427,11 +441,50 @@ impl GrokProc {
     }
 
     pub async fn next_raw_line(&mut self) -> Option<String> {
-        let line = self.reader.next_line().await;
-        if let Some(raw) = &line {
-            self.failures.observe_stdout(raw);
+        loop {
+            let Some(raw) = self.reader.next_line().await else {
+                let pending = self.pending_terminal.take()?;
+                let status = match self.child.wait().await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        self.failures.note_incomplete_evidence(format!(
+                            "Grok terminal process status was unavailable: {error}"
+                        ));
+                        return None;
+                    }
+                };
+                if !status.success() {
+                    self.failures.note_incomplete_evidence(format!(
+                        "Grok emitted terminal success but exited with {status}"
+                    ));
+                    return None;
+                }
+                if self.failures.observed_strict_failure().is_some() {
+                    return None;
+                }
+                return Some(pending);
+            };
+            self.failures.observe_stdout(&raw);
+
+            if self.pending_terminal.is_some() {
+                let detail = match terminal_session_id(&raw) {
+                    Some(_) => "Grok emitted a duplicate or conflicting terminal session ID",
+                    None => "Grok emitted output after its terminal session event",
+                };
+                self.failures.note_incomplete_evidence(detail);
+                continue;
+            }
+
+            if terminal_session_id(&raw).is_some() {
+                // Grok issues its continuation identity at terminal end. Do
+                // not expose completion until EOF and zero exit prove there
+                // is no duplicate/conflicting ID, trailing outcome, or late
+                // non-zero process status.
+                self.pending_terminal = Some(raw);
+                continue;
+            }
+            return Some(raw);
         }
-        line
     }
 
     pub async fn next_raw_line_bounded(
@@ -533,17 +586,20 @@ pub fn normalize_grok_line(raw: &str) -> Vec<AgentEvent> {
 }
 
 fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
-    let Some(session_id) = value
-        .get("sessionId")
-        .and_then(serde_json::Value::as_str)
-        .filter(|session_id| !session_id.trim().is_empty())
-    else {
+    let Some(session_id) = value.get("sessionId").and_then(serde_json::Value::as_str) else {
         return vec![AgentEvent::TurnFailed {
             message: "Grok end event missing sessionId".into(),
             usage: terminal_usage(value),
             cost_usd: terminal_cost(value),
         }];
     };
+    if !valid_session_id(session_id) {
+        return vec![AgentEvent::TurnFailed {
+            message: "Grok end event missing sessionId or sessionId malformed".into(),
+            usage: terminal_usage(value),
+            cost_usd: terminal_cost(value),
+        }];
+    }
     vec![
         AgentEvent::ThreadStarted {
             thread_id: session_id.to_string(),
@@ -553,6 +609,25 @@ fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
             cost_usd: terminal_cost(value),
         },
     ]
+}
+
+fn terminal_session_id(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("end") {
+        return None;
+    }
+    value
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|session_id| valid_session_id(session_id))
+        .map(str::to_string)
+}
+
+fn valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= MAX_SESSION_ID_BYTES
+        && session_id.trim() == session_id
+        && !session_id.chars().any(char::is_control)
 }
 
 fn terminal_usage(value: &serde_json::Value) -> Option<TokenUsage> {
@@ -846,6 +921,8 @@ mod tests {
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
+            pending_terminal: None,
+            worker_request: None,
         }
     }
 

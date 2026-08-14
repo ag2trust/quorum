@@ -34,7 +34,9 @@ use quorum_core::journal::{self, JournalEntry};
 use quorum_core::lifecycle::{self, Effect, Event};
 use quorum_core::mailbox;
 use quorum_core::pr_targets;
-use quorum_core::runner_state::{self, ContinuationIdentity, ContinuationSlot, PendingTurn};
+use quorum_core::runner_state::{
+    self, ContinuationIdentity, ContinuationSlot, InitialWorkerSession, PendingTurn,
+};
 use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
 use rusqlite::OptionalExtension;
@@ -2861,6 +2863,13 @@ impl SlotProcess {
         }
     }
 
+    fn worker_request(&self) -> Option<&runner::WorkerTurnRequest> {
+        match self {
+            Self::Running(proc) => proc.worker_request(),
+            Self::Dormant { .. } => None,
+        }
+    }
+
     fn continuation_id(&self) -> Option<&str> {
         match self {
             Self::Running(_) => None,
@@ -2991,6 +3000,10 @@ impl SlotState {
 
     fn live_process_mut(&mut self) -> std::io::Result<&mut runner::RunnerProc> {
         self.proc.running_mut()
+    }
+
+    fn worker_request(&self) -> Option<&runner::WorkerTurnRequest> {
+        self.proc.worker_request()
     }
 
     fn continuation_id_for_launch(&self) -> Option<&str> {
@@ -12081,6 +12094,215 @@ async fn persist_runner_continuation(
     }
 }
 
+struct DurableGrokWorkerIdentity {
+    run_task_id: i64,
+    run_agent: String,
+    run_role: String,
+    run_model: String,
+    run_effort: String,
+    run_provider: Option<String>,
+    assignment_id: i64,
+    responsibility_key: String,
+    assignment_task_id: Option<i64>,
+    assignment_role: String,
+    assignment_provider: String,
+    assignment_runner: String,
+    assignment_model: String,
+    assignment_effort: String,
+}
+
+/// Atomically hand off a Grok initial worker's terminal session identity.
+///
+/// Grok is intentionally unreachable from managed configuration, but its
+/// transport boundary is exercised internally. Unlike Codex, Grok issues its
+/// identity only at terminal end, so accepting completion first and persisting
+/// later would allow a continuation decision to race missing or mismatched
+/// authority. Revalidate every durable identity here, then write the exact
+/// pending turn and continuation in one short transaction.
+async fn persist_initial_grok_worker_session(
+    db_path: &Path,
+    slot: &SlotState,
+    session_id: &str,
+) -> Result<()> {
+    if session_id.is_empty()
+        || session_id.len() > 1024
+        || session_id.trim() != session_id
+        || session_id.chars().any(char::is_control)
+    {
+        return Err(QuorumError::Io(
+            "Grok terminal session identity is malformed".into(),
+        ));
+    }
+    let request = slot.worker_request().cloned().ok_or_else(|| {
+        QuorumError::Io("Grok terminal session is missing its exact RunnerRequest".into())
+    })?;
+    if slot.process_kind() != runner::AgentKind::Grok
+        || request.task_id != slot.task_id
+        || request.agent != slot.agent_name
+        || request.role != "worker"
+        || request.provider != "grok"
+        || request.runner != "grok"
+        || request.model != slot.model
+        || request.effort != slot.effort
+        || request.pending_turn.prompt != slot.pending_prompt
+        || request.pending_turn.turn_kind != slot.pending_turn_kind
+        || request.pending_turn.turn_kind != "initial"
+        || slot.continuation_id.is_some()
+    {
+        return Err(QuorumError::Io(
+            "Grok terminal identity does not belong to a fresh initial worker turn".into(),
+        ));
+    }
+
+    let run_id = slot.agent_run_id.ok_or_else(|| {
+        QuorumError::Io("Grok worker terminal identity is missing its agent run".into())
+    })?;
+    let cap_run_id = slot.cap_run_id.clone().ok_or_else(|| {
+        QuorumError::Io("Grok worker terminal identity is missing its run capability".into())
+    })?;
+    let path = db_path.to_path_buf();
+    let task_id = request.task_id;
+    let agent = request.agent.clone();
+    let model = request.model.clone();
+    let effort = request.effort.clone();
+    let pending_turn = request.pending_turn.clone();
+    let requested_assignment_id = request.role_assignment_id;
+    let requested_responsibility = request.responsibility_key.clone();
+    let session_id = session_id.to_string();
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let (status, assignee, revision, refs): (String, Option<String>, i64, Option<String>) = tx
+            .query_row(
+                "SELECT status,assignee,revision,refs FROM tasks WHERE id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        if status != "working" || assignee.as_deref() != Some(agent.as_str()) {
+            return Err(QuorumError::Io(format!(
+                "Grok worker terminal identity arrived after task #{task_id} left its exact working assignment"
+            )));
+        }
+
+        let durable = tx.query_row(
+            "SELECT ar.task_id,ar.agent_name,ar.role,ar.model,ar.effort,ar.provider,
+                    ar.role_assignment_id,ra.responsibility_key,ra.task_id,ra.role,
+                    ra.provider,ra.runner,ra.model,ra.effort
+             FROM agent_runs ar
+             JOIN role_assignments ra ON ra.id=ar.role_assignment_id
+             WHERE ar.id=?1 AND ar.ended_at IS NULL",
+            [run_id],
+            |row| {
+                Ok(DurableGrokWorkerIdentity {
+                    run_task_id: row.get(0)?,
+                    run_agent: row.get(1)?,
+                    run_role: row.get(2)?,
+                    run_model: row.get(3)?,
+                    run_effort: row.get(4)?,
+                    run_provider: row.get(5)?,
+                    assignment_id: row.get(6)?,
+                    responsibility_key: row.get(7)?,
+                    assignment_task_id: row.get(8)?,
+                    assignment_role: row.get(9)?,
+                    assignment_provider: row.get(10)?,
+                    assignment_runner: row.get(11)?,
+                    assignment_model: row.get(12)?,
+                    assignment_effort: row.get(13)?,
+                })
+            },
+        )?;
+        let expected_responsibility = worker_responsibility_key(task_id, revision);
+        if durable.run_task_id != task_id
+            || durable.run_agent != agent
+            || durable.run_role != "worker"
+            || durable.run_model != model
+            || durable.run_effort != effort
+            || durable.run_provider.as_deref() != Some("grok")
+            || durable.assignment_id != requested_assignment_id
+            || durable.responsibility_key != expected_responsibility
+            || durable.responsibility_key != requested_responsibility
+            || durable.assignment_task_id != Some(task_id)
+            || durable.assignment_role != "worker"
+            || durable.assignment_provider != "grok"
+            || durable.assignment_runner != "grok"
+            || durable.assignment_model != model
+            || durable.assignment_effort != effort
+        {
+            return Err(QuorumError::Io(
+                "Grok terminal session does not match its durable task, assignment, role, model, effort, and runner identity".into(),
+            ));
+        }
+
+        let owns_capability: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM run_capabilities
+                 WHERE run_id=?1 AND task_id=?2 AND agent=?3
+                   AND role='worker' AND revoked_at IS NULL
+             )",
+            rusqlite::params![cap_run_id, task_id, agent],
+            |row| row.get(0),
+        )?;
+        if !owns_capability {
+            return Err(QuorumError::Io(
+                "Grok terminal session lost its exact worker capability".into(),
+            ));
+        }
+
+        let mut refs: serde_json::Value = refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?
+            .unwrap_or_else(|| serde_json::json!({}));
+        if refs.get(runner_state::CONTINUATION_REF).is_some()
+            || refs
+                .get(runner_state::INITIAL_WORKER_SESSION_REF)
+                .is_some()
+        {
+            return Err(QuorumError::Io(
+                "Grok emitted a duplicate or conflicting terminal session identity".into(),
+            ));
+        }
+        let handoff = InitialWorkerSession {
+            task_id,
+            role_assignment_id: durable.assignment_id,
+            responsibility_key: durable.responsibility_key,
+            agent: agent.clone(),
+            role: "worker".into(),
+            provider: "grok".into(),
+            runner: "grok".into(),
+            model,
+            effort,
+            pending_turn,
+            session_id: session_id.clone(),
+        };
+        runner_state::set_initial_worker_session(&mut refs, &handoff);
+        runner_state::set_continuation(
+            &mut refs,
+            ContinuationSlot::Worker,
+            &ContinuationIdentity {
+                provider: "grok".into(),
+                id: session_id,
+            },
+        );
+        let updated = tx.execute(
+            "UPDATE tasks SET refs=?2,updated_at=?3
+             WHERE id=?1 AND status='working' AND assignee=?4 AND revision=?5",
+            rusqlite::params![task_id, refs.to_string(), now_unix(), agent, revision],
+        )?;
+        if updated != 1 {
+            return Err(QuorumError::Io(
+                "Grok worker terminal identity lost task authority before persistence".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("Grok session handoff join failed: {error}")))?
+}
+
 /// Phase 4b disposition for a dead turn-oriented worker.
 ///
 /// A turn-oriented process exits at turn end, so a successful `quorum submit`
@@ -12374,20 +12596,32 @@ async fn drain_events(
             slot.last_event_at = std::time::Instant::now();
             match agent_event {
                 runner::AgentEvent::ThreadStarted { thread_id } => {
-                    slot.continuation_id = Some(thread_id.clone());
-                    let continuation_slot = if role == "worker" {
-                        ContinuationSlot::Worker
+                    if slot.process_kind() == runner::AgentKind::Grok {
+                        if role != "worker" {
+                            return Err(QuorumError::Io(
+                                "managed Grok terminal identity is valid only at the internal worker boundary"
+                                    .into(),
+                            ));
+                        }
+                        persist_initial_grok_worker_session(db_path, slot, thread_id).await?;
                     } else {
-                        reviewer_continuation_slot(slot.r2_origin)
-                    };
-                    persist_runner_continuation(
-                        db_path,
-                        slot.task_id,
-                        &slot.process_kind().to_string(),
-                        thread_id,
-                        continuation_slot,
-                    )
-                    .await;
+                        let continuation_slot = if role == "worker" {
+                            ContinuationSlot::Worker
+                        } else {
+                            reviewer_continuation_slot(slot.r2_origin)
+                        };
+                        persist_runner_continuation(
+                            db_path,
+                            slot.task_id,
+                            &slot.process_kind().to_string(),
+                            thread_id,
+                            continuation_slot,
+                        )
+                        .await;
+                    }
+                    // In-memory continuation becomes usable only after the
+                    // provider-specific durable handoff has completed.
+                    slot.continuation_id = Some(thread_id.clone());
                 }
                 runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
                     let turn_tokens =
@@ -17437,6 +17671,283 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn grok_worker_fixture_program(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join("grok-worker-fixture.sh");
+        std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    #[cfg(unix)]
+    async fn initial_grok_worker_fixture(dir: &Path, body: &str) -> (PathBuf, SlotState, i64) {
+        let db_path = dir.join("grok-worker.db");
+        let worktree = dir.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let now = now_unix();
+        let (task_id, assignment_id, run_id, cap_run_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "internal Grok worker terminal handoff",
+                Some("preserve the exact internal initial prompt"),
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"internal-test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Internal-grok", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("internal worker claim");
+            let responsibility_key = worker_responsibility_key(task_id, 1);
+            conn.execute(
+                "INSERT INTO role_assignments
+                   (responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                    profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (?1,?2,NULL,'worker',NULL,'3','internal-grok','grok','grok',
+                         'grok-4.5','high','worker','internal-test',?3)",
+                rusqlite::params![responsibility_key, task_id, now],
+            )
+            .unwrap();
+            let assignment_id = conn.last_insert_rowid();
+            let run_id = quorum_core::agent_runs::insert_worker_with_assignment(
+                &conn,
+                task_id,
+                "Internal-grok",
+                &worker_responsibility_key(task_id, 1),
+                "grok-4.5",
+                "high",
+                "grok",
+                "grok",
+                Some(assignment_id),
+                now,
+            )
+            .unwrap();
+            let cap_run_id = "internal-grok-capability".to_string();
+            quorum_core::capabilities::issue(
+                &mut conn,
+                &cap_run_id,
+                task_id,
+                "Internal-grok",
+                "worker",
+                now,
+            )
+            .unwrap();
+            (task_id, assignment_id, run_id, cap_run_id)
+        };
+
+        let program = grok_worker_fixture_program(dir, body);
+        let responsibility_key = worker_responsibility_key(task_id, 1);
+        let proc = runner::RunnerProc::launch_internal_worker(
+            &runner::RunnerRequest {
+                launch: runner::LaunchRequest {
+                    model: "grok-4.5",
+                    effort: "high",
+                    worktree: &worktree,
+                    prompt: "preserve the exact internal initial prompt",
+                    environment: &[],
+                    mode: runner::LaunchMode::Normal,
+                    continuation_id: None,
+                },
+                task_id,
+                role_assignment_id: assignment_id,
+                responsibility_key: &responsibility_key,
+                agent: "Internal-grok",
+                role: "worker",
+                pending_turn: PendingTurn {
+                    provider: "grok".into(),
+                    model: "grok-4.5".into(),
+                    effort: "high".into(),
+                    prompt: "preserve the exact internal initial prompt".into(),
+                    turn_kind: "initial".into(),
+                    continuation_id: None,
+                    requested: false,
+                },
+            },
+            &runner::AdapterConfig {
+                executable: program.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut slot = slot_with_process(proc);
+        slot.agent_name = "Internal-grok".into();
+        slot.task_id = task_id;
+        slot.model = "grok-4.5".into();
+        slot.effort = "high".into();
+        slot.worktree_path = worktree;
+        slot.agent_run_id = Some(run_id);
+        slot.cap_run_id = Some(cap_run_id);
+        slot.pending_prompt = "preserve the exact internal initial prompt".into();
+        slot.pending_turn_kind = "initial".into();
+        slot.draining = true;
+        assert!(assignment_id > 0);
+        (db_path, slot, task_id)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_persists_exact_terminal_session_before_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"text\",\"data\":\"working\"}' \
+             '{\"type\":\"end\",\"sessionId\":\"grok-session-exact\"}'",
+        )
+        .await;
+        let original_tokens = slot.cost_tokens;
+        let original_cost = slot.cost_usd;
+
+        assert!(
+            drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(slot.continuation_id.as_deref(), Some("grok-session-exact"));
+        assert!(!slot.draining, "completion must follow the durable handoff");
+        assert!(
+            slot.try_wait().unwrap().is_some(),
+            "the turn-end barrier must preserve exited-process visibility"
+        );
+        assert_eq!(
+            slot.cost_tokens, original_tokens,
+            "missing usage is not fabricated"
+        );
+        assert_eq!(
+            slot.cost_usd, original_cost,
+            "missing cost is not fabricated"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "grok-session-exact"
+        );
+        let handoff = runner_state::initial_worker_session(&refs).unwrap();
+        assert_eq!(handoff.task_id, task_id);
+        assert_eq!(handoff.agent, "Internal-grok");
+        assert_eq!(handoff.role, "worker");
+        assert_eq!(handoff.provider, "grok");
+        assert_eq!(handoff.runner, "grok");
+        assert_eq!(handoff.model, "grok-4.5");
+        assert_eq!(handoff.effort, "high");
+        assert_eq!(
+            handoff.pending_turn.prompt,
+            "preserve the exact internal initial prompt"
+        );
+        assert_eq!(handoff.pending_turn.turn_kind, "initial");
+        assert!(handoff.pending_turn.continuation_id.is_none());
+        assert_eq!(handoff.session_id, "grok-session-exact");
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_rejects_incomplete_and_ambiguous_terminal_processes() {
+        let fixtures = [
+            ("early-eof", "printf '%s\\n' '{\"type\":\"text\",\"data\":\"partial\"}'"),
+            ("nonzero-exit", "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}'; exit 7"),
+            ("malformed-terminal", "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":'"),
+            ("missing-session", "printf '%s\\n' '{\"type\":\"end\"}'"),
+            ("duplicate-session", "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-a\"}'"),
+            ("conflicting-session", "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-b\"}'"),
+            ("trailing-outcome", "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"text\",\"data\":\"late\"}'"),
+        ];
+
+        for (name, body) in fixtures {
+            let dir = tempfile::tempdir().unwrap();
+            let (db_path, mut slot, task_id) = initial_grok_worker_fixture(dir.path(), body).await;
+            let result = drain_events(&mut slot, &db_path, "worker", &CostLimits::default()).await;
+            if let Err(error) = result {
+                panic!("{name}: {error}");
+            }
+            assert!(
+                slot.continuation_id.is_none(),
+                "{name}: in-memory identity leaked"
+            );
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            let refs: serde_json::Value = task
+                .refs
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .unwrap()
+                .unwrap_or_else(|| serde_json::json!({}));
+            assert!(
+                refs.get(runner_state::CONTINUATION_REF).is_none(),
+                "{name}: continuation was persisted"
+            );
+            assert!(
+                refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none(),
+                "{name}: terminal handoff was persisted"
+            );
+            drop(conn);
+            slot.kill_and_reap().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_rejects_session_identity_after_durable_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"too-late\"}'",
+        )
+        .await;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Internal-grok",
+                task_id,
+                &Event::SignaledDone { pr: "459".into() },
+                now_unix() + 1,
+            )
+            .unwrap();
+        }
+
+        let error = match drain_events(&mut slot, &db_path, "worker", &CostLimits::default()).await
+        {
+            Ok(_) => panic!("late Grok terminal identity unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("left its exact working assignment"));
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.draining, "late identity must not complete the turn");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "in-review",
+            "the earlier outcome remains authoritative"
+        );
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
+        assert!(refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none());
+        drop(conn);
+        slot.kill_and_reap().await;
     }
 
     #[test]
