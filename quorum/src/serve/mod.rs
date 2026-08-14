@@ -2591,10 +2591,10 @@ pub struct CostLimits {
     pub max_turn_cost_usd: Option<f64>,
     pub max_task_cost_usd: Option<f64>,
     pub max_turn_wall_secs: Option<u64>,
+    /// Max seconds a worker/reviewer may sit idle between turns. Default: 900.
+    pub max_idle_secs: Option<u64>,
     pub max_task_wall_secs: Option<u64>,
-    /// Max seconds a worker/reviewer may sit idle between turns (draining=false)
-    /// before the watchdog kills it. Catches zombies that asked a question no one
-    /// can answer (e.g. permission denied in dontAsk mode). Default: 300.
+    /// Legacy idle limit retained for compatibility. Prefer max_idle_secs.
     pub idle_timeout_secs: Option<u64>,
 }
 
@@ -9580,7 +9580,11 @@ async fn tick(
     }
 
     // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
-    let idle_timeout = config.limits.idle_timeout_secs.unwrap_or(300);
+    let idle_timeout = config
+        .limits
+        .max_idle_secs
+        .or(config.limits.idle_timeout_secs)
+        .unwrap_or(900);
     let mut idle_reviewers: Vec<usize> = Vec::new();
     for (i, r) in reviewers.iter().enumerate() {
         if r.draining {
@@ -18670,6 +18674,7 @@ mod tests {
         assert!(limits.max_turn_cost_usd.is_none());
         assert!(limits.max_task_cost_usd.is_none());
         assert!(limits.max_turn_wall_secs.is_none());
+        assert!(limits.max_idle_secs.is_none());
         assert!(limits.max_task_wall_secs.is_none());
         assert!(limits.idle_timeout_secs.is_none());
     }
