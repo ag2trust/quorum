@@ -19,6 +19,9 @@ use tokio::io::AsyncReadExt;
 
 const DIAGNOSTIC_CAPACITY: usize = 256;
 const DIAGNOSTIC_LINE_BYTES: usize = 16 * 1024;
+const EXIT_EVIDENCE_LINES: usize = 256;
+const EXIT_EVIDENCE_LINE_BYTES: usize = 16 * 1024;
+const EXIT_EVIDENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Closed, provider-neutral classification for runner failures observed before
 /// a managed agent has produced an authoritative task or review outcome.
@@ -169,6 +172,7 @@ struct FailureTrackerState {
     terminal_success: bool,
     saw_protocol_line: bool,
     unknown_failure: Option<String>,
+    incomplete_evidence: Option<String>,
 }
 
 impl FailureTracker {
@@ -180,6 +184,9 @@ impl FailureTracker {
     }
 
     pub fn observe_stdout(&self, raw: &str) {
+        if raw.is_empty() {
+            return;
+        }
         let kind = self.0.lock().expect("failure tracker poisoned").kind;
         let observation = match kind {
             Some(AgentKind::Claude) => AgentProc::failure_observation(raw),
@@ -206,6 +213,26 @@ impl FailureTracker {
             FailureObservation::classified(FailureDisposition::NonFailover, detail),
             false,
         );
+    }
+
+    /// Start a fresh managed turn on a persistent provider process. Failure
+    /// evidence is authoritative only within one pre-outcome turn; retaining
+    /// success or conflicting evidence across rework/re-review turns would
+    /// suppress or corrupt the later turn's classification.
+    pub fn begin_turn(&self) {
+        let mut state = self.0.lock().expect("failure tracker poisoned");
+        let kind = state.kind;
+        *state = FailureTrackerState {
+            kind,
+            ..FailureTrackerState::default()
+        };
+    }
+
+    pub fn note_incomplete_evidence(&self, detail: impl Into<String>) {
+        let mut state = self.0.lock().expect("failure tracker poisoned");
+        if state.incomplete_evidence.is_none() {
+            state.incomplete_evidence = Some(detail.into());
+        }
     }
 
     fn record(&self, observation: FailureObservation, protocol_line: bool) {
@@ -260,6 +287,12 @@ impl FailureTracker {
 fn observed_failure(state: &FailureTrackerState) -> Option<RunnerFailure> {
     if state.terminal_success {
         return None;
+    }
+    if let Some(detail) = &state.incomplete_evidence {
+        return Some(RunnerFailure::new(
+            FailureDisposition::Unclassified,
+            detail.clone(),
+        ));
     }
     if state.conflicting {
         return Some(RunnerFailure::new(
@@ -554,6 +587,102 @@ impl RunnerProc {
             Self::Claude(proc) => proc.kill_and_reap().await,
             Self::Codex(proc) => proc.kill_and_reap().await,
             Self::Grok(proc) => proc.kill_and_reap().await,
+        }
+    }
+
+    /// After `try_wait` proves that the provider leader exited, consume the
+    /// remaining bounded stdout records and join the stderr reader before a
+    /// caller snapshots failure evidence. Descendants may retain pipes, so
+    /// both work and allocation are bounded; incomplete evidence fails safe.
+    pub async fn finalize_pre_authoritative_evidence(&mut self) -> Vec<CapturedOutput> {
+        let deadline = tokio::time::Instant::now() + EXIT_EVIDENCE_TIMEOUT;
+        let mut stdout = VecDeque::new();
+        let mut dropped = 0usize;
+        let mut stdout_complete = false;
+
+        for index in 0..=EXIT_EVIDENCE_LINES {
+            match tokio::time::timeout_at(
+                deadline,
+                self.next_exit_evidence_line_bounded(EXIT_EVIDENCE_LINE_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(Some(line))) => {
+                    if stdout.len() == EXIT_EVIDENCE_LINES {
+                        stdout.pop_front();
+                        dropped = dropped.saturating_add(1);
+                    }
+                    stdout.push_back(CapturedOutput::Stdout(line));
+                    if index == EXIT_EVIDENCE_LINES {
+                        self.failure_tracker().note_incomplete_evidence(format!(
+                            "provider exit evidence exceeded {EXIT_EVIDENCE_LINES} stdout records"
+                        ));
+                        break;
+                    }
+                }
+                Ok(Ok(None)) => {
+                    stdout_complete = true;
+                    break;
+                }
+                Ok(Err(error)) => {
+                    self.failure_tracker().note_incomplete_evidence(format!(
+                        "provider exit stdout could not be finalized: {error}"
+                    ));
+                    break;
+                }
+                Err(_) => {
+                    self.failure_tracker()
+                        .note_incomplete_evidence("provider exit stdout finalization timed out");
+                    break;
+                }
+            }
+        }
+
+        if !stdout_complete && dropped == 0 {
+            // The specific read/timeout path above records a diagnostic. This
+            // fallback covers any future loop exit that does not reach EOF.
+            self.failure_tracker()
+                .note_incomplete_evidence("provider exit stdout evidence was incomplete");
+        }
+        if !self.finish_stderr_until(deadline).await {
+            self.failure_tracker()
+                .note_incomplete_evidence("provider exit stderr evidence was incomplete");
+        }
+
+        let mut output =
+            Vec::with_capacity(stdout.len() + usize::from(dropped > 0) + DIAGNOSTIC_CAPACITY);
+        if dropped > 0 {
+            output.push(CapturedOutput::StdoutTruncated { dropped });
+        }
+        output.extend(stdout);
+        output.extend(self.drain_diagnostics());
+        output
+    }
+
+    fn failure_tracker(&self) -> FailureTracker {
+        match self {
+            Self::Claude(proc) => proc.failure_tracker(),
+            Self::Codex(proc) => proc.failure_tracker(),
+            Self::Grok(proc) => proc.failure_tracker(),
+        }
+    }
+
+    async fn finish_stderr_until(&mut self, deadline: tokio::time::Instant) -> bool {
+        match self {
+            Self::Claude(proc) => proc.finish_stderr_until(deadline).await,
+            Self::Codex(proc) => proc.finish_stderr_until(deadline).await,
+            Self::Grok(proc) => proc.finish_stderr_until(deadline).await,
+        }
+    }
+
+    async fn next_exit_evidence_line_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        match self {
+            Self::Claude(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::Codex(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::Grok(proc) => proc.next_raw_line_bounded(max_bytes).await,
         }
     }
 
@@ -1160,6 +1289,21 @@ mod tests {
         ];
         assert_eq!(dispositions.len(), 5);
         assert_eq!(FailureDisposition::Unclassified.to_string(), "unclassified");
+    }
+
+    #[test]
+    fn blank_provider_records_leave_failure_tracking_inert() {
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok] {
+            let tracker = FailureTracker::for_kind(kind);
+            tracker.observe_stdout("");
+            let state = tracker.0.lock().unwrap();
+            assert!(
+                !state.saw_protocol_line,
+                "{kind} blank line became protocol evidence"
+            );
+            assert!(state.classified.is_none());
+            assert!(state.unknown_failure.is_none());
+        }
     }
 
     #[cfg(unix)]

@@ -2981,6 +2981,14 @@ impl SlotState {
         }
     }
 
+    async fn finalize_pre_authoritative_exit_evidence(&mut self) {
+        let output = match &mut self.proc {
+            SlotProcess::Running(proc) => proc.finalize_pre_authoritative_evidence().await,
+            SlotProcess::Dormant { .. } => Vec::new(),
+        };
+        persist_terminal_output(&mut self.session_log, output);
+    }
+
     fn live_process_mut(&mut self) -> std::io::Result<&mut runner::RunnerProc> {
         self.proc.running_mut()
     }
@@ -9952,7 +9960,7 @@ async fn tick(
         }
     }
     for &(i, status) in dead_workers.iter().rev() {
-        let dead = workers.remove(i);
+        let mut dead = workers.remove(i);
         if dead.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
             let reason = dead
                 .last_error_text
@@ -10007,6 +10015,7 @@ async fn tick(
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
+                    dead.finalize_pre_authoritative_exit_evidence().await;
                     if let Some(failure) = dead.classify_pre_authoritative_exit(status) {
                         log(&format!(
                             "worker {} pre-authoritative runner failure classified as {failure}",
@@ -10039,7 +10048,8 @@ async fn tick(
             continue;
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
-        let runner_failure = classify_managed_pre_authoritative_exit(&dead, status, &disposition);
+        let runner_failure =
+            classify_managed_pre_authoritative_exit(&mut dead, status, &disposition).await;
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -10169,7 +10179,7 @@ async fn tick(
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
         let runner_failure =
-            classify_managed_pre_authoritative_exit(&reviewers[i], status, &disposition);
+            classify_managed_pre_authoritative_exit(&mut reviewers[i], status, &disposition).await;
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -14570,14 +14580,20 @@ fn managed_exit_end_reason(disposition: &tasks::ManagedExitDisposition) -> Optio
 /// The DB disposition is the authority gate for this taxonomy. Pending or
 /// recorded submissions/verdicts and transferred/terminal ownership are
 /// semantic managed outcomes, regardless of process output or exit status.
-fn classify_managed_pre_authoritative_exit(
-    slot: &SlotState,
+async fn classify_managed_pre_authoritative_exit(
+    slot: &mut SlotState,
     status: std::process::ExitStatus,
     disposition: &tasks::ManagedExitDisposition,
 ) -> Option<runner::RunnerFailure> {
+    if !managed_exit_permits_runner_failure(disposition) {
+        return None;
+    }
+    slot.finalize_pre_authoritative_exit_evidence().await;
+    slot.classify_pre_authoritative_exit(status)
+}
+
+fn managed_exit_permits_runner_failure(disposition: &tasks::ManagedExitDisposition) -> bool {
     matches!(disposition, tasks::ManagedExitDisposition::AgentFailed(_))
-        .then(|| slot.classify_pre_authoritative_exit(status))
-        .flatten()
 }
 
 /// Gather task context from the DB and persist a structured lifecycle diagnostic.
@@ -21567,10 +21583,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn authoritative_managed_outcomes_gate_runner_failure_taxonomy() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let slot = make_dummy_slot();
-        let status = std::process::ExitStatus::from_raw(1 << 8);
         // OutcomePending/Recorded cover worker submissions and reviewer
         // verdicts/findings. OwnershipTransferred covers authoritative agent
         // failed/blocked/needs-info reactions and already-advanced tasks.
@@ -21580,7 +21592,7 @@ mod tests {
             tasks::ManagedExitDisposition::OwnershipTransferred,
         ] {
             assert!(
-                classify_managed_pre_authoritative_exit(&slot, status, &disposition).is_none(),
+                !managed_exit_permits_runner_failure(&disposition),
                 "authoritative outcome entered runner failure taxonomy"
             );
         }

@@ -126,7 +126,7 @@ pub struct CodexProc {
     line_buffer: Vec<u8>,
     diagnostics: DiagnosticBuffer,
     failures: FailureTracker,
-    stderr_task: tokio::task::JoinHandle<()>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl CodexProc {
@@ -177,6 +177,9 @@ impl CodexProc {
     }
 
     pub(super) fn failure_observation(raw: &str) -> FailureObservation {
+        if raw.is_empty() {
+            return FailureObservation::inert();
+        }
         let Some(event) = codex_stream::parse_line(raw) else {
             return FailureObservation::classified(
                 FailureDisposition::NonFailover,
@@ -240,6 +243,25 @@ impl CodexProc {
         self.failures.observed_failure()
     }
 
+    pub(super) fn failure_tracker(&self) -> FailureTracker {
+        self.failures.clone()
+    }
+
+    pub(super) async fn finish_stderr_until(&mut self, deadline: tokio::time::Instant) -> bool {
+        let Some(mut task) = self.stderr_task.take() else {
+            return true;
+        };
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                false
+            }
+        }
+    }
+
     /// Read-only, single-turn planner boundary. Kept separate from worker
     /// spawning so future worker flags cannot silently weaken planning.
     pub fn spawn_planner(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
@@ -276,7 +298,7 @@ impl CodexProc {
             line_buffer: Vec::new(),
             diagnostics,
             failures,
-            stderr_task,
+            stderr_task: Some(stderr_task),
         })
     }
 
@@ -316,7 +338,7 @@ impl CodexProc {
             line_buffer: Vec::new(),
             diagnostics,
             failures,
-            stderr_task,
+            stderr_task: Some(stderr_task),
         })
     }
 
@@ -368,7 +390,7 @@ impl CodexProc {
             line_buffer: Vec::new(),
             diagnostics,
             failures,
-            stderr_task,
+            stderr_task: Some(stderr_task),
         })
     }
 
@@ -410,7 +432,7 @@ impl CodexProc {
             line_buffer: Vec::new(),
             diagnostics,
             failures,
-            stderr_task,
+            stderr_task: Some(stderr_task),
         })
     }
 
@@ -520,7 +542,9 @@ impl CodexProc {
             terminal.push(CapturedOutput::Stdout(line));
         }
         let diagnostics = self.diagnostics.clone();
-        let _ = self.stderr_task.await;
+        if let Some(stderr_task) = self.stderr_task.take() {
+            let _ = stderr_task.await;
+        }
         terminal.extend(diagnostics.drain());
         terminal
     }
@@ -691,7 +715,7 @@ mod tests {
             line_buffer: Vec::new(),
             diagnostics,
             failures,
-            stderr_task,
+            stderr_task: Some(stderr_task),
         }
     }
 
@@ -1204,7 +1228,13 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
         let mut nonzero = shell_proc("exit 7").await;
         assert!(nonzero.next_raw_line().await.is_none());
         let status = wait_for_exit(&mut nonzero).await;
-        let _ = (&mut nonzero.stderr_task).await;
+        assert!(
+            nonzero
+                .finish_stderr_until(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                )
+                .await
+        );
         assert_eq!(
             nonzero
                 .classify_pre_authoritative_exit(status)
@@ -1217,7 +1247,13 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
             shell_proc("echo 'error: unexpected argument --future' >&2; exit 2").await;
         assert!(ordinary.next_raw_line().await.is_none());
         let status = wait_for_exit(&mut ordinary).await;
-        let _ = (&mut ordinary.stderr_task).await;
+        assert!(
+            ordinary
+                .finish_stderr_until(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                )
+                .await
+        );
         assert_eq!(
             ordinary
                 .classify_pre_authoritative_exit(status)
@@ -1254,9 +1290,91 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
         let mut unknown = shell_proc("echo 'future provider diagnostic' >&2; exit 1").await;
         assert!(unknown.next_raw_line().await.is_none());
         let status = wait_for_exit(&mut unknown).await;
-        let _ = (&mut unknown.stderr_task).await;
+        assert!(
+            unknown
+                .finish_stderr_until(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                )
+                .await
+        );
         let failure = unknown.classify_pre_authoritative_exit(status).unwrap();
         assert_eq!(failure.disposition(), FailureDisposition::Unclassified);
+    }
+
+    #[tokio::test]
+    async fn exit_finalization_drains_past_tick_cap_and_joins_stderr() {
+        let prefix = "i=0; while [ $i -lt 70 ]; do printf '%s\\n' \
+            '{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}'; \
+            i=$((i+1)); done;";
+
+        let mut failed = shell_proc(&format!(
+            "{prefix} printf '%s\\n' \
+             '{{\"type\":\"turn.failed\",\"error\":{{\"message\":\"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header\"}}}}'; exit 1"
+        ))
+        .await;
+        for _ in 0..64 {
+            assert!(failed.next_raw_line().await.is_some());
+        }
+        let failed_status = wait_for_exit(&mut failed).await;
+        let mut failed = crate::serve::runner::RunnerProc::Codex(failed);
+        let terminal = failed.finalize_pre_authoritative_evidence().await;
+        assert!(!terminal.is_empty());
+        assert_eq!(
+            failed
+                .classify_pre_authoritative_exit(failed_status)
+                .unwrap()
+                .disposition(),
+            FailureDisposition::ProviderUnavailable
+        );
+        failed.kill_and_reap().await;
+
+        let mut succeeded = shell_proc(&format!(
+            "{prefix} printf '%s\\n' '{{\"type\":\"turn.completed\"}}'"
+        ))
+        .await;
+        for _ in 0..64 {
+            assert!(succeeded.next_raw_line().await.is_some());
+        }
+        let succeeded_status = wait_for_exit(&mut succeeded).await;
+        let mut succeeded = crate::serve::runner::RunnerProc::Codex(succeeded);
+        succeeded.finalize_pre_authoritative_evidence().await;
+        assert!(succeeded
+            .classify_pre_authoritative_exit(succeeded_status)
+            .is_none());
+        succeeded.kill_and_reap().await;
+
+        let mut delayed_stderr = shell_proc(&format!("{prefix} exit 1")).await;
+        if let Some(task) = delayed_stderr.stderr_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        let delayed_failures = delayed_stderr.failures.clone();
+        delayed_stderr.stderr_task = Some(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            delayed_failures.observe_stderr("future stderr boundary");
+        }));
+        for _ in 0..64 {
+            assert!(delayed_stderr.next_raw_line().await.is_some());
+        }
+        let stderr_status = wait_for_exit(&mut delayed_stderr).await;
+        assert_eq!(
+            delayed_stderr
+                .classify_pre_authoritative_exit(stderr_status)
+                .unwrap()
+                .disposition(),
+            FailureDisposition::RetryableSameRoute,
+            "fixture must reproduce the pre-finalization stderr race"
+        );
+        let mut delayed_stderr = crate::serve::runner::RunnerProc::Codex(delayed_stderr);
+        delayed_stderr.finalize_pre_authoritative_evidence().await;
+        assert_eq!(
+            delayed_stderr
+                .classify_pre_authoritative_exit(stderr_status)
+                .unwrap()
+                .disposition(),
+            FailureDisposition::Unclassified
+        );
+        delayed_stderr.kill_and_reap().await;
     }
 
     #[tokio::test]

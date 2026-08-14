@@ -134,6 +134,9 @@ impl AgentProc {
     }
 
     pub(super) fn failure_observation(raw: &str) -> FailureObservation {
+        if raw.is_empty() {
+            return FailureObservation::inert();
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
             return FailureObservation::classified(
                 FailureDisposition::NonFailover,
@@ -144,17 +147,23 @@ impl AgentProc {
             Some("assistant") => {
                 let error = value.get("error").and_then(|error| error.as_str());
                 match error {
-                    Some(
-                        "authentication_failed"
-                        | "billing_error"
-                        | "credit_balance_too_low"
-                        | "rate_limit",
-                    ) => FailureObservation::classified(
-                        FailureDisposition::ProviderUnavailable,
-                        format!(
-                            "Claude structured provider error: {}",
-                            error.expect("matched Some")
-                        ),
+                    Some("authentication_failed" | "billing_error" | "credit_balance_too_low") => {
+                        FailureObservation::classified(
+                            FailureDisposition::ProviderUnavailable,
+                            format!(
+                                "Claude structured provider error: {}",
+                                error.expect("matched Some")
+                            ),
+                        )
+                    }
+                    Some("rate_limit") if claude_quota_text(&claude_assistant_text(&value)) => {
+                        FailureObservation::classified(
+                            FailureDisposition::ProviderUnavailable,
+                            "Claude reported an account/session quota limit",
+                        )
+                    }
+                    Some("rate_limit") => FailureObservation::unknown_failure(
+                        "Claude rate limit did not prove account/session quota",
                     ),
                     Some("model_not_found" | "invalid_model" | "model_unavailable") => {
                         FailureObservation::classified(
@@ -198,10 +207,15 @@ impl AgentProc {
             Some("result") if value.get("is_error").and_then(|v| v.as_bool()) == Some(true) => {
                 let status = value.get("api_error_status").and_then(|v| v.as_u64());
                 let result = value.get("result").and_then(|v| v.as_str()).unwrap_or("");
-                if status == Some(429) {
+                if status == Some(429) && claude_quota_text(result) {
                     return FailureObservation::classified(
                         FailureDisposition::ProviderUnavailable,
-                        "Claude returned API status 429",
+                        "Claude returned API status 429 with account/session quota evidence",
+                    );
+                }
+                if status == Some(429) {
+                    return FailureObservation::unknown_failure(
+                        "Claude API status 429 did not prove account/session quota",
                     );
                 }
                 if matches!(status, Some(500 | 502 | 503 | 529)) {
@@ -268,6 +282,25 @@ impl AgentProc {
 
     pub fn observed_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
         self.failures.observed_failure()
+    }
+
+    pub(super) fn failure_tracker(&self) -> FailureTracker {
+        self.failures.clone()
+    }
+
+    pub(super) async fn finish_stderr_until(&mut self, deadline: tokio::time::Instant) -> bool {
+        let Some(mut task) = self.stderr_task.take() else {
+            return true;
+        };
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                false
+            }
+        }
     }
 
     pub fn spawn(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
@@ -384,6 +417,7 @@ impl AgentProc {
     }
 
     pub async fn feed_turn(&mut self, json_turn: &str) -> std::io::Result<()> {
+        self.failures.begin_turn();
         self.stdin.write_all(json_turn.as_bytes()).await?;
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
@@ -533,7 +567,7 @@ impl AgentProc {
             terminal.push(CapturedOutput::Stdout(line));
         }
         let diagnostics = self.diagnostics.clone();
-        if let Some(stderr_task) = self.stderr_task {
+        if let Some(stderr_task) = self.stderr_task.take() {
             let _ = stderr_task.await;
         }
         terminal.extend(diagnostics.drain());
@@ -545,6 +579,44 @@ fn claude_auth_text(text: &str) -> bool {
     text.len() <= 4096
         && (text == "Not logged in · Please run /login"
             || text == "Not logged in. Please run /login")
+}
+
+fn claude_assistant_text(value: &serde_json::Value) -> String {
+    let Some(content) = value.pointer("/message/content").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let mut text = String::new();
+    for fragment in content
+        .iter()
+        .filter_map(|item| item.get("text").and_then(|value| value.as_str()))
+    {
+        let separator = usize::from(!text.is_empty());
+        if text
+            .len()
+            .saturating_add(separator)
+            .saturating_add(fragment.len())
+            > 4096
+        {
+            return String::new();
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(fragment);
+    }
+    text
+}
+
+fn claude_quota_text(text: &str) -> bool {
+    if text.is_empty() || text.len() > 4096 {
+        return false;
+    }
+    let text = text.to_ascii_lowercase();
+    text.contains("session limit")
+        || text.contains("account quota")
+        || text.contains("credit balance is too low")
+        || text.contains("billing hard limit")
+        || text.contains("spend limit")
 }
 
 fn claude_model_unavailable_text(text: &str) -> bool {
@@ -923,6 +995,24 @@ mod tests {
     }
 
     #[test]
+    fn claude_http_429_requires_account_or_session_quota_evidence() {
+        let quota = r#"{"type":"result","result":"You've hit your session limit","is_error":true,"api_error_status":429}"#;
+        assert_eq!(
+            AgentProc::failure_observation(quota).disposition,
+            Some(FailureDisposition::ProviderUnavailable)
+        );
+
+        for transient in [
+            r#"{"type":"result","result":"upstream rate limit exceeded","is_error":true,"api_error_status":429}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"upstream rate limit exceeded"}]},"error":"rate_limit","is_api_error_message":true}"#,
+        ] {
+            let observation = AgentProc::failure_observation(transient);
+            assert_eq!(observation.disposition, None);
+            assert!(observation.unknown_failure);
+        }
+    }
+
+    #[test]
     fn claude_model_fixture_is_profile_scoped_and_unknown_is_fail_safe() {
         let model = r#"{"type":"assistant","message":{"model":"<synthetic>"},"error":"model_not_found","is_api_error_message":true}"#;
         assert_eq!(
@@ -976,6 +1066,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_claude_tracker_is_scoped_to_each_managed_turn() {
+        let mut proc = shell_proc(
+            "IFS= read -r first; \
+             printf '%s\\n' '{\"type\":\"result\",\"result\":\"submitted\",\"is_error\":false}'; \
+             IFS= read -r second; \
+             printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Not logged in · Please run /login\"}]},\"error\":\"authentication_failed\",\"is_api_error_message\":true}'; \
+             exec sleep 30",
+        )
+        .await;
+
+        proc.feed_turn(&user_turn("initial work")).await.unwrap();
+        let _ = proc.next_raw_line().await.unwrap();
+        assert!(proc.observed_pre_authoritative_failure().is_none());
+
+        proc.feed_turn(&user_turn("review requested changes"))
+            .await
+            .unwrap();
+        let _ = proc.next_raw_line().await.unwrap();
+        assert_eq!(
+            proc.observed_pre_authoritative_failure()
+                .unwrap()
+                .disposition(),
+            FailureDisposition::ProviderUnavailable
+        );
+        proc.kill_and_reap().await;
+    }
+
+    #[tokio::test]
     async fn claude_boundary_bounds_stderr_drains_terminal_output_and_reaps() {
         // 17618 bytes must stay above runner::DIAGNOSTIC_LINE_BYTES (16384) and 306
         // lines above runner::DIAGNOSTIC_CAPACITY (256) — both constants are private
@@ -988,8 +1106,8 @@ mod tests {
             "printf '\\377invalid\\n' >&2; \
              head -c 17618 /dev/zero | tr '\\000' x >&2; echo >&2; \
              i=0; while [ $i -lt 306 ]; do echo claude-stderr-$i >&2; i=$((i+1)); done; \
-             echo '{\"type\":\"provider.ready\"}'; \
-             echo '{\"type\":\"result\",\"result\":\"trailing\"}'; \
+             printf '%s\\n%s\\n' '{\"type\":\"provider.ready\"}' \
+               '{\"type\":\"result\",\"result\":\"trailing\"}'; \
              exec sleep 30",
         )
         .await;

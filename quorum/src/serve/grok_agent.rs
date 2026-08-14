@@ -262,7 +262,7 @@ pub struct GrokProc {
     reader: BoundedStdout,
     diagnostics: DiagnosticBuffer,
     failures: FailureTracker,
-    stderr_task: tokio::task::JoinHandle<()>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GrokProc {
@@ -343,7 +343,7 @@ impl GrokProc {
             reader,
             diagnostics,
             failures,
-            stderr_task,
+            stderr_task: Some(stderr_task),
         })
     }
 
@@ -355,6 +355,9 @@ impl GrokProc {
     }
 
     pub(super) fn failure_observation(raw: &str) -> FailureObservation {
+        if raw.is_empty() {
+            return FailureObservation::inert();
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
             return FailureObservation::classified(
                 FailureDisposition::NonFailover,
@@ -370,10 +373,12 @@ impl GrokProc {
             {
                 FailureObservation::success()
             }
-            Some("end" | "provider.stdout_invalid_utf8") => FailureObservation::classified(
-                FailureDisposition::NonFailover,
-                "Grok terminal protocol was invalid",
-            ),
+            Some("end" | "provider.stdout_invalid_utf8" | "provider.stdout_bytes_truncated") => {
+                FailureObservation::classified(
+                    FailureDisposition::NonFailover,
+                    "Grok terminal protocol was invalid",
+                )
+            }
             Some("error") => FailureObservation::unknown_failure(
                 "Grok terminal error has no enabled availability classifier",
             ),
@@ -402,12 +407,45 @@ impl GrokProc {
         self.failures.observed_failure()
     }
 
+    pub(super) fn failure_tracker(&self) -> FailureTracker {
+        self.failures.clone()
+    }
+
+    pub(super) async fn finish_stderr_until(&mut self, deadline: tokio::time::Instant) -> bool {
+        let Some(mut task) = self.stderr_task.take() else {
+            return true;
+        };
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                false
+            }
+        }
+    }
+
     pub async fn next_raw_line(&mut self) -> Option<String> {
         let line = self.reader.next_line().await;
         if let Some(raw) = &line {
             self.failures.observe_stdout(raw);
         }
         line
+    }
+
+    pub async fn next_raw_line_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        let line = self.next_raw_line().await;
+        if line.as_ref().is_some_and(|line| line.len() > max_bytes) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Grok stdout record exceeded {max_bytes} bytes"),
+            ));
+        }
+        Ok(line)
     }
 
     pub fn pid(&self) -> Option<i32> {
@@ -441,7 +479,9 @@ impl GrokProc {
             terminal.push_back(CapturedOutput::Stdout(line));
         }
         let diagnostics = self.diagnostics.clone();
-        let _ = self.stderr_task.await;
+        if let Some(stderr_task) = self.stderr_task.take() {
+            let _ = stderr_task.await;
+        }
         let mut output = Vec::with_capacity(terminal.len() + usize::from(dropped > 0));
         if dropped > 0 {
             output.push(CapturedOutput::StdoutTruncated { dropped });
@@ -805,7 +845,7 @@ mod tests {
             reader,
             diagnostics,
             failures,
-            stderr_task,
+            stderr_task: Some(stderr_task),
         }
     }
 
@@ -859,6 +899,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(marker.contains("provider.stdout_bytes_truncated"));
+        assert_eq!(
+            proc.observed_pre_authoritative_failure()
+                .unwrap()
+                .disposition(),
+            FailureDisposition::NonFailover,
+            "discarding an overlong Grok record is a protocol failure, not retryable EOF"
+        );
         let tail = proc.next_raw_line().await.unwrap();
         assert!(tail.contains("tail"));
         let output = proc.kill_and_reap().await;
