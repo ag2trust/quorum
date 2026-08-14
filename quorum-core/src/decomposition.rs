@@ -1358,7 +1358,9 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
 /// does not infer relationships from titles, notes, labels, or a shared PR
 /// alone.  The original graph membership, explicit source-task provenance,
 /// daemon publication handoff, managed review, merge transition, and exact PR
-/// head all have to agree inside one `BEGIN IMMEDIATE` transaction.  A stale,
+/// head all have to agree inside one `BEGIN IMMEDIATE` transaction. A blocked
+/// graph still accepts a managed recovery delivery; blocking stops new
+/// execution authority without discarding recovery evidence. A stale,
 /// incomplete, or replayed request is a clean negative.
 pub fn adopt_recovery_delivery(
     conn: &mut Connection,
@@ -1385,7 +1387,7 @@ pub fn adopt_recovery_delivery(
              WHERE original.id=?1 AND original.id!=recovery.id
                AND original.status='failed'
                AND member.active=1 AND member.plan_revision=graph.accepted_plan_revision
-               AND graph.state='active' AND graph.active=1
+               AND graph.state IN ('active','blocked') AND graph.active=1
                AND source.status='decomposed'
                AND NOT EXISTS (
                     SELECT 1 FROM task_graph_members sibling
@@ -3973,6 +3975,49 @@ mod tests {
             .unwrap(),
             crate::review_followup_graph_eligibility::GraphAssessmentEligibility::WaitingInterpretation
         );
+    }
+
+    #[test]
+    fn exact_continuation_adoption_succeeds_on_blocked_graph_without_completing_it() {
+        let mut fixture = RecoveryFixture::new();
+        fixture
+            .conn
+            .execute(
+                "UPDATE task_decompositions SET state='blocked' WHERE id=?1",
+                [fixture.graph],
+            )
+            .unwrap();
+
+        assert!(fixture.adoption());
+
+        let state: (String, String, i64, String) = fixture
+            .conn
+            .query_row(
+                "SELECT original.status,graph.state,graph.active,source.status
+                 FROM tasks original
+                 JOIN task_graph_members member ON member.task_id=original.id
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks source ON source.id=graph.source_task_id
+                 WHERE original.id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("done".into(), "blocked".into(), 1, "decomposed".into())
+        );
+
+        let completed_events: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='task_graph_completed' AND subject='task#1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed_events, 0);
     }
 
     #[test]
