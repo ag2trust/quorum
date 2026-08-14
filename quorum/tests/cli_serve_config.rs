@@ -195,10 +195,21 @@ max_turn_wall_secs = 2700
         stderr_text.contains("model_profiles:            2"),
         "profile count missing from banner:\n{stderr_text}"
     );
-    // max_turn_wall_secs=2700 from file
+    // The deprecated config key maps to max_idle_secs and warns once.
     assert!(
-        stderr_text.contains("2700 (file)"),
-        "max_turn_wall_secs should show '2700 (file)':\n{stderr_text}"
+        stderr_text.contains("WARNING: max_turn_wall_secs is deprecated; it now sets the max_idle_secs idle timeout when max_idle_secs is unset"),
+        "deprecated max_turn_wall_secs warning missing:\n{stderr_text}"
+    );
+    assert_eq!(
+        stderr_text
+            .matches("WARNING: max_turn_wall_secs is deprecated")
+            .count(),
+        1,
+        "deprecated max_turn_wall_secs warning must be one line:\n{stderr_text}"
+    );
+    assert!(
+        stderr_text.contains("max_idle_secs:             2700 (file)"),
+        "deprecated max_turn_wall_secs should resolve as max_idle_secs:\n{stderr_text}"
     );
     // base_branch defaults
     assert!(

@@ -446,7 +446,7 @@ pub enum Command {
         /// Max cumulative USD cost per task.
         #[arg(long)]
         max_task_cost_usd: Option<f64>,
-        /// Legacy alias for max_idle_secs.
+        /// Deprecated alias for --max-idle-secs.
         #[arg(long)]
         max_turn_wall_secs: Option<u64>,
         /// Max seconds an active worker/reviewer may go without emitting an event.

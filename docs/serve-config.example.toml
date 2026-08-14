@@ -64,9 +64,6 @@ opus = 100
 opus = 100
 
 # ── cost ceilings ────────────────────────────────────────────────────
-# Legacy alias retained for existing configurations; it uses event-idle
-# semantics, not elapsed turn time.
-max_turn_wall_secs = 2700       # legacy alias for max_idle_secs
 max_idle_secs = 900              # 15 min without an event
 max_task_wall_secs = 14400      # 4h
 # max_turn_tokens  = 500000
