@@ -43,6 +43,9 @@ pub struct ProposedTask {
     pub key: String,
     pub title: String,
     pub observable_outcome: String,
+    /// Explicit child file contract. Writes and contextual references are
+    /// distinct so downstream enforcement need not infer intent from prose.
+    pub deliverables: quorum_core::decomposition::ChildDeliverables,
     pub acceptance_criteria: Vec<String>,
     pub source_constraints: Vec<String>,
     pub verification_expectations: Vec<String>,
@@ -78,9 +81,11 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          Preserve every source constraint. Do not create synthetic integration work, recursive \
          planning, or unrelated scope. Dependencies must be real delivery prerequisites and may \
          reference another task key or source:<dependency-id>. Return exactly one valid JSON \
-         object, with no markdown or commentary. The object must be exactly one of these closed \
+         object. For each task, declare every file-level deliverable in `deliverables`: use \
+         `write` only for requested changes and `read_only_reference` only for context. Use no \
+         markdown or commentary. The object must be exactly one of these closed \
          shapes: do not omit, rename, or add fields.\n\
-         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"observable_outcome\":\"<observable-outcome>\",\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
+         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"observable_outcome\":\"<observable-outcome>\",\"deliverables\":[{{\"kind\":\"write\",\"path\":\"<repo-relative-path>\"}},{{\"kind\":\"read_only_reference\",\"path\":\"<contextual-path>\"}}],\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
          BLOCKER={{\"outcome\":\"blocker\",\"category\":\"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>\",\"evidence\":[\"<evidence>\"],\"required_decision\":\"<decision>\",\"why_no_safe_split\":\"<reason>\"}}\n\
          `outcome` must be exactly `plan` or `blocker`; use PLAN only when it has 2-8 tasks. \
          PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
@@ -162,6 +167,15 @@ pub fn parse_response(text: &str) -> Result<PlannerResponse, PlannerParseError> 
     Ok(response)
 }
 
+/// Rehydrate the durable task-list form accepted by the planner coordinator.
+/// This shares `ProposedTask` with the live response parser, so a persisted
+/// deliverables manifest always has the same explicit write/reference shape
+/// before deterministic source validation runs.
+pub fn parse_accepted_proposal(text: &str) -> Result<Vec<ProposedTask>, PlannerParseError> {
+    serde_json::from_str(text)
+        .map_err(|error| PlannerParseError::Provider(format!("invalid accepted proposal: {error}")))
+}
+
 fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseError> {
     match response {
         PlannerResponse::Blocker {
@@ -195,6 +209,7 @@ fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseErro
                 }
                 validate_text("title", &task.title)?;
                 validate_text("observable outcome", &task.observable_outcome)?;
+                validate_deliverables(&task.deliverables)?;
                 validate_list("acceptance criteria", &task.acceptance_criteria, 1)?;
                 validate_list("source constraints", &task.source_constraints, 1)?;
                 validate_list(
@@ -221,6 +236,24 @@ fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseErro
             }
             reject_cycles(tasks)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_deliverables(
+    deliverables: &quorum_core::decomposition::ChildDeliverables,
+) -> Result<(), PlannerParseError> {
+    if deliverables.0.is_empty() || deliverables.0.len() > MAX_LIST_ITEMS {
+        return semantic(&format!(
+            "deliverables must contain 1..={MAX_LIST_ITEMS} items"
+        ));
+    }
+    for deliverable in &deliverables.0 {
+        let path = match deliverable {
+            quorum_core::decomposition::ChildDeliverable::Write { path }
+            | quorum_core::decomposition::ChildDeliverable::ReadOnlyReference { path } => path,
+        };
+        validate_text("deliverable path", path)?;
     }
     Ok(())
 }
@@ -522,6 +555,7 @@ mod tests {
             "key": key,
             "title": format!("Implement {key}"),
             "observable_outcome": format!("{key} works"),
+            "deliverables": [{"kind": "write", "path": format!("src/{key}.rs")}],
             "acceptance_criteria": ["behavior is covered"],
             "source_constraints": ["preserve atomicity"],
             "verification_expectations": ["focused tests pass"],
@@ -544,6 +578,66 @@ mod tests {
             parse_response(&blocker.to_string()),
             Ok(PlannerResponse::Blocker { .. })
         ));
+    }
+
+    #[test]
+    fn parses_writable_and_read_only_deliverables_without_conflating_them() {
+        let plan = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [
+                task("core", &[]),
+                {
+                    "key": "daemon",
+                    "title": "Implement daemon boundary",
+                    "observable_outcome": "daemon boundary works",
+                    "deliverables": [
+                        {"kind": "write", "path": "quorum/src/serve/mod.rs"},
+                        {"kind": "read_only_reference", "path": "quorum-core/src/decomposition.rs"}
+                    ],
+                    "acceptance_criteria": ["boundary is covered"],
+                    "source_constraints": ["preserve atomicity"],
+                    "verification_expectations": ["focused tests pass"],
+                    "prerequisites": ["core"]
+                }
+            ]
+        });
+        let PlannerResponse::Plan { tasks } = parse_response(&plan.to_string()).unwrap() else {
+            panic!("expected plan");
+        };
+        assert_eq!(
+            tasks[1].deliverables.writable_paths().collect::<Vec<_>>(),
+            ["quorum/src/serve/mod.rs"]
+        );
+        assert_eq!(
+            tasks[1].deliverables.reference_paths().collect::<Vec<_>>(),
+            ["quorum-core/src/decomposition.rs"]
+        );
+    }
+
+    #[test]
+    fn accepted_proposal_json_rehydrates_structured_deliverables() {
+        let accepted = serde_json::json!([{
+            "key": "core",
+            "title": "Implement core boundary",
+            "observable_outcome": "core boundary works",
+            "deliverables": [
+                {"kind": "write", "path": "quorum-core/src/decomposition.rs"},
+                {"kind": "read_only_reference", "path": "docs/decomposition.md"}
+            ],
+            "acceptance_criteria": ["boundary is covered"],
+            "source_constraints": ["preserve atomicity"],
+            "verification_expectations": ["focused tests pass"],
+            "prerequisites": []
+        }]);
+        let tasks = parse_accepted_proposal(&accepted.to_string()).unwrap();
+        assert_eq!(
+            tasks[0].deliverables.writable_paths().collect::<Vec<_>>(),
+            ["quorum-core/src/decomposition.rs"]
+        );
+        assert_eq!(
+            tasks[0].deliverables.reference_paths().collect::<Vec<_>>(),
+            ["docs/decomposition.md"]
+        );
     }
 
     #[test]
@@ -753,6 +847,11 @@ mod tests {
             key: "a".into(),
             title: "Implement a".into(),
             observable_outcome: "a works".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: "src/a.rs".into(),
+                },
+            ]),
             acceptance_criteria: vec!["covered".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["tests".into()],
@@ -766,6 +865,11 @@ mod tests {
             key: "integration".into(),
             title: "Integration task".into(),
             observable_outcome: "merge all siblings".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: "src/integration.rs".into(),
+                },
+            ]),
             acceptance_criteria: vec!["covered".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["tests".into()],
@@ -790,7 +894,7 @@ mod tests {
         let prompt = build_prompt(&source, &[]);
         assert!(prompt.contains("do not omit, rename, or add fields"));
         assert!(prompt.contains(
-            r#"PLAN={"outcome":"plan","tasks":[{"key":"<lowercase-ascii-key>","title":"<title>","observable_outcome":"<observable-outcome>","acceptance_criteria":["<criterion>"],"source_constraints":["<constraint>"],"verification_expectations":["<verification>"],"prerequisites":["<task-key-or-source:positive-id>"]}]}"#
+            r#"PLAN={"outcome":"plan","tasks":[{"key":"<lowercase-ascii-key>","title":"<title>","observable_outcome":"<observable-outcome>","deliverables":[{"kind":"write","path":"<repo-relative-path>"},{"kind":"read_only_reference","path":"<contextual-path>"}],"acceptance_criteria":["<criterion>"],"source_constraints":["<constraint>"],"verification_expectations":["<verification>"],"prerequisites":["<task-key-or-source:positive-id>"]}]}"#
         ));
         assert!(prompt.contains(
             r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#
