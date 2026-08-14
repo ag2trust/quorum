@@ -1680,9 +1680,13 @@ before provisioning. The replacement worktree starts from the accepted live head
 integrates the current base. On completion, the daemon pins the replacement `HEAD` before
 overwriting the intent's source, preserving the advanced PR/head authority; a crash before
 intent persistence can only leave a harmless newer pin that reconciliation restores to
-the still-durable source. Successful worker lifecycle transitions retire the intent in the
-same SQLite transaction, including the late-mailbox fold, and the reachability pin is
-removed afterward with an exact-SHA guard. Startup and bounded periodic reconciliation
+the still-durable source. Successful existing-PR worker lifecycle transitions guard that
+the persisted PR target still equals the intent's prior lease baseline or already equals
+the exact published source, then rotate that target to the exact source and retire the
+intent in the same SQLite transaction as the lifecycle event, including the late-mailbox
+fold. This makes the newly published source the next remediation round's lease baseline
+while preserving idempotent post-push crash replay. The reachability pin is removed
+afterward with an exact-SHA guard. Startup and bounded periodic reconciliation
 walk minimal task-id/SHA projections in fixed cursor batches, restore missing or
 mismatched intent pins, and exact-SHA-delete no-intent or terminal-task pins without
 scanning the full task history or Git ref namespace in one pass. A retry from `pr_created`

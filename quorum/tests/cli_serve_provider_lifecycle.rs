@@ -295,15 +295,52 @@ impl Case {
             None,
             None,
             None,
+            None,
+        )
+    }
+
+    fn start_with_role_config_and_checks(
+        default_provider: &str,
+        model: &str,
+        role_config: Option<&str>,
+        merge_checks_cmd: &str,
+    ) -> Self {
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            None,
+            role_config,
+            None,
+            None,
+            None,
+            Some(merge_checks_cmd),
         )
     }
 
     fn start_review_only(default_provider: &str, model: &str) -> Self {
-        Self::start_with_pr_assignment(default_provider, model, None, None, Some(1), None, None)
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            None,
+            None,
+            Some(1),
+            None,
+            None,
+            None,
+        )
     }
 
     fn start_continue(default_provider: &str, model: &str, pr: i64) -> Self {
-        Self::start_with_pr_assignment(default_provider, model, None, None, None, Some(pr), None)
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            None,
+            None,
+            None,
+            Some(pr),
+            None,
+            None,
+        )
     }
 
     fn start_parked_publication(remote_state: ParkedRemoteState) -> Self {
@@ -318,9 +355,11 @@ impl Case {
                 pr: 10,
                 remote_state,
             }),
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_with_pr_assignment(
         default_provider: &str,
         model: &str,
@@ -329,6 +368,7 @@ impl Case {
         review_pr: Option<i64>,
         continue_pr: Option<i64>,
         parked_publication: Option<ParkedPublicationFixture>,
+        merge_checks_cmd: Option<&str>,
     ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -678,6 +718,11 @@ elif [ "$cmd" = "pr list" ]; then
   fi
 elif [ "$cmd" = "pr view" ]; then
   pr="$3"
+  if [ -f "$QUORUM_TEST_GH_STATE/block-pr-view" ]; then
+    : > "$QUORUM_TEST_GH_STATE/started-pr-view"
+    while [ ! -f "$QUORUM_TEST_GH_STATE/release-pr-view" ]; do /bin/sleep 0.05; done
+    rm -f "$QUORUM_TEST_GH_STATE/block-pr-view"
+  fi
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" ls-remote origin "refs/heads/$branch" | awk '{print $1}')"
   if [ -z "$sha" ]; then
@@ -734,7 +779,7 @@ fi
                 "--merge-cmd",
                 "true",
                 "--merge-checks-cmd",
-                "echo ready",
+                merge_checks_cmd.unwrap_or("echo ready"),
                 "--merge-checks-timeout-secs",
                 "10",
                 "--merge-checks-poll-secs",
@@ -1361,8 +1406,8 @@ fn continuation_worker_without_pr_recovers_pre_fix_intent_with_spawn_lease() {
     assert_eq!(quorum_core::tasks::extract_pr_number(&task.refs), Some(10));
     let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
     assert_eq!(
-        target.head_sha, baseline_sha,
-        "publication must retain the spawn-time lease baseline"
+        target.head_sha, published_sha,
+        "continuation publication must rotate the spawn-time lease to the exact published head"
     );
     drop(conn);
 
@@ -2781,6 +2826,179 @@ fn strict_codex_restart_does_not_resume_interrupted_claude_reviewer() {
     assert_eq!(
         claims, 0,
         "incompatible reviewer recovery must not retain a claim"
+    );
+    drop(conn);
+    case.handle.stop_mut();
+}
+
+#[cfg(unix)]
+#[test]
+fn consecutive_reviewer_and_ci_rework_publications_rotate_pr_head_authority() {
+    let checks = tempfile::tempdir().unwrap();
+    let checks_count = checks.path().join("count");
+    let checks_cmd = format!(
+        "n=$(cat '{}' 2>/dev/null || echo 0); n=$((n+1)); printf '%s' \"$n\" > '{}'; \
+         if [ \"$n\" -eq 2 ]; then printf 'failed\\nci-test\\n'; else printf 'ready\\n'; fi",
+        checks_count.display(),
+        checks_count.display(),
+    );
+    let mut case = Case::start_with_role_config_and_checks(
+        "codex",
+        "gpt-5.6-terra",
+        Some(CHATGPT_ONLY_ROLE_CONFIG),
+        &checks_cmd,
+    );
+    case.handle.wait_for("spawning agent");
+    let worker = case.handle.agent_after("spawning agent ");
+    case.handle.wait_for("turn");
+    case.done(&worker, &["--pr", "1"]);
+
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for("result");
+    let (worktree, branch, initial_sha) = {
+        let conn = case.db();
+        let (worktree, branch): (String, String) = conn
+            .query_row(
+                "SELECT worktree,branch FROM journal WHERE task_id=1 AND role='worker'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let target = quorum_core::pr_targets::get(&conn, 1, 1).unwrap().unwrap();
+        (worktree, branch, target.head_sha)
+    };
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "first remediation",
+        ],
+    );
+    case.handle.wait_for("rework #1 started");
+    case.handle.wait_for("turn");
+
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "first reviewer rework",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let first_rework_sha = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &worktree, "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(first_rework_sha, initial_sha);
+    case.done(&worker, &["--pr", "1"]);
+    case.handle.wait_for("failed (ci-test) — entering rework");
+    {
+        let conn = case.db();
+        assert_eq!(
+            quorum_core::pr_targets::get(&conn, 1, 1)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            first_rework_sha,
+            "first rework settlement must rotate the durable PR head",
+        );
+    }
+    case.handle.wait_for("rework #2 (pre-review CI failure)");
+    case.handle.wait_for("turn");
+
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "second CI rework",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let second_rework_sha = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &worktree, "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(second_rework_sha, first_rework_sha);
+
+    // Publication persists its intent before resolving the authoritative live
+    // target. Block that existing provider boundary to inspect the exact
+    // second-round lease without relying on timing or worktree hook config.
+    let gh_state = case.gh_shim.path().join("state");
+    let pr_view_started = gh_state.join("started-pr-view");
+    std::fs::write(gh_state.join("block-pr-view"), "block").unwrap();
+
+    case.done(&worker, &["--pr", "1"]);
+    wait_until(
+        "second publication to resolve its live PR target",
+        Duration::from_secs(10),
+        || {
+            if pr_view_started.exists() {
+                WaitState::Ready(())
+            } else {
+                WaitState::Pending("PR target resolution has not started".into())
+            }
+        },
+    );
+    {
+        let conn = case.db();
+        let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs["daemon_publication"]["expected_remote_sha"], first_rework_sha,
+            "the second rework must lease the immediately preceding published head",
+        );
+        assert_eq!(refs["daemon_publication"]["local_sha"], second_rework_sha);
+        assert_eq!(refs["daemon_publication"]["branch"], branch);
+        assert_eq!(
+            quorum_core::pr_targets::get(&conn, 1, 1)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            first_rework_sha,
+            "authority must not rotate before the verified push settles",
+        );
+    }
+    std::fs::write(gh_state.join("release-pr-view"), "release").unwrap();
+    case.handle.wait_for("PR #1 ready for review");
+    case.handle.wait_for("checks ready");
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    assert_eq!(
+        quorum_core::pr_targets::get(&conn, 1, 1)
+            .unwrap()
+            .unwrap()
+            .head_sha,
+        second_rework_sha,
+        "the second publication must rotate authority again",
     );
     drop(conn);
     case.handle.stop_mut();
