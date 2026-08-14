@@ -2011,8 +2011,8 @@ worktree_base = "/tmp/wt"
         );
         assert!(b.contains("8 (file)"), "cap should show file source: {b}");
         assert!(
-            b.contains("2700 (file)"),
-            "wall secs should show file source: {b}"
+            !b.contains("max_turn_wall_secs"),
+            "deprecated turn-wall ceiling must not appear in the resolved banner: {b}"
         );
         assert!(
             b.contains("max_idle_secs:             900 (default)"),
