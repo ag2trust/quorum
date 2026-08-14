@@ -1830,9 +1830,8 @@ pub(crate) fn complete_graph_if_final_child(
 /// still has daemon-owned continuation authority.
 // The dependent terminal-park tasks wire this shared primitive into their
 // respective transactions after this task lands.
-#[allow(dead_code)]
 pub(crate) fn block_graph_if_child_failed(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     task_id: i64,
     reason: &str,
     now: i64,
@@ -1842,7 +1841,7 @@ pub(crate) fn block_graph_if_child_failed(
             "embedded NUL in graph child failure reason".into(),
         ));
     }
-    let graph: Option<(i64, Option<String>)> = tx
+    let graph: Option<(i64, Option<String>)> = conn
         .query_row(
             "SELECT d.id,child.refs
              FROM task_graph_members m
@@ -1881,7 +1880,7 @@ pub(crate) fn block_graph_if_child_failed(
     }
 
     let summary = format!("generated child task #{task_id} failed: {reason}");
-    let graph_changed = tx.execute(
+    let graph_changed = conn.execute(
         "UPDATE task_decompositions
          SET state='blocked',hold_code='generated-child-failed',hold_summary=?2,updated_at=?3
          WHERE id=?1 AND state='active' AND active=1",
@@ -1891,14 +1890,14 @@ pub(crate) fn block_graph_if_child_failed(
         return Ok(false);
     }
     crate::events::emit(
-        tx,
+        conn,
         "task_graph_blocked",
         &format!("task#{task_id}"),
         &summary,
         now,
     )?;
     crate::tasks::alert_owner_of_park(
-        tx,
+        conn,
         task_id,
         &format!("task graph blocked after generated child failed: {reason}"),
         now,
