@@ -398,6 +398,12 @@ impl DiagnosticBuffer {
         let mut state = self.state.lock().expect("diagnostic buffer poisoned");
         state.dropped_bytes = state.dropped_bytes.saturating_add(count);
     }
+
+    fn note_read_error(&self, error: &std::io::Error) {
+        self.failures.note_incomplete_evidence(format!(
+            "provider stderr evidence could not be read: {error}"
+        ));
+    }
 }
 
 pub async fn capture_diagnostics<R>(mut reader: R, diagnostics: DiagnosticBuffer)
@@ -409,7 +415,11 @@ where
     let mut line_dropped = 0usize;
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(error) => {
+                diagnostics.note_read_error(&error);
+                break;
+            }
             Ok(read) => {
                 for &byte in &chunk[..read] {
                     if byte == b'\n' {
@@ -833,11 +843,27 @@ impl RunnerProc {
         matches!(self, Self::Grok(proc) if proc.terminal_evidence_pending())
     }
 
+    pub fn grok_terminal_candidate_pending(&self) -> bool {
+        matches!(self, Self::Grok(proc) if proc.terminal_candidate_pending())
+    }
+
     #[cfg(test)]
     pub fn inject_grok_stdout_read_error_after_lines(&mut self, lines: usize) {
         if let Self::Grok(proc) = self {
             proc.inject_stdout_read_error_after_lines(lines);
         }
+    }
+
+    #[cfg(test)]
+    pub async fn inject_grok_stderr_read_error(&mut self) {
+        if let Self::Grok(proc) = self {
+            proc.inject_stderr_read_error().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn grok_stderr_evidence_pending(&self) -> bool {
+        matches!(self, Self::Grok(proc) if proc.stderr_evidence_pending())
     }
 
     /// Read one line with a hard boundary on bytes accumulated before a line

@@ -12,8 +12,14 @@ use super::runner::{
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::pin::Pin;
 use std::process::Stdio;
+#[cfg(test)]
+use std::task::{Context, Poll};
 use tokio::io::AsyncReadExt;
+#[cfg(test)]
+use tokio::io::ReadBuf;
 use tokio::process::{Child, ChildStdout, Command};
 
 pub const SUPPORTED_MODEL: &str = "grok-4.5";
@@ -29,6 +35,22 @@ const RESTRICTED_MAX_TURNS: u32 = 8;
 const STDOUT_LINE_BYTES: usize = 1024 * 1024;
 const TERMINAL_STDOUT_LINES: usize = 256;
 const MAX_SESSION_ID_BYTES: usize = 1024;
+
+#[cfg(test)]
+struct InjectedStderrReadError;
+
+#[cfg(test)]
+impl tokio::io::AsyncRead for InjectedStderrReadError {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Err(std::io::Error::other(
+            "injected Grok stderr read error",
+        )))
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct GrokAdapterConfig<'a> {
@@ -591,6 +613,10 @@ impl GrokProc {
         self.pending_terminal.is_some() && !self.terminal_rejected && self.stdout_complete
     }
 
+    pub(super) fn terminal_candidate_pending(&self) -> bool {
+        self.pending_terminal.is_some() && !self.terminal_rejected
+    }
+
     pub(super) fn normalize_stream_line(raw: &str) -> Vec<AgentEvent> {
         if terminal_session_id(raw).is_some() {
             Vec::new()
@@ -602,6 +628,25 @@ impl GrokProc {
     #[cfg(test)]
     pub(super) fn inject_stdout_read_error_after_lines(&mut self, lines: usize) {
         self.reader.inject_read_error_after_lines(lines);
+    }
+
+    #[cfg(test)]
+    pub(super) async fn inject_stderr_read_error(&mut self) {
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        let diagnostics = self.diagnostics.clone();
+        self.stderr_task = Some(tokio::spawn(async move {
+            capture_diagnostics(InjectedStderrReadError, diagnostics).await
+        }));
+    }
+
+    #[cfg(test)]
+    pub(super) fn stderr_evidence_pending(&self) -> bool {
+        self.stderr_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
     }
 
     pub async fn next_raw_line_bounded(

@@ -2973,6 +2973,15 @@ impl SlotState {
         self.proc.try_wait()
     }
 
+    fn has_pending_grok_terminal_handoff(&self) -> bool {
+        self.draining
+            && self.continuation_id.is_none()
+            && matches!(
+                &self.proc,
+                SlotProcess::Running(proc) if proc.grok_terminal_candidate_pending()
+            )
+    }
+
     fn classify_pre_authoritative_exit(
         &self,
         status: std::process::ExitStatus,
@@ -3042,6 +3051,25 @@ impl SlotState {
     async fn kill_and_reap(self) -> Vec<runner::CapturedOutput> {
         self.proc.kill_and_reap().await
     }
+}
+
+#[derive(Debug)]
+enum WorkerExitObservation {
+    Running,
+    DeferredTerminalEvidence(std::process::ExitStatus),
+    Exited(std::process::ExitStatus),
+}
+
+fn observe_worker_exit_for_lifecycle(
+    worker: &mut SlotState,
+) -> std::io::Result<WorkerExitObservation> {
+    Ok(match worker.try_wait()? {
+        Some(status) if worker.has_pending_grok_terminal_handoff() => {
+            WorkerExitObservation::DeferredTerminalEvidence(status)
+        }
+        Some(status) => WorkerExitObservation::Exited(status),
+        None => WorkerExitObservation::Running,
+    })
 }
 
 fn worker_done_event(rework_count: u32, pr: i64) -> Event {
@@ -9973,15 +10001,21 @@ async fn tick(
     // its stdout open. `try_wait` is the authoritative signal.
     let mut dead_workers = Vec::new();
     for (i, w) in workers.iter_mut().enumerate() {
-        match w.try_wait() {
-            Ok(Some(status)) => {
+        match observe_worker_exit_for_lifecycle(w) {
+            Ok(WorkerExitObservation::Exited(status)) => {
                 log(&format!(
                     "worker {} process exited (task #{}, status={:?}) — classifying lifecycle outcome",
                     w.agent_name, w.task_id, status
                 ));
                 dead_workers.push((i, status));
             }
-            Ok(None) => {}
+            Ok(WorkerExitObservation::DeferredTerminalEvidence(status)) => {
+                log(&format!(
+                    "worker {} process exited (task #{}, status={:?}) — retaining pending Grok terminal evidence",
+                    w.agent_name, w.task_id, status
+                ));
+            }
+            Ok(WorkerExitObservation::Running) => {}
             Err(e) => {
                 log(&format!("worker {} try_wait error: {e}", w.agent_name));
             }
@@ -17885,6 +17919,20 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn wait_for_worker_exit_observation(slot: &mut SlotState) -> WorkerExitObservation {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match observe_worker_exit_for_lifecycle(slot).unwrap() {
+                    WorkerExitObservation::Running => tokio::task::yield_now().await,
+                    observation => return observation,
+                }
+            }
+        })
+        .await
+        .expect("worker did not reach an exited Phase 4b observation")
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn internal_grok_worker_persists_exact_terminal_session_before_completion() {
         let dir = tempfile::tempdir().unwrap();
@@ -18094,6 +18142,147 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn phase4b_defers_grok_terminal_at_raw_drain_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = r#"{"type":"end","sessionId":"budget-edge-session"}"#;
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "i=0; while [ \"$i\" -lt 63 ]; do printf '{\"type\":\"text\",\"data\":\"line-%s\"}\\n' \"$i\"; i=$((i+1)); done; printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"budget-edge-session\"}'",
+        )
+        .await;
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.has_pending_grok_terminal_handoff());
+        let stream_path = slot
+            .session_log
+            .as_ref()
+            .unwrap()
+            .dir()
+            .join("stream.jsonl");
+        let stream = std::fs::read_to_string(&stream_path).unwrap();
+        assert_eq!(stream.lines().count(), MAX_STREAM_LINES_PER_TICK);
+        assert_eq!(stream.lines().last(), Some(terminal));
+        assert!(matches!(
+            wait_for_worker_exit_observation(&mut slot).await,
+            WorkerExitObservation::DeferredTerminalEvidence(status) if status.success()
+        ));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| serde_json::json!({}));
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
+        drop(conn);
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(slot.continuation_id.as_deref(), Some("budget-edge-session"));
+        assert!(!slot.draining);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "budget-edge-session"
+        );
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase4b_defers_exited_grok_worker_while_stderr_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let stderr_gate = dir.path().join("stderr-gate");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&stderr_gate)
+            .status()
+            .unwrap()
+            .success());
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            &format!(
+                "(read release < '{}') >&2 & printf '%s\\n' '{{\"type\":\"end\",\"sessionId\":\"pending-stderr-session\"}}'; exit 0",
+                stderr_gate.display()
+            ),
+        )
+        .await;
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.has_pending_grok_terminal_handoff());
+        assert!(slot
+            .live_process_mut()
+            .unwrap()
+            .grok_stderr_evidence_pending());
+        assert!(matches!(
+            wait_for_worker_exit_observation(&mut slot).await,
+            WorkerExitObservation::DeferredTerminalEvidence(status) if status.success()
+        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| serde_json::json!({}));
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+        drop(conn);
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stderr_gate)
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while slot.continuation_id.is_none() {
+                drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Grok stderr evidence did not finish after its fixture gate opened");
+        assert_eq!(
+            slot.continuation_id.as_deref(),
+            Some("pending-stderr-session")
+        );
+        assert!(!slot.draining);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "pending-stderr-session"
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn internal_grok_worker_read_error_after_terminal_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let terminal = r#"{"type":"end","sessionId":"read-error-session"}"#;
@@ -18127,6 +18316,61 @@ mod tests {
             .unwrap_or_else(|| serde_json::json!({}));
         assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
         assert!(refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none());
+        let stream_path = slot
+            .session_log
+            .as_ref()
+            .unwrap()
+            .dir()
+            .join("stream.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(stream_path).unwrap(),
+            format!("{terminal}\n")
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_stderr_read_error_after_terminal_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = r#"{"type":"end","sessionId":"stderr-read-error-session"}"#;
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"stderr-read-error-session\"}'",
+        )
+        .await;
+        slot.live_process_mut()
+            .unwrap()
+            .inject_grok_stderr_read_error()
+            .await;
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.draining);
+        assert!(!slot.has_pending_grok_terminal_handoff());
+        let failure = slot.observed_pre_authoritative_failure().unwrap();
+        assert_eq!(
+            failure.disposition(),
+            runner::FailureDisposition::Unclassified
+        );
+        assert!(failure
+            .to_string()
+            .contains("stderr evidence could not be read"));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| serde_json::json!({}));
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
+        assert!(refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none());
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
         let stream_path = slot
             .session_log
             .as_ref()
