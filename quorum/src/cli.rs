@@ -449,7 +449,7 @@ pub enum Command {
         /// Deprecated alias for --max-idle-secs.
         #[arg(long)]
         max_turn_wall_secs: Option<u64>,
-        /// Max seconds a worker/reviewer may sit idle between turns.
+        /// Max seconds an active worker/reviewer may go without emitting an event.
         #[arg(long)]
         max_idle_secs: Option<u64>,
         /// Max wall-clock seconds per task (across all turns).

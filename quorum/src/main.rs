@@ -1249,14 +1249,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r_max_task_cost.value,
             )?;
             let r_max_turn_wall = resolve_opt(max_turn_wall_secs, file_cfg.max_turn_wall_secs);
-            let mut r_max_idle = resolve_opt(max_idle_secs, file_cfg.max_idle_secs);
+            let r_max_idle = serve_config::resolve_idle_limit(
+                max_idle_secs,
+                max_turn_wall_secs,
+                file_cfg.max_idle_secs,
+                file_cfg.max_turn_wall_secs,
+            );
             if r_max_turn_wall.value.is_some() {
                 eprintln!(
                     "quorum serve: WARNING: max_turn_wall_secs is deprecated; it now sets the max_idle_secs idle timeout when max_idle_secs is unset"
                 );
-            }
-            if r_max_idle.value.is_none() && r_max_turn_wall.value.is_some() {
-                r_max_idle = r_max_turn_wall;
             }
             let r_max_task_wall = resolve_opt(max_task_wall_secs, file_cfg.max_task_wall_secs);
             let r_idle_timeout = resolve_opt(idle_timeout_secs, file_cfg.idle_timeout_secs);

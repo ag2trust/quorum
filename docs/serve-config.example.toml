@@ -64,7 +64,7 @@ opus = 100
 opus = 100
 
 # ── cost ceilings ────────────────────────────────────────────────────
-max_idle_secs = 900              # 15 min between turns
+max_idle_secs = 900              # 15 min without an event
 max_task_wall_secs = 14400      # 4h
 # max_turn_tokens  = 500000
 # max_task_tokens  = 2000000
