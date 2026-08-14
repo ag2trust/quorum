@@ -61,6 +61,15 @@ pub struct CiRemediationIntent {
     pub attempts: i64,
 }
 
+/// Exact daemon-verified publication authority settled with a worker event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedWorkerPublication {
+    pub pr: i64,
+    pub source_sha: String,
+    pub head_ref: String,
+    pub expected_remote_sha: Option<String>,
+}
+
 pub fn ci_remediation_intent(refs: Option<&str>) -> Result<Option<CiRemediationIntent>> {
     let Some(raw) = refs else {
         return Ok(None);
@@ -1334,18 +1343,101 @@ pub fn apply_published_worker_event(
     agent: &str,
     id: i64,
     event: &Event,
+    publication: &PublishedWorkerPublication,
     now: i64,
 ) -> Result<TransitionResult> {
     let tx = begin_immediate(conn)?;
     apply_event_tx(tx, agent, id, event, now, |tx| {
-        tx.execute(
-            "UPDATE tasks
-             SET refs=json_remove(COALESCE(refs, '{}'), '$.daemon_publication')
-             WHERE id=?1",
-            params![id],
-        )?;
-        Ok(())
+        settle_published_worker_tx(tx, id, publication, now)
     })
+}
+
+fn settle_published_worker_tx(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    publication: &PublishedWorkerPublication,
+    now: i64,
+) -> Result<()> {
+    if publication.pr <= 0
+        || publication.source_sha.is_empty()
+        || publication.head_ref.is_empty()
+        || publication
+            .expected_remote_sha
+            .as_deref()
+            .is_some_and(str::is_empty)
+    {
+        return Err(QuorumError::BadInput(
+            "published worker settlement requires a valid PR, source SHA, head ref, and lease baseline"
+                .into(),
+        ));
+    }
+
+    let recorded = tx
+        .query_row(
+            "SELECT json_extract(refs, '$.daemon_publication.pr'),
+                    json_extract(refs, '$.daemon_publication.local_sha'),
+                    json_extract(refs, '$.daemon_publication.branch'),
+                    json_extract(refs, '$.daemon_publication.expected_remote_sha'),
+                    json_extract(refs, '$.daemon_publication.stage')
+             FROM tasks WHERE id=?1",
+            params![task_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let expected_intent = (
+        Some(publication.pr),
+        Some(publication.source_sha.clone()),
+        Some(publication.head_ref.clone()),
+        publication.expected_remote_sha.clone(),
+        Some("verified".to_string()),
+    );
+    if recorded.as_ref() != Some(&expected_intent) {
+        return Err(QuorumError::Io(format!(
+            "published worker settlement for task #{task_id} no longer matches its verified publication intent"
+        )));
+    }
+
+    if let Some(prior_sha) = publication.expected_remote_sha.as_deref() {
+        let rotated = tx.execute(
+            "UPDATE pr_targets
+             SET head_sha=?4, resolved_at=?6
+             WHERE task_id=?1 AND pr_number=?2 AND head_ref=?3 AND is_fork=0
+               AND (head_sha=?5 OR head_sha=?4)",
+            params![
+                task_id,
+                publication.pr,
+                publication.head_ref,
+                publication.source_sha,
+                prior_sha,
+                now,
+            ],
+        )?;
+        if rotated != 1 {
+            return Err(QuorumError::Io(format!(
+                "published PR #{} target authority changed before settlement: expected {} or already-published {} on {}",
+                publication.pr,
+                prior_sha,
+                publication.source_sha,
+                publication.head_ref,
+            )));
+        }
+    }
+
+    tx.execute(
+        "UPDATE tasks
+         SET refs=json_remove(COALESCE(refs, '{}'), '$.daemon_publication')
+         WHERE id=?1",
+        params![task_id],
+    )?;
+    Ok(())
 }
 
 /// Atomically enter rework for failed pre-review CI and persist the exact
@@ -1514,6 +1606,7 @@ pub fn recover_late_worker_completion(
     agent: &str,
     task_id: i64,
     pr: i64,
+    publication: Option<&PublishedWorkerPublication>,
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
@@ -1549,12 +1642,16 @@ pub fn recover_late_worker_completion(
         Event::SignaledDone { pr: pr.to_string() }
     };
     apply_event_tx(tx, agent, task_id, &event, now, |tx| {
-        tx.execute(
-            "UPDATE tasks
-             SET refs=json_remove(COALESCE(refs, '{}'), '$.daemon_publication')
-             WHERE id=?1",
-            params![task_id],
-        )?;
+        if let Some(publication) = publication {
+            settle_published_worker_tx(tx, task_id, publication, now)?;
+        } else {
+            tx.execute(
+                "UPDATE tasks
+                 SET refs=json_remove(COALESCE(refs, '{}'), '$.daemon_publication')
+                 WHERE id=?1",
+                params![task_id],
+            )?;
+        }
         consume_late_mailbox(tx, mailbox_id, now)
     })
     .map(|_| true)
@@ -3960,10 +4057,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(
-            recover_late_worker_completion(&mut c, mailbox_id, "worker", task_id, 42, 1001)
-                .unwrap()
-        );
+        assert!(recover_late_worker_completion(
+            &mut c, mailbox_id, "worker", task_id, 42, None, 1001
+        )
+        .unwrap());
         assert_eq!(get(&c, task_id).unwrap().unwrap().status, "in-review");
         assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 0);
         let events: i64 = c
@@ -4030,6 +4127,7 @@ mod tests {
             "replacement",
             task_id,
             42,
+            None,
             1004
         )
         .unwrap());

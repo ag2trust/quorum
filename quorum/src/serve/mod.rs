@@ -948,10 +948,15 @@ struct PublicationIntent {
     expected_remote_sha: Option<String>,
 }
 
-#[derive(Debug)]
-struct PublishedCompletion {
-    pr: i64,
-    source_sha: String,
+type PublishedCompletion = tasks::PublishedWorkerPublication;
+
+fn published_completion(intent: PublicationIntent, pr: i64) -> PublishedCompletion {
+    PublishedCompletion {
+        pr,
+        source_sha: intent.local_sha,
+        head_ref: intent.branch,
+        expected_remote_sha: intent.expected_remote_sha,
+    }
 }
 
 async fn persist_publication_intent(
@@ -1338,20 +1343,14 @@ async fn publish_worker_completion(
         if validate_pr_created_retry_target(&intent, &target, &config.base_branch)? {
             intent.stage = "verified".into();
             persist_publication_intent(&config.db_path, task_id, &intent).await?;
-            return Ok(PublishedCompletion {
-                pr,
-                source_sha: intent.local_sha,
-            });
+            return Ok(published_completion(intent, pr));
         }
         let Some(expected_remote_sha) =
             existing_pr_lease_baseline(&intent, &target, &config.base_branch)?
         else {
             intent.stage = "verified".into();
             persist_publication_intent(&config.db_path, task_id, &intent).await?;
-            return Ok(PublishedCompletion {
-                pr,
-                source_sha: intent.local_sha,
-            });
+            return Ok(published_completion(intent, pr));
         };
         wt_mgr
             .push_to_pr_head(
@@ -1365,10 +1364,7 @@ async fn publish_worker_completion(
         intent.stage = "verified".into();
         intent.branch = target.head_ref;
         persist_publication_intent(&config.db_path, task_id, &intent).await?;
-        return Ok(PublishedCompletion {
-            pr,
-            source_sha: intent.local_sha,
-        });
+        return Ok(published_completion(intent, pr));
     }
 
     let pushed_sha = wt_mgr
@@ -1399,10 +1395,7 @@ async fn publish_worker_completion(
     validate_initial_pr_target(&target, branch, &pushed_sha, &config.base_branch)?;
     intent.stage = "verified".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
-    Ok(PublishedCompletion {
-        pr,
-        source_sha: intent.local_sha,
-    })
+    Ok(published_completion(intent, pr))
 }
 
 fn log(msg: &str) {
@@ -3075,8 +3068,11 @@ async fn recover_late_worker_done_atomic(
     mailbox_id: i64,
     row: &mailbox::MailboxRow,
     published_pr: Option<i64>,
+    publication: Option<PublishedCompletion>,
 ) -> Result<bool> {
-    let (Some(task_id), Some(pr)) = (row.task_id, published_pr.or(row.pr)) else {
+    let publication_pr = publication.as_ref().map(|publication| publication.pr);
+    let (Some(task_id), Some(pr)) = (row.task_id, publication_pr.or(published_pr).or(row.pr))
+    else {
         return Ok(false);
     };
     if row.kind != mailbox::MailboxKind::Done || row.verdict.is_some() {
@@ -3092,6 +3088,7 @@ async fn recover_late_worker_done_atomic(
             &agent,
             task_id,
             pr,
+            publication.as_ref(),
             now_unix(),
         )
     })
@@ -3110,7 +3107,7 @@ async fn recover_late_worker_done(db_path: &Path, row: &mailbox::MailboxRow) -> 
     })
     .await
     .map_err(|error| QuorumError::Io(format!("late worker test mailbox join: {error}")))??;
-    recover_late_worker_done_atomic(db_path, mailbox_id, &row, row.pr).await
+    recover_late_worker_done_atomic(db_path, mailbox_id, &row, row.pr, None).await
 }
 
 #[cfg(test)]
@@ -3128,7 +3125,7 @@ async fn fold_late_worker_done_after_publication(
     })
     .await
     .map_err(|error| QuorumError::Io(format!("late worker test mailbox join: {error}")))??;
-    recover_late_worker_done_atomic(db_path, mailbox_id, &row, Some(published_pr)).await
+    recover_late_worker_done_atomic(db_path, mailbox_id, &row, Some(published_pr), None).await
 }
 
 async fn recover_late_worker_done_with_publication(
@@ -3189,9 +3186,14 @@ async fn recover_late_worker_done_with_publication(
                 return Ok(false);
             }
         };
-    let folded =
-        recover_late_worker_done_atomic(&config.db_path, mailbox_id, row, Some(published.pr))
-            .await?;
+    let folded = recover_late_worker_done_atomic(
+        &config.db_path,
+        mailbox_id,
+        row,
+        Some(published.pr),
+        Some(published.clone()),
+    )
+    .await?;
     if folded {
         if let Err(error) = wt_mgr
             .retire_publication_source(&config.repo_dir, task_id, &published.source_sha)
@@ -9348,6 +9350,9 @@ async fn tick(
                     &workers[wi].agent_name,
                     workers[wi].task_id,
                     &event,
+                    published
+                        .as_ref()
+                        .expect("successful publication result must remain available"),
                 )
                 .await;
 
@@ -14274,7 +14279,7 @@ async fn fire_event_result(
     task_id: i64,
     event: &Event,
 ) -> std::result::Result<tasks::TransitionResult, String> {
-    fire_event_result_inner(db_path, agent, task_id, event, false).await
+    fire_event_result_inner(db_path, agent, task_id, event, None).await
 }
 
 async fn fire_published_event_result(
@@ -14282,8 +14287,9 @@ async fn fire_published_event_result(
     agent: &str,
     task_id: i64,
     event: &Event,
+    publication: &PublishedCompletion,
 ) -> std::result::Result<tasks::TransitionResult, String> {
-    fire_event_result_inner(db_path, agent, task_id, event, true).await
+    fire_event_result_inner(db_path, agent, task_id, event, Some(publication.clone())).await
 }
 
 async fn fire_event_result_inner(
@@ -14291,7 +14297,7 @@ async fn fire_event_result_inner(
     agent: &str,
     task_id: i64,
     event: &Event,
-    published: bool,
+    publication: Option<PublishedCompletion>,
 ) -> std::result::Result<tasks::TransitionResult, String> {
     let p = db_path.to_path_buf();
     let a = agent.to_string();
@@ -14300,8 +14306,8 @@ async fn fire_event_result_inner(
     let result = tokio::task::spawn_blocking(move || -> Result<tasks::TransitionResult> {
         let mut conn = quorum_core::db::open(&p)?;
         let now = now_unix();
-        if published {
-            tasks::apply_published_worker_event(&mut conn, &a, task_id, &ev, now)
+        if let Some(publication) = publication {
+            tasks::apply_published_worker_event(&mut conn, &a, task_id, &ev, &publication, now)
         } else {
             tasks::apply_event(&mut conn, &a, task_id, &ev, now)
         }
@@ -20257,7 +20263,7 @@ mod tests {
             stage: "verified".into(),
             expected_remote_sha: Some("sha-x".into()),
         };
-        let conn = quorum_core::db::open(&db_path).unwrap();
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
         tasks::set_publication_intent(
             &conn,
             id,
@@ -20265,14 +20271,17 @@ mod tests {
             now_unix(),
         )
         .unwrap();
+        pr_targets::upsert(&mut conn, id, 482, "daemon/publisher-t1", "sha-x", false).unwrap();
         drop(conn);
 
         let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let publication = published_completion(intent, 482);
         tasks::apply_published_worker_event(
             &mut conn,
             "Publisher",
             id,
             &Event::SignaledDone { pr: "482".into() },
+            &publication,
             now_unix(),
         )
         .unwrap();
@@ -20286,6 +20295,106 @@ mod tests {
             "committed lifecycle must not leave stale SHA A for later rework"
         );
         assert_eq!(task.status, "in-review");
+        assert_eq!(
+            pr_targets::get(&conn, id, 482).unwrap().unwrap().head_sha,
+            "sha-a"
+        );
+    }
+
+    #[test]
+    fn published_lifecycle_converges_when_target_already_equals_exact_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("published-replay.db");
+        let id = working_task(&db_path, "Publisher", None);
+        let intent = PublicationIntent {
+            branch: "daemon/publisher-t1".into(),
+            local_sha: "sha-a".into(),
+            pr: Some(482),
+            stage: "verified".into(),
+            expected_remote_sha: Some("sha-x".into()),
+        };
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::set_publication_intent(
+            &conn,
+            id,
+            &serde_json::to_string(&intent).unwrap(),
+            now_unix(),
+        )
+        .unwrap();
+        pr_targets::upsert(&mut conn, id, 482, "daemon/publisher-t1", "sha-a", false).unwrap();
+        let publication = published_completion(intent, 482);
+
+        tasks::apply_published_worker_event(
+            &mut conn,
+            "Publisher",
+            id,
+            &Event::SignaledDone { pr: "482".into() },
+            &publication,
+            now_unix(),
+        )
+        .unwrap();
+
+        let task = tasks::get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get("daemon_publication").is_none());
+        assert_eq!(
+            pr_targets::get(&conn, id, 482).unwrap().unwrap().head_sha,
+            "sha-a"
+        );
+    }
+
+    #[test]
+    fn published_lifecycle_rejects_unrelated_durable_head_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("published-authority-mismatch.db");
+        let id = working_task(&db_path, "Publisher", None);
+        let intent = PublicationIntent {
+            branch: "daemon/publisher-t1".into(),
+            local_sha: "sha-a".into(),
+            pr: Some(482),
+            stage: "verified".into(),
+            expected_remote_sha: Some("sha-x".into()),
+        };
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::set_publication_intent(
+            &conn,
+            id,
+            &serde_json::to_string(&intent).unwrap(),
+            now_unix(),
+        )
+        .unwrap();
+        pr_targets::upsert(
+            &mut conn,
+            id,
+            482,
+            "daemon/publisher-t1",
+            "unrelated-z",
+            false,
+        )
+        .unwrap();
+        let publication = published_completion(intent, 482);
+
+        let error = tasks::apply_published_worker_event(
+            &mut conn,
+            "Publisher",
+            id,
+            &Event::SignaledDone { pr: "482".into() },
+            &publication,
+            now_unix(),
+        )
+        .err()
+        .expect("an unrelated durable head must fail settlement");
+        assert!(error.to_string().contains("target authority changed"));
+
+        let task = tasks::get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_publication"]["local_sha"], "sha-a");
+        assert_eq!(
+            pr_targets::get(&conn, id, 482).unwrap().unwrap().head_sha,
+            "unrelated-z"
+        );
     }
 
     // ── reviewer PR target acceptance ────────────────────────────────────
