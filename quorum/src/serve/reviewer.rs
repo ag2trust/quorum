@@ -21,6 +21,7 @@
 //!   post findings as inline and summary comments; the daemon posts formal
 //!   approval or request-changes from the reviewer verdict as the merge account.
 
+use super::review_cycle_context::ReviewCycleContext;
 use super::runner::AgentKind;
 use std::path::{Path, PathBuf};
 
@@ -588,7 +589,16 @@ pub fn build_rereview_turn(
     worker_agent: &str,
     effort: &str,
 ) -> String {
-    build_rereview_turn_with_context(reviewer_name, pr, worker_agent, effort, None)
+    build_rereview_turn_with_context(
+        reviewer_name,
+        pr,
+        worker_agent,
+        effort,
+        None,
+        // This test-only compatibility helper builds a re-review, whose first
+        // possible persisted value is one completed transition.
+        ReviewCycleContext::from_persisted_rework_round(1),
+    )
 }
 
 pub fn build_rereview_turn_with_context(
@@ -597,6 +607,7 @@ pub fn build_rereview_turn_with_context(
     worker_agent: &str,
     effort: &str,
     graph_context: Option<&str>,
+    review_cycle: ReviewCycleContext,
 ) -> String {
     super::agent::user_turn(&format!(
         "The author ({worker}) pushed rework for PR #{pr}. Re-review the updated diff.\n\n\
@@ -608,6 +619,7 @@ pub fn build_rereview_turn_with_context(
          Verify prior fixes by reading the prior review thread on the PR. Then re-audit the \
          full current diff and relevant sibling paths; do not narrowly inspect only the last \
          remediation commit.\n\n\
+         {review_cycle_contract}\n\
          {complete_review_contract}\n\
          {finding_contract}\n\
          The PR is the source of truth for this review:\n\
@@ -642,6 +654,7 @@ pub fn build_rereview_turn_with_context(
         finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
         graph_contract = graph_review_contract(reviewer_name, pr, graph_context),
+        review_cycle_contract = review_cycle.prompt_contract(),
     ))
 }
 
@@ -1007,6 +1020,7 @@ mod tests {
                     "Worker-1",
                     "high",
                     Some(context),
+                    ReviewCycleContext::from_persisted_rework_round(1),
                 ),
                 true,
             ),
@@ -1146,6 +1160,7 @@ mod tests {
                     "Worker-1",
                     "high",
                     Some(context),
+                    ReviewCycleContext::from_persisted_rework_round(1),
                 ),
             ),
         ];
@@ -1445,6 +1460,35 @@ mod tests {
             parsed["message"]["role"], "user",
             "claude CLI exits 1 on turns without message.role"
         );
+    }
+
+    #[test]
+    fn rereview_cycle_context_is_provider_neutral_and_excludes_initial_review() {
+        let spec = ReviewerSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Rev-1".into(),
+        };
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            assert!(
+                !build_review_prompt_for_kind(kind, &spec, "high").contains("Review-cycle context"),
+                "the initial review is not a rework round"
+            );
+        }
+
+        let context = ReviewCycleContext::from_persisted_rework_round(i64::from(
+            quorum_core::lifecycle::REWORK_CAP,
+        ));
+        let claude_turn =
+            build_rereview_turn_with_context("Rev-1", 42, "Worker-1", "high", None, context);
+        let codex_turn =
+            build_rereview_turn_with_context("Rev-1", 42, "Worker-1", "high", None, context);
+        assert_eq!(
+            claude_turn, codex_turn,
+            "the runner receives one neutral turn"
+        );
+        assert!(claude_turn.contains("final review opportunity"));
+        assert!(!claude_turn.contains("review round"));
     }
 
     #[test]
@@ -2033,7 +2077,14 @@ mod tests {
                 "high",
                 Some(context),
             ),
-            build_rereview_turn_with_context("R1", 42, "W", "high", Some(context)),
+            build_rereview_turn_with_context(
+                "R1",
+                42,
+                "W",
+                "high",
+                Some(context),
+                ReviewCycleContext::from_persisted_rework_round(1),
+            ),
         ];
         for prompt in prompts {
             assert!(prompt.contains("parser only"));
@@ -2070,7 +2121,14 @@ mod tests {
         }
         assert_eq!(
             build_rereview_turn("R1", 42, "W", "high"),
-            build_rereview_turn_with_context("R1", 42, "W", "high", None)
+            build_rereview_turn_with_context(
+                "R1",
+                42,
+                "W",
+                "high",
+                None,
+                ReviewCycleContext::from_persisted_rework_round(1),
+            )
         );
     }
 }
