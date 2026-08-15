@@ -3,26 +3,25 @@
 
 Runs the preflight test gates (fmt, clippy, test compile, test execute) and,
 for each test executable, records compile/no-run and execution durations by
-reading ``cargo --message-format=json`` rather than parsing human prose.
+combining ``cargo --message-format=json`` (for the *identity* of each test
+binary) with a ``RUSTC_WRAPPER`` shim (for the *exact per-rustc-invocation
+compile interval*, preserving Cargo's normal parallel build).
 
-Writes both a machine-readable JSON artifact (``timing.json``) and a
-human-readable text summary (``summary.txt``) to a deterministic local path
-under ``target/preflight-timing/`` suitable for CI artifact upload. The
-summary includes a bounded top-N list of the slowest test binaries from the
-single run.
+Cargo's stable ``compiler-artifact`` JSON message identifies a test binary and
+its executable path but carries neither a start time nor a duration; naive
+inter-artifact-arrival gaps misattribute concurrent and shared work. This
+script therefore points ``RUSTC_WRAPPER`` at itself (dispatching via the
+``TIMING_RUSTC_WRAPPER_ACTIVE`` env var) so it fork/execs rustc while wall-
+clocking each invocation, then correlates each entry to a compiler-artifact
+message by ``(--crate-name, --test)``. Execution time is measured by invoking
+each test executable directly and wall-clocking its run.
 
-Per-binary compile/no-run attribution is derived from the wall-clock gap
-between successive ``compiler-artifact`` messages in the stream. Cargo compiles
-units in parallel, so this gap approximates emission cadence rather than
-exclusive CPU time for a single unit; the identity of each test binary,
-however, comes verbatim from the structured message. Per-binary execution time
-is measured by invoking each test executable directly (bypassing cargo) and
-wall-clocking its run.
-
-The extra work versus a plain preflight is: (a) parsing the JSON stream
-already emitted by ``--message-format=json`` (cheap, O(#artifact messages));
-and (b) invoking each test binary in its own process, which cargo already
-does by default, so overhead is limited to shell/fork setup per binary.
+Outputs (under ``target/preflight-timing/`` by default):
+  timing.json                  — machine-readable artifact
+  summary.txt                  — human-readable summary + bounded top-N
+  cargo-test-no-run.jsonl      — raw cargo JSON stream
+  cargo-test-no-run.stderr     — cargo stderr
+  rustc-invocations.jsonl      — per-rustc-invocation timing log
 
 Usage:
     scripts/preflight/timing.sh [--top-n N] [--out DIR] [--test-threads N]
@@ -47,9 +46,145 @@ from pathlib import Path
 
 CARGO_FEATURES = ["--all-features", "--features", "quorum-core/test-support"]
 
+WRAPPER_ACTIVE_ENV = "TIMING_RUSTC_WRAPPER_ACTIVE"
+WRAPPER_LOG_ENV = "TIMING_RUSTC_LOG"
+
 
 def now() -> float:
     return time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# RUSTC_WRAPPER mode
+# ---------------------------------------------------------------------------
+
+
+def _parse_rustc_argv(argv: list[str]) -> tuple[str | None, bool, list[str]]:
+    """Extract ``--crate-name``, whether ``--test`` is present, and
+    ``--crate-type`` values from a rustc argv."""
+    crate_name: str | None = None
+    is_test = False
+    crate_types: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--crate-name" and i + 1 < len(argv):
+            crate_name = argv[i + 1]
+            i += 2
+            continue
+        if a == "--test":
+            is_test = True
+        elif a == "--crate-type" and i + 1 < len(argv):
+            crate_types.append(argv[i + 1])
+            i += 2
+            continue
+        elif a.startswith("--crate-type="):
+            crate_types.append(a.split("=", 1)[1])
+        i += 1
+    return crate_name, is_test, crate_types
+
+
+def _rustc_wrapper() -> int:
+    """Fork/exec rustc, wall-clock the invocation, append a JSON line to the
+    log named by ``TIMING_RUSTC_LOG``. Single ``f.write()`` on an <PIPE_BUF
+    payload is atomic on POSIX, so concurrent wrappers may safely share the
+    log file."""
+    argv = sys.argv[1:]
+    if not argv:
+        return 2
+    crate_name, is_test, crate_types = _parse_rustc_argv(argv)
+
+    start = time.monotonic()
+    try:
+        pid = os.fork()
+    except OSError:
+        rc = subprocess.run(argv).returncode
+        end = time.monotonic()
+    else:
+        if pid == 0:
+            try:
+                os.execvp(argv[0], argv)
+            except OSError:
+                os._exit(127)
+        _, status = os.waitpid(pid, 0)
+        end = time.monotonic()
+        rc = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+
+    log = os.environ.get(WRAPPER_LOG_ENV)
+    if log and crate_name:
+        entry = {
+            "crate_name": crate_name,
+            "is_test": is_test,
+            "crate_types": crate_types,
+            "duration_secs": round(end - start, 6),
+            "end_monotonic": round(end, 6),
+            "exit_code": rc,
+        }
+        try:
+            with open(log, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            pass
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# Correlation
+# ---------------------------------------------------------------------------
+
+
+def correlate_compile_times(
+    rustc_log: Path, binaries: list[dict]
+) -> tuple[int, int]:
+    """Attach exact per-invocation compile times from the RUSTC_WRAPPER log
+    onto ``binaries`` in place. Match by ``(--crate-name, --test == true)``,
+    which is 1:1 with a test executable in cargo's build graph. Returns
+    ``(matched_count, log_entry_count)``.
+    """
+    by_name: dict[str, float] = {}
+    entries = 0
+    if rustc_log.exists():
+        with rustc_log.open() as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    e = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                entries += 1
+                if not e.get("is_test"):
+                    continue
+                name = e.get("crate_name")
+                if not name:
+                    continue
+                # Same crate_name + is_test may recur across profiles; sum so
+                # the reported figure covers every rustc invocation that fed
+                # the executable.
+                by_name[name] = by_name.get(name, 0.0) + float(
+                    e.get("duration_secs") or 0.0
+                )
+    matched = 0
+    for b in binaries:
+        name = b.get("target_name")
+        if name and name in by_name:
+            b["compile_no_run_secs"] = round(by_name[name], 3)
+            b["compile_no_run_source"] = "rustc_wrapper"
+            matched += 1
+        elif b.get("fresh"):
+            # Cargo skipped rustc for this artifact — no compile cost this run.
+            b["compile_no_run_secs"] = 0.0
+            b["compile_no_run_source"] = "cached_fresh"
+        else:
+            b["compile_no_run_secs"] = None
+            b["compile_no_run_source"] = "unmatched"
+    return matched, entries
+
+
+# ---------------------------------------------------------------------------
+# Cargo drivers
+# ---------------------------------------------------------------------------
 
 
 def run_gate(argv: list[str]) -> tuple[float, int]:
@@ -59,14 +194,21 @@ def run_gate(argv: list[str]) -> tuple[float, int]:
 
 
 def compile_tests(
-    compile_log: Path, stderr_log: Path
-) -> tuple[float, int, list[dict]]:
-    """Run ``cargo test --no-run --message-format=json`` and derive per-binary
-    compile/no-run durations from the emission gap between successive
-    ``compiler-artifact`` messages. Also mirrors the raw stream to
-    ``compile_log`` with a monotonic timestamp per line so the run is
-    reproducible offline.
+    compile_log: Path,
+    stderr_log: Path,
+    rustc_log: Path,
+    wrapper_path: str,
+) -> tuple[float, int, list[dict], int, int]:
+    """Run ``cargo test --no-run --message-format=json`` with the RUSTC_WRAPPER
+    active. Enumerate test binaries from ``compiler-artifact`` messages, then
+    correlate exact compile intervals from the wrapper log.
     """
+    rustc_log.write_text("")
+    env = os.environ.copy()
+    env["RUSTC_WRAPPER"] = wrapper_path
+    env[WRAPPER_ACTIVE_ENV] = "1"
+    env[WRAPPER_LOG_ENV] = str(rustc_log)
+
     argv = [
         "cargo", "test", "--no-run", "--message-format=json",
         "--workspace", *CARGO_FEATURES,
@@ -75,13 +217,15 @@ def compile_tests(
     t0 = now()
     with compile_log.open("w") as clog, stderr_log.open("w") as elog:
         proc = subprocess.Popen(
-            argv, stdout=subprocess.PIPE, stderr=elog, text=True
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=elog,
+            text=True,
+            env=env,
         )
         assert proc.stdout is not None
-        prev_ts = t0
         for line in proc.stdout:
-            ts = now()
-            clog.write(f"{ts:.6f} {line}")
+            clog.write(line)
             stripped = line.strip()
             if not stripped:
                 continue
@@ -101,12 +245,11 @@ def compile_tests(
                 "target_name": target.get("name"),
                 "target_kinds": list(target.get("kind") or []),
                 "executable": executable,
-                "compile_no_run_secs": round(ts - prev_ts, 3),
-                "artifact_emitted_at_secs": round(ts - t0, 3),
+                "fresh": bool(msg.get("fresh")),
             })
-            prev_ts = ts
         proc.wait()
-    return now() - t0, proc.returncode, binaries
+    matched, log_entries = correlate_compile_times(rustc_log, binaries)
+    return now() - t0, proc.returncode, binaries, matched, log_entries
 
 
 def run_test_binary(exe: str, threads: int) -> tuple[float, int]:
@@ -116,20 +259,23 @@ def run_test_binary(exe: str, threads: int) -> tuple[float, int]:
     return now() - t0, proc.returncode
 
 
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+
 def slowest(binaries: list[dict], top_n: int) -> list[dict]:
-    return sorted(
-        binaries,
-        key=lambda b: (
+    def key(b: dict) -> float:
+        return (
             (b.get("execute_secs") or 0.0)
             + (b.get("compile_no_run_secs") or 0.0)
-        ),
-        reverse=True,
-    )[:top_n]
+        )
+
+    return sorted(binaries, key=key, reverse=True)[:top_n]
 
 
 def emit_artifact(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    # Round-trip parse guards against silent corruption from future edits.
     json.loads(path.read_text())
 
 
@@ -137,6 +283,14 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
     lines: list[str] = []
     lines.append("=== preflight timing summary ===")
     lines.append(f"timestamp_utc: {data['timestamp_utc']}")
+    wrapper = data.get("rustc_wrapper") or {}
+    if wrapper:
+        lines.append(
+            "rustc_wrapper: matched "
+            f"{wrapper.get('matched', 0)} of "
+            f"{len(data.get('test_binaries') or [])} binaries "
+            f"from {wrapper.get('log_entries', 0)} rustc invocations"
+        )
     lines.append("")
     lines.append("gates:")
     for g in data["gates"]:
@@ -154,25 +308,31 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
     )
     for b in top:
         name = b.get("target_name") or Path(b["executable"]).name
-        c = b.get("compile_no_run_secs") or 0.0
+        c = b.get("compile_no_run_secs")
         e = b.get("execute_secs") or 0.0
-        lines.append(
-            f"  {name[:48]:<48} {c:>14.2f}s {e:>10.2f}s"
-        )
+        c_str = f"{c:>14.2f}s" if c is not None else f"{'n/a':>15}"
+        lines.append(f"  {name[:48]:<48} {c_str} {e:>10.2f}s")
     lines.append("")
     path.write_text("\n".join(lines) + "\n")
 
 
-def collect(args: argparse.Namespace) -> int:
+# ---------------------------------------------------------------------------
+# Main collect
+# ---------------------------------------------------------------------------
+
+
+def collect(args: argparse.Namespace, wrapper_path: str) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     artifact = out / "timing.json"
     summary = out / "summary.txt"
     compile_log = out / "cargo-test-no-run.jsonl"
     stderr_log = out / "cargo-test-no-run.stderr"
+    rustc_log = out / "rustc-invocations.jsonl"
 
     gates: list[dict] = []
     binaries: list[dict] = []
+    wrapper_stats: dict = {}
     status = 0
 
     def add_gate(name: str, duration: float, rc: int) -> None:
@@ -192,9 +352,8 @@ def collect(args: argparse.Namespace) -> int:
 
     if not args.skip_clippy and status == 0:
         print(
-            "=== timing 2/4: cargo clippy --all-targets "
-            "--all-features --features quorum-core/test-support "
-            "-- -D warnings ===",
+            "=== timing 2/4: cargo clippy --all-targets --all-features "
+            "--features quorum-core/test-support -- -D warnings ===",
             flush=True,
         )
         dur, rc = run_gate([
@@ -205,12 +364,19 @@ def collect(args: argparse.Namespace) -> int:
 
     if status == 0:
         print(
-            "=== timing 3/4: cargo test --no-run "
-            "--message-format=json --workspace ===",
+            "=== timing 3/4: cargo test --no-run --message-format=json "
+            "--workspace (RUSTC_WRAPPER active) ===",
             flush=True,
         )
-        dur, rc, binaries = compile_tests(compile_log, stderr_log)
+        dur, rc, binaries, matched, log_entries = compile_tests(
+            compile_log, stderr_log, rustc_log, wrapper_path
+        )
         add_gate("cargo_test_no_run", dur, rc)
+        wrapper_stats = {
+            "matched": matched,
+            "log_entries": log_entries,
+            "log_path": str(rustc_log),
+        }
 
     if status == 0:
         print(
@@ -229,13 +395,14 @@ def collect(args: argparse.Namespace) -> int:
         add_gate("test_execute", now() - t0, exec_rc)
 
     data = {
-        "version": 1,
+        "version": 2,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "top_n": args.top_n,
         "test_threads": args.test_threads,
         "gates": gates,
         "test_binaries": binaries,
         "top_n_slowest": slowest(binaries, args.top_n),
+        "rustc_wrapper": wrapper_stats,
     }
     emit_artifact(artifact, data)
     emit_summary(summary, data, args.top_n)
@@ -245,10 +412,104 @@ def collect(args: argparse.Namespace) -> int:
     return status
 
 
+# ---------------------------------------------------------------------------
+# Self-test
+# ---------------------------------------------------------------------------
+
+
 def self_test() -> int:
-    """Synthetic-fixture check — no cargo required. Confirms the artifact is
-    valid JSON and the top-N list in the summary is bounded by N (or by the
-    binary count, whichever is smaller)."""
+    """Fixture checks — no cargo required. Cover:
+      1. Artifact is valid JSON and top-N in the summary is bounded.
+      2. Rustc-argv parser extracts crate_name/--test/--crate-type correctly.
+      3. Correlation attaches exact per-binary durations from a synthetic
+         wrapper log and leaves unmatched binaries as null.
+    """
+    # ---- (2) rustc-argv parser ----
+    name, is_test, kinds = _parse_rustc_argv([
+        "/usr/bin/rustc", "--crate-name", "quorum_core", "--edition=2021",
+        "src/lib.rs", "--crate-type", "lib", "--test",
+        "--crate-type=proc-macro",
+    ])
+    assert name == "quorum_core", name
+    assert is_test is True
+    assert kinds == ["lib", "proc-macro"], kinds
+
+    name, is_test, _ = _parse_rustc_argv([
+        "/usr/bin/rustc", "--crate-name=serde",
+        "--crate-name", "serde_json",
+    ])
+    # Only the space-separated form is used; the ``=`` form isn't emitted by
+    # cargo for --crate-name, but if both appear the last space-separated one
+    # wins deterministically.
+    assert name == "serde_json", name
+    assert is_test is False
+
+    # ---- (3) correlation fixture ----
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        log = out / "rustc.jsonl"
+        log.write_text("\n".join([
+            json.dumps({
+                "crate_name": "quorum_core", "is_test": True,
+                "duration_secs": 10.0,
+            }),
+            json.dumps({
+                "crate_name": "quorum", "is_test": True,
+                "duration_secs": 24.0,
+            }),
+            # Non-test build of same crate — must be ignored.
+            json.dumps({
+                "crate_name": "quorum_core", "is_test": False,
+                "duration_secs": 5.0,
+            }),
+            json.dumps({
+                "crate_name": "cli_serve_config", "is_test": True,
+                "duration_secs": 27.0,
+            }),
+            # Duplicate test invocation — must sum.
+            json.dumps({
+                "crate_name": "cli_serve_config", "is_test": True,
+                "duration_secs": 0.5,
+            }),
+            "not-json",
+            "",
+        ]) + "\n")
+        binaries = [
+            {"target_name": "quorum_core", "executable": "/x",
+             "target_kinds": ["lib"], "fresh": False},
+            {"target_name": "quorum", "executable": "/y",
+             "target_kinds": ["bin"], "fresh": False},
+            {"target_name": "cli_serve_config", "executable": "/z",
+             "target_kinds": ["test"], "fresh": False},
+            {"target_name": "unmatched_bin", "executable": "/w",
+             "target_kinds": ["test"], "fresh": False},
+            {"target_name": "cached_bin", "executable": "/v",
+             "target_kinds": ["test"], "fresh": True},
+        ]
+        matched, entries = correlate_compile_times(log, binaries)
+        assert matched == 3, matched
+        assert entries == 5, entries
+        assert binaries[0]["compile_no_run_secs"] == 10.0
+        assert binaries[0]["compile_no_run_source"] == "rustc_wrapper"
+        assert binaries[1]["compile_no_run_secs"] == 24.0
+        assert binaries[2]["compile_no_run_secs"] == 27.5, \
+            binaries[2]["compile_no_run_secs"]
+        assert binaries[3]["compile_no_run_secs"] is None
+        assert binaries[3]["compile_no_run_source"] == "unmatched"
+        assert binaries[4]["compile_no_run_secs"] == 0.0
+        assert binaries[4]["compile_no_run_source"] == "cached_fresh"
+
+        # Missing log file → all unmatched, no crash.
+        binaries2 = [
+            {"target_name": "x", "executable": "/x", "target_kinds": []}
+        ]
+        matched2, entries2 = correlate_compile_times(
+            out / "no-such-log.jsonl", binaries2
+        )
+        assert matched2 == 0 and entries2 == 0
+        assert binaries2[0]["compile_no_run_secs"] is None
+
+    # ---- (1) artifact + bounded top-N ----
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         binaries = [
@@ -258,34 +519,33 @@ def self_test() -> int:
                 "target_kinds": ["lib"],
                 "executable": f"/tmp/bin_{i:02d}",
                 "compile_no_run_secs": float(i),
-                "artifact_emitted_at_secs": float(i),
+                "compile_no_run_source": "rustc_wrapper",
                 "execute_secs": float(20 - i),
                 "execute_exit_code": 0,
             }
             for i in range(20)
         ]
         data = {
-            "version": 1,
+            "version": 2,
             "timestamp_utc": "2026-08-14T00:00:00Z",
             "top_n": 5,
             "test_threads": 4,
             "gates": [
                 {"name": "cargo_fmt", "duration_secs": 1.2, "exit_code": 0},
-                {
-                    "name": "cargo_clippy",
-                    "duration_secs": 45.6,
-                    "exit_code": 0,
-                },
+                {"name": "cargo_clippy", "duration_secs": 45.6,
+                 "exit_code": 0},
             ],
             "test_binaries": binaries,
             "top_n_slowest": slowest(binaries, 5),
+            "rustc_wrapper": {"matched": 20, "log_entries": 200,
+                              "log_path": str(out / "rustc.jsonl")},
         }
         artifact = out / "timing.json"
         summary = out / "summary.txt"
         emit_artifact(artifact, data)
 
         parsed = json.loads(artifact.read_text())
-        assert parsed["version"] == 1, parsed
+        assert parsed["version"] == 2
         assert len(parsed["test_binaries"]) == 20
         assert len(parsed["top_n_slowest"]) == 5
 
@@ -294,7 +554,7 @@ def self_test() -> int:
             ln for ln in summary.read_text().splitlines()
             if ln.startswith("  bin_")
         ]
-        assert len(rows) == 5, f"expected 5 rows, got {len(rows)}: {rows}"
+        assert len(rows) == 5, f"expected 5 rows, got {len(rows)}"
 
         emit_summary(summary, data, top_n=1000)
         rows = [
@@ -308,13 +568,21 @@ def self_test() -> int:
             ln for ln in summary.read_text().splitlines()
             if ln.startswith("  bin_")
         ]
-        assert rows == [], f"expected 0 rows for empty binaries, got {rows}"
+        assert rows == []
 
-        print("self-test OK")
+    print("self-test OK")
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+
+
 def main() -> int:
+    if os.environ.get(WRAPPER_ACTIVE_ENV) == "1":
+        return _rustc_wrapper()
+
     p = argparse.ArgumentParser(
         description=(
             "Structured per-gate and per-test-binary timing collector."
@@ -341,7 +609,9 @@ def main() -> int:
 
     if args.self_test_mode:
         return self_test()
-    return collect(args)
+
+    wrapper_path = os.path.abspath(__file__)
+    return collect(args, wrapper_path)
 
 
 if __name__ == "__main__":
