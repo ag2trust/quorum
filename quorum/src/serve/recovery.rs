@@ -1150,7 +1150,9 @@ mod tests {
                 "silent-git",
                 "exec sleep 3600",
                 "timed out",
-                std::time::Duration::from_millis(300),
+                // Leave enough scheduling headroom for the shim to record its
+                // PID even while the full suite is running four test binaries.
+                std::time::Duration::from_secs(2),
             ),
             (
                 "noisy-git",
