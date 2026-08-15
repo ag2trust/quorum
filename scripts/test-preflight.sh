@@ -19,7 +19,10 @@ cat >"$BIN/cargo" <<'EOF'
 if [ -n "${PREFLIGHT_CARGO_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$PREFLIGHT_CARGO_LOG"
 fi
-[ "${PREFLIGHT_CARGO_FAIL:-0}" = 0 ] || {
+# Modes: 0 = pass, 1 = fail every cargo invocation (fmt path),
+# compile = pass fmt/clippy but fail `cargo test` compile/no-run with the same
+# exit status Cargo returns for a real compile error.
+[ "${PREFLIGHT_CARGO_FAIL:-0}" != 1 ] || {
   printf 'forced cargo diagnostic\n' >&2
   exit 1
 }
