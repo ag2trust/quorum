@@ -70,9 +70,12 @@ const COMPLETE_REVIEW_CONTRACT: &str = "\
 Complete the planned review before submitting a verdict. Coverage, not the number of \
 findings, determines when the review is complete: audit the full current diff, surrounding \
 code, and relevant sibling and negative paths. A complete review may have zero findings.\n\
-For cross-cutting changes, derive a small affected-path matrix/checklist from the PR scope \
-(for example, producers × success/error/shutdown) and audit every applicable cell together. \
-Do not turn this into an exhaustive proof over unrelated code or invent speculative findings.\n\
+Before reaching a verdict, derive a bounded, task-specific affected-path model from the \
+embedded managed-task contract when provided and the mechanisms changed by the PR. Choose the \
+useful representation — a short matrix, checklist, state/event map, or equivalent — and use it \
+to review applicable related lifecycle and compatibility paths together, including whether the \
+proposed remedy closes each relevant path. This is not a mandatory format or an exhaustive proof \
+over unrelated code; do not invent speculative findings.\n\
 On re-review, a new blocker in unchanged behavior must explain why it was not reasonably \
 discoverable in the prior complete audit.\n\
 Before submitting, publish one complete PR review summary for this reviewed SHA, with inline \
@@ -950,22 +953,58 @@ mod tests {
             r1_reviewer: "Reviewer-1".into(),
             r2_name: "Reviewer-2".into(),
         };
+        let context =
+            r#"{"task_id":7,"assigned_requirements":"parser only","direct_prerequisites":[]}"#;
         let prompts = [
-            ("Claude R1", build_review_prompt(&r1_spec, "high"), false),
+            (
+                "Claude R1",
+                build_review_prompt_for_kind_with_context(
+                    AgentKind::Claude,
+                    &r1_spec,
+                    "high",
+                    Some(context),
+                ),
+                false,
+            ),
             (
                 "Codex R1",
-                build_review_prompt_for_kind(AgentKind::Codex, &r1_spec, "high"),
+                build_review_prompt_for_kind_with_context(
+                    AgentKind::Codex,
+                    &r1_spec,
+                    "high",
+                    Some(context),
+                ),
                 false,
             ),
-            ("Claude R2", build_r2_review_prompt(&r2_spec, "high"), false),
+            (
+                "Claude R2",
+                build_r2_review_prompt_for_kind_with_context(
+                    AgentKind::Claude,
+                    &r2_spec,
+                    "high",
+                    Some(context),
+                ),
+                false,
+            ),
             (
                 "Codex R2",
-                build_r2_review_prompt_for_kind(AgentKind::Codex, &r2_spec, "high"),
+                build_r2_review_prompt_for_kind_with_context(
+                    AgentKind::Codex,
+                    &r2_spec,
+                    "high",
+                    Some(context),
+                ),
                 false,
             ),
             (
-                "re-review",
-                build_rereview_turn("Reviewer-1", 42, "Worker-1", "high"),
+                "sticky re-review (Claude/Codex)",
+                build_rereview_turn_with_context(
+                    "Reviewer-1",
+                    42,
+                    "Worker-1",
+                    "high",
+                    Some(context),
+                ),
                 true,
             ),
         ];
@@ -981,8 +1020,27 @@ mod tests {
                 "{name} must define completion by coverage without a finding quota"
             );
             assert!(
-                prompt.contains("affected-path matrix/checklist"),
-                "{name} must require cross-cutting path coverage"
+                prompt.contains("bounded, task-specific affected-path model")
+                    && prompt.contains("embedded managed-task contract when provided")
+                    && prompt.contains("mechanisms changed by the PR"),
+                "{name} must derive task-specific coverage from the managed-task contract and changed mechanisms"
+            );
+            assert!(
+                prompt.contains("short matrix, checklist, state/event map, or equivalent")
+                    && prompt.contains("not a mandatory format")
+                    && prompt.contains("complete review may have zero findings"),
+                "{name} must preserve reviewer discretion and zero-findings validity"
+            );
+            assert!(
+                prompt.contains("lifecycle and compatibility paths together")
+                    && prompt.contains("proposed remedy closes each relevant path"),
+                "{name} must review related paths together and assess whole-path remedies"
+            );
+            assert!(
+                !prompt.contains("producers × success/error/shutdown")
+                    && !prompt.contains("durable-state checklist")
+                    && !prompt.contains("mandatory visible table"),
+                "{name} must not prescribe a hard-coded affected-path checklist or table"
             );
             assert!(
                 prompt.contains("complete BLOCKING and FOLLOW-UP set"),

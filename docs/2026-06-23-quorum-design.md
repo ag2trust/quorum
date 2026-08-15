@@ -687,14 +687,19 @@ conversation. Concretely:
   submitting a verdict: discovering one blocker does not end exploration. They
   post the complete discovered blocking and advisory set to one PR review
   summary (with inline comments where a specific file/line applies), and the
-  `--blocking` count covers that complete blocker set. For cross-cutting work,
-  they derive a small affected-path matrix from the PR scope to check relevant
-  sibling and negative paths together; this does not require speculative
-  findings or exhaustive proof over unrelated code. Re-reviews verify prior
-  fixes and re-audit the full current diff and relevant sibling paths, rather
-  than only the most recent remediation commit. A new blocker in unchanged
-  behavior must explain why it was not reasonably discoverable in the prior
-  complete audit. Reviewers respond to author pushback on the PR itself.
+  `--blocking` count covers that complete blocker set. Before a verdict,
+  reviewers derive a bounded, task-specific affected-path model from the
+  embedded managed-task contract when provided and the mechanisms changed by
+  the PR. They choose a useful representation — a short matrix, checklist,
+  state/event map, or equivalent — to review applicable related lifecycle and
+  compatibility paths together and determine whether the proposed remedy
+  closes each relevant path. This does not prescribe a fixed format, require
+  speculative findings, or demand exhaustive proof over unrelated code.
+  Re-reviews verify prior fixes and re-audit the full current diff and relevant
+  sibling paths, rather than only the most recent remediation commit. A new
+  blocker in unchanged behavior must explain why it was not reasonably
+  discoverable in the prior complete audit. Reviewers respond to author
+  pushback on the PR itself.
   Encouraged GitHub operations are normal comments, inline comments, and review
   summary comments. Formal APPROVE and REQUEST_CHANGES reviews remain daemon-owned
   because managed reviewers use the same GitHub account as PR authors.
