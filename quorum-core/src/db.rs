@@ -773,6 +773,16 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                    AND depends_on IS NOT NULL
                    AND json_valid(refs)
                    AND json_extract(refs, '$.daemon_parked')=1
+                   -- Same rule as `upgrade_stale_recoverable_parks` in
+                   -- sweep.rs: classifier-policy parks own their own
+                   -- lifecycle (reason 'classifier declined', retry stays
+                   -- in `failed` as a reclassification request) and must
+                   -- not be relabeled as unsatisfiable-dep parks.
+                   -- Diverging here would make behavior depend on upgrade
+                   -- timing.
+                   AND COALESCE(
+                       json_extract(refs, '$.classifier_policy_parked'), 0
+                   ) != 1
                    AND COALESCE(
                        json_extract(refs, '$.daemon_parked_unsatisfiable'), 0
                    ) != 1
@@ -3948,7 +3958,8 @@ mod tests {
                          (3,'legacy park cancelled','failed','owner',1,1),
                          (4,'legacy park failed only','failed','owner',1,1),
                          (5,'legacy park no deps','failed','owner',1,1),
-                         (6,'open with cancelled dep','open','owner',1,1);
+                         (6,'open with cancelled dep','open','owner',1,1),
+                         (7,'v49 policy park cancelled dep','failed','owner',1,1);
                  UPDATE tasks SET depends_on='[1,2]',
                      refs='{\"daemon_parked\": true,
                              \"daemon_parked_reason\": \"dependency #1 is terminal-not-done\",
@@ -3964,6 +3975,12 @@ mod tests {
                              \"daemon_resume_status\": \"open\"}'
                      WHERE id=5;
                  UPDATE tasks SET depends_on='[1]' WHERE id=6;
+                 UPDATE tasks SET depends_on='[1]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"classifier declined\",
+                             \"daemon_resume_status\": \"open\",
+                             \"classifier_policy_parked\": true}'
+                     WHERE id=7;
                  PRAGMA user_version=49;",
             )
             .unwrap();
@@ -4012,6 +4029,17 @@ mod tests {
             .query_row("SELECT refs FROM tasks WHERE id=6", [], |r| r.get(0))
             .unwrap();
         assert!(refs6.is_none());
+
+        // Classifier-policy parks with a cancelled dep are NOT relabeled:
+        // the migration and the runtime convergence pass must apply one
+        // coherent rule, and policy parks own their own lifecycle.
+        let refs7: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=7", [], |r| r.get(0))
+            .unwrap();
+        let v7: serde_json::Value = serde_json::from_str(&refs7).unwrap();
+        assert!(v7.get("daemon_parked_unsatisfiable").is_none());
+        assert_eq!(v7["daemon_parked_reason"], "classifier declined");
+        assert_eq!(v7["classifier_policy_parked"], true);
 
         // Idempotent: re-opening from the migrated DB does not double-write.
         drop(conn);
