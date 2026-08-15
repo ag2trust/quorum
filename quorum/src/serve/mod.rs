@@ -25078,14 +25078,17 @@ mod tests {
         let capture = tokio::spawn(async move {
             repository_head_sha_with_options(&repo_path, &git, Duration::from_secs(5), 4096).await
         });
+        let mut pid = None;
         for _ in 0..1_500 {
-            if pid_path.exists() {
+            pid = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|value| value.parse().ok());
+            if pid.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(pid_path.exists(), "frozen-base child did not start");
-        let pid: i32 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        let pid: i32 = pid.expect("frozen-base child did not publish its pid");
         capture.abort();
         let _ = capture.await;
         for _ in 0..500 {
