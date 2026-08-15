@@ -1322,7 +1322,7 @@ fn cancel_graph_in_tx(
     intents: &[CleanupIntent],
     now: i64,
 ) -> Result<()> {
-    cancel_unfinished_members(tx, graph_id, now)?;
+    let cancelled_members = cancel_unfinished_members(tx, graph_id, now)?;
     for intent in intents {
         validate_cleanup_intent(intent)?;
         let member: bool = tx.query_row(
@@ -1358,11 +1358,23 @@ fn cancel_graph_in_tx(
          WHERE id=?1",
         params![graph_id, now],
     )?;
-    tx.execute(
+    let source_cancelled = tx.execute(
         "UPDATE tasks SET status='cancelled',assignee=NULL,updated_at=?2
          WHERE id=?1 AND status!='done'",
         params![source_task_id, now],
     )?;
+    // Task #473: every real cancellation writer must refresh the durable
+    // park refs of dependents so status inference and the durable reason
+    // stay coherent. `tasks::update` covers the ordinary path; graph and
+    // member cancellations reach `cancelled` via this path with no
+    // intervening call to that helper, so run convergence here per newly
+    // cancelled id. Bounded by CONVERGE_LIMIT per id.
+    for id in &cancelled_members {
+        crate::tasks::converge_parked_dependents_of_cancelled(tx, *id, now)?;
+    }
+    if source_cancelled > 0 {
+        crate::tasks::converge_parked_dependents_of_cancelled(tx, source_task_id, now)?;
+    }
     Ok(())
 }
 
@@ -1454,7 +1466,7 @@ fn validate_cleanup_intent(intent: &CleanupIntent) -> Result<()> {
     Ok(())
 }
 
-fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> Result<()> {
+fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> Result<Vec<i64>> {
     tx.execute(
         "UPDATE claims SET active=0 WHERE active=1 AND target IN (
              SELECT 'task#' || task_id FROM task_graph_members WHERE graph_id=?1)",
@@ -1465,13 +1477,19 @@ fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> R
              SELECT task_id FROM task_graph_members WHERE graph_id=?1)",
         params![graph_id, now],
     )?;
-    tx.execute(
-        "UPDATE tasks SET status='cancelled',assignee=NULL,updated_at=?2
-         WHERE status!='done' AND id IN (
-             SELECT task_id FROM task_graph_members WHERE graph_id=?1)",
-        params![graph_id, now],
-    )?;
-    Ok(())
+    let cancelled_ids: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "UPDATE tasks SET status='cancelled',assignee=NULL,updated_at=?2
+             WHERE status!='done' AND id IN (
+                 SELECT task_id FROM task_graph_members WHERE graph_id=?1)
+             RETURNING id",
+        )?;
+        let rows = stmt
+            .query_map(params![graph_id, now], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    Ok(cancelled_ids)
 }
 
 /// Record a reviewer-confirmed decomposition defect and revoke only the
@@ -2212,7 +2230,10 @@ pub fn recovery_reset(
     if evidence {
         return Ok(false);
     }
-    cancel_unfinished_members(&tx, graph_id, now)?;
+    let cancelled_members = cancel_unfinished_members(&tx, graph_id, now)?;
+    for id in &cancelled_members {
+        crate::tasks::converge_parked_dependents_of_cancelled(&tx, *id, now)?;
+    }
     tx.execute(
         "UPDATE task_graph_members SET active=0 WHERE graph_id=?1",
         [graph_id],
@@ -5774,5 +5795,91 @@ mod tests {
                 .sum::<usize>();
             assert_eq!(winners, 2, "round {round}");
         }
+    }
+
+    /// Task #473 blocker 1: graph member cancellation must refresh the
+    /// durable park refs of parked dependents. Ordinary `tasks::update`
+    /// wires convergence; `cancel_graph_in_tx` is a separate cancellation
+    /// writer and must do the same.
+    fn park_dependent(conn: &Connection, dep: i64, dependent: i64) {
+        conn.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'dependency #' || ?2 || ' is terminal-not-done',
+                 'daemon_parked_unsatisfiable', json('false'),
+                 'daemon_resume_status', 'open'
+             ) WHERE id=?1",
+            params![dependent, dep],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn graph_member_cancellation_converges_parked_dependents() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        // Create an external dependent parked recoverably on member a.
+        let dependent: i64 = conn
+            .query_row(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,depends_on)
+                 VALUES ('external','open','owner',1,1,?1) RETURNING id",
+                [format!("[{}]", ids[0])],
+                |r| r.get(0),
+            )
+            .unwrap();
+        park_dependent(&conn, ids[0], dependent);
+        assert!(cancel_graph(&mut conn, 1, &[], 5).unwrap());
+        let refs: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [dependent], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["daemon_parked_unsatisfiable"], true);
+        assert_eq!(
+            refs["daemon_parked_reason"],
+            format!("dependency #{} is cancelled — unsatisfiable", ids[0])
+        );
+    }
+
+    #[test]
+    fn graph_source_cancellation_converges_parked_dependents() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        // Materialize so cancel_graph reaches the source-cancel path.
+        let _ = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        // A dependent parked recoverably on the graph source (task#1).
+        let dependent: i64 = conn
+            .query_row(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,depends_on)
+                 VALUES ('external','open','owner',1,1,'[1]') RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        park_dependent(&conn, 1, dependent);
+        assert!(cancel_graph(&mut conn, 1, &[], 5).unwrap());
+        // Source itself is now cancelled.
+        let source_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(source_status, "cancelled");
+        // Dependent's park was converged to unsatisfiable naming the source.
+        let refs: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [dependent], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["daemon_parked_unsatisfiable"], true);
+        assert_eq!(
+            refs["daemon_parked_reason"],
+            "dependency #1 is cancelled — unsatisfiable"
+        );
     }
 }

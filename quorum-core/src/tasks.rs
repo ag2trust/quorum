@@ -2370,6 +2370,7 @@ pub fn update(
         ));
     }
 
+    let mut cancel_applied = false;
     let mut n = match fields.status {
         Some("open") => tx.execute(
             "UPDATE tasks SET
@@ -2387,23 +2388,27 @@ pub fn update(
                 agent
             ],
         )?,
-        Some("cancelled") => tx.execute(
-            "UPDATE tasks SET
-                status='cancelled',
-                body  = COALESCE(?3, body),
-                refs  = COALESCE(?4, refs),
-                updated_at = ?5
-             WHERE id=?1 AND (created_by=?6 OR assignee=?6)
-                   AND status NOT IN ('done', 'failed', 'cancelled')",
-            params![
-                id,
-                "cancelled",
-                fields.body,
-                preserved_refs.as_deref(),
-                now,
-                agent
-            ],
-        )?,
+        Some("cancelled") => {
+            let rows = tx.execute(
+                "UPDATE tasks SET
+                    status='cancelled',
+                    body  = COALESCE(?3, body),
+                    refs  = COALESCE(?4, refs),
+                    updated_at = ?5
+                 WHERE id=?1 AND (created_by=?6 OR assignee=?6)
+                       AND status NOT IN ('done', 'failed', 'cancelled')",
+                params![
+                    id,
+                    "cancelled",
+                    fields.body,
+                    preserved_refs.as_deref(),
+                    now,
+                    agent
+                ],
+            )?;
+            cancel_applied = rows > 0;
+            rows
+        }
         _ => {
             let rows = tx.execute(
                 "UPDATE tasks SET
@@ -2538,7 +2543,7 @@ pub fn update(
             &format!("released by {agent}"),
             now,
         )?;
-    } else if fields.status == Some("cancelled") {
+    } else if fields.status == Some("cancelled") && cancel_applied {
         deactivate_lease(&tx, id, now)?;
         crate::events::emit(
             &tx,
@@ -2550,6 +2555,11 @@ pub fn update(
         // Refresh durable park refs of parked dependents in the same tx,
         // so a following status read sees the unsatisfiable disposition
         // without waiting for another mutation to trigger a sweep.
+        // Gated on `cancel_applied`: a combined status+depends_on edit whose
+        // cancel UPDATE affects zero rows (e.g. task already 'failed') must
+        // not falsely relabel dependents as cancelled — the guarded
+        // depends_on branch may still have applied but the id is not
+        // cancelled.
         converge_parked_dependents_of_cancelled(&tx, id, now)?;
     }
 
@@ -3283,15 +3293,30 @@ pub fn retain_blocked_remediation_retry(
 /// each daemon-parked dependent so refs stay consistent with the live dep
 /// graph. Called inside the cancellation transaction so status readers see
 /// the upgrade atomically with the cancel — no scheduling gap where the
-/// dependent stays hidden from BLOCKED. Bounded per cancellation (one call
-/// per cancel; the search is scoped to dependents of exactly this id, not
-/// a whole-repo scan).
+/// dependent stays hidden from BLOCKED.
+///
+/// Bounded per call by [`CONVERGE_LIMIT`]: without a reverse-dep index the
+/// selector scans failed daemon-parked rows and evaluates `json_each` per
+/// dep, and the write loop is O(matches). The LIMIT caps both under the
+/// cancellation `BEGIN IMMEDIATE` so the writer window stays bounded.
+/// Correctness of the operator disposition queue does not depend on this
+/// convergence: `stats::blocked_tasks` and `retry_parked` both infer the
+/// unsatisfiable condition from the live dep graph, so any dependent that
+/// exceeds the bound still surfaces in BLOCKED and still refuses retry —
+/// only the durable `daemon_parked_reason`/marker refresh may lag one
+/// mutation, and the next cancel or `sweep_all` completes convergence.
 ///
 /// Classifier-policy parks are skipped intentionally: their durable reason
 /// is "classifier declined" and their retry path is reclassification, not
 /// dep restoration — overwriting the reason would lose the classifier
 /// cause. `stats::blocked_tasks` surfaces those rows via live dep-graph
 /// inference instead, so the disposition signal is still present.
+///
+/// ponytail: bounded scan + write, upgrade to a reverse-dep index if the
+/// operator disposition queue grows enough that lagging refs become
+/// observable.
+pub(crate) const CONVERGE_LIMIT: usize = 64;
+
 pub(crate) fn converge_parked_dependents_of_cancelled(
     tx: &Connection,
     cancelled_id: i64,
@@ -3313,10 +3338,13 @@ pub(crate) fn converge_parked_dependents_of_cancelled(
                AND EXISTS (
                    SELECT 1 FROM json_each(depends_on) j
                    WHERE j.value = ?1
-               )",
+               )
+             LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![cancelled_id], |r| r.get::<_, i64>(0))?
+            .query_map(params![cancelled_id, CONVERGE_LIMIT as i64], |r| {
+                r.get::<_, i64>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
@@ -11145,6 +11173,158 @@ mod tests {
         .unwrap();
         assert!(refs.get("daemon_parked_unsatisfiable").is_none());
         assert_eq!(refs["daemon_parked_reason"], "classifier declined");
+    }
+
+    /// Task #473 R7 blocker 3: the cancellation convergence hook must
+    /// only fire when the cancel UPDATE actually applied. A combined
+    /// status=cancelled + depends_on edit on a `failed` daemon-parked
+    /// task has the cancel UPDATE affect zero rows (WHERE clause excludes
+    /// failed) but the guarded depends_on branch may still succeed. The
+    /// hook keying off `fields.status == Some("cancelled")` alone would
+    /// falsely relabel the task's dependents as unsatisfiable even
+    /// though the task itself is not cancelled.
+    #[test]
+    fn cancel_hook_gated_on_actual_transition_not_requested_status() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        let dependent = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        // Park dependent recoverably on `dep`.
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'dependency #' || ?2 || ' is terminal-not-done',
+                 'daemon_parked_unsatisfiable', json('false'),
+                 'daemon_resume_status', 'open'
+             ) WHERE id=?1",
+            params![dependent, dep],
+        )
+        .unwrap();
+        // `dep` is itself failed + daemon-parked (guarded depends_on edit
+        // path allows edits here).
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'some failure',
+                 'daemon_resume_status', 'open'
+             ) WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        // Combined edit: requested status='cancelled' + depends_on edit.
+        // The cancel UPDATE affects zero rows (dep is failed); the
+        // depends_on UPDATE fires under the guarded failed+parked branch.
+        let _ = update(
+            &mut c,
+            "boss",
+            dep,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                depends_on: Some("[]"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            1002,
+        );
+        // dep must NOT have moved to cancelled.
+        let dep_status: String = c
+            .query_row("SELECT status FROM tasks WHERE id=?1", params![dep], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dep_status, "failed");
+        // Dependent's park refs must NOT have been relabeled.
+        let refs: serde_json::Value = serde_json::from_str(
+            get(&c, dependent)
+                .unwrap()
+                .unwrap()
+                .refs
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refs["daemon_parked_unsatisfiable"], false);
+        assert!(
+            refs["daemon_parked_reason"]
+                .as_str()
+                .unwrap()
+                .contains("terminal-not-done"),
+            "unexpected reason: {}",
+            refs["daemon_parked_reason"]
+        );
+    }
+
+    /// Task #473 R7 blocker 2: convergence is bounded per call. Piling on
+    /// more dependents than `CONVERGE_LIMIT` must not blow the write
+    /// window under the cancellation transaction; the remainder is picked
+    /// up by later calls (idempotent) or by live read inference in the
+    /// meantime.
+    #[test]
+    fn converge_parked_dependents_of_cancelled_bounded_per_call() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        let extra = CONVERGE_LIMIT + 5;
+        let mut ids = Vec::new();
+        for i in 0..extra {
+            let id = create(
+                &mut c,
+                "boss",
+                &format!("d{i}"),
+                None,
+                0,
+                None,
+                None,
+                Some(&format!("[{dep}]")),
+                None,
+                1000,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='failed', refs=json_object(
+                     'daemon_parked', json('true'),
+                     'daemon_parked_reason', 'dependency #' || ?2 || ' is terminal-not-done',
+                     'daemon_parked_unsatisfiable', json('false'),
+                     'daemon_resume_status', 'open'
+                 ) WHERE id=?1",
+                params![id, dep],
+            )
+            .unwrap();
+            ids.push(id);
+        }
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        let first = converge_parked_dependents_of_cancelled(&c, dep, 2000).unwrap();
+        assert_eq!(first, CONVERGE_LIMIT, "must not exceed bound");
+        // A follow-up call keeps converging remaining dependents.
+        let second = converge_parked_dependents_of_cancelled(&c, dep, 2001).unwrap();
+        assert_eq!(second, extra - CONVERGE_LIMIT);
+        // After both, all dependents are converged.
+        let remaining: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE status='failed' AND json_valid(refs)
+                   AND json_extract(refs,'$.daemon_parked')=1
+                   AND COALESCE(json_extract(refs,'$.daemon_parked_unsatisfiable'),0)!=1
+                   AND EXISTS(SELECT 1 FROM json_each(depends_on) j WHERE j.value=?1)",
+                params![dep],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]
