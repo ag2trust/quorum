@@ -31,7 +31,9 @@ enum Scenario {
     CompileFailure,
     Timeout,
     DiscoverySpawnFailure,
+    #[cfg(target_os = "macos")]
     DarwinPartialFallback,
+    #[cfg(target_os = "macos")]
     DarwinPartialChildList,
     Interrupted,
     AbruptOwnerDeath,
@@ -45,7 +47,9 @@ impl Scenario {
             Self::CompileFailure => "compile-failure",
             Self::Timeout => "timeout",
             Self::DiscoverySpawnFailure => "discovery-spawn-failure",
+            #[cfg(target_os = "macos")]
             Self::DarwinPartialFallback => "darwin-partial-fallback",
+            #[cfg(target_os = "macos")]
             Self::DarwinPartialChildList => "darwin-partial-child-list",
             Self::Interrupted => "interrupted",
             Self::AbruptOwnerDeath => "abrupt-owner-death",
@@ -119,10 +123,12 @@ impl Fixture {
                     Scenario::TestFailure => self.repo.join("fixture-test-failure"),
                     Scenario::Timeout
                     | Scenario::DiscoverySpawnFailure
-                    | Scenario::DarwinPartialFallback
-                    | Scenario::DarwinPartialChildList
                     | Scenario::Interrupted
                     | Scenario::AbruptOwnerDeath => self.repo.join("fixture-test-blocking"),
+                    #[cfg(target_os = "macos")]
+                    Scenario::DarwinPartialFallback | Scenario::DarwinPartialChildList => {
+                        self.repo.join("fixture-test-blocking")
+                    }
                     _ => self.repo.join("fixture-test-unused"),
                 },
             )
@@ -138,6 +144,7 @@ impl Fixture {
                 // stages so the platform's spawn-free fallback owns teardown.
                 .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000");
         }
+        #[cfg(target_os = "macos")]
         if matches!(scenario, Scenario::DarwinPartialFallback) {
             command
                 .env("PREFLIGHT_TEST_TIMEOUT_SECS", "2")
@@ -151,6 +158,7 @@ impl Fixture {
                     self.pid_file().with_extension("partial"),
                 );
         }
+        #[cfg(target_os = "macos")]
         if matches!(scenario, Scenario::DarwinPartialChildList) {
             command
                 .env("PREFLIGHT_TEST_TIMEOUT_SECS", "2")
