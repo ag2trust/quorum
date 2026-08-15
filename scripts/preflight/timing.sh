@@ -25,12 +25,17 @@ Outputs (under ``target/preflight-timing/`` by default):
 
 Usage:
     scripts/preflight/timing.sh [--top-n N] [--out DIR] [--test-threads N]
+                                [--test-timeout-secs N]
+                                [--term-grace-secs N]
                                 [--skip-fmt] [--skip-clippy] [--self-test]
 
 Defaults: --top-n 10, --out target/preflight-timing,
-          --test-threads $RUST_TEST_THREADS or 4.
+          --test-threads $RUST_TEST_THREADS or 4,
+          --test-timeout-secs $PREFLIGHT_TEST_TIMEOUT_SECS or 120,
+          --term-grace-secs $PREFLIGHT_TERM_GRACE_SECS or 2.
 
-Exit codes mirror preflight.sh: 0 pass, 1 gate failure, 2 usage.
+Exit codes mirror preflight.sh: 0 pass, 1 gate failure, 2 usage; an interrupted
+test-execution phase returns 128 plus the received signal number.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -48,6 +54,10 @@ CARGO_FEATURES = ["--all-features", "--features", "quorum-core/test-support"]
 
 WRAPPER_ACTIVE_ENV = "TIMING_RUSTC_WRAPPER_ACTIVE"
 WRAPPER_LOG_ENV = "TIMING_RUSTC_LOG"
+
+DEFAULT_TEST_TIMEOUT_SECS = 120.0
+DEFAULT_TERM_GRACE_SECS = 2.0
+TIMEOUT_EXIT_CODE = 124
 
 
 def now() -> float:
@@ -304,11 +314,250 @@ def compile_tests(
     return now() - t0, proc.returncode, binaries, matched, log_entries
 
 
-def run_test_binary(exe: str, threads: int) -> tuple[float, int]:
+class CollectorInterrupted(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+        self.result: dict | None = None
+
+
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reap_group_children(pgid: int) -> None:
+    """Reap direct (and, on Linux, subreaper-adopted) group children."""
+    while True:
+        try:
+            pid, _ = os.waitpid(-pgid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
+def _enable_child_subreaper() -> None:
+    """Keep orphaned test descendants reparented here on Linux.
+
+    Other POSIX systems reap orphans through their normal init process. Linux
+    lets the collector become the nearest subreaper so killed grandchildren do
+    not accumulate as zombies beneath a container's PID 1.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+    except (ImportError, OSError) as exc:
+        print(
+            f"preflight timing: could not become child subreaper: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _cleanup_process_group(
+    proc: subprocess.Popen, grace_secs: float
+) -> dict:
+    """Bounded TERM/KILL cleanup for the isolated group led by ``proc``."""
+    pgid = proc.pid
+    cleanup = {
+        "attempted": False,
+        "term_sent": False,
+        "kill_sent": False,
+        "complete": False,
+        "error": None,
+    }
+
+    def send(sig: signal.Signals, key: str) -> None:
+        cleanup["attempted"] = True
+        try:
+            os.killpg(pgid, sig)
+            cleanup[key] = True
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            cleanup["error"] = f"killpg({pgid}, {sig.name}): {exc}"
+
+    def wait_until_gone(deadline: float) -> bool:
+        while True:
+            proc.poll()  # Reap the group leader as soon as it exits.
+            _reap_group_children(pgid)
+            if not _process_group_exists(pgid):
+                return True
+            if now() >= deadline:
+                return False
+            time.sleep(min(0.02, max(0.0, deadline - now())))
+
+    if _process_group_exists(pgid):
+        send(signal.SIGTERM, "term_sent")
+        gone = wait_until_gone(now() + grace_secs)
+        if not gone:
+            send(signal.SIGKILL, "kill_sent")
+            gone = wait_until_gone(now() + grace_secs)
+    else:
+        gone = True
+
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=max(grace_secs, 0.01))
+        except subprocess.TimeoutExpired:
+            gone = False
+            cleanup["error"] = cleanup["error"] or (
+                f"group leader {proc.pid} did not exit after SIGKILL"
+            )
+    _reap_group_children(pgid)
+    cleanup["complete"] = gone and not _process_group_exists(pgid)
+    if not cleanup["complete"] and cleanup["error"] is None:
+        cleanup["error"] = f"process group {pgid} still exists after SIGKILL"
+    return cleanup
+
+
+def _run_result(
+    started: float,
+    rc: int,
+    outcome: str,
+    timeout_secs: float,
+    cleanup: dict,
+) -> dict:
+    return {
+        "duration_secs": now() - started,
+        "exit_code": rc,
+        "outcome": outcome,
+        "timed_out": outcome == "timed_out",
+        "timeout_secs": timeout_secs,
+        "cleanup": cleanup,
+    }
+
+
+def _cleanup_diagnostic(cleanup: dict) -> str:
+    actions = []
+    if cleanup["term_sent"]:
+        actions.append("SIGTERM sent")
+    if cleanup["kill_sent"]:
+        actions.append("SIGKILL sent")
+    actions.append(
+        "process group reaped" if cleanup["complete"]
+        else f"cleanup incomplete: {cleanup['error']}"
+    )
+    return ", ".join(actions)
+
+
+def run_test_binary(
+    exe: str,
+    threads: int,
+    timeout_secs: float,
+    term_grace_secs: float,
+    display_name: str,
+) -> dict:
     argv = [exe, "--test-threads", str(threads)]
     t0 = now()
-    proc = subprocess.run(argv)
-    return now() - t0, proc.returncode
+    proc: subprocess.Popen | None = None
+    previous_handlers: dict[signal.Signals, object] = {}
+
+    def interrupted(signum: int, _frame: object) -> None:
+        raise CollectorInterrupted(signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sig] = signal.signal(sig, interrupted)
+
+    try:
+        # Do not leave a signal-sized gap between spawn and recording the PID:
+        # a pending interruption is delivered immediately after the group is
+        # known, so the exception path can always clean it.
+        old_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+
+        def restore_child_signal_mask() -> None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+        try:
+            proc = subprocess.Popen(
+                argv,
+                start_new_session=True,
+                preexec_fn=restore_child_signal_mask,
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        try:
+            rc = proc.wait(timeout=timeout_secs)
+        except subprocess.TimeoutExpired:
+            for sig in previous_handlers:
+                signal.signal(sig, signal.SIG_IGN)
+            cleanup = _cleanup_process_group(proc, term_grace_secs)
+            result = _run_result(
+                t0, TIMEOUT_EXIT_CODE, "timed_out", timeout_secs, cleanup
+            )
+            print(
+                f"preflight timing: test binary {display_name!r} timed out "
+                f"after {result['duration_secs']:.2f}s "
+                f"(deadline {timeout_secs:.2f}s); "
+                f"{_cleanup_diagnostic(cleanup)}. Re-run {exe!r} "
+                f"--test-threads {threads} --nocapture to diagnose.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return result
+
+        cleanup = _cleanup_process_group(proc, term_grace_secs)
+        outcome = "passed" if rc == 0 else "failed"
+        if not cleanup["complete"]:
+            print(
+                f"preflight timing: test binary {display_name!r} exited "
+                f"but {_cleanup_diagnostic(cleanup)}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return _run_result(t0, rc, outcome, timeout_secs, cleanup)
+    except CollectorInterrupted as exc:
+        for sig in previous_handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        cleanup = (
+            _cleanup_process_group(proc, term_grace_secs)
+            if proc is not None
+            else {
+                "attempted": False,
+                "term_sent": False,
+                "kill_sent": False,
+                "complete": True,
+                "error": None,
+            }
+        )
+        exc.result = _run_result(
+            t0,
+            128 + exc.signum,
+            "interrupted",
+            timeout_secs,
+            cleanup,
+        )
+        print(
+            f"preflight timing: interrupted while running test binary "
+            f"{display_name!r} after {exc.result['duration_secs']:.2f}s; "
+            f"{_cleanup_diagnostic(cleanup)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
+    except BaseException:
+        if proc is not None:
+            for sig in previous_handlers:
+                signal.signal(sig, signal.SIG_IGN)
+            _cleanup_process_group(proc, term_grace_secs)
+        raise
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +584,9 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
     lines: list[str] = []
     lines.append("=== preflight timing summary ===")
     lines.append(f"timestamp_utc: {data['timestamp_utc']}")
+    lines.append(
+        f"test_timeout_secs: {data.get('test_timeout_secs', 'n/a')}"
+    )
     wrapper = data.get("rustc_wrapper") or {}
     if wrapper:
         lines.append(
@@ -356,14 +608,17 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
         f"slowest test binaries (top {len(top)} of {len(binaries)}):"
     )
     lines.append(
-        f"  {'binary':<48} {'compile_no_run':>16} {'execute':>12}"
+        f"  {'binary':<40} {'compile_no_run':>16} {'execute':>12}  outcome"
     )
     for b in top:
         name = b.get("target_name") or Path(b["executable"]).name
         c = b.get("compile_no_run_secs")
         e = b.get("execute_secs") or 0.0
         c_str = f"{c:>14.2f}s" if c is not None else f"{'n/a':>15}"
-        lines.append(f"  {name[:48]:<48} {c_str} {e:>10.2f}s")
+        outcome = b.get("execute_outcome", "unknown")
+        lines.append(
+            f"  {name[:40]:<40} {c_str} {e:>10.2f}s  {outcome}"
+        )
     lines.append("")
     path.write_text("\n".join(lines) + "\n")
 
@@ -386,6 +641,7 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
     binaries: list[dict] = []
     wrapper_stats: dict = {}
     status = 0
+    interrupted_signal: int | None = None
 
     def add_gate(name: str, duration: float, rc: int) -> None:
         nonlocal status
@@ -431,26 +687,54 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
         }
 
     if status == 0:
+        _enable_child_subreaper()
         print(
             f"=== timing 4/4: run {len(binaries)} test binaries "
-            f"(--test-threads {args.test_threads}) ===",
+            f"(--test-threads {args.test_threads}, "
+            f"{args.test_timeout_secs:g}s deadline each) ===",
             flush=True,
         )
         t0 = now()
         exec_rc = 0
         for b in binaries:
-            edur, erc = run_test_binary(b["executable"], args.test_threads)
-            b["execute_secs"] = round(edur, 3)
-            b["execute_exit_code"] = erc
-            if erc != 0 and exec_rc == 0:
-                exec_rc = erc
+            name = b.get("target_name") or Path(b["executable"]).name
+            try:
+                result = run_test_binary(
+                    b["executable"],
+                    args.test_threads,
+                    args.test_timeout_secs,
+                    args.term_grace_secs,
+                    name,
+                )
+            except CollectorInterrupted as exc:
+                assert exc.result is not None
+                result = exc.result
+                interrupted_signal = exc.signum
+            b["execute_secs"] = round(result["duration_secs"], 3)
+            b["execute_exit_code"] = result["exit_code"]
+            b["execute_outcome"] = result["outcome"]
+            b["execute_timed_out"] = result["timed_out"]
+            b["execute_timeout_secs"] = result["timeout_secs"]
+            b["cleanup"] = result["cleanup"]
+            if (
+                result["exit_code"] != 0
+                or not result["cleanup"]["complete"]
+            ) and exec_rc == 0:
+                exec_rc = result["exit_code"] or 1
+            if interrupted_signal is not None:
+                break
         add_gate("test_execute", now() - t0, exec_rc)
+        if interrupted_signal is not None:
+            status = 128 + interrupted_signal
 
     data = {
-        "version": 2,
+        "version": 3,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "top_n": args.top_n,
         "test_threads": args.test_threads,
+        "test_timeout_secs": args.test_timeout_secs,
+        "term_grace_secs": args.term_grace_secs,
+        "interrupted_signal": interrupted_signal,
         "gates": gates,
         "test_binaries": binaries,
         "top_n_slowest": slowest(binaries, args.top_n),
@@ -642,10 +926,13 @@ def self_test() -> int:
             for i in range(20)
         ]
         data = {
-            "version": 2,
+            "version": 3,
             "timestamp_utc": "2026-08-14T00:00:00Z",
             "top_n": 5,
             "test_threads": 4,
+            "test_timeout_secs": 120.0,
+            "term_grace_secs": 2.0,
+            "interrupted_signal": None,
             "gates": [
                 {"name": "cargo_fmt", "duration_secs": 1.2, "exit_code": 0},
                 {"name": "cargo_clippy", "duration_secs": 45.6,
@@ -661,7 +948,7 @@ def self_test() -> int:
         emit_artifact(artifact, data)
 
         parsed = json.loads(artifact.read_text())
-        assert parsed["version"] == 2
+        assert parsed["version"] == 3
         assert len(parsed["test_binaries"]) == 20
         assert len(parsed["top_n_slowest"]) == 5
 
@@ -711,6 +998,22 @@ def main() -> int:
         type=int,
         default=int(os.environ.get("RUST_TEST_THREADS", "4")),
     )
+    p.add_argument(
+        "--test-timeout-secs",
+        type=float,
+        default=float(os.environ.get(
+            "PREFLIGHT_TEST_TIMEOUT_SECS", DEFAULT_TEST_TIMEOUT_SECS
+        )),
+        help="deadline for each test executable (default: 120 seconds)",
+    )
+    p.add_argument(
+        "--term-grace-secs",
+        type=float,
+        default=float(os.environ.get(
+            "PREFLIGHT_TERM_GRACE_SECS", DEFAULT_TERM_GRACE_SECS
+        )),
+        help="grace after TERM and KILL while reaping a test process group",
+    )
     p.add_argument("--skip-fmt", action="store_true")
     p.add_argument("--skip-clippy", action="store_true")
     p.add_argument(
@@ -722,6 +1025,10 @@ def main() -> int:
         p.error("--top-n must be positive")
     if args.test_threads <= 0:
         p.error("--test-threads must be positive")
+    if args.test_timeout_secs <= 0:
+        p.error("--test-timeout-secs must be positive")
+    if args.term_grace_secs <= 0:
+        p.error("--term-grace-secs must be positive")
 
     if args.self_test_mode:
         return self_test()

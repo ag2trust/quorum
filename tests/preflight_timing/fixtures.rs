@@ -2,7 +2,9 @@ use std::{
     env, fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -16,6 +18,7 @@ enum Scenario {
     Success,
     TestFailure,
     CompileFailure,
+    Timeout,
     Interrupted,
 }
 
@@ -25,6 +28,7 @@ impl Scenario {
             Self::Success => "success",
             Self::TestFailure => "test-failure",
             Self::CompileFailure => "compile-failure",
+            Self::Timeout => "timeout",
             Self::Interrupted => "interrupted",
         }
     }
@@ -70,10 +74,7 @@ impl Fixture {
 
         write_executable(&bin.join("cargo"), CARGO_SHIM);
         write_executable(&repo.join("fixture-test-failure"), TEST_FAILURE_SHIM);
-        write_executable(
-            &repo.join("fixture-test-interrupted"),
-            INTERRUPTED_TEST_SHIM,
-        );
+        write_executable(&repo.join("fixture-test-blocking"), BLOCKING_TEST_SHIM);
 
         Self {
             _temp: temp,
@@ -88,7 +89,8 @@ impl Fixture {
             self.bin.display(),
             env::var("PATH").expect("PATH is set")
         );
-        Command::new("./preflight.sh")
+        let mut command = Command::new("./preflight.sh");
+        command
             .current_dir(&self.repo)
             .env("PATH", path)
             .env("PREFLIGHT_TIMING_SCENARIO", scenario.env_value())
@@ -96,12 +98,70 @@ impl Fixture {
                 "PREFLIGHT_TEST_EXECUTABLE",
                 match scenario {
                     Scenario::TestFailure => self.repo.join("fixture-test-failure"),
-                    Scenario::Interrupted => self.repo.join("fixture-test-interrupted"),
+                    Scenario::Timeout | Scenario::Interrupted => {
+                        self.repo.join("fixture-test-blocking")
+                    }
                     _ => self.repo.join("fixture-test-unused"),
                 },
             )
-            .output()
-            .expect("run preflight")
+            .env("PREFLIGHT_TERM_GRACE_SECS", "0.2")
+            .env("PREFLIGHT_FIXTURE_PID_FILE", self.pid_file());
+        if matches!(scenario, Scenario::Timeout) {
+            command.env("PREFLIGHT_TEST_TIMEOUT_SECS", "5");
+        }
+        command.output().expect("run preflight")
+    }
+
+    fn interrupted_timing(&self) -> Child {
+        let path = format!(
+            "{}:{}",
+            self.bin.display(),
+            env::var("PATH").expect("PATH is set")
+        );
+        Command::new("scripts/preflight/timing.sh")
+            .current_dir(&self.repo)
+            .args([
+                "--skip-fmt",
+                "--skip-clippy",
+                "--test-timeout-secs",
+                "30",
+                "--term-grace-secs",
+                "0.2",
+            ])
+            .env("PATH", path)
+            .env(
+                "PREFLIGHT_TIMING_SCENARIO",
+                Scenario::Interrupted.env_value(),
+            )
+            .env(
+                "PREFLIGHT_TEST_EXECUTABLE",
+                self.repo.join("fixture-test-blocking"),
+            )
+            .env("PREFLIGHT_FIXTURE_PID_FILE", self.pid_file())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn interruptible timing collector")
+    }
+
+    fn pid_file(&self) -> PathBuf {
+        self.repo.join("fixture-pids")
+    }
+
+    fn wait_for_fixture_pids(&self) -> Vec<i32> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(text) = fs::read_to_string(self.pid_file()) {
+                let pids = text
+                    .split_whitespace()
+                    .map(|pid| pid.parse().expect("fixture PID is numeric"))
+                    .collect::<Vec<_>>();
+                assert_eq!(pids.len(), 2, "fixture records test and grandchild");
+                return pids;
+            }
+            assert!(Instant::now() < deadline, "fixture did not publish PIDs");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn timing(&self) -> Value {
@@ -157,8 +217,28 @@ fn assert_gate(timing: &Value, name: &str, expected_exit_code: i64) {
 }
 
 fn assert_branch_base(timing: &Value) {
-    assert_eq!(timing["version"].as_i64(), Some(2));
+    assert_eq!(timing["version"].as_i64(), Some(3));
     assert_gate(timing, "branch_base", 0);
+}
+
+fn process_exists(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn assert_processes_gone(pids: &[i32]) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while pids.iter().copied().any(process_exists) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let survivors = pids
+        .iter()
+        .copied()
+        .filter(|pid| process_exists(*pid))
+        .collect::<Vec<_>>();
+    assert!(
+        survivors.is_empty(),
+        "fixture processes survived: {survivors:?}"
+    );
 }
 
 #[test]
@@ -191,7 +271,9 @@ fn test_failure_writes_a_parseable_timing_artifact() {
     assert_eq!(output.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&output.stderr).contains(TEST_DIAGNOSTIC),
-        "test diagnostic was not preserved"
+        "test diagnostic was not preserved; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     let timing = fixture.timing();
     assert_branch_base(&timing);
@@ -219,21 +301,85 @@ fn compilation_failure_preserves_diagnostics_and_timing() {
 }
 
 #[test]
-fn interrupted_execution_writes_a_parseable_timing_artifact() {
+fn timeout_reaps_the_process_group_and_records_diagnostics() {
     let fixture = Fixture::new();
-    let output = fixture.preflight(Scenario::Interrupted);
+    let output = fixture.preflight(Scenario::Timeout);
 
     assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fixture_test"));
+    assert!(stderr.contains("timed out after"));
+    assert!(stderr.contains("--nocapture to diagnose"));
     let timing = fixture.timing();
     assert_branch_base(&timing);
-    let gate = timing["gates"]
-        .as_array()
-        .expect("timing gates is an array")
-        .iter()
-        .find(|gate| gate["name"] == "test_execute")
-        .expect("timing artifact is missing test_execute");
-    assert_ne!(gate["exit_code"].as_i64(), Some(0));
-    assert!(gate["duration_secs"].as_f64().is_some());
+    assert_gate(&timing, "test_execute", 124);
+    let binary = &timing["test_binaries"][0];
+    assert_eq!(binary["execute_outcome"], "timed_out");
+    assert_eq!(binary["execute_timed_out"], true);
+    assert_eq!(binary["cleanup"]["term_sent"], true);
+    assert_eq!(binary["cleanup"]["complete"], true);
+    assert_processes_gone(&fixture.wait_for_fixture_pids());
+}
+
+#[test]
+fn interruption_reaps_the_process_group_and_writes_bounded_timing() {
+    let fixture = Fixture::new();
+    let mut collector = fixture.interrupted_timing();
+    let pid_deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.pid_file().exists() {
+        if let Some(status) = collector.try_wait().expect("poll timing collector startup") {
+            let output = collector
+                .wait_with_output()
+                .expect("collect failed startup");
+            panic!(
+                "timing collector exited before fixture startup ({status}); stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            Instant::now() < pid_deadline,
+            "fixture did not publish PIDs"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let fixture_pids = fixture.wait_for_fixture_pids();
+    let started = Instant::now();
+    assert_eq!(
+        unsafe { libc::kill(collector.id() as i32, libc::SIGTERM) },
+        0,
+        "signal timing collector"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while collector
+        .try_wait()
+        .expect("poll timing collector")
+        .is_none()
+    {
+        if Instant::now() >= deadline {
+            collector.kill().expect("kill stuck timing collector");
+            panic!("interrupted timing collector did not exit");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = collector.wait_with_output().expect("collect timing output");
+
+    assert_eq!(output.status.code(), Some(128 + libc::SIGTERM));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("interrupted while running test binary 'fixture_test'"));
+    let timing = fixture.timing();
+    assert_eq!(timing["version"].as_i64(), Some(3));
+    assert_eq!(
+        timing["interrupted_signal"].as_i64(),
+        Some(libc::SIGTERM as i64)
+    );
+    assert_gate(&timing, "test_execute", (128 + libc::SIGTERM) as i64);
+    let binary = &timing["test_binaries"][0];
+    assert_eq!(binary["execute_outcome"], "interrupted");
+    assert_eq!(binary["cleanup"]["complete"], true);
+    assert!(binary["execute_secs"].as_f64().unwrap() < 5.0);
+    assert_processes_gone(&fixture_pids);
 }
 
 const CARGO_SHIM: &str = r##"#!/bin/sh
@@ -259,6 +405,27 @@ printf '%s\n' 'fixture test failure: assertion failed' >&2
 exit 42
 "##;
 
-const INTERRUPTED_TEST_SHIM: &str = r##"#!/bin/sh
-kill -INT $$
+const BLOCKING_TEST_SHIM: &str = r##"#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+pid_file = Path(os.environ["PREFLIGHT_FIXTURE_PID_FILE"])
+ready_file = pid_file.with_suffix(".ready")
+signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
+child_code = """import os, signal, sys, time
+from pathlib import Path
+signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
+Path(sys.argv[1]).write_text(str(os.getpid()))
+while True: time.sleep(1)
+"""
+child = subprocess.Popen([sys.executable, "-c", child_code, str(ready_file)])
+while not ready_file.exists():
+    time.sleep(0.01)
+pid_file.write_text(f"{os.getpid()} {child.pid}\n")
+while True:
+    time.sleep(1)
 "##;
