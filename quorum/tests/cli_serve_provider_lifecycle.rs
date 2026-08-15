@@ -2907,6 +2907,20 @@ fn consecutive_reviewer_and_ci_rework_publications_rotate_pr_head_authority() {
     .trim()
     .to_string();
     assert_ne!(first_rework_sha, initial_sha);
+    // CommandMergeExecutor models the gated PR head with repo-dir HEAD. Keep
+    // that test double aligned with the just-published PR head so the failed-CI
+    // intent carries the same exact SHA that the live gh shim will resolve.
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "update-ref",
+            "HEAD",
+            &first_rework_sha
+        ])
+        .status()
+        .unwrap()
+        .success());
     case.done(&worker, &["--pr", "1"]);
     case.handle.wait_for("failed (ci-test) — entering rework");
     {

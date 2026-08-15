@@ -15819,8 +15819,8 @@ async fn release_sticky_remediation_lease(db_path: &Path, agent: &str, task_id: 
 /// authority: when it already exists, the resolved live target MUST match it
 /// on head_ref, head_sha, and fork status; any drift means the head moved
 /// outside the daemon's lease and fails loudly. When the durable row is
-/// missing (the #447 initial-publication gap), the resolved live target
-/// bootstraps it.
+/// missing (the #447 initial-publication gap), the live target may bootstrap
+/// it only after matching any exact failed-CI head retained in task refs.
 ///
 /// The GitHub lookup runs BEFORE the DB transaction; the transaction only
 /// upserts pr_targets and fills a missing `intent.expected_remote_sha`. A
@@ -15883,6 +15883,8 @@ async fn bind_sticky_remediation_pr_baseline(
 /// baseline (immutability of spawn-time authority) and never rewrites the
 /// durable `pr_targets` row when it already contradicts the live head — that
 /// contradiction means the head moved outside our lease and must fail loudly.
+/// A retained failed-CI intent is a second exact-head authority and must also
+/// match before a missing target row can adopt the live target.
 fn persist_sticky_remediation_baseline(
     conn: &mut quorum_core::Connection,
     task_id: i64,
@@ -15903,7 +15905,7 @@ fn persist_sticky_remediation_baseline(
             "task #{task_id} is not bound to PR #{pr}"
         )));
     }
-    if let Some(existing) = pr_targets::get(&tx, task_id, pr)? {
+    let target_missing = if let Some(existing) = pr_targets::get(&tx, task_id, pr)? {
         if existing.is_fork != target.is_fork
             || existing.head_ref != target.head_ref
             || existing.head_sha != target.head_sha
@@ -15913,7 +15915,19 @@ fn persist_sticky_remediation_baseline(
                 existing.head_ref, existing.head_sha, target.head_ref, target.head_sha
             )));
         }
+        false
     } else {
+        true
+    };
+    if let Some(ci_intent) = tasks::ci_remediation_intent(task.refs.as_deref())? {
+        if ci_intent.pr != pr || ci_intent.head_sha != target.head_sha {
+            return Err(QuorumError::Usage(format!(
+                "PR #{pr} live head {} does not match failed-CI head {} for PR #{}",
+                target.head_sha, ci_intent.head_sha, ci_intent.pr
+            )));
+        }
+    }
+    if target_missing {
         tx.execute(
             "INSERT INTO pr_targets
                (task_id, pr_number, head_ref, head_sha, is_fork, resolved_at)
@@ -21766,6 +21780,27 @@ mod tests {
             .and_then(|intent| intent.expected_remote_sha)
     }
 
+    fn seed_ci_remediation_intent(
+        conn: &quorum_core::Connection,
+        task_id: i64,
+        pr: i64,
+        head_sha: &str,
+    ) {
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(
+                 COALESCE(refs, '{}'),
+                 '$.ci_remediation_requested', json('true'),
+                 '$.ci_remediation_pr', ?2,
+                 '$.ci_remediation_head_sha', ?3,
+                 '$.ci_remediation_feedback', 'fix failed CI',
+                 '$.ci_remediation_checks', json('[\"test\"]'),
+                 '$.ci_remediation_attempts', 0
+             ) WHERE id=?1",
+            rusqlite::params![task_id, pr, head_sha],
+        )
+        .unwrap();
+    }
+
     fn sticky_baseline_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
         pre_review_ci_test_config(db_path, repo_dir)
     }
@@ -22106,6 +22141,129 @@ mod tests {
         assert_eq!(
             load_intent_baseline(&conn, task_id).as_deref(),
             Some(live_sha)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_ci_missing_target_rejects_live_head_after_gated_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-missing-target-moved.db");
+        let pr: i64 = 624;
+        let gated_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let live_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, None);
+            seed_ci_remediation_intent(&conn, id, pr, gated_sha);
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-ci-moved-before-bootstrap",
+            &open_pr_target_json("daemon/live-worker-t624", live_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let installed = install_sticky_remediation_lease_and_baseline(
+            &config,
+            "live-worker".to_string(),
+            task_id,
+            pr,
+            "fix failed CI",
+        )
+        .await;
+        assert!(
+            !installed,
+            "a moved head must not authorize a provider turn"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(
+            pr_targets::get(&conn, task_id, pr).unwrap().is_none(),
+            "the live outside head must not become durable authority"
+        );
+        assert_eq!(load_intent_baseline(&conn, task_id), None);
+        assert_eq!(
+            tasks::ci_remediation_intent(
+                tasks::get(&conn, task_id).unwrap().unwrap().refs.as_deref()
+            )
+            .unwrap()
+            .unwrap()
+            .head_sha,
+            gated_sha
+        );
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked"], true);
+        assert_eq!(
+            refs["daemon_resume_status"], "rework",
+            "the rejected turn must remain owner-retry recoverable"
+        );
+        let active_claim: Option<String> = conn
+            .query_row(
+                "SELECT holder FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .ok();
+        assert!(
+            active_claim.is_none(),
+            "rejected turn must release its lease"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_ci_missing_target_binds_exact_gated_head_for_descendant_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-missing-target-exact.db");
+        let pr: i64 = 625;
+        let gated_sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, None);
+            seed_ci_remediation_intent(&conn, id, pr, gated_sha);
+            id
+        };
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t625".into(),
+            head_sha: gated_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-ci-exact-before-bootstrap",
+            &open_pr_target_json(&target.head_ref, gated_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let installed = install_sticky_remediation_lease_and_baseline(
+            &config,
+            "live-worker".to_string(),
+            task_id,
+            pr,
+            "fix failed CI",
+        )
+        .await;
+        assert!(installed, "the exact gated head must authorize the turn");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, gated_sha);
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let publication = publication_intent_from_refs(task.refs.as_deref()).unwrap();
+        assert_eq!(publication.expected_remote_sha.as_deref(), Some(gated_sha));
+        assert_eq!(
+            existing_pr_lease_baseline(&publication, &target, "main").unwrap(),
+            Some(gated_sha),
+            "a descendant delivery must use the exact gated head as its push lease"
         );
     }
 
