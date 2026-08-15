@@ -13703,6 +13703,17 @@ async fn provision_reviewer_reserved(
             }
         }
     };
+    // Replacement R1/R2 reviewers, including daemon-restart recovery, are
+    // fresh processes. Carry the durable lifecycle count into their initial
+    // turn whenever they are actually reviewing a remediated task.
+    let review_cycle = {
+        let db_path = config.db_path.clone();
+        let task_id = worker.task_id;
+        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
+    };
+    let review_cycle = (review_cycle.rework_round != 0).then_some(review_cycle);
 
     // Prompt composition remains role- and provider-aware; the runner adapter
     // owns how that neutral prompt reaches the CLI.
@@ -13713,11 +13724,12 @@ async fn provision_reviewer_reserved(
                 worker_agent: worker.agent_name.to_string(),
                 reviewer_name: reviewer_name.clone(),
             };
-            reviewer::build_review_prompt_for_kind_with_context(
+            reviewer::build_review_prompt_for_kind_with_context_and_cycle(
                 reviewer_kind,
                 &spec,
                 &reviewer_effort,
                 graph_context.as_deref(),
+                review_cycle,
             )
         }
         ReviewRole::R2 { r1_reviewer, .. } => {
@@ -13727,11 +13739,12 @@ async fn provision_reviewer_reserved(
                 r1_reviewer: r1_reviewer.clone(),
                 r2_name: reviewer_name.clone(),
             };
-            reviewer::build_r2_review_prompt_for_kind_with_context(
+            reviewer::build_r2_review_prompt_for_kind_with_context_and_cycle(
                 reviewer_kind,
                 &spec,
                 &reviewer_effort,
                 graph_context.as_deref(),
+                review_cycle,
             )
         }
     };

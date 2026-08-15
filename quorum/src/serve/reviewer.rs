@@ -212,20 +212,37 @@ pub fn build_review_prompt_for_kind(kind: AgentKind, spec: &ReviewerSpec, effort
     build_review_prompt_for_kind_with_context(kind, spec, effort, None)
 }
 
+#[cfg(test)]
 pub fn build_review_prompt_for_kind_with_context(
     kind: AgentKind,
     spec: &ReviewerSpec,
     effort: &str,
     graph_context: Option<&str>,
 ) -> String {
+    build_review_prompt_for_kind_with_context_and_cycle(kind, spec, effort, graph_context, None)
+}
+
+/// Build an R1 prompt with optional persisted re-review lifecycle context.
+/// Initial reviews have no completed changes-to-rework transition, so callers
+/// omit the context for them rather than presenting a re-review calibration.
+pub fn build_review_prompt_for_kind_with_context_and_cycle(
+    kind: AgentKind,
+    spec: &ReviewerSpec,
+    effort: &str,
+    graph_context: Option<&str>,
+    review_cycle: Option<ReviewCycleContext>,
+) -> String {
+    let review_cycle_contract = review_cycle
+        .map(ReviewCycleContext::prompt_contract)
+        .unwrap_or_default();
     match kind {
         AgentKind::Claude => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_review_prompt(spec, effort),
             graph_review_contract(spec.reviewer_name.as_str(), spec.pr, graph_context)
         ),
         AgentKind::Codex => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_codex_review_prompt(spec, effort),
             graph_review_contract(spec.reviewer_name.as_str(), spec.pr, graph_context)
         ),
@@ -333,20 +350,35 @@ pub fn build_r2_review_prompt_for_kind(
     build_r2_review_prompt_for_kind_with_context(kind, spec, effort, None)
 }
 
+#[cfg(test)]
 pub fn build_r2_review_prompt_for_kind_with_context(
     kind: AgentKind,
     spec: &R2ReviewSpec,
     effort: &str,
     graph_context: Option<&str>,
 ) -> String {
+    build_r2_review_prompt_for_kind_with_context_and_cycle(kind, spec, effort, graph_context, None)
+}
+
+/// Build an R2 prompt with optional persisted re-review lifecycle context.
+pub fn build_r2_review_prompt_for_kind_with_context_and_cycle(
+    kind: AgentKind,
+    spec: &R2ReviewSpec,
+    effort: &str,
+    graph_context: Option<&str>,
+    review_cycle: Option<ReviewCycleContext>,
+) -> String {
+    let review_cycle_contract = review_cycle
+        .map(ReviewCycleContext::prompt_contract)
+        .unwrap_or_default();
     match kind {
         AgentKind::Claude => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_r2_review_prompt(spec, effort),
             graph_review_contract(spec.r2_name.as_str(), spec.pr, graph_context)
         ),
         AgentKind::Codex => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_codex_r2_review_prompt(spec, effort),
             graph_review_contract(spec.r2_name.as_str(), spec.pr, graph_context)
         ),
@@ -1463,11 +1495,17 @@ mod tests {
     }
 
     #[test]
-    fn rereview_cycle_context_is_provider_neutral_and_excludes_initial_review() {
+    fn recovered_r1_r2_prompts_preserve_cycle_context_for_both_providers() {
         let spec = ReviewerSpec {
             pr: 42,
             worker_agent: "Worker-1".into(),
             reviewer_name: "Rev-1".into(),
+        };
+        let r2_spec = R2ReviewSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            r1_reviewer: "Rev-1".into(),
+            r2_name: "Rev-2".into(),
         };
         for kind in [AgentKind::Claude, AgentKind::Codex] {
             assert!(
@@ -1479,6 +1517,24 @@ mod tests {
         let context = ReviewCycleContext::from_persisted_rework_round(i64::from(
             quorum_core::lifecycle::REWORK_CAP,
         ));
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            let r1 = build_review_prompt_for_kind_with_context_and_cycle(
+                kind,
+                &spec,
+                "high",
+                None,
+                Some(context),
+            );
+            let r2 = build_r2_review_prompt_for_kind_with_context_and_cycle(
+                kind,
+                &r2_spec,
+                "high",
+                None,
+                Some(context),
+            );
+            assert!(r1.contains("final review opportunity"));
+            assert!(r2.contains("final review opportunity"));
+        }
         let claude_turn =
             build_rereview_turn_with_context("Rev-1", 42, "Worker-1", "high", None, context);
         let codex_turn =
