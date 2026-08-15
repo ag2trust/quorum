@@ -106,7 +106,10 @@ outcome can remain accurate without cataloguing or fixing that behavior.\n\n\
 Evidence and PR-summary requirements:\n\
 - Every finding must cite a concrete code path (file:line or function), explain the \
 demonstrated failure and assumptions, and identify the affected product behavior.\n\
-- Every BLOCKING finding must explain why this PR cannot merge under the current contract.\n\
+- Every BLOCKING finding must explain why this PR cannot merge under the current contract, name \
+the exact repository invariant it violates (or the precise assigned outcome left false or \
+supported behavior materially worsened), and explain the broader affected path left unsafe, \
+not only the local symptom.\n\
 - Every FOLLOW-UP finding must explain why deferral is safe; identify its scope relationship \
 (pre-existing, out-of-scope/adjacent, threat-model expansion, defense-in-depth, future \
 requirement, or design debt); and give a desired future outcome and verification. Include \
@@ -1131,10 +1134,12 @@ mod tests {
             );
             assert!(
                 prompt.contains("why this PR cannot merge")
+                    && prompt.contains("exact repository invariant it violates")
+                    && prompt.contains("broader affected path left unsafe")
                     && prompt.contains("why deferral is safe")
                     && prompt.contains("desired future outcome and verification")
                     && prompt.contains("later collector extraction"),
-                "{name} must make both dispositions evidence-rich and collector-readable"
+                "{name} must require blockers to identify their violated contract and affected path, while keeping both dispositions evidence-rich and collector-readable"
             );
             assert!(
                 prompt.contains("Only BLOCKING findings contribute to `--blocking`")
