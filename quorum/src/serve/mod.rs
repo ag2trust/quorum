@@ -20,6 +20,7 @@ pub mod names;
 pub mod planner;
 pub mod recovery;
 pub mod render;
+pub mod review_cycle_context;
 pub mod reviewer;
 pub mod runner;
 pub mod session_log;
@@ -81,6 +82,19 @@ fn load_task_review_contract(db_path: &Path, task_id: i64) -> Result<String> {
         depends_on.as_deref(),
         &recovery_notes,
     ))
+}
+
+fn load_review_cycle_context(
+    db_path: &Path,
+    task_id: i64,
+) -> Result<review_cycle_context::ReviewCycleContext> {
+    let conn = quorum_core::db::open(db_path)?;
+    let rework_round = conn.query_row(
+        "SELECT rework_round FROM tasks WHERE id=?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    Ok(review_cycle_context::ReviewCycleContext::from_persisted_rework_round(rework_round))
 }
 
 fn prepare_reviewer_authority(
@@ -5952,6 +5966,14 @@ async fn resume_reviewer_after_ci(
             .await
             .map_err(|error| QuorumError::Io(format!("task review context join: {error}")))??
     };
+    // Reload from durable task state: sticky reviewer continuation and daemon
+    // recovery must not depend on an in-memory slot counter.
+    let review_cycle = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
+    };
     let rereview_turn = format!(
         "{}\n\n{}",
         reviewer::build_rereview_turn_with_context(
@@ -5960,6 +5982,7 @@ async fn resume_reviewer_after_ci(
             &workers[worker_index].agent_name,
             &reviewers[reviewer_index].effort,
             graph_context.as_deref(),
+            review_cycle,
         ),
         task_contract
     );
@@ -5977,6 +6000,19 @@ async fn resume_reviewer_after_ci(
     if current_graph_context != graph_context {
         return Err(QuorumError::Io(format!(
             "graph review authority changed before re-review feed for task #{task_id}"
+        )));
+    }
+    let current_review_cycle = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!("review-cycle rereview revalidation join: {error}"))
+            })??
+    };
+    if current_review_cycle != review_cycle {
+        return Err(QuorumError::Io(format!(
+            "review-cycle context changed before re-review feed for task #{task_id}"
         )));
     }
     if let Err(error) = reviewers[reviewer_index]
@@ -13670,6 +13706,17 @@ async fn provision_reviewer_reserved(
             }
         }
     };
+    // Replacement R1/R2 reviewers, including daemon-restart recovery, are
+    // fresh processes. Carry the durable lifecycle count into their initial
+    // turn whenever they are actually reviewing a remediated task.
+    let review_cycle = {
+        let db_path = config.db_path.clone();
+        let task_id = worker.task_id;
+        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
+    };
+    let review_cycle = (review_cycle.rework_round != 0).then_some(review_cycle);
 
     // Prompt composition remains role- and provider-aware; the runner adapter
     // owns how that neutral prompt reaches the CLI.
@@ -13680,11 +13727,12 @@ async fn provision_reviewer_reserved(
                 worker_agent: worker.agent_name.to_string(),
                 reviewer_name: reviewer_name.clone(),
             };
-            reviewer::build_review_prompt_for_kind_with_context(
+            reviewer::build_review_prompt_for_kind_with_context_and_cycle(
                 reviewer_kind,
                 &spec,
                 &reviewer_effort,
                 graph_context.as_deref(),
+                review_cycle,
             )
         }
         ReviewRole::R2 { r1_reviewer, .. } => {
@@ -13694,11 +13742,12 @@ async fn provision_reviewer_reserved(
                 r1_reviewer: r1_reviewer.clone(),
                 r2_name: reviewer_name.clone(),
             };
-            reviewer::build_r2_review_prompt_for_kind_with_context(
+            reviewer::build_r2_review_prompt_for_kind_with_context_and_cycle(
                 reviewer_kind,
                 &spec,
                 &reviewer_effort,
                 graph_context.as_deref(),
+                review_cycle,
             )
         }
     };
@@ -16720,6 +16769,41 @@ mod tests {
     use super::*;
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn review_cycle_context_reloads_persisted_rework_round_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("review-cycle.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "creator",
+                "review-cycle context",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET rework_round=?1 WHERE id=?2",
+                rusqlite::params![quorum_core::lifecycle::REWORK_CAP, task_id],
+            )
+            .unwrap();
+            task_id
+        };
+
+        let resumed = load_review_cycle_context(&db_path, task_id).unwrap();
+        assert_eq!(
+            resumed.rework_round,
+            i64::from(quorum_core::lifecycle::REWORK_CAP)
+        );
+        assert!(resumed.final_opportunity);
+    }
 
     fn writable_deliverables(path: &str) -> quorum_core::decomposition::ChildDeliverables {
         quorum_core::decomposition::ChildDeliverables(vec![
