@@ -3295,16 +3295,17 @@ pub fn retain_blocked_remediation_retry(
 /// the upgrade atomically with the cancel — no scheduling gap where the
 /// dependent stays hidden from BLOCKED.
 ///
-/// Bounded per call by [`CONVERGE_LIMIT`]: without a reverse-dep index the
-/// selector scans failed daemon-parked rows and evaluates `json_each` per
-/// dep, and the write loop is O(matches). The LIMIT caps both under the
-/// cancellation `BEGIN IMMEDIATE` so the writer window stays bounded.
+/// Bounded per call by [`CONVERGE_LIMIT`]. Cancellation installs a durable
+/// cursor and examines at most one primary-key page of tasks. Ordinary
+/// write-sweeps continue that cursor, so retained no-match history cannot
+/// enlarge one `BEGIN IMMEDIATE` window and matches beyond the first page
+/// are eventually repaired without another cancellation.
 /// Correctness of the operator disposition queue does not depend on this
 /// convergence: `stats::blocked_tasks` and `retry_parked` both infer the
 /// unsatisfiable condition from the live dep graph, so any dependent that
 /// exceeds the bound still surfaces in BLOCKED and still refuses retry —
-/// only the durable `daemon_parked_reason`/marker refresh may lag one
-/// mutation, and the next cancel or `sweep_all` completes convergence.
+/// only the durable `daemon_parked_reason`/marker refresh may lag while the
+/// durable queue is drained by production sweep call sites.
 ///
 /// Classifier-policy parks are skipped intentionally: their durable reason
 /// is "classifier declined" and their retry path is reclassification, not
@@ -3312,9 +3313,6 @@ pub fn retain_blocked_remediation_retry(
 /// cause. `stats::blocked_tasks` surfaces those rows via live dep-graph
 /// inference instead, so the disposition signal is still present.
 ///
-/// ponytail: bounded scan + write, upgrade to a reverse-dep index if the
-/// operator disposition queue grows enough that lagging refs become
-/// observable.
 pub(crate) const CONVERGE_LIMIT: usize = 64;
 
 pub(crate) fn converge_parked_dependents_of_cancelled(
@@ -3322,32 +3320,108 @@ pub(crate) fn converge_parked_dependents_of_cancelled(
     cancelled_id: i64,
     now: i64,
 ) -> Result<usize> {
-    let candidates: Vec<i64> = {
+    tx.execute(
+        "INSERT INTO cancelled_dependency_reconciliation(
+             cancelled_task_id, task_cursor, updated_at
+         ) VALUES (?1, 0, ?2)
+         ON CONFLICT(cancelled_task_id) DO UPDATE SET updated_at=excluded.updated_at",
+        params![cancelled_id, now],
+    )?;
+    process_cancelled_dependency_reconciliation(tx, cancelled_id, now, CONVERGE_LIMIT)
+}
+
+/// Continue one durable cancelled-dependency cursor by examining at most
+/// `limit` raw task rows. Paging only on the INTEGER PRIMARY KEY makes the
+/// amount of candidate work independent of task status and JSON selectivity.
+pub(crate) fn converge_cancelled_dependency_reconciliation(
+    tx: &Connection,
+    now: i64,
+    limit: usize,
+) -> Result<usize> {
+    let Some(cancelled_id) = tx
+        .query_row(
+            "SELECT cancelled_task_id
+             FROM cancelled_dependency_reconciliation
+             ORDER BY cancelled_task_id
+             LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(0);
+    };
+    process_cancelled_dependency_reconciliation(tx, cancelled_id, now, limit)
+}
+
+fn process_cancelled_dependency_reconciliation(
+    tx: &Connection,
+    cancelled_id: i64,
+    now: i64,
+    limit: usize,
+) -> Result<usize> {
+    let cursor: i64 = tx.query_row(
+        "SELECT task_cursor FROM cancelled_dependency_reconciliation
+         WHERE cancelled_task_id=?1",
+        [cancelled_id],
+        |row| row.get(0),
+    )?;
+    let page_limit = limit.min(CONVERGE_LIMIT).max(1);
+    let page: Vec<(i64, String, Option<String>, Option<String>)> = {
         let mut stmt = tx.prepare(
-            "SELECT id FROM tasks
-             WHERE status='failed'
-               AND depends_on IS NOT NULL
-               AND json_valid(refs)
-               AND json_extract(refs, '$.daemon_parked')=1
-               AND COALESCE(
-                   json_extract(refs, '$.classifier_policy_parked'), 0
-               ) != 1
-               AND COALESCE(
-                   json_extract(refs, '$.daemon_parked_unsatisfiable'), 0
-               ) != 1
-               AND EXISTS (
-                   SELECT 1 FROM json_each(depends_on) j
-                   WHERE j.value = ?1
-               )
+            "SELECT id, status, depends_on, refs
+             FROM tasks
+             WHERE id > ?1
+             ORDER BY id
              LIMIT ?2",
         )?;
-        let rows = stmt
-            .query_map(params![cancelled_id, CONVERGE_LIMIT as i64], |r| {
-                r.get::<_, i64>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
+        let rows = stmt.query_map(params![cursor, page_limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
+    if page.is_empty() {
+        tx.execute(
+            "DELETE FROM cancelled_dependency_reconciliation
+             WHERE cancelled_task_id=?1",
+            [cancelled_id],
+        )?;
+        return Ok(0);
+    }
+    let last_id = page.last().expect("non-empty page").0;
+    let mut candidates = Vec::new();
+    for (task_id, status, depends_on, refs) in &page {
+        if status != "failed" {
+            continue;
+        }
+        let Some(deps) = depends_on
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<i64>>(raw).ok())
+        else {
+            continue;
+        };
+        if !deps.contains(&cancelled_id) {
+            continue;
+        }
+        let Some(refs) = refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        else {
+            continue;
+        };
+        if refs.get(PARKED_REF).and_then(serde_json::Value::as_bool) == Some(true)
+            && refs
+                .get(CLASSIFIER_POLICY_PARKED_REF)
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            && refs
+                .get(PARKED_UNSATISFIABLE_REF)
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            candidates.push(*task_id);
+        }
+    }
     let reason = format!("dependency #{cancelled_id} is cancelled — unsatisfiable");
     for task_id in &candidates {
         tx.execute(
@@ -3373,6 +3447,20 @@ pub(crate) fn converge_parked_dependents_of_cancelled(
             &format!("task#{task_id}"),
             &reason,
             now,
+        )?;
+    }
+    if page.len() < page_limit {
+        tx.execute(
+            "DELETE FROM cancelled_dependency_reconciliation
+             WHERE cancelled_task_id=?1",
+            [cancelled_id],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE cancelled_dependency_reconciliation
+             SET task_cursor=?2, updated_at=?3
+             WHERE cancelled_task_id=?1",
+            params![cancelled_id, last_id, now],
         )?;
     }
     Ok(candidates.len())
@@ -11265,14 +11353,32 @@ mod tests {
         );
     }
 
-    /// Task #473 R7 blocker 2: convergence is bounded per call. Piling on
-    /// more dependents than `CONVERGE_LIMIT` must not blow the write
-    /// window under the cancellation transaction; the remainder is picked
-    /// up by later calls (idempotent) or by live read inference in the
-    /// meantime.
+    /// Task #473 final blockers: cancellation examines a raw-ID page rather
+    /// than scanning to `LIMIT` matches, and ordinary write-side sweeping
+    /// durably converges dependents beyond that page without a second helper
+    /// or cancellation call.
     #[test]
-    fn converge_parked_dependents_of_cancelled_bounded_per_call() {
+    fn cancelled_dependency_reconciliation_is_bounded_and_continues_in_production() {
         let (_d, mut c) = open_tmp();
+        // Retained no-match history precedes both the dependency and its
+        // dependents. A post-filter LIMIT would scan all of this during the
+        // cancellation transaction; the cursor page examines exactly the
+        // first CONVERGE_LIMIT primary-key rows instead.
+        for i in 0..(CONVERGE_LIMIT * 2) {
+            create(
+                &mut c,
+                "boss",
+                &format!("history-{i}"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .unwrap();
+        }
         let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
         let extra = CONVERGE_LIMIT + 5;
         let mut ids = Vec::new();
@@ -11302,17 +11408,61 @@ mod tests {
             .unwrap();
             ids.push(id);
         }
-        c.execute(
-            "UPDATE tasks SET status='cancelled' WHERE id=?1",
-            params![dep],
+        update(
+            &mut c,
+            "boss",
+            dep,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            2000,
         )
         .unwrap();
-        let first = converge_parked_dependents_of_cancelled(&c, dep, 2000).unwrap();
-        assert_eq!(first, CONVERGE_LIMIT, "must not exceed bound");
-        // A follow-up call keeps converging remaining dependents.
-        let second = converge_parked_dependents_of_cancelled(&c, dep, 2001).unwrap();
-        assert_eq!(second, extra - CONVERGE_LIMIT);
-        // After both, all dependents are converged.
+        let cursor: i64 = c
+            .query_row(
+                "SELECT task_cursor FROM cancelled_dependency_reconciliation
+                 WHERE cancelled_task_id=?1",
+                [dep],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, CONVERGE_LIMIT as i64);
+        assert!(ids.iter().all(|id| {
+            let refs: serde_json::Value =
+                serde_json::from_str(get(&c, *id).unwrap().unwrap().refs.as_deref().unwrap())
+                    .unwrap();
+            refs["daemon_parked_unsatisfiable"] == false
+        }));
+
+        // `create` is a normal mutation and therefore invokes
+        // sweep_on_write. Repeated production writes drain the durable
+        // cursor through history and then through every dependent page.
+        for i in 0..4 {
+            create(
+                &mut c,
+                "boss",
+                &format!("sweep-trigger-{i}"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                2001 + i as i64,
+            )
+            .unwrap();
+        }
+        let queued: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM cancelled_dependency_reconciliation
+                 WHERE cancelled_task_id=?1",
+                [dep],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 0, "production sweeps must drain the queue");
         let remaining: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM tasks
@@ -11325,6 +11475,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 0);
+
+        let plan: Vec<String> = c
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, status, depends_on, refs FROM tasks
+                 WHERE id > ?1 ORDER BY id LIMIT ?2",
+            )
+            .unwrap()
+            .query_map(params![0, CONVERGE_LIMIT as i64], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("INTEGER PRIMARY KEY (rowid>?)")),
+            "cursor page must use the task primary key: {plan:?}"
+        );
     }
 
     #[test]

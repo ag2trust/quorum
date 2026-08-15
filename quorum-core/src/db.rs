@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 50;
+pub const SCHEMA_VERSION: i64 = 51;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -792,6 +792,18 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                        WHERE d.status IN ('cancelled')
                    )",
                 [],
+            )?;
+        }
+        // v51 adds a durable cursor queue for bounded cancelled-dependency
+        // reconciliation. The idempotent table is declared in SCHEMA_SQL;
+        // repeat it here to make the versioned shape explicit.
+        if current < 51 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cancelled_dependency_reconciliation (
+                     cancelled_task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+                     task_cursor       INTEGER NOT NULL DEFAULT 0,
+                     updated_at        INTEGER NOT NULL
+                 );",
             )?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -4048,5 +4060,49 @@ mod tests {
             .query_row("SELECT refs FROM tasks WHERE id=3", [], |r| r.get(0))
             .unwrap();
         assert_eq!(refs3_again, refs3);
+    }
+
+    #[test]
+    fn migrates_v50_to_v51_adds_cancelled_dependency_reconciliation_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v50-cancelled-dependency-queue.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE cancelled_dependency_reconciliation;
+                 PRAGMA user_version=50;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+             VALUES (1,'cancelled','cancelled','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cancelled_dependency_reconciliation(
+                 cancelled_task_id,task_cursor,updated_at
+             ) VALUES (1,64,2)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT task_cursor FROM cancelled_dependency_reconciliation
+                 WHERE cancelled_task_id=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            64
+        );
     }
 }

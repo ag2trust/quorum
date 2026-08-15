@@ -535,6 +535,7 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // `claimed` task must become re-claimable on the next write).
     reap_lapsed_tasks(conn, now, limit)?;
     cascade_dead_deps(conn, now, limit)?;
+    crate::tasks::converge_cancelled_dependency_reconciliation(conn, now, limit)?;
     delete_bounded(conn, "messages", now, limit)?;
     delete_bounded(conn, "events", now, limit)?;
     delete_bounded(conn, "errors", now, limit)?;
@@ -563,6 +564,17 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     reap_lapsed_tasks(&tx, now, usize::MAX)?;
     cascade_dead_deps(&tx, now, usize::MAX)?;
+    while tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM cancelled_dependency_reconciliation)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        crate::tasks::converge_cancelled_dependency_reconciliation(
+            &tx,
+            now,
+            crate::tasks::CONVERGE_LIMIT,
+        )?;
+    }
     tx.execute("DELETE FROM messages WHERE expires_at <= ?1", params![now])?;
     tx.execute("DELETE FROM events WHERE expires_at <= ?1", params![now])?;
     tx.execute("DELETE FROM errors WHERE expires_at <= ?1", params![now])?;
