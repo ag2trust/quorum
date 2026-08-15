@@ -8,12 +8,18 @@
 use super::runner::{
     capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
     CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation, FailureTracker,
-    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
+    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage, WorkerTurnRequest,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::pin::Pin;
 use std::process::Stdio;
+#[cfg(test)]
+use std::task::{Context, Poll};
 use tokio::io::AsyncReadExt;
+#[cfg(test)]
+use tokio::io::ReadBuf;
 use tokio::process::{Child, ChildStdout, Command};
 
 pub const SUPPORTED_MODEL: &str = "grok-4.5";
@@ -28,6 +34,23 @@ const RESTRICTED_PERMISSION_MODE: &str = "dontAsk";
 const RESTRICTED_MAX_TURNS: u32 = 8;
 const STDOUT_LINE_BYTES: usize = 1024 * 1024;
 const TERMINAL_STDOUT_LINES: usize = 256;
+const MAX_SESSION_ID_BYTES: usize = 1024;
+
+#[cfg(test)]
+struct InjectedStderrReadError;
+
+#[cfg(test)]
+impl tokio::io::AsyncRead for InjectedStderrReadError {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Err(std::io::Error::other(
+            "injected Grok stderr read error",
+        )))
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct GrokAdapterConfig<'a> {
@@ -158,8 +181,8 @@ pub fn headless_args(spec: &GrokSpec, mode: LaunchMode) -> std::io::Result<Vec<S
 /// supplies the same validated configuration on every turn.
 pub fn resume_args(session_id: &str, spec: &GrokSpec) -> std::io::Result<Vec<String>> {
     spec.validate()?;
-    if session_id.trim().is_empty() {
-        return Err(invalid_input("Grok continuation session ID is empty"));
+    if !valid_session_id(session_id) {
+        return Err(invalid_input("Grok continuation session ID is malformed"));
     }
     let mut args = vec!["--resume".into(), session_id.into()];
     args.extend(common_args(
@@ -179,6 +202,12 @@ struct BoundedStdout {
     line: Vec<u8>,
     dropped: usize,
     eof: bool,
+    clean_eof: bool,
+    read_error: Option<String>,
+    #[cfg(test)]
+    lines_returned: usize,
+    #[cfg(test)]
+    injected_read_error_after_lines: Option<usize>,
 }
 
 impl BoundedStdout {
@@ -191,6 +220,12 @@ impl BoundedStdout {
             line: Vec::new(),
             dropped: 0,
             eof: false,
+            clean_eof: false,
+            read_error: None,
+            #[cfg(test)]
+            lines_returned: 0,
+            #[cfg(test)]
+            injected_read_error_after_lines: None,
         }
     }
 
@@ -216,8 +251,26 @@ impl BoundedStdout {
                 return Some(self.finish_line());
             }
 
+            #[cfg(test)]
+            if self
+                .injected_read_error_after_lines
+                .is_some_and(|lines| self.lines_returned >= lines)
+            {
+                self.injected_read_error_after_lines = None;
+                self.read_error = Some("injected Grok stdout read error".into());
+                self.eof = true;
+                continue;
+            }
+
             match self.reader.read(&mut self.chunk[..]).await {
-                Ok(0) | Err(_) => self.eof = true,
+                Ok(0) => {
+                    self.eof = true;
+                    self.clean_eof = true;
+                }
+                Err(error) => {
+                    self.eof = true;
+                    self.read_error = Some(error.to_string());
+                }
                 Ok(read) => {
                     self.position = 0;
                     self.filled = read;
@@ -227,6 +280,10 @@ impl BoundedStdout {
     }
 
     fn finish_line(&mut self) -> String {
+        #[cfg(test)]
+        {
+            self.lines_returned = self.lines_returned.saturating_add(1);
+        }
         if self.line.last() == Some(&b'\r') {
             self.line.pop();
         }
@@ -254,6 +311,19 @@ impl BoundedStdout {
         self.line.clear();
         line
     }
+
+    fn reached_clean_eof(&self) -> bool {
+        self.clean_eof
+    }
+
+    fn take_read_error(&mut self) -> Option<String> {
+        self.read_error.take()
+    }
+
+    #[cfg(test)]
+    fn inject_read_error_after_lines(&mut self, lines: usize) {
+        self.injected_read_error_after_lines = Some(lines);
+    }
 }
 
 pub struct GrokProc {
@@ -263,6 +333,11 @@ pub struct GrokProc {
     diagnostics: DiagnosticBuffer,
     failures: FailureTracker,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+    pending_terminal: Option<String>,
+    terminal_rejected: bool,
+    stdout_complete: bool,
+    terminal_exit_status: Option<std::process::ExitStatus>,
+    worker_request: Option<Box<WorkerTurnRequest>>,
 }
 
 impl GrokProc {
@@ -344,6 +419,11 @@ impl GrokProc {
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
+            pending_terminal: None,
+            terminal_rejected: false,
+            stdout_complete: false,
+            terminal_exit_status: None,
+            worker_request: None,
         })
     }
 
@@ -369,7 +449,7 @@ impl GrokProc {
                 if value
                     .get("sessionId")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|id| !id.trim().is_empty()) =>
+                    .is_some_and(valid_session_id) =>
             {
                 FailureObservation::success()
             }
@@ -400,15 +480,27 @@ impl GrokProc {
         &self,
         status: std::process::ExitStatus,
     ) -> Option<RunnerFailure> {
+        if let Some(failure) = self.failures.observed_strict_failure() {
+            return Some(failure);
+        }
         self.failures.classify_exit(status)
     }
 
     pub fn observed_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
-        self.failures.observed_failure()
+        self.failures.observed_strict_failure()
     }
 
     pub(super) fn failure_tracker(&self) -> FailureTracker {
         self.failures.clone()
+    }
+
+    #[allow(dead_code)] // dormant internal boundary; managed Grok routing is still rejected
+    pub(super) fn set_worker_request(&mut self, request: WorkerTurnRequest) {
+        self.worker_request = Some(Box::new(request));
+    }
+
+    pub(super) fn worker_request(&self) -> Option<&WorkerTurnRequest> {
+        self.worker_request.as_deref()
     }
 
     pub(super) async fn finish_stderr_until(&mut self, deadline: tokio::time::Instant) -> bool {
@@ -428,10 +520,133 @@ impl GrokProc {
 
     pub async fn next_raw_line(&mut self) -> Option<String> {
         let line = self.reader.next_line().await;
-        if let Some(raw) = &line {
-            self.failures.observe_stdout(raw);
+        if let Some(error) = self.reader.take_read_error() {
+            self.failures.note_incomplete_evidence(format!(
+                "Grok terminal stdout evidence could not be read: {error}"
+            ));
+            self.terminal_rejected = true;
         }
-        line
+        let Some(raw) = line else {
+            self.stdout_complete = self.reader.reached_clean_eof();
+            return None;
+        };
+
+        self.failures.observe_stdout(&raw);
+        if self.pending_terminal.is_some() {
+            let detail = match terminal_session_id(&raw) {
+                Some(_) => "Grok emitted a duplicate or conflicting terminal session ID",
+                None => "Grok emitted output after its terminal session event",
+            };
+            self.failures.note_incomplete_evidence(detail);
+            self.terminal_rejected = true;
+        } else if terminal_session_id(&raw).is_some() {
+            // Preserve the raw terminal record immediately. Lifecycle events
+            // remain withheld until `authorized_terminal` proves clean
+            // EOF, zero exit, and complete stderr evidence.
+            self.pending_terminal = Some(raw.clone());
+        }
+        Some(raw)
+    }
+
+    /// Return a buffered Grok terminal record only after every source of
+    /// contradictory process evidence is complete. This method never waits
+    /// on a running child or stderr task, so polling cancellation cannot lose
+    /// the pending provider identity.
+    pub(super) async fn authorized_terminal(&mut self) -> Option<String> {
+        if self.pending_terminal.is_none() || self.terminal_rejected || !self.stdout_complete {
+            return None;
+        }
+
+        if self.terminal_exit_status.is_none() {
+            match self.child.try_wait() {
+                Ok(Some(status)) => self.terminal_exit_status = Some(status),
+                Ok(None) => return None,
+                Err(error) => {
+                    self.failures.note_incomplete_evidence(format!(
+                        "Grok terminal process status was unavailable: {error}"
+                    ));
+                    self.terminal_rejected = true;
+                    return None;
+                }
+            }
+        }
+        let status = self
+            .terminal_exit_status
+            .expect("terminal exit status was checked above");
+        if !status.success() {
+            self.failures.note_incomplete_evidence(format!(
+                "Grok emitted terminal success but exited with {status}"
+            ));
+            self.terminal_rejected = true;
+            return None;
+        }
+
+        if self
+            .stderr_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return None;
+        }
+        if let Some(task) = self.stderr_task.take() {
+            if let Err(error) = task.await {
+                self.failures.note_incomplete_evidence(format!(
+                    "Grok terminal stderr evidence could not be finalized: {error}"
+                ));
+                self.terminal_rejected = true;
+                return None;
+            }
+        }
+
+        if self.failures.observed_strict_failure().is_some() {
+            self.terminal_rejected = true;
+            return None;
+        }
+        // Keep the candidate until slot teardown. A caller may be cancelled
+        // or encounter a persistence error after this pure authorization
+        // decision; retaining the exact provider record makes that handoff
+        // retryable instead of silently losing the identity.
+        self.pending_terminal.clone()
+    }
+
+    pub(super) fn terminal_evidence_pending(&self) -> bool {
+        self.pending_terminal.is_some() && !self.terminal_rejected && self.stdout_complete
+    }
+
+    pub(super) fn terminal_candidate_pending(&self) -> bool {
+        self.pending_terminal.is_some() && !self.terminal_rejected
+    }
+
+    pub(super) fn normalize_stream_line(raw: &str) -> Vec<AgentEvent> {
+        if terminal_session_id(raw).is_some() {
+            Vec::new()
+        } else {
+            normalize_grok_line(raw)
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_stdout_read_error_after_lines(&mut self, lines: usize) {
+        self.reader.inject_read_error_after_lines(lines);
+    }
+
+    #[cfg(test)]
+    pub(super) async fn inject_stderr_read_error(&mut self) {
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        let diagnostics = self.diagnostics.clone();
+        self.stderr_task = Some(tokio::spawn(async move {
+            capture_diagnostics(InjectedStderrReadError, diagnostics).await
+        }));
+    }
+
+    #[cfg(test)]
+    pub(super) fn stderr_evidence_pending(&self) -> bool {
+        self.stderr_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
     }
 
     pub async fn next_raw_line_bounded(
@@ -533,17 +748,20 @@ pub fn normalize_grok_line(raw: &str) -> Vec<AgentEvent> {
 }
 
 fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
-    let Some(session_id) = value
-        .get("sessionId")
-        .and_then(serde_json::Value::as_str)
-        .filter(|session_id| !session_id.trim().is_empty())
-    else {
+    let Some(session_id) = value.get("sessionId").and_then(serde_json::Value::as_str) else {
         return vec![AgentEvent::TurnFailed {
             message: "Grok end event missing sessionId".into(),
             usage: terminal_usage(value),
             cost_usd: terminal_cost(value),
         }];
     };
+    if !valid_session_id(session_id) {
+        return vec![AgentEvent::TurnFailed {
+            message: "Grok end event missing sessionId or sessionId malformed".into(),
+            usage: terminal_usage(value),
+            cost_usd: terminal_cost(value),
+        }];
+    }
     vec![
         AgentEvent::ThreadStarted {
             thread_id: session_id.to_string(),
@@ -553,6 +771,25 @@ fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
             cost_usd: terminal_cost(value),
         },
     ]
+}
+
+fn terminal_session_id(raw: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("end") {
+        return None;
+    }
+    value
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|session_id| valid_session_id(session_id))
+        .map(str::to_string)
+}
+
+fn valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= MAX_SESSION_ID_BYTES
+        && session_id.trim() == session_id
+        && !session_id.chars().any(char::is_control)
 }
 
 fn terminal_usage(value: &serde_json::Value) -> Option<TokenUsage> {
@@ -846,6 +1083,11 @@ mod tests {
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
+            pending_terminal: None,
+            terminal_rejected: false,
+            stdout_complete: false,
+            terminal_exit_status: None,
+            worker_request: None,
         }
     }
 

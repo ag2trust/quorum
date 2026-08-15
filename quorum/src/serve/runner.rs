@@ -12,6 +12,7 @@
 use super::agent::AgentProc;
 use super::codex_agent::CodexProc;
 use super::grok_agent::{GrokAdapterConfig, GrokProc};
+use quorum_core::runner_state::{self, PendingTurn};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -258,12 +259,25 @@ impl FailureTracker {
         let state = self.0.lock().expect("failure tracker poisoned");
         observed_failure(&state)
     }
+
+    /// Grok withholds terminal success until EOF and zero exit, so any earlier
+    /// protocol/diagnostic failure remains authoritative even if a later
+    /// syntactically valid `end` was observed. Other providers retain their
+    /// established terminal-success precedence through `observed_failure`.
+    pub fn observed_strict_failure(&self) -> Option<RunnerFailure> {
+        let state = self.0.lock().expect("failure tracker poisoned");
+        observed_strict_failure(&state)
+    }
 }
 
 fn observed_failure(state: &FailureTrackerState) -> Option<RunnerFailure> {
     if state.terminal_success {
         return None;
     }
+    observed_strict_failure(state)
+}
+
+fn observed_strict_failure(state: &FailureTrackerState) -> Option<RunnerFailure> {
     if let Some(detail) = &state.incomplete_evidence {
         return Some(RunnerFailure::new(
             FailureDisposition::Unclassified,
@@ -384,6 +398,12 @@ impl DiagnosticBuffer {
         let mut state = self.state.lock().expect("diagnostic buffer poisoned");
         state.dropped_bytes = state.dropped_bytes.saturating_add(count);
     }
+
+    fn note_read_error(&self, error: &std::io::Error) {
+        self.failures.note_incomplete_evidence(format!(
+            "provider stderr evidence could not be read: {error}"
+        ));
+    }
 }
 
 pub async fn capture_diagnostics<R>(mut reader: R, diagnostics: DiagnosticBuffer)
@@ -395,7 +415,11 @@ where
     let mut line_dropped = 0usize;
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(error) => {
+                diagnostics.note_read_error(&error);
+                break;
+            }
             Ok(read) => {
                 for &byte in &chunk[..read] {
                     if byte == b'\n' {
@@ -463,6 +487,35 @@ pub struct LaunchRequest<'a> {
     pub continuation_id: Option<&'a str>,
 }
 
+/// Complete identity for one internally exercised managed worker launch.
+/// Public/configured Grok role selection remains rejected elsewhere; this
+/// request exists so transport plumbing cannot drop task, assignment, role,
+/// or pending-turn identity between launch and terminal persistence.
+#[allow(dead_code)] // constructed only by the dormant internal Grok worker exercise today
+pub struct RunnerRequest<'a> {
+    pub launch: LaunchRequest<'a>,
+    pub task_id: i64,
+    pub role_assignment_id: i64,
+    pub responsibility_key: &'a str,
+    pub agent: &'a str,
+    pub role: &'a str,
+    pub pending_turn: PendingTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerTurnRequest {
+    pub task_id: i64,
+    pub role_assignment_id: i64,
+    pub responsibility_key: String,
+    pub agent: String,
+    pub role: String,
+    pub provider: String,
+    pub runner: String,
+    pub model: String,
+    pub effort: String,
+    pub pending_turn: PendingTurn,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchMode {
     Normal,
@@ -497,6 +550,60 @@ pub enum RunnerProc {
 }
 
 impl RunnerProc {
+    /// Exercise an initial Grok worker through the shared request/process
+    /// boundary without making the provider selectable by managed routing.
+    #[allow(dead_code)] // activation gate intentionally leaves this unreachable in production
+    pub async fn launch_internal_worker(
+        request: &RunnerRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> Result<Self, RunnerFailure> {
+        let kind = AgentKind::for_model(request.launch.model).map_err(|error| {
+            RunnerFailure::new(FailureDisposition::Unclassified, error)
+                .with_io_kind(std::io::ErrorKind::InvalidInput)
+        })?;
+        if kind != AgentKind::Grok
+            || request.task_id <= 0
+            || request.role_assignment_id <= 0
+            || request.responsibility_key.is_empty()
+            || request.agent.is_empty()
+            || request.role != "worker"
+            || request.launch.continuation_id.is_some()
+            || request.pending_turn.turn_kind != "initial"
+            || request.pending_turn.continuation_id.is_some()
+            || request.pending_turn.requested
+            || request.pending_turn.provider != kind.to_string()
+            || request.pending_turn.model != request.launch.model
+            || request.pending_turn.effort != request.launch.effort
+            || request.pending_turn.prompt != request.launch.prompt
+            || !runner_state::pending_turn_is_complete(&request.pending_turn)
+        {
+            return Err(RunnerFailure::new(
+                FailureDisposition::NonFailover,
+                "internal Grok worker request has incomplete or mismatched task, assignment, role, model, effort, or pending-turn identity",
+            )
+            .with_io_kind(std::io::ErrorKind::InvalidInput));
+        }
+        let identity = WorkerTurnRequest {
+            task_id: request.task_id,
+            role_assignment_id: request.role_assignment_id,
+            responsibility_key: request.responsibility_key.to_string(),
+            agent: request.agent.to_string(),
+            role: request.role.to_string(),
+            provider: kind.to_string(),
+            runner: kind.to_string(),
+            model: request.launch.model.to_string(),
+            effort: request.launch.effort.to_string(),
+            pending_turn: request.pending_turn.clone(),
+        };
+        match Self::launch(&request.launch, config).await? {
+            Self::Grok(mut proc) => {
+                proc.set_worker_request(identity);
+                Ok(Self::Grok(proc))
+            }
+            _ => unreachable!("internal worker boundary accepted only Grok above"),
+        }
+    }
+
     /// Resolve and launch the explicit built-in adapter for this model.
     pub async fn launch(
         request: &LaunchRequest<'_>,
@@ -555,6 +662,13 @@ impl RunnerProc {
             Self::Claude(_) => AgentKind::Claude,
             Self::Codex(_) => AgentKind::Codex,
             Self::Grok(_) => AgentKind::Grok,
+        }
+    }
+
+    pub fn worker_request(&self) -> Option<&WorkerTurnRequest> {
+        match self {
+            Self::Grok(proc) => proc.worker_request(),
+            Self::Claude(_) | Self::Codex(_) => None,
         }
     }
 
@@ -706,6 +820,50 @@ impl RunnerProc {
             Self::Codex(proc) => proc.next_raw_line().await,
             Self::Grok(proc) => proc.next_raw_line().await,
         }
+    }
+
+    /// Normalize a line for immediate stream delivery. Grok terminal records
+    /// are raw evidence first; their lifecycle events are exposed separately
+    /// only after the adapter proves terminal process evidence is complete.
+    pub fn normalize_stream_line(&self, raw: &str) -> Vec<AgentEvent> {
+        match self {
+            Self::Grok(_) => GrokProc::normalize_stream_line(raw),
+            Self::Claude(_) | Self::Codex(_) => normalize_line(self.kind(), raw),
+        }
+    }
+
+    pub async fn authorized_grok_terminal(&mut self) -> Option<String> {
+        match self {
+            Self::Grok(proc) => proc.authorized_terminal().await,
+            Self::Claude(_) | Self::Codex(_) => None,
+        }
+    }
+
+    pub fn grok_terminal_evidence_pending(&self) -> bool {
+        matches!(self, Self::Grok(proc) if proc.terminal_evidence_pending())
+    }
+
+    pub fn grok_terminal_candidate_pending(&self) -> bool {
+        matches!(self, Self::Grok(proc) if proc.terminal_candidate_pending())
+    }
+
+    #[cfg(test)]
+    pub fn inject_grok_stdout_read_error_after_lines(&mut self, lines: usize) {
+        if let Self::Grok(proc) = self {
+            proc.inject_stdout_read_error_after_lines(lines);
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn inject_grok_stderr_read_error(&mut self) {
+        if let Self::Grok(proc) = self {
+            proc.inject_stderr_read_error().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn grok_stderr_evidence_pending(&self) -> bool {
+        matches!(self, Self::Grok(proc) if proc.stderr_evidence_pending())
     }
 
     /// Read one line with a hard boundary on bytes accumulated before a line
