@@ -112,6 +112,12 @@ def _rustc_wrapper() -> int:
 
     log = os.environ.get(WRAPPER_LOG_ENV)
     if log and crate_name:
+        # ``CARGO_MANIFEST_DIR`` uniquely identifies the source package for
+        # each rustc invocation cargo drives, disambiguating targets that
+        # collapse to the same rustc crate name across workspace members.
+        manifest_dir = os.environ.get("CARGO_MANIFEST_DIR", "")
+        pkg_name = os.environ.get("CARGO_PKG_NAME", "")
+        pkg_version = os.environ.get("CARGO_PKG_VERSION", "")
         entry = {
             "crate_name": crate_name,
             "is_test": is_test,
@@ -119,6 +125,9 @@ def _rustc_wrapper() -> int:
             "duration_secs": round(end - start, 6),
             "end_monotonic": round(end, 6),
             "exit_code": rc,
+            "manifest_dir": manifest_dir,
+            "pkg_name": pkg_name,
+            "pkg_version": pkg_version,
         }
         try:
             with open(log, "a") as f:
@@ -133,15 +142,37 @@ def _rustc_wrapper() -> int:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_crate_name(name: str) -> str:
+    """rustc emits the Rust identifier form of a crate name (hyphens replaced
+    with underscores) via ``--crate-name``. Cargo's structured ``target.name``
+    keeps the original hyphens for non-library targets. Normalize both sides
+    here so ``fake-agent`` (cargo target) matches ``fake_agent`` (rustc key).
+    """
+    return name.replace("-", "_")
+
+
 def correlate_compile_times(
     rustc_log: Path, binaries: list[dict]
 ) -> tuple[int, int]:
     """Attach exact per-invocation compile times from the RUSTC_WRAPPER log
-    onto ``binaries`` in place. Match by ``(--crate-name, --test == true)``,
-    which is 1:1 with a test executable in cargo's build graph. Returns
-    ``(matched_count, log_entry_count)``.
+    onto ``binaries`` in place. The compound key is
+    ``(manifest_dir, is_test, normalized_crate_name)``:
+
+    - ``manifest_dir`` (from cargo's ``CARGO_MANIFEST_DIR`` env in the wrapper
+      and ``dirname(manifest_path)`` in the compiler-artifact message)
+      distinguishes workspace members whose target names would otherwise
+      collide.
+    - ``is_test`` guards against matching a non-test build of the same crate.
+    - ``normalized_crate_name`` reconciles cargo's original hyphenated
+      ``target.name`` with rustc's underscored ``--crate-name``.
+
+    Returns ``(matched_count, log_entry_count)``.
     """
-    by_name: dict[str, float] = {}
+    Key = tuple  # (manifest_dir: str, is_test: bool, name: str)
+    by_key: dict[Key, float] = {}
+    # Fallback key when a wrapper record lacks manifest_dir (older log lines
+    # or non-cargo invocations); used only if no manifest-qualified match.
+    by_name_only: dict[tuple[bool, str], float] = {}
     entries = 0
     if rustc_log.exists():
         with rustc_log.open() as f:
@@ -159,18 +190,38 @@ def correlate_compile_times(
                 name = e.get("crate_name")
                 if not name:
                     continue
-                # Same crate_name + is_test may recur across profiles; sum so
-                # the reported figure covers every rustc invocation that fed
-                # the executable.
-                by_name[name] = by_name.get(name, 0.0) + float(
-                    e.get("duration_secs") or 0.0
+                dur = float(e.get("duration_secs") or 0.0)
+                norm = _normalize_crate_name(name)
+                by_name_only[(True, norm)] = (
+                    by_name_only.get((True, norm), 0.0) + dur
                 )
+                manifest_dir = e.get("manifest_dir") or ""
+                if manifest_dir:
+                    key = (manifest_dir, True, norm)
+                    by_key[key] = by_key.get(key, 0.0) + dur
     matched = 0
     for b in binaries:
-        name = b.get("target_name")
-        if name and name in by_name:
-            b["compile_no_run_secs"] = round(by_name[name], 3)
-            b["compile_no_run_source"] = "rustc_wrapper"
+        target_name = b.get("target_name") or ""
+        norm_name = _normalize_crate_name(target_name)
+        manifest_path = b.get("manifest_path") or ""
+        manifest_dir = (
+            str(Path(manifest_path).parent) if manifest_path else ""
+        )
+        dur: float | None = None
+        source: str | None = None
+        if manifest_dir:
+            k = (manifest_dir, True, norm_name)
+            if k in by_key:
+                dur = by_key[k]
+                source = "rustc_wrapper"
+        if dur is None:
+            k2 = (True, norm_name)
+            if k2 in by_name_only:
+                dur = by_name_only[k2]
+                source = "rustc_wrapper"
+        if dur is not None:
+            b["compile_no_run_secs"] = round(dur, 3)
+            b["compile_no_run_source"] = source
             matched += 1
         elif b.get("fresh"):
             # Cargo skipped rustc for this artifact — no compile cost this run.
@@ -242,6 +293,7 @@ def compile_tests(
                 continue
             binaries.append({
                 "package_id": msg.get("package_id"),
+                "manifest_path": msg.get("manifest_path"),
                 "target_name": target.get("name"),
                 "target_kinds": list(target.get("kind") or []),
                 "executable": executable,
@@ -448,47 +500,101 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
         log = out / "rustc.jsonl"
+        # Reviewer regression: hyphenated cargo target (`fake-agent`) must
+        # match the rustc key (`fake_agent`).  Also cover: two workspace
+        # members that expose the same target name → manifest_dir
+        # disambiguates.  Also cover: legacy wrapper record without
+        # manifest_dir → falls back to name-only key.
         log.write_text("\n".join([
             json.dumps({
                 "crate_name": "quorum_core", "is_test": True,
                 "duration_secs": 10.0,
+                "manifest_dir": "/ws/quorum-core",
             }),
             json.dumps({
                 "crate_name": "quorum", "is_test": True,
                 "duration_secs": 24.0,
+                "manifest_dir": "/ws/quorum",
             }),
             # Non-test build of same crate — must be ignored.
             json.dumps({
                 "crate_name": "quorum_core", "is_test": False,
                 "duration_secs": 5.0,
+                "manifest_dir": "/ws/quorum-core",
             }),
             json.dumps({
                 "crate_name": "cli_serve_config", "is_test": True,
                 "duration_secs": 27.0,
+                "manifest_dir": "/ws/quorum",
             }),
             # Duplicate test invocation — must sum.
             json.dumps({
                 "crate_name": "cli_serve_config", "is_test": True,
                 "duration_secs": 0.5,
+                "manifest_dir": "/ws/quorum",
+            }),
+            # Reviewer's hyphenated case: rustc key `fake_agent` from a
+            # target Cargo advertises as `fake-agent`.
+            json.dumps({
+                "crate_name": "fake_agent", "is_test": True,
+                "duration_secs": 3.25,
+                "manifest_dir": "/ws/quorum",
+            }),
+            # Same target name in a different package — manifest_dir wins.
+            json.dumps({
+                "crate_name": "shared_name", "is_test": True,
+                "duration_secs": 7.0,
+                "manifest_dir": "/ws/pkg_a",
+            }),
+            json.dumps({
+                "crate_name": "shared_name", "is_test": True,
+                "duration_secs": 11.0,
+                "manifest_dir": "/ws/pkg_b",
+            }),
+            # Legacy record — no manifest_dir; name-only fallback.
+            json.dumps({
+                "crate_name": "legacy_bin", "is_test": True,
+                "duration_secs": 4.5,
             }),
             "not-json",
             "",
         ]) + "\n")
         binaries = [
             {"target_name": "quorum_core", "executable": "/x",
-             "target_kinds": ["lib"], "fresh": False},
+             "target_kinds": ["lib"], "fresh": False,
+             "manifest_path": "/ws/quorum-core/Cargo.toml"},
             {"target_name": "quorum", "executable": "/y",
-             "target_kinds": ["bin"], "fresh": False},
+             "target_kinds": ["bin"], "fresh": False,
+             "manifest_path": "/ws/quorum/Cargo.toml"},
             {"target_name": "cli_serve_config", "executable": "/z",
-             "target_kinds": ["test"], "fresh": False},
+             "target_kinds": ["test"], "fresh": False,
+             "manifest_path": "/ws/quorum/Cargo.toml"},
             {"target_name": "unmatched_bin", "executable": "/w",
-             "target_kinds": ["test"], "fresh": False},
+             "target_kinds": ["test"], "fresh": False,
+             "manifest_path": "/ws/quorum/Cargo.toml"},
             {"target_name": "cached_bin", "executable": "/v",
-             "target_kinds": ["test"], "fresh": True},
+             "target_kinds": ["test"], "fresh": True,
+             "manifest_path": "/ws/quorum/Cargo.toml"},
+            # Hyphenated cargo target name — must match `fake_agent`.
+            {"target_name": "fake-agent", "executable": "/fa",
+             "target_kinds": ["bin"], "fresh": False,
+             "manifest_path": "/ws/quorum/Cargo.toml"},
+            # Same target name, different packages.
+            {"target_name": "shared_name", "executable": "/sa",
+             "target_kinds": ["test"], "fresh": False,
+             "manifest_path": "/ws/pkg_a/Cargo.toml"},
+            {"target_name": "shared_name", "executable": "/sb",
+             "target_kinds": ["test"], "fresh": False,
+             "manifest_path": "/ws/pkg_b/Cargo.toml"},
+            # Legacy fallback — no manifest_path on either side works too;
+            # here we set one on the binary but wrapper record has none.
+            {"target_name": "legacy_bin", "executable": "/lb",
+             "target_kinds": ["test"], "fresh": False,
+             "manifest_path": "/ws/legacy/Cargo.toml"},
         ]
         matched, entries = correlate_compile_times(log, binaries)
-        assert matched == 3, matched
-        assert entries == 5, entries
+        assert matched == 7, matched
+        assert entries == 9, entries
         assert binaries[0]["compile_no_run_secs"] == 10.0
         assert binaries[0]["compile_no_run_source"] == "rustc_wrapper"
         assert binaries[1]["compile_no_run_secs"] == 24.0
@@ -498,6 +604,16 @@ def self_test() -> int:
         assert binaries[3]["compile_no_run_source"] == "unmatched"
         assert binaries[4]["compile_no_run_secs"] == 0.0
         assert binaries[4]["compile_no_run_source"] == "cached_fresh"
+        # Hyphenated target matched via normalization.
+        assert binaries[5]["compile_no_run_secs"] == 3.25, \
+            binaries[5]["compile_no_run_secs"]
+        assert binaries[5]["compile_no_run_source"] == "rustc_wrapper"
+        # Same-name-different-package disambiguation.
+        assert binaries[6]["compile_no_run_secs"] == 7.0
+        assert binaries[7]["compile_no_run_secs"] == 11.0
+        # Legacy fallback (wrapper record without manifest_dir).
+        assert binaries[8]["compile_no_run_secs"] == 4.5
+        assert binaries[8]["compile_no_run_source"] == "rustc_wrapper"
 
         # Missing log file → all unmatched, no crash.
         binaries2 = [
