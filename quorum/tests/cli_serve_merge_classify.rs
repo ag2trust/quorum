@@ -485,6 +485,16 @@ fn policy_blocked_merge_parks_task_no_rework() {
         "exit 0",
         &[],
     );
+    std::fs::write(
+        retry_handle
+            ._gh_shim
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("state/1"),
+        &retry_branch,
+    )
+    .unwrap();
     assert!(
         retry_handle.wait_for("spawning reviewer", 15),
         "retried merge did not provision a fresh reviewer: {:?}",
