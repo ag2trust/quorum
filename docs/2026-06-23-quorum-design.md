@@ -654,20 +654,37 @@ a durable parked state. Parking atomically:
 This applies to exhausted crash recovery, repeated instant worker death, merge-policy
 blocks, reviewer repository mismatch, reviewer provision exhaustion, and terminal
 not-done dependencies. The dependency cascade parks the dependent with resume status
-`open`; readiness remains false until all dependencies are `done`.
+`open`; readiness remains false until all dependencies are `done`. The cascade also
+distinguishes a merely-`failed` dependency (recoverable — the dep itself may still
+retry to `done`) from a `cancelled` dependency (terminal-terminal — no path exists
+back to `done` without a `depends_on` edit or closing the dependent). The park reason
+names the specific failing dep — a `cancelled` dep is preferred over a `failed`
+sibling because it drives the operator disposition — and the durable
+`daemon_parked_unsatisfiable=true` bit records the distinction in refs. Every other
+park path (`set_parked_refs`) clears any stale value so the marker is authoritative
+for the current park only. `quorum status` includes `daemon_parked_unsatisfiable=1`
+rows in the BLOCKED section with the cancelled dep in `deadlocked_on`, so the
+operator sees the disposition queue without DB inspection.
 
 `quorum task-retry --task-id N --by <operator>` is the sole resume operation for a
-daemon-parked task. It atomically validates the marker, clears it, resets only the crash
-recovery counter, and emits `task_retry`. `open`, `rework`, and `in-review` restore
-directly. A `rework` retry also records `daemon_rework_retry_requested=true`; startup
-recovery preserves it and the next daemon tick atomically claims and spawns a replacement
-worker on the same task and branch. A parked `merging` task restores to `in-review`
-because the original approval mailbox row and agents were consumed during teardown;
-the orphan-review reconciler obtains fresh R1/R2 approval before the next merge attempt.
-Retry does not change PR identity, approvals,
-dependencies, author/reviewer provenance, or rework count. An unparked or terminal task
-is a clean negative (exit 1). This explicit gate prevents hot respawn/provision loops:
-daemon ticks cannot retry a parked task until the operator requests it.
+daemon-parked task. It atomically validates the marker, clears it (including the
+unsatisfiable bit), resets only the crash recovery counter, and emits `task_retry`.
+`open`, `rework`, and `in-review` restore directly. A `rework` retry also records
+`daemon_rework_retry_requested=true`; startup recovery preserves it and the next
+daemon tick atomically claims and spawns a replacement worker on the same task and
+branch. A parked `merging` task restores to `in-review` because the original approval
+mailbox row and agents were consumed during teardown; the orphan-review reconciler
+obtains fresh R1/R2 approval before the next merge attempt. Retry does not change PR
+identity, approvals, dependencies, author/reviewer provenance, or rework count. An
+unparked or terminal task is a clean negative (exit 1). One additional clean negative
+(exit 1) fires when the parked task's `depends_on` still contains any `cancelled`
+task id: silently restoring the dependent would just have the sweep re-park it on
+the next tick while leaving the operator with no disposition signal. The CLI names
+the cancelled dep(s) in the JSON payload; the operator resolves it by editing
+`depends_on` (existing task-update guarded path) or closing the dependent. No
+automatic cancellation cascade is added. This explicit gate prevents hot
+respawn/provision loops: daemon ticks cannot retry a parked task until the operator
+requests it.
 
 Daemon startup also reconciles bounded batches of legacy/corrupt terminal rows carrying
 runnable remediation retry markers. `failed` parks retain their reason and explicit

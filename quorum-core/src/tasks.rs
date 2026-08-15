@@ -34,6 +34,10 @@ pub const MAX_RECOVERY_ATTEMPTS: i64 = 3;
 pub const PARKED_REF: &str = "daemon_parked";
 pub const PARKED_REASON_REF: &str = "daemon_parked_reason";
 pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
+/// Durable "the dependency this park names cannot ever satisfy" bit (#473).
+/// Only the dependency-sweep path sets it; every other park path clears it so
+/// status's BLOCKED section renders no false unsatisfiable rows.
+pub const PARKED_UNSATISFIABLE_REF: &str = "daemon_parked_unsatisfiable";
 pub const CLASSIFIER_POLICY_PARKED_REF: &str = "classifier_policy_parked";
 pub const PARKED_REWORK_RETRY_REF: &str = "daemon_rework_retry_requested";
 /// Maximum corrupt terminal retry rows reconciled in one daemon tick.  The
@@ -2859,6 +2863,10 @@ pub(crate) fn set_parked_refs(
         PARKED_RESUME_STATUS_REF.into(),
         serde_json::Value::String(resume_status.into()),
     );
+    // A generic park is never unsatisfiable — only the dependency-sweep path
+    // sets this marker. Clear any stale bit left over from a prior park so
+    // status's BLOCKED section never renders a false unsatisfiable row.
+    object.remove(PARKED_UNSATISFIABLE_REF);
     serde_json::to_string(&value).map_err(|e| QuorumError::Io(format!("serialize task refs: {e}")))
 }
 
@@ -3432,6 +3440,7 @@ pub fn retry_parked(
                           refs,
                           '$.daemon_parked',
                           '$.daemon_parked_reason',
+                          '$.daemon_parked_unsatisfiable',
                           '$.daemon_resume_status',
                           '$.daemon_parked_head_check'
                       ),
@@ -3442,6 +3451,7 @@ pub fn retry_parked(
                       refs,
                       '$.daemon_parked',
                       '$.daemon_parked_reason',
+                      '$.daemon_parked_unsatisfiable',
                       '$.daemon_resume_status',
                       '$.daemon_rework_retry_requested',
                       '$.daemon_parked_head_check'
@@ -10832,6 +10842,73 @@ mod tests {
             .unwrap()
             .expect("dep edit clears the guard");
         assert_eq!(restored.status, "open");
+    }
+
+    /// Task #473 review blocker: a successful `retry_parked` must clear
+    /// `daemon_parked_unsatisfiable`. Otherwise a later generic park (via
+    /// `set_parked_refs`) preserves the stale `true`, and `quorum status`
+    /// reports the unrelated failure as an unsatisfiable-dep row.
+    #[test]
+    fn retry_parked_clears_daemon_parked_unsatisfiable_marker() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        let id = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        // Park with unsatisfiable=true, then simulate the operator dropping
+        // the cancelled dep from depends_on (so retry passes the guard).
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_unsatisfiable', json('true'),
+                 'daemon_parked_reason', 'stale unsatisfiable park',
+                 'daemon_resume_status', 'open'
+             ) WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET depends_on='[]' WHERE id=?1", params![id])
+            .unwrap();
+
+        let restored = retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("restored to open");
+        assert_eq!(restored.status, "open");
+        let refs: serde_json::Value =
+            serde_json::from_str(restored.refs.as_deref().unwrap_or("{}")).unwrap();
+        assert!(
+            refs.get(PARKED_UNSATISFIABLE_REF).is_none(),
+            "successful retry must strip the unsatisfiable marker; leftover refs: {refs}"
+        );
+    }
+
+    /// Task #473 review blocker: `set_parked_refs` is the shared builder for
+    /// every generic park path. It must NOT carry forward a stale
+    /// `daemon_parked_unsatisfiable=true` from a prior park — only the
+    /// dependency-sweep path is authorized to set that marker.
+    #[test]
+    fn generic_park_clears_stale_daemon_parked_unsatisfiable_marker() {
+        let stale = r#"{"daemon_parked_unsatisfiable": true, "some": "context"}"#;
+        let out = set_parked_refs(Some(stale), "generic failure", "rework").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed.get(PARKED_UNSATISFIABLE_REF).is_none(),
+            "generic park must clear stale unsatisfiable marker: {parsed}"
+        );
+        assert_eq!(parsed[PARKED_REF], true);
+        assert_eq!(parsed[PARKED_REASON_REF], "generic failure");
+        assert_eq!(parsed[PARKED_RESUME_STATUS_REF], "rework");
+        assert_eq!(parsed["some"], "context");
     }
 
     #[test]
