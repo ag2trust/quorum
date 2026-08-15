@@ -3461,6 +3461,17 @@ async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<LateRevi
             Some("changes") => tasks::LateReviewerVerdict::Changes,
             _ => continue,
         };
+        let remediation_feedback =
+            (verdict == tasks::LateReviewerVerdict::Changes).then(|| {
+                match (&gated.demotion_reason, &row.feedback) {
+                    (Some(reason), Some(feedback)) => {
+                        format!("{reason}\n\nReviewer feedback:\n{feedback}")
+                    }
+                    (Some(reason), None) => reason.clone(),
+                    (None, Some(feedback)) => feedback.clone(),
+                    (None, None) => "Changes requested.".to_string(),
+                }
+            });
         // A changed PR invalidates an approval, not a changes verdict. Changes
         // must still enter durable rework before stateless recovery discards
         // the reviewer journal identity; no approval is being stamped.
@@ -3523,6 +3534,7 @@ async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<LateRevi
                 verdict,
                 gated.blocking_count.unwrap_or(0) as i64,
                 &reviewed_sha,
+                remediation_feedback.as_deref(),
                 now_unix(),
             )
         })

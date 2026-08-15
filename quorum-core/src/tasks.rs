@@ -1695,8 +1695,8 @@ pub fn recover_late_worker_completion(
 }
 
 /// Fold a reviewer verdict that committed before a daemon restart. Validation,
-/// approval persistence/invalidation, transition, and mailbox consumption are
-/// deliberately one immediate transaction.
+/// approval persistence/invalidation, transition, remediation feedback, and
+/// mailbox consumption are deliberately one immediate transaction.
 #[allow(clippy::too_many_arguments)]
 pub fn recover_late_reviewer_verdict(
     conn: &mut Connection,
@@ -1707,6 +1707,7 @@ pub fn recover_late_reviewer_verdict(
     verdict: LateReviewerVerdict,
     blocking_count: i64,
     reviewed_head_sha: &str,
+    remediation_feedback: Option<&str>,
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
@@ -1806,6 +1807,10 @@ pub fn recover_late_reviewer_verdict(
             Ok(true)
         }
         LateReviewerVerdict::Changes => {
+            let remediation_feedback = remediation_feedback
+                .map(str::trim)
+                .filter(|feedback| !feedback.is_empty())
+                .unwrap_or("Changes requested.");
             apply_event_tx(tx, agent, task_id, &Event::VerdictChanges, now, |tx| {
                 tx.execute(
                     "DELETE FROM approvals WHERE pr_number=?1 AND task_id=?2",
@@ -1814,9 +1819,10 @@ pub fn recover_late_reviewer_verdict(
                 tx.execute(
                     "UPDATE tasks SET assignee=NULL,
                      refs=json_set(COALESCE(refs, '{}'),
-                       '$.daemon_rework_retry_requested', json('true'))
+                       '$.daemon_rework_retry_requested', json('true'),
+                       '$.remediation_feedback', ?2)
                      WHERE id=?1 AND status='rework'",
-                    params![task_id],
+                    params![task_id, remediation_feedback],
                 )?;
                 consume_late_mailbox(tx, mailbox_id, now)
             })
@@ -4234,6 +4240,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003
         )
         .unwrap());
@@ -4270,6 +4277,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003
         )
         .unwrap());
@@ -4298,6 +4306,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003,
         )
         .unwrap());
@@ -4324,6 +4333,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003,
         )
         .unwrap());
@@ -4364,10 +4374,16 @@ mod tests {
                 LateReviewerVerdict::Changes,
                 1,
                 "",
+                Some("fix the blocking finding"),
                 1003,
             )
             .unwrap());
-            assert_eq!(get(&c, task_id).unwrap().unwrap().status, "rework");
+            let task = get(&c, task_id).unwrap().unwrap();
+            assert_eq!(task.status, "rework");
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(refs[PARKED_REWORK_RETRY_REF], true);
+            assert_eq!(refs["remediation_feedback"], "fix the blocking finding");
             assert!(crate::approvals::get_for_pr(&c, 42).unwrap().is_empty());
             assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 0);
         }
@@ -4388,6 +4404,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003
         )
         .unwrap());
@@ -4402,6 +4419,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003
         )
         .is_err());
