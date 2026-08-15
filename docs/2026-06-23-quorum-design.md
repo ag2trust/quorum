@@ -707,7 +707,11 @@ conversation. Concretely:
   concrete finding is BLOCKING only when merging the exact change would leave
   the assigned primary outcome false, violate an applicable repository
   invariant, or introduce/materially worsen supported behavior, and its
-  assumptions fit the established operating/threat model. Real pre-existing,
+  assumptions fit the established operating/threat model. Each blocking finding
+  explains why the PR cannot merge, names the exact repository invariant it
+  violates (or the precise assigned outcome left false or supported behavior
+  materially worsened), and describes the broader affected path left unsafe
+  rather than only its local symptom. Real pre-existing,
   adjacent, defense-in-depth, future, or stronger-threat-model concerns are
   FOLLOW-UP unless an explicit current contract makes them blocking. For
   documentation changes, reviewers require the smallest accurate statement of
