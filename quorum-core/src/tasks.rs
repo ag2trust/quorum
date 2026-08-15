@@ -2547,6 +2547,10 @@ pub fn update(
             &format!("cancelled by {agent}"),
             now,
         )?;
+        // Refresh durable park refs of parked dependents in the same tx,
+        // so a following status read sees the unsatisfiable disposition
+        // without waiting for another mutation to trigger a sweep.
+        converge_parked_dependents_of_cancelled(&tx, id, now)?;
     }
 
     let mut task = tx.query_row(
@@ -3273,6 +3277,77 @@ pub fn retain_blocked_remediation_retry(
     )?;
     tx.commit()?;
     Ok(updated == 1)
+}
+
+/// Task #473: when a task is cancelled, refresh the durable park refs of
+/// each daemon-parked dependent so refs stay consistent with the live dep
+/// graph. Called inside the cancellation transaction so status readers see
+/// the upgrade atomically with the cancel — no scheduling gap where the
+/// dependent stays hidden from BLOCKED. Bounded per cancellation (one call
+/// per cancel; the search is scoped to dependents of exactly this id, not
+/// a whole-repo scan).
+///
+/// Classifier-policy parks are skipped intentionally: their durable reason
+/// is "classifier declined" and their retry path is reclassification, not
+/// dep restoration — overwriting the reason would lose the classifier
+/// cause. `stats::blocked_tasks` surfaces those rows via live dep-graph
+/// inference instead, so the disposition signal is still present.
+pub(crate) fn converge_parked_dependents_of_cancelled(
+    tx: &Connection,
+    cancelled_id: i64,
+    now: i64,
+) -> Result<usize> {
+    let candidates: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM tasks
+             WHERE status='failed'
+               AND depends_on IS NOT NULL
+               AND json_valid(refs)
+               AND json_extract(refs, '$.daemon_parked')=1
+               AND COALESCE(
+                   json_extract(refs, '$.classifier_policy_parked'), 0
+               ) != 1
+               AND COALESCE(
+                   json_extract(refs, '$.daemon_parked_unsatisfiable'), 0
+               ) != 1
+               AND EXISTS (
+                   SELECT 1 FROM json_each(depends_on) j
+                   WHERE j.value = ?1
+               )",
+        )?;
+        let rows = stmt
+            .query_map(params![cancelled_id], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let reason = format!("dependency #{cancelled_id} is cancelled — unsatisfiable");
+    for task_id in &candidates {
+        tx.execute(
+            "UPDATE tasks
+             SET refs = json_set(
+                     refs,
+                     '$.daemon_parked_unsatisfiable', json('true'),
+                     '$.daemon_parked_reason', ?1
+                 ),
+                 updated_at=?2
+             WHERE id=?3",
+            params![reason, now, task_id],
+        )?;
+        tx.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body)
+             VALUES (?1, ?2, 'daemon',
+                     'park upgraded to unsatisfiable: ' || ?3)",
+            params![task_id, now, reason],
+        )?;
+        crate::events::emit(
+            tx,
+            "task_parked_upgraded",
+            &format!("task#{task_id}"),
+            &reason,
+            now,
+        )?;
+    }
+    Ok(candidates.len())
 }
 
 /// Cancelled dep ids in a task's `depends_on`. Cancelled is terminal, so
@@ -10961,6 +11036,115 @@ mod tests {
         assert_eq!(parsed[PARKED_REASON_REF], "generic failure");
         assert_eq!(parsed[PARKED_RESUME_STATUS_REF], "rework");
         assert_eq!(parsed["some"], "context");
+    }
+
+    /// Task #473 R6 blocker 1: convergence must run at the cancellation
+    /// transition, not later. `converge_parked_dependents_of_cancelled`
+    /// upgrades the durable refs of every non-policy parked dependent of a
+    /// just-cancelled task. Any subsequent status read sees the upgrade
+    /// without waiting for another mutation to trigger a sweep.
+    #[test]
+    fn converge_parked_dependents_of_cancelled_upgrades_stale_park() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        let child = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        // Recoverable park (dep is failed) — matches the primary cascade shape.
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'dependency #' || ?2 || ' is terminal-not-done',
+                 'daemon_parked_unsatisfiable', json('false'),
+                 'daemon_resume_status', 'open'
+             ) WHERE id=?1",
+            params![child, dep],
+        )
+        .unwrap();
+        // Now cancel the dep and run convergence in the same transaction.
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        let n = converge_parked_dependents_of_cancelled(&c, dep, 2000).unwrap();
+        assert_eq!(n, 1);
+        let refs: serde_json::Value =
+            serde_json::from_str(get(&c, child).unwrap().unwrap().refs.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(refs["daemon_parked_unsatisfiable"], true);
+        assert_eq!(
+            refs["daemon_parked_reason"],
+            format!("dependency #{dep} is cancelled — unsatisfiable")
+        );
+        // Idempotent: a second call finds nothing.
+        assert_eq!(
+            converge_parked_dependents_of_cancelled(&c, dep, 2001).unwrap(),
+            0
+        );
+    }
+
+    /// Task #473 R6: convergence must NOT overwrite the "classifier
+    /// declined" reason of a policy park. Refs stay owned by the classifier
+    /// path; `stats::blocked_tasks` surfaces the row via live dep-graph
+    /// inference so the disposition signal is still present.
+    #[test]
+    fn converge_parked_dependents_of_cancelled_skips_policy_park() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        let policy_park = create(
+            &mut c,
+            "boss",
+            "policy-parked",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'classifier declined',
+                 'daemon_resume_status', 'open',
+                 'classifier_policy_parked', json('true')
+             ) WHERE id=?1",
+            params![policy_park],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        assert_eq!(
+            converge_parked_dependents_of_cancelled(&c, dep, 2000).unwrap(),
+            0
+        );
+        let refs: serde_json::Value = serde_json::from_str(
+            get(&c, policy_park)
+                .unwrap()
+                .unwrap()
+                .refs
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(refs.get("daemon_parked_unsatisfiable").is_none());
+        assert_eq!(refs["daemon_parked_reason"], "classifier declined");
     }
 
     #[test]

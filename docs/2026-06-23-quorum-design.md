@@ -666,16 +666,32 @@ for the current park only. `quorum status` includes `daemon_parked_unsatisfiable
 rows in the BLOCKED section with the cancelled dep in `deadlocked_on`, so the
 operator sees the disposition queue without DB inspection.
 
-The dependency sweep also runs a bounded second pass over already-`failed`
-daemon-parked rows: if `depends_on` currently contains any `cancelled` dep, the
-sweep upgrades the durable marker to `true` and rewrites the reason to name the
-cancelled dep. This converges the recoverable park to unsatisfiable when the
-failing dep is later retried and cancelled, or when any dep set gains a cancelled
-member after the original park — a transition the primary cascade cannot see
-(it only re-parks `open`/`rework`). A one-shot v50 migration performs the same
-repair at upgrade time on installed databases so pre-existing parks join the
-disposition queue immediately. The upgrade emits `task_parked_upgraded` and a
-task note; it re-uses the original owner alert (no duplicate alert).
+Convergence when a dep transitions to `cancelled` runs in two coordinated
+layers:
+
+1. **Atomic at the cancellation:** `tasks::update` calls
+   `converge_parked_dependents_of_cancelled` inside the cancel transaction.
+   Every non-classifier-policy daemon-parked dependent of the just-cancelled
+   task has its refs upgraded — durable marker flipped to `true` and the
+   reason rewritten to name the cancelled dep — before commit. Bounded per
+   cancellation (one call per cancel, scoped to dependents of that single id).
+2. **Read-side inference in `stats::blocked_tasks`:** the BLOCKED section
+   surfaces every `status='failed'` daemon-parked task whose `depends_on`
+   currently contains any `cancelled` dep, regardless of the durable marker.
+   This covers cancellation paths that do not route through `tasks::update`
+   (decomposition-triggered cancels, direct test mutations, upgrade timing),
+   and covers classifier-policy parks whose refs must not be overwritten
+   (their durable `daemon_parked_reason` stays "classifier declined").
+
+The v50 migration performs the same durable repair at upgrade time on
+installed databases so pre-existing parks join the disposition queue
+immediately. Both the migration and the runtime convergence skip
+classifier-policy parks so the classifier cause is preserved; those rows
+still surface via the read-side inference. Convergence emits
+`task_parked_upgraded` and a task note; it does not duplicate the original
+owner alert. No unbounded periodic scan is added: the earlier design's
+sweep-time convergence pass was replaced by these two layers to keep
+sweep work bounded per mutation.
 
 `quorum task-retry --task-id N --by <operator>` is the sole resume operation for a
 daemon-parked task. It atomically validates the marker, clears it (including the
