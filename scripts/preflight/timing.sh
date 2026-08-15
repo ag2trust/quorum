@@ -340,11 +340,11 @@ def _process_group_exists(pgid: int) -> bool:
     return True
 
 
-def _reap_group_children(pgid: int) -> None:
-    """Reap direct (and, on Linux, subreaper-adopted) group children."""
+def _reap_children() -> None:
+    """Reap direct children, including Linux subreaper adoptees."""
     while True:
         try:
-            pid, _ = os.waitpid(-pgid, os.WNOHANG)
+            pid, _ = os.waitpid(-1, os.WNOHANG)
         except ChildProcessError:
             return
         if pid == 0:
@@ -375,11 +375,68 @@ def _enable_child_subreaper() -> None:
         )
 
 
-def _cleanup_process_group(
+def _process_table() -> tuple[dict[int, tuple[int, int]], str | None]:
+    """Return PID -> (PPID, PGID) from a bounded POSIX process snapshot."""
+    ps_proc = subprocess.Popen(
+        ["ps", "-axo", "pid=,ppid=,pgid="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout, stderr = ps_proc.communicate(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        ps_proc.kill()
+        ps_proc.wait()
+        return {}, "process-tree discovery timed out"
+    if ps_proc.returncode != 0:
+        return {}, f"process-tree discovery failed: {stderr.strip()}"
+
+    rows: dict[int, tuple[int, int]] = {}
+    try:
+        for line in stdout.splitlines():
+            pid, ppid, pgid = (int(value) for value in line.split())
+            if pid != ps_proc.pid:
+                rows[pid] = (ppid, pgid)
+    except ValueError as exc:
+        return {}, f"invalid process-tree snapshot: {exc}"
+    return rows, None
+
+
+def _discover_descendants(
+    root_pid: int, known: set[int]
+) -> tuple[dict[int, tuple[int, int]], str | None]:
+    rows, error = _process_table()
+    if error is not None:
+        return {}, error
+
+    # Keep every PID ever observed: a descendant can be reparented after its
+    # parent is killed, or can move into a new process group. Linux subreaper
+    # adoptees appear as direct supervisor children. The original group is
+    # included even if its leader has already exited.
+    known.add(root_pid)
+    for pid, (ppid, pgid) in rows.items():
+        if ppid == os.getpid() or pgid == root_pid:
+            known.add(pid)
+    changed = True
+    while changed:
+        changed = False
+        for pid, (ppid, _pgid) in rows.items():
+            if pid not in known and ppid in known:
+                known.add(pid)
+                changed = True
+    return {pid: rows[pid] for pid in known if pid in rows}, None
+
+
+def _cleanup_process_tree(
     proc: subprocess.Popen, grace_secs: float
 ) -> dict:
-    """Bounded TERM/KILL cleanup for the isolated group led by ``proc``."""
-    pgid = proc.pid
+    """Bounded TERM/KILL cleanup for every descendant of ``proc``."""
+    root_pgid = proc.pid
+    supervisor_pgid = os.getpgrp()
+    known = {proc.pid}
+    discovery_error: str | None = None
+    signal_errors: list[str] = []
     cleanup = {
         "attempted": False,
         "term_sent": False,
@@ -388,32 +445,81 @@ def _cleanup_process_group(
         "error": None,
     }
 
-    def send(sig: signal.Signals, key: str) -> None:
-        cleanup["attempted"] = True
-        try:
-            os.killpg(pgid, sig)
-            cleanup[key] = True
-        except ProcessLookupError:
-            pass
-        except OSError as exc:
-            cleanup["error"] = f"killpg({pgid}, {sig.name}): {exc}"
+    def snapshot() -> dict[int, tuple[int, int]]:
+        nonlocal discovery_error
+        proc.poll()
+        _reap_children()
+        live, error = _discover_descendants(proc.pid, known)
+        if error is not None and discovery_error is None:
+            discovery_error = error
+        return live
 
-    def wait_until_gone(deadline: float) -> bool:
+    def signal_targets(
+        live: dict[int, tuple[int, int]],
+        sig: signal.Signals,
+        key: str,
+    ) -> None:
+        groups = {
+            pgid for _pid, (_ppid, pgid) in live.items()
+            if pgid > 0 and pgid != supervisor_pgid
+        }
+        # Keep the original group as a fallback if discovery raced its leader
+        # or failed. Each known PID is also signaled in case it changes groups
+        # between the snapshot and killpg.
+        groups.add(root_pgid)
+        sent = False
+        for pgid in groups:
+            try:
+                os.killpg(pgid, sig)
+                sent = True
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                signal_errors.append(f"killpg({pgid}, {sig.name}): {exc}")
+        for pid in live:
+            try:
+                os.kill(pid, sig)
+                sent = True
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                signal_errors.append(f"kill({pid}, {sig.name}): {exc}")
+        cleanup["attempted"] = cleanup["attempted"] or sent
+        cleanup[key] = cleanup[key] or sent
+
+    def send(sig: signal.Signals, key: str) -> None:
+        signal_targets(snapshot(), sig, key)
+
+    def wait_until_gone(
+        deadline: float, sig: signal.Signals, key: str
+    ) -> bool:
         while True:
-            proc.poll()  # Reap the group leader as soon as it exits.
-            _reap_group_children(pgid)
-            if not _process_group_exists(pgid):
+            live = snapshot()
+            if (
+                not live
+                and not _process_group_exists(root_pgid)
+                and discovery_error is None
+            ):
                 return True
             if now() >= deadline:
                 return False
+            # Close process-creation and process-group-change races by applying
+            # the current cleanup stage to every newly discovered survivor.
+            if live:
+                signal_targets(live, sig, key)
             time.sleep(min(0.02, max(0.0, deadline - now())))
 
-    if _process_group_exists(pgid):
+    live = snapshot()
+    if live or _process_group_exists(root_pgid):
         send(signal.SIGTERM, "term_sent")
-        gone = wait_until_gone(now() + grace_secs)
+        gone = wait_until_gone(
+            now() + grace_secs, signal.SIGTERM, "term_sent"
+        )
         if not gone:
             send(signal.SIGKILL, "kill_sent")
-            gone = wait_until_gone(now() + grace_secs)
+            gone = wait_until_gone(
+                now() + grace_secs, signal.SIGKILL, "kill_sent"
+            )
     else:
         gone = True
 
@@ -425,10 +531,30 @@ def _cleanup_process_group(
             cleanup["error"] = cleanup["error"] or (
                 f"group leader {proc.pid} did not exit after SIGKILL"
             )
-    _reap_group_children(pgid)
-    cleanup["complete"] = gone and not _process_group_exists(pgid)
-    if not cleanup["complete"] and cleanup["error"] is None:
-        cleanup["error"] = f"process group {pgid} still exists after SIGKILL"
+    _reap_children()
+    final_live = snapshot()
+    cleanup["complete"] = (
+        gone
+        and not final_live
+        and not _process_group_exists(root_pgid)
+        and discovery_error is None
+    )
+    if not cleanup["complete"]:
+        survivors = sorted(final_live)
+        if discovery_error is not None:
+            cleanup["error"] = discovery_error
+        elif survivors:
+            cleanup["error"] = (
+                f"descendant processes still exist after SIGKILL: {survivors}"
+            )
+        elif signal_errors:
+            cleanup["error"] = signal_errors[-1]
+        elif cleanup["error"] is not None:
+            pass
+        else:
+            cleanup["error"] = (
+                f"process group {root_pgid} still exists after SIGKILL"
+            )
     return cleanup
 
 
@@ -456,7 +582,7 @@ def _cleanup_diagnostic(cleanup: dict) -> str:
     if cleanup["kill_sent"]:
         actions.append("SIGKILL sent")
     actions.append(
-        "process group reaped" if cleanup["complete"]
+        "descendant tree reaped" if cleanup["complete"]
         else f"cleanup incomplete: {cleanup['error']}"
     )
     return ", ".join(actions)
@@ -550,7 +676,7 @@ def _test_supervisor() -> int:
                 outcome = "owner_lost"
                 break
 
-        cleanup = _cleanup_process_group(proc, grace_secs)
+        cleanup = _cleanup_process_tree(proc, grace_secs)
         result = _run_result(started, rc, outcome, timeout_secs, cleanup)
         if outcome == "timed_out":
             print(
@@ -573,7 +699,7 @@ def _test_supervisor() -> int:
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, signal.SIG_IGN)
         cleanup = (
-            _cleanup_process_group(proc, grace_secs)
+            _cleanup_process_tree(proc, grace_secs)
             if proc is not None
             else {
                 "attempted": False,
@@ -590,7 +716,7 @@ def _test_supervisor() -> int:
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, signal.SIG_IGN)
         cleanup = (
-            _cleanup_process_group(proc, grace_secs)
+            _cleanup_process_tree(proc, grace_secs)
             if proc is not None
             else {
                 "attempted": False,
