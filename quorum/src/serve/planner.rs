@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use super::agent::{self, AgentProc, AgentSpec};
+use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, RunnerProc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -519,6 +520,7 @@ pub struct PlannerSlot {
     pub response_text: String,
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
+    codex_terminal_candidate: bool,
 }
 
 impl PlannerSlot {
@@ -580,42 +582,51 @@ async fn spawn_planner_with_timeout(
     }
     let started_at = tokio::time::Instant::now();
     let deadline = started_at + turn_timeout;
-    let proc = match provider {
-        AgentKind::Codex => return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Codex decomposition planner refused: no portable launch boundary can isolate provider transport from model-generated network and filesystem access",
-        )),
-        AgentKind::Grok => return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Grok decomposition planner refused: managed Grok lifecycle roles are not enabled",
-        )),
-        AgentKind::Claude => {
-            let spec = AgentSpec {
-                kind: AgentKind::Claude,
-                model: model.into(),
-                effort: effort.into(),
-                session_id: agent::new_session_id(),
-                worktree: repo.to_path_buf(),
-                bare,
-                allowed_tools: "Read,Glob,Grep".into(),
-                env_vars: vec![],
-            };
-            let mut proc = AgentProc::spawn_planner(&spec, provider_bin)?;
-            if let Err(error) = proc
-                .feed_turn_until(&agent::user_turn(prompt), deadline)
-                .await
-            {
-                let _ = proc.kill_and_reap().await;
-                return Err(error);
+    let proc =
+        match provider {
+            AgentKind::Codex => {
+                let spec = CodexSpec {
+                    model: model.into(),
+                    effort: effort.into(),
+                    sandbox: "read-only".into(),
+                    worktree: repo.to_path_buf(),
+                    prompt: prompt.into(),
+                    env_vars: vec![],
+                };
+                RunnerProc::Codex(CodexProc::spawn_planner(&spec, provider_bin)?)
             }
-            RunnerProc::Claude(proc)
-        }
-    };
+            AgentKind::Grok => return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Grok decomposition planner refused: managed Grok lifecycle roles are not enabled",
+            )),
+            AgentKind::Claude => {
+                let spec = AgentSpec {
+                    kind: AgentKind::Claude,
+                    model: model.into(),
+                    effort: effort.into(),
+                    session_id: agent::new_session_id(),
+                    worktree: repo.to_path_buf(),
+                    bare,
+                    allowed_tools: "Read,Glob,Grep".into(),
+                    env_vars: vec![],
+                };
+                let mut proc = AgentProc::spawn_planner(&spec, provider_bin)?;
+                if let Err(error) = proc
+                    .feed_turn_until(&agent::user_turn(prompt), deadline)
+                    .await
+                {
+                    let _ = proc.kill_and_reap().await;
+                    return Err(error);
+                }
+                RunnerProc::Claude(proc)
+            }
+        };
     Ok(PlannerSlot {
         proc,
         response_text: String::new(),
         started_at,
         stdout_bytes: 0,
+        codex_terminal_candidate: false,
     })
 }
 
@@ -627,6 +638,7 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
     }
     let remaining = PLANNER_TIMEOUT.saturating_sub(slot.started_at.elapsed());
     let poll_for = remaining.min(Duration::from_secs(2));
+    let mut stdout_complete = false;
     loop {
         // Reserve the byte previously charged for the line terminator. More
         // importantly, enforce the remaining allowance while bytes are read;
@@ -639,7 +651,10 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
         {
             Err(_) => break,
             Ok(Ok(Some(raw))) => raw,
-            Ok(Ok(None)) => break,
+            Ok(Ok(None)) => {
+                stdout_complete = true;
+                break;
+            }
             Ok(Err(_)) => {
                 return Some(PlannerPoll::ProviderFailed(
                     "planner stdout exceeded 256 KiB".into(),
@@ -651,6 +666,19 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
             return Some(PlannerPoll::ProviderFailed(
                 "planner stdout exceeded 256 KiB".into(),
             ));
+        }
+        if slot.codex_terminal_candidate {
+            return Some(PlannerPoll::ProviderFailed(
+                "planner provider emitted output after terminal response".into(),
+            ));
+        }
+        if slot.proc.kind() == AgentKind::Codex {
+            if let Some(failure) = slot.proc.observed_pre_authoritative_failure() {
+                return Some(PlannerPoll::ProviderFailed(format!(
+                    "planner provider protocol failed: {}",
+                    failure.detail()
+                )));
+            }
         }
         if slot.proc.kind() == AgentKind::Claude {
             if let Some(super::stream::Event::Result {
@@ -681,7 +709,11 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                     ));
                 }
                 AgentEvent::TurnCompleted { .. } => {
-                    return Some(parsed_poll(&slot.response_text));
+                    if slot.proc.kind() == AgentKind::Codex {
+                        slot.codex_terminal_candidate = true;
+                    } else {
+                        return Some(parsed_poll(&slot.response_text));
+                    }
                 }
                 AgentEvent::AssistantText { text } => {
                     if slot.response_text.len().saturating_add(text.len()) > MAX_RESPONSE_BYTES {
@@ -698,7 +730,31 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
             return Some(PlannerPoll::ProviderFailed("planner timed out".into()));
         }
     }
-    if matches!(slot.proc.try_wait(), Ok(Some(_))) {
+    let status = match slot.proc.try_wait() {
+        Ok(status) => status,
+        Err(error) => {
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner process status unavailable: {error}"
+            )));
+        }
+    };
+    if slot.proc.kind() == AgentKind::Codex && slot.codex_terminal_candidate && stdout_complete {
+        let status = status?;
+        let _ = slot.proc.finalize_pre_authoritative_evidence().await;
+        if !status.success() {
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner provider exited unsuccessfully after terminal response: {status}"
+            )));
+        }
+        if let Some(failure) = slot.proc.observed_strict_pre_authoritative_failure() {
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner provider terminal evidence failed: {}",
+                failure.detail()
+            )));
+        }
+        return Some(parsed_poll(&slot.response_text));
+    }
+    if status.is_some() {
         return Some(PlannerPoll::ProviderFailed(
             "planner exited without a terminal response".into(),
         ));
@@ -722,6 +778,52 @@ mod tests {
     // normal CI scheduling delay while retaining a finite failure boundary.
     const TEST_STDIN_FEED_TIMEOUT: Duration = Duration::from_secs(15);
     const TEST_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(15);
+
+    #[cfg(unix)]
+    fn executable_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runner = dir.join(name);
+        std::fs::write(&runner, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        runner
+    }
+
+    #[cfg(unix)]
+    async fn poll_to_terminal(slot: &mut PlannerSlot) -> PlannerPoll {
+        tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            loop {
+                if let Some(outcome) = poll_planner(slot).await {
+                    break outcome;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("planner did not reach a terminal outcome")
+    }
+
+    #[cfg(unix)]
+    async fn spawn_fake_codex(dir: &Path, stdout: &str) -> PlannerSlot {
+        let stdout_path = dir.join("stdout.jsonl");
+        std::fs::write(&stdout_path, stdout).unwrap();
+        let runner = executable_script(
+            dir,
+            "codex",
+            &format!("exec /bin/cat '{}'", stdout_path.display()),
+        );
+        spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir,
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap()
+    }
 
     fn task(key: &str, prerequisites: &[&str]) -> serde_json::Value {
         serde_json::json!({
@@ -1006,51 +1108,219 @@ mod tests {
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn codex_planner_fails_closed_before_real_binary_launch() {
+    async fn codex_terminal_response_reaches_existing_plan_validation_with_exact_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("invoked");
-        let fake = dir.path().join("codex");
-        std::fs::write(&fake, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let error = spawn_planner(
+        let args_path = dir.path().join("args");
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type": "turn.completed"})
+        );
+        let output_path = dir.path().join("stdout.jsonl");
+        std::fs::write(&output_path, output).unwrap();
+        let fake = executable_script(
+            dir.path(),
+            "codex",
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'\nexec /bin/cat '{}'",
+                args_path.display(),
+                output_path.display()
+            ),
+        );
+        let mut slot = spawn_planner(
             AgentKind::Codex,
-            CODEX_PLANNER_MODEL,
-            PLANNER_EFFORT,
-            Path::new("."),
-            "bounded prompt",
+            "gpt-5.6-luna",
+            "xhigh",
+            dir.path(),
+            "exact bounded prompt",
             false,
             fake.to_str(),
         )
         .await
-        .err()
-        .expect("Codex planner must fail closed");
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        .unwrap();
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::Done(PlannerResponse::Plan { ref tasks })
+                if tasks.len() == 2 && tasks[1].prerequisites == ["core"]
+        ));
         assert!(
-            !marker.exists(),
-            "refused planner must not execute provider binary"
+            slot.proc.try_wait().unwrap().is_some(),
+            "Codex plan authority preceded provider exit"
         );
-        if let Ok(output) = std::process::Command::new("which").arg("codex").output() {
-            if output.status.success() {
-                let real = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let real_error = spawn_planner(
-                    AgentKind::Codex,
-                    CODEX_PLANNER_MODEL,
-                    PLANNER_EFFORT,
-                    Path::new("."),
-                    "attempt network, quorum, database, and coordination access",
-                    false,
-                    Some(real.as_str()),
-                )
-                .await
-                .err()
-                .expect("real Codex binary must also be refused before launch");
-                assert_eq!(real_error.kind(), std::io::ErrorKind::PermissionDenied);
+        slot.kill_and_reap().await;
+
+        let args = std::fs::read_to_string(args_path).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "gpt-5.6-luna"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=xhigh"]));
+        assert_eq!(args.last(), Some(&"exact bounded prompt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_terminal_candidate_requires_clean_exit_and_final_evidence() {
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let terminal_output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type": "turn.completed"})
+        );
+        let cases = [
+            ("nonzero-exit", "exit 7"),
+            (
+                "trailing-stdout",
+                "printf '%s\\n' '{\"type\":\"error\",\"message\":\"fatal trailing error\"}'",
+            ),
+            (
+                "trailing-stderr",
+                "printf '%s\\n' 'fatal trailing error' >&2",
+            ),
+        ];
+        for (name, trailer) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let output_path = dir.path().join("stdout.jsonl");
+            std::fs::write(&output_path, &terminal_output).unwrap();
+            let runner = executable_script(
+                dir.path(),
+                "codex",
+                &format!("/bin/cat '{}'\n{trailer}", output_path.display()),
+            );
+            let mut slot = spawn_planner(
+                AgentKind::Codex,
+                CODEX_PLANNER_MODEL,
+                PLANNER_EFFORT,
+                dir.path(),
+                "bounded prompt",
+                false,
+                runner.to_str(),
+            )
+            .await
+            .unwrap();
+            let outcome = poll_to_terminal(&mut slot).await;
+            assert!(
+                matches!(outcome, PlannerPoll::ProviderFailed(_)),
+                "{name} acquired planner authority"
+            );
+            slot.kill_and_reap().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_malformed_error_and_missing_terminal_streams_fail_without_a_plan() {
+        let cases = [
+            ("malformed", "not-json\n"),
+            (
+                "provider-error",
+                "{\"type\":\"error\",\"message\":\"provider exploded\"}\n",
+            ),
+            (
+                "missing-terminal",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"id\":\"m1\",\"text\":\"{}\"}}\n",
+            ),
+        ];
+        for (name, stdout) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut slot = spawn_fake_codex(dir.path(), stdout).await;
+            let outcome = poll_to_terminal(&mut slot).await;
+            assert!(
+                matches!(outcome, PlannerPoll::ProviderFailed(_)),
+                "{name} stream created planner authority"
+            );
+            slot.kill_and_reap().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_response_and_stdout_bounds_fail_and_reap_without_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let oversized_text = "x".repeat(MAX_RESPONSE_BYTES + 1);
+        let output = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": oversized_text}
+            })
+        );
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::ProviderFailed(ref message) if message.contains("response exceeded")
+        ));
+        slot.kill_and_reap().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runner = executable_script(dir.path(), "codex", "while :; do printf '%08192d' 0; done");
+        let mut slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let pid = slot.pid().unwrap();
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::ProviderFailed(ref message) if message.contains("stdout exceeded")
+        ));
+        slot.kill_and_reap().await;
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_timeout_and_cancellation_reap_the_process_group() {
+        for timed_out in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let runner = executable_script(dir.path(), "codex", "exec sleep 30");
+            let mut slot = spawn_planner(
+                AgentKind::Codex,
+                CODEX_PLANNER_MODEL,
+                PLANNER_EFFORT,
+                dir.path(),
+                "bounded prompt",
+                false,
+                runner.to_str(),
+            )
+            .await
+            .unwrap();
+            let pid = slot.pid().unwrap();
+            if timed_out {
+                slot.started_at = tokio::time::Instant::now() - PLANNER_TIMEOUT;
+                assert!(matches!(
+                    poll_planner(&mut slot).await,
+                    Some(PlannerPoll::ProviderFailed(ref message)) if message.contains("timed out")
+                ));
             }
+            slot.kill_and_reap().await;
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
         }
     }
 

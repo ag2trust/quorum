@@ -275,6 +275,8 @@ pub struct DecompositionStatusView {
     pub source_title: String,
     pub source_status: String,
     pub graph_state: String,
+    /// Stable reason new graph-member implementation work cannot dispatch.
+    pub dispatch_hold: Option<String>,
     pub proposal_attempts: i64,
     pub provider_failures: i64,
     pub planner_provider: Option<String>,
@@ -1366,7 +1368,7 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
 fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusView>> {
     let graph = conn
         .query_row(
-            "SELECT d.id, d.source_task_id, t.title, t.status, d.state,
+            "SELECT d.id, d.source_task_id, t.title, t.status, d.state, d.active,
                     d.proposal_attempts, d.provider_failures, d.planner_provider,
                     d.planner_model, d.accepted_plan_revision, d.hold_summary
              FROM task_decompositions d
@@ -1383,12 +1385,13 @@ fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusV
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, i64>(5)?,
+                    r.get::<_, bool>(5)?,
                     r.get::<_, i64>(6)?,
-                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, i64>(7)?,
                     r.get::<_, Option<String>>(8)?,
-                    r.get::<_, Option<i64>>(9)?,
-                    r.get::<_, Option<String>>(10)?,
+                    r.get::<_, Option<String>>(9)?,
+                    r.get::<_, Option<i64>>(10)?,
+                    r.get::<_, Option<String>>(11)?,
                 ))
             },
         )
@@ -1399,6 +1402,7 @@ fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusV
         source_title,
         source_status,
         graph_state,
+        graph_active,
         proposal_attempts,
         provider_failures,
         planner_provider,
@@ -1467,12 +1471,26 @@ fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusV
     }
     reasons.truncate(6);
 
+    let dispatch_hold = if graph_state != "active" || !graph_active {
+        Some(format!(
+            "implementation dispatch held: graph state={graph_state}, active={}",
+            i64::from(graph_active)
+        ))
+    } else if source_status != "decomposed" {
+        Some(format!(
+            "implementation dispatch held: source status={source_status}"
+        ))
+    } else {
+        None
+    };
+
     Ok(Some(DecompositionStatusView {
         graph_id,
         source_task_id,
         source_title,
         source_status,
         graph_state,
+        dispatch_hold,
         proposal_attempts,
         provider_failures,
         planner_provider,
@@ -3192,6 +3210,10 @@ mod tests {
 
         let graph = decomposition_status(&c).unwrap().unwrap();
         assert_eq!(graph.source_task_id, source);
+        assert_eq!(
+            graph.dispatch_hold.as_deref(),
+            Some("implementation dispatch held: graph state=blocked, active=1")
+        );
         assert_eq!(graph.completed_children, 0);
         assert_eq!(graph.total_children, 2);
         assert_eq!(graph.failed_children, vec![child_b]);

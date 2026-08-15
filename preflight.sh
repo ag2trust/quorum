@@ -11,7 +11,7 @@
 #   1. branch base   — HEAD is branched from origin/main, not another feature branch
 #   2. cargo fmt     — --all -- --check
 #   3. cargo clippy  — all targets and quorum-core/test-support
-#   4. cargo test    — full suite incl. real-process contention canaries (4 threads)
+#   4. cargo test    — compile/no-run then full execution, timed by the collector
 #
 # Usage:
 #   ./preflight.sh          # all four gates
@@ -93,8 +93,78 @@ fi
 
 fail() { printf '\nPREFLIGHT: FAIL (%s)\n' "$1"; exit 1; }
 
+# Full preflight writes its timing evidence to this deterministic path. The
+# collector owns the Cargo gates and the per-test-binary top-N list; preflight
+# contributes the branch-base gate, whose work necessarily happens before the
+# collector can run.
+TIMING_DIR=target/preflight-timing
+TIMING_ARTIFACT="$TIMING_DIR/timing.json"
+TIMING_SUMMARY="$TIMING_DIR/summary.txt"
+
+monotonic_now() {
+  python3 -c 'import time; print(time.monotonic())'
+}
+
+record_branch_base_timing() {
+  python3 - "$TIMING_ARTIFACT" "$TIMING_SUMMARY" "$1" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+artifact = Path(sys.argv[1])
+summary = Path(sys.argv[2])
+duration = round(float(sys.argv[3]), 3)
+
+data = json.loads(artifact.read_text())
+gates = [gate for gate in data.get("gates", [])
+         if gate.get("name") != "branch_base"]
+gates.insert(0, {
+    "name": "branch_base",
+    "duration_secs": duration,
+    "exit_code": 0,
+})
+data["gates"] = gates
+
+def replace_atomically(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+replace_atomically(artifact, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+branch_line = f"  {'branch_base':<24} {duration:>10.2f}s  ok\n"
+summary_text = summary.read_text()
+marker = "gates:\n"
+if marker not in summary_text:
+    raise RuntimeError(f"timing summary missing {marker!r}")
+replace_atomically(summary, summary_text.replace(marker, marker + branch_line, 1))
+PY
+}
+
+timing_failure_gate() {
+  python3 - "$TIMING_ARTIFACT" <<'PY'
+import json
+import sys
+
+for gate in json.load(open(sys.argv[1])).get("gates", []):
+    if gate.get("exit_code"):
+        print(gate.get("name", ""))
+        break
+PY
+}
+
 # --- Gate 1: branch base ------------------------------------------------------
 printf '=== preflight 1/4: branch base ===\n'
+if [ "$QUICK" -eq 0 ]; then
+  BRANCH_BASE_STARTED=$(monotonic_now) || fail "start branch-base timer"
+fi
 if [ "$HOOK_FORMAT_ONLY" -eq 1 ]; then
   printf 'non-publication push — branch base not applicable\n'
 else
@@ -220,23 +290,49 @@ fi
 fi
 
 # --- Gate 2: cargo fmt --------------------------------------------------------
-printf '=== preflight 2/4: cargo fmt --all -- --check ===\n'
-cargo fmt --all -- --check || fail "cargo fmt"
-printf 'fmt OK\n'
-
 if [ "$QUICK" -eq 1 ]; then
+  printf '=== preflight 2/4: cargo fmt --all -- --check ===\n'
+  cargo fmt --all -- --check || fail "cargo fmt"
+  printf 'fmt OK\n'
   printf '\nPREFLIGHT: PASS (quick — gates 1-2; run without --quick before quorum submit)\n'
   exit 0
 fi
 
-# --- Gate 3: cargo clippy -----------------------------------------------------
-printf '=== preflight 3/4: cargo clippy --all-targets --all-features --features quorum-core/test-support -- -D warnings ===\n'
-cargo clippy --all-targets --all-features --features quorum-core/test-support -- -D warnings || fail "cargo clippy"
-printf 'clippy OK\n'
-
-# --- Gate 4: cargo test -------------------------------------------------------
+# --- Gates 2-4: timing collector ---------------------------------------------
 TEST_THREADS="${RUST_TEST_THREADS:-4}"
-printf '=== preflight 4/4: RUST_TEST_THREADS=%s cargo test --workspace --all-features --features quorum-core/test-support ===\n' "$TEST_THREADS"
-RUST_TEST_THREADS="$TEST_THREADS" cargo test --workspace --all-features --features quorum-core/test-support || fail "cargo test"
+BRANCH_BASE_DURATION=$(python3 - "$BRANCH_BASE_STARTED" <<'PY'
+import sys
+import time
+print(time.monotonic() - float(sys.argv[1]))
+PY
+) || fail "finish branch-base timer"
+
+printf '=== preflight 2-4: timing collector (fmt, clippy, compile/no-run, test execution) ===\n'
+if scripts/preflight/timing.sh --test-threads "$TEST_THREADS"; then
+  record_branch_base_timing "$BRANCH_BASE_DURATION" \
+    || fail "publish branch-base timing"
+else
+  TIMING_STATUS=$?
+  record_branch_base_timing "$BRANCH_BASE_DURATION" \
+    || fail "publish branch-base timing"
+  TIMING_FAILED_GATE=$(timing_failure_gate) || fail "read timing failure"
+  case "$TIMING_FAILED_GATE" in
+    cargo_fmt) fail "cargo fmt" ;;
+    cargo_clippy) fail "cargo clippy" ;;
+    cargo_test_no_run)
+      # The collector keeps structured Cargo stdout separately, but Cargo's
+      # actionable compiler diagnostics are stderr. Replay it verbatim before
+      # failing as the original `cargo test` gate would have done.
+      cat "$TIMING_DIR/cargo-test-no-run.stderr" >&2
+      fail "cargo test"
+      ;;
+    test_execute) fail "cargo test" ;;
+    *)
+      printf 'preflight.sh: timing collector failed (exit %s)\n' \
+        "$TIMING_STATUS" >&2
+      exit "$TIMING_STATUS"
+      ;;
+  esac
+fi
 
 printf '\nPREFLIGHT: PASS (all 4 gates green)\n'

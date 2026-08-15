@@ -620,13 +620,6 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
         .ok_or_else(|| QuorumError::Usage("serve config requires [routing]".into()))?;
     validate_percentage_pool("classifier", &routing.classifier, profiles)?;
     validate_percentage_pool("planner", &routing.planner, profiles)?;
-    for profile_id in routing.planner.keys() {
-        if profiles[profile_id].runner == "codex" {
-            return Err(QuorumError::Usage(format!(
-                "routing.planner profile \"{profile_id}\" uses unsupported runner \"codex\""
-            )));
-        }
-    }
     validate_percentage_pool("collector", &routing.collector, profiles)?;
     validate_complexity_pools("worker", &routing.worker, profiles)?;
     validate_complexity_pools("reviewer", &routing.reviewer, profiles)?;
@@ -1786,15 +1779,37 @@ worktree_base = "/tmp/wt"
     }
 
     #[test]
-    fn planner_rejects_codex_profile_until_launch_boundary_supports_it() {
+    fn planner_accepts_matching_codex_profile_and_rejects_mismatch_and_grok() {
         let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
         let planner = &mut cfg.routing.as_mut().unwrap().planner;
         planner.clear();
         planner.insert("primary".into(), 100);
+        validate_model_routing(&cfg).unwrap();
+
+        cfg.model_profiles
+            .as_mut()
+            .unwrap()
+            .get_mut("primary")
+            .unwrap()
+            .runner = "claude".into();
         let err = validate_model_routing(&cfg).unwrap_err();
         assert!(
-            err.to_string().contains("routing.planner")
-                && err.to_string().contains("unsupported runner \"codex\""),
+            err.to_string().contains("does not match runner \"claude\""),
+            "{err}"
+        );
+
+        let profile = cfg
+            .model_profiles
+            .as_mut()
+            .unwrap()
+            .get_mut("primary")
+            .unwrap();
+        profile.runner = "grok".into();
+        profile.model = "grok-4.5".into();
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("managed Grok lifecycle roles are not enabled"),
             "{err}"
         );
     }

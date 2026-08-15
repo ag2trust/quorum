@@ -687,14 +687,19 @@ conversation. Concretely:
   submitting a verdict: discovering one blocker does not end exploration. They
   post the complete discovered blocking and advisory set to one PR review
   summary (with inline comments where a specific file/line applies), and the
-  `--blocking` count covers that complete blocker set. For cross-cutting work,
-  they derive a small affected-path matrix from the PR scope to check relevant
-  sibling and negative paths together; this does not require speculative
-  findings or exhaustive proof over unrelated code. Re-reviews verify prior
-  fixes and re-audit the full current diff and relevant sibling paths, rather
-  than only the most recent remediation commit. A new blocker in unchanged
-  behavior must explain why it was not reasonably discoverable in the prior
-  complete audit. Reviewers respond to author pushback on the PR itself.
+  `--blocking` count covers that complete blocker set. Before a verdict,
+  reviewers derive a bounded, task-specific affected-path model from the
+  embedded managed-task contract when provided and the mechanisms changed by
+  the PR. They choose a useful representation — a short matrix, checklist,
+  state/event map, or equivalent — to review applicable related lifecycle and
+  compatibility paths together and determine whether the proposed remedy
+  closes each relevant path. This does not prescribe a fixed format, require
+  speculative findings, or demand exhaustive proof over unrelated code.
+  Re-reviews verify prior fixes and re-audit the full current diff and relevant
+  sibling paths, rather than only the most recent remediation commit. A new
+  blocker in unchanged behavior must explain why it was not reasonably
+  discoverable in the prior complete audit. Reviewers respond to author
+  pushback on the PR itself.
   Encouraged GitHub operations are normal comments, inline comments, and review
   summary comments. Formal APPROVE and REQUEST_CHANGES reviews remain daemon-owned
   because managed reviewers use the same GitHub account as PR authors.
@@ -702,7 +707,11 @@ conversation. Concretely:
   concrete finding is BLOCKING only when merging the exact change would leave
   the assigned primary outcome false, violate an applicable repository
   invariant, or introduce/materially worsen supported behavior, and its
-  assumptions fit the established operating/threat model. Real pre-existing,
+  assumptions fit the established operating/threat model. Each blocking finding
+  explains why the PR cannot merge, names the exact repository invariant it
+  violates (or the precise assigned outcome left false or supported behavior
+  materially worsened), and describes the broader affected path left unsafe
+  rather than only its local symptom. Real pre-existing,
   adjacent, defense-in-depth, future, or stronger-threat-model concerns are
   FOLLOW-UP unless an explicit current contract makes them blocking. For
   documentation changes, reviewers require the smallest accurate statement of
@@ -1859,10 +1868,11 @@ filesystem access is refused fail-closed. The view is an archive of the recorded
 and source drift is rejected before launch. A valid concrete blocker parks the source immediately
 with no second opinion.
 
-Current product limitation: Codex planning is refused fail-closed because its CLI transport does
-not yet provide that isolation boundary. A repository configured to plan with Codex records a
-bounded provider failure and releases or parks the source under the normal retry policy; use the
-Claude runner for daemon-managed decomposition until an enforceable Codex boundary exists.
+Codex planning is supported only through its hardened planner-specific boundary: the CLI runs
+read-only without coordination authority, and a bounded JSONL terminal response remains only a
+candidate until stdout reaches EOF, final diagnostics are bounded and complete, and the process
+exits successfully. Any contradictory or incomplete terminal evidence fails without plan
+authority. Grok planning remains refused because managed Grok lifecycle roles are not enabled.
 
 A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Before any
 task row is created, the complete proposal is validated for scope coverage, real delivery
@@ -2060,6 +2070,17 @@ review, and outcome evidence with assignment/profile identity; routing does not 
 parallel statistics subsystem. Unknown models, unavailable runners, missing continuation
 metadata, or a profile snapshot that cannot be executed fail loudly through the existing
 bounded retry or parked-task path, never by silent substitution.
+
+Each distinct configured route attempted for a responsibility may add one immutable evidence
+row linked to, but never replacing, the original role assignment. The row snapshots the exact
+profile and optionally records the closed pre-authoritative failure disposition. Replay is
+idempotent by assignment and profile, and the eligible pool bounds the total distinct rows.
+Exclusions are derived rather than separately granted: `ProviderUnavailable` excludes every
+profile on that provider for the responsibility, while `ProfileUnavailable` excludes only that
+profile. `RetryableSameRoute`, `NonFailover`, `Unclassified`, and an attempt with no classified
+runner failure grant no alternate-route authority. Recording does not advance allocation,
+`rework_round`, task recovery attempts, or lifecycle state. Alternate selection and launch are
+not yet activated.
 
 ### Verification gates
 

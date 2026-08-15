@@ -575,10 +575,23 @@ pub fn bind_frozen_base_and_enter_planning(
         return Err(QuorumError::Usage("invalid frozen base SHA".into()));
     }
     let tx = begin_immediate(conn)?;
+    // Bind must recheck drain quiescence atomically: the daemon tick's
+    // pre-check reads task status outside this transaction, and a supported
+    // operator retry (see `tasks::retry_parked`) can restore a parked task to
+    // `rework`/`in-review` between that read and this update. Refuse the bind
+    // if any started-but-not-terminal task exists other than the planning
+    // source itself, so the drain-to-planning handoff never captures a base
+    // while a merge, remediation, or review is still in flight.
     let changed = tx.execute(
         "UPDATE task_decompositions SET state='planning',frozen_base_sha=?2,updated_at=?3
          WHERE id=?1 AND state='draining' AND freeze_active=1 AND active=0
-           AND frozen_base_sha IS NULL",
+           AND frozen_base_sha IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM tasks t
+               WHERE t.status IN ('working','in-review','rework')
+                 AND t.id != (SELECT g.source_task_id
+                              FROM task_decompositions g WHERE g.id=?1)
+           )",
         params![graph_id, sha, now],
     )?;
     tx.commit().map_err(map_sql_err)?;
@@ -2913,6 +2926,149 @@ mod tests {
     }
 
     #[test]
+    fn bind_refuses_when_a_task_is_started_non_terminal() {
+        let mut conn = setup();
+        // Second task the drain must wait on. Starts terminal, then a supported
+        // operator retry restores it under the freeze between the tick's read
+        // and this bind's transaction — the atomic recheck must refuse.
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('other','failed','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "unused",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3).unwrap();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        // Simulate the retry race: task #2 restored to in-review just before bind.
+        conn.execute("UPDATE tasks SET status='in-review' WHERE id=2", [])
+            .unwrap();
+        assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 4).unwrap());
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM task_decompositions WHERE id=?1",
+                [graph],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "draining");
+
+        // The planning source itself sits in `planning` — it must not block.
+        conn.execute("UPDATE tasks SET status='working' WHERE id=1", [])
+            .unwrap();
+        assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 5).unwrap());
+        conn.execute("UPDATE tasks SET status='planning' WHERE id=1", [])
+            .unwrap();
+
+        // Rework also holds; other terminals do not.
+        conn.execute("UPDATE tasks SET status='rework' WHERE id=2", [])
+            .unwrap();
+        assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 6).unwrap());
+        conn.execute("UPDATE tasks SET status='done' WHERE id=2", [])
+            .unwrap();
+        assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 7).unwrap());
+    }
+
+    #[test]
+    fn concurrent_retry_and_bind_never_capture_base_over_started_work() {
+        use std::sync::{Arc, Barrier};
+        for iteration in 0..32 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("retry-bind-{iteration}.db"));
+            let mut conn = crate::db::open(&path).unwrap();
+            // Source: sits in planning under the freeze.
+            let source = crate::tasks::create(
+                &mut conn, "owner", "src", None, 1, None, None, None, None, 1,
+            )
+            .unwrap();
+            // Parked continuation: `failed` with daemon_parked=1, resume=in-review.
+            let parked = crate::tasks::create(
+                &mut conn, "owner", "parked", None, 1, None, None, None, None, 1,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='failed',refs=json_set(
+                    json_object(
+                        'cx_est',2,'cx_size','S','cx_ready',true,
+                        'cx_not_ready_reason',NULL,'cx_by','test:v2'
+                    ),
+                    '$.daemon_parked', json('true'),
+                    '$.daemon_parked_reason','test',
+                    '$.daemon_resume_status','in-review'
+                 ) WHERE id=?1",
+                [parked],
+            )
+            .unwrap();
+            let graph = begin_planning(
+                &mut conn,
+                &BeginPlanning {
+                    source_task_id: source,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "sol",
+                    frozen_base_sha: "unused",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3).unwrap();
+            drop(conn);
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            let retry_path = path.clone();
+            let retry_barrier = Arc::clone(&barrier);
+            let retry = std::thread::spawn(move || {
+                let mut conn = crate::db::open(&retry_path).unwrap();
+                retry_barrier.wait();
+                crate::tasks::retry_parked(&mut conn, parked, "operator", true, 4)
+            });
+
+            let bind_path = path.clone();
+            let bind_barrier = Arc::clone(&barrier);
+            let bind = std::thread::spawn(move || {
+                let mut conn = crate::db::open(&bind_path).unwrap();
+                bind_barrier.wait();
+                let sha = "0123456789abcdef0123456789abcdef01234567";
+                bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 4).unwrap()
+            });
+
+            let retry_result = retry.join().unwrap();
+            let _bind_result = bind.join().unwrap();
+
+            // The freeze guard in `retry_parked` fires under an active freeze,
+            // so retry must fail regardless of scheduling. The parked task must
+            // still be `failed`; bind may or may not have committed the base,
+            // but it cannot have done so over restored non-terminal work.
+            assert!(
+                retry_result.is_err(),
+                "iteration {iteration}: retry_parked succeeded under an active freeze"
+            );
+            let conn = crate::db::open(&path).unwrap();
+            let restored_status: String = conn
+                .query_row("SELECT status FROM tasks WHERE id=?1", [parked], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(restored_status, "failed", "iteration {iteration}");
+        }
+    }
+
+    #[test]
     fn concurrent_sources_have_one_freeze_winner() {
         use std::sync::{Arc, Barrier};
 
@@ -4065,6 +4221,56 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn blocked_graph_member_is_not_selected_until_graph_reactivates() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[
+                child("prerequisite", &[]),
+                child("ready", &["prerequisite"]),
+            ],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        conn.execute(
+            "UPDATE task_decompositions SET state='blocked' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+
+        let selected = crate::tasks::list_implementation_ready_open(&conn).unwrap();
+        assert!(
+            selected.is_empty(),
+            "blocked graph member must not be selected"
+        );
+        let claims: i64 = conn
+            .query_row("SELECT count(*) FROM claims", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(claims, 0, "selection must not attempt a claim");
+
+        conn.execute(
+            "UPDATE task_decompositions SET state='active',active=1 WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        let selected = crate::tasks::list_implementation_ready_open(&conn).unwrap();
+        assert_eq!(
+            selected.iter().map(|task| task.id).collect::<Vec<_>>(),
+            [ids[1]]
+        );
+        let claimed = crate::tasks::claim(&mut conn, "worker", Some(ids[1]), &[], 60, 5)
+            .unwrap()
+            .expect("reactivated graph member must claim on the next tick");
+        assert_eq!(claimed.id, ids[1]);
     }
 
     #[test]
