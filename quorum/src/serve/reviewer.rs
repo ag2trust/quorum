@@ -478,17 +478,27 @@ fn budget_line(spent_usd: f64, max_task_cost_usd: Option<f64>) -> String {
     }
 }
 
-/// Token-economy guidance for spawned workers. A daemon worker is a batch
-/// process: nobody waits on wall-clock, so parallel subagent fan-out buys
-/// nothing and multiplies cost (each subagent re-pays full boot context).
+/// Work-style guidance for spawned workers. A daemon worker is a batch process:
+/// nobody waits on wall-clock, so the levers are simplicity, token economy, and
+/// no subagent fan-out (each fan-out re-pays full boot context and buys nothing
+/// when latency does not matter).
 const WORKING_STYLE: &str =
     "Working style — you are a batch worker; wall-clock is cheap, tokens are not:\n\
+     - Bias to the simplest solution that fully solves the task. Take the lowest-friction \
+     path that keeps quality, maintainability, and the codebase's existing conventions: \
+     reach for what's already here before adding new machinery, and add complexity only \
+     when the task genuinely needs it — not for hypothetical futures. Match the surrounding \
+     code. Simpler means less code, never weaker code — do not trade away correctness, \
+     validation, tests, or safety to be smaller.\n\
      - Do ALL edits, fixes, and mechanical work directly in this session. Do NOT fan out \
      subagents (Agent/Task tool) to parallelize them — each subagent re-pays your full \
-     context as a boot tax and shares no cache with its siblings.\n\
-     - A subagent is justified ONLY to quarantine bulky read-only exploration (many-file \
-     reads that would bloat your context) behind a short returned conclusion, and rarely \
-     more than one or two per task.";
+     context as a boot tax and shares no cache with its siblings. A subagent is justified \
+     ONLY to quarantine bulky read-only exploration (many-file reads that would bloat your \
+     context) behind a short returned conclusion, and rarely more than one or two per task.\n\
+     - Spend as few tokens as the task allows: avoid needless re-reads, redundant tool \
+     calls, and re-running expensive builds or test suites you do not need. Never let \
+     austerity degrade quality or completeness — run the verification the task requires, \
+     and do not skip a real check to save tokens.";
 
 /// Build the raw worker prompt (no runner-specific wrapping).
 pub fn build_worker_prompt(
@@ -1349,6 +1359,14 @@ mod tests {
         assert!(
             turn.contains("Do NOT fan out"),
             "worker template must forbid subagent fan-out for mechanical work"
+        );
+        assert!(
+            turn.contains("simplest solution that fully solves the task"),
+            "worker template must nudge toward the simplest solution (anti-over-engineering)"
+        );
+        assert!(
+            turn.contains("as few tokens as the task allows"),
+            "worker template must nudge token austerity without degrading quality"
         );
         assert!(
             turn.contains("$0.00") && turn.contains("$50.00"),
