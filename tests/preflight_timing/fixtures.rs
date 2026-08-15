@@ -120,7 +120,9 @@ impl Fixture {
         if matches!(scenario, Scenario::DiscoverySpawnFailure) {
             command
                 .env("PREFLIGHT_TEST_TIMEOUT_SECS", "2")
-                .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1");
+                // Keep external discovery unavailable throughout both cleanup
+                // stages so the platform's spawn-free fallback owns teardown.
+                .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000");
         }
         command.output().expect("run preflight")
     }
@@ -365,7 +367,7 @@ fn timeout_reaps_descendants_in_separate_process_groups() {
 }
 
 #[test]
-fn process_discovery_spawn_failure_is_bounded_and_reaps_descendants() {
+fn sustained_process_discovery_failure_is_bounded_and_reaps_descendants() {
     let fixture = Fixture::new();
     let started = Instant::now();
     let output = fixture.preflight(Scenario::DiscoverySpawnFailure);
@@ -398,6 +400,12 @@ fn process_discovery_spawn_failure_is_bounded_and_reaps_descendants() {
         .as_str()
         .expect("cleanup error is recorded")
         .contains("process-tree discovery could not start"));
+    if cfg!(target_os = "macos") {
+        assert!(binary["cleanup"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("used libproc fallback"));
+    }
     fixture.assert_fixture_uses_separate_process_groups();
     assert_processes_gone(&fixture.wait_for_fixture_pids());
 }

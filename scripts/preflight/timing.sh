@@ -401,12 +401,88 @@ def _linux_process_table() -> dict[int, tuple[int, int]] | None:
     return rows
 
 
+def _darwin_process_table() -> dict[int, tuple[int, int]] | None:
+    """Read PID -> (PPID, PGID) without spawning under macOS."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+
+        class ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        libproc.proc_listallpids.restype = ctypes.c_int
+        libproc.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        libproc.proc_pidinfo.restype = ctypes.c_int
+
+        count = libproc.proc_listallpids(None, 0)
+        if count <= 0:
+            return None
+        capacity = count + 64
+        pids = (ctypes.c_int * capacity)()
+        count = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
+        if count < 0:
+            return None
+
+        rows: dict[int, tuple[int, int]] = {}
+        for pid in pids[:min(count, capacity)]:
+            if pid <= 0:
+                continue
+            info = ProcBsdInfo()
+            copied = libproc.proc_pidinfo(
+                pid,
+                3,  # PROC_PIDTBSDINFO
+                0,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            if copied == ctypes.sizeof(info):
+                rows[pid] = (int(info.pbi_ppid), int(info.pbi_pgid))
+        return rows
+    except (AttributeError, ImportError, OSError, ValueError):
+        return None
+
+
 def _process_table_failure(
     error: str,
 ) -> tuple[dict[int, tuple[int, int]], str]:
     rows = _linux_process_table()
     if rows is not None:
         return rows, f"process-tree discovery degraded: {error}; used /proc fallback"
+    rows = _darwin_process_table()
+    if rows is not None:
+        return rows, f"process-tree discovery degraded: {error}; used libproc fallback"
     return {}, error
 
 
