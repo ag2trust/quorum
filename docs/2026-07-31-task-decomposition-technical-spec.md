@@ -239,9 +239,14 @@ transaction; freeze acquisition is refused while any reservation is live, and ev
 failure path releases it.
 
 After the freeze commits, already active managed work may finish, including protected merge.
-Nothing new is provisioned. Planning starts only when live slots and durable in-flight journal
-rows are empty. This coordinator is separate from self-update `DrainState`, which drains and
-exits the process.
+Nothing new is provisioned. Planning starts only when live slots, durable in-flight journal
+rows, and started-but-not-terminal tasks (`working`, `in-review`, `rework`, excluding the
+planning source itself) are all empty. Zero live processes alone is not enough: a task can be
+`in-review` between worker teardown and reviewer attach with no futures retained, and starting
+planning while that task is still non-terminal would let its merge race the frozen-base
+capture. Convergence holds because the freeze blocks new claims, so the set of started tasks
+can only shrink under drain. This coordinator is separate from self-update `DrainState`, which
+drains and exits the process.
 
 A semantic plan rejection retains the freeze. A provider failure clears it during bounded
 backoff; retry reacquires it and drains again. A valid blocker or exhausted budget clears the

@@ -537,6 +537,25 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
     Ok(unmet == 0)
 }
 
+/// Count tasks that have already started but not yet reached a terminal
+/// state, excluding one task id (the planning source itself, which sits in
+/// `planning` while draining and is not "started work" for this predicate).
+///
+/// Used by the decomposition drain-readiness gate: draining must wait for
+/// every already-started task to run through review/rework/remediation/merge
+/// to `done`/`failed`/`cancelled` before capturing the frozen base and
+/// entering `planning`. `open` tasks never started; the freeze blocks new
+/// claims, so the counted set can only shrink under drain.
+pub fn count_started_non_terminal_excluding(conn: &Connection, exclude_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM tasks
+         WHERE status IN ('working','in-review','rework')
+           AND id != ?1",
+        params![exclude_id],
+        |r| r.get(0),
+    )?)
+}
+
 fn merge_pr_into_refs(existing: &Option<String>, pr: &str) -> String {
     let pr_val: serde_json::Value = pr
         .parse::<i64>()
@@ -10503,5 +10522,58 @@ mod tests {
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         // No claim was ever taken (e.g., worker died before insert).
         assert!(!worker_lease_active_for(&mut c, "W1", id, 1001).unwrap());
+    }
+
+    #[test]
+    fn count_started_non_terminal_excludes_source_open_and_terminals() {
+        let (_d, mut c) = open_tmp();
+        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
+        let working = create(&mut c, "boss", "w", None, 0, None, None, None, None, 1000).unwrap();
+        let in_review = create(&mut c, "boss", "r", None, 0, None, None, None, None, 1000).unwrap();
+        let rework = create(&mut c, "boss", "k", None, 0, None, None, None, None, 1000).unwrap();
+        let open_task = create(&mut c, "boss", "o", None, 0, None, None, None, None, 1000).unwrap();
+        let merging = create(&mut c, "boss", "m", None, 0, None, None, None, None, 1000).unwrap();
+        let done = create(&mut c, "boss", "d", None, 0, None, None, None, None, 1000).unwrap();
+        let failed = create(&mut c, "boss", "f", None, 0, None, None, None, None, 1000).unwrap();
+        let cancelled = create(&mut c, "boss", "x", None, 0, None, None, None, None, 1000).unwrap();
+
+        for (id, status) in [
+            (working, "working"),
+            (in_review, "in-review"),
+            (rework, "rework"),
+            (merging, "merging"),
+            (done, "done"),
+            (failed, "failed"),
+            (cancelled, "cancelled"),
+        ] {
+            c.execute(
+                "UPDATE tasks SET status=?2 WHERE id=?1",
+                params![id, status],
+            )
+            .unwrap();
+        }
+
+        // working+in-review+rework block; source, open, merging, and terminals do not.
+        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 3);
+
+        // Excluding an actual started task drops its count.
+        assert_eq!(
+            count_started_non_terminal_excluding(&c, in_review).unwrap(),
+            2
+        );
+
+        // Move the last blocker to done → predicate releases (returns 0).
+        for id in [working, rework] {
+            c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![id])
+                .unwrap();
+        }
+        c.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            params![in_review],
+        )
+        .unwrap();
+        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 0);
+
+        let _ = open_task; // silence "unused" — open row also present in DB
     }
 }
