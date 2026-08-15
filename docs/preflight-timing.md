@@ -90,30 +90,67 @@ WT2=/path/to/quorum-wt-2
 run_preflight() {
   wt=$1 label=$2
   (
-    cd "$wt" || exit
-    RUST_TEST_THREADS=4 rtk proxy ./preflight.sh >"$RESULTS/$label.log" 2>&1
-    status=$?
-    if [ "$status" -eq 0 ]; then
-      cp target/preflight-timing/timing.json "$RESULTS/$label.timing.json"
-      cp target/preflight-timing/summary.txt "$RESULTS/$label.summary.txt"
+    preflight_status=not_run
+    timing_copy_status=not_run
+    summary_copy_status=not_run
+
+    if cd "$wt"; then
+      RUST_TEST_THREADS=4 rtk proxy ./preflight.sh >"$RESULTS/$label.log" 2>&1
+      preflight_status=$?
+      if [ "$preflight_status" -eq 0 ]; then
+        cp target/preflight-timing/timing.json "$RESULTS/$label.timing.json"
+        timing_copy_status=$?
+        cp target/preflight-timing/summary.txt "$RESULTS/$label.summary.txt"
+        summary_copy_status=$?
+      fi
     fi
-    exit "$status"
+
+    # Preserve every outcome, including skipped copies after a failed preflight.
+    printf 'preflight=%s\ntiming_copy=%s\nsummary_copy=%s\n' \
+      "$preflight_status" "$timing_copy_status" "$summary_copy_status" \
+      >"$RESULTS/$label.status"
+    status_file_status=$?
+
+    if [ "$preflight_status" = 0 ] \
+      && [ "$timing_copy_status" = 0 ] \
+      && [ "$summary_copy_status" = 0 ] \
+      && [ "$status_file_status" = 0 ]; then
+      exit 0
+    fi
+    exit 1
   )
 }
 
+wait_for_all() {
+  round_failed=0
+  for child_pid in "$@"; do
+    wait "$child_pid" || round_failed=1
+  done
+  return "$round_failed"
+}
+
 # Idle baseline: wait for this one run before creating competing work.
-run_preflight "$WT0" idle
+if ! run_preflight "$WT0" idle; then
+  printf 'idle round failed; see %s/idle.status and idle.log\n' "$RESULTS" >&2
+  exit 1
+fi
 
 # Two concurrent worktrees: start both before either is awaited.
 run_preflight "$WT0" two-a & p0=$!
 run_preflight "$WT1" two-b & p1=$!
-wait "$p0"; wait "$p1"
+if ! wait_for_all "$p0" "$p1"; then
+  printf 'two-worktree round failed; see %s/two-*.status and *.log\n' "$RESULTS" >&2
+  exit 1
+fi
 
 # Three concurrent worktrees: start all three before any wait.
 run_preflight "$WT0" three-a & p0=$!
 run_preflight "$WT1" three-b & p1=$!
 run_preflight "$WT2" three-c & p2=$!
-wait "$p0"; wait "$p1"; wait "$p2"
+if ! wait_for_all "$p0" "$p1" "$p2"; then
+  printf 'three-worktree round failed; see %s/three-*.status and *.log\n' "$RESULTS" >&2
+  exit 1
+fi
 ```
 
 Before each round, verify every worktree has the intended identical `HEAD` and
@@ -125,6 +162,10 @@ the round. If `branch_base` failed, there is no new collector output and any
 file at the deterministic path is stale. A failure after the collector began
 can have a partial artifact, but it is diagnostic only and is excluded from
 this comparison; the example preserves artifacts only from green runs.
+Each `<label>.status` file records the preflight and both copy outcomes; all
+three must be `0` for each label before comparing a round. The wait helper
+waits for every started child even after a failure, then rejects the entire
+round if any child or status-file write failed.
 
 Compare the `gates` arrays for idle, both two-way artifacts, and all three
 three-way artifacts. Compare `top_n_slowest` (or the matching summaries) to
