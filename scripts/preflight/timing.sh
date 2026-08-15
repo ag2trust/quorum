@@ -43,6 +43,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -54,6 +56,13 @@ CARGO_FEATURES = ["--all-features", "--features", "quorum-core/test-support"]
 
 WRAPPER_ACTIVE_ENV = "TIMING_RUSTC_WRAPPER_ACTIVE"
 WRAPPER_LOG_ENV = "TIMING_RUSTC_LOG"
+SUPERVISOR_ACTIVE_ENV = "TIMING_TEST_SUPERVISOR_ACTIVE"
+SUPERVISOR_OWNER_FD_ENV = "TIMING_TEST_SUPERVISOR_OWNER_FD"
+SUPERVISOR_RESULT_FD_ENV = "TIMING_TEST_SUPERVISOR_RESULT_FD"
+SUPERVISOR_ARGV_ENV = "TIMING_TEST_SUPERVISOR_ARGV"
+SUPERVISOR_TIMEOUT_ENV = "TIMING_TEST_SUPERVISOR_TIMEOUT"
+SUPERVISOR_GRACE_ENV = "TIMING_TEST_SUPERVISOR_GRACE"
+SUPERVISOR_DISPLAY_ENV = "TIMING_TEST_SUPERVISOR_DISPLAY"
 
 DEFAULT_TEST_TIMEOUT_SECS = 120.0
 DEFAULT_TERM_GRACE_SECS = 2.0
@@ -346,8 +355,8 @@ def _enable_child_subreaper() -> None:
     """Keep orphaned test descendants reparented here on Linux.
 
     Other POSIX systems reap orphans through their normal init process. Linux
-    lets the collector become the nearest subreaper so killed grandchildren do
-    not accumulate as zombies beneath a container's PID 1.
+    lets the test supervisor become the nearest subreaper so killed
+    grandchildren do not accumulate as zombies beneath a container's PID 1.
     """
     if not sys.platform.startswith("linux"):
         return
@@ -453,6 +462,166 @@ def _cleanup_diagnostic(cleanup: dict) -> str:
     return ", ".join(actions)
 
 
+class SupervisorInterrupted(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _write_supervisor_result(fd: int, result: dict) -> None:
+    payload = (json.dumps(result, sort_keys=True) + "\n").encode()
+    try:
+        while payload:
+            written = os.write(fd, payload)
+            payload = payload[written:]
+    except (BrokenPipeError, OSError):
+        # Abrupt owner death normally removes the result reader. Cleanup is
+        # still complete, so the supervisor can exit without reporting back.
+        pass
+
+
+def _test_supervisor() -> int:
+    """Own one isolated test group, even if the timing collector is killed."""
+    owner_fd = int(os.environ[SUPERVISOR_OWNER_FD_ENV])
+    result_fd = int(os.environ[SUPERVISOR_RESULT_FD_ENV])
+    argv = json.loads(os.environ[SUPERVISOR_ARGV_ENV])
+    timeout_secs = float(os.environ[SUPERVISOR_TIMEOUT_ENV])
+    grace_secs = float(os.environ[SUPERVISOR_GRACE_ENV])
+    display_name = os.environ[SUPERVISOR_DISPLAY_ENV]
+    started = now()
+    proc: subprocess.Popen | None = None
+    result: dict | None = None
+
+    def interrupted(signum: int, _frame: object) -> None:
+        raise SupervisorInterrupted(signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, interrupted)
+
+    try:
+        _enable_child_subreaper()
+        old_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+
+        def restore_child_signal_mask() -> None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+        test_env = os.environ.copy()
+        for key in (
+            SUPERVISOR_ACTIVE_ENV,
+            SUPERVISOR_OWNER_FD_ENV,
+            SUPERVISOR_RESULT_FD_ENV,
+            SUPERVISOR_ARGV_ENV,
+            SUPERVISOR_TIMEOUT_ENV,
+            SUPERVISOR_GRACE_ENV,
+            SUPERVISOR_DISPLAY_ENV,
+        ):
+            test_env.pop(key, None)
+        try:
+            proc = subprocess.Popen(
+                argv,
+                env=test_env,
+                start_new_session=True,
+                preexec_fn=restore_child_signal_mask,
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+        deadline = started + timeout_secs
+        outcome = "failed"
+        rc = 1
+        while True:
+            polled = proc.poll()
+            if polled is not None:
+                rc = polled
+                outcome = "passed" if rc == 0 else "failed"
+                break
+            remaining = deadline - now()
+            if remaining <= 0:
+                rc = TIMEOUT_EXIT_CODE
+                outcome = "timed_out"
+                break
+            readable, _, _ = select.select(
+                [owner_fd], [], [], min(remaining, 0.05)
+            )
+            if readable and os.read(owner_fd, 1) == b"":
+                rc = 1
+                outcome = "owner_lost"
+                break
+
+        cleanup = _cleanup_process_group(proc, grace_secs)
+        result = _run_result(started, rc, outcome, timeout_secs, cleanup)
+        if outcome == "timed_out":
+            print(
+                f"preflight timing: test binary {display_name!r} timed out "
+                f"after {result['duration_secs']:.2f}s "
+                f"(deadline {timeout_secs:.2f}s); "
+                f"{_cleanup_diagnostic(cleanup)}. Re-run "
+                f"{shlex.join([*argv, '--nocapture'])} to diagnose.",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif outcome != "owner_lost" and not cleanup["complete"]:
+            print(
+                f"preflight timing: test binary {display_name!r} exited "
+                f"but {_cleanup_diagnostic(cleanup)}",
+                file=sys.stderr,
+                flush=True,
+            )
+    except SupervisorInterrupted as exc:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, signal.SIG_IGN)
+        cleanup = (
+            _cleanup_process_group(proc, grace_secs)
+            if proc is not None
+            else {
+                "attempted": False,
+                "term_sent": False,
+                "kill_sent": False,
+                "complete": True,
+                "error": None,
+            }
+        )
+        result = _run_result(
+            started, 128 + exc.signum, "interrupted", timeout_secs, cleanup
+        )
+    except BaseException as exc:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, signal.SIG_IGN)
+        cleanup = (
+            _cleanup_process_group(proc, grace_secs)
+            if proc is not None
+            else {
+                "attempted": False,
+                "term_sent": False,
+                "kill_sent": False,
+                "complete": True,
+                "error": None,
+            }
+        )
+        cleanup["error"] = cleanup["error"] or f"supervisor failure: {exc}"
+        result = _run_result(started, 1, "failed", timeout_secs, cleanup)
+    finally:
+        if result is not None:
+            _write_supervisor_result(result_fd, result)
+        os.close(owner_fd)
+        os.close(result_fd)
+    return 0
+
+
+def _read_supervisor_result(fd: int) -> dict:
+    payload = bytearray()
+    while True:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        payload.extend(chunk)
+    if not payload:
+        raise RuntimeError("test supervisor exited without a result")
+    return json.loads(payload)
+
+
 def run_test_binary(
     exe: str,
     threads: int,
@@ -463,6 +632,8 @@ def run_test_binary(
     argv = [exe, "--test-threads", str(threads)]
     t0 = now()
     proc: subprocess.Popen | None = None
+    owner_read, owner_write = os.pipe()
+    result_read, result_write = os.pipe()
     previous_handlers: dict[signal.Signals, object] = {}
 
     def interrupted(signum: int, _frame: object) -> None:
@@ -472,9 +643,20 @@ def run_test_binary(
         previous_handlers[sig] = signal.signal(sig, interrupted)
 
     try:
-        # Do not leave a signal-sized gap between spawn and recording the PID:
-        # a pending interruption is delivered immediately after the group is
-        # known, so the exception path can always clean it.
+        env = os.environ.copy()
+        env.update({
+            SUPERVISOR_ACTIVE_ENV: "1",
+            SUPERVISOR_OWNER_FD_ENV: str(owner_read),
+            SUPERVISOR_RESULT_FD_ENV: str(result_write),
+            SUPERVISOR_ARGV_ENV: json.dumps(argv),
+            SUPERVISOR_TIMEOUT_ENV: str(timeout_secs),
+            SUPERVISOR_GRACE_ENV: str(term_grace_secs),
+            SUPERVISOR_DISPLAY_ENV: display_name,
+        })
+
+        # The supervisor leaves the daemon-owned worker group before it starts
+        # the test. If the collector is SIGKILLed, EOF on owner_read tells the
+        # independently live supervisor to clean and reap the test group.
         old_mask = signal.pthread_sigmask(
             signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
         )
@@ -484,78 +666,76 @@ def run_test_binary(
 
         try:
             proc = subprocess.Popen(
-                argv,
+                [sys.executable, str(Path(__file__).resolve())],
+                env=env,
+                pass_fds=(owner_read, result_write),
                 start_new_session=True,
                 preexec_fn=restore_child_signal_mask,
             )
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-        try:
-            rc = proc.wait(timeout=timeout_secs)
-        except subprocess.TimeoutExpired:
-            for sig in previous_handlers:
-                signal.signal(sig, signal.SIG_IGN)
-            cleanup = _cleanup_process_group(proc, term_grace_secs)
-            result = _run_result(
-                t0, TIMEOUT_EXIT_CODE, "timed_out", timeout_secs, cleanup
-            )
-            print(
-                f"preflight timing: test binary {display_name!r} timed out "
-                f"after {result['duration_secs']:.2f}s "
-                f"(deadline {timeout_secs:.2f}s); "
-                f"{_cleanup_diagnostic(cleanup)}. Re-run {exe!r} "
-                f"--test-threads {threads} --nocapture to diagnose.",
-                file=sys.stderr,
-                flush=True,
-            )
-            return result
-
-        cleanup = _cleanup_process_group(proc, term_grace_secs)
-        outcome = "passed" if rc == 0 else "failed"
-        if not cleanup["complete"]:
-            print(
-                f"preflight timing: test binary {display_name!r} exited "
-                f"but {_cleanup_diagnostic(cleanup)}",
-                file=sys.stderr,
-                flush=True,
-            )
-        return _run_result(t0, rc, outcome, timeout_secs, cleanup)
+        os.close(owner_read)
+        owner_read = -1
+        os.close(result_write)
+        result_write = -1
+        proc.wait()
+        return _read_supervisor_result(result_read)
     except CollectorInterrupted as exc:
         for sig in previous_handlers:
             signal.signal(sig, signal.SIG_IGN)
-        cleanup = (
-            _cleanup_process_group(proc, term_grace_secs)
-            if proc is not None
-            else {
-                "attempted": False,
-                "term_sent": False,
-                "kill_sent": False,
-                "complete": True,
-                "error": None,
-            }
-        )
-        exc.result = _run_result(
-            t0,
-            128 + exc.signum,
-            "interrupted",
-            timeout_secs,
-            cleanup,
-        )
+        if owner_read >= 0:
+            os.close(owner_read)
+            owner_read = -1
+        if result_write >= 0:
+            os.close(result_write)
+            result_write = -1
+        os.close(owner_write)
+        owner_write = -1
+        if proc is not None:
+            proc.wait(timeout=(2 * term_grace_secs) + 2)
+            result = _read_supervisor_result(result_read)
+        else:
+            result = _run_result(
+                t0,
+                128 + exc.signum,
+                "interrupted",
+                timeout_secs,
+                {
+                    "attempted": False,
+                    "term_sent": False,
+                    "kill_sent": False,
+                    "complete": True,
+                    "error": None,
+                },
+            )
+        result["exit_code"] = 128 + exc.signum
+        result["outcome"] = "interrupted"
+        result["timed_out"] = False
+        exc.result = result
         print(
             f"preflight timing: interrupted while running test binary "
             f"{display_name!r} after {exc.result['duration_secs']:.2f}s; "
-            f"{_cleanup_diagnostic(cleanup)}",
+            f"{_cleanup_diagnostic(result['cleanup'])}",
             file=sys.stderr,
             flush=True,
         )
         raise
     except BaseException:
-        if proc is not None:
-            for sig in previous_handlers:
-                signal.signal(sig, signal.SIG_IGN)
-            _cleanup_process_group(proc, term_grace_secs)
+        for sig in previous_handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        if owner_write >= 0:
+            os.close(owner_write)
+            owner_write = -1
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.wait(timeout=(2 * term_grace_secs) + 2)
+            except subprocess.TimeoutExpired:
+                pass
         raise
     finally:
+        for fd in (owner_read, owner_write, result_read, result_write):
+            if fd >= 0:
+                os.close(fd)
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
 
@@ -687,7 +867,6 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
         }
 
     if status == 0:
-        _enable_child_subreaper()
         print(
             f"=== timing 4/4: run {len(binaries)} test binaries "
             f"(--test-threads {args.test_threads}, "
@@ -985,6 +1164,8 @@ def self_test() -> int:
 def main() -> int:
     if os.environ.get(WRAPPER_ACTIVE_ENV) == "1":
         return _rustc_wrapper()
+    if os.environ.get(SUPERVISOR_ACTIVE_ENV) == "1":
+        return _test_supervisor()
 
     p = argparse.ArgumentParser(
         description=(

@@ -1,6 +1,9 @@
 use std::{
     env, fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::{
+        fs::PermissionsExt,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     thread,
@@ -20,6 +23,7 @@ enum Scenario {
     CompileFailure,
     Timeout,
     Interrupted,
+    AbruptOwnerDeath,
 }
 
 impl Scenario {
@@ -30,6 +34,7 @@ impl Scenario {
             Self::CompileFailure => "compile-failure",
             Self::Timeout => "timeout",
             Self::Interrupted => "interrupted",
+            Self::AbruptOwnerDeath => "abrupt-owner-death",
         }
     }
 }
@@ -98,7 +103,7 @@ impl Fixture {
                 "PREFLIGHT_TEST_EXECUTABLE",
                 match scenario {
                     Scenario::TestFailure => self.repo.join("fixture-test-failure"),
-                    Scenario::Timeout | Scenario::Interrupted => {
+                    Scenario::Timeout | Scenario::Interrupted | Scenario::AbruptOwnerDeath => {
                         self.repo.join("fixture-test-blocking")
                     }
                     _ => self.repo.join("fixture-test-unused"),
@@ -112,13 +117,14 @@ impl Fixture {
         command.output().expect("run preflight")
     }
 
-    fn interrupted_timing(&self) -> Child {
+    fn timing_collector(&self, scenario: Scenario) -> Command {
         let path = format!(
             "{}:{}",
             self.bin.display(),
             env::var("PATH").expect("PATH is set")
         );
-        Command::new("scripts/preflight/timing.sh")
+        let mut command = Command::new("scripts/preflight/timing.sh");
+        command
             .current_dir(&self.repo)
             .args([
                 "--skip-fmt",
@@ -129,19 +135,28 @@ impl Fixture {
                 "0.2",
             ])
             .env("PATH", path)
-            .env(
-                "PREFLIGHT_TIMING_SCENARIO",
-                Scenario::Interrupted.env_value(),
-            )
+            .env("PREFLIGHT_TIMING_SCENARIO", scenario.env_value())
             .env(
                 "PREFLIGHT_TEST_EXECUTABLE",
                 self.repo.join("fixture-test-blocking"),
             )
             .env("PREFLIGHT_FIXTURE_PID_FILE", self.pid_file())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn interrupted_timing(&self) -> Child {
+        self.timing_collector(Scenario::Interrupted)
             .spawn()
             .expect("spawn interruptible timing collector")
+    }
+
+    fn abruptly_owned_timing(&self) -> Child {
+        self.timing_collector(Scenario::AbruptOwnerDeath)
+            .process_group(0)
+            .spawn()
+            .expect("spawn abruptly killable timing collector")
     }
 
     fn pid_file(&self) -> PathBuf {
@@ -149,7 +164,7 @@ impl Fixture {
     }
 
     fn wait_for_fixture_pids(&self) -> Vec<i32> {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(text) = fs::read_to_string(self.pid_file()) {
                 let pids = text
@@ -379,6 +394,25 @@ fn interruption_reaps_the_process_group_and_writes_bounded_timing() {
     assert_eq!(binary["execute_outcome"], "interrupted");
     assert_eq!(binary["cleanup"]["complete"], true);
     assert!(binary["execute_secs"].as_f64().unwrap() < 5.0);
+    assert_processes_gone(&fixture_pids);
+}
+
+#[test]
+fn abrupt_owner_group_death_still_reaps_the_test_process_group() {
+    let fixture = Fixture::new();
+    let collector = fixture.abruptly_owned_timing();
+    let fixture_pids = fixture.wait_for_fixture_pids();
+
+    assert_eq!(
+        unsafe { libc::killpg(collector.id() as i32, libc::SIGKILL) },
+        0,
+        "kill timing collector process group"
+    );
+    let output = collector
+        .wait_with_output()
+        .expect("collect abruptly killed timing output");
+
+    assert_eq!(output.status.signal(), Some(libc::SIGKILL));
     assert_processes_gone(&fixture_pids);
 }
 

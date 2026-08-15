@@ -24,15 +24,18 @@ the complete author-gate artifact is required.
 
 ## Artifact schema
 
-`timing.json` is valid JSON with `version: 2` and these top-level fields:
+`timing.json` is valid JSON with `version: 3` and these top-level fields:
 
 | Field | Meaning |
 | --- | --- |
 | `timestamp_utc` | UTC completion timestamp in RFC 3339 form. |
 | `top_n` | Requested list length (default `10`). |
 | `test_threads` | `--test-threads` value used when executing each test binary. |
+| `test_timeout_secs` | Per-test-executable deadline (default `120`). |
+| `term_grace_secs` | Bounded wait after TERM and again after KILL while cleaning a test process group (default `2`). |
+| `interrupted_signal` | Signal number that interrupted test execution, or JSON `null` when uninterrupted. |
 | `gates` | Ordered objects with `name`, `duration_secs`, and `exit_code`. Full preflight prepends `branch_base`; the collector records `cargo_fmt`, `cargo_clippy`, `cargo_test_no_run`, and `test_execute` until a failure stops later gates. |
-| `test_binaries` | One object per Cargo test executable discovered during the compile/no-run gate. Its identity fields are `package_id`, `manifest_path`, `target_name`, `target_kinds`, `executable`, and `fresh`; after execution it also has `execute_secs` and `execute_exit_code`. It is empty when compilation was never reached. |
+| `test_binaries` | One object per Cargo test executable discovered during the compile/no-run gate. Its identity fields are `package_id`, `manifest_path`, `target_name`, `target_kinds`, `executable`, and `fresh`; execution fields are described below. It is empty when compilation was never reached. |
 | `top_n_slowest` | A bounded, descending copy of the slowest entries in `test_binaries`. |
 | `rustc_wrapper` | Correlation accounting (`matched`, `log_entries`, and `log_path`) once compile/no-run starts; `{}` for an earlier fmt or clippy failure. |
 
@@ -41,6 +44,18 @@ early collector gate fails. In that case, `cargo-test-no-run.jsonl`,
 `cargo-test-no-run.stderr`, and `rustc-invocations.jsonl` do not exist, and
 `rustc_wrapper` has no accounting fields. Those files and fields are therefore
 conditional, not an artifact validity check.
+
+After a binary is executed, its entry has `execute_secs`,
+`execute_exit_code`, `execute_outcome` (`passed`, `failed`, `timed_out`, or
+`interrupted`), `execute_timed_out`, and `execute_timeout_secs`. Its `cleanup`
+object records `attempted`, `term_sent`, `kill_sent`, `complete`, and `error`.
+`complete: true` means the isolated test process group no longer exists and
+the supervisor reaped the children it owns. A timeout uses exit code `124`.
+Each test is owned by a supervisor outside the collector's process group; if
+the collector is abruptly killed, that supervisor observes owner loss and
+performs the same bounded TERM/KILL cleanup before exiting. Because an
+abruptly killed collector cannot finish writing JSON, that owner-loss cleanup
+does not itself promise a new timing artifact.
 
 For a binary, `compile_no_run_secs` is the sum of wall-clock intervals for the
 matching test `rustc` invocations, and `compile_no_run_source` identifies the
@@ -61,10 +76,10 @@ shows `target_name`, `compile_no_run`, and `execute` for the same entries as
 ```
 
 It is descending and limited to `top_n`; it is not separately ranked by
-compile or execution time. Inspect the two columns to decide which phase to
-investigate. A compile value of `n/a` means the wrapper could not match that
+compile or execution time. Inspect those columns and the execution `outcome`
+to decide which phase to investigate. A compile value of `n/a` means the wrapper could not match that
 binary, not that its compile time was zero. The binary name in the text table
-is truncated to 48 characters; use `timing.json` for the full executable path
+is truncated to 40 characters; use `timing.json` for the full executable path
 and package identity.
 
 ## Optional loaded-worktree comparison
