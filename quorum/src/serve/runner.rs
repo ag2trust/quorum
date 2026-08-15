@@ -814,6 +814,13 @@ impl RunnerProc {
         }
     }
 
+    /// Return any failure or incomplete evidence even after a syntactic
+    /// terminal-success record. Callers must first finalize bounded process
+    /// evidence and prove the provider process exited successfully.
+    pub fn observed_strict_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
+        self.failure_tracker().observed_strict_failure()
+    }
+
     pub async fn next_raw_line(&mut self) -> Option<String> {
         match self {
             Self::Claude(proc) => proc.next_raw_line().await,
