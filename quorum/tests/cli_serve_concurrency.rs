@@ -914,14 +914,13 @@ fn sentinel_gone_terminates_serve_and_children() {
     }
 }
 
-// ── #419: Spawn log only after successful claim ───────────────────────
+// ── #419/#472: selection and claim authority ──────────────────────────
 
 #[test]
-fn claim_clean_negative_no_spawn_log() {
-    // A graph member whose sibling has failed passes the daemon's local
-    // selection filter (open, ready, classified) but fails the claim SQL's
-    // GRAPH_IMPLEMENTATION_READY_CLAUSE → Ok(None). Assert: no "spawning
-    // agent" log, neutral clean-negative message, no authority artefacts.
+fn stable_graph_rejection_is_filtered_without_skip_or_spawn() {
+    // A graph member whose sibling has failed is deterministically rejected by
+    // GRAPH_IMPLEMENTATION_READY_CLAUSE. Selection shares that predicate, so
+    // repeated ticks must not attempt claims or emit race-skip/spawn logs.
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -1006,16 +1005,19 @@ fn claim_clean_negative_no_spawn_log() {
     let mut handle =
         ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file, 1);
 
-    // Wait for the neutral clean-negative message.
-    assert!(
-        handle.wait_for("no longer claimable after selection", 15),
-        "expected clean-negative claim message. Lines: {:?}",
-        handle.lines
-    );
-
-    // Drain remaining output.
-    std::thread::sleep(Duration::from_secs(1));
+    // Allow several dispatch ticks and drain their output.
+    std::thread::sleep(Duration::from_secs(2));
     handle.drain_available();
+
+    let skip_lines: Vec<_> = handle
+        .lines
+        .iter()
+        .filter(|line| line.contains("no longer claimable after selection"))
+        .collect();
+    assert!(
+        skip_lines.is_empty(),
+        "stable graph rejection must be filtered before claim: {skip_lines:?}"
+    );
 
     // No "spawning agent" for task #2.
     let spawn_lines: Vec<_> = handle
@@ -1050,7 +1052,10 @@ fn claim_clean_negative_no_spawn_log() {
         let errs: i64 = conn
             .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(errs, 0, "clean negative must not produce errors");
+        assert_eq!(
+            errs, 0,
+            "stable selection rejection must not produce errors"
+        );
     }
 
     handle.stop();

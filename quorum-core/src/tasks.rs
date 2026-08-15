@@ -311,6 +311,34 @@ const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
     )
 ))";
 
+// Generated implementation work has additional graph authority. This exact
+// predicate is used both by daemon-side candidate selection and by the
+// authoritative claim transaction so the two paths cannot drift.
+const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
+    SELECT 1 FROM task_graph_members own_member
+    WHERE own_member.task_id=tasks.id
+) OR EXISTS (
+    SELECT 1
+    FROM task_graph_members own_member
+    JOIN task_decompositions graph ON graph.id=own_member.graph_id
+    JOIN tasks source ON source.id=graph.source_task_id
+    WHERE own_member.task_id=tasks.id AND own_member.active=1
+      AND graph.state='active' AND graph.active=1
+      AND source.status='decomposed'
+      AND NOT EXISTS (
+          SELECT 1 FROM task_graph_members sibling_member
+          JOIN tasks sibling ON sibling.id=sibling_member.task_id
+          WHERE sibling_member.graph_id=own_member.graph_id
+            AND sibling_member.active=1 AND sibling.status='failed'
+      )
+      AND 2 > (
+          SELECT COUNT(*) FROM task_graph_members sibling_member
+          JOIN tasks sibling ON sibling.id=sibling_member.task_id
+          WHERE sibling_member.graph_id=own_member.graph_id
+            AND sibling_member.active=1 AND sibling.status='working'
+      )
+))";
+
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
         id: r.get(0)?,
@@ -781,35 +809,10 @@ pub fn claim(
         AND NOT (json_extract(refs, '$.cx_est')=5
                  AND json_extract(refs, '$.cx_size')='L')
     ))";
-    // Generated implementation work has additional graph authority. Keep this
-    // predicate in the same BEGIN IMMEDIATE transaction as the task update so
-    // sibling claims, failures, and graph blockers cannot race provisioning.
+    // Keep graph authority in this BEGIN IMMEDIATE transaction so sibling
+    // claims, failures, and graph blockers cannot race provisioning.
     // Review/rework authority for an already-started child is intentionally not
     // gated: active children may finish after a sibling fails or blocks the graph.
-    const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
-        SELECT 1 FROM task_graph_members own_member
-        WHERE own_member.task_id=tasks.id
-    ) OR EXISTS (
-        SELECT 1
-        FROM task_graph_members own_member
-        JOIN task_decompositions graph ON graph.id=own_member.graph_id
-        JOIN tasks source ON source.id=graph.source_task_id
-        WHERE own_member.task_id=tasks.id AND own_member.active=1
-          AND graph.state='active' AND graph.active=1
-          AND source.status='decomposed'
-          AND NOT EXISTS (
-              SELECT 1 FROM task_graph_members sibling_member
-              JOIN tasks sibling ON sibling.id=sibling_member.task_id
-              WHERE sibling_member.graph_id=own_member.graph_id
-                AND sibling_member.active=1 AND sibling.status='failed'
-          )
-          AND 2 > (
-              SELECT COUNT(*) FROM task_graph_members sibling_member
-              JOIN tasks sibling ON sibling.id=sibling_member.task_id
-              WHERE sibling_member.graph_id=own_member.graph_id
-                AND sibling_member.active=1 AND sibling.status='working'
-          )
-    ))";
 
     let mut task = match task_id {
         Some(id) => tx
@@ -3732,6 +3735,27 @@ pub fn list(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for t in &mut tasks {
         t.ready = compute_ready(conn, &t.depends_on)?;
+    }
+    Ok(tasks)
+}
+
+/// List open implementation candidates whose dependencies and decomposition
+/// authority currently permit a claim. The claim transaction repeats these
+/// predicates authoritatively; this read prevents stable graph holds from
+/// becoming a repeated select/claim-reject loop.
+pub fn list_implementation_ready_open(conn: &Connection) -> Result<Vec<Task>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM tasks
+         WHERE status='open'
+           AND {DEP_READY_CLAUSE}
+           AND {GRAPH_IMPLEMENTATION_READY_CLAUSE}
+         ORDER BY priority DESC, id ASC"
+    ))?;
+    let mut tasks: Vec<Task> = stmt
+        .query_map([], row_to_task)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for task in &mut tasks {
+        task.ready = true;
     }
     Ok(tasks)
 }
@@ -9413,6 +9437,54 @@ mod tests {
             .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
             .unwrap();
         assert_eq!(err_count, 0, "lost race must not produce error rows");
+    }
+
+    #[test]
+    fn two_selected_implementation_claimants_have_one_clean_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let (dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn, "boss", "selected", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        assert_eq!(
+            list_implementation_ready_open(&conn)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            [id]
+        );
+        drop(conn);
+
+        let path = dir.path().join("q.db");
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["worker-a", "worker-b"]
+            .into_iter()
+            .map(|agent| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    claim(&mut conn, agent, Some(id), &[], TTL, 1001)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|task| task.is_some()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|task| task.is_none()).count(), 1);
+
+        let conn = crate::db::open(&path).unwrap();
+        assert_eq!(get(&conn, id).unwrap().unwrap().status, "working");
+        let err_count: i64 = conn
+            .query_row("SELECT count(*) FROM errors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(err_count, 0, "lost claim race must stay a clean negative");
     }
 
     #[test]
