@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 49;
+pub const SCHEMA_VERSION: i64 = 50;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -745,6 +745,45 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // v49 adds immutable responsibility-scoped routing-attempt evidence.
         // The table, assignment guard, immutability triggers, and read index are
         // all additive and created idempotently by SCHEMA_SQL above.
+
+        // v50 backfills task #473's durable `daemon_parked_unsatisfiable` bit
+        // and the distinct "cancelled — unsatisfiable" reason onto rows already
+        // parked before this binary shipped. Without this, live examples
+        // (#308/#309, #313/#314, #318, #421/#422 in ag2trust/quorum on
+        // 2026-08-15) stay hidden from the BLOCKED disposition queue and
+        // indistinguishable from recoverable failed-dep parks — the exact
+        // operator symptom task #473 was opened to fix. Idempotent: the guard
+        // requires the marker to be missing/false, so a re-run at v50 is a
+        // no-op. Data-only backfill; no schema shape change.
+        if current < 50 && column_exists(conn, "tasks", "depends_on")? {
+            conn.execute(
+                "UPDATE tasks
+                 SET refs = json_set(
+                         refs,
+                         '$.daemon_parked_unsatisfiable', json('true'),
+                         '$.daemon_parked_reason',
+                         'dependency #' ||
+                         (SELECT j.value FROM json_each(tasks.depends_on) j
+                          JOIN tasks d ON d.id = j.value
+                          WHERE d.status IN ('cancelled')
+                          ORDER BY j.value LIMIT 1)
+                         || ' is cancelled — unsatisfiable'
+                     )
+                 WHERE status='failed'
+                   AND depends_on IS NOT NULL
+                   AND json_valid(refs)
+                   AND json_extract(refs, '$.daemon_parked')=1
+                   AND COALESCE(
+                       json_extract(refs, '$.daemon_parked_unsatisfiable'), 0
+                   ) != 1
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(tasks.depends_on) j
+                       JOIN tasks d ON d.id = j.value
+                       WHERE d.status IN ('cancelled')
+                   )",
+                [],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -3887,5 +3926,99 @@ mod tests {
                 .pr,
             71
         );
+    }
+
+    /// Task #473: rows parked before this binary shipped carry the legacy
+    /// `terminal-not-done` reason and lack the new `daemon_parked_unsatisfiable`
+    /// bit, so `stats::blocked_tasks` (which requires the bit) would hide the
+    /// exact operator disposition queue the task was opened to surface. The
+    /// v50 migration must backfill both refs onto the pre-existing rows,
+    /// leave recoverable failed-dep parks untouched, and be idempotent.
+    #[test]
+    fn migrates_v49_to_v50_backfills_cancelled_dependency_park_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v49-backfill.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                     VALUES
+                         (1,'cancelled-dep','cancelled','owner',1,1),
+                         (2,'failed-dep','failed','owner',1,1),
+                         (3,'legacy park cancelled','failed','owner',1,1),
+                         (4,'legacy park failed only','failed','owner',1,1),
+                         (5,'legacy park no deps','failed','owner',1,1),
+                         (6,'open with cancelled dep','open','owner',1,1);
+                 UPDATE tasks SET depends_on='[1,2]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"dependency #1 is terminal-not-done\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=3;
+                 UPDATE tasks SET depends_on='[2]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"dependency #2 is terminal-not-done\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=4;
+                 UPDATE tasks SET refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"other reason\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=5;
+                 UPDATE tasks SET depends_on='[1]' WHERE id=6;
+                 PRAGMA user_version=49;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let refs3: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=3", [], |r| r.get(0))
+            .unwrap();
+        let v3: serde_json::Value = serde_json::from_str(&refs3).unwrap();
+        assert_eq!(v3["daemon_parked_unsatisfiable"], true);
+        assert_eq!(
+            v3["daemon_parked_reason"],
+            "dependency #1 is cancelled — unsatisfiable"
+        );
+
+        // Recoverable failed-only park stays untouched: no marker, original
+        // terminal-not-done reason preserved so operators still see the
+        // recoverable text.
+        let refs4: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=4", [], |r| r.get(0))
+            .unwrap();
+        let v4: serde_json::Value = serde_json::from_str(&refs4).unwrap();
+        assert!(v4.get("daemon_parked_unsatisfiable").is_none());
+        assert_eq!(
+            v4["daemon_parked_reason"],
+            "dependency #2 is terminal-not-done"
+        );
+
+        // Parks without any depends_on aren't touched.
+        let refs5: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=5", [], |r| r.get(0))
+            .unwrap();
+        let v5: serde_json::Value = serde_json::from_str(&refs5).unwrap();
+        assert!(v5.get("daemon_parked_unsatisfiable").is_none());
+        assert_eq!(v5["daemon_parked_reason"], "other reason");
+
+        // Open (non-failed) rows aren't touched by the parked-only backfill;
+        // the cascade will park them via the new production path.
+        let refs6: Option<String> = conn
+            .query_row("SELECT refs FROM tasks WHERE id=6", [], |r| r.get(0))
+            .unwrap();
+        assert!(refs6.is_none());
+
+        // Idempotent: re-opening from the migrated DB does not double-write.
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        let refs3_again: String = reopened
+            .query_row("SELECT refs FROM tasks WHERE id=3", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refs3_again, refs3);
     }
 }
