@@ -666,6 +666,17 @@ for the current park only. `quorum status` includes `daemon_parked_unsatisfiable
 rows in the BLOCKED section with the cancelled dep in `deadlocked_on`, so the
 operator sees the disposition queue without DB inspection.
 
+The dependency sweep also runs a bounded second pass over already-`failed`
+daemon-parked rows: if `depends_on` currently contains any `cancelled` dep, the
+sweep upgrades the durable marker to `true` and rewrites the reason to name the
+cancelled dep. This converges the recoverable park to unsatisfiable when the
+failing dep is later retried and cancelled, or when any dep set gains a cancelled
+member after the original park — a transition the primary cascade cannot see
+(it only re-parks `open`/`rework`). A one-shot v50 migration performs the same
+repair at upgrade time on installed databases so pre-existing parks join the
+disposition queue immediately. The upgrade emits `task_parked_upgraded` and a
+task note; it re-uses the original owner alert (no duplicate alert).
+
 `quorum task-retry --task-id N --by <operator>` is the sole resume operation for a
 daemon-parked task. It atomically validates the marker, clears it (including the
 unsatisfiable bit), resets only the crash recovery counter, and emits `task_retry`.
