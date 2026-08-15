@@ -1859,10 +1859,11 @@ filesystem access is refused fail-closed. The view is an archive of the recorded
 and source drift is rejected before launch. A valid concrete blocker parks the source immediately
 with no second opinion.
 
-Current product limitation: Codex planning is refused fail-closed because its CLI transport does
-not yet provide that isolation boundary. A repository configured to plan with Codex records a
-bounded provider failure and releases or parks the source under the normal retry policy; use the
-Claude runner for daemon-managed decomposition until an enforceable Codex boundary exists.
+Codex planning is supported only through its hardened planner-specific boundary: the CLI runs
+read-only without coordination authority, and a bounded JSONL terminal response remains only a
+candidate until stdout reaches EOF, final diagnostics are bounded and complete, and the process
+exits successfully. Any contradictory or incomplete terminal evidence fails without plan
+authority. Grok planning remains refused because managed Grok lifecycle roles are not enabled.
 
 A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Before any
 task row is created, the complete proposal is validated for scope coverage, real delivery

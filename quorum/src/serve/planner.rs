@@ -520,6 +520,7 @@ pub struct PlannerSlot {
     pub response_text: String,
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
+    codex_terminal_candidate: bool,
 }
 
 impl PlannerSlot {
@@ -625,6 +626,7 @@ async fn spawn_planner_with_timeout(
         response_text: String::new(),
         started_at,
         stdout_bytes: 0,
+        codex_terminal_candidate: false,
     })
 }
 
@@ -636,6 +638,7 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
     }
     let remaining = PLANNER_TIMEOUT.saturating_sub(slot.started_at.elapsed());
     let poll_for = remaining.min(Duration::from_secs(2));
+    let mut stdout_complete = false;
     loop {
         // Reserve the byte previously charged for the line terminator. More
         // importantly, enforce the remaining allowance while bytes are read;
@@ -648,7 +651,10 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
         {
             Err(_) => break,
             Ok(Ok(Some(raw))) => raw,
-            Ok(Ok(None)) => break,
+            Ok(Ok(None)) => {
+                stdout_complete = true;
+                break;
+            }
             Ok(Err(_)) => {
                 return Some(PlannerPoll::ProviderFailed(
                     "planner stdout exceeded 256 KiB".into(),
@@ -659,6 +665,11 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
         if slot.stdout_bytes > MAX_STDOUT_BYTES {
             return Some(PlannerPoll::ProviderFailed(
                 "planner stdout exceeded 256 KiB".into(),
+            ));
+        }
+        if slot.codex_terminal_candidate {
+            return Some(PlannerPoll::ProviderFailed(
+                "planner provider emitted output after terminal response".into(),
             ));
         }
         if slot.proc.kind() == AgentKind::Codex {
@@ -698,7 +709,11 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                     ));
                 }
                 AgentEvent::TurnCompleted { .. } => {
-                    return Some(parsed_poll(&slot.response_text));
+                    if slot.proc.kind() == AgentKind::Codex {
+                        slot.codex_terminal_candidate = true;
+                    } else {
+                        return Some(parsed_poll(&slot.response_text));
+                    }
                 }
                 AgentEvent::AssistantText { text } => {
                     if slot.response_text.len().saturating_add(text.len()) > MAX_RESPONSE_BYTES {
@@ -715,7 +730,31 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
             return Some(PlannerPoll::ProviderFailed("planner timed out".into()));
         }
     }
-    if matches!(slot.proc.try_wait(), Ok(Some(_))) {
+    let status = match slot.proc.try_wait() {
+        Ok(status) => status,
+        Err(error) => {
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner process status unavailable: {error}"
+            )));
+        }
+    };
+    if slot.proc.kind() == AgentKind::Codex && slot.codex_terminal_candidate && stdout_complete {
+        let status = status?;
+        let _ = slot.proc.finalize_pre_authoritative_evidence().await;
+        if !status.success() {
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner provider exited unsuccessfully after terminal response: {status}"
+            )));
+        }
+        if let Some(failure) = slot.proc.observed_strict_pre_authoritative_failure() {
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner provider terminal evidence failed: {}",
+                failure.detail()
+            )));
+        }
+        return Some(parsed_poll(&slot.response_text));
+    }
+    if status.is_some() {
         return Some(PlannerPoll::ProviderFailed(
             "planner exited without a terminal response".into(),
         ));
@@ -1114,6 +1153,10 @@ mod tests {
             PlannerPoll::Done(PlannerResponse::Plan { ref tasks })
                 if tasks.len() == 2 && tasks[1].prerequisites == ["core"]
         ));
+        assert!(
+            slot.proc.try_wait().unwrap().is_some(),
+            "Codex plan authority preceded provider exit"
+        );
         slot.kill_and_reap().await;
 
         let args = std::fs::read_to_string(args_path).unwrap();
@@ -1125,6 +1168,61 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["-c", "model_reasoning_effort=xhigh"]));
         assert_eq!(args.last(), Some(&"exact bounded prompt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_terminal_candidate_requires_clean_exit_and_final_evidence() {
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let terminal_output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type": "turn.completed"})
+        );
+        let cases = [
+            ("nonzero-exit", "exit 7"),
+            (
+                "trailing-stdout",
+                "printf '%s\\n' '{\"type\":\"error\",\"message\":\"fatal trailing error\"}'",
+            ),
+            (
+                "trailing-stderr",
+                "printf '%s\\n' 'fatal trailing error' >&2",
+            ),
+        ];
+        for (name, trailer) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let output_path = dir.path().join("stdout.jsonl");
+            std::fs::write(&output_path, &terminal_output).unwrap();
+            let runner = executable_script(
+                dir.path(),
+                "codex",
+                &format!("/bin/cat '{}'\n{trailer}", output_path.display()),
+            );
+            let mut slot = spawn_planner(
+                AgentKind::Codex,
+                CODEX_PLANNER_MODEL,
+                PLANNER_EFFORT,
+                dir.path(),
+                "bounded prompt",
+                false,
+                runner.to_str(),
+            )
+            .await
+            .unwrap();
+            let outcome = poll_to_terminal(&mut slot).await;
+            assert!(
+                matches!(outcome, PlannerPoll::ProviderFailed(_)),
+                "{name} acquired planner authority"
+            );
+            slot.kill_and_reap().await;
+        }
     }
 
     #[cfg(unix)]
