@@ -21,6 +21,7 @@
 //!   post findings as inline and summary comments; the daemon posts formal
 //!   approval or request-changes from the reviewer verdict as the merge account.
 
+use super::review_cycle_context::ReviewCycleContext;
 use super::runner::AgentKind;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +29,38 @@ pub struct ReviewerSpec {
     pub pr: i64,
     pub worker_agent: String,
     pub reviewer_name: String,
+}
+
+pub fn task_review_contract(
+    task_id: i64,
+    title: &str,
+    body: Option<&str>,
+    depends_on: Option<&str>,
+    recovery_notes: &[String],
+) -> String {
+    let body = body.unwrap_or("<no task body>");
+    let depends_on = depends_on.unwrap_or("[]");
+    let notes = if recovery_notes.is_empty() {
+        "<none>".to_string()
+    } else {
+        recovery_notes
+            .iter()
+            .enumerate()
+            .map(|(index, note)| format!("{}. {}", index + 1, note))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let context = format!(
+        "task_id: {task_id}\ntitle: {title}\ndepends_on: {depends_on}\n\nbody:\n{body}\n\nrecent recovery notes:\n{notes}"
+    )
+    .replace('\n', "\n    ");
+    format!(
+        "## Authoritative managed-task contract\n\n\
+         Review the PR against this task context, not the generic PR title or body. The task body \
+         defines the assigned outcome, constraints, and verification expectations; dependencies \
+         are scheduler-enforced assumptions, and recovery notes are bounded operational context.\n\n\
+             {context}\n"
+    )
 }
 
 /// Reviewers must finish the planned audit for a SHA before their lifecycle
@@ -38,9 +71,12 @@ const COMPLETE_REVIEW_CONTRACT: &str = "\
 Complete the planned review before submitting a verdict. Coverage, not the number of \
 findings, determines when the review is complete: audit the full current diff, surrounding \
 code, and relevant sibling and negative paths. A complete review may have zero findings.\n\
-For cross-cutting changes, derive a small affected-path matrix/checklist from the PR scope \
-(for example, producers × success/error/shutdown) and audit every applicable cell together. \
-Do not turn this into an exhaustive proof over unrelated code or invent speculative findings.\n\
+Before reaching a verdict, derive a bounded, task-specific affected-path model from the \
+embedded managed-task contract when provided and the mechanisms changed by the PR. Choose the \
+useful representation — a short matrix, checklist, state/event map, or equivalent — and use it \
+to review applicable related lifecycle and compatibility paths together, including whether the \
+proposed remedy closes each relevant path. This is not a mandatory format or an exhaustive proof \
+over unrelated code; do not invent speculative findings.\n\
 On re-review, a new blocker in unchanged behavior must explain why it was not reasonably \
 discoverable in the prior complete audit.\n\
 Before submitting, publish one complete PR review summary for this reviewed SHA, with inline \
@@ -74,7 +110,10 @@ outcome can remain accurate without cataloguing or fixing that behavior.\n\n\
 Evidence and PR-summary requirements:\n\
 - Every finding must cite a concrete code path (file:line or function), explain the \
 demonstrated failure and assumptions, and identify the affected product behavior.\n\
-- Every BLOCKING finding must explain why this PR cannot merge under the current contract.\n\
+- Every BLOCKING finding must explain why this PR cannot merge under the current contract, name \
+the exact repository invariant it violates (or the precise assigned outcome left false or \
+supported behavior materially worsened), and explain the broader affected path left unsafe, \
+not only the local symptom.\n\
 - Every FOLLOW-UP finding must explain why deferral is safe; identify its scope relationship \
 (pre-existing, out-of-scope/adjacent, threat-model expansion, defense-in-depth, future \
 requirement, or design debt); and give a desired future outcome and verification. Include \
@@ -173,20 +212,37 @@ pub fn build_review_prompt_for_kind(kind: AgentKind, spec: &ReviewerSpec, effort
     build_review_prompt_for_kind_with_context(kind, spec, effort, None)
 }
 
+#[cfg(test)]
 pub fn build_review_prompt_for_kind_with_context(
     kind: AgentKind,
     spec: &ReviewerSpec,
     effort: &str,
     graph_context: Option<&str>,
 ) -> String {
+    build_review_prompt_for_kind_with_context_and_cycle(kind, spec, effort, graph_context, None)
+}
+
+/// Build an R1 prompt with optional persisted re-review lifecycle context.
+/// Initial reviews have no completed changes-to-rework transition, so callers
+/// omit the context for them rather than presenting a re-review calibration.
+pub fn build_review_prompt_for_kind_with_context_and_cycle(
+    kind: AgentKind,
+    spec: &ReviewerSpec,
+    effort: &str,
+    graph_context: Option<&str>,
+    review_cycle: Option<ReviewCycleContext>,
+) -> String {
+    let review_cycle_contract = review_cycle
+        .map(ReviewCycleContext::prompt_contract)
+        .unwrap_or_default();
     match kind {
         AgentKind::Claude => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_review_prompt(spec, effort),
             graph_review_contract(spec.reviewer_name.as_str(), spec.pr, graph_context)
         ),
         AgentKind::Codex => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_codex_review_prompt(spec, effort),
             graph_review_contract(spec.reviewer_name.as_str(), spec.pr, graph_context)
         ),
@@ -294,20 +350,35 @@ pub fn build_r2_review_prompt_for_kind(
     build_r2_review_prompt_for_kind_with_context(kind, spec, effort, None)
 }
 
+#[cfg(test)]
 pub fn build_r2_review_prompt_for_kind_with_context(
     kind: AgentKind,
     spec: &R2ReviewSpec,
     effort: &str,
     graph_context: Option<&str>,
 ) -> String {
+    build_r2_review_prompt_for_kind_with_context_and_cycle(kind, spec, effort, graph_context, None)
+}
+
+/// Build an R2 prompt with optional persisted re-review lifecycle context.
+pub fn build_r2_review_prompt_for_kind_with_context_and_cycle(
+    kind: AgentKind,
+    spec: &R2ReviewSpec,
+    effort: &str,
+    graph_context: Option<&str>,
+    review_cycle: Option<ReviewCycleContext>,
+) -> String {
+    let review_cycle_contract = review_cycle
+        .map(ReviewCycleContext::prompt_contract)
+        .unwrap_or_default();
     match kind {
         AgentKind::Claude => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_r2_review_prompt(spec, effort),
             graph_review_contract(spec.r2_name.as_str(), spec.pr, graph_context)
         ),
         AgentKind::Codex => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_codex_r2_review_prompt(spec, effort),
             graph_review_contract(spec.r2_name.as_str(), spec.pr, graph_context)
         ),
@@ -478,17 +549,27 @@ fn budget_line(spent_usd: f64, max_task_cost_usd: Option<f64>) -> String {
     }
 }
 
-/// Token-economy guidance for spawned workers. A daemon worker is a batch
-/// process: nobody waits on wall-clock, so parallel subagent fan-out buys
-/// nothing and multiplies cost (each subagent re-pays full boot context).
+/// Work-style guidance for spawned workers. A daemon worker is a batch process:
+/// nobody waits on wall-clock, so the levers are simplicity, token economy, and
+/// no subagent fan-out (each fan-out re-pays full boot context and buys nothing
+/// when latency does not matter).
 const WORKING_STYLE: &str =
     "Working style — you are a batch worker; wall-clock is cheap, tokens are not:\n\
+     - Bias to the simplest solution that fully solves the task. Take the lowest-friction \
+     path that keeps quality, maintainability, and the codebase's existing conventions: \
+     reach for what's already here before adding new machinery, and add complexity only \
+     when the task genuinely needs it — not for hypothetical futures. Match the surrounding \
+     code. Simpler means less code, never weaker code — do not trade away correctness, \
+     validation, tests, or safety to be smaller.\n\
      - Do ALL edits, fixes, and mechanical work directly in this session. Do NOT fan out \
      subagents (Agent/Task tool) to parallelize them — each subagent re-pays your full \
-     context as a boot tax and shares no cache with its siblings.\n\
-     - A subagent is justified ONLY to quarantine bulky read-only exploration (many-file \
-     reads that would bloat your context) behind a short returned conclusion, and rarely \
-     more than one or two per task.";
+     context as a boot tax and shares no cache with its siblings. A subagent is justified \
+     ONLY to quarantine bulky read-only exploration (many-file reads that would bloat your \
+     context) behind a short returned conclusion, and rarely more than one or two per task.\n\
+     - Spend as few tokens as the task allows: avoid needless re-reads, redundant tool \
+     calls, and re-running expensive builds or test suites you do not need. Never let \
+     austerity degrade quality or completeness — run the verification the task requires, \
+     and do not skip a real check to save tokens.";
 
 /// Build the raw worker prompt (no runner-specific wrapping).
 pub fn build_worker_prompt(
@@ -540,7 +621,16 @@ pub fn build_rereview_turn(
     worker_agent: &str,
     effort: &str,
 ) -> String {
-    build_rereview_turn_with_context(reviewer_name, pr, worker_agent, effort, None)
+    build_rereview_turn_with_context(
+        reviewer_name,
+        pr,
+        worker_agent,
+        effort,
+        None,
+        // This test-only compatibility helper builds a re-review, whose first
+        // possible persisted value is one completed transition.
+        ReviewCycleContext::from_persisted_rework_round(1),
+    )
 }
 
 pub fn build_rereview_turn_with_context(
@@ -549,6 +639,7 @@ pub fn build_rereview_turn_with_context(
     worker_agent: &str,
     effort: &str,
     graph_context: Option<&str>,
+    review_cycle: ReviewCycleContext,
 ) -> String {
     super::agent::user_turn(&format!(
         "The author ({worker}) pushed rework for PR #{pr}. Re-review the updated diff.\n\n\
@@ -560,6 +651,7 @@ pub fn build_rereview_turn_with_context(
          Verify prior fixes by reading the prior review thread on the PR. Then re-audit the \
          full current diff and relevant sibling paths; do not narrowly inspect only the last \
          remediation commit.\n\n\
+         {review_cycle_contract}\n\
          {complete_review_contract}\n\
          {finding_contract}\n\
          The PR is the source of truth for this review:\n\
@@ -594,6 +686,7 @@ pub fn build_rereview_turn_with_context(
         finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
         graph_contract = graph_review_contract(reviewer_name, pr, graph_context),
+        review_cycle_contract = review_cycle.prompt_contract(),
     ))
 }
 
@@ -706,6 +799,24 @@ pub fn build_remediation_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_review_contract_carries_bounded_authoritative_fields() {
+        let contract = task_review_contract(
+            473,
+            "Surface cancelled dependencies",
+            Some("Expected\nCancelled dependency parks are visible."),
+            Some("[461,462]"),
+            &["recovery attempt preserved PR #618".into()],
+        );
+        assert!(contract.contains("Authoritative managed-task contract"));
+        assert!(contract.contains("task_id: 473"));
+        assert!(contract.contains("title: Surface cancelled dependencies"));
+        assert!(contract.contains("depends_on: [461,462]"));
+        assert!(contract.contains("Cancelled dependency parks are visible."));
+        assert!(contract.contains("recovery attempt preserved PR #618"));
+        assert!(contract.contains("not the generic PR title or body"));
+    }
 
     #[test]
     fn review_prompt_contains_agent_names_and_pr() {
@@ -890,22 +1001,59 @@ mod tests {
             r1_reviewer: "Reviewer-1".into(),
             r2_name: "Reviewer-2".into(),
         };
+        let context =
+            r#"{"task_id":7,"assigned_requirements":"parser only","direct_prerequisites":[]}"#;
         let prompts = [
-            ("Claude R1", build_review_prompt(&r1_spec, "high"), false),
+            (
+                "Claude R1",
+                build_review_prompt_for_kind_with_context(
+                    AgentKind::Claude,
+                    &r1_spec,
+                    "high",
+                    Some(context),
+                ),
+                false,
+            ),
             (
                 "Codex R1",
-                build_review_prompt_for_kind(AgentKind::Codex, &r1_spec, "high"),
+                build_review_prompt_for_kind_with_context(
+                    AgentKind::Codex,
+                    &r1_spec,
+                    "high",
+                    Some(context),
+                ),
                 false,
             ),
-            ("Claude R2", build_r2_review_prompt(&r2_spec, "high"), false),
+            (
+                "Claude R2",
+                build_r2_review_prompt_for_kind_with_context(
+                    AgentKind::Claude,
+                    &r2_spec,
+                    "high",
+                    Some(context),
+                ),
+                false,
+            ),
             (
                 "Codex R2",
-                build_r2_review_prompt_for_kind(AgentKind::Codex, &r2_spec, "high"),
+                build_r2_review_prompt_for_kind_with_context(
+                    AgentKind::Codex,
+                    &r2_spec,
+                    "high",
+                    Some(context),
+                ),
                 false,
             ),
             (
-                "re-review",
-                build_rereview_turn("Reviewer-1", 42, "Worker-1", "high"),
+                "sticky re-review (Claude/Codex)",
+                build_rereview_turn_with_context(
+                    "Reviewer-1",
+                    42,
+                    "Worker-1",
+                    "high",
+                    Some(context),
+                    ReviewCycleContext::from_persisted_rework_round(1),
+                ),
                 true,
             ),
         ];
@@ -921,8 +1069,27 @@ mod tests {
                 "{name} must define completion by coverage without a finding quota"
             );
             assert!(
-                prompt.contains("affected-path matrix/checklist"),
-                "{name} must require cross-cutting path coverage"
+                prompt.contains("bounded, task-specific affected-path model")
+                    && prompt.contains("embedded managed-task contract when provided")
+                    && prompt.contains("mechanisms changed by the PR"),
+                "{name} must derive task-specific coverage from the managed-task contract and changed mechanisms"
+            );
+            assert!(
+                prompt.contains("short matrix, checklist, state/event map, or equivalent")
+                    && prompt.contains("not a mandatory format")
+                    && prompt.contains("complete review may have zero findings"),
+                "{name} must preserve reviewer discretion and zero-findings validity"
+            );
+            assert!(
+                prompt.contains("lifecycle and compatibility paths together")
+                    && prompt.contains("proposed remedy closes each relevant path"),
+                "{name} must review related paths together and assess whole-path remedies"
+            );
+            assert!(
+                !prompt.contains("producers × success/error/shutdown")
+                    && !prompt.contains("durable-state checklist")
+                    && !prompt.contains("mandatory visible table"),
+                "{name} must not prescribe a hard-coded affected-path checklist or table"
             );
             assert!(
                 prompt.contains("complete BLOCKING and FOLLOW-UP set"),
@@ -1025,6 +1192,7 @@ mod tests {
                     "Worker-1",
                     "high",
                     Some(context),
+                    ReviewCycleContext::from_persisted_rework_round(1),
                 ),
             ),
         ];
@@ -1071,10 +1239,12 @@ mod tests {
             );
             assert!(
                 prompt.contains("why this PR cannot merge")
+                    && prompt.contains("exact repository invariant it violates")
+                    && prompt.contains("broader affected path left unsafe")
                     && prompt.contains("why deferral is safe")
                     && prompt.contains("desired future outcome and verification")
                     && prompt.contains("later collector extraction"),
-                "{name} must make both dispositions evidence-rich and collector-readable"
+                "{name} must require blockers to identify their violated contract and affected path, while keeping both dispositions evidence-rich and collector-readable"
             );
             assert!(
                 prompt.contains("Only BLOCKING findings contribute to `--blocking`")
@@ -1325,6 +1495,59 @@ mod tests {
     }
 
     #[test]
+    fn recovered_r1_r2_prompts_preserve_cycle_context_for_both_providers() {
+        let spec = ReviewerSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Rev-1".into(),
+        };
+        let r2_spec = R2ReviewSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            r1_reviewer: "Rev-1".into(),
+            r2_name: "Rev-2".into(),
+        };
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            assert!(
+                !build_review_prompt_for_kind(kind, &spec, "high").contains("Review-cycle context"),
+                "the initial review is not a rework round"
+            );
+        }
+
+        let context = ReviewCycleContext::from_persisted_rework_round(i64::from(
+            quorum_core::lifecycle::REWORK_CAP,
+        ));
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            let r1 = build_review_prompt_for_kind_with_context_and_cycle(
+                kind,
+                &spec,
+                "high",
+                None,
+                Some(context),
+            );
+            let r2 = build_r2_review_prompt_for_kind_with_context_and_cycle(
+                kind,
+                &r2_spec,
+                "high",
+                None,
+                Some(context),
+            );
+            assert!(r1.contains("final review opportunity"));
+            assert!(r2.contains("final review opportunity"));
+        }
+        let claude_turn =
+            build_rereview_turn_with_context("Rev-1", 42, "Worker-1", "high", None, context);
+        let codex_turn =
+            build_rereview_turn_with_context("Rev-1", 42, "Worker-1", "high", None, context);
+        assert_eq!(
+            claude_turn, codex_turn,
+            "the runner receives one neutral turn"
+        );
+        assert!(claude_turn.contains("final review opportunity"));
+        assert!(!claude_turn.contains("review round"));
+    }
+
+    #[test]
     fn worker_turn_contains_agent_and_task() {
         let turn = build_worker_turn("Agent-1", 99, "Fix the bug", "Detailed body text", None);
         assert!(turn.contains("Agent-1"));
@@ -1349,6 +1572,14 @@ mod tests {
         assert!(
             turn.contains("Do NOT fan out"),
             "worker template must forbid subagent fan-out for mechanical work"
+        );
+        assert!(
+            turn.contains("simplest solution that fully solves the task"),
+            "worker template must nudge toward the simplest solution (anti-over-engineering)"
+        );
+        assert!(
+            turn.contains("as few tokens as the task allows"),
+            "worker template must nudge token austerity without degrading quality"
         );
         assert!(
             turn.contains("$0.00") && turn.contains("$50.00"),
@@ -1902,7 +2133,14 @@ mod tests {
                 "high",
                 Some(context),
             ),
-            build_rereview_turn_with_context("R1", 42, "W", "high", Some(context)),
+            build_rereview_turn_with_context(
+                "R1",
+                42,
+                "W",
+                "high",
+                Some(context),
+                ReviewCycleContext::from_persisted_rework_round(1),
+            ),
         ];
         for prompt in prompts {
             assert!(prompt.contains("parser only"));
@@ -1939,7 +2177,14 @@ mod tests {
         }
         assert_eq!(
             build_rereview_turn("R1", 42, "W", "high"),
-            build_rereview_turn_with_context("R1", 42, "W", "high", None)
+            build_rereview_turn_with_context(
+                "R1",
+                42,
+                "W",
+                "high",
+                None,
+                ReviewCycleContext::from_persisted_rework_round(1),
+            )
         );
     }
 }

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 49;
+pub const SCHEMA_VERSION: i64 = 50;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -742,11 +742,12 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                      ON review_followup_assessments(source_task_id);",
             )?;
         }
-        // v49 = restart-safe dormant turn-oriented workers. These fields make
-        // the awaiting-review journal row a complete, provider-bound recovery
-        // record instead of forcing startup to infer a continuation or local
-        // checkout identity from mutable task/config state.
-        if current < 49 {
+        // v50 converges two independently shipped v49 schemas: main's immutable
+        // routing-attempt evidence and the dormant-worker journal identity from
+        // task #426. SCHEMA_SQL creates the routing objects above whenever a v49
+        // database opens; these guarded ALTERs add the journal columns for the
+        // main-line v49 shape without disturbing the task-426 v49 shape.
+        if current < 50 {
             if !column_exists(conn, "journal", "provider")? {
                 conn.execute("ALTER TABLE journal ADD COLUMN provider TEXT", [])?;
             }
@@ -822,6 +823,7 @@ mod tests {
             "agent_runs",
             "role_assignments",
             "routing_cursors",
+            "routing_attempts",
             "task_messages",
             "task_message_deliveries",
         ] {
@@ -850,9 +852,9 @@ mod tests {
     }
 
     #[test]
-    fn populated_v48_migration_adds_dormant_journal_identity_without_backfill() {
+    fn main_v49_migration_adds_dormant_journal_identity_without_backfill() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v48-dormant-journal.db");
+        let path = dir.path().join("main-v49-dormant-journal.db");
         {
             let conn = open(&path).unwrap();
             conn.execute(
@@ -865,7 +867,7 @@ mod tests {
                 "ALTER TABLE journal DROP COLUMN provider;
                  ALTER TABLE journal DROP COLUMN continuation_id;
                  ALTER TABLE journal DROP COLUMN local_branch;
-                 PRAGMA user_version=48;",
+                 PRAGMA user_version=49;",
             )
             .unwrap();
         }
@@ -886,6 +888,91 @@ mod tests {
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn dormant_worker_v49_migration_adds_immutable_routing_attempts_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dormant-worker-v49.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE role_assignments (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     responsibility_key TEXT NOT NULL UNIQUE,
+                     task_id INTEGER,
+                     pr_number INTEGER,
+                     role TEXT NOT NULL,
+                     review_stage TEXT,
+                     complexity TEXT,
+                     profile_id TEXT NOT NULL,
+                     provider TEXT NOT NULL,
+                     runner TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     effort TEXT NOT NULL,
+                     pool_key TEXT NOT NULL,
+                     policy_generation TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,role,complexity,profile_id,provider,
+                     runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (9,'worker:task:9',9,'worker','M','opus','claude','claude',
+                         'claude-opus-4-8','high','worker.M','generation-1',10);
+                 PRAGMA user_version=49;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT responsibility_key,profile_id FROM role_assignments WHERE id=9",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            ("worker:task:9".into(), "opus".into())
+        );
+        for object in [
+            "routing_attempts",
+            "routing_attempts_responsibility",
+            "routing_attempts_assignment_guard",
+            "routing_attempts_no_update",
+            "routing_attempts_no_delete",
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name=?1",
+                    [object],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "missing migrated object {object}"
+            );
+        }
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM role_assignments", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 

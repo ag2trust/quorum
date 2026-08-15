@@ -465,6 +465,58 @@ CREATE TABLE IF NOT EXISTS role_assignments (
 CREATE INDEX IF NOT EXISTS role_assignments_task ON role_assignments(task_id);
 CREATE INDEX IF NOT EXISTS role_assignments_pr ON role_assignments(pr_number);
 
+-- v49: immutable evidence for each distinct configured route attempted for one
+-- managed responsibility. The original role assignment remains the routing
+-- decision; these rows only record execution evidence and derive exclusions.
+CREATE TABLE IF NOT EXISTS routing_attempts (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    role_assignment_id    INTEGER NOT NULL REFERENCES role_assignments(id),
+    responsibility_key    TEXT NOT NULL,
+    profile_id            TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    runner                TEXT NOT NULL,
+    model                 TEXT NOT NULL,
+    effort                TEXT NOT NULL,
+    pool_key              TEXT NOT NULL,
+    policy_generation     TEXT NOT NULL,
+    failure_disposition   TEXT CHECK(failure_disposition IS NULL OR
+                              failure_disposition IN (
+                                  'provider-unavailable',
+                                  'profile-unavailable',
+                                  'retryable-same-route',
+                                  'non-failover',
+                                  'unclassified')),
+    recorded_at           INTEGER NOT NULL,
+    UNIQUE(role_assignment_id, profile_id)
+);
+CREATE INDEX IF NOT EXISTS routing_attempts_responsibility
+    ON routing_attempts(responsibility_key, id);
+
+CREATE TRIGGER IF NOT EXISTS routing_attempts_assignment_guard
+BEFORE INSERT ON routing_attempts
+WHEN NOT EXISTS (
+    SELECT 1 FROM role_assignments AS assignment
+    WHERE assignment.id=NEW.role_assignment_id
+      AND assignment.responsibility_key=NEW.responsibility_key
+      AND assignment.pool_key=NEW.pool_key
+      AND assignment.policy_generation=NEW.policy_generation
+)
+BEGIN
+    SELECT RAISE(ABORT, 'routing attempt does not match role assignment');
+END;
+
+CREATE TRIGGER IF NOT EXISTS routing_attempts_no_update
+BEFORE UPDATE ON routing_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'routing attempt evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS routing_attempts_no_delete
+BEFORE DELETE ON routing_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'routing attempt evidence is immutable');
+END;
+
 -- The exact shuffled 100-slot epoch is persisted. `next_slot` and assignment insertion
 -- advance in one BEGIN IMMEDIATE transaction, so restart never rerolls a pending turn.
 CREATE TABLE IF NOT EXISTS routing_cursors (

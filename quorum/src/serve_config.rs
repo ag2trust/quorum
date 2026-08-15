@@ -140,6 +140,7 @@ declare_serve_file_config! {
     max_turn_cost_usd: Option<f64>,
     max_task_cost_usd: Option<f64>,
     max_turn_wall_secs: Option<u64>,
+    max_idle_secs: Option<u64>,
     max_task_wall_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
     allowed_tools: Option<String>,
@@ -214,6 +215,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("max_turn_cost_usd", ConfigKeyDisposition::Runtime),
     ("max_task_cost_usd", ConfigKeyDisposition::Runtime),
     ("max_turn_wall_secs", ConfigKeyDisposition::Runtime),
+    ("max_idle_secs", ConfigKeyDisposition::Runtime),
     ("max_task_wall_secs", ConfigKeyDisposition::Runtime),
     ("idle_timeout_secs", ConfigKeyDisposition::Runtime),
     ("allowed_tools", ConfigKeyDisposition::Runtime),
@@ -618,13 +620,6 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
         .ok_or_else(|| QuorumError::Usage("serve config requires [routing]".into()))?;
     validate_percentage_pool("classifier", &routing.classifier, profiles)?;
     validate_percentage_pool("planner", &routing.planner, profiles)?;
-    for profile_id in routing.planner.keys() {
-        if profiles[profile_id].runner == "codex" {
-            return Err(QuorumError::Usage(format!(
-                "routing.planner profile \"{profile_id}\" uses unsupported runner \"codex\""
-            )));
-        }
-    }
     validate_percentage_pool("collector", &routing.collector, profiles)?;
     validate_complexity_pools("worker", &routing.worker, profiles)?;
     validate_complexity_pools("reviewer", &routing.reviewer, profiles)?;
@@ -921,6 +916,30 @@ pub fn resolve_opt<T: Copy>(flag: Option<T>, file: Option<T>) -> Sourced<Option<
     }
 }
 
+/// Resolve the modern idle ceiling and its legacy turn-wall alias without
+/// losing the normal CLI-over-file precedence between the two names.
+pub fn resolve_idle_limit<T: Copy>(
+    max_idle_flag: Option<T>,
+    max_turn_wall_flag: Option<T>,
+    max_idle_file: Option<T>,
+    max_turn_wall_file: Option<T>,
+) -> Sourced<Option<T>> {
+    for (value, source) in [
+        (max_idle_flag, Source::Flag),
+        (max_turn_wall_flag, Source::Flag),
+        (max_idle_file, Source::File),
+        (max_turn_wall_file, Source::File),
+    ] {
+        if value.is_some() {
+            return Sourced { value, source };
+        }
+    }
+    Sourced {
+        value: None,
+        source: Source::Default,
+    }
+}
+
 pub fn resolve_opt_str(flag: Option<&str>, file: Option<&str>) -> Sourced<Option<String>> {
     if let Some(v) = flag {
         return Sourced {
@@ -974,7 +993,7 @@ pub struct BannerData<'a> {
     pub no_bare_agent: &'a Sourced<bool>,
     pub self_update_drain: &'a Sourced<bool>,
     pub drain_timeout_secs: &'a Sourced<u64>,
-    pub max_turn_wall_secs: &'a Sourced<Option<u64>>,
+    pub max_idle_secs: &'a Sourced<Option<u64>>,
     pub max_task_wall_secs: &'a Sourced<Option<u64>>,
     pub idle_timeout_secs: &'a Sourced<Option<u64>>,
     pub max_turn_tokens: &'a Sourced<Option<i64>>,
@@ -1050,8 +1069,11 @@ pub fn banner(d: &BannerData<'_>) -> String {
         }
     }
     lines.push(format!(
-        "  max_turn_wall_secs:        {}",
-        opt_u64(d.max_turn_wall_secs)
+        "  max_idle_secs:             {}",
+        match d.max_idle_secs.value {
+            Some(v) => format!("{v} ({src})", src = d.max_idle_secs.source),
+            None => format!("900 ({src})", src = d.max_idle_secs.source),
+        }
     ));
     lines.push(format!(
         "  max_task_wall_secs:        {}",
@@ -1221,6 +1243,25 @@ primary = 100
     }
 
     #[test]
+    fn resolve_idle_limit_preserves_source_precedence_across_aliases() {
+        let modern_flag = resolve_idle_limit(Some(900), Some(60), Some(300), Some(120));
+        assert_eq!(modern_flag.value, Some(900));
+        assert_eq!(modern_flag.source, Source::Flag);
+
+        let legacy_flag_over_file = resolve_idle_limit(None, Some(60), Some(900), Some(120));
+        assert_eq!(legacy_flag_over_file.value, Some(60));
+        assert_eq!(legacy_flag_over_file.source, Source::Flag);
+
+        let modern_file = resolve_idle_limit(None, None, Some(900), Some(120));
+        assert_eq!(modern_file.value, Some(900));
+        assert_eq!(modern_file.source, Source::File);
+
+        let default = resolve_idle_limit::<u64>(None, None, None, None);
+        assert_eq!(default.value, None);
+        assert_eq!(default.source, Source::Default);
+    }
+
+    #[test]
     fn load_rejects_unknown_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("serve.toml");
@@ -1279,6 +1320,7 @@ primary = 100
                 r#"
 cap = 8
 max_turn_wall_secs = 2700
+max_idle_secs = 900
 max_task_wall_secs = 14400
 repo = "ag2trust/quorum"
 repo_dir = "/home/user/dev/quorum"
@@ -1295,6 +1337,7 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
             "high"
         );
         assert_eq!(cfg.max_turn_wall_secs, Some(2700));
+        assert_eq!(cfg.max_idle_secs, Some(900));
         assert!(cfg.doctor_enabled.is_none());
     }
 
@@ -1736,15 +1779,37 @@ worktree_base = "/tmp/wt"
     }
 
     #[test]
-    fn planner_rejects_codex_profile_until_launch_boundary_supports_it() {
+    fn planner_accepts_matching_codex_profile_and_rejects_mismatch_and_grok() {
         let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
         let planner = &mut cfg.routing.as_mut().unwrap().planner;
         planner.clear();
         planner.insert("primary".into(), 100);
+        validate_model_routing(&cfg).unwrap();
+
+        cfg.model_profiles
+            .as_mut()
+            .unwrap()
+            .get_mut("primary")
+            .unwrap()
+            .runner = "claude".into();
         let err = validate_model_routing(&cfg).unwrap_err();
         assert!(
-            err.to_string().contains("routing.planner")
-                && err.to_string().contains("unsupported runner \"codex\""),
+            err.to_string().contains("does not match runner \"claude\""),
+            "{err}"
+        );
+
+        let profile = cfg
+            .model_profiles
+            .as_mut()
+            .unwrap()
+            .get_mut("primary")
+            .unwrap();
+        profile.runner = "grok".into();
+        profile.model = "grok-4.5".into();
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("managed Grok lifecycle roles are not enabled"),
             "{err}"
         );
     }
@@ -1909,9 +1974,9 @@ worktree_base = "/tmp/wt"
                 value: 900,
                 source: Source::Default,
             },
-            max_turn_wall_secs: &Sourced {
-                value: Some(2700),
-                source: Source::File,
+            max_idle_secs: &Sourced {
+                value: None,
+                source: Source::Default,
             },
             max_task_wall_secs: &Sourced {
                 value: None,
@@ -1961,8 +2026,12 @@ worktree_base = "/tmp/wt"
         );
         assert!(b.contains("8 (file)"), "cap should show file source: {b}");
         assert!(
-            b.contains("2700 (file)"),
-            "wall secs should show file source: {b}"
+            !b.contains("max_turn_wall_secs"),
+            "deprecated turn-wall ceiling must not appear in the resolved banner: {b}"
+        );
+        assert!(
+            b.contains("max_idle_secs:             900 (default)"),
+            "max_idle_secs should default to 900: {b}"
         );
         assert!(b.contains("(default)"), "defaults should be labeled: {b}");
     }

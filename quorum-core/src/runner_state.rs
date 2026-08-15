@@ -12,6 +12,7 @@ pub const REVIEWER_R1_CONTINUATION_REF: &str = "runner_reviewer_r1_continuation"
 pub const REVIEWER_R2_CONTINUATION_REF: &str = "runner_reviewer_r2_continuation";
 pub const PROVIDER_BLOCK_REF: &str = "runner_provider_block";
 pub const RETRY_REF: &str = "runner_retry";
+pub const INITIAL_WORKER_SESSION_REF: &str = "runner_initial_worker_session";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContinuationIdentity {
@@ -30,6 +31,25 @@ pub struct PendingTurn {
     pub continuation_id: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub requested: bool,
+}
+
+/// Exact durable handoff for a turn-oriented worker whose provider issues its
+/// continuation identity only at terminal success. This record is written in
+/// the same transaction as [`CONTINUATION_REF`], after the immutable role
+/// assignment and worker run have been revalidated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitialWorkerSession {
+    pub task_id: i64,
+    pub role_assignment_id: i64,
+    pub responsibility_key: String,
+    pub agent: String,
+    pub role: String,
+    pub provider: String,
+    pub runner: String,
+    pub model: String,
+    pub effort: String,
+    pub pending_turn: PendingTurn,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +85,35 @@ impl ContinuationSlot {
 
 pub fn set_continuation(refs: &mut Value, slot: ContinuationSlot, identity: &ContinuationIdentity) {
     refs[slot.ref_key()] = serde_json::to_value(identity).expect("continuation is serializable");
+}
+
+pub fn set_initial_worker_session(refs: &mut Value, session: &InitialWorkerSession) {
+    refs[INITIAL_WORKER_SESSION_REF] =
+        serde_json::to_value(session).expect("initial worker session is serializable");
+}
+
+pub fn initial_worker_session(refs: &Value) -> Option<InitialWorkerSession> {
+    let session: InitialWorkerSession =
+        serde_json::from_value(refs.get(INITIAL_WORKER_SESSION_REF)?.clone()).ok()?;
+    (session.task_id > 0
+        && session.role_assignment_id > 0
+        && !session.responsibility_key.is_empty()
+        && !session.agent.is_empty()
+        && session.role == "worker"
+        && !session.provider.is_empty()
+        && session.provider == session.runner
+        && session.provider == session.pending_turn.provider
+        && session.model == session.pending_turn.model
+        && session.effort == session.pending_turn.effort
+        && session.pending_turn.turn_kind == "initial"
+        && session.pending_turn.continuation_id.is_none()
+        && !session.pending_turn.requested
+        && pending_turn_is_complete(&session.pending_turn)
+        && !session.session_id.is_empty()
+        && session.session_id.len() <= 1024
+        && session.session_id.trim() == session.session_id
+        && !session.session_id.chars().any(char::is_control))
+    .then_some(session)
 }
 
 /// Read a continuation only when its provider matches the selected runner.
@@ -409,5 +458,38 @@ mod tests {
             }
         });
         assert!(!request_retry(&mut missing_continuation_block));
+    }
+
+    #[test]
+    fn initial_worker_session_preserves_complete_exact_turn_identity() {
+        let session = InitialWorkerSession {
+            task_id: 459,
+            role_assignment_id: 88,
+            responsibility_key: "worker:task:459:revision:1".into(),
+            agent: "Tread-n2so".into(),
+            role: "worker".into(),
+            provider: "grok".into(),
+            runner: "grok".into(),
+            model: "grok-4.5".into(),
+            effort: "high".into(),
+            pending_turn: PendingTurn {
+                provider: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+                prompt: "exact initial prompt".into(),
+                turn_kind: "initial".into(),
+                continuation_id: None,
+                requested: false,
+            },
+            session_id: "provider-session-exact".into(),
+        };
+        let mut refs = serde_json::json!({});
+        set_initial_worker_session(&mut refs, &session);
+        assert_eq!(initial_worker_session(&refs), Some(session.clone()));
+
+        let mut mismatched = session;
+        mismatched.pending_turn.model = "grok-other".into();
+        set_initial_worker_session(&mut refs, &mismatched);
+        assert!(initial_worker_session(&refs).is_none());
     }
 }
