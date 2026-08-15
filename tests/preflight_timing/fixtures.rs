@@ -22,6 +22,7 @@ enum Scenario {
     TestFailure,
     CompileFailure,
     Timeout,
+    DiscoverySpawnFailure,
     Interrupted,
     AbruptOwnerDeath,
 }
@@ -33,6 +34,7 @@ impl Scenario {
             Self::TestFailure => "test-failure",
             Self::CompileFailure => "compile-failure",
             Self::Timeout => "timeout",
+            Self::DiscoverySpawnFailure => "discovery-spawn-failure",
             Self::Interrupted => "interrupted",
             Self::AbruptOwnerDeath => "abrupt-owner-death",
         }
@@ -103,9 +105,10 @@ impl Fixture {
                 "PREFLIGHT_TEST_EXECUTABLE",
                 match scenario {
                     Scenario::TestFailure => self.repo.join("fixture-test-failure"),
-                    Scenario::Timeout | Scenario::Interrupted | Scenario::AbruptOwnerDeath => {
-                        self.repo.join("fixture-test-blocking")
-                    }
+                    Scenario::Timeout
+                    | Scenario::DiscoverySpawnFailure
+                    | Scenario::Interrupted
+                    | Scenario::AbruptOwnerDeath => self.repo.join("fixture-test-blocking"),
                     _ => self.repo.join("fixture-test-unused"),
                 },
             )
@@ -113,6 +116,11 @@ impl Fixture {
             .env("PREFLIGHT_FIXTURE_PID_FILE", self.pid_file());
         if matches!(scenario, Scenario::Timeout) {
             command.env("PREFLIGHT_TEST_TIMEOUT_SECS", "5");
+        }
+        if matches!(scenario, Scenario::DiscoverySpawnFailure) {
+            command
+                .env("PREFLIGHT_TEST_TIMEOUT_SECS", "2")
+                .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1");
         }
         command.output().expect("run preflight")
     }
@@ -352,6 +360,44 @@ fn timeout_reaps_descendants_in_separate_process_groups() {
         "cleanup={}",
         binary["cleanup"]
     );
+    fixture.assert_fixture_uses_separate_process_groups();
+    assert_processes_gone(&fixture.wait_for_fixture_pids());
+}
+
+#[test]
+fn process_discovery_spawn_failure_is_bounded_and_reaps_descendants() {
+    let fixture = Fixture::new();
+    let started = Instant::now();
+    let output = fixture.preflight(Scenario::DiscoverySpawnFailure);
+
+    assert_eq!(output.status.code(), Some(1));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "process discovery failure did not terminate promptly: {elapsed:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("process-tree discovery could not start")
+            && stderr.contains("injected process-table spawn failure"),
+        "missing bounded discovery diagnostic: {stderr}"
+    );
+    let timing = fixture.timing();
+    assert_branch_base(&timing);
+    assert_gate(&timing, "test_execute", 124);
+    let binary = &timing["test_binaries"][0];
+    assert_eq!(binary["execute_outcome"], "timed_out");
+    assert_eq!(binary["cleanup"]["term_sent"], true);
+    assert_eq!(binary["cleanup"]["kill_sent"], true);
+    assert!(
+        binary["execute_secs"].as_f64().unwrap() < 5.0,
+        "test supervisor exceeded its bounded cleanup window"
+    );
+    assert_eq!(binary["cleanup"]["complete"], true);
+    assert!(binary["cleanup"]["error"]
+        .as_str()
+        .expect("cleanup error is recorded")
+        .contains("process-tree discovery could not start"));
     fixture.assert_fixture_uses_separate_process_groups();
     assert_processes_gone(&fixture.wait_for_fixture_pids());
 }

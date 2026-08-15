@@ -63,6 +63,7 @@ SUPERVISOR_ARGV_ENV = "TIMING_TEST_SUPERVISOR_ARGV"
 SUPERVISOR_TIMEOUT_ENV = "TIMING_TEST_SUPERVISOR_TIMEOUT"
 SUPERVISOR_GRACE_ENV = "TIMING_TEST_SUPERVISOR_GRACE"
 SUPERVISOR_DISPLAY_ENV = "TIMING_TEST_SUPERVISOR_DISPLAY"
+PROCESS_TABLE_FAULT_ENV = "TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES"
 
 DEFAULT_TEST_TIMEOUT_SECS = 120.0
 DEFAULT_TERM_GRACE_SECS = 2.0
@@ -375,22 +376,82 @@ def _enable_child_subreaper() -> None:
         )
 
 
+def _linux_process_table() -> dict[int, tuple[int, int]] | None:
+    """Read PID -> (PPID, PGID) without spawning under Linux."""
+    proc_root = Path("/proc")
+    if not (proc_root / "self/stat").exists():
+        return None
+    rows: dict[int, tuple[int, int]] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(errors="replace")
+            # The command name in field 2 may contain spaces or parentheses.
+            # Fields following its final ')' start with state, PPID, and PGID.
+            fields = stat[stat.rfind(")") + 2:].split()
+            rows[int(entry.name)] = (int(fields[1]), int(fields[2]))
+        except (IndexError, OSError, ValueError):
+            # Processes may disappear while /proc is being traversed.
+            continue
+    return rows
+
+
+def _process_table_failure(
+    error: str,
+) -> tuple[dict[int, tuple[int, int]], str]:
+    rows = _linux_process_table()
+    if rows is not None:
+        return rows, f"process-tree discovery degraded: {error}; used /proc fallback"
+    return {}, error
+
+
 def _process_table() -> tuple[dict[int, tuple[int, int]], str | None]:
     """Return PID -> (PPID, PGID) from a bounded POSIX process snapshot."""
-    ps_proc = subprocess.Popen(
-        ["ps", "-axo", "pid=,ppid=,pgid="],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        injected_failures = int(os.environ.get(PROCESS_TABLE_FAULT_ENV, "0"))
+    except ValueError:
+        injected_failures = 0
+    try:
+        if injected_failures > 0:
+            os.environ[PROCESS_TABLE_FAULT_ENV] = str(injected_failures - 1)
+            raise OSError("injected process-table spawn failure")
+        ps_proc = subprocess.Popen(
+            ["ps", "-axo", "pid=,ppid=,pgid="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        return _process_table_failure(
+            f"process-tree discovery could not start: {exc}"
+        )
     try:
         stdout, stderr = ps_proc.communicate(timeout=0.5)
     except subprocess.TimeoutExpired:
         ps_proc.kill()
         ps_proc.wait()
-        return {}, "process-tree discovery timed out"
+        return _process_table_failure("process-tree discovery timed out")
+    except OSError as exc:
+        try:
+            ps_proc.kill()
+        except OSError:
+            pass
+        try:
+            ps_proc.wait(timeout=0.5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return _process_table_failure(
+            f"process-tree discovery failed while reading: {exc}"
+        )
     if ps_proc.returncode != 0:
-        return {}, f"process-tree discovery failed: {stderr.strip()}"
+        return _process_table_failure(
+            f"process-tree discovery failed: {stderr.strip()}"
+        )
 
     rows: dict[int, tuple[int, int]] = {}
     try:
@@ -407,8 +468,6 @@ def _discover_descendants(
     root_pid: int, known: set[int]
 ) -> tuple[dict[int, tuple[int, int]], str | None]:
     rows, error = _process_table()
-    if error is not None:
-        return {}, error
 
     # Keep every PID ever observed: a descendant can be reparented after its
     # parent is killed, or can move into a new process group. Linux subreaper
@@ -425,7 +484,7 @@ def _discover_descendants(
             if pid not in known and ppid in known:
                 known.add(pid)
                 changed = True
-    return {pid: rows[pid] for pid in known if pid in rows}, None
+    return {pid: rows[pid] for pid in known if pid in rows}, error
 
 
 def _cleanup_process_tree(
@@ -436,6 +495,7 @@ def _cleanup_process_tree(
     supervisor_pgid = os.getpgrp()
     known = {proc.pid}
     discovery_error: str | None = None
+    discovery_errors: list[str] = []
     signal_errors: list[str] = []
     cleanup = {
         "attempted": False,
@@ -450,8 +510,16 @@ def _cleanup_process_tree(
         proc.poll()
         _reap_children()
         live, error = _discover_descendants(proc.pid, known)
-        if error is not None and discovery_error is None:
-            discovery_error = error
+        if error is not None and error not in discovery_errors:
+            discovery_errors.append(error)
+        # A Linux /proc fallback is a complete snapshot, while a later clean
+        # ps snapshot proves that a transient startup failure has recovered.
+        discovery_error = (
+            error
+            if error is not None
+            and not error.startswith("process-tree discovery degraded:")
+            else None
+        )
         return live
 
     def signal_targets(
@@ -555,6 +623,8 @@ def _cleanup_process_tree(
             cleanup["error"] = (
                 f"process group {root_pgid} still exists after SIGKILL"
             )
+    elif discovery_errors:
+        cleanup["error"] = discovery_errors[-1]
     return cleanup
 
 
@@ -585,6 +655,8 @@ def _cleanup_diagnostic(cleanup: dict) -> str:
         "descendant tree reaped" if cleanup["complete"]
         else f"cleanup incomplete: {cleanup['error']}"
     )
+    if cleanup["complete"] and cleanup["error"] is not None:
+        actions.append(f"discovery diagnostic: {cleanup['error']}")
     return ", ".join(actions)
 
 

@@ -53,6 +53,36 @@ fn load_graph_review_context(db_path: &Path, task_id: i64) -> Result<Option<Stri
         .transpose()
 }
 
+const REVIEW_TASK_BODY_LIMIT: i64 = 16_000;
+const REVIEW_TASK_NOTE_LIMIT: i64 = 4;
+const REVIEW_TASK_NOTE_BODY_LIMIT: i64 = 1_200;
+
+fn load_task_review_contract(db_path: &Path, task_id: i64) -> Result<String> {
+    let conn = quorum_core::db::open(db_path)?;
+    let (title, body, depends_on): (String, Option<String>, Option<String>) = conn.query_row(
+        "SELECT title, substr(body, 1, ?2), depends_on FROM tasks WHERE id=?1",
+        rusqlite::params![task_id, REVIEW_TASK_BODY_LIMIT],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT substr(body, 1, ?2) FROM task_notes
+         WHERE task_id=?1 ORDER BY id DESC LIMIT ?3",
+    )?;
+    let recovery_notes = stmt
+        .query_map(
+            rusqlite::params![task_id, REVIEW_TASK_NOTE_BODY_LIMIT, REVIEW_TASK_NOTE_LIMIT],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(reviewer::task_review_contract(
+        task_id,
+        &title,
+        body.as_deref(),
+        depends_on.as_deref(),
+        &recovery_notes,
+    ))
+}
+
 fn prepare_reviewer_authority(
     db_path: &Path,
     task_id: i64,
@@ -5913,12 +5943,22 @@ async fn resume_reviewer_after_ci(
             .await
             .map_err(|error| QuorumError::Io(format!("graph review context join: {error}")))??
     };
-    let rereview_turn = reviewer::build_rereview_turn_with_context(
-        &reviewers[reviewer_index].agent_name,
-        pr,
-        &workers[worker_index].agent_name,
-        &reviewers[reviewer_index].effort,
-        graph_context.as_deref(),
+    let task_contract = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_task_review_contract(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("task review context join: {error}")))??
+    };
+    let rereview_turn = format!(
+        "{}\n\n{}",
+        reviewer::build_rereview_turn_with_context(
+            &reviewers[reviewer_index].agent_name,
+            pr,
+            &workers[worker_index].agent_name,
+            &reviewers[reviewer_index].effort,
+            graph_context.as_deref(),
+        ),
+        task_contract
     );
     // Revalidate at the external feed boundary. This second guarded read makes
     // any cancellation/context change during CI/prompt preparation fail loud
@@ -13659,6 +13699,14 @@ async fn provision_reviewer_reserved(
             )
         }
     };
+    let task_contract = {
+        let db_path = config.db_path.clone();
+        let task_id = worker.task_id;
+        tokio::task::spawn_blocking(move || load_task_review_contract(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("task review context join: {error}")))??
+    };
+    let prompt = format!("{prompt}\n\n{task_contract}");
 
     let reviewer_env = vec![
         ("QUORUM_REPO".into(), config.repo.clone()),

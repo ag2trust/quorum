@@ -51,7 +51,9 @@ After a binary is executed, its entry has `execute_secs`,
 object records `attempted`, `term_sent`, `kill_sent`, `complete`, and `error`.
 `complete: true` means the isolated test and its tracked descendant tree,
 including descendants that created separate process groups, no longer exist
-and the supervisor reaped the children it owns. A timeout uses exit code `124`.
+and the supervisor reaped the children it owns. `error` also retains a
+transient process-discovery diagnostic when fallback or a later snapshot still
+allowed cleanup to complete. A timeout uses exit code `124`.
 Each test is owned by a supervisor outside the collector's process group; if
 the collector is abruptly killed, that supervisor observes owner loss and
 performs the same bounded TERM/KILL cleanup before exiting. Because an
