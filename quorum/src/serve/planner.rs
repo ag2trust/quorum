@@ -5,10 +5,13 @@
 #![allow(dead_code)]
 
 use super::agent::{self, AgentProc, AgentSpec};
+use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, RunnerProc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const CODEX_PLANNER_MODEL: &str = "gpt-5.6-sol";
@@ -18,6 +21,8 @@ pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_STDOUT_BYTES: usize = 128 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
+const WRITABLE_PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
+pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigned worktree and repository are writable. This defense-in-depth guidance does not itself enforce that boundary.";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 // Keep all required literal payload within one text field's budget so a plan
 // carrying every required value still has ample space under the 64 KiB response
@@ -26,6 +31,68 @@ const MAX_REQUIRED_LITERAL_BYTES: usize = MAX_TEXT_BYTES;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
+
+/// Process-local admission gate for filesystem-backed write-path resolution.
+///
+/// The resolver runs on at most one dedicated OS thread, never Tokio's shared
+/// blocking pool. A timed-out filesystem call retains this single slot until
+/// it really returns; later requests fail closed without spawning or queueing
+/// more work.
+#[derive(Clone, Default)]
+pub struct WritablePathResolver {
+    active: Arc<AtomicBool>,
+}
+
+struct WritablePathResolutionGuard(Arc<AtomicBool>);
+
+impl Drop for WritablePathResolutionGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl WritablePathResolver {
+    async fn resolve_with<F>(
+        &self,
+        repo_root: std::path::PathBuf,
+        writable_paths: Vec<String>,
+        resolution_timeout: Duration,
+        resolver: F,
+    ) -> bool
+    where
+        F: FnOnce(std::path::PathBuf, Vec<String>) -> bool + Send + 'static,
+    {
+        if self
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+
+        let guard = WritablePathResolutionGuard(Arc::clone(&self.active));
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("quorum-write-path-resolver".into())
+            .spawn(move || {
+                let _guard = guard;
+                let _ = result_tx.send(resolver(repo_root, writable_paths));
+            });
+        if spawned.is_err() {
+            return false;
+        }
+
+        matches!(
+            tokio::time::timeout(resolution_timeout, result_rx).await,
+            Ok(Ok(true))
+        )
+    }
+
+    #[cfg(test)]
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "outcome", rename_all = "lowercase", deny_unknown_fields)]
@@ -51,6 +118,9 @@ pub struct ProposedTask {
     #[serde(default)]
     pub affected_paths: Vec<String>,
     pub observable_outcome: String,
+    /// Explicit child file contract. Writes and contextual references are
+    /// distinct so downstream enforcement need not infer intent from prose.
+    pub deliverables: quorum_core::decomposition::ChildDeliverables,
     pub acceptance_criteria: Vec<String>,
     pub source_constraints: Vec<String>,
     pub verification_expectations: Vec<String>,
@@ -109,16 +179,37 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          constraint, verification expectation, or non-goal. Do not create synthetic integration \
          work, recursive planning, no-op/regression-only tasks, or unrelated scope. Dependencies \
          must be real delivery prerequisites and may \
-         reference another task key or source:<dependency-id>. Return exactly one valid JSON \
-         object, with no markdown or commentary. The object must be exactly one of these closed \
+         reference another task key or source:<dependency-id>. Every PLAN task's \
+         `source_constraints` must include this worker-facing guidance: \
+         \"{WORKER_WRITABILITY_GUIDANCE}\". The daemon adds it deterministically, so it is \
+         guidance rather than an enforcement claim. Return exactly one valid JSON object. For \
+         each task, declare every file-level deliverable in `deliverables`: use \
+         `write` only for requested changes and `read_only_reference` only for context. Use no \
+         markdown or commentary. The object must be exactly one of these closed \
          shapes: do not omit, rename, or add fields.\n\
-         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"implementation_delta\":\"<new-code-or-documentation-change>\",\"affected_paths\":[\"<repo-relative-path-or-narrow-pattern>\"],\"observable_outcome\":\"<observable-outcome>\",\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"non_goals\":[\"<preserved-or-explicitly-excluded-behavior>\"],\"preserved_literals\":[\"<exact-source-literal>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
+         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"implementation_delta\":\"<new-code-or-documentation-change>\",\"affected_paths\":[\"<repo-relative-path-or-narrow-pattern>\"],\"observable_outcome\":\"<observable-outcome>\",\"deliverables\":[{{\"kind\":\"write\",\"path\":\"<repo-relative-path>\"}},{{\"kind\":\"read_only_reference\",\"path\":\"<contextual-path>\"}}],\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"non_goals\":[\"<preserved-or-explicitly-excluded-behavior>\"],\"preserved_literals\":[\"<exact-source-literal>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
          BLOCKER={{\"outcome\":\"blocker\",\"category\":\"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>\",\"evidence\":[\"<evidence>\"],\"required_decision\":\"<decision>\",\"why_no_safe_split\":\"<reason>\"}}\n\
          `outcome` must be exactly `plan` or `blocker`; use PLAN only when it has 2-8 tasks. \
          PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
          to {MAX_REJECTION_SUMMARY_BYTES} bytes. On retry, use only those summaries to correct \
          the cited semantic defect; do not discuss them or request more context.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
     )
+}
+
+/// Add the worker-facing defense-in-depth guidance to every generated child,
+/// independent of the planner's response.
+pub fn with_worker_writability_guidance(source_constraints: &[String]) -> Vec<String> {
+    let mut constraints = source_constraints.to_vec();
+    if !contains_worker_writability_guidance(source_constraints) {
+        constraints.push(WORKER_WRITABILITY_GUIDANCE.into());
+    }
+    constraints
+}
+
+fn contains_worker_writability_guidance(source_constraints: &[String]) -> bool {
+    source_constraints
+        .iter()
+        .any(|constraint| constraint == WORKER_WRITABILITY_GUIDANCE)
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -134,15 +225,55 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 
 /// Recheck proposal dependencies against the authoritative source snapshot.
 /// Shape/cycle/text validation has already run in `parse_response`.
-pub fn validate_for_source(
+pub async fn validate_for_source(
     tasks: &[ProposedTask],
     source_dependency_ids: &[i64],
     source_title: &str,
     source_body: Option<&str>,
+    repo_root: &Path,
+    path_resolver: &WritablePathResolver,
 ) -> Result<(), PlannerParseError> {
     validate_plan_tasks(tasks)?;
+    validate_source_literals(tasks, source_title, source_body)?;
+    validate_for_source_with_resolver(
+        tasks,
+        source_dependency_ids,
+        repo_root,
+        path_resolver,
+        WRITABLE_PATH_RESOLUTION_TIMEOUT,
+        |repo_root, paths| {
+            paths.iter().all(|path| {
+                quorum_core::decomposition::classify_writable_deliverable_path_blocking(
+                    &repo_root, path,
+                ) == quorum_core::decomposition::WritableDeliverablePath::Permitted
+            })
+        },
+    )
+    .await
+}
+
+async fn validate_for_source_with_resolver<F>(
+    tasks: &[ProposedTask],
+    source_dependency_ids: &[i64],
+    repo_root: &Path,
+    path_resolver: &WritablePathResolver,
+    resolution_timeout: Duration,
+    resolver: F,
+) -> Result<(), PlannerParseError>
+where
+    F: FnOnce(std::path::PathBuf, Vec<String>) -> bool + Send + 'static,
+{
     let allowed: HashSet<i64> = source_dependency_ids.iter().copied().collect();
+    let mut writable_paths = Vec::new();
     for task in tasks {
+        for path in task.deliverables.writable_paths() {
+            if quorum_core::decomposition::writable_deliverable_is_lexically_external(
+                repo_root, path,
+            ) {
+                return escaping_write(task, path);
+            }
+            writable_paths.push(path.to_owned());
+        }
         for prerequisite in &task.prerequisites {
             if let Some(raw) = prerequisite.strip_prefix("source:") {
                 let id = raw
@@ -161,6 +292,32 @@ pub fn validate_for_source(
             return semantic("synthetic integration work is not permitted");
         }
     }
+    if writable_paths.is_empty() {
+        return Ok(());
+    }
+    let permitted = path_resolver
+        .resolve_with(
+            repo_root.to_path_buf(),
+            writable_paths,
+            resolution_timeout,
+            resolver,
+        )
+        .await;
+    if permitted {
+        Ok(())
+    } else {
+        semantic(
+            "a writable deliverable resolves outside the managed repository; use an \
+             in-repository write path or declare external context as read_only_reference",
+        )
+    }
+}
+
+fn validate_source_literals(
+    tasks: &[ProposedTask],
+    source_title: &str,
+    source_body: Option<&str>,
+) -> Result<(), PlannerParseError> {
     let source_text = format!("{source_title}\n{}", source_body.unwrap_or_default());
     let preserved: HashSet<&str> = tasks
         .iter()
@@ -183,6 +340,27 @@ pub fn validate_for_source(
         }
     }
     Ok(())
+}
+
+fn escaping_write<T>(task: &ProposedTask, path: &str) -> Result<T, PlannerParseError> {
+    const MAX_PATH_BYTES: usize = 512;
+    const ELLIPSIS: &str = "…";
+    let path = if path.len() > MAX_PATH_BYTES {
+        format!(
+            "{}{}",
+            truncate_utf8(path, MAX_PATH_BYTES - ELLIPSIS.len()),
+            ELLIPSIS
+        )
+    } else {
+        path.to_owned()
+    };
+    let message = format!(
+        "child {} writable deliverable `{path}` escapes the managed repository; use an \
+         in-repository write path or declare external context as read_only_reference",
+        task.key
+    );
+    debug_assert!(message.len() <= MAX_REJECTION_SUMMARY_BYTES);
+    semantic(&message)
 }
 
 /// Extract source-marked literals that can be checked without asking a model
@@ -301,13 +479,16 @@ pub fn parse_response(text: &str) -> Result<PlannerResponse, PlannerParseError> 
     Ok(response)
 }
 
-/// Validate a plan restored from durable storage before it can resume any
-/// downstream phase. Serde defaults preserve compatibility with older stored
-/// proposals, but never make missing newly-required fields admissible.
-pub fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> {
-    validate_semantics(&PlannerResponse::Plan {
-        tasks: tasks.to_vec(),
-    })
+/// Rehydrate the durable task-list form accepted by the planner coordinator.
+/// This shares `ProposedTask` with the live response parser, so a persisted
+/// proposal receives the complete closed-plan semantic validation before any
+/// downstream phase resumes.
+pub fn parse_accepted_proposal(text: &str) -> Result<Vec<ProposedTask>, PlannerParseError> {
+    let tasks: Vec<ProposedTask> = serde_json::from_str(text).map_err(|error| {
+        PlannerParseError::Provider(format!("invalid accepted proposal: {error}"))
+    })?;
+    validate_plan_tasks(&tasks)?;
+    Ok(tasks)
 }
 
 fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseError> {
@@ -331,48 +512,74 @@ fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseErro
             validate_text("required decision", required_decision)?;
             validate_text("why no safe split", why_no_safe_split)?;
         }
-        PlannerResponse::Plan { tasks } => {
-            if !(2..=8).contains(&tasks.len()) {
-                return semantic("plan must contain between 2 and 8 tasks");
-            }
-            let mut keys = HashSet::new();
-            for task in tasks {
-                validate_key(&task.key)?;
-                if !keys.insert(task.key.as_str()) {
-                    return semantic("task keys must be unique");
-                }
-                validate_text("title", &task.title)?;
-                validate_text("implementation delta", &task.implementation_delta)?;
-                validate_list("affected paths", &task.affected_paths, 1)?;
-                validate_text("observable outcome", &task.observable_outcome)?;
-                validate_list("acceptance criteria", &task.acceptance_criteria, 1)?;
-                validate_list("source constraints", &task.source_constraints, 1)?;
-                validate_list(
-                    "verification expectations",
-                    &task.verification_expectations,
-                    1,
-                )?;
-                validate_list("non-goals", &task.non_goals, 1)?;
-                validate_list("preserved literals", &task.preserved_literals, 0)?;
-                if task.prerequisites.len() > MAX_LIST_ITEMS {
-                    return semantic("too many prerequisites");
-                }
-            }
-            for task in tasks {
-                for prerequisite in &task.prerequisites {
-                    validate_text("prerequisite", prerequisite)?;
-                    if prerequisite == &task.key {
-                        return semantic("task cannot depend on itself");
-                    }
-                    if !keys.contains(prerequisite.as_str())
-                        && !valid_source_dependency(prerequisite)
-                    {
-                        return semantic("prerequisite must be a task key or source:<positive-id>");
-                    }
-                }
-            }
-            reject_cycles(tasks)?;
+        PlannerResponse::Plan { tasks } => validate_plan_tasks(tasks)?,
+    }
+    Ok(())
+}
+
+pub(super) fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> {
+    if !(2..=8).contains(&tasks.len()) {
+        return semantic("plan must contain between 2 and 8 tasks");
+    }
+    let mut keys = HashSet::new();
+    for task in tasks {
+        validate_key(&task.key)?;
+        if !keys.insert(task.key.as_str()) {
+            return semantic("task keys must be unique");
         }
+        validate_text("title", &task.title)?;
+        validate_text("implementation delta", &task.implementation_delta)?;
+        validate_list("affected paths", &task.affected_paths, 1)?;
+        validate_text("observable outcome", &task.observable_outcome)?;
+        validate_deliverables(&task.deliverables)?;
+        validate_list("acceptance criteria", &task.acceptance_criteria, 1)?;
+        validate_list("source constraints", &task.source_constraints, 1)?;
+        if task.source_constraints.len() == MAX_LIST_ITEMS
+            && !contains_worker_writability_guidance(&task.source_constraints)
+        {
+            return semantic(
+                "source constraints at maximum size must include worker writability guidance",
+            );
+        }
+        validate_list(
+            "verification expectations",
+            &task.verification_expectations,
+            1,
+        )?;
+        validate_list("non-goals", &task.non_goals, 1)?;
+        validate_list("preserved literals", &task.preserved_literals, 0)?;
+        if task.prerequisites.len() > MAX_LIST_ITEMS {
+            return semantic("too many prerequisites");
+        }
+    }
+    for task in tasks {
+        for prerequisite in &task.prerequisites {
+            validate_text("prerequisite", prerequisite)?;
+            if prerequisite == &task.key {
+                return semantic("task cannot depend on itself");
+            }
+            if !keys.contains(prerequisite.as_str()) && !valid_source_dependency(prerequisite) {
+                return semantic("prerequisite must be a task key or source:<positive-id>");
+            }
+        }
+    }
+    reject_cycles(tasks)
+}
+
+fn validate_deliverables(
+    deliverables: &quorum_core::decomposition::ChildDeliverables,
+) -> Result<(), PlannerParseError> {
+    if deliverables.0.is_empty() || deliverables.0.len() > MAX_LIST_ITEMS {
+        return semantic(&format!(
+            "deliverables must contain 1..={MAX_LIST_ITEMS} items"
+        ));
+    }
+    for deliverable in &deliverables.0 {
+        let path = match deliverable {
+            quorum_core::decomposition::ChildDeliverable::Write { path }
+            | quorum_core::decomposition::ChildDeliverable::ReadOnlyReference { path } => path,
+        };
+        validate_text("deliverable path", path)?;
     }
     Ok(())
 }
@@ -465,6 +672,7 @@ pub struct PlannerSlot {
     pub response_text: String,
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
+    codex_terminal_candidate: bool,
 }
 
 impl PlannerSlot {
@@ -526,42 +734,51 @@ async fn spawn_planner_with_timeout(
     }
     let started_at = tokio::time::Instant::now();
     let deadline = started_at + turn_timeout;
-    let proc = match provider {
-        AgentKind::Codex => return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Codex decomposition planner refused: no portable launch boundary can isolate provider transport from model-generated network and filesystem access",
-        )),
-        AgentKind::Grok => return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Grok decomposition planner refused: managed Grok lifecycle roles are not enabled",
-        )),
-        AgentKind::Claude => {
-            let spec = AgentSpec {
-                kind: AgentKind::Claude,
-                model: model.into(),
-                effort: effort.into(),
-                session_id: agent::new_session_id(),
-                worktree: repo.to_path_buf(),
-                bare,
-                allowed_tools: "Read,Glob,Grep".into(),
-                env_vars: vec![],
-            };
-            let mut proc = AgentProc::spawn_planner(&spec, provider_bin)?;
-            if let Err(error) = proc
-                .feed_turn_until(&agent::user_turn(prompt), deadline)
-                .await
-            {
-                let _ = proc.kill_and_reap().await;
-                return Err(error);
+    let proc =
+        match provider {
+            AgentKind::Codex => {
+                let spec = CodexSpec {
+                    model: model.into(),
+                    effort: effort.into(),
+                    sandbox: "read-only".into(),
+                    worktree: repo.to_path_buf(),
+                    prompt: prompt.into(),
+                    env_vars: vec![],
+                };
+                RunnerProc::Codex(CodexProc::spawn_planner(&spec, provider_bin)?)
             }
-            RunnerProc::Claude(proc)
-        }
-    };
+            AgentKind::Grok => return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Grok decomposition planner refused: managed Grok lifecycle roles are not enabled",
+            )),
+            AgentKind::Claude => {
+                let spec = AgentSpec {
+                    kind: AgentKind::Claude,
+                    model: model.into(),
+                    effort: effort.into(),
+                    session_id: agent::new_session_id(),
+                    worktree: repo.to_path_buf(),
+                    bare,
+                    allowed_tools: "Read,Glob,Grep".into(),
+                    env_vars: vec![],
+                };
+                let mut proc = AgentProc::spawn_planner(&spec, provider_bin)?;
+                if let Err(error) = proc
+                    .feed_turn_until(&agent::user_turn(prompt), deadline)
+                    .await
+                {
+                    let _ = proc.kill_and_reap().await;
+                    return Err(error);
+                }
+                RunnerProc::Claude(proc)
+            }
+        };
     Ok(PlannerSlot {
         proc,
         response_text: String::new(),
         started_at,
         stdout_bytes: 0,
+        codex_terminal_candidate: false,
     })
 }
 
@@ -573,6 +790,7 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
     }
     let remaining = PLANNER_TIMEOUT.saturating_sub(slot.started_at.elapsed());
     let poll_for = remaining.min(Duration::from_secs(2));
+    let mut stdout_complete = false;
     loop {
         // Reserve the byte previously charged for the line terminator. More
         // importantly, enforce the remaining allowance while bytes are read;
@@ -585,7 +803,10 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
         {
             Err(_) => break,
             Ok(Ok(Some(raw))) => raw,
-            Ok(Ok(None)) => break,
+            Ok(Ok(None)) => {
+                stdout_complete = true;
+                break;
+            }
             Ok(Err(_)) => {
                 return Some(PlannerPoll::ProviderFailed(format!(
                     "planner stdout exceeded {} KiB",
@@ -599,6 +820,19 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                 "planner stdout exceeded {} KiB",
                 MAX_STDOUT_BYTES / 1024
             )));
+        }
+        if slot.codex_terminal_candidate {
+            return Some(PlannerPoll::ProviderFailed(
+                "planner provider emitted output after terminal response".into(),
+            ));
+        }
+        if slot.proc.kind() == AgentKind::Codex {
+            if let Some(failure) = slot.proc.observed_pre_authoritative_failure() {
+                return Some(PlannerPoll::ProviderFailed(format!(
+                    "planner provider protocol failed: {}",
+                    failure.detail()
+                )));
+            }
         }
         if slot.proc.kind() == AgentKind::Claude {
             if let Some(super::stream::Event::Result {
@@ -629,7 +863,11 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                     ));
                 }
                 AgentEvent::TurnCompleted { .. } => {
-                    return Some(parsed_poll(&slot.response_text));
+                    if slot.proc.kind() == AgentKind::Codex {
+                        slot.codex_terminal_candidate = true;
+                    } else {
+                        return Some(parsed_poll(&slot.response_text));
+                    }
                 }
                 AgentEvent::AssistantText { text } => {
                     if slot.response_text.len().saturating_add(text.len()) > MAX_RESPONSE_BYTES {
@@ -646,7 +884,31 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
             return Some(PlannerPoll::ProviderFailed("planner timed out".into()));
         }
     }
-    if matches!(slot.proc.try_wait(), Ok(Some(_))) {
+    let status = match slot.proc.try_wait() {
+        Ok(status) => status,
+        Err(error) => {
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner process status unavailable: {error}"
+            )));
+        }
+    };
+    if slot.proc.kind() == AgentKind::Codex && slot.codex_terminal_candidate && stdout_complete {
+        let status = status?;
+        let _ = slot.proc.finalize_pre_authoritative_evidence().await;
+        if !status.success() {
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner provider exited unsuccessfully after terminal response: {status}"
+            )));
+        }
+        if let Some(failure) = slot.proc.observed_strict_pre_authoritative_failure() {
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner provider terminal evidence failed: {}",
+                failure.detail()
+            )));
+        }
+        return Some(parsed_poll(&slot.response_text));
+    }
+    if status.is_some() {
         return Some(PlannerPoll::ProviderFailed(
             "planner exited without a terminal response".into(),
         ));
@@ -671,6 +933,52 @@ mod tests {
     const TEST_STDIN_FEED_TIMEOUT: Duration = Duration::from_secs(15);
     const TEST_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(15);
 
+    #[cfg(unix)]
+    fn executable_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runner = dir.join(name);
+        std::fs::write(&runner, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        runner
+    }
+
+    #[cfg(unix)]
+    async fn poll_to_terminal(slot: &mut PlannerSlot) -> PlannerPoll {
+        tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            loop {
+                if let Some(outcome) = poll_planner(slot).await {
+                    break outcome;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("planner did not reach a terminal outcome")
+    }
+
+    #[cfg(unix)]
+    async fn spawn_fake_codex(dir: &Path, stdout: &str) -> PlannerSlot {
+        let stdout_path = dir.join("stdout.jsonl");
+        std::fs::write(&stdout_path, stdout).unwrap();
+        let runner = executable_script(
+            dir,
+            "codex",
+            &format!("exec /bin/cat '{}'", stdout_path.display()),
+        );
+        spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir,
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap()
+    }
+
     fn task(key: &str, prerequisites: &[&str]) -> serde_json::Value {
         serde_json::json!({
             "key": key,
@@ -678,6 +986,7 @@ mod tests {
             "implementation_delta": format!("change the {key} implementation seam"),
             "affected_paths": [format!("src/{key}.rs")],
             "observable_outcome": format!("{key} works"),
+            "deliverables": [{"kind": "write", "path": format!("src/{key}.rs")}],
             "acceptance_criteria": ["behavior is covered"],
             "source_constraints": ["preserve atomicity"],
             "verification_expectations": ["focused tests pass"],
@@ -685,6 +994,12 @@ mod tests {
             "preserved_literals": [],
             "prerequisites": prerequisites,
         })
+    }
+
+    fn writable_deliverables(path: &str) -> quorum_core::decomposition::ChildDeliverables {
+        quorum_core::decomposition::ChildDeliverables(vec![
+            quorum_core::decomposition::ChildDeliverable::Write { path: path.into() },
+        ])
     }
 
     #[test]
@@ -702,6 +1017,77 @@ mod tests {
             parse_response(&blocker.to_string()),
             Ok(PlannerResponse::Blocker { .. })
         ));
+    }
+
+    #[test]
+    fn parses_writable_and_read_only_deliverables_without_conflating_them() {
+        let plan = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [
+                task("core", &[]),
+                {
+                    "key": "daemon",
+                    "title": "Implement daemon boundary",
+                    "implementation_delta": "change the daemon boundary",
+                    "affected_paths": ["quorum/src/serve/mod.rs"],
+                    "observable_outcome": "daemon boundary works",
+                    "deliverables": [
+                        {"kind": "write", "path": "quorum/src/serve/mod.rs"},
+                        {"kind": "read_only_reference", "path": "quorum-core/src/decomposition.rs"}
+                    ],
+                    "acceptance_criteria": ["boundary is covered"],
+                    "source_constraints": ["preserve atomicity"],
+                    "verification_expectations": ["focused tests pass"],
+                    "non_goals": ["do not change decomposition storage"],
+                    "preserved_literals": [],
+                    "prerequisites": ["core"]
+                }
+            ]
+        });
+        let PlannerResponse::Plan { tasks } = parse_response(&plan.to_string()).unwrap() else {
+            panic!("expected plan");
+        };
+        assert_eq!(
+            tasks[1].deliverables.writable_paths().collect::<Vec<_>>(),
+            ["quorum/src/serve/mod.rs"]
+        );
+        assert_eq!(
+            tasks[1].deliverables.reference_paths().collect::<Vec<_>>(),
+            ["quorum-core/src/decomposition.rs"]
+        );
+    }
+
+    #[test]
+    fn accepted_proposal_json_rehydrates_structured_deliverables() {
+        let accepted = serde_json::json!([
+            {
+                "key": "core",
+                "title": "Implement core boundary",
+                "implementation_delta": "change the core boundary",
+                "affected_paths": ["quorum-core/src/decomposition.rs"],
+                "observable_outcome": "core boundary works",
+                "deliverables": [
+                    {"kind": "write", "path": "quorum-core/src/decomposition.rs"},
+                    {"kind": "read_only_reference", "path": "docs/decomposition.md"}
+                ],
+                "acceptance_criteria": ["boundary is covered"],
+                "source_constraints": ["preserve atomicity"],
+                "verification_expectations": ["focused tests pass"],
+                "non_goals": ["do not change daemon behavior"],
+                "preserved_literals": [],
+                "prerequisites": []
+            },
+            task("other", &[])
+        ]);
+        let tasks = parse_accepted_proposal(&accepted.to_string()).unwrap();
+        assert_eq!(
+            tasks[0].deliverables.writable_paths().collect::<Vec<_>>(),
+            ["quorum-core/src/decomposition.rs"]
+        );
+        assert_eq!(
+            tasks[0].deliverables.reference_paths().collect::<Vec<_>>(),
+            ["docs/decomposition.md"]
+        );
     }
 
     #[test]
@@ -754,11 +1140,13 @@ mod tests {
         let legacy = serde_json::json!([
             {
                 "key": "a", "title": "a", "observable_outcome": "a works",
+                "deliverables": [{"kind": "write", "path": "src/a.rs"}],
                 "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
                 "verification_expectations": ["tests"], "prerequisites": []
             },
             {
                 "key": "b", "title": "b", "observable_outcome": "b works",
+                "deliverables": [{"kind": "write", "path": "src/b.rs"}],
                 "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
                 "verification_expectations": ["tests"], "prerequisites": ["a"]
             }
@@ -772,6 +1160,43 @@ mod tests {
             Err(PlannerParseError::Semantic(message))
                 if message.contains("implementation delta must not be empty")
         ));
+    }
+
+    #[test]
+    fn maximum_source_constraints_without_worker_guidance_are_semantically_rejected() {
+        let mut maximum = task("maximum", &[]);
+        let constraints: Vec<String> = (0..MAX_LIST_ITEMS)
+            .map(|index| format!("constraint {index}"))
+            .collect();
+        maximum["source_constraints"] = serde_json::to_value(constraints).unwrap();
+        let plan = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [maximum, task("other", &[])],
+        });
+        assert_eq!(
+            parse_response(&plan.to_string()),
+            Err(PlannerParseError::Semantic(
+                "source constraints at maximum size must include worker writability guidance"
+                    .into(),
+            ))
+        );
+    }
+
+    #[test]
+    fn durable_maximum_source_constraints_without_worker_guidance_are_rejected() {
+        let mut maximum = task("maximum", &[]);
+        let constraints: Vec<String> = (0..MAX_LIST_ITEMS)
+            .map(|index| format!("constraint {index}"))
+            .collect();
+        maximum["source_constraints"] = serde_json::to_value(constraints).unwrap();
+        let accepted = serde_json::json!([maximum, task("other", &[])]);
+        assert_eq!(
+            parse_accepted_proposal(&accepted.to_string()),
+            Err(PlannerParseError::Semantic(
+                "source constraints at maximum size must include worker writability guidance"
+                    .into(),
+            ))
+        );
     }
 
     #[test]
@@ -898,83 +1323,570 @@ mod tests {
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn codex_planner_fails_closed_before_real_binary_launch() {
+    async fn codex_terminal_response_reaches_existing_plan_validation_with_exact_profile() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("invoked");
-        let fake = dir.path().join("codex");
-        std::fs::write(&fake, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let error = spawn_planner(
+        let args_path = dir.path().join("args");
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type": "turn.completed"})
+        );
+        let output_path = dir.path().join("stdout.jsonl");
+        std::fs::write(&output_path, output).unwrap();
+        let fake = executable_script(
+            dir.path(),
+            "codex",
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'\nexec /bin/cat '{}'",
+                args_path.display(),
+                output_path.display()
+            ),
+        );
+        let mut slot = spawn_planner(
             AgentKind::Codex,
-            CODEX_PLANNER_MODEL,
-            PLANNER_EFFORT,
-            Path::new("."),
-            "bounded prompt",
+            "gpt-5.6-luna",
+            "xhigh",
+            dir.path(),
+            "exact bounded prompt",
             false,
             fake.to_str(),
         )
         .await
-        .err()
-        .expect("Codex planner must fail closed");
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        .unwrap();
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::Done(PlannerResponse::Plan { ref tasks })
+                if tasks.len() == 2 && tasks[1].prerequisites == ["core"]
+        ));
         assert!(
-            !marker.exists(),
-            "refused planner must not execute provider binary"
+            slot.proc.try_wait().unwrap().is_some(),
+            "Codex plan authority preceded provider exit"
         );
-        if let Ok(output) = std::process::Command::new("which").arg("codex").output() {
-            if output.status.success() {
-                let real = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let real_error = spawn_planner(
-                    AgentKind::Codex,
-                    CODEX_PLANNER_MODEL,
-                    PLANNER_EFFORT,
-                    Path::new("."),
-                    "attempt network, quorum, database, and coordination access",
-                    false,
-                    Some(real.as_str()),
-                )
-                .await
-                .err()
-                .expect("real Codex binary must also be refused before launch");
-                assert_eq!(real_error.kind(), std::io::ErrorKind::PermissionDenied);
-            }
+        slot.kill_and_reap().await;
+
+        let args = std::fs::read_to_string(args_path).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "gpt-5.6-luna"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=xhigh"]));
+        assert_eq!(args.last(), Some(&"exact bounded prompt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_terminal_candidate_requires_clean_exit_and_final_evidence() {
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let terminal_output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type": "turn.completed"})
+        );
+        let cases = [
+            ("nonzero-exit", "exit 7"),
+            (
+                "trailing-stdout",
+                "printf '%s\\n' '{\"type\":\"error\",\"message\":\"fatal trailing error\"}'",
+            ),
+            (
+                "trailing-stderr",
+                "printf '%s\\n' 'fatal trailing error' >&2",
+            ),
+        ];
+        for (name, trailer) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let output_path = dir.path().join("stdout.jsonl");
+            std::fs::write(&output_path, &terminal_output).unwrap();
+            let runner = executable_script(
+                dir.path(),
+                "codex",
+                &format!("/bin/cat '{}'\n{trailer}", output_path.display()),
+            );
+            let mut slot = spawn_planner(
+                AgentKind::Codex,
+                CODEX_PLANNER_MODEL,
+                PLANNER_EFFORT,
+                dir.path(),
+                "bounded prompt",
+                false,
+                runner.to_str(),
+            )
+            .await
+            .unwrap();
+            let outcome = poll_to_terminal(&mut slot).await;
+            assert!(
+                matches!(outcome, PlannerPoll::ProviderFailed(_)),
+                "{name} acquired planner authority"
+            );
+            slot.kill_and_reap().await;
         }
     }
 
-    #[test]
-    fn source_validation_rejects_foreign_dependencies_and_synthetic_integration() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_malformed_error_and_missing_terminal_streams_fail_without_a_plan() {
+        let cases = [
+            ("malformed", "not-json\n"),
+            (
+                "provider-error",
+                "{\"type\":\"error\",\"message\":\"provider exploded\"}\n",
+            ),
+            (
+                "missing-terminal",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"id\":\"m1\",\"text\":\"{}\"}}\n",
+            ),
+        ];
+        for (name, stdout) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut slot = spawn_fake_codex(dir.path(), stdout).await;
+            let outcome = poll_to_terminal(&mut slot).await;
+            assert!(
+                matches!(outcome, PlannerPoll::ProviderFailed(_)),
+                "{name} stream created planner authority"
+            );
+            slot.kill_and_reap().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_response_and_stdout_bounds_fail_and_reap_without_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let oversized_text = "x".repeat(MAX_RESPONSE_BYTES + 1);
+        let output = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": oversized_text}
+            })
+        );
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::ProviderFailed(ref message) if message.contains("response exceeded")
+        ));
+        slot.kill_and_reap().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runner = executable_script(dir.path(), "codex", "while :; do printf '%08192d' 0; done");
+        let mut slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let pid = slot.pid().unwrap();
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::ProviderFailed(ref message) if message.contains("stdout exceeded")
+        ));
+        slot.kill_and_reap().await;
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_timeout_and_cancellation_reap_the_process_group() {
+        for timed_out in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let runner = executable_script(dir.path(), "codex", "exec sleep 30");
+            let mut slot = spawn_planner(
+                AgentKind::Codex,
+                CODEX_PLANNER_MODEL,
+                PLANNER_EFFORT,
+                dir.path(),
+                "bounded prompt",
+                false,
+                runner.to_str(),
+            )
+            .await
+            .unwrap();
+            let pid = slot.pid().unwrap();
+            if timed_out {
+                slot.started_at = tokio::time::Instant::now() - PLANNER_TIMEOUT;
+                assert!(matches!(
+                    poll_planner(&mut slot).await,
+                    Some(PlannerPoll::ProviderFailed(ref message)) if message.contains("timed out")
+                ));
+            }
+            slot.kill_and_reap().await;
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
+        }
+    }
+
+    #[tokio::test]
+    async fn source_validation_rejects_foreign_dependencies_and_synthetic_integration() {
+        let path_resolver = WritablePathResolver::default();
         let foreign = ProposedTask {
             key: "a".into(),
             title: "Implement a".into(),
+            implementation_delta: "change dependency handling".into(),
+            affected_paths: vec!["src/a.rs".into()],
             observable_outcome: "a works".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: "src/a.rs".into(),
+                },
+            ]),
             acceptance_criteria: vec!["covered".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["tests".into()],
+            non_goals: vec!["no unrelated changes".into()],
             prerequisites: vec!["source:9".into()],
             ..Default::default()
         };
         assert!(matches!(
-            validate_for_source(&[foreign], &[7], "source", None),
+            validate_for_source(
+                &[foreign],
+                &[7],
+                "source",
+                None,
+                Path::new("."),
+                &path_resolver,
+            )
+            .await,
             Err(PlannerParseError::Semantic(_))
         ));
         let synthetic = ProposedTask {
             key: "integration".into(),
             title: "Integration task".into(),
+            implementation_delta: "merge sibling changes".into(),
+            affected_paths: vec!["src/integration.rs".into()],
             observable_outcome: "merge all siblings".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: "src/integration.rs".into(),
+                },
+            ]),
             acceptance_criteria: vec!["covered".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["tests".into()],
+            non_goals: vec!["no unrelated changes".into()],
             prerequisites: vec![],
             ..Default::default()
         };
         assert!(matches!(
-            validate_for_source(&[synthetic], &[], "source", None),
+            validate_for_source(
+                &[synthetic],
+                &[],
+                "source",
+                None,
+                Path::new("."),
+                &path_resolver,
+            )
+            .await,
             Err(PlannerParseError::Semantic(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn source_validation_inspects_only_requested_writes() {
+        let path_resolver = WritablePathResolver::default();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let external = sibling.join("context.rs").to_string_lossy().into_owned();
+        let task = ProposedTask {
+            key: "bounded".into(),
+            title: "Implement bounded change".into(),
+            implementation_delta: "change the bounded implementation".into(),
+            affected_paths: vec!["src/in_repo.rs".into()],
+            observable_outcome: "bounded change works".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: "src/in_repo.rs".into(),
+                },
+                quorum_core::decomposition::ChildDeliverable::ReadOnlyReference { path: external },
+                quorum_core::decomposition::ChildDeliverable::ReadOnlyReference {
+                    path: "../sibling/other-context.rs".into(),
+                },
+            ]),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["bounded".into()],
+            verification_expectations: vec!["tests".into()],
+            non_goals: vec!["do not change external references".into()],
+            prerequisites: vec![],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            validate_for_source_with_resolver(
+                &[task],
+                &[],
+                &repo,
+                &path_resolver,
+                WRITABLE_PATH_RESOLUTION_TIMEOUT,
+                |repo_root, paths| {
+                    paths.iter().all(|path| {
+                        quorum_core::decomposition::classify_writable_deliverable_path_blocking(
+                            &repo_root, path,
+                        ) == quorum_core::decomposition::WritableDeliverablePath::Permitted
+                    })
+                },
+            )
+            .await,
+            Ok(())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_validation_rejects_every_repository_escape_shape() {
+        let path_resolver = WritablePathResolver::default();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        std::os::unix::fs::symlink(&sibling, repo.join("external-link")).unwrap();
+
+        for path in [
+            "../sibling/output.rs".to_string(),
+            "nested/../../sibling/output.rs".to_string(),
+            sibling.join("output.rs").to_string_lossy().into_owned(),
+            "external-link/new/output.rs".to_string(),
+        ] {
+            let task = ProposedTask {
+                key: "escaping".into(),
+                title: "Implement escaping change".into(),
+                implementation_delta: "write the declared output".into(),
+                affected_paths: vec![path.clone()],
+                observable_outcome: "escaping change works".into(),
+                deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                    quorum_core::decomposition::ChildDeliverable::Write { path: path.clone() },
+                ]),
+                acceptance_criteria: vec!["covered".into()],
+                source_constraints: vec!["bounded".into()],
+                verification_expectations: vec!["tests".into()],
+                non_goals: vec!["do not write external paths".into()],
+                prerequisites: vec![],
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    validate_for_source_with_resolver(
+                        &[task],
+                        &[],
+                        &repo,
+                        &path_resolver,
+                        WRITABLE_PATH_RESOLUTION_TIMEOUT,
+                        |repo_root, paths| {
+                            paths.iter().all(|path| {
+                                quorum_core::decomposition::classify_writable_deliverable_path_blocking(
+                                    &repo_root, path,
+                                ) == quorum_core::decomposition::WritableDeliverablePath::Permitted
+                            })
+                        },
+                    )
+                    .await,
+                    Err(PlannerParseError::Semantic(ref error))
+                        if error.contains("writable deliverable")
+                            && error.contains("managed repository")
+                            && error.contains("read_only_reference")
+                ),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_validation_times_out_blocking_filesystem_resolution() {
+        let path_resolver = WritablePathResolver::default();
+        let repo = tempfile::tempdir().unwrap();
+        let task = ProposedTask {
+            key: "bounded".into(),
+            title: "Implement bounded change".into(),
+            observable_outcome: "bounded change works".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: "src/in_repo.rs".into(),
+                },
+            ]),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["bounded".into()],
+            verification_expectations: vec!["tests".into()],
+            prerequisites: vec![],
+            ..Default::default()
+        };
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        let outcome = validate_for_source_with_resolver(
+            &[task],
+            &[],
+            repo.path(),
+            &path_resolver,
+            Duration::from_millis(25),
+            move |_, _| {
+                release_rx.recv().unwrap();
+                true
+            },
+        )
+        .await;
+        release_tx.send(()).unwrap();
+
+        assert!(
+            matches!(outcome, Err(PlannerParseError::Semantic(ref error))
+                if error == "a writable deliverable resolves outside the managed repository; use an in-repository write path or declare external context as read_only_reference")
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while path_resolver.is_active() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("released resolver exits");
+    }
+
+    #[test]
+    fn repeated_resolution_timeouts_do_not_queue_or_starve_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let path_resolver = WritablePathResolver::default();
+            let repo = tempfile::tempdir().unwrap();
+            let db_path = repo.path().join("quorum.db");
+            drop(quorum_core::db::open(&db_path).unwrap());
+            let task = ProposedTask {
+                key: "bounded".into(),
+                title: "Implement bounded change".into(),
+                observable_outcome: "bounded change works".into(),
+                deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                    quorum_core::decomposition::ChildDeliverable::Write {
+                        path: "src/in_repo.rs".into(),
+                    },
+                ]),
+                acceptance_criteria: vec!["covered".into()],
+                source_constraints: vec!["bounded".into()],
+                verification_expectations: vec!["tests".into()],
+                prerequisites: vec![],
+                ..Default::default()
+            };
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_in_resolver = Arc::clone(&calls);
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let first = validate_for_source_with_resolver(
+                std::slice::from_ref(&task),
+                &[],
+                repo.path(),
+                &path_resolver,
+                Duration::from_millis(10),
+                move |_, _| {
+                    calls_in_resolver.fetch_add(1, Ordering::SeqCst);
+                    release_rx.recv().unwrap();
+                    true
+                },
+            )
+            .await;
+            assert!(matches!(first, Err(PlannerParseError::Semantic(_))));
+
+            for _ in 0..16 {
+                let outcome = validate_for_source_with_resolver(
+                    std::slice::from_ref(&task),
+                    &[],
+                    repo.path(),
+                    &path_resolver,
+                    Duration::from_millis(10),
+                    |_, _| panic!("occupied resolver slot queued another job"),
+                )
+                .await;
+                assert!(matches!(outcome, Err(PlannerParseError::Semantic(_))));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(path_resolver.is_active());
+
+            let db_style_work = tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::task::spawn_blocking(move || {
+                    let conn = quorum_core::db::open(&db_path).unwrap();
+                    conn.query_row("SELECT 42", [], |row| row.get::<_, i64>(0))
+                        .unwrap()
+                }),
+            )
+            .await
+            .expect("resolver must not starve Tokio's blocking pool")
+            .expect("DB-style blocking work joins");
+            assert_eq!(db_style_work, 42);
+
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while path_resolver.is_active() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("released resolver exits");
+        });
+    }
+
+    #[tokio::test]
+    async fn source_validation_rejects_absolute_external_path_before_resolver() {
+        let path_resolver = WritablePathResolver::default();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let external = root.path().join("unavailable-mount/output.rs");
+        std::fs::create_dir(&repo).unwrap();
+        let task = ProposedTask {
+            key: "external".into(),
+            title: "Implement external change".into(),
+            observable_outcome: "external change works".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: external.to_string_lossy().into_owned(),
+                },
+            ]),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["bounded".into()],
+            verification_expectations: vec!["tests".into()],
+            prerequisites: vec![],
+            ..Default::default()
+        };
+
+        let outcome = validate_for_source_with_resolver(
+            &[task],
+            &[],
+            &repo,
+            &path_resolver,
+            Duration::from_secs(1),
+            |_, _| panic!("lexically external path reached filesystem resolver"),
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            Err(PlannerParseError::Semantic(ref error))
+                if error.contains("child external writable deliverable")
+                    && error.contains("unavailable-mount/output.rs")
+                    && error.contains("read_only_reference")
         ));
     }
 
@@ -992,6 +1904,7 @@ mod tests {
         assert!(prompt.contains("do not omit, rename, or add fields"));
         assert!(prompt.contains(r#""implementation_delta":"<new-code-or-documentation-change>""#));
         assert!(prompt.contains(r#""affected_paths":["<repo-relative-path-or-narrow-pattern>"]"#));
+        assert!(prompt.contains(r#""deliverables":[{"kind":"write""#));
         assert!(prompt.contains(r#""non_goals":["<preserved-or-explicitly-excluded-behavior>"]"#));
         assert!(prompt.contains(r#""preserved_literals":["<exact-source-literal>"]"#));
         assert!(prompt.contains(
@@ -1001,6 +1914,10 @@ mod tests {
         assert!(prompt.contains("S = focused/local; M = bounded coherent work"));
         assert!(prompt.contains("Use at most 5 Grep/Glob calls and 10 Read calls"));
         assert!(prompt.contains("labels, tags, messages, identifiers"));
+        assert!(prompt.contains(&format!(
+            "Every PLAN task's `source_constraints` must include this worker-facing guidance: \"{WORKER_WRITABILITY_GUIDANCE}\""
+        )));
+        assert!(prompt.contains("The daemon adds it deterministically"));
     }
 
     #[test]
@@ -1013,6 +1930,7 @@ mod tests {
             implementation_delta: "change one routing seam".into(),
             affected_paths: vec!["src/routing.rs".into()],
             observable_outcome: "routing works".into(),
+            deliverables: writable_deliverables("src/routing.rs"),
             acceptance_criteria: vec!["covered".into()],
             source_constraints: vec!["preserve literals".into()],
             verification_expectations: vec!["tests pass".into()],
@@ -1032,6 +1950,7 @@ mod tests {
             implementation_delta: "add focused routing verification".into(),
             affected_paths: vec!["tests/routing.rs".into()],
             observable_outcome: "routing verification works".into(),
+            deliverables: writable_deliverables("tests/routing.rs"),
             acceptance_criteria: vec!["verification is covered".into()],
             source_constraints: vec!["preserve literals".into()],
             verification_expectations: vec!["tests pass".into()],
@@ -1039,16 +1958,15 @@ mod tests {
             preserved_literals: vec![],
             prerequisites: vec!["routing".into()],
         };
-        assert!(validate_for_source(
+        assert!(validate_source_literals(
             &[proposed.clone(), companion.clone()],
-            &[],
             title,
-            Some(source)
+            Some(source),
         )
         .is_ok());
         proposed.preserved_literals[3] = "merge ready".into();
         assert!(matches!(
-            validate_for_source(&[proposed, companion], &[], title, Some(source)),
+            validate_source_literals(&[proposed, companion], title, Some(source)),
             Err(PlannerParseError::Semantic(message))
                 if message.contains("match source bytes exactly")
         ));
@@ -1070,6 +1988,7 @@ mod tests {
             implementation_delta: "change one routing seam".into(),
             affected_paths: vec!["src/routing.rs".into()],
             observable_outcome: "routing works".into(),
+            deliverables: writable_deliverables("src/routing.rs"),
             acceptance_criteria: vec!["covered".into()],
             source_constraints: vec!["preserve behavior".into()],
             verification_expectations: vec!["tests pass".into()],
@@ -1083,6 +2002,7 @@ mod tests {
             implementation_delta: "add focused routing verification".into(),
             affected_paths: vec!["tests/routing.rs".into()],
             observable_outcome: "routing verification works".into(),
+            deliverables: writable_deliverables("tests/routing.rs"),
             acceptance_criteria: vec!["verification is covered".into()],
             source_constraints: vec!["preserve behavior".into()],
             verification_expectations: vec!["tests pass".into()],
@@ -1096,11 +2016,10 @@ mod tests {
             format!("Keep this fenced literal exactly:\n```\n{literal}\n```"),
         ] {
             assert!(required_source_literals(&source).is_empty());
-            assert!(validate_for_source(
+            assert!(validate_source_literals(
                 &[proposed.clone(), companion.clone()],
-                &[],
                 "source",
-                Some(&source)
+                Some(&source),
             )
             .is_ok());
         }
@@ -1130,7 +2049,7 @@ mod tests {
         let PlannerResponse::Plan { tasks } = parse_response(&plan.to_string()).unwrap() else {
             panic!("plan response expected");
         };
-        assert!(validate_for_source(&tasks, &[], "source", Some(&source)).is_ok());
+        assert!(validate_source_literals(&tasks, "source", Some(&source)).is_ok());
     }
 
     #[test]
@@ -1161,6 +2080,30 @@ mod tests {
         )));
         assert!(prompt
             .contains("On retry, use only those summaries to correct the cited semantic defect"));
+    }
+
+    #[test]
+    fn worker_writability_guidance_is_added_without_trusting_the_planner() {
+        let constraints = vec!["preserve atomicity".into()];
+        let with_guidance = with_worker_writability_guidance(&constraints);
+        assert_eq!(with_guidance.len(), 2);
+        assert_eq!(with_guidance[0], "preserve atomicity");
+        assert_eq!(with_guidance[1], WORKER_WRITABILITY_GUIDANCE);
+
+        let mut maximum_with_guidance: Vec<String> = (0..MAX_LIST_ITEMS - 1)
+            .map(|index| format!("constraint {index}"))
+            .collect();
+        maximum_with_guidance.push(WORKER_WRITABILITY_GUIDANCE.into());
+        assert_eq!(
+            with_worker_writability_guidance(&maximum_with_guidance),
+            maximum_with_guidance
+        );
+
+        let already_present = vec![WORKER_WRITABILITY_GUIDANCE.into()];
+        assert_eq!(
+            with_worker_writability_guidance(&already_present),
+            already_present
+        );
     }
 
     #[test]

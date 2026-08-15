@@ -61,6 +61,15 @@ pub struct CiRemediationIntent {
     pub attempts: i64,
 }
 
+/// Exact daemon-verified publication authority settled with a worker event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedWorkerPublication {
+    pub pr: i64,
+    pub source_sha: String,
+    pub head_ref: String,
+    pub expected_remote_sha: Option<String>,
+}
+
 pub fn ci_remediation_intent(refs: Option<&str>) -> Result<Option<CiRemediationIntent>> {
     let Some(raw) = refs else {
         return Ok(None);
@@ -302,6 +311,34 @@ const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
     )
 ))";
 
+// Generated implementation work has additional graph authority. This exact
+// predicate is used both by daemon-side candidate selection and by the
+// authoritative claim transaction so the two paths cannot drift.
+const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
+    SELECT 1 FROM task_graph_members own_member
+    WHERE own_member.task_id=tasks.id
+) OR EXISTS (
+    SELECT 1
+    FROM task_graph_members own_member
+    JOIN task_decompositions graph ON graph.id=own_member.graph_id
+    JOIN tasks source ON source.id=graph.source_task_id
+    WHERE own_member.task_id=tasks.id AND own_member.active=1
+      AND graph.state='active' AND graph.active=1
+      AND source.status='decomposed'
+      AND NOT EXISTS (
+          SELECT 1 FROM task_graph_members sibling_member
+          JOIN tasks sibling ON sibling.id=sibling_member.task_id
+          WHERE sibling_member.graph_id=own_member.graph_id
+            AND sibling_member.active=1 AND sibling.status='failed'
+      )
+      AND 2 > (
+          SELECT COUNT(*) FROM task_graph_members sibling_member
+          JOIN tasks sibling ON sibling.id=sibling_member.task_id
+          WHERE sibling_member.graph_id=own_member.graph_id
+            AND sibling_member.active=1 AND sibling.status='working'
+      )
+))";
+
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
         id: r.get(0)?,
@@ -528,6 +565,25 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
     Ok(unmet == 0)
 }
 
+/// Count tasks that have already started but not yet reached a terminal
+/// state, excluding one task id (the planning source itself, which sits in
+/// `planning` while draining and is not "started work" for this predicate).
+///
+/// Used by the decomposition drain-readiness gate: draining must wait for
+/// every already-started task to run through review/rework/remediation/merge
+/// to `done`/`failed`/`cancelled` before capturing the frozen base and
+/// entering `planning`. `open` tasks never started; the freeze blocks new
+/// claims, so the counted set can only shrink under drain.
+pub fn count_started_non_terminal_excluding(conn: &Connection, exclude_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM tasks
+         WHERE status IN ('working','in-review','rework')
+           AND id != ?1",
+        params![exclude_id],
+        |r| r.get(0),
+    )?)
+}
+
 fn merge_pr_into_refs(existing: &Option<String>, pr: &str) -> String {
     let pr_val: serde_json::Value = pr
         .parse::<i64>()
@@ -734,6 +790,14 @@ pub fn claim(
                AND (json_extract(owner.refs, '$.pr') = tasks.continue_pr
                     OR json_extract(owner.refs, '$.pr') = CAST(tasks.continue_pr AS TEXT))))
     ))";
+    // The decomposition freeze blocks only NEW implementation starts, so this
+    // clause is applied to the status='open' branch alone. Existing in-flight
+    // work — reviewer attachment (status='in-review') here, plus rework and
+    // remediation in claim_provider_retry_rework / claim_remediation_rework —
+    // must still complete under the freeze, because the freeze's drain
+    // predicate waits for workers==0 && reviewers==0 before capturing the
+    // frozen base. Gating continuation on the freeze would deadlock it against
+    // its own drain.
     const NO_PLANNING_FREEZE_CLAUSE: &str = "NOT EXISTS (
         SELECT 1 FROM task_decompositions WHERE freeze_active=1
     )";
@@ -745,35 +809,10 @@ pub fn claim(
         AND NOT (json_extract(refs, '$.cx_est')=5
                  AND json_extract(refs, '$.cx_size')='L')
     ))";
-    // Generated implementation work has additional graph authority. Keep this
-    // predicate in the same BEGIN IMMEDIATE transaction as the task update so
-    // sibling claims, failures, and graph blockers cannot race provisioning.
+    // Keep graph authority in this BEGIN IMMEDIATE transaction so sibling
+    // claims, failures, and graph blockers cannot race provisioning.
     // Review/rework authority for an already-started child is intentionally not
     // gated: active children may finish after a sibling fails or blocks the graph.
-    const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
-        SELECT 1 FROM task_graph_members own_member
-        WHERE own_member.task_id=tasks.id
-    ) OR EXISTS (
-        SELECT 1
-        FROM task_graph_members own_member
-        JOIN task_decompositions graph ON graph.id=own_member.graph_id
-        JOIN tasks source ON source.id=graph.source_task_id
-        WHERE own_member.task_id=tasks.id AND own_member.active=1
-          AND graph.state='active' AND graph.active=1
-          AND source.status='decomposed'
-          AND NOT EXISTS (
-              SELECT 1 FROM task_graph_members sibling_member
-              JOIN tasks sibling ON sibling.id=sibling_member.task_id
-              WHERE sibling_member.graph_id=own_member.graph_id
-                AND sibling_member.active=1 AND sibling.status='failed'
-          )
-          AND 2 > (
-              SELECT COUNT(*) FROM task_graph_members sibling_member
-              JOIN tasks sibling ON sibling.id=sibling_member.task_id
-              WHERE sibling_member.graph_id=own_member.graph_id
-                AND sibling_member.active=1 AND sibling.status='working'
-          )
-    ))";
 
     let mut task = match task_id {
         Some(id) => tx
@@ -786,7 +825,6 @@ pub fn claim(
                         reviewer = CASE WHEN status='in-review' THEN ?1 ELSE reviewer END,
                         updated_at = ?2
                      WHERE id = ?3
-                       AND {NO_PLANNING_FREEZE_CLAUSE}
                        AND json_valid(refs)
                        AND json_type(refs, '$.cx_est')='integer'
                        AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
@@ -797,7 +835,8 @@ pub fn claim(
                        AND json_type(refs, '$.cx_not_ready_reason')='null'
                        AND {CONTINUE_PR_UNOWNED_CLAUSE}
                        AND (
-                         (status='open' AND {DEP_READY_CLAUSE}
+                         (status='open' AND {NO_PLANNING_FREEZE_CLAUSE}
+                            AND {DEP_READY_CLAUSE}
                             AND {GRAPH_IMPLEMENTATION_READY_CLAUSE})
                          OR (status='in-review' AND reviewer IS NULL \
                              AND (author IS NULL OR author != ?1))
@@ -812,7 +851,6 @@ pub fn claim(
             let mut selector = format!(
                 "SELECT id FROM tasks
                  WHERE json_valid(refs)
-                   AND {NO_PLANNING_FREEZE_CLAUSE}
                    AND json_type(refs, '$.cx_est')='integer'
                    AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                    AND json_type(refs, '$.cx_size')='text'
@@ -822,7 +860,8 @@ pub fn claim(
                    AND json_type(refs, '$.cx_not_ready_reason')='null'
                    AND {CONTINUE_PR_UNOWNED_CLAUSE}
                    AND (
-                    (status='open' AND {DEP_READY_CLAUSE}
+                    (status='open' AND {NO_PLANNING_FREEZE_CLAUSE}
+                       AND {DEP_READY_CLAUSE}
                        AND {GRAPH_IMPLEMENTATION_READY_CLAUSE})
                     OR (status='in-review' AND reviewer IS NULL \
                         AND (author IS NULL OR author != ?1))
@@ -913,7 +952,6 @@ pub fn claim_provider_retry_rework(
             "UPDATE tasks SET assignee=?1, updated_at=?2
          WHERE id=?3 AND status='rework' AND assignee IS NULL
            AND {DEP_READY_CLAUSE}
-           AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)
            AND CASE WHEN json_valid(refs) THEN
                json_type(refs, '$.cx_est')='integer'
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
@@ -1023,10 +1061,7 @@ pub fn claim_remediation_rework_with_feedback(
 
     let status: Option<String> = tx
         .query_row(
-            &format!(
-                "SELECT status FROM tasks WHERE id=?1 AND {DEP_READY_CLAUSE}
-                 AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)"
-            ),
+            &format!("SELECT status FROM tasks WHERE id=?1 AND {DEP_READY_CLAUSE}"),
             params![id],
             |r| r.get(0),
         )
@@ -1112,9 +1147,21 @@ pub fn claim_remediation_rework_with_feedback(
     Ok(Some(task))
 }
 
-/// Atomically reserve reviewer provisioning authority against the repository
-/// planning freeze. The daemon must release the opaque token after either
-/// attaching the reviewer or cleaning up a failed external provision.
+/// Atomically reserve reviewer provisioning authority. The daemon must release
+/// the opaque token after either attaching the reviewer or cleaning up a failed
+/// external provision.
+///
+/// This deliberately does NOT gate on the repository decomposition freeze. A
+/// freeze blocks only a new open-status worker start (see `claim`, where the
+/// freeze clause sits inside the status='open' branch); existing in-flight
+/// continuation — reviewer attachment, rework, and remediation — must still
+/// complete. An already-published PR still needs its reviewer to finish. The
+/// freeze's
+/// quiescence contract is enforced by `decomposition_drain_ready`, which waits
+/// for workers==0 && reviewers==0 before capturing the frozen base — a state
+/// only reachable if in-flight reviews are allowed to run. Gating reservation
+/// on the freeze would strand a retained worker awaiting review and deadlock the
+/// freeze against its own drain.
 pub fn reserve_reviewer_provision(
     conn: &mut Connection,
     task_id: i64,
@@ -1149,7 +1196,6 @@ pub fn reserve_reviewer_provision(
                ))
                AND json_type(t.refs,'$.cx_ready')='true'
                AND json_type(t.refs,'$.cx_not_ready_reason')='null'
-               AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)
                AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations WHERE task_id=t.id)
          )",
         params![task_id, role],
@@ -1193,6 +1239,31 @@ pub fn clear_reviewer_provision_reservations(conn: &mut Connection) -> Result<us
     let changed = tx.execute("DELETE FROM reviewer_provision_reservations", [])?;
     tx.commit()?;
     Ok(changed)
+}
+
+/// Daemon-private: check whether `agent` still holds an active, unexpired task
+/// lease on `task#<id>`. Used by the final worker teardown to guard the
+/// name-pool release: while the lease is live, the identity is still authoritative
+/// and must not be recycled. Idempotent read; returns `false` once the lease has
+/// been deactivated (released/transferred) or expired.
+pub fn worker_lease_active_for(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let target = lease_target(id);
+    let active = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM claims
+              WHERE target=?1 AND holder=?2 AND active=1 AND expires_at > ?3
+         )",
+        params![target, agent, now],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(active)
 }
 
 /// Daemon-private: revalidate that a remediation worker still owns the exact
@@ -1309,18 +1380,101 @@ pub fn apply_published_worker_event(
     agent: &str,
     id: i64,
     event: &Event,
+    publication: &PublishedWorkerPublication,
     now: i64,
 ) -> Result<TransitionResult> {
     let tx = begin_immediate(conn)?;
     apply_event_tx(tx, agent, id, event, now, |tx| {
-        tx.execute(
-            "UPDATE tasks
-             SET refs=json_remove(COALESCE(refs, '{}'), '$.daemon_publication')
-             WHERE id=?1",
-            params![id],
-        )?;
-        Ok(())
+        settle_published_worker_tx(tx, id, publication, now)
     })
+}
+
+fn settle_published_worker_tx(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    publication: &PublishedWorkerPublication,
+    now: i64,
+) -> Result<()> {
+    if publication.pr <= 0
+        || publication.source_sha.is_empty()
+        || publication.head_ref.is_empty()
+        || publication
+            .expected_remote_sha
+            .as_deref()
+            .is_some_and(str::is_empty)
+    {
+        return Err(QuorumError::BadInput(
+            "published worker settlement requires a valid PR, source SHA, head ref, and lease baseline"
+                .into(),
+        ));
+    }
+
+    let recorded = tx
+        .query_row(
+            "SELECT json_extract(refs, '$.daemon_publication.pr'),
+                    json_extract(refs, '$.daemon_publication.local_sha'),
+                    json_extract(refs, '$.daemon_publication.branch'),
+                    json_extract(refs, '$.daemon_publication.expected_remote_sha'),
+                    json_extract(refs, '$.daemon_publication.stage')
+             FROM tasks WHERE id=?1",
+            params![task_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let expected_intent = (
+        Some(publication.pr),
+        Some(publication.source_sha.clone()),
+        Some(publication.head_ref.clone()),
+        publication.expected_remote_sha.clone(),
+        Some("verified".to_string()),
+    );
+    if recorded.as_ref() != Some(&expected_intent) {
+        return Err(QuorumError::Io(format!(
+            "published worker settlement for task #{task_id} no longer matches its verified publication intent"
+        )));
+    }
+
+    if let Some(prior_sha) = publication.expected_remote_sha.as_deref() {
+        let rotated = tx.execute(
+            "UPDATE pr_targets
+             SET head_sha=?4, resolved_at=?6
+             WHERE task_id=?1 AND pr_number=?2 AND head_ref=?3 AND is_fork=0
+               AND (head_sha=?5 OR head_sha=?4)",
+            params![
+                task_id,
+                publication.pr,
+                publication.head_ref,
+                publication.source_sha,
+                prior_sha,
+                now,
+            ],
+        )?;
+        if rotated != 1 {
+            return Err(QuorumError::Io(format!(
+                "published PR #{} target authority changed before settlement: expected {} or already-published {} on {}",
+                publication.pr,
+                prior_sha,
+                publication.source_sha,
+                publication.head_ref,
+            )));
+        }
+    }
+
+    tx.execute(
+        "UPDATE tasks
+         SET refs=json_remove(COALESCE(refs, '{}'), '$.daemon_publication')
+         WHERE id=?1",
+        params![task_id],
+    )?;
+    Ok(())
 }
 
 /// Atomically enter rework for failed pre-review CI and persist the exact
@@ -1489,6 +1643,7 @@ pub fn recover_late_worker_completion(
     agent: &str,
     task_id: i64,
     pr: i64,
+    publication: Option<&PublishedWorkerPublication>,
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
@@ -1524,12 +1679,16 @@ pub fn recover_late_worker_completion(
         Event::SignaledDone { pr: pr.to_string() }
     };
     apply_event_tx(tx, agent, task_id, &event, now, |tx| {
-        tx.execute(
-            "UPDATE tasks
-             SET refs=json_remove(COALESCE(refs, '{}'), '$.daemon_publication')
-             WHERE id=?1",
-            params![task_id],
-        )?;
+        if let Some(publication) = publication {
+            settle_published_worker_tx(tx, task_id, publication, now)?;
+        } else {
+            tx.execute(
+                "UPDATE tasks
+                 SET refs=json_remove(COALESCE(refs, '{}'), '$.daemon_publication')
+                 WHERE id=?1",
+                params![task_id],
+            )?;
+        }
         consume_late_mailbox(tx, mailbox_id, now)
     })
     .map(|_| true)
@@ -3043,6 +3202,7 @@ pub fn park(
     )?;
     crate::events::emit(&tx, "task_parked", &lease_target(id), reason, now)?;
     alert_owner_of_park(&tx, id, reason, now)?;
+    crate::decomposition::block_graph_if_child_failed(&tx, id, reason, now)?;
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -3148,6 +3308,25 @@ pub fn retry_parked(
         params![id],
         |row| row.get(0),
     )?;
+    // Non-growth under a decomposition freeze: restoring a parked task to a
+    // non-terminal status while `freeze_active=1` would add started work to
+    // the drain-quiescence set that the frozen-base capture waits on. Refuse
+    // the restore; the operator can rerun once planning materializes and the
+    // freeze clears. The policy-parked branch keeps status='failed', so it
+    // does not grow the counted set and is allowed under a freeze.
+    if !policy_parked {
+        let freeze_active: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM task_decompositions WHERE freeze_active=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if freeze_active > 0 {
+            return Err(QuorumError::Usage(format!(
+                "cannot retry task #{id}: a decomposition freeze is active; \
+                 wait for planning to materialize before retrying"
+            )));
+        }
+    }
     if policy_parked {
         // Retry of a policy park is a request to estimate remaining work.  Keep
         // the durable park/resume context but make it a classifier candidate.
@@ -3560,6 +3739,27 @@ pub fn list(
     Ok(tasks)
 }
 
+/// List open implementation candidates whose dependencies and decomposition
+/// authority currently permit a claim. The claim transaction repeats these
+/// predicates authoritatively; this read prevents stable graph holds from
+/// becoming a repeated select/claim-reject loop.
+pub fn list_implementation_ready_open(conn: &Connection) -> Result<Vec<Task>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM tasks
+         WHERE status='open'
+           AND {DEP_READY_CLAUSE}
+           AND {GRAPH_IMPLEMENTATION_READY_CLAUSE}
+         ORDER BY priority DESC, id ASC"
+    ))?;
+    let mut tasks: Vec<Task> = stmt
+        .query_map([], row_to_task)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for task in &mut tasks {
+        task.ready = true;
+    }
+    Ok(tasks)
+}
+
 /// List rework tasks whose dependencies satisfy the same SQL eligibility
 /// predicate used by remediation claims. Durable remediation reconciliation
 /// uses this read before provisioning so dependency-blocked retries retain
@@ -3935,10 +4135,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(
-            recover_late_worker_completion(&mut c, mailbox_id, "worker", task_id, 42, 1001)
-                .unwrap()
-        );
+        assert!(recover_late_worker_completion(
+            &mut c, mailbox_id, "worker", task_id, 42, None, 1001
+        )
+        .unwrap());
         assert_eq!(get(&c, task_id).unwrap().unwrap().status, "in-review");
         assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 0);
         let events: i64 = c
@@ -4005,6 +4205,7 @@ mod tests {
             "replacement",
             task_id,
             42,
+            None,
             1004
         )
         .unwrap());
@@ -8238,6 +8439,173 @@ mod tests {
     }
 
     #[test]
+    fn daemon_push_rejection_park_blocks_parent_graph() {
+        let (_dir, mut conn) = open_tmp();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('parent','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph = crate::decomposition::begin_planning(
+            &mut conn,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(crate::decomposition::set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            2
+        )
+        .unwrap());
+        let child = |key: &str| {
+            crate::decomposition::PlannedChild {
+            local_key: key.into(),
+            title: key.into(),
+            body: format!("deliver {key}"),
+            labels: None,
+            classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+            prerequisite_keys: vec![],
+            source_dependency_ids: vec![],
+        }
+        };
+        let ids = crate::decomposition::materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a"), child("b")],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        let reason = "daemon-owned push rejected: non-fast-forward";
+
+        park(&mut conn, ids[0], reason, "open", 10)
+            .unwrap()
+            .expect("child must park");
+
+        let (state, hold_code, hold_summary): (String, String, String) = conn
+            .query_row(
+                "SELECT state,hold_code,hold_summary
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "blocked");
+        assert_eq!(hold_code, "generated-child-failed");
+        assert!(hold_summary.contains(&format!("#{}", ids[0])));
+        assert!(hold_summary.contains(reason));
+
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='task_graph_blocked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+
+        let graph_alert: String = conn
+            .query_row(
+                "SELECT body FROM messages
+                 WHERE kind='alert' AND recipient='owner'
+                   AND body LIKE '%task graph blocked%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("graph-blocked alert must exist");
+        assert!(graph_alert.contains("task graph blocked"));
+        assert!(graph_alert.contains(reason));
+    }
+
+    #[test]
+    fn daemon_push_rejection_park_skips_graph_block_with_retry_marker() {
+        let (_dir, mut conn) = open_tmp();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('parent','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph = crate::decomposition::begin_planning(
+            &mut conn,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(crate::decomposition::set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            2
+        )
+        .unwrap());
+        let child = |key: &str| {
+            crate::decomposition::PlannedChild {
+            local_key: key.into(),
+            title: key.into(),
+            body: format!("deliver {key}"),
+            labels: None,
+            classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+            prerequisite_keys: vec![],
+            source_dependency_ids: vec![],
+        }
+        };
+        let ids = crate::decomposition::materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a"), child("b")],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            rusqlite::params![ids[0], r#"{"runner_retry":{"requested":true}}"#,],
+        )
+        .unwrap();
+        let reason = "daemon-owned push rejected: non-fast-forward";
+
+        park(&mut conn, ids[0], reason, "open", 10)
+            .unwrap()
+            .expect("child must park");
+
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM task_decompositions WHERE id=?1",
+                [graph],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state, "active",
+            "graph stays active when retry marker present"
+        );
+    }
+
+    #[test]
     fn parked_rework_retry_becomes_claimable_by_replacement_worker() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create(
@@ -9072,6 +9440,54 @@ mod tests {
     }
 
     #[test]
+    fn two_selected_implementation_claimants_have_one_clean_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let (dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn, "boss", "selected", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        assert_eq!(
+            list_implementation_ready_open(&conn)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            [id]
+        );
+        drop(conn);
+
+        let path = dir.path().join("q.db");
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["worker-a", "worker-b"]
+            .into_iter()
+            .map(|agent| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    claim(&mut conn, agent, Some(id), &[], TTL, 1001)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|task| task.is_some()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|task| task.is_none()).count(), 1);
+
+        let conn = crate::db::open(&path).unwrap();
+        assert_eq!(get(&conn, id).unwrap().unwrap().status, "working");
+        let err_count: i64 = conn
+            .query_row("SELECT count(*) FROM errors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(err_count, 0, "lost claim race must stay a clean negative");
+    }
+
+    #[test]
     fn remediation_claim_fails_if_task_not_in_rework() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
@@ -9572,7 +9988,8 @@ mod tests {
     }
 
     #[test]
-    fn review_only_atomic_authority_still_requires_complete_ready_classification_and_no_freeze() {
+    fn review_provision_requires_complete_ready_classification_but_runs_under_decomposition_freeze()
+    {
         let (_d, mut c) = open_tmp();
         let incomplete = create(
             &mut c,
@@ -9673,12 +10090,22 @@ mod tests {
         .unwrap()
         .expect("planning source must acquire the freeze");
 
-        assert!(!reserve_reviewer_provision(&mut c, frozen_review, "frozen", "r1", 1023,).unwrap());
+        // Deadlock regression: an in-flight PR's reviewer MUST still provision
+        // under an active decomposition freeze. The freeze's drain predicate
+        // (decomposition_drain_ready) waits for reviewers==0; blocking this
+        // reservation would strand the retained worker awaiting review and the
+        // freeze would never drain to capture its frozen base.
+        assert!(reserve_reviewer_provision(&mut c, frozen_review, "frozen", "r1", 1023,).unwrap());
+        // Attaching that reviewer to the in-review PR is likewise allowed under
+        // the freeze — reviewer attachment is in-flight continuation.
         assert!(
             claim(&mut c, "frozen", Some(frozen_review), &[], TTL, 1024,)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
+        // Existing rework/remediation, by contrast, MUST finish under the freeze
+        // (same deadlock class as review): the retained worker's rework turn is
+        // in-flight work the drain waits on, not a new start.
         c.execute(
             "UPDATE tasks SET status='rework',assignee=NULL WHERE id=?1",
             [frozen_review],
@@ -9687,7 +10114,7 @@ mod tests {
         assert!(
             claim_remediation_rework(&mut c, "frozen", frozen_review, TTL, 1025)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
 
         let reservations: i64 = c
@@ -9702,8 +10129,11 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(reservations, 0);
-        assert_eq!(claims, 0);
+        // Reviewer reservation and the remediation claim both landed under the
+        // freeze — the two continuation paths that let the freeze drain. The
+        // only thing the freeze blocked was the new open-status worker start.
+        assert_eq!(reservations, 1);
+        assert_eq!(claims, 1);
     }
 
     #[test]
@@ -10067,7 +10497,7 @@ mod tests {
     }
 
     #[test]
-    fn planning_freeze_atomically_blocks_all_new_task_authority() {
+    fn planning_freeze_blocks_new_open_claims_but_allows_existing_continuation() {
         let (_dir, mut c) = open_tmp();
         let source = create(&mut c, "owner", "large", None, 1, None,
             Some(r#"{"cx_est":4,"cx_size":"XL","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
@@ -10078,6 +10508,9 @@ mod tests {
         let review = create_with_continue_pr(&mut c, "owner", "review", None, 1, None,
             Some(r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
             None, Some(42), None, 1).unwrap();
+        let remediation = create(&mut c, "owner", "small2", None, 1, None,
+            Some(r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None, None, 1).unwrap();
         crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
@@ -10092,12 +10525,21 @@ mod tests {
         .unwrap()
         .unwrap();
 
+        // A new open-status worker start stays blocked under the freeze — no
+        // new implementation work begins while draining.
         assert!(claim(&mut c, "worker", Some(implementation), &[], 60, 3)
             .unwrap()
             .is_none());
+        // But reviewer attachment to an existing in-review PR is allowed: review
+        // continuation is in-flight work the drain waits on, not a new start.
         assert!(claim(&mut c, "reviewer", Some(review), &[], 60, 3)
             .unwrap()
-            .is_none());
+            .is_some());
+
+        // Existing rework/remediation MUST still complete under the freeze:
+        // these are in-flight continuations the drain predicate waits on
+        // (workers==0 && reviewers==0). Blocking them would deadlock the freeze
+        // against its own drain — the incident this regression guards.
         c.execute(
             "UPDATE tasks SET status='rework',assignee=NULL,
             refs=json_set(refs,'$.daemon_rework_retry_requested',json('true')) WHERE id=?1",
@@ -10107,12 +10549,183 @@ mod tests {
         assert!(
             claim_provider_retry_rework(&mut c, "retry", implementation, 60, 4)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
+        c.execute(
+            "UPDATE tasks SET status='rework',assignee=NULL WHERE id=?1",
+            [remediation],
+        )
+        .unwrap();
         assert!(
-            claim_remediation_rework(&mut c, "remediation", implementation, 60, 4)
+            claim_remediation_rework(&mut c, "remediation", remediation, 60, 4)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
+    }
+
+    #[test]
+    fn worker_lease_active_for_flags_live_claim() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+
+        assert!(
+            worker_lease_active_for(&mut c, "W1", id, 1001).unwrap(),
+            "live worker lease must block name-pool release"
+        );
+        // Idempotent: same-holder repeat check does not change state.
+        assert!(worker_lease_active_for(&mut c, "W1", id, 1002).unwrap());
+    }
+
+    #[test]
+    fn worker_lease_active_for_rejects_different_holder() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+
+        // A retired worker name (W2) never held this lease; the guard must not
+        // treat a sibling holder's claim as a reason to retain a different name.
+        assert!(!worker_lease_active_for(&mut c, "W2", id, 1001).unwrap());
+    }
+
+    #[test]
+    fn worker_lease_active_for_ignores_expired_and_deactivated() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], 100, 1000).unwrap();
+        // Past expiry.
+        assert!(!worker_lease_active_for(&mut c, "W1", id, 2000).unwrap());
+
+        let id2 = create(&mut c, "boss", "u", None, 0, None, None, None, None, 3000).unwrap();
+        claim(&mut c, "W2", Some(id2), &[], TTL, 3000).unwrap();
+        // Terminal handoff would deactivate the lease.
+        c.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND holder=?2",
+            params![lease_target(id2), "W2"],
+        )
+        .unwrap();
+        assert!(!worker_lease_active_for(&mut c, "W2", id2, 3001).unwrap());
+    }
+
+    #[test]
+    fn worker_lease_active_for_missing_claim_is_false() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        // No claim was ever taken (e.g., worker died before insert).
+        assert!(!worker_lease_active_for(&mut c, "W1", id, 1001).unwrap());
+    }
+
+    #[test]
+    fn count_started_non_terminal_excludes_source_open_and_terminals() {
+        let (_d, mut c) = open_tmp();
+        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
+        let working = create(&mut c, "boss", "w", None, 0, None, None, None, None, 1000).unwrap();
+        let in_review = create(&mut c, "boss", "r", None, 0, None, None, None, None, 1000).unwrap();
+        let rework = create(&mut c, "boss", "k", None, 0, None, None, None, None, 1000).unwrap();
+        let open_task = create(&mut c, "boss", "o", None, 0, None, None, None, None, 1000).unwrap();
+        let merging = create(&mut c, "boss", "m", None, 0, None, None, None, None, 1000).unwrap();
+        let done = create(&mut c, "boss", "d", None, 0, None, None, None, None, 1000).unwrap();
+        let failed = create(&mut c, "boss", "f", None, 0, None, None, None, None, 1000).unwrap();
+        let cancelled = create(&mut c, "boss", "x", None, 0, None, None, None, None, 1000).unwrap();
+
+        for (id, status) in [
+            (working, "working"),
+            (in_review, "in-review"),
+            (rework, "rework"),
+            (merging, "merging"),
+            (done, "done"),
+            (failed, "failed"),
+            (cancelled, "cancelled"),
+        ] {
+            c.execute(
+                "UPDATE tasks SET status=?2 WHERE id=?1",
+                params![id, status],
+            )
+            .unwrap();
+        }
+
+        // working+in-review+rework block; source, open, merging, and terminals do not.
+        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 3);
+
+        // Excluding an actual started task drops its count.
+        assert_eq!(
+            count_started_non_terminal_excluding(&c, in_review).unwrap(),
+            2
+        );
+
+        // Move the last blocker to done → predicate releases (returns 0).
+        for id in [working, rework] {
+            c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![id])
+                .unwrap();
+        }
+        c.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            params![in_review],
+        )
+        .unwrap();
+        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 0);
+
+        let _ = open_task; // silence "unused" — open row also present in DB
+    }
+
+    #[test]
+    fn retry_parked_refuses_under_a_decomposition_freeze() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        // Park the task with a non-terminal resume status so restoration would
+        // grow the drain-quiescence set.
+        c.execute(
+            "UPDATE tasks SET status='failed',refs=json_set(
+                json_object(
+                    'cx_est',2,'cx_size','S','cx_ready',true,
+                    'cx_not_ready_reason',NULL,'cx_by','test:v2'
+                ),
+                '$.daemon_parked', json('true'),
+                '$.daemon_parked_reason','test',
+                '$.daemon_resume_status','in-review'
+             ) WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+
+        // No freeze: retry restores to in-review.
+        let restored = retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("parked task restored when no freeze");
+        assert_eq!(restored.status, "in-review");
+
+        // Re-park then start a freeze; retry must fail Usage.
+        c.execute(
+            "UPDATE tasks SET status='failed',refs=json_set(
+                refs,
+                '$.daemon_parked', json('true'),
+                '$.daemon_resume_status','in-review'
+             ) WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,1000,1000)",
+            params![source],
+        )
+        .unwrap();
+        let err = retry_parked(&mut c, id, "operator", true, 1002).unwrap_err();
+        match err {
+            QuorumError::Usage(msg) => {
+                assert!(msg.contains("decomposition freeze"), "unexpected: {msg}")
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        // Task stays failed — non-growth invariant preserved.
+        let status: String = c
+            .query_row("SELECT status FROM tasks WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "failed");
     }
 }

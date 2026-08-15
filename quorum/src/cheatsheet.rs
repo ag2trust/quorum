@@ -35,6 +35,8 @@ OPERATOR
   quorum log --refs task#N        Read lifecycle events for a task.
   quorum tail <agent>             Read a managed session log.
   quorum kill --help              Terminate a stuck managed agent.
+  quorum decomposition-adopt-recovery --help
+                                  Adopt one exact proven continuation delivery.
 
 MESSAGES
   `post`/`read` are agent-authored feed messages. `log` is the system lifecycle event

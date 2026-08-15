@@ -127,6 +127,7 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
             )?;
             crate::events::emit(conn, "task_parked", &target, &park_reason, now)?;
             crate::tasks::alert_owner_of_park(conn, *id, &park_reason, now)?;
+            crate::decomposition::block_graph_if_child_failed(conn, *id, &park_reason, now)?;
             continue;
         }
         // Only implementation tasks reach here: review_only tasks are never
@@ -482,6 +483,7 @@ fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
              WHERE id=?4",
             params![reason, resume_status, now, task_id],
         )?;
+        crate::decomposition::block_graph_if_child_failed(conn, *task_id, &reason, now)?;
         conn.execute(
             "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
             params![target],
@@ -586,6 +588,69 @@ mod tests {
         )
         .unwrap();
         crate::tasks::claim(c, agent, Some(task_id), &[], ttl, now).unwrap();
+    }
+
+    fn active_graph_rework_child(c: &mut Connection, refs: Option<&str>) -> (i64, i64) {
+        let source = crate::tasks::create(
+            c,
+            "owner",
+            "decomposition source",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let graph = crate::decomposition::begin_planning(
+            c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 1000,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(crate::decomposition::set_frozen_phase(
+            c,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            1000,
+        )
+        .unwrap());
+        let children = ["a", "b"].map(|key| crate::decomposition::PlannedChild {
+            local_key: key.into(),
+            title: format!("child {key}"),
+            body: format!("deliver {key}"),
+            labels: None,
+            classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+            prerequisite_keys: vec![],
+            source_dependency_ids: vec![],
+        });
+        let child = crate::decomposition::materialize_graph(c, graph, 1, &children, 1000)
+            .unwrap()
+            .unwrap()[0];
+        c.execute(
+            "UPDATE tasks SET status='rework',review_only=1,assignee='W1',reviewer='R1',refs=?2,
+                    updated_at=1000 WHERE id=?1",
+            params![child, refs],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+             VALUES (?1,'W1',1000,1050,1)",
+            params![format!("task#{child}")],
+        )
+        .unwrap();
+        (graph, child)
     }
 
     #[test]
@@ -1041,6 +1106,161 @@ mod tests {
             "park alert uses the default message TTL"
         );
         assert_eq!(alert.5, "owner");
+    }
+
+    fn active_graph_with_dependency_park_child(
+        c: &mut Connection,
+        child_refs: Option<&str>,
+    ) -> (i64, i64, i64) {
+        let source =
+            crate::tasks::create(c, "owner", "source", None, 0, None, None, None, None, 100)
+                .unwrap();
+        c.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        let dependency = crate::tasks::create(
+            c,
+            "owner",
+            "failed dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let child = crate::tasks::create(
+            c,
+            "owner",
+            "generated child",
+            None,
+            0,
+            None,
+            child_refs,
+            Some(&format!("[{dependency}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        let sibling = crate::tasks::create(
+            c,
+            "owner",
+            "generated sibling",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,created_at,updated_at)
+             VALUES (?1,'active',1,0,1,1,1,100,100)",
+            [source],
+        )
+        .unwrap();
+        let graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'child',1,1),(?1,?3,'sibling',1,1)",
+            params![graph, child, sibling],
+        )
+        .unwrap();
+        (graph, child, dependency)
+    }
+
+    #[test]
+    fn dependency_park_blocks_active_generated_child_graph_in_same_transaction() {
+        let (_d, mut c) = open_tmp();
+        let (graph, child, dependency) = active_graph_with_dependency_park_child(&mut c, None);
+        c.execute(
+            "UPDATE tasks SET status='failed',updated_at=200 WHERE id=?1",
+            [dependency],
+        )
+        .unwrap();
+
+        assert_eq!(cascade_dead_deps(&c, 300, SWEEP_LIMIT).unwrap(), 1);
+
+        let reason = format!("dependency #{dependency} is terminal-not-done");
+        let aggregate: (String, String, String, i64) = c
+            .query_row(
+                "SELECT state,hold_code,hold_summary,updated_at
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(aggregate.0, "blocked");
+        assert_eq!(aggregate.1, "generated-child-failed");
+        assert!(aggregate.2.contains(&format!("task #{child}")));
+        assert!(aggregate.2.contains(&reason));
+        assert_eq!(aggregate.3, 300);
+        let event: (String, String, String) = c
+            .query_row(
+                "SELECT kind,subject,body FROM events WHERE kind='task_graph_blocked'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(event.0, "task_graph_blocked");
+        assert_eq!(event.1, format!("task#{child}"));
+        assert!(event.2.contains(&reason));
+        let graph_alerts: i64 = c
+            .query_row(
+                "SELECT count(*) FROM messages
+                 WHERE author='daemon' AND kind='alert' AND recipient='owner'
+                   AND refs=?1 AND body LIKE '%task graph blocked%'",
+                [format!("task:{child}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(graph_alerts, 1);
+    }
+
+    #[test]
+    fn dependency_park_with_active_retry_keeps_generated_child_graph_active() {
+        for refs in [
+            r#"{"runner_retry":{"requested":true}}"#,
+            r#"{"codex_retry_requested":true}"#,
+        ] {
+            let (_d, mut c) = open_tmp();
+            let (graph, child, dependency) =
+                active_graph_with_dependency_park_child(&mut c, Some(refs));
+            c.execute(
+                "UPDATE tasks SET status='rework',updated_at=200 WHERE id=?1",
+                [child],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='failed',updated_at=200 WHERE id=?1",
+                [dependency],
+            )
+            .unwrap();
+
+            assert_eq!(cascade_dead_deps(&c, 300, SWEEP_LIMIT).unwrap(), 1);
+
+            let state: (String, Option<String>, Option<String>) = c
+                .query_row(
+                    "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("active".into(), None, None));
+            let transitions: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM events WHERE kind='task_graph_blocked'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(transitions, 0);
+        }
     }
 
     #[test]
@@ -1521,6 +1741,80 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.status, "rework");
         assert_eq!(resumed.rework_round, 2);
+    }
+
+    #[test]
+    fn reaper_park_blocks_active_graph_with_failed_child_and_alert() {
+        let (_d, mut c) = open_tmp();
+        let (graph, child) = active_graph_rework_child(&mut c, None);
+
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+
+        let graph_state: (String, i64, String, String) = c
+            .query_row(
+                "SELECT state,active,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            graph_state,
+            (
+                "blocked".into(),
+                1,
+                "generated-child-failed".into(),
+                format!("generated child task #{child} failed: remediation lease lapsed"),
+            )
+        );
+        let graph_event: (String, String) = c
+            .query_row(
+                "SELECT subject,body FROM events WHERE kind='task_graph_blocked'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(graph_event.0, format!("task#{child}"));
+        assert!(graph_event.1.contains(&format!("task #{child}")));
+        let alerts: i64 = c
+            .query_row(
+                "SELECT count(*) FROM messages WHERE kind='alert' AND recipient='owner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(alerts >= 1, "blocked graph must leave an owner alert");
+    }
+
+    #[test]
+    fn reaper_park_does_not_block_graph_when_child_has_active_retry_marker() {
+        let (_d, mut c) = open_tmp();
+        let (graph, child) =
+            active_graph_rework_child(&mut c, Some(r#"{"runner_retry":{"requested":true}}"#));
+
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+
+        assert_eq!(
+            crate::tasks::get(&c, child).unwrap().unwrap().status,
+            "failed",
+            "the child is parked before its retry marker suppresses graph blocking"
+        );
+
+        let graph_state: (String, Option<String>, Option<String>) = c
+            .query_row(
+                "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(graph_state, ("active".into(), None, None));
+        let graph_events: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_graph_blocked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(graph_events, 0);
     }
 
     #[test]

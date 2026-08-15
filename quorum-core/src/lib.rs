@@ -44,6 +44,7 @@ pub mod review_followup_writes;
 pub mod review_followups;
 pub mod review_interpret_jobs;
 pub mod role_assignments;
+pub mod routing_attempts;
 pub mod runner_state;
 pub mod stats;
 pub mod sweep;

@@ -2,7 +2,8 @@
 
 use super::runner::{
     capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
-    CapturedOutput, DiagnosticBuffer, LaunchMode, LaunchRequest, NormalizedLine, TokenUsage,
+    CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation, FailureTracker,
+    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
 };
 use super::stream::{self, Event};
 use std::path::PathBuf;
@@ -37,6 +38,7 @@ pub struct AgentProc {
     reader: BufReader<tokio::process::ChildStdout>,
     line_buffer: Vec<u8>,
     diagnostics: DiagnosticBuffer,
+    failures: FailureTracker,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -127,6 +129,176 @@ impl AgentProc {
         NormalizedLine {
             events: event.map(normalize_event).unwrap_or_default(),
             terminal_text,
+        }
+    }
+
+    pub(super) fn failure_observation(raw: &str) -> FailureObservation {
+        if raw.is_empty() {
+            return FailureObservation::inert();
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return FailureObservation::classified(
+                FailureDisposition::NonFailover,
+                "Claude emitted malformed stream-json",
+            );
+        };
+        match value.get("type").and_then(|kind| kind.as_str()) {
+            Some("assistant") => {
+                let error = value.get("error").and_then(|error| error.as_str());
+                match error {
+                    Some("authentication_failed" | "billing_error" | "credit_balance_too_low") => {
+                        FailureObservation::classified(
+                            FailureDisposition::ProviderUnavailable,
+                            format!(
+                                "Claude structured provider error: {}",
+                                error.expect("matched Some")
+                            ),
+                        )
+                    }
+                    Some("rate_limit") if claude_quota_text(&claude_assistant_text(&value)) => {
+                        FailureObservation::classified(
+                            FailureDisposition::ProviderUnavailable,
+                            "Claude reported an account/session quota limit",
+                        )
+                    }
+                    Some("rate_limit") => FailureObservation::unknown_failure(
+                        "Claude rate limit did not prove account/session quota",
+                    ),
+                    Some("model_not_found" | "invalid_model" | "model_unavailable") => {
+                        FailureObservation::classified(
+                            FailureDisposition::ProfileUnavailable,
+                            format!(
+                                "Claude structured model error: {}",
+                                error.expect("matched Some")
+                            ),
+                        )
+                    }
+                    Some("overloaded_error") => FailureObservation::classified(
+                        FailureDisposition::ProviderUnavailable,
+                        "Claude reported provider overload",
+                    ),
+                    Some("connection_error") => FailureObservation::classified(
+                        FailureDisposition::RetryableSameRoute,
+                        "Claude reported a connection error",
+                    ),
+                    Some(other)
+                        if value.get("is_api_error_message").and_then(|v| v.as_bool())
+                            == Some(true) =>
+                    {
+                        FailureObservation::unknown_failure(format!(
+                            "Claude emitted unclassified API error code {other}"
+                        ))
+                    }
+                    _ => FailureObservation::inert(),
+                }
+            }
+            Some("rate_limit_event")
+                if value
+                    .pointer("/rate_limit_info/status")
+                    .and_then(|v| v.as_str())
+                    == Some("rejected") =>
+            {
+                FailureObservation::classified(
+                    FailureDisposition::ProviderUnavailable,
+                    "Claude rejected the request at the account quota boundary",
+                )
+            }
+            Some("result") if value.get("is_error").and_then(|v| v.as_bool()) == Some(true) => {
+                let status = value.get("api_error_status").and_then(|v| v.as_u64());
+                let result = value.get("result").and_then(|v| v.as_str()).unwrap_or("");
+                if status == Some(429) && claude_quota_text(result) {
+                    return FailureObservation::classified(
+                        FailureDisposition::ProviderUnavailable,
+                        "Claude returned API status 429 with account/session quota evidence",
+                    );
+                }
+                if status == Some(429) {
+                    return FailureObservation::unknown_failure(
+                        "Claude API status 429 did not prove account/session quota",
+                    );
+                }
+                if matches!(status, Some(500 | 502 | 503 | 529)) {
+                    return FailureObservation::classified(
+                        FailureDisposition::ProviderUnavailable,
+                        format!(
+                            "Claude provider outage status {}",
+                            status.expect("matched Some")
+                        ),
+                    );
+                }
+                if status == Some(404) && claude_model_unavailable_text(result) {
+                    return FailureObservation::classified(
+                        FailureDisposition::ProfileUnavailable,
+                        "Claude reported the selected model unavailable",
+                    );
+                }
+                if claude_auth_text(result) {
+                    return FailureObservation::classified(
+                        FailureDisposition::ProviderUnavailable,
+                        "Claude reported missing authentication",
+                    );
+                }
+                FailureObservation::unknown_failure(
+                    "Claude terminal error did not match a bounded provider signal",
+                )
+            }
+            Some("result") => FailureObservation::success(),
+            _ => FailureObservation::inert(),
+        }
+    }
+
+    pub(super) fn stderr_failure_observation(text: &str) -> FailureObservation {
+        if text.len() > 16 * 1024 {
+            return FailureObservation::unknown_failure(
+                "Claude stderr exceeded classification bound",
+            );
+        }
+        if text == "Invalid session ID. Must be a valid UUID."
+            || text.starts_with("error: unexpected argument")
+            || text.starts_with("error: invalid value")
+            || text.starts_with("error: unrecognized option")
+        {
+            return FailureObservation::classified(
+                FailureDisposition::NonFailover,
+                "Claude rejected the execution protocol or arguments",
+            );
+        }
+        if text.is_empty() {
+            FailureObservation::inert()
+        } else {
+            FailureObservation::unknown_failure(
+                "Claude stderr did not match a bounded provider signal",
+            )
+        }
+    }
+
+    pub fn classify_pre_authoritative_exit(
+        &self,
+        status: std::process::ExitStatus,
+    ) -> Option<RunnerFailure> {
+        self.failures.classify_exit(status)
+    }
+
+    pub fn observed_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
+        self.failures.observed_failure()
+    }
+
+    pub(super) fn failure_tracker(&self) -> FailureTracker {
+        self.failures.clone()
+    }
+
+    pub(super) async fn finish_stderr_until(&mut self, deadline: tokio::time::Instant) -> bool {
+        let Some(mut task) = self.stderr_task.take() else {
+            return true;
+        };
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                false
+            }
         }
     }
 
@@ -226,7 +398,8 @@ impl AgentProc {
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
-        let diagnostics = DiagnosticBuffer::default();
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Claude);
+        let failures = diagnostics.failures();
         let stderr_diagnostics = diagnostics.clone();
         let stderr_task =
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
@@ -237,11 +410,13 @@ impl AgentProc {
             reader,
             line_buffer: Vec::new(),
             diagnostics,
+            failures,
             stderr_task: Some(stderr_task),
         })
     }
 
     pub async fn feed_turn(&mut self, json_turn: &str) -> std::io::Result<()> {
+        self.failures.begin_turn();
         self.stdin.write_all(json_turn.as_bytes()).await?;
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
@@ -315,12 +490,19 @@ impl AgentProc {
             self.line_buffer.pop();
         }
         let bytes = std::mem::take(&mut self.line_buffer);
-        String::from_utf8(bytes).map(Some).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("provider stdout is not UTF-8: {error}"),
-            )
-        })
+        String::from_utf8(bytes)
+            .map(|line| {
+                self.failures.observe_stdout(&line);
+                Some(line)
+            })
+            .map_err(|error| {
+                self.failures
+                    .observe_protocol_read_error(format!("Claude stdout is not UTF-8: {error}"));
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("provider stdout is not UTF-8: {error}"),
+                )
+            })
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
@@ -358,13 +540,15 @@ impl AgentProc {
         stdin: tokio::process::ChildStdin,
         reader: BufReader<tokio::process::ChildStdout>,
     ) -> Self {
-        let diagnostics = DiagnosticBuffer::default();
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Claude);
+        let failures = diagnostics.failures();
         Self {
             child,
             stdin,
             reader,
             line_buffer: Vec::new(),
             diagnostics,
+            failures,
             stderr_task: None,
         }
     }
@@ -382,12 +566,64 @@ impl AgentProc {
             terminal.push(CapturedOutput::Stdout(line));
         }
         let diagnostics = self.diagnostics.clone();
-        if let Some(stderr_task) = self.stderr_task {
+        if let Some(stderr_task) = self.stderr_task.take() {
             let _ = stderr_task.await;
         }
         terminal.extend(diagnostics.drain());
         terminal
     }
+}
+
+fn claude_auth_text(text: &str) -> bool {
+    text.len() <= 4096
+        && (text == "Not logged in · Please run /login"
+            || text == "Not logged in. Please run /login")
+}
+
+fn claude_assistant_text(value: &serde_json::Value) -> String {
+    let Some(content) = value.pointer("/message/content").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let mut text = String::new();
+    for fragment in content
+        .iter()
+        .filter_map(|item| item.get("text").and_then(|value| value.as_str()))
+    {
+        let separator = usize::from(!text.is_empty());
+        if text
+            .len()
+            .saturating_add(separator)
+            .saturating_add(fragment.len())
+            > 4096
+        {
+            return String::new();
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(fragment);
+    }
+    text
+}
+
+fn claude_quota_text(text: &str) -> bool {
+    if text.is_empty() || text.len() > 4096 {
+        return false;
+    }
+    let text = text.to_ascii_lowercase();
+    text.contains("session limit")
+        || text.contains("account quota")
+        || text.contains("credit balance is too low")
+        || text.contains("billing hard limit")
+        || text.contains("spend limit")
+}
+
+fn claude_model_unavailable_text(text: &str) -> bool {
+    text.len() <= 4096
+        && text.contains("model")
+        && (text.contains("not found")
+            || text.contains("does not exist")
+            || text.contains("not available"))
 }
 
 fn line_limit_error(limit: usize) -> std::io::Error {
@@ -521,7 +757,8 @@ mod tests {
         let stdin = child.stdin.take().unwrap();
         let reader = BufReader::new(child.stdout.take().unwrap());
         let stderr = BufReader::new(child.stderr.take().unwrap());
-        let diagnostics = DiagnosticBuffer::default();
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Claude);
+        let failures = diagnostics.failures();
         let stderr_diagnostics = diagnostics.clone();
         let stderr_task =
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
@@ -531,6 +768,7 @@ mod tests {
             reader,
             line_buffer: Vec::new(),
             diagnostics,
+            failures,
             stderr_task: Some(stderr_task),
         }
     }
@@ -779,6 +1017,118 @@ mod tests {
         assert_eq!(parsed["message"]["content"], "hello world");
     }
 
+    #[test]
+    fn real_claude_quota_and_auth_fixtures_are_provider_wide() {
+        // Captured from Claude Code 2.1.229 at the real stream-json boundary.
+        let quota = r#"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"You've hit your session limit"}]},"error":"rate_limit","is_api_error_message":true}"#;
+        let auth = r#"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"Not logged in · Please run /login"}]},"error":"authentication_failed","is_api_error_message":true}"#;
+        for fixture in [quota, auth] {
+            assert_eq!(
+                AgentProc::failure_observation(fixture).disposition,
+                Some(FailureDisposition::ProviderUnavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn claude_http_429_requires_account_or_session_quota_evidence() {
+        let quota = r#"{"type":"result","result":"You've hit your session limit","is_error":true,"api_error_status":429}"#;
+        assert_eq!(
+            AgentProc::failure_observation(quota).disposition,
+            Some(FailureDisposition::ProviderUnavailable)
+        );
+
+        for transient in [
+            r#"{"type":"result","result":"upstream rate limit exceeded","is_error":true,"api_error_status":429}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"upstream rate limit exceeded"}]},"error":"rate_limit","is_api_error_message":true}"#,
+        ] {
+            let observation = AgentProc::failure_observation(transient);
+            assert_eq!(observation.disposition, None);
+            assert!(observation.unknown_failure);
+        }
+    }
+
+    #[test]
+    fn claude_model_fixture_is_profile_scoped_and_unknown_is_fail_safe() {
+        let model = r#"{"type":"assistant","message":{"model":"<synthetic>"},"error":"model_not_found","is_api_error_message":true}"#;
+        assert_eq!(
+            AgentProc::failure_observation(model).disposition,
+            Some(FailureDisposition::ProfileUnavailable)
+        );
+
+        let unknown = r#"{"type":"assistant","message":{"content":"future failure"},"error":"future_provider_code","is_api_error_message":true}"#;
+        let observation = AgentProc::failure_observation(unknown);
+        assert!(observation.disposition.is_none());
+        assert!(observation.unknown_failure);
+    }
+
+    #[test]
+    fn claude_semantic_text_never_enters_provider_taxonomy() {
+        for text in [
+            "cargo test failed; I will fix the compilation error",
+            "I reported failed through quorum react",
+            "I reported blocked through quorum react",
+            "I reported needs-info through quorum react",
+            "BLOCKING review finding: the state transition is unsafe",
+        ] {
+            let line = serde_json::json!({
+                "type": "assistant",
+                "message": {"content": text}
+            })
+            .to_string();
+            let observation = AgentProc::failure_observation(&line);
+            assert_eq!(observation, FailureObservation::inert(), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_quota_is_available_before_persistent_child_exit() {
+        let mut proc = shell_proc(
+            "printf '%s\\n' \
+             '{\"type\":\"assistant\",\"message\":{\"model\":\"<synthetic>\"},\"error\":\"rate_limit\",\"is_api_error_message\":true}' \
+             '{\"type\":\"result\",\"result\":\"session limit\",\"is_error\":true,\"api_error_status\":429}'; \
+             exec sleep 30",
+        )
+        .await;
+        let _ = proc.next_raw_line().await;
+        let _ = proc.next_raw_line().await;
+        assert_eq!(
+            proc.observed_pre_authoritative_failure()
+                .unwrap()
+                .disposition(),
+            FailureDisposition::ProviderUnavailable
+        );
+        proc.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn persistent_claude_tracker_is_scoped_to_each_managed_turn() {
+        let mut proc = shell_proc(
+            "IFS= read -r first; \
+             printf '%s\\n' '{\"type\":\"result\",\"result\":\"submitted\",\"is_error\":false}'; \
+             IFS= read -r second; \
+             printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Not logged in · Please run /login\"}]},\"error\":\"authentication_failed\",\"is_api_error_message\":true}'; \
+             exec sleep 30",
+        )
+        .await;
+
+        proc.feed_turn(&user_turn("initial work")).await.unwrap();
+        let _ = proc.next_raw_line().await.unwrap();
+        assert!(proc.observed_pre_authoritative_failure().is_none());
+
+        proc.feed_turn(&user_turn("review requested changes"))
+            .await
+            .unwrap();
+        let _ = proc.next_raw_line().await.unwrap();
+        assert_eq!(
+            proc.observed_pre_authoritative_failure()
+                .unwrap()
+                .disposition(),
+            FailureDisposition::ProviderUnavailable
+        );
+        proc.kill_and_reap().await;
+    }
+
     #[tokio::test]
     async fn claude_boundary_bounds_stderr_drains_terminal_output_and_reaps() {
         // 17618 bytes must stay above runner::DIAGNOSTIC_LINE_BYTES (16384) and 306
@@ -792,8 +1142,8 @@ mod tests {
             "printf '\\377invalid\\n' >&2; \
              head -c 17618 /dev/zero | tr '\\000' x >&2; echo >&2; \
              i=0; while [ $i -lt 306 ]; do echo claude-stderr-$i >&2; i=$((i+1)); done; \
-             echo '{\"type\":\"provider.ready\"}'; \
-             echo '{\"type\":\"result\",\"result\":\"trailing\"}'; \
+             printf '%s\\n%s\\n' '{\"type\":\"provider.ready\"}' \
+               '{\"type\":\"result\",\"result\":\"trailing\"}'; \
              exec sleep 30",
         )
         .await;

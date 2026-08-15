@@ -20,6 +20,7 @@ pub mod names;
 pub mod planner;
 pub mod recovery;
 pub mod render;
+pub mod review_cycle_context;
 pub mod reviewer;
 pub mod runner;
 pub mod session_log;
@@ -34,7 +35,9 @@ use quorum_core::journal::{self, JournalEntry};
 use quorum_core::lifecycle::{self, Effect, Event};
 use quorum_core::mailbox;
 use quorum_core::pr_targets;
-use quorum_core::runner_state::{self, ContinuationIdentity, ContinuationSlot, PendingTurn};
+use quorum_core::runner_state::{
+    self, ContinuationIdentity, ContinuationSlot, InitialWorkerSession, PendingTurn,
+};
 use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
 use rusqlite::OptionalExtension;
@@ -49,6 +52,49 @@ fn load_graph_review_context(db_path: &Path, task_id: i64) -> Result<Option<Stri
     quorum_core::decomposition_review::load(&conn, task_id)?
         .map(|context| context.to_bounded_json())
         .transpose()
+}
+
+const REVIEW_TASK_BODY_LIMIT: i64 = 16_000;
+const REVIEW_TASK_NOTE_LIMIT: i64 = 4;
+const REVIEW_TASK_NOTE_BODY_LIMIT: i64 = 1_200;
+
+fn load_task_review_contract(db_path: &Path, task_id: i64) -> Result<String> {
+    let conn = quorum_core::db::open(db_path)?;
+    let (title, body, depends_on): (String, Option<String>, Option<String>) = conn.query_row(
+        "SELECT title, substr(body, 1, ?2), depends_on FROM tasks WHERE id=?1",
+        rusqlite::params![task_id, REVIEW_TASK_BODY_LIMIT],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT substr(body, 1, ?2) FROM task_notes
+         WHERE task_id=?1 ORDER BY id DESC LIMIT ?3",
+    )?;
+    let recovery_notes = stmt
+        .query_map(
+            rusqlite::params![task_id, REVIEW_TASK_NOTE_BODY_LIMIT, REVIEW_TASK_NOTE_LIMIT],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(reviewer::task_review_contract(
+        task_id,
+        &title,
+        body.as_deref(),
+        depends_on.as_deref(),
+        &recovery_notes,
+    ))
+}
+
+fn load_review_cycle_context(
+    db_path: &Path,
+    task_id: i64,
+) -> Result<review_cycle_context::ReviewCycleContext> {
+    let conn = quorum_core::db::open(db_path)?;
+    let rework_round = conn.query_row(
+        "SELECT rework_round FROM tasks WHERE id=?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    Ok(review_cycle_context::ReviewCycleContext::from_persisted_rework_round(rework_round))
 }
 
 fn prepare_reviewer_authority(
@@ -71,6 +117,10 @@ const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 const MAX_CI_REMEDIATION_PROVISION_STRIKES: i64 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
+/// Limit per-slot stream work so one noisy provider cannot starve other slots.
+const MAX_STREAM_LINES_PER_TICK: usize = 64;
+const CLAIM_SKIP_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const CLAIM_SKIP_LOG_CAPACITY: usize = 64;
 const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLICATION_GH_PIPE_LIMIT: usize = 1024 * 1024;
 const SELF_UPDATE_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -236,6 +286,10 @@ struct PoisonTracker {
     strikes: HashMap<i64, u32>,
 }
 
+struct ClaimSkipLogLimiter {
+    logged: VecDeque<(i64, std::time::Instant)>,
+}
+
 enum PreReviewChecksState {
     Waiting(tokio::task::JoinHandle<merge::ChecksOutcome>),
     Retry,
@@ -284,6 +338,28 @@ impl PoisonTracker {
     #[cfg(test)]
     fn strikes(&self, task_id: i64) -> u32 {
         self.strikes.get(&task_id).copied().unwrap_or(0)
+    }
+}
+
+impl ClaimSkipLogLimiter {
+    fn new() -> Self {
+        Self {
+            logged: VecDeque::new(),
+        }
+    }
+
+    fn should_log(&mut self, task_id: i64, now: std::time::Instant) -> bool {
+        if let Some(index) = self.logged.iter().position(|(id, _)| *id == task_id) {
+            if now.saturating_duration_since(self.logged[index].1) < CLAIM_SKIP_LOG_INTERVAL {
+                return false;
+            }
+            self.logged.remove(index);
+        }
+        if self.logged.len() == CLAIM_SKIP_LOG_CAPACITY {
+            self.logged.pop_front();
+        }
+        self.logged.push_back((task_id, now));
+        true
     }
 }
 
@@ -692,19 +768,6 @@ fn parse_pr_target(pr: i64, stdout: &[u8]) -> Option<PrTarget> {
     })
 }
 
-fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<PrTarget> {
-    let args = pr_target_args(pr, gh_repo);
-    let output = std::process::Command::new("gh")
-        .args(&args)
-        .current_dir(repo_dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_pr_target(pr, &output.stdout)
-}
-
 /// Run one publication-owned GitHub command with cancellation-safe process
 /// ownership. A timeout explicitly kills and reaps the child; kill-on-drop
 /// covers daemon shutdown or future cancellation while the command is live.
@@ -961,10 +1024,15 @@ struct PublicationIntent {
     expected_remote_sha: Option<String>,
 }
 
-#[derive(Debug)]
-struct PublishedCompletion {
-    pr: i64,
-    source_sha: String,
+type PublishedCompletion = tasks::PublishedWorkerPublication;
+
+fn published_completion(intent: PublicationIntent, pr: i64) -> PublishedCompletion {
+    PublishedCompletion {
+        pr,
+        source_sha: intent.local_sha,
+        head_ref: intent.branch,
+        expected_remote_sha: intent.expected_remote_sha,
+    }
 }
 
 async fn persist_publication_intent(
@@ -1351,20 +1419,14 @@ async fn publish_worker_completion(
         if validate_pr_created_retry_target(&intent, &target, &config.base_branch)? {
             intent.stage = "verified".into();
             persist_publication_intent(&config.db_path, task_id, &intent).await?;
-            return Ok(PublishedCompletion {
-                pr,
-                source_sha: intent.local_sha,
-            });
+            return Ok(published_completion(intent, pr));
         }
         let Some(expected_remote_sha) =
             existing_pr_lease_baseline(&intent, &target, &config.base_branch)?
         else {
             intent.stage = "verified".into();
             persist_publication_intent(&config.db_path, task_id, &intent).await?;
-            return Ok(PublishedCompletion {
-                pr,
-                source_sha: intent.local_sha,
-            });
+            return Ok(published_completion(intent, pr));
         };
         wt_mgr
             .push_to_pr_head(
@@ -1378,10 +1440,7 @@ async fn publish_worker_completion(
         intent.stage = "verified".into();
         intent.branch = target.head_ref;
         persist_publication_intent(&config.db_path, task_id, &intent).await?;
-        return Ok(PublishedCompletion {
-            pr,
-            source_sha: intent.local_sha,
-        });
+        return Ok(published_completion(intent, pr));
     }
 
     let pushed_sha = wt_mgr
@@ -1412,10 +1471,7 @@ async fn publish_worker_completion(
     validate_initial_pr_target(&target, branch, &pushed_sha, &config.base_branch)?;
     intent.stage = "verified".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
-    Ok(PublishedCompletion {
-        pr,
-        source_sha: intent.local_sha,
-    })
+    Ok(published_completion(intent, pr))
 }
 
 fn log(msg: &str) {
@@ -1492,38 +1548,216 @@ fn orphan_worker_branch(author: &str, task_id: i64, review_only: bool) -> Option
     }
 }
 
-/// Resolve PR target from GitHub, persist on success, fall back to
-/// persisted target when GitHub is unavailable.
-fn resolve_or_load_pr_target(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewerPrTargetSource {
+    Live,
+    Persisted,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedReviewerPrTarget {
+    target: PrTarget,
+    source: ReviewerPrTargetSource,
+}
+
+/// Resolve reviewer metadata without granting it durable authority. GitHub is
+/// queried through the bounded publication runner; an unavailable live target
+/// may only fall back to the task's previously accepted durable tuple.
+async fn resolve_or_load_reviewer_pr_target(
     pr: i64,
     task_id: i64,
     db_path: &Path,
     repo_dir: &Path,
     gh_repo: Option<&str>,
-) -> Option<PrTarget> {
-    if let Some(target) = resolve_pr_target(pr, repo_dir, gh_repo) {
-        if let Ok(mut conn) = quorum_core::db::open(db_path) {
-            let _ = pr_targets::upsert(
-                &mut conn,
-                task_id,
-                target.pr,
-                &target.head_ref,
-                &target.head_sha,
-                target.is_fork,
-            );
+) -> Result<Option<ResolvedReviewerPrTarget>> {
+    match resolve_publication_pr_target(pr, repo_dir, gh_repo).await {
+        Ok(target) => Ok(Some(ResolvedReviewerPrTarget {
+            target,
+            source: ReviewerPrTargetSource::Live,
+        })),
+        Err(error) => {
+            log(&format!(
+                "reviewer: live PR #{pr} target unavailable ({error}); trying accepted durable target"
+            ));
+            let path = db_path.to_path_buf();
+            tokio::task::spawn_blocking(move || -> Result<Option<ResolvedReviewerPrTarget>> {
+                let conn = quorum_core::db::open(&path)?;
+                let Some(stored) = pr_targets::get(&conn, task_id, pr)? else {
+                    return Ok(None);
+                };
+                Ok(Some(ResolvedReviewerPrTarget {
+                    target: PrTarget {
+                        pr: stored.pr_number,
+                        head_ref: stored.head_ref,
+                        head_sha: stored.head_sha,
+                        is_fork: stored.is_fork,
+                        base_ref: None,
+                        state: None,
+                    },
+                    source: ReviewerPrTargetSource::Persisted,
+                }))
+            })
+            .await
+            .map_err(|join_error| {
+                QuorumError::Io(format!(
+                    "reviewer persisted PR target read join for task #{task_id}: {join_error}"
+                ))
+            })?
         }
-        return Some(target);
     }
-    let conn = quorum_core::db::open(db_path).ok()?;
-    let stored = pr_targets::get(&conn, task_id, pr).ok()??;
-    Some(PrTarget {
-        pr: stored.pr_number,
-        head_ref: stored.head_ref,
-        head_sha: stored.head_sha,
-        is_fork: stored.is_fork,
-        base_ref: None,
-        state: None,
-    })
+}
+
+fn validate_reviewer_pr_target(
+    resolved: &ResolvedReviewerPrTarget,
+    expected_pr: i64,
+    gated_head_sha: &str,
+    base_branch: &str,
+) -> std::result::Result<(), String> {
+    let target = &resolved.target;
+    if target.pr != expected_pr {
+        return Err(format!(
+            "PR identity changed: expected #{expected_pr}, got #{}",
+            target.pr
+        ));
+    }
+    if target.head_sha != gated_head_sha {
+        return Err(format!(
+            "PR #{expected_pr} resolved target moved after CI gate (gated {gated_head_sha}, current {})",
+            target.head_sha
+        ));
+    }
+    if resolved.source == ReviewerPrTargetSource::Live {
+        if target.state.as_deref() != Some("OPEN") {
+            return Err(format!("PR #{expected_pr} is not open"));
+        }
+        if target.base_ref.as_deref() != Some(base_branch) {
+            return Err(format!(
+                "PR #{expected_pr} targets base {:?}, expected {base_branch}",
+                target.base_ref
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Persist one reviewer target only while the exact reservation still owns an
+/// eligible in-review task. Live resolution may advance the accepted head, but
+/// it may never rotate PR/ref/fork identity. Persisted fallback is read-only.
+fn persist_reviewer_pr_target(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    reservation: &str,
+    role: &str,
+    resolved: &ResolvedReviewerPrTarget,
+    gated_head_sha: &str,
+) -> Result<bool> {
+    if resolved.target.head_sha != gated_head_sha {
+        return Err(QuorumError::Usage(format!(
+            "reviewer target for task #{task_id} does not match gated head"
+        )));
+    }
+
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let reservation_active: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM reviewer_provision_reservations
+             WHERE task_id=?1 AND token=?2 AND role=?3
+         )",
+        rusqlite::params![task_id, reservation, role],
+        |row| row.get(0),
+    )?;
+    let Some(task) = tasks::get(&tx, task_id)? else {
+        tx.commit()?;
+        return Ok(false);
+    };
+    // A decomposition freeze deliberately does NOT block reviewer target
+    // persistence for an already-in-review PR: the reviewer is in-flight
+    // continuation the freeze's drain predicate waits on (workers==0 &&
+    // reviewers==0). Gating here would strand the reviewer and deadlock the
+    // freeze against its own drain — the same class as the reserve/claim gates.
+    if !reservation_active
+        || task.status != "in-review"
+        || !tasks::classification_is_dispatchable(&task.refs, task.review_only, task.continue_pr)
+    {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    let existing = tx
+        .query_row(
+            "SELECT pr_number,head_ref,head_sha,is_fork,resolved_at
+             FROM pr_targets WHERE task_id=?1",
+            [task_id],
+            |row| {
+                Ok(pr_targets::PersistedPrTarget {
+                    pr_number: row.get(0)?,
+                    head_ref: row.get(1)?,
+                    head_sha: row.get(2)?,
+                    is_fork: row.get::<_, i64>(3)? != 0,
+                    resolved_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+
+    if let Some(existing) = &existing {
+        if existing.pr_number != resolved.target.pr
+            || existing.head_ref != resolved.target.head_ref
+            || existing.is_fork != resolved.target.is_fork
+        {
+            return Err(QuorumError::Usage(format!(
+                "reviewer PR target identity changed for task #{task_id} (expected #{} {} fork={}, got #{} {} fork={})",
+                existing.pr_number,
+                existing.head_ref,
+                existing.is_fork,
+                resolved.target.pr,
+                resolved.target.head_ref,
+                resolved.target.is_fork,
+            )));
+        }
+    } else if resolved.source == ReviewerPrTargetSource::Persisted {
+        return Err(QuorumError::Usage(format!(
+            "reviewer durable target disappeared for task #{task_id}"
+        )));
+    }
+
+    if resolved.source == ReviewerPrTargetSource::Persisted {
+        if existing
+            .as_ref()
+            .is_none_or(|target| target.head_sha != gated_head_sha)
+        {
+            return Err(QuorumError::Usage(format!(
+                "reviewer durable target for task #{task_id} does not match gated head"
+            )));
+        }
+        tx.commit()?;
+        return Ok(true);
+    }
+
+    if !task.review_only && resolved.target.is_fork {
+        return Err(QuorumError::Usage(format!(
+            "reviewer PR #{} unexpectedly changed to a fork target",
+            resolved.target.pr
+        )));
+    }
+    tx.execute(
+        "INSERT INTO pr_targets
+           (task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+         VALUES (?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(task_id) DO UPDATE SET
+           head_sha=excluded.head_sha,
+           resolved_at=excluded.resolved_at",
+        rusqlite::params![
+            task_id,
+            resolved.target.pr,
+            resolved.target.head_ref,
+            resolved.target.head_sha,
+            resolved.target.is_fork as i64,
+            now_unix(),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Resolve a remediation PR through the bounded, kill-and-reap GitHub runner,
@@ -2417,7 +2651,7 @@ fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry
             .session_log
             .as_ref()
             .map(|l| l.dir().to_string_lossy().into()),
-        pid: slot.proc.pid(),
+        pid: slot.pid(),
         pr: slot.pr,
         rework_count: slot.rework_count as i32,
     }
@@ -2431,11 +2665,11 @@ pub struct CostLimits {
     pub max_task_tokens: Option<i64>,
     pub max_turn_cost_usd: Option<f64>,
     pub max_task_cost_usd: Option<f64>,
-    pub max_turn_wall_secs: Option<u64>,
+    /// Max seconds an active worker/reviewer may go without emitting an
+    /// event. Default: 900.
+    pub max_idle_secs: Option<u64>,
     pub max_task_wall_secs: Option<u64>,
-    /// Max seconds a worker/reviewer may sit idle between turns (draining=false)
-    /// before the watchdog kills it. Catches zombies that asked a question no one
-    /// can answer (e.g. permission denied in dontAsk mode). Default: 300.
+    /// Legacy idle limit retained for compatibility. Prefer max_idle_secs.
     pub idle_timeout_secs: Option<u64>,
 }
 
@@ -2500,6 +2734,9 @@ pub struct ServeConfig {
     pub r2_steady_state_p: f64,
     /// Codex sandbox mode (default: "danger-full-access").
     pub codex_sandbox: String,
+    /// Test-only override for the `gh` binary used by sticky remediation
+    /// baseline resolution. None → look up "gh" on PATH.
+    pub pr_target_program: Option<PathBuf>,
 }
 
 /// Supervisor handoff: a daemon which has drained for a self-update exits 75.
@@ -2626,9 +2863,128 @@ impl LiveStats {
     }
 }
 
+/// The runner transport currently attached to a worker slot.
+///
+/// Turn-oriented providers finish and exit after each turn. A sticky worker
+/// may therefore remain assigned while its provider process is dormant between
+/// turns, but only after receiving the provider-issued continuation identity
+/// needed to launch the next exact turn.
+enum SlotProcess {
+    Running(Box<runner::RunnerProc>),
+    Dormant {
+        kind: runner::AgentKind,
+        continuation_id: String,
+    },
+}
+
+impl SlotProcess {
+    fn running(proc: runner::RunnerProc) -> Self {
+        Self::Running(Box::new(proc))
+    }
+
+    fn dormant(kind: runner::AgentKind, continuation_id: Option<&str>) -> std::io::Result<Self> {
+        if kind.turn_mode() != runner::TurnMode::RespawnPerTurn {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{kind} cannot be dormant because it requires a persistent child"),
+            ));
+        }
+        let continuation_id = continuation_id.filter(|id| !id.is_empty()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("dormant {kind} slot is missing its exact persisted continuation"),
+            )
+        })?;
+        Ok(Self::Dormant {
+            kind,
+            continuation_id: continuation_id.to_owned(),
+        })
+    }
+
+    fn kind(&self) -> runner::AgentKind {
+        match self {
+            Self::Running(proc) => proc.kind(),
+            Self::Dormant { kind, .. } => *kind,
+        }
+    }
+
+    fn pid(&self) -> Option<i32> {
+        match self {
+            Self::Running(proc) => proc.pid(),
+            Self::Dormant { .. } => None,
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Running(proc) => proc.try_wait(),
+            Self::Dormant { .. } => Ok(None),
+        }
+    }
+
+    fn running_mut(&mut self) -> std::io::Result<&mut runner::RunnerProc> {
+        match self {
+            Self::Running(proc) => Ok(proc),
+            Self::Dormant {
+                kind,
+                continuation_id,
+            } => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "dormant {kind} slot ({continuation_id}) has no live process; launch a continuation turn first"
+                ),
+            )),
+        }
+    }
+
+    fn worker_request(&self) -> Option<&runner::WorkerTurnRequest> {
+        match self {
+            Self::Running(proc) => proc.worker_request(),
+            Self::Dormant { .. } => None,
+        }
+    }
+
+    fn continuation_id(&self) -> Option<&str> {
+        match self {
+            Self::Running(_) => None,
+            Self::Dormant {
+                continuation_id, ..
+            } => Some(continuation_id),
+        }
+    }
+
+    fn replace_with_launched_turn(
+        &mut self,
+        proc: runner::RunnerProc,
+    ) -> std::io::Result<Option<runner::RunnerProc>> {
+        let expected = self.kind();
+        if proc.kind() != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "launched {actual} turn cannot replace a {expected} slot",
+                    actual = proc.kind(),
+                ),
+            ));
+        }
+        let old = std::mem::replace(self, Self::Running(Box::new(proc)));
+        Ok(match old {
+            Self::Running(old) => Some(*old),
+            Self::Dormant { .. } => None,
+        })
+    }
+
+    async fn kill_and_reap(self) -> Vec<runner::CapturedOutput> {
+        match self {
+            Self::Running(proc) => proc.kill_and_reap().await,
+            Self::Dormant { .. } => Vec::new(),
+        }
+    }
+}
+
 pub(crate) struct SlotState {
     agent_name: String,
-    proc: runner::RunnerProc,
+    proc: SlotProcess,
     task_id: i64,
     session_id: String,
     /// Exact provider selection for this run. Continuations must never
@@ -2651,6 +3007,9 @@ pub(crate) struct SlotState {
     cost_usd: f64,
     task_started_at: std::time::Instant,
     turn_started_at: std::time::Instant,
+    /// Updated whenever the provider emits a normalized event for this slot.
+    /// The watchdog uses it to distinguish a live turn from a silent one.
+    last_event_at: std::time::Instant,
     /// Set when `draining` flips to false (turn completed). Used by the idle
     /// watchdog to detect zombies sitting between turns indefinitely.
     turn_ended_at: Option<std::time::Instant>,
@@ -2675,12 +3034,150 @@ pub(crate) struct SlotState {
     pending_turn_kind: String,
 }
 
+impl SlotState {
+    fn process_kind(&self) -> runner::AgentKind {
+        self.proc.kind()
+    }
+
+    fn pid(&self) -> Option<i32> {
+        self.proc.pid()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.proc.try_wait()
+    }
+
+    fn has_pending_grok_terminal_handoff(&self) -> bool {
+        self.draining
+            && self.continuation_id.is_none()
+            && matches!(
+                &self.proc,
+                SlotProcess::Running(proc) if proc.grok_terminal_candidate_pending()
+            )
+    }
+
+    fn classify_pre_authoritative_exit(
+        &self,
+        status: std::process::ExitStatus,
+    ) -> Option<runner::RunnerFailure> {
+        match &self.proc {
+            SlotProcess::Running(proc) => proc.classify_pre_authoritative_exit(status),
+            SlotProcess::Dormant { .. } => None,
+        }
+    }
+
+    fn observed_pre_authoritative_failure(&self) -> Option<runner::RunnerFailure> {
+        match &self.proc {
+            SlotProcess::Running(proc) => proc.observed_pre_authoritative_failure(),
+            SlotProcess::Dormant { .. } => None,
+        }
+    }
+
+    async fn finalize_pre_authoritative_exit_evidence(&mut self) {
+        let output = match &mut self.proc {
+            SlotProcess::Running(proc) => proc.finalize_pre_authoritative_evidence().await,
+            SlotProcess::Dormant { .. } => Vec::new(),
+        };
+        persist_terminal_output(&mut self.session_log, output);
+    }
+
+    fn live_process_mut(&mut self) -> std::io::Result<&mut runner::RunnerProc> {
+        self.proc.running_mut()
+    }
+
+    fn worker_request(&self) -> Option<&runner::WorkerTurnRequest> {
+        self.proc.worker_request()
+    }
+
+    fn continuation_id_for_launch(&self) -> Option<&str> {
+        self.proc
+            .continuation_id()
+            .or(self.continuation_id.as_deref())
+    }
+
+    /// Park a completed turn-oriented runner while retaining its sticky worker
+    /// slot. The caller owns reaping the returned completed process.
+    fn become_dormant(&mut self) -> std::io::Result<runner::RunnerProc> {
+        if matches!(&self.proc, SlotProcess::Dormant { .. }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot park an already dormant slot",
+            ));
+        }
+        let dormant = SlotProcess::dormant(self.process_kind(), self.continuation_id.as_deref())?;
+        let old = std::mem::replace(&mut self.proc, dormant);
+        match old {
+            SlotProcess::Running(proc) => Ok(*proc),
+            SlotProcess::Dormant { .. } => unreachable!("dormant slots returned above"),
+        }
+    }
+
+    /// Install the process launched for the next turn. A dormant slot has no
+    /// old process to reap; a running respawn-per-turn slot retains the
+    /// established replacement behavior until callers begin parking it.
+    fn replace_with_launched_turn(
+        &mut self,
+        proc: runner::RunnerProc,
+    ) -> std::io::Result<Option<runner::RunnerProc>> {
+        self.proc.replace_with_launched_turn(proc)
+    }
+
+    async fn kill_and_reap(self) -> Vec<runner::CapturedOutput> {
+        self.proc.kill_and_reap().await
+    }
+}
+
+#[derive(Debug)]
+enum WorkerExitObservation {
+    Running,
+    DeferredTerminalEvidence(std::process::ExitStatus),
+    Exited(std::process::ExitStatus),
+}
+
+fn observe_worker_exit_for_lifecycle(
+    worker: &mut SlotState,
+) -> std::io::Result<WorkerExitObservation> {
+    Ok(match worker.try_wait()? {
+        Some(status) if worker.has_pending_grok_terminal_handoff() => {
+            WorkerExitObservation::DeferredTerminalEvidence(status)
+        }
+        Some(status) => WorkerExitObservation::Exited(status),
+        None => WorkerExitObservation::Running,
+    })
+}
+
 fn worker_done_event(rework_count: u32, pr: i64) -> Event {
     if rework_count > 0 {
         Event::ReworkPushed
     } else {
         Event::SignaledDone { pr: pr.to_string() }
     }
+}
+
+/// Start another turn on a live worker after the daemon has moved its task to
+/// rework.  The PR belongs to the daemon for the lifetime of this worker: a
+/// rework turn must retain it both in memory and in the crash-recovery journal.
+async fn begin_sticky_worker_rework(slot: &mut SlotState, db_path: &Path) {
+    debug_assert!(
+        slot.pr.is_some(),
+        "a sticky rework worker must retain its daemon-owned PR"
+    );
+    slot.draining = true;
+    slot.rework_count += 1;
+    let now = std::time::Instant::now();
+    slot.turn_started_at = now;
+    slot.last_event_at = now;
+    if let Some(ref mut session_log) = slot.session_log {
+        session_log.log_rework(slot.rework_count);
+    }
+    let p = db_path.to_path_buf();
+    let entry = slot_journal_entry(slot, "worker", "working");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        journal::upsert(&mut conn, &entry)
+    })
+    .await
+    .ok();
 }
 
 /// Resolve a worker's publication target without granting the worker any PR
@@ -2718,8 +3215,11 @@ async fn recover_late_worker_done_atomic(
     mailbox_id: i64,
     row: &mailbox::MailboxRow,
     published_pr: Option<i64>,
+    publication: Option<PublishedCompletion>,
 ) -> Result<bool> {
-    let (Some(task_id), Some(pr)) = (row.task_id, published_pr.or(row.pr)) else {
+    let publication_pr = publication.as_ref().map(|publication| publication.pr);
+    let (Some(task_id), Some(pr)) = (row.task_id, publication_pr.or(published_pr).or(row.pr))
+    else {
         return Ok(false);
     };
     if row.kind != mailbox::MailboxKind::Done || row.verdict.is_some() {
@@ -2735,6 +3235,7 @@ async fn recover_late_worker_done_atomic(
             &agent,
             task_id,
             pr,
+            publication.as_ref(),
             now_unix(),
         )
     })
@@ -2753,7 +3254,7 @@ async fn recover_late_worker_done(db_path: &Path, row: &mailbox::MailboxRow) -> 
     })
     .await
     .map_err(|error| QuorumError::Io(format!("late worker test mailbox join: {error}")))??;
-    recover_late_worker_done_atomic(db_path, mailbox_id, &row, row.pr).await
+    recover_late_worker_done_atomic(db_path, mailbox_id, &row, row.pr, None).await
 }
 
 #[cfg(test)]
@@ -2771,7 +3272,7 @@ async fn fold_late_worker_done_after_publication(
     })
     .await
     .map_err(|error| QuorumError::Io(format!("late worker test mailbox join: {error}")))??;
-    recover_late_worker_done_atomic(db_path, mailbox_id, &row, Some(published_pr)).await
+    recover_late_worker_done_atomic(db_path, mailbox_id, &row, Some(published_pr), None).await
 }
 
 async fn recover_late_worker_done_with_publication(
@@ -2832,9 +3333,14 @@ async fn recover_late_worker_done_with_publication(
                 return Ok(false);
             }
         };
-    let folded =
-        recover_late_worker_done_atomic(&config.db_path, mailbox_id, row, Some(published.pr))
-            .await?;
+    let folded = recover_late_worker_done_atomic(
+        &config.db_path,
+        mailbox_id,
+        row,
+        Some(published.pr),
+        Some(published.clone()),
+    )
+    .await?;
     if folded {
         if let Err(error) = wt_mgr
             .retire_publication_source(&config.repo_dir, task_id, &published.source_sha)
@@ -3293,6 +3799,7 @@ struct DecompositionCoordinator {
     planner_slot: Option<planner::PlannerSlot>,
     classifier_slot: Option<classifier::ClassifierSlot>,
     planner_view: Option<tempfile::TempDir>,
+    writable_path_resolver: planner::WritablePathResolver,
 }
 
 #[derive(Clone)]
@@ -3325,8 +3832,11 @@ const FROZEN_BASE_CAPTURE_PIPE_BYTES: usize = 4096;
 struct DecompositionLiveWork {
     // These are the only provider/network futures retained across tick
     // boundaries. Merge, publication, collector, and recovery calls are
-    // awaited inline, so tick cannot begin the drain transition concurrently
-    // with one of those operations.
+    // awaited inline. Inline execution keeps no future here, but a task can
+    // still sit at a non-terminal status ('working' after worker teardown but
+    // before reviewer attach, 'in-review' between reviewers, 'rework' waiting
+    // for a rework worker) across ticks. The `started_non_terminal` gate at
+    // the call site closes that gap; these flags alone are not sufficient.
     ordinary_classifier: bool,
     doctor: bool,
     pre_review_checks: bool,
@@ -3336,11 +3846,13 @@ fn decomposition_drain_ready(
     workers: usize,
     reviewers: usize,
     durable_journal: i64,
+    started_non_terminal: i64,
     live: DecompositionLiveWork,
 ) -> bool {
     workers == 0
         && reviewers == 0
         && durable_journal == 0
+        && started_non_terminal == 0
         && !live.ordinary_classifier
         && !live.doctor
         && !live.pre_review_checks
@@ -3426,7 +3938,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
     let source_bytes = usize::try_from(source_bytes)
         .map_err(|_| QuorumError::Io("invalid planning source byte count".into()))?;
     let accepted_proposal = accepted_proposal_json
-        .map(|json| serde_json::from_str(&json))
+        .map(|json| planner::parse_accepted_proposal(&json))
         .transpose()
         .map_err(|error| QuorumError::Io(format!("invalid durable accepted proposal: {error}")))?;
     let mut statement = conn.prepare(
@@ -3507,7 +4019,7 @@ fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupD
         let raw = proposal.ok_or_else(|| {
             QuorumError::Io(format!("{state} decomposition lacks accepted proposal"))
         })?;
-        serde_json::from_str::<Vec<planner::ProposedTask>>(&raw).map_err(|error| {
+        planner::parse_accepted_proposal(&raw).map_err(|error| {
             QuorumError::Io(format!(
                 "{state} decomposition proposal is invalid: {error}"
             ))
@@ -4247,24 +4759,30 @@ fn child_preclassification_rejection(
     ))
 }
 
-async fn reset_decomposition_to_planning(
+async fn reject_decomposition_proposal(
     config: &ServeConfig,
     graph_id: i64,
     from: &'static str,
+    code: &str,
+    summary: &str,
 ) -> Result<()> {
     let path = config.db_path.clone();
+    let code = code.to_string();
+    let summary = truncate_utf8_bytes(summary, DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES).to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
-        quorum_core::decomposition::reset_accepted_proposal_to_planning(
+        quorum_core::decomposition::reject_frozen_proposal(
             &mut conn,
             graph_id,
             from,
+            &code,
+            &summary,
             now_unix(),
         )?;
         Ok(())
     })
     .await
-    .map_err(|error| QuorumError::Io(format!("decomposition phase join: {error}")))??;
+    .map_err(|error| QuorumError::Io(format!("proposal rejection join: {error}")))??;
     Ok(())
 }
 
@@ -4284,8 +4802,11 @@ fn proposed_classifier_tasks(
                         "implementation_delta": task.implementation_delta,
                         "affected_paths": task.affected_paths,
                         "observable_outcome": task.observable_outcome,
+                        "deliverables": task.deliverables,
                         "acceptance_criteria": task.acceptance_criteria,
-                        "source_constraints": task.source_constraints,
+                        "source_constraints": planner::with_worker_writability_guidance(
+                            &task.source_constraints,
+                        ),
                         "verification_expectations": task.verification_expectations,
                         "non_goals": task.non_goals,
                         "preserved_literals": task.preserved_literals,
@@ -4337,8 +4858,11 @@ fn planned_children(
                     "implementation_delta": task.implementation_delta,
                     "affected_paths": task.affected_paths,
                     "observable_outcome": task.observable_outcome,
+                    "deliverables": task.deliverables,
                     "acceptance_criteria": task.acceptance_criteria,
-                    "source_constraints": task.source_constraints,
+                    "source_constraints": planner::with_worker_writability_guidance(
+                        &task.source_constraints,
+                    ),
                     "verification_expectations": task.verification_expectations,
                     "non_goals": task.non_goals,
                     "preserved_literals": task.preserved_literals,
@@ -4486,12 +5010,10 @@ async fn tick_decomposition(
                     );
                     match result {
                         Err(summary) => {
-                            reset_decomposition_to_planning(config, graph_id, "preclassifying")
-                                .await?;
-                            record_decomposition_attempt(
+                            reject_decomposition_proposal(
                                 config,
                                 graph_id,
-                                "proposal",
+                                "preclassifying",
                                 "child-preclassification",
                                 &summary,
                             )
@@ -4614,11 +5136,10 @@ async fn tick_decomposition(
                 "preclassifying" => "preclassifying",
                 _ => unreachable!("resumable phase was matched above"),
             };
-            reset_decomposition_to_planning(config, snapshot.graph_id, phase).await?;
-            record_decomposition_attempt(
+            reject_decomposition_proposal(
                 config,
                 snapshot.graph_id,
-                "proposal",
+                phase,
                 "durable-proposal-validation",
                 &error.to_string(),
             )
@@ -4651,6 +5172,14 @@ async fn tick_decomposition(
             row.get::<_, i64>(0)
         })?
     };
+    // Every task that had already started (working/in-review/rework) must reach
+    // a terminal state before we capture the frozen base. The planning source
+    // itself sits in 'planning' — exclude it. Live-process counts alone miss
+    // the `in-review` gap between worker teardown and reviewer attach.
+    let started_non_terminal = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        quorum_core::tasks::count_started_non_terminal_excluding(&conn, snapshot.source_task_id)?
+    };
     if snapshot.state == "freeze-requested" {
         let path = config.db_path.clone();
         let graph_id = snapshot.graph_id;
@@ -4671,7 +5200,13 @@ async fn tick_decomposition(
         return Ok(true);
     }
     if snapshot.state == "draining"
-        && decomposition_drain_ready(workers.len(), reviewers.len(), durable_in_flight, live)
+        && decomposition_drain_ready(
+            workers.len(),
+            reviewers.len(),
+            durable_in_flight,
+            started_non_terminal,
+            live,
+        )
     {
         let sha = repository_head_sha(&config.repo_dir).await?;
         let path = config.db_path.clone();
@@ -4789,13 +5324,16 @@ async fn tick_decomposition(
             &snapshot.dependencies,
             &snapshot.title,
             snapshot.body.as_deref(),
-        ) {
+            &config.repo_dir,
+            &coordinator.writable_path_resolver,
+        )
+        .await
+        {
             Err(error) => {
-                reset_decomposition_to_planning(config, snapshot.graph_id, "validating").await?;
-                record_decomposition_attempt(
+                reject_decomposition_proposal(
                     config,
                     snapshot.graph_id,
-                    "proposal",
+                    "validating",
                     "deterministic-validation",
                     &error.to_string(),
                 )
@@ -5301,7 +5839,7 @@ async fn handle_pre_review_checks_failure(
     match transition {
         Some(ref result) if result.task.status == "rework" => {
             if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
-                if !install_live_worker_remediation_lease(
+                if !install_sticky_remediation_lease_and_baseline(
                     config,
                     workers[worker_index].agent_name.clone(),
                     task_id,
@@ -5336,39 +5874,37 @@ async fn handle_pre_review_checks_failure(
                             "pre-review CI rework feed failed for task #{task_id}: {error}; \
                          preserving durable remediation intent"
                         ));
-                        let worker = workers.remove(worker_index);
-                        let p = config.db_path.clone();
-                        let agent = worker.agent_name.clone();
-                        tokio::task::spawn_blocking(move || {
-                            if let Ok(mut conn) = quorum_core::db::open(&p) {
-                                let _ = tasks::release_remediation_lease(
-                                    &mut conn,
-                                    &agent,
-                                    task_id,
-                                    now_unix(),
-                                );
-                            }
-                        })
+                        if !handle_dormant_worker_feed_failure(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            workers,
+                            worker_index,
+                            &error,
+                        )
                         .await
-                        .ok();
-                        cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+                        {
+                            let worker = workers.remove(worker_index);
+                            let p = config.db_path.clone();
+                            let agent = worker.agent_name.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Ok(mut conn) = quorum_core::db::open(&p) {
+                                    let _ = tasks::release_remediation_lease(
+                                        &mut conn,
+                                        &agent,
+                                        task_id,
+                                        now_unix(),
+                                    );
+                                }
+                            })
+                            .await
+                            .ok();
+                            cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed")
+                                .await;
+                        }
                     } else {
                         let worker = &mut workers[worker_index];
-                        worker.draining = true;
-                        worker.pr = None;
-                        worker.rework_count += 1;
-                        worker.turn_started_at = std::time::Instant::now();
-                        if let Some(ref mut session_log) = worker.session_log {
-                            session_log.log_rework(worker.rework_count);
-                        }
-                        let p = config.db_path.clone();
-                        let entry = slot_journal_entry(worker, "worker", "working");
-                        tokio::task::spawn_blocking(move || -> Result<()> {
-                            let mut conn = quorum_core::db::open(&p)?;
-                            journal::upsert(&mut conn, &entry)
-                        })
-                        .await
-                        .ok();
+                        begin_sticky_worker_rework(worker, &config.db_path).await;
                         log(&format!(
                             "worker {} rework #{} (pre-review CI failure)",
                             worker.agent_name, worker.rework_count
@@ -5484,12 +6020,31 @@ async fn resume_reviewer_after_ci(
             .await
             .map_err(|error| QuorumError::Io(format!("graph review context join: {error}")))??
     };
-    let rereview_turn = reviewer::build_rereview_turn_with_context(
-        &reviewers[reviewer_index].agent_name,
-        pr,
-        &workers[worker_index].agent_name,
-        &reviewers[reviewer_index].effort,
-        graph_context.as_deref(),
+    let task_contract = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_task_review_contract(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("task review context join: {error}")))??
+    };
+    // Reload from durable task state: sticky reviewer continuation and daemon
+    // recovery must not depend on an in-memory slot counter.
+    let review_cycle = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
+    };
+    let rereview_turn = format!(
+        "{}\n\n{}",
+        reviewer::build_rereview_turn_with_context(
+            &reviewers[reviewer_index].agent_name,
+            pr,
+            &workers[worker_index].agent_name,
+            &reviewers[reviewer_index].effort,
+            graph_context.as_deref(),
+            review_cycle,
+        ),
+        task_contract
     );
     // Revalidate at the external feed boundary. This second guarded read makes
     // any cancellation/context change during CI/prompt preparation fail loud
@@ -5507,17 +6062,32 @@ async fn resume_reviewer_after_ci(
             "graph review authority changed before re-review feed for task #{task_id}"
         )));
     }
+    let current_review_cycle = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!("review-cycle rereview revalidation join: {error}"))
+            })??
+    };
+    if current_review_cycle != review_cycle {
+        return Err(QuorumError::Io(format!(
+            "review-cycle context changed before re-review feed for task #{task_id}"
+        )));
+    }
     if let Err(error) = reviewers[reviewer_index]
-        .proc
+        .live_process_mut()
+        .map_err(|error| QuorumError::Io(format!("reviewer has no live process: {error}")))?
         .feed_turn(&rereview_turn)
         .await
     {
-        let reason =
-            if reviewers[reviewer_index].proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
-                "codex_rereview"
-            } else {
-                "failed"
-            };
+        let reason = if reviewers[reviewer_index].process_kind().turn_mode()
+            == runner::TurnMode::RespawnPerTurn
+        {
+            "codex_rereview"
+        } else {
+            "failed"
+        };
         log(&format!(
             "ResumeReviewer: feed_turn failed for task #{task_id}: {error} \
              — tearing down ({reason})"
@@ -5530,7 +6100,9 @@ async fn resume_reviewer_after_ci(
             reviewers[reviewer_index].agent_name
         ));
         reviewers[reviewer_index].draining = true;
-        reviewers[reviewer_index].turn_started_at = std::time::Instant::now();
+        let now = std::time::Instant::now();
+        reviewers[reviewer_index].turn_started_at = now;
+        reviewers[reviewer_index].last_event_at = now;
         reviewers[reviewer_index].reviewed_head_sha = Some(gated_head_sha);
     }
     pre_review_checks.remove(&task_id);
@@ -5858,6 +6430,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut pre_review_checks: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
     let mut pending_reviewer_resumes: HashMap<i64, i64> = HashMap::new();
     let mut poison_tracker = PoisonTracker::new();
+    let mut claim_skip_logs = ClaimSkipLogLimiter::new();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
@@ -6092,12 +6665,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     slot.kill_and_reap().await;
                 }
                 for r in reviewers.drain(..) {
-                    let _terminal_output = r.proc.kill_and_reap().await;
-                    name_pool.release(&r.agent_name);
+                    let agent_name = r.agent_name.clone();
+                    let _terminal_output = r.kill_and_reap().await;
+                    name_pool.release(&agent_name);
                 }
                 for w in workers.drain(..) {
-                    let _terminal_output = w.proc.kill_and_reap().await;
-                    name_pool.release(&w.agent_name);
+                    let agent_name = w.agent_name.clone();
+                    let _terminal_output = w.kill_and_reap().await;
+                    name_pool.release(&agent_name);
                 }
                 return Ok(1);
             }
@@ -6270,6 +6845,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut pre_review_checks,
             &mut pending_reviewer_resumes,
             &mut poison_tracker,
+            &mut claim_skip_logs,
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -6306,12 +6882,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                         slot.kill_and_reap().await;
                     }
                     for r in reviewers.drain(..) {
-                        let _terminal_output = r.proc.kill_and_reap().await;
-                        name_pool.release(&r.agent_name);
+                        let agent_name = r.agent_name.clone();
+                        let _terminal_output = r.kill_and_reap().await;
+                        name_pool.release(&agent_name);
                     }
                     for w in workers.drain(..) {
-                        let _terminal_output = w.proc.kill_and_reap().await;
-                        name_pool.release(&w.agent_name);
+                        let agent_name = w.agent_name.clone();
+                        let _terminal_output = w.kill_and_reap().await;
+                        name_pool.release(&agent_name);
                     }
                     return Ok(EXIT_SELF_UPDATE);
                 }
@@ -6333,6 +6911,7 @@ async fn tick(
     pre_review_checks: &mut HashMap<i64, PreReviewChecksEntry>,
     pending_reviewer_resumes: &mut HashMap<i64, i64>,
     poison_tracker: &mut PoisonTracker,
+    claim_skip_logs: &mut ClaimSkipLogLimiter,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
@@ -6827,23 +7406,22 @@ async fn tick(
                                 } else {
                                     let pr_val = pr_num;
                                     let tid = reviewer_task_id;
-                                    let dbp = db_path.clone();
-                                    let repo_dir = config.repo_dir.clone();
-                                    let gh_repo = config.repo.clone();
-                                    let resolved = tokio::task::spawn_blocking(move || {
-                                        resolve_or_load_pr_target(
-                                            pr_val,
-                                            tid,
-                                            &dbp,
-                                            &repo_dir,
-                                            Some(&gh_repo),
-                                        )
-                                    })
+                                    let resolved = resolve_or_load_reviewer_pr_target(
+                                        pr_val,
+                                        tid,
+                                        &config.db_path,
+                                        &config.repo_dir,
+                                        Some(&config.repo),
+                                    )
                                     .await
                                     .ok()
                                     .flatten();
                                     resolved.map(|target| {
-                                        ("external".to_string(), reviewer_task_id, target.head_ref)
+                                        (
+                                            "external".to_string(),
+                                            reviewer_task_id,
+                                            target.target.head_ref,
+                                        )
                                     })
                                 }
                             };
@@ -7223,7 +7801,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        if !install_live_worker_remediation_lease(
+                                        if !install_sticky_remediation_lease_and_baseline(
                                             config,
                                             workers[wi].agent_name.clone(),
                                             reviewer_task_id,
@@ -7261,45 +7839,36 @@ async fn tick(
                                                 log(&format!(
                                                 "conflict rework feed failed: {e} — cleaning up"
                                             ));
-                                                let w = workers.remove(wi);
-                                                fire_event(
-                                                    &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
-                                                    },
-                                                )
-                                                .await;
-                                                cleanup_slot(
-                                                    config,
-                                                    wt_mgr,
-                                                    name_pool,
-                                                    w,
-                                                    None,
-                                                    "agent_failed",
-                                                )
-                                                .await;
-                                            } else {
-                                                let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
+                                                if !handle_dormant_worker_feed_failure(
+                                                    config, wt_mgr, name_pool, workers, wi, &e,
                                                 )
                                                 .await
-                                                .ok();
+                                                {
+                                                    let w = workers.remove(wi);
+                                                    fire_event(
+                                                        &db_path,
+                                                        &w.agent_name,
+                                                        w.task_id,
+                                                        &Event::AgentFailed {
+                                                            reason: format!(
+                                                                "rework feed failed: {e}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    cleanup_slot(
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        w,
+                                                        None,
+                                                        "agent_failed",
+                                                    )
+                                                    .await;
+                                                }
+                                            } else {
+                                                let w = &mut workers[wi];
+                                                begin_sticky_worker_rework(w, &db_path).await;
                                                 log(&format!(
                                                     "worker {} rework #{} (pre-merge conflict)",
                                                     w.agent_name, w.rework_count
@@ -7523,7 +8092,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        if !install_live_worker_remediation_lease(
+                                        if !install_sticky_remediation_lease_and_baseline(
                                             config,
                                             workers[wi].agent_name.clone(),
                                             reviewer_task_id,
@@ -7561,45 +8130,36 @@ async fn tick(
                                                 log(&format!(
                                                 "checks-failure rework feed failed: {e} — cleaning up"
                                             ));
-                                                let w = workers.remove(wi);
-                                                fire_event(
-                                                    &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
-                                                    },
-                                                )
-                                                .await;
-                                                cleanup_slot(
-                                                    config,
-                                                    wt_mgr,
-                                                    name_pool,
-                                                    w,
-                                                    None,
-                                                    "agent_failed",
-                                                )
-                                                .await;
-                                            } else {
-                                                let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
+                                                if !handle_dormant_worker_feed_failure(
+                                                    config, wt_mgr, name_pool, workers, wi, &e,
                                                 )
                                                 .await
-                                                .ok();
+                                                {
+                                                    let w = workers.remove(wi);
+                                                    fire_event(
+                                                        &db_path,
+                                                        &w.agent_name,
+                                                        w.task_id,
+                                                        &Event::AgentFailed {
+                                                            reason: format!(
+                                                                "rework feed failed: {e}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    cleanup_slot(
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        w,
+                                                        None,
+                                                        "agent_failed",
+                                                    )
+                                                    .await;
+                                                }
+                                            } else {
+                                                let w = &mut workers[wi];
+                                                begin_sticky_worker_rework(w, &db_path).await;
                                                 log(&format!(
                                                     "worker {} rework #{} (checks failure)",
                                                     w.agent_name, w.rework_count
@@ -7752,7 +8312,7 @@ async fn tick(
                                             .iter()
                                             .position(|w| w.task_id == reviewer_task_id)
                                         {
-                                            if !install_live_worker_remediation_lease(
+                                            if !install_sticky_remediation_lease_and_baseline(
                                                 config,
                                                 workers[wi].agent_name.clone(),
                                                 reviewer_task_id,
@@ -7791,48 +8351,36 @@ async fn tick(
                                                         "timeout-conflict rework feed failed: \
                                                      {e} — cleaning up"
                                                     ));
-                                                    let w = workers.remove(wi);
-                                                    fire_event(
-                                                        &db_path,
-                                                        &w.agent_name,
-                                                        w.task_id,
-                                                        &Event::AgentFailed {
-                                                            reason: format!(
-                                                                "rework feed failed: {e}"
-                                                            ),
-                                                        },
-                                                    )
-                                                    .await;
-                                                    cleanup_slot(
-                                                        config,
-                                                        wt_mgr,
-                                                        name_pool,
-                                                        w,
-                                                        None,
-                                                        "agent_failed",
-                                                    )
-                                                    .await;
-                                                } else {
-                                                    let w = &mut workers[wi];
-                                                    w.draining = true;
-                                                    w.pr = None;
-                                                    w.rework_count += 1;
-                                                    w.turn_started_at = std::time::Instant::now();
-                                                    if let Some(ref mut sl) = w.session_log {
-                                                        sl.log_rework(w.rework_count);
-                                                    }
-                                                    let p = db_path.clone();
-                                                    let entry =
-                                                        slot_journal_entry(w, "worker", "working");
-                                                    tokio::task::spawn_blocking(
-                                                        move || -> Result<()> {
-                                                            let mut conn =
-                                                                quorum_core::db::open(&p)?;
-                                                            journal::upsert(&mut conn, &entry)
-                                                        },
+                                                    if !handle_dormant_worker_feed_failure(
+                                                        config, wt_mgr, name_pool, workers, wi, &e,
                                                     )
                                                     .await
-                                                    .ok();
+                                                    {
+                                                        let w = workers.remove(wi);
+                                                        fire_event(
+                                                            &db_path,
+                                                            &w.agent_name,
+                                                            w.task_id,
+                                                            &Event::AgentFailed {
+                                                                reason: format!(
+                                                                    "rework feed failed: {e}"
+                                                                ),
+                                                            },
+                                                        )
+                                                        .await;
+                                                        cleanup_slot(
+                                                            config,
+                                                            wt_mgr,
+                                                            name_pool,
+                                                            w,
+                                                            None,
+                                                            "agent_failed",
+                                                        )
+                                                        .await;
+                                                    }
+                                                } else {
+                                                    let w = &mut workers[wi];
+                                                    begin_sticky_worker_rework(w, &db_path).await;
                                                     log(&format!(
                                                         "worker {} rework #{} \
                                                      (timeout + conflict)",
@@ -8114,7 +8662,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        if !install_live_worker_remediation_lease(
+                                        if !install_sticky_remediation_lease_and_baseline(
                                             config,
                                             workers[wi].agent_name.clone(),
                                             reviewer_task_id,
@@ -8153,45 +8701,36 @@ async fn tick(
                                                     "pre-merge conflict rework feed failed: \
                                                  {e} — cleaning up"
                                                 ));
-                                                let w = workers.remove(wi);
-                                                fire_event(
-                                                    &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
-                                                    },
-                                                )
-                                                .await;
-                                                cleanup_slot(
-                                                    config,
-                                                    wt_mgr,
-                                                    name_pool,
-                                                    w,
-                                                    None,
-                                                    "agent_failed",
-                                                )
-                                                .await;
-                                            } else {
-                                                let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
+                                                if !handle_dormant_worker_feed_failure(
+                                                    config, wt_mgr, name_pool, workers, wi, &e,
                                                 )
                                                 .await
-                                                .ok();
+                                                {
+                                                    let w = workers.remove(wi);
+                                                    fire_event(
+                                                        &db_path,
+                                                        &w.agent_name,
+                                                        w.task_id,
+                                                        &Event::AgentFailed {
+                                                            reason: format!(
+                                                                "rework feed failed: {e}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    cleanup_slot(
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        w,
+                                                        None,
+                                                        "agent_failed",
+                                                    )
+                                                    .await;
+                                                }
+                                            } else {
+                                                let w = &mut workers[wi];
+                                                begin_sticky_worker_rework(w, &db_path).await;
                                                 log(&format!(
                                                     "worker {} rework #{} \
                                                  (pre-merge conflict recheck)",
@@ -8519,7 +9058,7 @@ async fn tick(
                                                 .iter()
                                                 .position(|w| w.task_id == reviewer_task_id)
                                             {
-                                                if !install_live_worker_remediation_lease(
+                                                if !install_sticky_remediation_lease_and_baseline(
                                                     config,
                                                     workers[wi].agent_name.clone(),
                                                     reviewer_task_id,
@@ -8558,50 +9097,38 @@ async fn tick(
                                                         log(&format!(
                                                     "merge-failure rework feed failed: {e} — cleaning up"
                                                 ));
-                                                        let w = workers.remove(wi);
-                                                        fire_event(
-                                                            &db_path,
-                                                            &w.agent_name,
-                                                            w.task_id,
-                                                            &Event::AgentFailed {
-                                                                reason: format!(
-                                                                    "rework feed failed: {e}"
-                                                                ),
-                                                            },
-                                                        )
-                                                        .await;
-                                                        cleanup_slot(
-                                                            config,
-                                                            wt_mgr,
-                                                            name_pool,
-                                                            w,
-                                                            None,
-                                                            "agent_failed",
-                                                        )
-                                                        .await;
-                                                    } else {
-                                                        let w = &mut workers[wi];
-                                                        w.draining = true;
-                                                        w.pr = None;
-                                                        w.rework_count += 1;
-                                                        w.turn_started_at =
-                                                            std::time::Instant::now();
-                                                        if let Some(ref mut sl) = w.session_log {
-                                                            sl.log_rework(w.rework_count);
-                                                        }
-                                                        let p = db_path.clone();
-                                                        let entry = slot_journal_entry(
-                                                            w, "worker", "working",
-                                                        );
-                                                        tokio::task::spawn_blocking(
-                                                            move || -> Result<()> {
-                                                                let mut conn =
-                                                                    quorum_core::db::open(&p)?;
-                                                                journal::upsert(&mut conn, &entry)
-                                                            },
+                                                        if !handle_dormant_worker_feed_failure(
+                                                            config, wt_mgr, name_pool, workers, wi,
+                                                            &e,
                                                         )
                                                         .await
-                                                        .ok();
+                                                        {
+                                                            let w = workers.remove(wi);
+                                                            fire_event(
+                                                                &db_path,
+                                                                &w.agent_name,
+                                                                w.task_id,
+                                                                &Event::AgentFailed {
+                                                                    reason: format!(
+                                                                        "rework feed failed: {e}"
+                                                                    ),
+                                                                },
+                                                            )
+                                                            .await;
+                                                            cleanup_slot(
+                                                                config,
+                                                                wt_mgr,
+                                                                name_pool,
+                                                                w,
+                                                                None,
+                                                                "agent_failed",
+                                                            )
+                                                            .await;
+                                                        }
+                                                    } else {
+                                                        let w = &mut workers[wi];
+                                                        begin_sticky_worker_rework(w, &db_path)
+                                                            .await;
                                                         log(&format!(
                                                             "worker {} rework #{} (merge failure)",
                                                             w.agent_name, w.rework_count
@@ -8813,7 +9340,7 @@ async fn tick(
                                     ));
                                     0
                                 });
-                                if !install_live_worker_remediation_lease(
+                                if !install_sticky_remediation_lease_and_baseline(
                                     config,
                                     workers[wi].agent_name.clone(),
                                     reviewer_task_id,
@@ -8846,42 +9373,34 @@ async fn tick(
                                             .await
                                     {
                                         log(&format!("rework feed_turn failed: {e} — cleaning up"));
-                                        let w = workers.remove(wi);
-                                        fire_event(
-                                            &db_path,
-                                            &w.agent_name,
-                                            w.task_id,
-                                            &Event::AgentFailed {
-                                                reason: format!("rework feed failed: {e}"),
-                                            },
+                                        if !handle_dormant_worker_feed_failure(
+                                            config, wt_mgr, name_pool, workers, wi, &e,
                                         )
-                                        .await;
-                                        cleanup_slot(
-                                            config,
-                                            wt_mgr,
-                                            name_pool,
-                                            w,
-                                            None,
-                                            "agent_failed",
-                                        )
-                                        .await;
+                                        .await
+                                        {
+                                            let w = workers.remove(wi);
+                                            fire_event(
+                                                &db_path,
+                                                &w.agent_name,
+                                                w.task_id,
+                                                &Event::AgentFailed {
+                                                    reason: format!("rework feed failed: {e}"),
+                                                },
+                                            )
+                                            .await;
+                                            cleanup_slot(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                w,
+                                                None,
+                                                "agent_failed",
+                                            )
+                                            .await;
+                                        }
                                     } else {
                                         let w = &mut workers[wi];
-                                        w.draining = true;
-                                        w.pr = None;
-                                        w.rework_count += 1;
-                                        w.turn_started_at = std::time::Instant::now();
-                                        if let Some(ref mut sl) = w.session_log {
-                                            sl.log_rework(w.rework_count);
-                                        }
-                                        let p = db_path.clone();
-                                        let entry = slot_journal_entry(w, "worker", "working");
-                                        tokio::task::spawn_blocking(move || -> Result<()> {
-                                            let mut conn = quorum_core::db::open(&p)?;
-                                            journal::upsert(&mut conn, &entry)
-                                        })
-                                        .await
-                                        .ok();
+                                        begin_sticky_worker_rework(w, &db_path).await;
                                         log(&format!(
                                             "worker {} rework #{} started",
                                             w.agent_name, w.rework_count
@@ -8972,9 +9491,6 @@ async fn tick(
                     )
                     .await;
                     teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:none").await;
-                    if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id) {
-                        workers[wi].pr = None;
-                    }
                 }
             }
 
@@ -9112,6 +9628,9 @@ async fn tick(
                     &workers[wi].agent_name,
                     workers[wi].task_id,
                     &event,
+                    published
+                        .as_ref()
+                        .expect("successful publication result must remain available"),
                 )
                 .await;
 
@@ -9302,16 +9821,9 @@ async fn tick(
         if !r.draining {
             continue;
         }
-        // Wall-clock watchdog (checked each tick, even before result arrives)
-        if let Some(breach) = check_wall_clock_limits(&config.limits, r) {
-            log(&format!(
-                "WATCHDOG: reviewer {} killed — {}",
-                r.agent_name, breach
-            ));
-            reviewers_to_kill.push(i);
-            continue;
-        }
-        if let Some(breach) = drain_events(r, &db_path, "reviewer", &config.limits).await? {
+        if let Some(breach) =
+            check_active_slot_limits(r, &db_path, "reviewer", &config.limits).await?
+        {
             log(&format!(
                 "WATCHDOG: reviewer {} killed — {}",
                 r.agent_name, breach
@@ -9339,7 +9851,11 @@ async fn tick(
     }
 
     // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
-    let idle_timeout = config.limits.idle_timeout_secs.unwrap_or(300);
+    let idle_timeout = config
+        .limits
+        .max_idle_secs
+        .or(config.limits.idle_timeout_secs)
+        .unwrap_or(900);
     let mut idle_reviewers: Vec<usize> = Vec::new();
     for (i, r) in reviewers.iter().enumerate() {
         if r.draining {
@@ -9386,15 +9902,9 @@ async fn tick(
         if !w.draining {
             continue;
         }
-        if let Some(breach) = check_wall_clock_limits(&config.limits, w) {
-            log(&format!(
-                "WATCHDOG: worker {} killed (task #{}) — {}",
-                w.agent_name, w.task_id, breach
-            ));
-            workers_to_kill.push(i);
-            continue;
-        }
-        if let Some(breach) = drain_events(w, &db_path, "worker", &config.limits).await? {
+        if let Some(breach) =
+            check_active_slot_limits(w, &db_path, "worker", &config.limits).await?
+        {
             log(&format!(
                 "WATCHDOG: worker {} killed (task #{}) — {}",
                 w.agent_name, w.task_id, breach
@@ -9424,13 +9934,8 @@ async fn tick(
     // firing AgentFailed (#176).
     let mut idle_workers: Vec<usize> = Vec::new();
     for (i, w) in workers.iter().enumerate() {
-        if w.draining || w.error_turn_count > 0 {
-            continue;
-        }
-        if let Some(ended) = w.turn_ended_at {
-            if ended.elapsed().as_secs() > idle_timeout {
-                idle_workers.push(i);
-            }
+        if slot_is_idle_zombie_candidate(w, idle_timeout) {
+            idle_workers.push(i);
         }
     }
     for &i in idle_workers.iter().rev() {
@@ -9516,7 +10021,9 @@ async fn tick(
         match feed_worker_turn(w, &raw_prompt, config).await {
             Ok(()) => {
                 w.draining = true;
-                w.turn_started_at = std::time::Instant::now();
+                let now = std::time::Instant::now();
+                w.turn_started_at = now;
+                w.last_event_at = now;
                 log(&format!(
                     "auto-refeed worker {} after error (attempt {}/{})",
                     w.agent_name, w.error_turn_count, MAX_ERROR_RETRIES
@@ -9533,8 +10040,8 @@ async fn tick(
     }
     for &i in error_failed.iter().rev() {
         let dead = workers.remove(i);
-        if dead.proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
-            let provider = dead.proc.kind().to_string();
+        if dead.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
+            let provider = dead.process_kind().to_string();
             let reason = dead
                 .last_error_text
                 .as_deref()
@@ -9566,7 +10073,10 @@ async fn tick(
                     workers.insert(i, dead);
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
-                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+                    park_or_cleanup_delivered_worker_slot(
+                        config, wt_mgr, name_pool, workers, i, dead,
+                    )
+                    .await;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
                     cleanup_slot(
@@ -9580,6 +10090,12 @@ async fn tick(
                     .await;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
+                    if let Some(failure) = dead.observed_pre_authoritative_failure() {
+                        log(&format!(
+                            "worker {} pre-authoritative runner failure classified as {failure}",
+                            dead.agent_name
+                        ));
+                    }
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
                 }
                 Err(error) => {
@@ -9673,30 +10189,36 @@ async fn tick(
     // its stdout open. `try_wait` is the authoritative signal.
     let mut dead_workers = Vec::new();
     for (i, w) in workers.iter_mut().enumerate() {
-        match w.proc.try_wait() {
-            Ok(Some(status)) => {
+        match observe_worker_exit_for_lifecycle(w) {
+            Ok(WorkerExitObservation::Exited(status)) => {
                 log(&format!(
                     "worker {} process exited (task #{}, status={:?}) — classifying lifecycle outcome",
                     w.agent_name, w.task_id, status
                 ));
                 dead_workers.push((i, status));
             }
-            Ok(None) => {}
+            Ok(WorkerExitObservation::DeferredTerminalEvidence(status)) => {
+                log(&format!(
+                    "worker {} process exited (task #{}, status={:?}) — retaining pending Grok terminal evidence",
+                    w.agent_name, w.task_id, status
+                ));
+            }
+            Ok(WorkerExitObservation::Running) => {}
             Err(e) => {
                 log(&format!("worker {} try_wait error: {e}", w.agent_name));
             }
         }
     }
     for &(i, status) in dead_workers.iter().rev() {
-        let dead = workers.remove(i);
-        if dead.proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
+        let mut dead = workers.remove(i);
+        if dead.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
             let reason = dead
                 .last_error_text
                 .as_deref()
                 .unwrap_or("turn-oriented runner exited before task submission")
                 .to_string();
             let retry = PendingTurn {
-                provider: dead.proc.kind().to_string(),
+                provider: dead.process_kind().to_string(),
                 model: dead.model.clone(),
                 effort: dead.effort.clone(),
                 prompt: dead.pending_prompt.clone(),
@@ -9720,11 +10242,10 @@ async fn tick(
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
-                    log(&format!(
-                        "worker {} exited normally after delivering task #{} — cleaning up completed run",
-                        dead.agent_name, dead.task_id
-                    ));
-                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+                    park_or_cleanup_delivered_worker_slot(
+                        config, wt_mgr, name_pool, workers, i, dead,
+                    )
+                    .await;
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
@@ -9744,6 +10265,13 @@ async fn tick(
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
+                    dead.finalize_pre_authoritative_exit_evidence().await;
+                    if let Some(failure) = dead.classify_pre_authoritative_exit(status) {
+                        log(&format!(
+                            "worker {} pre-authoritative runner failure classified as {failure}",
+                            dead.agent_name
+                        ));
+                    }
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
                     continue;
                 }
@@ -9770,6 +10298,8 @@ async fn tick(
             continue;
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
+        let runner_failure =
+            classify_managed_pre_authoritative_exit(&mut dead, status, &disposition).await;
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -9812,6 +10342,12 @@ async fn tick(
                 continue;
             }
             tasks::ManagedExitDisposition::AgentFailed(_) => {}
+        }
+        if let Some(failure) = runner_failure {
+            log(&format!(
+                "worker {} pre-authoritative runner failure classified as {failure}",
+                dead.agent_name
+            ));
         }
         log(&format!(
             "worker {} died mid-task after classification proved no submission and active ownership (task #{}, status={status:?}) — recovering worker",
@@ -9859,15 +10395,15 @@ async fn tick(
         }
     }
 
-    let mut dead_reviewers: Vec<usize> = Vec::new();
+    let mut dead_reviewers = Vec::new();
     for (i, r) in reviewers.iter_mut().enumerate() {
-        match r.proc.try_wait() {
+        match r.try_wait() {
             Ok(Some(status)) => {
                 log(&format!(
                     "reviewer {} process exited (task #{}, status={:?}) — classifying lifecycle outcome",
                     r.agent_name, r.task_id, status
                 ));
-                dead_reviewers.push(i);
+                dead_reviewers.push((i, status));
             }
             Ok(None) => {}
             Err(e) => {
@@ -9875,7 +10411,7 @@ async fn tick(
             }
         }
     }
-    for &i in dead_reviewers.iter().rev() {
+    for &(i, status) in dead_reviewers.iter().rev() {
         let disposition = dispose_managed_process_exit(
             &db_path,
             tasks::ManagedRunRole::Reviewer,
@@ -9892,6 +10428,8 @@ async fn tick(
             continue;
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
+        let runner_failure =
+            classify_managed_pre_authoritative_exit(&mut reviewers[i], status, &disposition).await;
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -9931,6 +10469,12 @@ async fn tick(
             }
             tasks::ManagedExitDisposition::AgentFailed(_) => {
                 let dead = reviewers.remove(i);
+                if let Some(failure) = runner_failure {
+                    log(&format!(
+                        "reviewer {} pre-authoritative runner failure classified as {failure}",
+                        dead.agent_name
+                    ));
+                }
                 log(&format!(
                     "reviewer {} died after classification proved no verdict and active ownership of task #{} — recovering review",
                     dead.agent_name, dead.task_id
@@ -10028,7 +10572,9 @@ async fn tick(
                 match feed_worker_turn(&mut workers[wi], &raw_prompt, config).await {
                     Ok(()) => {
                         workers[wi].draining = true;
-                        workers[wi].turn_started_at = std::time::Instant::now();
+                        let now = std::time::Instant::now();
+                        workers[wi].turn_started_at = now;
+                        workers[wi].last_event_at = now;
                         log(&format!(
                             "delivered message from {} to {} (task #{})",
                             msg_row.agent, target, workers[wi].task_id,
@@ -10057,31 +10603,24 @@ async fn tick(
     // ── Phase 4d: Renew task leases for active workers (#130) ───────────
     // The daemon explicitly renews the exact lease for each active worker's
     // task. External writes (sync, post, etc.) no longer auto-renew leases.
-    {
-        let p = db_path.clone();
-        let active_pairs: Vec<(String, i64)> = workers
-            .iter()
-            .map(|w| (w.agent_name.clone(), w.task_id))
-            .collect();
-        if !active_pairs.is_empty() {
-            tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = quorum_core::db::open(&p) {
-                    let now = now_unix();
-                    for (agent, task_id) in &active_pairs {
-                        let _ = quorum_core::agents::renew_task_lease(&conn, agent, *task_id, now);
-                    }
-                }
-            })
-            .await
-            .ok();
-        }
-    }
+    renew_active_worker_task_leases(&db_path, workers).await;
 
     // ── Phase 5: Spawn reviewers for workers with PRs ──────────────────
     // Each worker that has a PR and no paired reviewer (and is not draining)
     // gets a reviewer spawned. Reviewers don't consume worker capacity.
-    // Skip during drain — no new work, let existing agents finish.
-    if !drain_state.draining && !decomposition_freeze {
+    // Skip during shutdown drain — no new work, let existing agents finish.
+    //
+    // A decomposition freeze must NOT skip this. Phase 5 only ever serves
+    // workers that already exist (phase 6 spawns none during the freeze), and
+    // the freeze's own drain predicate (decomposition_drain_ready) requires
+    // reviewers==0 && workers==0 && started_non_terminal==0. Gating reviewer
+    // provisioning on the freeze strands a retained worker awaiting review: it
+    // keeps the drain predicate false forever, and the freeze keeps its
+    // reviewer from spawning — a deadlock against the very drain the freeze
+    // waits for. Letting the reviewer run lets the retained worker settle and
+    // drives every started task toward a terminal state, which is exactly what
+    // the frozen-base capture waits for.
+    if !drain_state.draining {
         let active_in_review = {
             let p = db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
@@ -10100,12 +10639,7 @@ async fn tick(
             .iter()
             .enumerate()
             .filter_map(|(i, w)| {
-                if let Some(pr) = w.pr {
-                    if !w.draining && !reviewers.iter().any(|r| r.task_id == w.task_id) {
-                        return Some((pr, w.task_id, i));
-                    }
-                }
-                None
+                slot_needs_reviewer_provisioning(w, reviewers).map(|pr| (pr, w.task_id, i))
             })
             .collect();
         if !needs_reviewer_from_workers.is_empty() {
@@ -10590,33 +11124,33 @@ async fn tick(
                     } else {
                         ReviewRole::R1
                     };
-                    let branch = if let Some(b) =
-                        orphan_worker_branch(author, *task_id, *review_only)
-                    {
-                        b
-                    } else {
-                        let pr_num = *pr;
-                        let tid = *task_id;
-                        let dbp = config.db_path.clone();
-                        let repo_dir = config.repo_dir.clone();
-                        let gh_repo = config.repo.clone();
-                        let resolved = tokio::task::spawn_blocking(move || {
-                            resolve_or_load_pr_target(pr_num, tid, &dbp, &repo_dir, Some(&gh_repo))
-                        })
-                        .await
-                        .ok()
-                        .flatten();
-                        match resolved {
-                            Some(target) => target.head_ref,
-                            None => {
-                                log(&format!(
-                                    "orphan in-review task #{task_id} PR #{pr}: \
+                    let branch =
+                        if let Some(b) = orphan_worker_branch(author, *task_id, *review_only) {
+                            b
+                        } else {
+                            let pr_num = *pr;
+                            let tid = *task_id;
+                            let resolved = resolve_or_load_reviewer_pr_target(
+                                pr_num,
+                                tid,
+                                &config.db_path,
+                                &config.repo_dir,
+                                Some(&config.repo),
+                            )
+                            .await
+                            .ok()
+                            .flatten();
+                            match resolved {
+                                Some(target) => target.target.head_ref,
+                                None => {
+                                    log(&format!(
+                                        "orphan in-review task #{task_id} PR #{pr}: \
                                          could not resolve PR head ref — skipping"
-                                ));
-                                continue;
+                                    ));
+                                    continue;
+                                }
                             }
-                        }
-                    };
+                        };
                     let counterpart = ReviewCounterpart {
                         agent_name: if author.is_empty() {
                             "external"
@@ -10685,6 +11219,7 @@ async fn tick(
                 name_pool,
                 workers,
                 poison_tracker,
+                claim_skip_logs,
                 lifetime_roster,
             )
             .await?
@@ -11115,7 +11650,7 @@ enum LimitBreached {
     TurnCostUsd { turn: f64, max: f64 },
     TurnCostUsdMissing { max: f64 },
     TaskCostUsd { total: f64, max: f64 },
-    TurnWallSecs { elapsed: u64, max: u64 },
+    IdleSecs { elapsed: u64, max: u64 },
     TaskWallSecs { elapsed: u64, max: u64 },
 }
 
@@ -11137,8 +11672,8 @@ impl std::fmt::Display for LimitBreached {
             Self::TaskCostUsd { total, max } => {
                 write!(f, "task cost ${total:.4} exceeded limit ${max:.4}")
             }
-            Self::TurnWallSecs { elapsed, max } => {
-                write!(f, "turn wall-clock {elapsed}s exceeded limit {max}s")
+            Self::IdleSecs { elapsed, max } => {
+                write!(f, "idle {elapsed}s exceeded limit {max}s")
             }
             Self::TaskWallSecs { elapsed, max } => {
                 write!(f, "task wall-clock {elapsed}s exceeded limit {max}s")
@@ -11194,11 +11729,13 @@ fn check_post_result_limits(
             });
         }
     }
-    if let Some(max) = limits.max_turn_wall_secs {
-        let elapsed = slot.turn_started_at.elapsed().as_secs();
-        if elapsed > max {
-            return Some(LimitBreached::TurnWallSecs { elapsed, max });
-        }
+    let max_idle_secs = max_idle_secs(limits);
+    let elapsed = slot.last_event_at.elapsed().as_secs();
+    if elapsed > max_idle_secs {
+        return Some(LimitBreached::IdleSecs {
+            elapsed,
+            max: max_idle_secs,
+        });
     }
     if let Some(max) = limits.max_task_wall_secs {
         let elapsed = slot.task_started_at.elapsed().as_secs();
@@ -11211,11 +11748,13 @@ fn check_post_result_limits(
 
 /// Check wall-clock limits only (called each tick for slots still draining).
 fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<LimitBreached> {
-    if let Some(max) = limits.max_turn_wall_secs {
-        let elapsed = slot.turn_started_at.elapsed().as_secs();
-        if elapsed > max {
-            return Some(LimitBreached::TurnWallSecs { elapsed, max });
-        }
+    let max_idle_secs = max_idle_secs(limits);
+    let elapsed = slot.last_event_at.elapsed().as_secs();
+    if elapsed > max_idle_secs {
+        return Some(LimitBreached::IdleSecs {
+            elapsed,
+            max: max_idle_secs,
+        });
     }
     if let Some(max) = limits.max_task_wall_secs {
         let elapsed = slot.task_started_at.elapsed().as_secs();
@@ -11226,6 +11765,13 @@ fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<Limi
     None
 }
 
+/// Prefer the explicit idle ceiling while accepting the retired turn-wall
+/// option as a compatibility alias with the new event-based semantics. Active
+/// slots always have a liveness watchdog, even when neither setting is given.
+fn max_idle_secs(limits: &CostLimits) -> u64 {
+    limits.max_idle_secs.unwrap_or(900)
+}
+
 /// Feed a worker turn according to the adapter's declared process lifetime.
 /// Persistent-child runners receive stdin; turn-oriented runners respawn with
 /// their opaque continuation identity.
@@ -11234,7 +11780,7 @@ async fn feed_worker_turn(
     raw_prompt: &str,
     config: &ServeConfig,
 ) -> std::io::Result<()> {
-    if slot.proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
+    if slot.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
         if should_replace_pending_prompt(raw_prompt) {
             slot.pending_prompt = raw_prompt.to_string();
             slot.pending_turn_kind = if slot.pr.is_some() {
@@ -11244,15 +11790,24 @@ async fn feed_worker_turn(
             };
         }
         let (model, effort) = runner_continuation_identity(slot)?;
+        let dormant_authority = if matches!(&slot.proc, SlotProcess::Dormant { .. }) {
+            Some(prepare_dormant_worker_turn(slot, config).await?)
+        } else {
+            None
+        };
         let mut env_vars: Vec<(String, String)> = vec![
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), slot.agent_name.clone()),
         ];
-        if let Some(ref rid) = slot.cap_run_id {
+        let launch_capability = dormant_authority
+            .as_ref()
+            .map(|authority| &authority.cap_run_id)
+            .or(slot.cap_run_id.as_ref());
+        if let Some(rid) = launch_capability {
             env_vars.push(("QUORUM_RUN_ID".into(), rid.clone()));
         }
 
-        let new_proc = runner::RunnerProc::launch(
+        let launch = runner::RunnerProc::launch(
             &runner::LaunchRequest {
                 model,
                 effort,
@@ -11261,22 +11816,434 @@ async fn feed_worker_turn(
                 environment: &env_vars,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: runner_continuation_id(
-                    slot.proc.kind(),
+                    slot.process_kind(),
                     &slot.session_id,
-                    slot.continuation_id.as_deref(),
+                    slot.continuation_id_for_launch(),
                 ),
             },
             &runner_adapter_config(config, config.agent_bin.as_deref()),
         )
-        .await?;
+        .await;
+        let new_proc = match launch {
+            Ok(proc) => proc,
+            Err(error) => {
+                if let Some(authority) = dormant_authority {
+                    abort_dormant_worker_turn(&config.db_path, &authority.cap_run_id).await;
+                }
+                return Err(error.into());
+            }
+        };
 
-        let old = std::mem::replace(&mut slot.proc, new_proc);
-        tokio::spawn(async move { old.kill_and_reap().await });
+        if let Some(authority) = dormant_authority {
+            let new_run_id = match finalize_dormant_worker_turn(slot, config, &authority).await {
+                Ok(run_id) => run_id,
+                Err(error) => {
+                    let _ = new_proc.kill_and_reap().await;
+                    abort_dormant_worker_turn(&config.db_path, &authority.cap_run_id).await;
+                    return Err(error);
+                }
+            };
+            slot.agent_run_id = Some(new_run_id);
+            slot.cap_run_id = Some(authority.cap_run_id);
+            slot.live_stats = LiveStats::new();
+            slot.turn_ended_at = None;
+        }
+
+        if let Some(old) = slot.replace_with_launched_turn(new_proc)? {
+            tokio::spawn(async move { old.kill_and_reap().await });
+        }
         Ok(())
     } else {
         let turn = agent::user_turn(raw_prompt);
-        slot.proc.feed_turn(&turn).await
+        slot.live_process_mut()?.feed_turn(&turn).await
     }
+}
+
+#[derive(Debug)]
+struct DormantWorkerTurnAuthority {
+    cap_run_id: String,
+    assignment: Option<quorum_core::role_assignments::RoleAssignment>,
+}
+
+fn dormant_worker_continuation(slot: &SlotState) -> std::io::Result<Option<&str>> {
+    let SlotProcess::Dormant {
+        kind,
+        continuation_id,
+    } = &slot.proc
+    else {
+        return Ok(None);
+    };
+    if *kind != slot.process_kind() || kind.turn_mode() != runner::TurnMode::RespawnPerTurn {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dormant worker process kind is not a turn-oriented runner",
+        ));
+    }
+    if slot.continuation_id.as_deref() != Some(continuation_id.as_str()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dormant worker continuation does not match the slot's persisted continuation",
+        ));
+    }
+    Ok(Some(continuation_id))
+}
+
+/// Prepare the daemon-owned identity for one dormant worker turn.
+///
+/// The transaction revalidates the exact live task lease, durable continuation,
+/// publication/worktree journal binding, and prior run layout before revoking
+/// the completed turn's capability and issuing the next one. The provider is
+/// not launched until this commits.
+async fn prepare_dormant_worker_turn(
+    slot: &SlotState,
+    config: &ServeConfig,
+) -> std::io::Result<DormantWorkerTurnAuthority> {
+    let continuation_id = dormant_worker_continuation(slot)?
+        .ok_or_else(|| std::io::Error::other("worker slot is not dormant"))?
+        .to_string();
+    let old_run_id = slot.agent_run_id.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dormant worker is missing its completed agent_run identity",
+        )
+    })?;
+    let old_cap_run_id = slot.cap_run_id.clone().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dormant worker is missing its completed run capability",
+        )
+    })?;
+    let pr = slot.pr.filter(|pr| *pr > 0).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "dormant worker rework is missing its daemon-owned PR binding",
+        )
+    })?;
+    let cap_run_id = uuid::Uuid::new_v4().to_string();
+    let path = config.db_path.clone();
+    let agent = slot.agent_name.clone();
+    let task_id = slot.task_id;
+    let provider = slot.process_kind().to_string();
+    let model = slot.model.clone();
+    let effort = slot.effort.clone();
+    let worktree = slot.worktree_path.to_string_lossy().into_owned();
+    let remote_branch = slot.remote_branch.clone();
+    let next_capability = cap_run_id.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<DormantWorkerTurnAuthority> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let now = now_unix();
+        let task = tasks::get(&tx, task_id)?
+            .ok_or_else(|| QuorumError::Io(format!("dormant task #{task_id} disappeared")))?;
+        if task.status != "rework" || task.assignee.as_deref() != Some(agent.as_str()) {
+            return Err(QuorumError::Io(format!(
+                "dormant task #{task_id} is not in rework under agent {agent}"
+            )));
+        }
+        let target = format!("task#{task_id}");
+        let owns_live_lease: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM claims
+             WHERE target=?1 AND holder=?2 AND active=1 AND expires_at>?3)",
+            rusqlite::params![target, agent, now],
+            |row| row.get(0),
+        )?;
+        if !owns_live_lease {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} does not durably own task #{task_id} before launch"
+            )));
+        }
+
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .ok_or_else(|| QuorumError::Io(format!("task #{task_id} has invalid durable refs")))?;
+        let persisted = runner_state::continuation(&refs, ContinuationSlot::Worker, &provider)
+            .ok_or_else(|| {
+                QuorumError::Io(format!(
+                    "task #{task_id} is missing its persisted {provider} continuation"
+                ))
+            })?;
+        if persisted.id != continuation_id {
+            return Err(QuorumError::Io(format!(
+                "task #{task_id} persisted continuation does not match dormant worker {agent}"
+            )));
+        }
+        if tasks::extract_pr_number(&task.refs) != Some(pr) {
+            return Err(QuorumError::Io(format!(
+                "task #{task_id} PR binding does not match dormant worker {agent}"
+            )));
+        }
+
+        let journal_matches: bool = tx
+            .query_row(
+                "SELECT role='worker' AND task_id=?2 AND worktree=?3 AND branch=?4
+                        AND phase='awaiting-review' AND pid IS NULL AND pr=?5
+                 FROM journal WHERE agent=?1",
+                rusqlite::params![agent, task_id, worktree, remote_branch, pr],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !journal_matches {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} does not match its awaiting-review journal binding"
+            )));
+        }
+
+        let old_run = quorum_core::agent_runs::runs_for_task(&tx, task_id)?
+            .into_iter()
+            .find(|run| run.id == old_run_id)
+            .ok_or_else(|| {
+                QuorumError::Io(format!(
+                    "dormant worker {agent} references missing agent_run {old_run_id}"
+                ))
+            })?;
+        if old_run.agent != agent
+            || old_run.role != "worker"
+            || (old_run.ended_at.is_some()
+                && old_run.end_reason.as_deref() != Some("turn-completed"))
+            || old_run.model != model
+            || old_run.effort != effort
+            || old_run.provider.as_deref() != Some(provider.as_str())
+        {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} does not match completed agent_run {old_run_id}"
+            )));
+        }
+        let old_run_was_open = old_run.ended_at.is_none();
+        let layout = recover_original_remediation_layout(&tx, task_id, old_run)?;
+        if layout.model != model || layout.effort != effort || layout.kind.to_string() != provider {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} execution layout changed before rework"
+            )));
+        }
+
+        let old_cap_matches: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_capabilities
+             WHERE run_id=?1 AND task_id=?2 AND agent=?3 AND role='worker')",
+            rusqlite::params![old_cap_run_id, task_id, agent],
+            |row| row.get(0),
+        )?;
+        if !old_cap_matches {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} completed capability does not match task #{task_id}"
+            )));
+        }
+        tx.execute(
+            "UPDATE run_capabilities SET revoked_at=?2
+             WHERE run_id=?1 AND revoked_at IS NULL",
+            rusqlite::params![old_cap_run_id, now],
+        )?;
+        tx.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+             VALUES (?1,?2,?3,'worker',?4)",
+            rusqlite::params![next_capability, task_id, agent, now],
+        )?;
+        let closed = tx.execute(
+            "UPDATE agent_runs SET ended_at=?2,end_reason='turn-completed'
+             WHERE id=?1 AND ended_at IS NULL",
+            rusqlite::params![old_run_id, now],
+        )?;
+        if closed != 1 && old_run_was_open {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} could not close completed agent_run {old_run_id}"
+            )));
+        }
+        tx.commit()?;
+        Ok(DormantWorkerTurnAuthority {
+            cap_run_id: next_capability,
+            assignment: layout.assignment,
+        })
+    })
+    .await
+    .map_err(|join| std::io::Error::other(format!("dormant turn prepare join failed: {join}")))?
+    .map_err(|error| std::io::Error::other(format!("dormant turn prepare failed: {error}")))
+}
+
+async fn finalize_dormant_worker_turn(
+    slot: &SlotState,
+    config: &ServeConfig,
+    authority: &DormantWorkerTurnAuthority,
+) -> std::io::Result<i64> {
+    let path = config.db_path.clone();
+    let task_id = slot.task_id;
+    let agent = slot.agent_name.clone();
+    let model = slot.model.clone();
+    let effort = slot.effort.clone();
+    let provider = slot.process_kind().to_string();
+    let cap_run_id = authority.cap_run_id.clone();
+    let assignment = authority.assignment.clone();
+    tokio::task::spawn_blocking(move || -> Result<i64> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let now = now_unix();
+        let owns_live_lease: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM claims c JOIN tasks t
+             ON c.target='task#' || t.id
+             WHERE t.id=?1 AND t.status='rework' AND t.assignee=?2
+               AND c.holder=?2 AND c.active=1 AND c.expires_at>?3)",
+            rusqlite::params![task_id, agent, now],
+            |row| row.get(0),
+        )?;
+        let owns_capability: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_capabilities
+             WHERE run_id=?1 AND task_id=?2 AND agent=?3 AND role='worker'
+               AND revoked_at IS NULL)",
+            rusqlite::params![cap_run_id, task_id, agent],
+            |row| row.get(0),
+        )?;
+        if !owns_live_lease || !owns_capability {
+            return Err(QuorumError::Io(format!(
+                "dormant worker {agent} lost task/capability authority before run installation"
+            )));
+        }
+        let run_id = match assignment {
+            Some(ref assignment) => quorum_core::agent_runs::insert_worker_with_assignment(
+                &tx,
+                task_id,
+                &agent,
+                &assignment.responsibility_key,
+                &model,
+                &effort,
+                &provider,
+                &provider,
+                Some(assignment.id),
+                now,
+            )?,
+            None => quorum_core::agent_runs::insert(
+                &tx, task_id, &agent, "worker", &model, &effort, &provider, now,
+            )?,
+        };
+        tx.commit()?;
+        Ok(run_id)
+    })
+    .await
+    .map_err(|join| std::io::Error::other(format!("dormant turn finalize join failed: {join}")))?
+    .map_err(|error| std::io::Error::other(format!("dormant turn finalize failed: {error}")))
+}
+
+async fn abort_dormant_worker_turn(db_path: &Path, cap_run_id: &str) {
+    let path = db_path.to_path_buf();
+    let cap_run_id = cap_run_id.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::capabilities::revoke(&mut conn, &cap_run_id, now_unix())?;
+        Ok(())
+    })
+    .await;
+}
+
+async fn settle_dormant_worker_turn_identity(
+    db_path: &Path,
+    agent_run_id: Option<i64>,
+    cap_run_id: Option<&str>,
+    end_reason: &str,
+) {
+    let path = db_path.to_path_buf();
+    let cap_run_id = cap_run_id.map(str::to_string);
+    let end_reason = end_reason.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let now = now_unix();
+        if let Some(run_id) = agent_run_id {
+            tx.execute(
+                "UPDATE agent_runs SET ended_at=COALESCE(ended_at,?2),
+                     end_reason=COALESCE(end_reason,?3) WHERE id=?1",
+                rusqlite::params![run_id, now, end_reason],
+            )?;
+        }
+        if let Some(cap_run_id) = cap_run_id {
+            tx.execute(
+                "UPDATE run_capabilities SET revoked_at=COALESCE(revoked_at,?2)
+                 WHERE run_id=?1",
+                rusqlite::params![cap_run_id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await;
+}
+
+/// Preserve a failed dormant turn through the same durable provider-block
+/// classifier used after bounded turn-oriented runtime failures. Returns
+/// `false` for a live-process slot so the caller can retain the existing
+/// persistent-Claude failure path unchanged.
+async fn handle_dormant_worker_feed_failure(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    worker_index: usize,
+    error: &std::io::Error,
+) -> bool {
+    let (provider, continuation_id) = match &workers[worker_index].proc {
+        SlotProcess::Dormant {
+            kind,
+            continuation_id,
+        } => (kind.to_string(), continuation_id.clone()),
+        SlotProcess::Running(_) => return false,
+    };
+    let pending = PendingTurn {
+        provider,
+        model: workers[worker_index].model.clone(),
+        effort: workers[worker_index].effort.clone(),
+        prompt: workers[worker_index].pending_prompt.clone(),
+        turn_kind: workers[worker_index].pending_turn_kind.clone(),
+        continuation_id: Some(continuation_id),
+        requested: false,
+    };
+    let task_id = workers[worker_index].task_id;
+    let agent = workers[worker_index].agent_name.clone();
+    let reason = format!("dormant continuation launch failed: {error}");
+    match dispose_dead_turn_runner_worker(&config.db_path, task_id, &agent, &reason, &pending).await
+    {
+        Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
+            let worker = workers.remove(worker_index);
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                worker.agent_run_id,
+                worker.cap_run_id.as_deref(),
+                "provider_blocked",
+            )
+            .await;
+            cleanup_slot(config, wt_mgr, name_pool, worker, None, "provider_blocked").await;
+        }
+        Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
+            let worker = workers.remove(worker_index);
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                worker.agent_run_id,
+                worker.cap_run_id.as_deref(),
+                "ownership_transferred",
+            )
+            .await;
+            cleanup_slot(
+                config,
+                wt_mgr,
+                name_pool,
+                worker,
+                None,
+                "ownership_transferred",
+            )
+            .await;
+        }
+        Ok(tasks::DeadTurnRunnerDisposition::DonePending)
+        | Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
+            log(&format!(
+                "dormant worker {agent} feed failure raced a durable delivery for task #{task_id}; retaining slot"
+            ));
+        }
+        Err(classification_error) => {
+            log(&format!(
+                "FATAL: dormant worker {agent} feed failed for task #{task_id} and exact turn could not be parked: {classification_error}; retaining slot"
+            ));
+        }
+    }
+    true
 }
 
 fn should_replace_pending_prompt(prompt: &str) -> bool {
@@ -11290,7 +12257,7 @@ fn runner_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str
             "runner continuation missing its resolved model/effort identity",
         ));
     }
-    let expected = slot.proc.kind();
+    let expected = slot.process_kind();
     match runner::AgentKind::for_model(&slot.model) {
         Ok(actual) if actual == expected => Ok((&slot.model, &slot.effort)),
         Ok(actual) => Err(std::io::Error::new(
@@ -11361,6 +12328,233 @@ async fn persist_runner_continuation(
     }
 }
 
+struct DurableGrokWorkerIdentity {
+    run_task_id: i64,
+    run_agent: String,
+    run_role: String,
+    run_model: String,
+    run_effort: String,
+    run_provider: Option<String>,
+    assignment_id: i64,
+    responsibility_key: String,
+    assignment_task_id: Option<i64>,
+    assignment_role: String,
+    assignment_provider: String,
+    assignment_runner: String,
+    assignment_model: String,
+    assignment_effort: String,
+}
+
+/// Atomically hand off a Grok initial worker's terminal session identity.
+///
+/// Grok is intentionally unreachable from managed configuration, but its
+/// transport boundary is exercised internally. Unlike Codex, Grok issues its
+/// identity only at terminal end, so accepting completion first and persisting
+/// later would allow a continuation decision to race missing or mismatched
+/// authority. Revalidate every durable identity here, then write the exact
+/// pending turn and continuation in one short transaction.
+async fn persist_initial_grok_worker_session(
+    db_path: &Path,
+    slot: &SlotState,
+    session_id: &str,
+) -> Result<()> {
+    if session_id.is_empty()
+        || session_id.len() > 1024
+        || session_id.trim() != session_id
+        || session_id.chars().any(char::is_control)
+    {
+        return Err(QuorumError::Io(
+            "Grok terminal session identity is malformed".into(),
+        ));
+    }
+    let request = slot.worker_request().cloned().ok_or_else(|| {
+        QuorumError::Io("Grok terminal session is missing its exact RunnerRequest".into())
+    })?;
+    if slot.process_kind() != runner::AgentKind::Grok
+        || request.task_id != slot.task_id
+        || request.agent != slot.agent_name
+        || request.role != "worker"
+        || request.provider != "grok"
+        || request.runner != "grok"
+        || request.model != slot.model
+        || request.effort != slot.effort
+        || request.pending_turn.prompt != slot.pending_prompt
+        || request.pending_turn.turn_kind != slot.pending_turn_kind
+        || request.pending_turn.turn_kind != "initial"
+        || slot.continuation_id.is_some()
+    {
+        return Err(QuorumError::Io(
+            "Grok terminal identity does not belong to a fresh initial worker turn".into(),
+        ));
+    }
+
+    let run_id = slot.agent_run_id.ok_or_else(|| {
+        QuorumError::Io("Grok worker terminal identity is missing its agent run".into())
+    })?;
+    let cap_run_id = slot.cap_run_id.clone().ok_or_else(|| {
+        QuorumError::Io("Grok worker terminal identity is missing its run capability".into())
+    })?;
+    let path = db_path.to_path_buf();
+    let task_id = request.task_id;
+    let agent = request.agent.clone();
+    let model = request.model.clone();
+    let effort = request.effort.clone();
+    let pending_turn = request.pending_turn.clone();
+    let requested_assignment_id = request.role_assignment_id;
+    let requested_responsibility = request.responsibility_key.clone();
+    let session_id = session_id.to_string();
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let (status, assignee, revision, refs): (String, Option<String>, i64, Option<String>) = tx
+            .query_row(
+                "SELECT status,assignee,revision,refs FROM tasks WHERE id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        if status != "working" || assignee.as_deref() != Some(agent.as_str()) {
+            return Err(QuorumError::Io(format!(
+                "Grok worker terminal identity arrived after task #{task_id} left its exact working assignment"
+            )));
+        }
+
+        let durable = tx.query_row(
+            "SELECT ar.task_id,ar.agent_name,ar.role,ar.model,ar.effort,ar.provider,
+                    ar.role_assignment_id,ra.responsibility_key,ra.task_id,ra.role,
+                    ra.provider,ra.runner,ra.model,ra.effort
+             FROM agent_runs ar
+             JOIN role_assignments ra ON ra.id=ar.role_assignment_id
+             WHERE ar.id=?1 AND ar.ended_at IS NULL",
+            [run_id],
+            |row| {
+                Ok(DurableGrokWorkerIdentity {
+                    run_task_id: row.get(0)?,
+                    run_agent: row.get(1)?,
+                    run_role: row.get(2)?,
+                    run_model: row.get(3)?,
+                    run_effort: row.get(4)?,
+                    run_provider: row.get(5)?,
+                    assignment_id: row.get(6)?,
+                    responsibility_key: row.get(7)?,
+                    assignment_task_id: row.get(8)?,
+                    assignment_role: row.get(9)?,
+                    assignment_provider: row.get(10)?,
+                    assignment_runner: row.get(11)?,
+                    assignment_model: row.get(12)?,
+                    assignment_effort: row.get(13)?,
+                })
+            },
+        )?;
+        let expected_responsibility = worker_responsibility_key(task_id, revision);
+        if durable.run_task_id != task_id
+            || durable.run_agent != agent
+            || durable.run_role != "worker"
+            || durable.run_model != model
+            || durable.run_effort != effort
+            || durable.run_provider.as_deref() != Some("grok")
+            || durable.assignment_id != requested_assignment_id
+            || durable.responsibility_key != expected_responsibility
+            || durable.responsibility_key != requested_responsibility
+            || durable.assignment_task_id != Some(task_id)
+            || durable.assignment_role != "worker"
+            || durable.assignment_provider != "grok"
+            || durable.assignment_runner != "grok"
+            || durable.assignment_model != model
+            || durable.assignment_effort != effort
+        {
+            return Err(QuorumError::Io(
+                "Grok terminal session does not match its durable task, assignment, role, model, effort, and runner identity".into(),
+            ));
+        }
+
+        let owns_capability: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM run_capabilities
+                 WHERE run_id=?1 AND task_id=?2 AND agent=?3
+                   AND role='worker' AND revoked_at IS NULL
+             )",
+            rusqlite::params![cap_run_id, task_id, agent],
+            |row| row.get(0),
+        )?;
+        if !owns_capability {
+            return Err(QuorumError::Io(
+                "Grok terminal session lost its exact worker capability".into(),
+            ));
+        }
+
+        let mut refs: serde_json::Value = refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let handoff = InitialWorkerSession {
+            task_id,
+            role_assignment_id: durable.assignment_id,
+            responsibility_key: durable.responsibility_key,
+            agent: agent.clone(),
+            role: "worker".into(),
+            provider: "grok".into(),
+            runner: "grok".into(),
+            model,
+            effort,
+            pending_turn,
+            session_id: session_id.clone(),
+        };
+        let existing_handoff = runner_state::initial_worker_session(&refs);
+        let existing_continuation = runner_state::continuation(
+            &refs,
+            ContinuationSlot::Worker,
+            "grok",
+        );
+        if refs.get(runner_state::CONTINUATION_REF).is_some()
+            || refs
+                .get(runner_state::INITIAL_WORKER_SESSION_REF)
+                .is_some()
+        {
+            if existing_handoff.as_ref() == Some(&handoff)
+                && existing_continuation
+                    .as_ref()
+                    .is_some_and(|identity| identity.id == session_id)
+            {
+                // The DB commit may have completed immediately before the
+                // async caller was cancelled. Replaying the identical exact
+                // handoff is safe; duplicate provider records are rejected by
+                // the process-evidence gate before this transaction begins.
+                tx.commit()?;
+                return Ok(());
+            }
+            return Err(QuorumError::Io(
+                "Grok emitted a duplicate or conflicting terminal session identity".into(),
+            ));
+        }
+        runner_state::set_initial_worker_session(&mut refs, &handoff);
+        runner_state::set_continuation(
+            &mut refs,
+            ContinuationSlot::Worker,
+            &ContinuationIdentity {
+                provider: "grok".into(),
+                id: session_id,
+            },
+        );
+        let updated = tx.execute(
+            "UPDATE tasks SET refs=?2,updated_at=?3
+             WHERE id=?1 AND status='working' AND assignee=?4 AND revision=?5",
+            rusqlite::params![task_id, refs.to_string(), now_unix(), agent, revision],
+        )?;
+        if updated != 1 {
+            return Err(QuorumError::Io(
+                "Grok worker terminal identity lost task authority before persistence".into(),
+            ));
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("Grok session handoff join failed: {error}")))?
+}
+
 /// Phase 4b disposition for a dead turn-oriented worker.
 ///
 /// A turn-oriented process exits at turn end, so a successful `quorum submit`
@@ -11402,6 +12596,127 @@ async fn dispose_dead_turn_runner_worker(
     disposition
 }
 
+/// Park a delivered turn-oriented worker slot in place. The completed process
+/// is reaped and its captured output persisted; the sticky slot retains its
+/// name, active claim, journal, worktree, branch, PR, and continuation so
+/// Phase 4d renews its lease and Phase 5 provisions a reviewer for it.
+///
+/// A failure to persist the `awaiting-review` journal row (SQLite busy/IO,
+/// blocking-task join failure, or an upsert error) is surfaced to the caller
+/// so the fallback path can fully release the slot instead of retaining a
+/// dormant worker whose crash-recovery row still advertises the reaped process
+/// PID and a stale phase — restart recovery trusts that PID and would call
+/// `killpg` on whatever process group has since reused it.
+async fn park_worker_slot_dormant(db_path: &Path, slot: &mut SlotState) -> std::io::Result<()> {
+    let old = slot.become_dormant()?;
+    let captured = old.kill_and_reap().await;
+    persist_terminal_output(&mut slot.session_log, captured);
+    slot.draining = false;
+    slot.turn_ended_at = Some(std::time::Instant::now());
+    slot.error_turn_count = 0;
+    slot.last_error_text = None;
+    let entry = slot_journal_entry(slot, "worker", "awaiting-review");
+    let p = db_path.to_path_buf();
+    let upsert = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        journal::upsert(&mut conn, &entry)
+    })
+    .await
+    .map_err(|join| std::io::Error::other(format!("park journal join failed: {join}")))?;
+    upsert.map_err(|err| std::io::Error::other(format!("park journal upsert failed: {err}")))?;
+    Ok(())
+}
+
+/// Phase 5 spawns a reviewer for every worker slot that has published a PR
+/// and finished its turn, without a reviewer already paired for the same
+/// task. Extracted so the production decision is testable: a dormant sticky
+/// slot with its PR retained and `draining=false` must remain eligible.
+fn slot_needs_reviewer_provisioning(slot: &SlotState, reviewers: &[SlotState]) -> Option<i64> {
+    let pr = slot.pr?;
+    if slot.draining {
+        return None;
+    }
+    if reviewers.iter().any(|r| r.task_id == slot.task_id) {
+        return None;
+    }
+    Some(pr)
+}
+
+/// Route a delivered turn-oriented worker exit through the sticky-dormant
+/// park; on any journal failure, fall through to the full-cleanup path that
+/// releases the name/worktree/branch and deletes the stale journal row.
+/// Extracted so both `DeliveryRecorded` call sites (ordinary exit and bounded
+/// error-exhaustion) execute the exact same reinsertion logic — a regression
+/// that drops the reinsertion at either site must fail the shared regression
+/// test.
+async fn park_or_cleanup_delivered_worker_slot(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    slot_index: usize,
+    mut dead: SlotState,
+) {
+    let db_path = config.db_path.clone();
+    match park_worker_slot_dormant(&db_path, &mut dead).await {
+        Ok(()) => {
+            log(&format!(
+                "worker {} parked dormant after delivering task #{} — awaiting reviewer",
+                dead.agent_name, dead.task_id
+            ));
+            workers.insert(slot_index, dead);
+        }
+        Err(error) => {
+            log(&format!(
+                "worker {} cannot park dormant for task #{} ({error}); cleaning up completed run",
+                dead.agent_name, dead.task_id
+            ));
+            cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+        }
+    }
+}
+
+/// Extend each active worker's task claim so a long review wait cannot let a
+/// task expire out from under a live or parked slot. Extracted so Phase 4d's
+/// tick loop and the state-machine regression test drive the same code path.
+async fn renew_active_worker_task_leases(db_path: &Path, workers: &[SlotState]) {
+    let active_pairs: Vec<(String, i64)> = workers
+        .iter()
+        .map(|w| (w.agent_name.clone(), w.task_id))
+        .collect();
+    if active_pairs.is_empty() {
+        return;
+    }
+    let p = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = quorum_core::db::open(&p) {
+            let now = now_unix();
+            for (agent, task_id) in &active_pairs {
+                let _ = quorum_core::agents::renew_task_lease(&conn, agent, *task_id, now);
+            }
+        }
+    })
+    .await
+    .ok();
+}
+
+/// The idle watchdog reaps workers that sit between turns for longer than the
+/// operator-configured limit. Extracted so the production decision is
+/// testable: a regression that lets the watchdog kill a dormant awaiting-
+/// review slot must break the same predicate the tick loop consults.
+fn slot_is_idle_zombie_candidate(slot: &SlotState, idle_timeout_secs: u64) -> bool {
+    if slot.draining || slot.error_turn_count > 0 {
+        return false;
+    }
+    // Dormant sticky slots have no live process to zombify; they exist to
+    // hold the exact continuation until the reviewer produces a verdict.
+    if matches!(slot.proc, SlotProcess::Dormant { .. }) {
+        return false;
+    }
+    slot.turn_ended_at
+        .is_some_and(|t| t.elapsed().as_secs() > idle_timeout_secs)
+}
+
 async fn persist_runner_provider_block(
     db_path: &std::path::Path,
     task_id: i64,
@@ -11433,6 +12748,27 @@ async fn persist_runner_provider_block(
     })
     .await;
     result.map_err(|error| QuorumError::Io(format!("provider-block join failed: {error}")))?
+}
+
+/// Record a retrying provider block before allowing its worker identity to
+/// remain leased. A failed durable write must leave the release guard loud:
+/// without the retry record, silently retaining the active claim would strand
+/// the task with no recoverable continuation state.
+async fn persist_provider_blocked_retry_for_name_retention(
+    db_path: &std::path::Path,
+    task_id: i64,
+    reason: &str,
+    retry: &PendingTurn,
+) -> WorkerNameReleaseExpectation {
+    match persist_runner_provider_block(db_path, task_id, reason, retry).await {
+        Ok(()) => WorkerNameReleaseExpectation::RetainedForProviderRetry,
+        Err(error) => {
+            log(&format!(
+                "FATAL: failed to persist provider-blocked retry for task #{task_id}: {error}"
+            ));
+            WorkerNameReleaseExpectation::Released
+        }
+    }
 }
 
 async fn cleanup_failed_remediation_identity(db_path: &Path, agent_name: &str, cap_run_id: &str) {
@@ -11507,33 +12843,103 @@ async fn drain_events(
     role: &str,
     limits: &CostLimits,
 ) -> Result<Option<LimitBreached>> {
-    persist_diagnostics(slot);
-    while let Ok(Some(raw_line)) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), slot.proc.next_raw_line()).await
-    {
-        let events = runner::normalize_line(slot.proc.kind(), &raw_line);
+    enum DrainedLine {
+        Raw(String),
+        AuthorizedGrokTerminal(String),
+    }
 
-        if let Some(ref mut sl) = slot.session_log {
-            sl.log_raw_and_normalized(&raw_line, &events);
-        }
+    persist_diagnostics(slot).map_err(|error| {
+        QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
+    })?;
+    for _ in 0..MAX_STREAM_LINES_PER_TICK {
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            slot.live_process_mut()
+                .map_err(|error| {
+                    QuorumError::Io(format!("slot event drain requires a live process: {error}"))
+                })?
+                .next_raw_line(),
+        )
+        .await;
+        let drained = match read {
+            Ok(Some(raw_line)) => DrainedLine::Raw(raw_line),
+            Ok(None) => {
+                let terminal = slot
+                    .live_process_mut()
+                    .map_err(|error| {
+                        QuorumError::Io(format!(
+                            "slot terminal authorization requires a live process: {error}"
+                        ))
+                    })?
+                    .authorized_grok_terminal()
+                    .await;
+                let Some(raw_line) = terminal else {
+                    let pending = slot
+                        .live_process_mut()
+                        .map_err(|error| {
+                            QuorumError::Io(format!(
+                                "slot terminal evidence check requires a live process: {error}"
+                            ))
+                        })?
+                        .grok_terminal_evidence_pending();
+                    if pending {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        continue;
+                    }
+                    break;
+                };
+                DrainedLine::AuthorizedGrokTerminal(raw_line)
+            }
+            Err(_) => break,
+        };
+        let events = match drained {
+            DrainedLine::Raw(raw_line) => {
+                let events = slot
+                    .live_process_mut()
+                    .map_err(|error| {
+                        QuorumError::Io(format!(
+                            "slot stream normalization requires a live process: {error}"
+                        ))
+                    })?
+                    .normalize_stream_line(&raw_line);
+                if let Some(ref mut sl) = slot.session_log {
+                    sl.log_raw_and_normalized(&raw_line, &events);
+                }
+                events
+            }
+            DrainedLine::AuthorizedGrokTerminal(raw_line) => runner::normalize_grok_line(&raw_line),
+        };
 
         for agent_event in &events {
+            slot.last_event_at = std::time::Instant::now();
             match agent_event {
                 runner::AgentEvent::ThreadStarted { thread_id } => {
-                    slot.continuation_id = Some(thread_id.clone());
-                    let continuation_slot = if role == "worker" {
-                        ContinuationSlot::Worker
+                    if slot.process_kind() == runner::AgentKind::Grok {
+                        if role != "worker" {
+                            return Err(QuorumError::Io(
+                                "managed Grok terminal identity is valid only at the internal worker boundary"
+                                    .into(),
+                            ));
+                        }
+                        persist_initial_grok_worker_session(db_path, slot, thread_id).await?;
                     } else {
-                        reviewer_continuation_slot(slot.r2_origin)
-                    };
-                    persist_runner_continuation(
-                        db_path,
-                        slot.task_id,
-                        &slot.proc.kind().to_string(),
-                        thread_id,
-                        continuation_slot,
-                    )
-                    .await;
+                        let continuation_slot = if role == "worker" {
+                            ContinuationSlot::Worker
+                        } else {
+                            reviewer_continuation_slot(slot.r2_origin)
+                        };
+                        persist_runner_continuation(
+                            db_path,
+                            slot.task_id,
+                            &slot.process_kind().to_string(),
+                            thread_id,
+                            continuation_slot,
+                        )
+                        .await;
+                    }
+                    // In-memory continuation becomes usable only after the
+                    // provider-specific durable handoff has completed.
+                    slot.continuation_id = Some(thread_id.clone());
                 }
                 runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
                     let turn_tokens =
@@ -11662,18 +13068,35 @@ async fn drain_events(
                 }
             }
         }
-        persist_diagnostics(slot);
+        persist_diagnostics(slot).map_err(|error| {
+            QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
+        })?;
     }
     Ok(None)
 }
 
-fn persist_diagnostics(slot: &mut SlotState) {
-    for output in slot.proc.drain_diagnostics() {
+/// Consume a bounded batch of queued provider events before judging liveness.
+/// A provider may have emitted fresh events that this tick has not observed yet.
+async fn check_active_slot_limits(
+    slot: &mut SlotState,
+    db_path: &std::path::Path,
+    role: &str,
+    limits: &CostLimits,
+) -> Result<Option<LimitBreached>> {
+    if let Some(breach) = drain_events(slot, db_path, role, limits).await? {
+        return Ok(Some(breach));
+    }
+    Ok(check_wall_clock_limits(limits, slot))
+}
+
+fn persist_diagnostics(slot: &mut SlotState) -> std::io::Result<()> {
+    for output in slot.live_process_mut()?.drain_diagnostics() {
         if let Some(ref mut sl) = slot.session_log {
             let line = output.session_line();
             sl.log_raw_and_normalized(&line, &[]);
         }
     }
+    Ok(())
 }
 
 fn persist_terminal_output(
@@ -11848,7 +13271,7 @@ async fn provision_reviewer(
     };
     if !reserved {
         log(&format!(
-            "{}: task #{} has no reviewer provisioning authority (phase, classification, reservation, or planning freeze)",
+            "{}: task #{} has no reviewer provisioning authority (phase, classification, or reservation)",
             role.as_str().to_uppercase(),
             worker.task_id
         ));
@@ -11866,6 +13289,7 @@ async fn provision_reviewer(
         role,
         head_sha,
         recover_interrupted,
+        &reservation,
     )
     .await;
     let path = config.db_path.clone();
@@ -11895,6 +13319,7 @@ async fn provision_reviewer_reserved(
     role: &ReviewRole,
     head_sha: &str,
     recover_interrupted: bool,
+    reservation: &str,
 ) -> Result<()> {
     // The check result is meaningful only for the exact PR head that was
     // gated. Re-resolve through the configured executor immediately before
@@ -11922,38 +13347,63 @@ async fn provision_reviewer_reserved(
         return Ok(());
     }
 
-    // Resolve/fetch metadata before acquisition too. Production gets the
-    // authoritative GitHub target; command-executor tests can fall back to
-    // their managed branch, whose fetched HEAD is still verified below.
-    let pr_target = {
-        let pr_num = pr;
+    // Resolution is deliberately complete before the short guarded
+    // persistence transaction. A live target has no durable authority until
+    // its complete identity and exact gated head pass validation.
+    let resolved_target = resolve_or_load_reviewer_pr_target(
+        pr,
+        worker.task_id,
+        &config.db_path,
+        &config.repo_dir,
+        Some(&config.repo),
+    )
+    .await?;
+    if let Some(resolved) = &resolved_target {
+        if let Err(reason) =
+            validate_reviewer_pr_target(resolved, pr, head_sha, &config.base_branch)
+        {
+            log(&format!(
+                "{}: {reason} — reviewer not acquired or spawned",
+                role.as_str().to_uppercase()
+            ));
+            return Ok(());
+        }
+        let path = config.db_path.clone();
+        let persisted = resolved.clone();
+        let token = reservation.to_string();
+        let role_name = role.as_str().to_string();
+        let gated = head_sha.to_string();
         let task_id = worker.task_id;
-        let repo_dir = config.repo_dir.clone();
-        let gh_repo = config.repo.clone();
-        let db_path = config.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            resolve_or_load_pr_target(pr_num, task_id, &db_path, &repo_dir, Some(&gh_repo))
+        let accepted = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&path)?;
+            persist_reviewer_pr_target(&mut conn, task_id, &token, &role_name, &persisted, &gated)
         })
         .await
-        .ok()
-        .flatten()
-    };
-    if pr_target
-        .as_ref()
-        .is_some_and(|target| target.head_sha != head_sha)
-    {
-        log(&format!(
-            "{}: PR #{pr} resolved target moved after CI gate (gated {}, current {}) — \
-             reviewer not acquired or spawned",
-            role.as_str().to_uppercase(),
-            head_sha,
-            pr_target
-                .as_ref()
-                .map(|target| target.head_sha.as_str())
-                .unwrap_or("<missing>")
-        ));
-        return Ok(());
+        .map_err(|error| {
+            QuorumError::Io(format!(
+                "reviewer target persistence join for task #{task_id}: {error}"
+            ))
+        })?;
+        match accepted {
+            Ok(true) => {}
+            Ok(false) => {
+                log(&format!(
+                    "{}: task #{task_id} lost lifecycle or reservation authority before target persistence — reviewer not acquired or spawned",
+                    role.as_str().to_uppercase()
+                ));
+                return Ok(());
+            }
+            Err(QuorumError::Usage(reason)) => {
+                log(&format!(
+                    "{}: {reason} — reviewer not acquired or spawned",
+                    role.as_str().to_uppercase()
+                ));
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
     }
+    let pr_target = resolved_target.map(|resolved| resolved.target);
 
     let recovery = if recover_interrupted {
         let p = config.db_path.clone();
@@ -12316,6 +13766,17 @@ async fn provision_reviewer_reserved(
             }
         }
     };
+    // Replacement R1/R2 reviewers, including daemon-restart recovery, are
+    // fresh processes. Carry the durable lifecycle count into their initial
+    // turn whenever they are actually reviewing a remediated task.
+    let review_cycle = {
+        let db_path = config.db_path.clone();
+        let task_id = worker.task_id;
+        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
+    };
+    let review_cycle = (review_cycle.rework_round != 0).then_some(review_cycle);
 
     // Prompt composition remains role- and provider-aware; the runner adapter
     // owns how that neutral prompt reaches the CLI.
@@ -12326,11 +13787,12 @@ async fn provision_reviewer_reserved(
                 worker_agent: worker.agent_name.to_string(),
                 reviewer_name: reviewer_name.clone(),
             };
-            reviewer::build_review_prompt_for_kind_with_context(
+            reviewer::build_review_prompt_for_kind_with_context_and_cycle(
                 reviewer_kind,
                 &spec,
                 &reviewer_effort,
                 graph_context.as_deref(),
+                review_cycle,
             )
         }
         ReviewRole::R2 { r1_reviewer, .. } => {
@@ -12340,14 +13802,23 @@ async fn provision_reviewer_reserved(
                 r1_reviewer: r1_reviewer.clone(),
                 r2_name: reviewer_name.clone(),
             };
-            reviewer::build_r2_review_prompt_for_kind_with_context(
+            reviewer::build_r2_review_prompt_for_kind_with_context_and_cycle(
                 reviewer_kind,
                 &spec,
                 &reviewer_effort,
                 graph_context.as_deref(),
+                review_cycle,
             )
         }
     };
+    let task_contract = {
+        let db_path = config.db_path.clone();
+        let task_id = worker.task_id;
+        tokio::task::spawn_blocking(move || load_task_review_contract(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("task review context join: {error}")))??
+    };
+    let prompt = format!("{prompt}\n\n{task_contract}");
 
     let reviewer_env = vec![
         ("QUORUM_REPO".into(), config.repo.clone()),
@@ -12622,7 +14093,7 @@ async fn provision_reviewer_reserved(
             let now_instant = std::time::Instant::now();
             reviewers.push(SlotState {
                 agent_name: reviewer_name.clone(),
-                proc,
+                proc: SlotProcess::running(proc),
                 task_id: worker.task_id,
                 session_id,
                 model: reviewer_model,
@@ -12639,6 +14110,7 @@ async fn provision_reviewer_reserved(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: None,
                 agent_state: None,
                 session_log: reviewer_session_log,
@@ -12706,6 +14178,7 @@ async fn spawn_worker(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     poison_tracker: &mut PoisonTracker,
+    claim_skip_logs: &mut ClaimSkipLogLimiter,
     lifetime_roster: &mut LifetimeRoster,
 ) -> Result<bool> {
     let db_path = config.db_path.clone();
@@ -12721,7 +14194,7 @@ async fn spawn_worker(
 
     let ready_task = tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
-        let mut available = tasks::list(&conn, Some("open"), None, None)?;
+        let mut available = tasks::list_implementation_ready_open(&conn)?;
         available.extend(
             tasks::list(&conn, Some("rework"), None, None)?
                 .into_iter()
@@ -12785,9 +14258,6 @@ async fn spawn_worker(
         ));
     }
     let agent_name = acquire_result.into_name();
-    // #181: register in the lifetime roster BEFORE any DB work so we know this
-    // name belongs to us for the rest of the daemon's life.
-    lifetime_roster.register(&agent_name);
 
     // F9: drain stale mailbox rows for this name to prevent phantom verdicts.
     {
@@ -12806,11 +14276,6 @@ async fn spawn_worker(
             ));
         }
     }
-
-    log(&format!(
-        "spawning agent {} for task #{} ({})",
-        agent_name, task.id, task.title
-    ));
 
     // Claim the task atomically (open → claimed)
     let p = db_path.clone();
@@ -12844,7 +14309,12 @@ async fn spawn_worker(
 
     match claimed {
         Ok(None) => {
-            log(&format!("task #{} already claimed, skipping", task.id));
+            if claim_skip_logs.should_log(task.id, std::time::Instant::now()) {
+                log(&format!(
+                    "task #{} no longer claimable after selection; skipping",
+                    task.id
+                ));
+            }
             name_pool.release(&agent_name);
             return Ok(false);
         }
@@ -12857,6 +14327,13 @@ async fn spawn_worker(
             task = claimed_task;
         }
     }
+
+    lifetime_roster.register(&agent_name);
+
+    log(&format!(
+        "spawning agent {} for task #{} ({})",
+        agent_name, task.id, task.title
+    ));
 
     let worker_repo_dir = &config.repo_dir;
 
@@ -12872,7 +14349,7 @@ async fn spawn_worker(
                 let reason = format!("continue PR #{pr} provisioning rejected: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "open").await;
-                name_pool.release(&agent_name);
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
         }
@@ -12883,7 +14360,7 @@ async fn spawn_worker(
                 let reason = format!("parked rework publication provisioning rejected: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "rework").await;
-                name_pool.release(&agent_name);
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
         };
@@ -12898,7 +14375,8 @@ async fn spawn_worker(
                         );
                         persist_provisioning_failure(&db_path, task.id, &reason).await;
                         park_task(&db_path, task.id, &reason, "rework").await;
-                        name_pool.release(&agent_name);
+                        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id)
+                            .await;
                         return Ok(false);
                     }
                 }
@@ -12967,7 +14445,7 @@ async fn spawn_worker(
                 let reason = format!("branch provenance resolution failed: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "open").await;
-                name_pool.release(&agent_name);
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
         };
@@ -13010,7 +14488,7 @@ async fn spawn_worker(
                 "open",
             )
             .await;
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
             return Ok(false);
         }
     }
@@ -13064,9 +14542,9 @@ async fn spawn_worker(
                     resume_status,
                 )
                 .await;
-                name_pool.release(&agent_name);
                 wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
             let strikes = poison_tracker.record_strike(task.id);
@@ -13075,7 +14553,7 @@ async fn spawn_worker(
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             return Ok(false);
         }
@@ -13094,9 +14572,9 @@ async fn spawn_worker(
         } else {
             release_task(&db_path, &agent_name, task.id).await;
         }
-        name_pool.release(&agent_name);
         wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
         return Ok(false);
     }
 
@@ -13234,25 +14712,32 @@ async fn spawn_worker(
              Codex cannot report cost; rejecting to avoid silent over-spend",
             task.id
         ));
-        if let Some(retry) = &retry_turn {
+        let name_release_expectation = if let Some(retry) = &retry_turn {
             // Rework retry: park so the operator can intervene without
             // losing the durable turn. Do NOT call release_task — it
             // would set status=open and break the rework state contract.
-            persist_runner_provider_block(
+            persist_provider_blocked_retry_for_name_retention(
                 &db_path,
                 task.id,
                 "Codex+USD cost limit incompatible — daemon has max_*_cost_usd configured",
                 retry,
             )
             .await
-            .ok();
         } else {
             // Initial open task: poison — this won't resolve on retry.
             poison_task(&db_path, &agent_name, task.id, MAX_POISON_STRIKES, None).await;
-        }
-        name_pool.release(&agent_name);
+            WorkerNameReleaseExpectation::Released
+        };
         wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+        guarded_worker_name_release_with_expectation(
+            &db_path,
+            name_pool,
+            &agent_name,
+            task.id,
+            name_release_expectation,
+        )
+        .await;
         return Ok(false);
     }
 
@@ -13343,7 +14828,7 @@ async fn spawn_worker(
             let now_instant = std::time::Instant::now();
             workers.push(SlotState {
                 agent_name,
-                proc,
+                proc: SlotProcess::running(proc),
                 task_id: task.id,
                 session_id,
                 model: resolved_model,
@@ -13364,6 +14849,7 @@ async fn spawn_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
@@ -13392,9 +14878,9 @@ async fn spawn_worker(
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
-            name_pool.release(&agent_name);
             wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
             return Ok(false);
         }
     }
@@ -13480,7 +14966,7 @@ async fn fire_event_result(
     task_id: i64,
     event: &Event,
 ) -> std::result::Result<tasks::TransitionResult, String> {
-    fire_event_result_inner(db_path, agent, task_id, event, false).await
+    fire_event_result_inner(db_path, agent, task_id, event, None).await
 }
 
 async fn fire_published_event_result(
@@ -13488,8 +14974,9 @@ async fn fire_published_event_result(
     agent: &str,
     task_id: i64,
     event: &Event,
+    publication: &PublishedCompletion,
 ) -> std::result::Result<tasks::TransitionResult, String> {
-    fire_event_result_inner(db_path, agent, task_id, event, true).await
+    fire_event_result_inner(db_path, agent, task_id, event, Some(publication.clone())).await
 }
 
 async fn fire_event_result_inner(
@@ -13497,7 +14984,7 @@ async fn fire_event_result_inner(
     agent: &str,
     task_id: i64,
     event: &Event,
-    published: bool,
+    publication: Option<PublishedCompletion>,
 ) -> std::result::Result<tasks::TransitionResult, String> {
     let p = db_path.to_path_buf();
     let a = agent.to_string();
@@ -13506,8 +14993,8 @@ async fn fire_event_result_inner(
     let result = tokio::task::spawn_blocking(move || -> Result<tasks::TransitionResult> {
         let mut conn = quorum_core::db::open(&p)?;
         let now = now_unix();
-        if published {
-            tasks::apply_published_worker_event(&mut conn, &a, task_id, &ev, now)
+        if let Some(publication) = publication {
+            tasks::apply_published_worker_event(&mut conn, &a, task_id, &ev, &publication, now)
         } else {
             tasks::apply_event(&mut conn, &a, task_id, &ev, now)
         }
@@ -13686,6 +15173,25 @@ fn managed_exit_end_reason(disposition: &tasks::ManagedExitDisposition) -> Optio
         tasks::ManagedExitDisposition::OwnershipTransferred => Some("ownership_transferred"),
         tasks::ManagedExitDisposition::AgentFailed(_) => Some("crashed"),
     }
+}
+
+/// The DB disposition is the authority gate for this taxonomy. Pending or
+/// recorded submissions/verdicts and transferred/terminal ownership are
+/// semantic managed outcomes, regardless of process output or exit status.
+async fn classify_managed_pre_authoritative_exit(
+    slot: &mut SlotState,
+    status: std::process::ExitStatus,
+    disposition: &tasks::ManagedExitDisposition,
+) -> Option<runner::RunnerFailure> {
+    if !managed_exit_permits_runner_failure(disposition) {
+        return None;
+    }
+    slot.finalize_pre_authoritative_exit_evidence().await;
+    slot.classify_pre_authoritative_exit(status)
+}
+
+fn managed_exit_permits_runner_failure(disposition: &tasks::ManagedExitDisposition) -> bool {
+    matches!(disposition, tasks::ManagedExitDisposition::AgentFailed(_))
 }
 
 /// Gather task context from the DB and persist a structured lifecycle diagnostic.
@@ -13874,6 +15380,119 @@ async fn lookup_task_refs(db_path: &std::path::Path, task_id: i64) -> Option<Str
     .flatten()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerNameReleaseExpectation {
+    /// The caller has settled the worker lease before cleanup, so a live lease
+    /// is an abnormal condition that must stay loud.
+    Released,
+    /// A provider-blocked retry deliberately preserves the worker lease and
+    /// its daemon-issued name for the continuation.
+    RetainedForProviderRetry,
+}
+
+fn worker_name_release_expectation(end_reason: &str) -> WorkerNameReleaseExpectation {
+    if end_reason == "provider_blocked" {
+        WorkerNameReleaseExpectation::RetainedForProviderRetry
+    } else {
+        WorkerNameReleaseExpectation::Released
+    }
+}
+
+/// Guarded release of a worker's daemon-issued identity back to the name pool.
+///
+/// Names are shared authority: an identity that is still tied to a live task
+/// lease can be re-acquired by the next spawn and race the still-active claim.
+/// This helper is the ONLY sanctioned path for returning a worker name after
+/// teardown — it verifies inside a `BEGIN IMMEDIATE` snapshot that no active,
+/// unexpired lease on `task#<id>` is still held by this agent before the pool
+/// release. If the lease is still live, or the DB check itself fails, the name
+/// is retained in `in_use` — a leaked name is strictly safer than one recycled
+/// under an active claim. A retained lease is only expected for a
+/// provider-blocked retry; every other live lease and all DB/spawn failures are
+/// recorded as errors. Filesystem and process cleanup is done by the caller
+/// before invoking this guard so the DB check/settlement stays a short
+/// transaction.
+async fn guarded_worker_name_release(
+    db_path: &Path,
+    name_pool: &mut Pool,
+    agent: &str,
+    task_id: i64,
+) {
+    guarded_worker_name_release_with_expectation(
+        db_path,
+        name_pool,
+        agent,
+        task_id,
+        WorkerNameReleaseExpectation::Released,
+    )
+    .await;
+}
+
+async fn guarded_worker_name_release_with_expectation(
+    db_path: &Path,
+    name_pool: &mut Pool,
+    agent: &str,
+    task_id: i64,
+    expectation: WorkerNameReleaseExpectation,
+) {
+    let p = db_path.to_path_buf();
+    let agent_owned = agent.to_string();
+    let check = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::worker_lease_active_for(&mut conn, &agent_owned, task_id, now_unix())
+    })
+    .await;
+
+    let active = match check {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            let detail = format!(
+                "worker name release retained: DB error checking task#{task_id} claim for {agent}: {e}"
+            );
+            log(&detail);
+            persist_name_release_error(db_path, agent, task_id, &detail).await;
+            return;
+        }
+        Err(e) => {
+            let detail = format!(
+                "worker name release retained: spawn error checking task#{task_id} claim for {agent}: {e}"
+            );
+            log(&detail);
+            persist_name_release_error(db_path, agent, task_id, &detail).await;
+            return;
+        }
+    };
+
+    if active {
+        let detail =
+            format!("worker name release retained: task#{task_id} claim still active for {agent}");
+        log(&detail);
+        if expectation == WorkerNameReleaseExpectation::Released {
+            persist_name_release_error(db_path, agent, task_id, &detail).await;
+        }
+        return;
+    }
+
+    name_pool.release(agent);
+}
+
+async fn persist_name_release_error(db_path: &Path, agent: &str, task_id: i64, detail: &str) {
+    let path = db_path.to_path_buf();
+    let agent_owned = agent.to_string();
+    let detail = detail.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = quorum_core::db::open(&path) {
+            quorum_core::errlog::log_error(
+                &conn,
+                now_unix(),
+                "name_release",
+                &format!("task #{task_id} agent {agent_owned}: {detail}"),
+            );
+        }
+    })
+    .await;
+}
+
 /// Clean up a worker slot's resources without updating task status.
 /// Used when `apply_event` has already transitioned the task state.
 async fn cleanup_slot(
@@ -13939,7 +15558,14 @@ async fn cleanup_slot_inner(
         wt_mgr.delete_branch(repo_dir, &state.branch).await;
     }
 
-    name_pool.release(&state.agent_name);
+    guarded_worker_name_release_with_expectation(
+        &config.db_path,
+        name_pool,
+        &state.agent_name,
+        state.task_id,
+        worker_name_release_expectation(end_reason),
+    )
+    .await;
 }
 
 /// Tear down a worker agent: kill process, update task, clean up journal/worktree/name.
@@ -14041,7 +15667,7 @@ async fn teardown_worker_with_body(
     wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
     wt_mgr.delete_branch(repo_dir, &state.branch).await;
 
-    name_pool.release(&state.agent_name);
+    guarded_worker_name_release(&config.db_path, name_pool, &state.agent_name, state.task_id).await;
     log(&format!("worker {} torn down", state.agent_name));
 }
 
@@ -14231,6 +15857,224 @@ async fn install_live_worker_remediation_lease(
     }
 }
 
+/// One shared entry point for every sticky-worker remediation call site: install
+/// the fresh remediation lease AND durably bind the exact daemon-owned PR head
+/// as the pre-turn baseline, in that order. Feed the pending turn only after
+/// both operations succeed under guarded authority.
+///
+/// Task #448 root cause: initial publication legitimately records an intent
+/// with `expected_remote_sha = NULL` (new branch push). Without binding the
+/// exact head before the next remediation turn, the subsequent existing-PR
+/// push cannot prove its compare-and-swap baseline and fails safe. Every
+/// sticky call site now goes through this helper.
+async fn install_sticky_remediation_lease_and_baseline(
+    config: &ServeConfig,
+    agent: String,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) -> bool {
+    if !install_live_worker_remediation_lease(config, agent.clone(), task_id, pr, feedback).await {
+        return false;
+    }
+    if pr <= 0 {
+        log(&format!(
+            "sticky remediation: task #{task_id} has no PR to bind — releasing lease and parking"
+        ));
+        release_sticky_remediation_lease(&config.db_path, &agent, task_id).await;
+        let cause = classified_provisioning_cause(
+            "sticky remediation baseline binding failed: no PR identity",
+        );
+        park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
+        return false;
+    }
+    if let Err(error) = bind_sticky_remediation_pr_baseline(config, task_id, pr).await {
+        log(&format!(
+            "sticky remediation: baseline bind failed for task #{task_id} PR #{pr}: {error} \
+             — releasing lease and parking"
+        ));
+        release_sticky_remediation_lease(&config.db_path, &agent, task_id).await;
+        let cause = classified_provisioning_cause(&format!(
+            "sticky remediation baseline binding failed: {error}"
+        ));
+        park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
+        return false;
+    }
+    true
+}
+
+async fn release_sticky_remediation_lease(db_path: &Path, agent: &str, task_id: i64) {
+    let p = db_path.to_path_buf();
+    let name = agent.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!(
+            "sticky remediation: lease release failed for task #{task_id}: {error}"
+        )),
+        Err(error) => log(&format!(
+            "sticky remediation: lease release join failed for task #{task_id}: {error}"
+        )),
+    }
+}
+
+/// Resolve the current daemon-owned PR target for every sticky remediation
+/// turn and atomically persist its exact head SHA as the durable baseline for
+/// the next publication push. The spawn-time `pr_targets` row is IMMUTABLE
+/// authority: when it already exists, the resolved live target MUST match it
+/// on head_ref, head_sha, and fork status; any drift means the head moved
+/// outside the daemon's lease and fails loudly. When the durable row is
+/// missing (the #447 initial-publication gap), the live target may bootstrap
+/// it only after matching any exact failed-CI head retained in task refs.
+///
+/// The GitHub lookup runs BEFORE the DB transaction; the transaction only
+/// upserts pr_targets and fills a missing `intent.expected_remote_sha`. A
+/// closed PR, cross-repo fork, wrong base, moved head, or unavailable lookup
+/// returns Err and does not touch state; the caller releases the lease and
+/// parks.
+async fn bind_sticky_remediation_pr_baseline(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+) -> std::result::Result<(), String> {
+    let program = config
+        .pr_target_program
+        .as_deref()
+        .unwrap_or(Path::new("gh"));
+    let target = resolve_pr_target_with_program(
+        pr,
+        &config.repo_dir,
+        Some(&config.repo),
+        PUBLICATION_GH_TIMEOUT,
+        program,
+    )
+    .await
+    .map_err(|error| format!("live PR #{pr} target lookup failed: {error}"))?;
+    if target.pr != pr {
+        return Err(format!(
+            "PR identity changed: expected #{pr}, got #{}",
+            target.pr
+        ));
+    }
+    if target.state.as_deref() != Some("OPEN") {
+        return Err(format!("PR #{pr} is not open"));
+    }
+    if target.is_fork {
+        return Err(format!(
+            "PR #{pr} is a fork head; daemon has no supported safe push mechanism"
+        ));
+    }
+    if target.base_ref.as_deref() != Some(&config.base_branch) {
+        return Err(format!(
+            "PR #{pr} targets base {:?}, expected {}",
+            target.base_ref, config.base_branch
+        ));
+    }
+
+    let db_path = config.db_path.clone();
+    let target_owned = target.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target_owned)
+    })
+    .await
+    .map_err(|error| format!("sticky baseline persistence join failure: {error}"))?
+    .map_err(|error| format!("sticky baseline persistence failed: {error}"))
+}
+
+/// Guarded write: upsert the durable `pr_targets` baseline and, if the current
+/// publication intent still carries no `expected_remote_sha`, install the exact
+/// live PR head as that immutable baseline. Never overwrites an existing intent
+/// baseline (immutability of spawn-time authority) and never rewrites the
+/// durable `pr_targets` row when it already contradicts the live head — that
+/// contradiction means the head moved outside our lease and must fail loudly.
+/// A retained failed-CI intent is a second exact-head authority and must also
+/// match before a missing target row can adopt the live target.
+fn persist_sticky_remediation_baseline(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    pr: i64,
+    target: &PrTarget,
+) -> Result<()> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let task = tasks::get(&tx, task_id)?
+        .ok_or_else(|| QuorumError::Usage(format!("task #{task_id} no longer exists")))?;
+    if task.status != "rework" {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} is not in rework (status={})",
+            task.status
+        )));
+    }
+    if tasks::extract_pr_number(&task.refs) != Some(pr) {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} is not bound to PR #{pr}"
+        )));
+    }
+    let target_missing = if let Some(existing) = pr_targets::get(&tx, task_id, pr)? {
+        if existing.is_fork != target.is_fork
+            || existing.head_ref != target.head_ref
+            || existing.head_sha != target.head_sha
+        {
+            return Err(QuorumError::Usage(format!(
+                "PR #{pr} moved outside its durable baseline (recorded {}@{}, live {}@{})",
+                existing.head_ref, existing.head_sha, target.head_ref, target.head_sha
+            )));
+        }
+        false
+    } else {
+        true
+    };
+    if let Some(ci_intent) = tasks::ci_remediation_intent(task.refs.as_deref())? {
+        if ci_intent.pr != pr || ci_intent.head_sha != target.head_sha {
+            return Err(QuorumError::Usage(format!(
+                "PR #{pr} live head {} does not match failed-CI head {} for PR #{}",
+                target.head_sha, ci_intent.head_sha, ci_intent.pr
+            )));
+        }
+    }
+    if target_missing {
+        tx.execute(
+            "INSERT INTO pr_targets
+               (task_id, pr_number, head_ref, head_sha, is_fork, resolved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                task_id,
+                pr,
+                target.head_ref.as_str(),
+                target.head_sha.as_str(),
+                target.is_fork as i64,
+                now_unix(),
+            ),
+        )?;
+    }
+    if let Some(mut intent) = publication_intent_from_refs(task.refs.as_deref()) {
+        if intent.pr == Some(pr) {
+            match intent.expected_remote_sha.as_deref() {
+                Some(existing) if existing != target.head_sha => {
+                    return Err(QuorumError::Usage(format!(
+                        "PR #{pr} intent baseline {existing} conflicts with live head {}",
+                        target.head_sha
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    intent.expected_remote_sha = Some(target.head_sha.clone());
+                    let json = serde_json::to_string(&intent).map_err(|error| {
+                        QuorumError::Io(format!("publication intent JSON: {error}"))
+                    })?;
+                    tasks::set_publication_intent(&tx, task_id, &json, now_unix())?;
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 async fn retain_blocked_remediation_retry_for_spawn(
     db_path: PathBuf,
     task_id: i64,
@@ -14379,7 +16223,7 @@ async fn spawn_remediation_worker(
                      lease release also failed: {release_error}"
                 ));
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Err(error);
         }
     };
@@ -14419,7 +16263,7 @@ async fn spawn_remediation_worker(
                      lease release also failed: {release_error}"
                 ));
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Err(error);
         }
     }
@@ -14437,7 +16281,7 @@ async fn spawn_remediation_worker(
                 tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
             })
             .await;
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: "structural: remediation PR target is unavailable and no safe fallback branch exists".into(),
             });
@@ -14542,7 +16386,7 @@ async fn spawn_remediation_worker(
                 })
                 .await;
             }
-            name_pool.release(&agent_name);
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: classified_provisioning_cause(&cause),
             });
@@ -14721,9 +16565,9 @@ async fn spawn_remediation_worker(
                         .await;
                         cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id)
                             .await;
-                        name_pool.release(&agent_name);
                         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                         wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                        guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
                         return Ok(RemediationSpawnOutcome::ProvisionFailed {
                             cause: classified_provisioning_cause(&format!(
                                 "remediation provider recovery failed: {error}"
@@ -14745,9 +16589,9 @@ async fn spawn_remediation_worker(
                 })
                 .await;
                 cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-                name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
                 return Ok(RemediationSpawnOutcome::ProvisionFailed {
                     cause: classified_provisioning_cause(&format!(
                         "remediation provider recovery failed: {error}"
@@ -14795,9 +16639,9 @@ async fn spawn_remediation_worker(
         })
         .await;
         cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-        name_pool.release(&agent_name);
         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(task_repo_dir, &branch).await;
+        guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
         return Ok(RemediationSpawnOutcome::ProvisionFailed {
             cause: "remediation provider policy rejected launch: Codex cannot report USD cost while max_*_cost_usd is configured".into(),
         });
@@ -14845,9 +16689,9 @@ async fn spawn_remediation_worker(
             })
             .await;
             cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-            name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             return Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: classified_provisioning_cause(&format!(
                     "remediation continuation recovery failed: {error}"
@@ -14917,7 +16761,7 @@ async fn spawn_remediation_worker(
             let now_instant = std::time::Instant::now();
             workers.push(SlotState {
                 agent_name: agent_name.clone(),
-                proc,
+                proc: SlotProcess::running(proc),
                 task_id,
                 session_id,
                 model: remediation_model.clone(),
@@ -14932,6 +16776,7 @@ async fn spawn_remediation_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                last_event_at: now_instant,
                 turn_ended_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
@@ -14967,9 +16812,9 @@ async fn spawn_remediation_worker(
                 .await;
             }
             cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-            name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
+            guarded_worker_name_release(db_path, name_pool, &agent_name, task_id).await;
             Ok(RemediationSpawnOutcome::ProvisionFailed {
                 cause: classified_provisioning_cause(&format!(
                     "remediation worker process launch failed: {e}"
@@ -14984,6 +16829,47 @@ mod tests {
     use super::*;
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn review_cycle_context_reloads_persisted_rework_round_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("review-cycle.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "creator",
+                "review-cycle context",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET rework_round=?1 WHERE id=?2",
+                rusqlite::params![quorum_core::lifecycle::REWORK_CAP, task_id],
+            )
+            .unwrap();
+            task_id
+        };
+
+        let resumed = load_review_cycle_context(&db_path, task_id).unwrap();
+        assert_eq!(
+            resumed.rework_round,
+            i64::from(quorum_core::lifecycle::REWORK_CAP)
+        );
+        assert!(resumed.final_opportunity);
+    }
+
+    fn writable_deliverables(path: &str) -> quorum_core::decomposition::ChildDeliverables {
+        quorum_core::decomposition::ChildDeliverables(vec![
+            quorum_core::decomposition::ChildDeliverable::Write { path: path.into() },
+        ])
+    }
 
     struct TimedOutPreReviewChecks;
 
@@ -15064,6 +16950,7 @@ mod tests {
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
             codex_sandbox: "danger-full-access".into(),
+            pr_target_program: None,
         }
     }
 
@@ -15654,10 +17541,34 @@ mod tests {
                 now + 1,
             )
             .unwrap();
+            // Seed the durable spawn-time PR baseline so the sticky remediation
+            // baseline binding takes the short-circuit path and skips the live
+            // `gh pr view` lookup that would fail in a hermetic test.
+            pr_targets::upsert(
+                &mut conn,
+                task_id,
+                553,
+                "daemon/live-worker-t553",
+                "0123456789abcdef0123456789abcdef01234567",
+                false,
+            )
+            .unwrap();
             task_id
         };
 
-        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        // Inject a fake `gh pr view` returning the same head the pr_targets
+        // seed recorded so the sticky baseline binding confirms the live
+        // target matches the immutable durable authority.
+        #[cfg(unix)]
+        {
+            let json = open_pr_target_json(
+                "daemon/live-worker-t553",
+                "0123456789abcdef0123456789abcdef01234567",
+                "main",
+            );
+            config.pr_target_program = Some(fake_gh_returning(dir.path(), "gh-pre-review", &json));
+        }
         let mut name_pool = Pool::new_generated();
         let wt_mgr = WorktreeManager::new();
         let mut workers =
@@ -15681,8 +17592,21 @@ mod tests {
             "the live worker must remain after a successful feed"
         );
         assert!(workers[0].draining, "the rework turn must be fed");
+        assert_eq!(
+            workers[0].pr,
+            Some(553),
+            "the rework turn must retain the daemon-owned publication PR"
+        );
 
         let conn = quorum_core::db::open(&db_path).unwrap();
+        let journal_entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(journal_entries.len(), 1);
+        assert_eq!(
+            journal_entries[0].pr,
+            Some(553),
+            "restart recovery must retain the same daemon-owned PR"
+        );
+        assert_eq!(journal_entries[0].rework_count, 1);
         quorum_core::sweep::reap_lapsed_tasks(&conn, now + 64, quorum_core::sweep::SWEEP_LIMIT)
             .unwrap();
         let task = tasks::get(&conn, task_id).unwrap().unwrap();
@@ -15698,7 +17622,34 @@ mod tests {
         assert_eq!(claim, ("live-worker".into(), 1));
 
         let worker = workers.remove(0);
-        worker.proc.kill_and_reap().await;
+        worker.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn sticky_rework_helper_preserves_publication_identity_in_slot_and_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sticky-rework.db");
+        let mut worker = make_live_pre_review_ci_slot(414, dir.path().to_path_buf()).await;
+        worker.pr = Some(571);
+
+        begin_sticky_worker_rework(&mut worker, &db_path).await;
+
+        assert!(worker.draining);
+        assert_eq!(worker.pr, Some(571));
+        assert_eq!(worker.rework_count, 1);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pr, Some(571));
+        assert_eq!(entries[0].rework_count, 1);
+
+        worker
+            .live_process_mut()
+            .unwrap()
+            .feed_turn("done")
+            .await
+            .unwrap();
+        worker.kill_and_reap().await;
     }
 
     #[test]
@@ -16241,7 +18192,6 @@ mod tests {
     }
 
     fn make_dummy_slot() -> SlotState {
-        use std::time::Instant;
         use tokio::io::BufReader;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -16256,10 +18206,14 @@ mod tests {
         let stdout = child.stdout.take().unwrap();
         let reader = BufReader::new(stdout);
         let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(child, stdin, reader));
-        let now = Instant::now();
+        slot_with_process(proc)
+    }
+
+    fn slot_with_process(proc: runner::RunnerProc) -> SlotState {
+        let now = std::time::Instant::now();
         SlotState {
             agent_name: "Test-1".into(),
-            proc,
+            proc: SlotProcess::running(proc),
             task_id: 1,
             session_id: "sess".into(),
             model: "test-model".into(),
@@ -16274,6 +18228,7 @@ mod tests {
             cost_usd: 0.01,
             task_started_at: now,
             turn_started_at: now,
+            last_event_at: now,
             turn_ended_at: None,
             agent_state: None,
             session_log: None,
@@ -16287,6 +18242,1696 @@ mod tests {
             continuation_id: None,
             pending_prompt: "test prompt".into(),
             pending_turn_kind: "initial".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn active_slot_check_drains_queued_events_before_liveness_for_both_roles() {
+        use tokio::io::BufReader;
+
+        for role in ["worker", "reviewer"] {
+            let mut child = tokio::process::Command::new("sh")
+                .args([
+                    "-c",
+                    r#"printf '%s\n' '{"type":"tool_use","name":"Bash","input":{"command":"true"}}'"#,
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+                child,
+                stdin,
+                BufReader::new(stdout),
+            ));
+            let mut slot = slot_with_process(proc);
+            slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(61);
+            let tempdir = tempfile::tempdir().unwrap();
+            let limits = CostLimits {
+                max_idle_secs: Some(60),
+                ..Default::default()
+            };
+
+            assert!(
+                check_active_slot_limits(&mut slot, tempdir.path(), role, &limits)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                slot.last_event_at.elapsed() < std::time::Duration::from_secs(60),
+                "{role} queued event was not consumed before its liveness check"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_events_bounds_noisy_slot_work_per_tick() {
+        use tokio::io::BufReader;
+
+        let command = format!(
+            "i=0; while [ \"$i\" -lt {} ]; do printf '%s\\n' '{{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{{\"command\":\"true\"}}}}'; i=$((i+1)); done",
+            MAX_STREAM_LINES_PER_TICK + 1
+        );
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", &command])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+            child,
+            stdin,
+            BufReader::new(stdout),
+        ));
+        let mut slot = slot_with_process(proc);
+        let tempdir = tempfile::tempdir().unwrap();
+
+        assert!(
+            drain_events(&mut slot, tempdir.path(), "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(slot.live_stats.tool_count, MAX_STREAM_LINES_PER_TICK as u32);
+    }
+
+    async fn launch_test_codex(
+        worktree: &Path,
+        continuation_id: Option<&str>,
+    ) -> runner::RunnerProc {
+        runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "medium",
+                worktree,
+                prompt: "test",
+                environment: &[],
+                mode: runner::LaunchMode::Normal,
+                continuation_id,
+            },
+            &runner::AdapterConfig {
+                executable: Some("true"),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn grok_worker_fixture_program(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join("grok-worker-fixture.sh");
+        std::fs::write(&program, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    #[cfg(unix)]
+    async fn initial_grok_worker_fixture(dir: &Path, body: &str) -> (PathBuf, SlotState, i64) {
+        let db_path = dir.join("grok-worker.db");
+        let worktree = dir.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let now = now_unix();
+        let (task_id, assignment_id, run_id, cap_run_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "internal Grok worker terminal handoff",
+                Some("preserve the exact internal initial prompt"),
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"internal-test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Internal-grok", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("internal worker claim");
+            let responsibility_key = worker_responsibility_key(task_id, 1);
+            conn.execute(
+                "INSERT INTO role_assignments
+                   (responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                    profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (?1,?2,NULL,'worker',NULL,'3','internal-grok','grok','grok',
+                         'grok-4.5','high','worker','internal-test',?3)",
+                rusqlite::params![responsibility_key, task_id, now],
+            )
+            .unwrap();
+            let assignment_id = conn.last_insert_rowid();
+            let run_id = quorum_core::agent_runs::insert_worker_with_assignment(
+                &conn,
+                task_id,
+                "Internal-grok",
+                &worker_responsibility_key(task_id, 1),
+                "grok-4.5",
+                "high",
+                "grok",
+                "grok",
+                Some(assignment_id),
+                now,
+            )
+            .unwrap();
+            let cap_run_id = "internal-grok-capability".to_string();
+            quorum_core::capabilities::issue(
+                &mut conn,
+                &cap_run_id,
+                task_id,
+                "Internal-grok",
+                "worker",
+                now,
+            )
+            .unwrap();
+            (task_id, assignment_id, run_id, cap_run_id)
+        };
+
+        let program = grok_worker_fixture_program(dir, body);
+        let responsibility_key = worker_responsibility_key(task_id, 1);
+        let proc = runner::RunnerProc::launch_internal_worker(
+            &runner::RunnerRequest {
+                launch: runner::LaunchRequest {
+                    model: "grok-4.5",
+                    effort: "high",
+                    worktree: &worktree,
+                    prompt: "preserve the exact internal initial prompt",
+                    environment: &[],
+                    mode: runner::LaunchMode::Normal,
+                    continuation_id: None,
+                },
+                task_id,
+                role_assignment_id: assignment_id,
+                responsibility_key: &responsibility_key,
+                agent: "Internal-grok",
+                role: "worker",
+                pending_turn: PendingTurn {
+                    provider: "grok".into(),
+                    model: "grok-4.5".into(),
+                    effort: "high".into(),
+                    prompt: "preserve the exact internal initial prompt".into(),
+                    turn_kind: "initial".into(),
+                    continuation_id: None,
+                    requested: false,
+                },
+            },
+            &runner::AdapterConfig {
+                executable: program.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut slot = slot_with_process(proc);
+        slot.agent_name = "Internal-grok".into();
+        slot.task_id = task_id;
+        slot.model = "grok-4.5".into();
+        slot.effort = "high".into();
+        slot.worktree_path = worktree;
+        slot.agent_run_id = Some(run_id);
+        slot.cap_run_id = Some(cap_run_id);
+        slot.pending_prompt = "preserve the exact internal initial prompt".into();
+        slot.pending_turn_kind = "initial".into();
+        slot.draining = true;
+        slot.session_log = Some(
+            session_log::SessionLog::create(
+                &dir.join("logs"),
+                "Internal-grok",
+                "worker",
+                Some(task_id),
+                "internal-grok-log",
+                "internal-grok-branch",
+                now,
+            )
+            .unwrap(),
+        );
+        assert!(assignment_id > 0);
+        (db_path, slot, task_id)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_worker_exit_observation(slot: &mut SlotState) -> WorkerExitObservation {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match observe_worker_exit_for_lifecycle(slot).unwrap() {
+                    WorkerExitObservation::Running => tokio::task::yield_now().await,
+                    observation => return observation,
+                }
+            }
+        })
+        .await
+        .expect("worker did not reach an exited Phase 4b observation")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_persists_exact_terminal_session_before_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"text\",\"data\":\"working\"}' \
+             '{\"type\":\"end\",\"sessionId\":\"grok-session-exact\"}'",
+        )
+        .await;
+        let original_tokens = slot.cost_tokens;
+        let original_cost = slot.cost_usd;
+
+        assert!(
+            drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(slot.continuation_id.as_deref(), Some("grok-session-exact"));
+        assert!(!slot.draining, "completion must follow the durable handoff");
+        assert!(
+            slot.try_wait().unwrap().is_some(),
+            "the turn-end barrier must preserve exited-process visibility"
+        );
+        assert_eq!(
+            slot.cost_tokens, original_tokens,
+            "missing usage is not fabricated"
+        );
+        assert_eq!(
+            slot.cost_usd, original_cost,
+            "missing cost is not fabricated"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "grok-session-exact"
+        );
+        let handoff = runner_state::initial_worker_session(&refs).unwrap();
+        assert_eq!(handoff.task_id, task_id);
+        assert_eq!(handoff.agent, "Internal-grok");
+        assert_eq!(handoff.role, "worker");
+        assert_eq!(handoff.provider, "grok");
+        assert_eq!(handoff.runner, "grok");
+        assert_eq!(handoff.model, "grok-4.5");
+        assert_eq!(handoff.effort, "high");
+        assert_eq!(
+            handoff.pending_turn.prompt,
+            "preserve the exact internal initial prompt"
+        );
+        assert_eq!(handoff.pending_turn.turn_kind, "initial");
+        assert!(handoff.pending_turn.continuation_id.is_none());
+        assert_eq!(handoff.session_id, "grok-session-exact");
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_rejects_incomplete_and_ambiguous_terminal_processes() {
+        let fixtures = [
+            (
+                "early-eof",
+                "printf '%s\\n' '{\"type\":\"text\",\"data\":\"partial\"}'",
+                vec![r#"{"type":"text","data":"partial"}"#],
+            ),
+            (
+                "nonzero-exit",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}'; exit 7",
+                vec![r#"{"type":"end","sessionId":"session-a"}"#],
+            ),
+            (
+                "malformed-terminal",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":'",
+                vec![r#"{"type":"end","sessionId":"#],
+            ),
+            (
+                "missing-session",
+                "printf '%s\\n' '{\"type\":\"end\"}'",
+                vec![r#"{"type":"end"}"#],
+            ),
+            (
+                "duplicate-session",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-a\"}'",
+                vec![
+                    r#"{"type":"end","sessionId":"session-a"}"#,
+                    r#"{"type":"end","sessionId":"session-a"}"#,
+                ],
+            ),
+            (
+                "conflicting-session",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-b\"}'",
+                vec![
+                    r#"{"type":"end","sessionId":"session-a"}"#,
+                    r#"{"type":"end","sessionId":"session-b"}"#,
+                ],
+            ),
+            (
+                "trailing-outcome",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"text\",\"data\":\"late\"}'",
+                vec![
+                    r#"{"type":"end","sessionId":"session-a"}"#,
+                    r#"{"type":"text","data":"late"}"#,
+                ],
+            ),
+        ];
+
+        for (name, body, expected_raw) in fixtures {
+            let dir = tempfile::tempdir().unwrap();
+            let (db_path, mut slot, task_id) = initial_grok_worker_fixture(dir.path(), body).await;
+            let result = drain_events(&mut slot, &db_path, "worker", &CostLimits::default()).await;
+            if let Err(error) = result {
+                panic!("{name}: {error}");
+            }
+            assert!(
+                slot.continuation_id.is_none(),
+                "{name}: in-memory identity leaked"
+            );
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            let refs: serde_json::Value = task
+                .refs
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .unwrap()
+                .unwrap_or_else(|| serde_json::json!({}));
+            assert!(
+                refs.get(runner_state::CONTINUATION_REF).is_none(),
+                "{name}: continuation was persisted"
+            );
+            assert!(
+                refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none(),
+                "{name}: terminal handoff was persisted"
+            );
+            let stream_path = slot
+                .session_log
+                .as_ref()
+                .unwrap()
+                .dir()
+                .join("stream.jsonl");
+            let stream = std::fs::read_to_string(stream_path).unwrap();
+            assert_eq!(
+                stream.lines().collect::<Vec<_>>(),
+                expected_raw,
+                "{name}: every provider stdout record must remain verbatim"
+            );
+            drop(conn);
+            slot.kill_and_reap().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_keeps_terminal_identity_across_drain_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = r#"{"type":"end","sessionId":"delayed-zero-exit"}"#;
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"delayed-zero-exit\"}'; sleep 6",
+        )
+        .await;
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(
+            slot.continuation_id.is_none(),
+            "the first five-second poll must not authorize a running child"
+        );
+        assert!(slot.draining);
+        let stream_path = slot
+            .session_log
+            .as_ref()
+            .unwrap()
+            .dir()
+            .join("stream.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(&stream_path).unwrap(),
+            format!("{terminal}\n")
+        );
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(slot.continuation_id.as_deref(), Some("delayed-zero-exit"));
+        assert!(!slot.draining);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "delayed-zero-exit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(stream_path).unwrap(),
+            format!("{terminal}\n")
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase4b_defers_grok_terminal_at_raw_drain_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = r#"{"type":"end","sessionId":"budget-edge-session"}"#;
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "i=0; while [ \"$i\" -lt 63 ]; do printf '{\"type\":\"text\",\"data\":\"line-%s\"}\\n' \"$i\"; i=$((i+1)); done; printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"budget-edge-session\"}'",
+        )
+        .await;
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.has_pending_grok_terminal_handoff());
+        let stream_path = slot
+            .session_log
+            .as_ref()
+            .unwrap()
+            .dir()
+            .join("stream.jsonl");
+        let stream = std::fs::read_to_string(&stream_path).unwrap();
+        assert_eq!(stream.lines().count(), MAX_STREAM_LINES_PER_TICK);
+        assert_eq!(stream.lines().last(), Some(terminal));
+        assert!(matches!(
+            wait_for_worker_exit_observation(&mut slot).await,
+            WorkerExitObservation::DeferredTerminalEvidence(status) if status.success()
+        ));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| serde_json::json!({}));
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
+        drop(conn);
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(slot.continuation_id.as_deref(), Some("budget-edge-session"));
+        assert!(!slot.draining);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "budget-edge-session"
+        );
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase4b_defers_exited_grok_worker_while_stderr_is_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let stderr_gate = dir.path().join("stderr-gate");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&stderr_gate)
+            .status()
+            .unwrap()
+            .success());
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            &format!(
+                "(read release < '{}') >&2 & printf '%s\\n' '{{\"type\":\"end\",\"sessionId\":\"pending-stderr-session\"}}'; exit 0",
+                stderr_gate.display()
+            ),
+        )
+        .await;
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.has_pending_grok_terminal_handoff());
+        assert!(slot
+            .live_process_mut()
+            .unwrap()
+            .grok_stderr_evidence_pending());
+        assert!(matches!(
+            wait_for_worker_exit_observation(&mut slot).await,
+            WorkerExitObservation::DeferredTerminalEvidence(status) if status.success()
+        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| serde_json::json!({}));
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+        drop(conn);
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stderr_gate)
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while slot.continuation_id.is_none() {
+                drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                    .await
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Grok stderr evidence did not finish after its fixture gate opened");
+        assert_eq!(
+            slot.continuation_id.as_deref(),
+            Some("pending-stderr-session")
+        );
+        assert!(!slot.draining);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "pending-stderr-session"
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_read_error_after_terminal_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = r#"{"type":"end","sessionId":"read-error-session"}"#;
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"read-error-session\"}'",
+        )
+        .await;
+        slot.live_process_mut()
+            .unwrap()
+            .inject_grok_stdout_read_error_after_lines(1);
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.draining);
+        assert!(slot
+            .observed_pre_authoritative_failure()
+            .unwrap()
+            .to_string()
+            .contains("stdout evidence could not be read"));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| serde_json::json!({}));
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
+        assert!(refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none());
+        let stream_path = slot
+            .session_log
+            .as_ref()
+            .unwrap()
+            .dir()
+            .join("stream.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(stream_path).unwrap(),
+            format!("{terminal}\n")
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_stderr_read_error_after_terminal_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = r#"{"type":"end","sessionId":"stderr-read-error-session"}"#;
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"stderr-read-error-session\"}'",
+        )
+        .await;
+        slot.live_process_mut()
+            .unwrap()
+            .inject_grok_stderr_read_error()
+            .await;
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.draining);
+        assert!(!slot.has_pending_grok_terminal_handoff());
+        let failure = slot.observed_pre_authoritative_failure().unwrap();
+        assert_eq!(
+            failure.disposition(),
+            runner::FailureDisposition::Unclassified
+        );
+        assert!(failure
+            .to_string()
+            .contains("stderr evidence could not be read"));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| serde_json::json!({}));
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
+        assert!(refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none());
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+        let stream_path = slot
+            .session_log
+            .as_ref()
+            .unwrap()
+            .dir()
+            .join("stream.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(stream_path).unwrap(),
+            format!("{terminal}\n")
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_finalizes_stderr_before_terminal_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminal = r#"{"type":"end","sessionId":"stderr-session"}"#;
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"stderr-session\"}'; exec 1>&-; sleep 1; printf '%s\\n' 'late stderr failure' >&2",
+        )
+        .await;
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(slot.continuation_id.is_none());
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.draining);
+        assert!(slot
+            .observed_pre_authoritative_failure()
+            .unwrap()
+            .to_string()
+            .contains("Grok stderr"));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .unwrap_or_else(|| serde_json::json!({}));
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
+        assert!(refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none());
+        let stream_path = slot
+            .session_log
+            .as_ref()
+            .unwrap()
+            .dir()
+            .join("stream.jsonl");
+        let stream = std::fs::read_to_string(stream_path).unwrap();
+        let mut lines = stream.lines();
+        assert_eq!(lines.next(), Some(terminal));
+        let diagnostic: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(diagnostic["type"], "provider.stderr");
+        assert_eq!(diagnostic["text"], "late stderr failure");
+        assert!(lines.next().is_none());
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn internal_grok_worker_rejects_session_identity_after_durable_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"too-late\"}'",
+        )
+        .await;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Internal-grok",
+                task_id,
+                &Event::SignaledDone { pr: "459".into() },
+                now_unix() + 1,
+            )
+            .unwrap();
+        }
+
+        let error = match drain_events(&mut slot, &db_path, "worker", &CostLimits::default()).await
+        {
+            Ok(_) => panic!("late Grok terminal identity unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("left its exact working assignment"));
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.draining, "late identity must not complete the turn");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "in-review",
+            "the earlier outcome remains authoritative"
+        );
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none());
+        assert!(refs.get(runner_state::INITIAL_WORKER_SESSION_REF).is_none());
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[test]
+    fn running_claude_slot_exposes_its_process_kind_pid_and_wait_status() {
+        let mut slot = make_dummy_slot();
+
+        assert!(matches!(slot.proc, SlotProcess::Running(_)));
+        assert_eq!(slot.process_kind(), runner::AgentKind::Claude);
+        assert!(slot.pid().is_some());
+        assert!(slot.try_wait().is_ok());
+    }
+
+    #[tokio::test]
+    async fn running_codex_slot_exposes_its_process_kind_pid_and_wait_status() {
+        let worktree = tempfile::tempdir().unwrap();
+        let proc = launch_test_codex(worktree.path(), None).await;
+        let mut slot = slot_with_process(proc);
+
+        assert!(matches!(slot.proc, SlotProcess::Running(_)));
+        assert_eq!(slot.process_kind(), runner::AgentKind::Codex);
+        assert!(slot.pid().is_some());
+        let _ = slot.try_wait().unwrap();
+        slot.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn dormant_codex_slot_has_no_process_and_accepts_a_matching_new_turn() {
+        let worktree = tempfile::tempdir().unwrap();
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = Some("provider-thread-42".into());
+
+        let old = slot.become_dormant().unwrap();
+        assert!(matches!(
+            &slot.proc,
+            SlotProcess::Dormant {
+                continuation_id, ..
+            } if continuation_id == "provider-thread-42"
+        ));
+        assert_eq!(slot.process_kind(), runner::AgentKind::Codex);
+        assert_eq!(slot.pid(), None);
+        assert_eq!(slot.try_wait().unwrap(), None);
+
+        let new_proc = launch_test_codex(worktree.path(), Some("provider-thread-42")).await;
+        assert!(slot.replace_with_launched_turn(new_proc).unwrap().is_none());
+        assert!(matches!(slot.proc, SlotProcess::Running(_)));
+        old.kill_and_reap().await;
+        slot.kill_and_reap().await;
+    }
+
+    fn dormant_codex_rework_fixture(
+        db_path: &Path,
+        worktree: &Path,
+        persisted_continuation: Option<&str>,
+        slot_continuation: &str,
+    ) -> (SlotState, i64, String) {
+        let now = now_unix();
+        let (task_id, old_run_id, old_capability) = {
+            let mut conn = quorum_core::db::open(db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "dormant Codex rework",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            let mut refs = serde_json::json!({
+                "cx_est": 3,
+                "cx_size": "M",
+                "cx_ready": true,
+                "cx_not_ready_reason": null,
+                "cx_by": "test:v2"
+            });
+            if let Some(continuation) = persisted_continuation {
+                runner_state::set_continuation(
+                    &mut refs,
+                    ContinuationSlot::Worker,
+                    &ContinuationIdentity {
+                        provider: "codex".into(),
+                        id: continuation.into(),
+                    },
+                );
+            }
+            tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now).unwrap();
+            tasks::claim(&mut conn, "Dormant", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("initial worker claim");
+            let old_run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "Dormant",
+                "worker",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now,
+            )
+            .unwrap();
+            let old_capability = "completed-turn-capability".to_string();
+            quorum_core::capabilities::issue(
+                &mut conn,
+                &old_capability,
+                task_id,
+                "Dormant",
+                "worker",
+                now,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Dormant",
+                task_id,
+                &Event::SignaledDone { pr: "443".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Reviewer",
+                task_id,
+                &Event::ReviewerAttached {
+                    agent: "Reviewer".into(),
+                },
+                now + 2,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Reviewer",
+                task_id,
+                &Event::VerdictChanges,
+                now + 3,
+            )
+            .unwrap();
+            let entry = JournalEntry {
+                agent: "Dormant".into(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "logical-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/dormant-t1".into()),
+                phase: "awaiting-review".into(),
+                cost_tokens: 17,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(443),
+                rework_count: 0,
+            };
+            journal::upsert(&mut conn, &entry).unwrap();
+            (task_id, old_run_id, old_capability)
+        };
+
+        let now_instant = std::time::Instant::now();
+        (
+            SlotState {
+                agent_name: "Dormant".into(),
+                proc: SlotProcess::dormant(runner::AgentKind::Codex, Some(slot_continuation))
+                    .unwrap(),
+                task_id,
+                session_id: "logical-session".into(),
+                model: "gpt-5.6-terra".into(),
+                effort: "high".into(),
+                worktree_path: worktree.to_path_buf(),
+                branch: "daemon/dormant-t1".into(),
+                remote_branch: "daemon/dormant-t1".into(),
+                draining: false,
+                pr: Some(443),
+                rework_count: 0,
+                cost_tokens: 17,
+                cost_usd: 0.0,
+                task_started_at: now_instant,
+                turn_started_at: now_instant,
+                last_event_at: now_instant,
+                turn_ended_at: Some(now_instant),
+                agent_state: None,
+                session_log: None,
+                live_stats: LiveStats::new(),
+                error_turn_count: 0,
+                last_error_text: None,
+                agent_run_id: Some(old_run_id),
+                cap_run_id: Some(old_capability.clone()),
+                r2_origin: false,
+                reviewed_head_sha: None,
+                continuation_id: Some(slot_continuation.into()),
+                pending_prompt: "initial delivery".into(),
+                pending_turn_kind: "initial".into(),
+            },
+            old_run_id,
+            old_capability,
+        )
+    }
+
+    fn dormant_codex_test_config(
+        db_path: PathBuf,
+        worktree: PathBuf,
+        agent_bin: Option<String>,
+    ) -> ServeConfig {
+        let mut config = pre_review_ci_test_config(db_path, worktree);
+        config.model_profiles.get_mut("test").unwrap().runner = "codex".into();
+        config.model_profiles.get_mut("test").unwrap().model = "gpt-5.6-terra".into();
+        config.model_profiles.get_mut("test").unwrap().effort = "high".into();
+        config.agent_bin = agent_bin;
+        config
+    }
+
+    #[cfg(unix)]
+    fn fake_codex_resume_program(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join("fake-codex-resume.sh");
+        let args = dir.join("args.txt");
+        let env = dir.join("env.txt");
+        let cwd = dir.join("cwd.txt");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n%s\\n' \"$QUORUM_AGENT\" \"$QUORUM_RUN_ID\" > '{}'\npwd > '{}'\nexec sleep 30\n",
+                args.display(),
+                env.display(),
+                cwd.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (program, args, env, cwd)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dormant_codex_rework_reacquires_lease_and_resumes_exact_turn_with_rotated_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dormant-rework.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (program, args_path, env_path, cwd_path) = fake_codex_resume_program(dir.path());
+        let (mut slot, old_run_id, old_capability) =
+            dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
+        let config = dormant_codex_test_config(
+            db_path.clone(),
+            worktree.clone(),
+            Some(program.to_string_lossy().into_owned()),
+        );
+        let prompt = "Fix the exact reviewer finding and retain PR #443.";
+
+        let error = feed_worker_turn(&mut slot, prompt, &config)
+            .await
+            .expect_err("a dormant worker must never launch before reacquiring its lease");
+        assert!(error.to_string().contains("does not durably own"));
+        assert!(
+            !args_path.exists(),
+            "provider launched before the task lease existed"
+        );
+
+        assert!(
+            install_live_worker_remediation_lease(
+                &config,
+                slot.agent_name.clone(),
+                slot.task_id,
+                443,
+                "exact reviewer finding",
+            )
+            .await,
+            "same logical worker must reacquire the rework lease"
+        );
+        feed_worker_turn(&mut slot, prompt, &config)
+            .await
+            .expect("exact dormant continuation resumes");
+        begin_sticky_worker_rework(&mut slot, &db_path).await;
+
+        for _ in 0..1000 {
+            if args_path.exists() && env_path.exists() && cwd_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            args_path.exists() && env_path.exists() && cwd_path.exists(),
+            "fake Codex process did not reach its capture boundary"
+        );
+        let args = std::fs::read_to_string(&args_path).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(&args[..3], ["exec", "resume", "thread-exact"]);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--model", "gpt-5.6-terra"]));
+        assert!(args.contains(&"model_reasoning_effort=high"));
+        assert_eq!(args.last().copied(), Some(prompt));
+        assert_eq!(
+            std::fs::canonicalize(std::fs::read_to_string(&cwd_path).unwrap().trim()).unwrap(),
+            std::fs::canonicalize(&worktree).unwrap()
+        );
+        let env = std::fs::read_to_string(&env_path).unwrap();
+        let env: Vec<&str> = env.lines().collect();
+        assert_eq!(env.first().copied(), Some("Dormant"));
+        let new_capability = env.get(1).expect("rotated QUORUM_RUN_ID");
+        assert_ne!(*new_capability, old_capability);
+        assert_eq!(slot.cap_run_id.as_deref(), Some(*new_capability));
+        assert_eq!(slot.agent_name, "Dormant");
+        assert_eq!(slot.pr, Some(443));
+        assert!(matches!(slot.proc, SlotProcess::Running(_)));
+        assert!(slot.draining);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let claim_holder: String = conn
+            .query_row(
+                "SELECT holder FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{}", slot.task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim_holder, "Dormant");
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, slot.task_id).unwrap();
+        assert_eq!(runs.len(), 2, "one agent_run per provider turn");
+        let old_run = runs.iter().find(|run| run.id == old_run_id).unwrap();
+        assert_eq!(old_run.end_reason.as_deref(), Some("turn-completed"));
+        let new_run = runs.iter().find(|run| run.id != old_run_id).unwrap();
+        assert_eq!(new_run.agent, "Dormant");
+        assert_eq!(new_run.model, "gpt-5.6-terra");
+        assert_eq!(new_run.effort, "high");
+        assert_eq!(new_run.provider.as_deref(), Some("codex"));
+        assert!(new_run.ended_at.is_none());
+        let capabilities: Vec<(String, Option<i64>)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT run_id,revoked_at FROM run_capabilities
+                     WHERE task_id=?1 AND agent='Dormant' ORDER BY created_at,run_id",
+                )
+                .unwrap();
+            statement
+                .query_map([slot.task_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(capabilities.len(), 2);
+        assert!(capabilities
+            .iter()
+            .any(|(run_id, revoked)| run_id == &old_capability && revoked.is_some()));
+        assert!(capabilities
+            .iter()
+            .any(|(run_id, revoked)| run_id == *new_capability && revoked.is_none()));
+        let task = tasks::get(&conn, slot.task_id).unwrap().unwrap();
+        assert_eq!(task.author.as_deref(), Some("Dormant"));
+        assert_eq!(tasks::extract_pr_number(&task.refs), Some(443));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "resume must not create a replacement task or duplicate PR binding"
+        );
+        let journal = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].agent, "Dormant");
+        assert_eq!(journal[0].phase, "working");
+        assert_eq!(journal[0].pr, Some(443));
+        assert!(journal[0].pid.is_some());
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dormant_codex_rework_missing_or_mismatched_durable_continuation_fails_closed() {
+        for (label, persisted) in [("missing", None), ("mismatched", Some("thread-other"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("{label}.db"));
+            let worktree = dir.path().join("worktree");
+            std::fs::create_dir_all(&worktree).unwrap();
+            let (program, args_path, _, _) = fake_codex_resume_program(dir.path());
+            let (mut slot, old_run_id, old_capability) =
+                dormant_codex_rework_fixture(&db_path, &worktree, persisted, "thread-exact");
+            let config = dormant_codex_test_config(
+                db_path.clone(),
+                worktree,
+                Some(program.to_string_lossy().into_owned()),
+            );
+            assert!(
+                install_live_worker_remediation_lease(
+                    &config,
+                    slot.agent_name.clone(),
+                    slot.task_id,
+                    443,
+                    "review feedback",
+                )
+                .await
+            );
+            let error = feed_worker_turn(&mut slot, "review feedback", &config)
+                .await
+                .expect_err("invalid durable continuation must not launch");
+            assert!(error.to_string().contains("persisted"), "{label}: {error}");
+            assert!(
+                !args_path.exists(),
+                "{label}: provider unexpectedly launched"
+            );
+            assert!(matches!(slot.proc, SlotProcess::Dormant { .. }));
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let old_run = quorum_core::agent_runs::runs_for_task(&conn, slot.task_id)
+                .unwrap()
+                .into_iter()
+                .find(|run| run.id == old_run_id)
+                .unwrap();
+            assert!(
+                old_run.ended_at.is_none(),
+                "{label}: run rotated before validation"
+            );
+            let old_cap = quorum_core::capabilities::validate(
+                &conn,
+                &old_capability,
+                "Dormant",
+                "worker",
+                Some(slot.task_id),
+            );
+            assert!(
+                old_cap.is_ok(),
+                "{label}: capability rotated before validation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dormant_codex_launch_failure_parks_the_exact_pending_rework_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("launch-failure.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (slot, _old_run_id, _old_capability) =
+            dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
+        let config = dormant_codex_test_config(
+            db_path.clone(),
+            worktree,
+            Some(
+                dir.path()
+                    .join("missing-codex")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
+        assert!(
+            install_live_worker_remediation_lease(
+                &config,
+                slot.agent_name.clone(),
+                slot.task_id,
+                443,
+                "exact launch-failure feedback",
+            )
+            .await
+        );
+        let task_id = slot.task_id;
+        let mut workers = vec![slot];
+        let prompt = "Exact feedback that must survive a failed codex exec resume.";
+        let error = feed_worker_turn(&mut workers[0], prompt, &config)
+            .await
+            .expect_err("missing provider executable must fail launch");
+        assert_eq!(workers[0].pending_prompt, prompt);
+        assert_eq!(workers[0].pending_turn_kind, "rework");
+        assert!(matches!(workers[0].proc, SlotProcess::Dormant { .. }));
+
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Dormant").unwrap();
+        assert!(
+            handle_dormant_worker_feed_failure(
+                &config,
+                &wt_mgr,
+                &mut name_pool,
+                &mut workers,
+                0,
+                &error,
+            )
+            .await
+        );
+        assert!(workers.is_empty());
+
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        let retry: PendingTurn = serde_json::from_value(refs[runner_state::RETRY_REF].clone())
+            .expect("exact turn was parked");
+        assert_eq!(retry.provider, "codex");
+        assert_eq!(retry.model, "gpt-5.6-terra");
+        assert_eq!(retry.effort, "high");
+        assert_eq!(retry.prompt, prompt);
+        assert_eq!(retry.turn_kind, "rework");
+        assert_eq!(retry.continuation_id.as_deref(), Some("thread-exact"));
+        assert!(!retry.requested);
+        let active_caps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_capabilities
+                 WHERE task_id=?1 AND agent='Dormant' AND revoked_at IS NULL",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_caps, 0);
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1,
+            "failed launch must not install a phantom agent_run"
+        );
+        let retried = tasks::retry_provider_blocked(&mut conn, task_id, "operator", now_unix())
+            .unwrap()
+            .expect("existing provider retry path accepts the parked turn");
+        assert_eq!(retried.status, "rework");
+        let retried_refs: serde_json::Value =
+            serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+        let requested = runner_state::requested_retry(&retried_refs, "codex").unwrap();
+        assert_eq!(requested.prompt, prompt);
+        assert_eq!(requested.continuation_id.as_deref(), Some("thread-exact"));
+    }
+
+    #[test]
+    fn dormant_slot_rejects_missing_continuation() {
+        let Err(error) = SlotProcess::dormant(runner::AgentKind::Codex, None) else {
+            panic!("dormant Codex slot unexpectedly accepted no continuation");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exact persisted continuation"));
+    }
+
+    #[test]
+    fn dormant_slot_rejects_persistent_child_provider() {
+        let Err(error) = SlotProcess::dormant(runner::AgentKind::Claude, Some("session")) else {
+            panic!("dormant Claude slot unexpectedly accepted a persistent child");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("persistent child"));
+    }
+
+    #[tokio::test]
+    async fn park_delivered_codex_slot_becomes_dormant_and_journals_awaiting_review() {
+        let worktree = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("park-delivered.db");
+        // Materialize the schema so journal::upsert can run against a real DB.
+        let _ = quorum_core::db::open(&db_path).unwrap();
+
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.agent_name = "Delivered".into();
+        slot.task_id = 4242;
+        slot.pr = Some(999);
+        slot.remote_branch = "daemon/delivered".into();
+        slot.branch = "daemon/delivered".into();
+        slot.continuation_id = Some("provider-thread-777".into());
+        slot.draining = true;
+        slot.error_turn_count = 3;
+        slot.last_error_text = Some("prior transient failure".into());
+
+        park_worker_slot_dormant(&db_path, &mut slot).await.unwrap();
+
+        // Live process torn down, logical slot preserved.
+        assert!(matches!(
+            &slot.proc,
+            SlotProcess::Dormant {
+                continuation_id, ..
+            } if continuation_id == "provider-thread-777"
+        ));
+        assert!(
+            !slot.draining,
+            "delivered turn must clear the drain flag so a reviewer can be provisioned"
+        );
+        assert_eq!(
+            slot.pr,
+            Some(999),
+            "publication identity must survive parking"
+        );
+        assert_eq!(slot.continuation_id.as_deref(), Some("provider-thread-777"));
+        assert_eq!(slot.agent_name, "Delivered");
+        assert_eq!(slot.remote_branch, "daemon/delivered");
+        assert_eq!(
+            slot.error_turn_count, 0,
+            "delivery clears the auto-refeed retry budget"
+        );
+        assert!(slot.last_error_text.is_none());
+        assert!(
+            slot.turn_ended_at.is_some(),
+            "watchdog must see the turn end time"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent, "Delivered");
+        assert_eq!(entries[0].role, "worker");
+        assert_eq!(entries[0].phase, "awaiting-review");
+        assert_eq!(entries[0].task_id, Some(4242));
+        assert_eq!(entries[0].pr, Some(999));
+        assert!(
+            entries[0].pid.is_none(),
+            "dormant journal entry must not advertise a live pid"
+        );
+    }
+
+    #[tokio::test]
+    async fn park_worker_slot_dormant_rejects_missing_continuation() {
+        let worktree = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("park-missing-continuation.db");
+        let _ = quorum_core::db::open(&db_path).unwrap();
+
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = None;
+        slot.pr = Some(1);
+
+        let err = park_worker_slot_dormant(&db_path, &mut slot)
+            .await
+            .expect_err("park must refuse a Codex slot without its provider-issued thread id");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            matches!(&slot.proc, SlotProcess::Running(_)),
+            "the slot must remain in its running state so the caller can fall back to cleanup"
+        );
+        slot.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn park_worker_slot_dormant_surfaces_journal_write_failure() {
+        // The DB path points at a directory, so `db::open` and therefore
+        // `journal::upsert` will fail. The park helper must surface that
+        // failure instead of returning Ok — otherwise the caller retains a
+        // dormant worker whose stale journal row still advertises the reaped
+        // process PID, and restart recovery would `killpg` a reused group.
+        let worktree = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let unwritable_db = db_dir.path().to_path_buf();
+
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = Some("provider-thread-42".into());
+        slot.pr = Some(1);
+
+        let err = park_worker_slot_dormant(&unwritable_db, &mut slot)
+            .await
+            .expect_err("an unwritable journal DB must not be reported as a successful park");
+        assert!(
+            err.to_string().contains("park journal"),
+            "the surfaced error must identify the park-time journal write, got: {err}"
+        );
+        // Process was already reaped inside `become_dormant`; the caller now
+        // owns the dormant slot and must run cleanup_slot to release the
+        // name/worktree/branch and delete the stale journal row.
+        assert!(matches!(&slot.proc, SlotProcess::Dormant { .. }));
+    }
+
+    #[tokio::test]
+    async fn slot_needs_reviewer_provisioning_covers_dormant_running_and_paired_slots() {
+        // Regression guard: production Phase 5 consults this exact predicate.
+        // Removing the `!draining` gate or the paired-reviewer check must
+        // break this test.
+        let worktree = tempfile::tempdir().unwrap();
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.agent_name = "Delivered".into();
+        slot.task_id = 42;
+        slot.pr = Some(777);
+        slot.continuation_id = Some("thread".into());
+
+        // No PR yet → not eligible.
+        let empty: Vec<SlotState> = Vec::new();
+        slot.pr = None;
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &empty), None);
+        slot.pr = Some(777);
+
+        // Draining mid-turn → not eligible.
+        slot.draining = true;
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &empty), None);
+        slot.draining = false;
+
+        // Running slot with PR and no reviewer → eligible.
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &empty), Some(777));
+
+        // Dormant awaiting-review slot with PR → still eligible.
+        let old = slot.become_dormant().unwrap();
+        old.kill_and_reap().await;
+        assert_eq!(
+            slot_needs_reviewer_provisioning(&slot, &empty),
+            Some(777),
+            "dormant sticky slot must remain reviewer-eligible after delivery"
+        );
+
+        // Reviewer already paired → not eligible even for a dormant slot.
+        let paired_worktree = tempfile::tempdir().unwrap();
+        let mut paired = slot_with_process(launch_test_codex(paired_worktree.path(), None).await);
+        paired.task_id = slot.task_id;
+        let reviewers = vec![paired];
+        assert_eq!(slot_needs_reviewer_provisioning(&slot, &reviewers), None);
+        for r in reviewers {
+            r.kill_and_reap().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_recorded_park_survives_watchdog_reviewer_capacity_and_lease_visibility() {
+        // End-to-end regression for the DeliveryRecorded → park lifecycle.
+        // Drives the real disposition classifier, the shared park-or-cleanup
+        // helper the two tick branches call, the shared Phase 4d lease
+        // renewal helper, and the shared watchdog and reviewer-eligibility
+        // predicates. A regression that drops the reinsertion at either
+        // production call site, breaks the dormant exemption, or breaks the
+        // lease renewal query must break this test.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("delivery-parks.db");
+        let repo = dir.path().join("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Seed a task in-review with PR 443 for agent "Spool" so that
+        // dispose_dead_turn_runner classifies the exit as DeliveryRecorded.
+        create_active_task(&db_path, "Spool", "working");
+        fire_event_result(
+            &db_path,
+            "Spool",
+            1,
+            &Event::SignaledDone { pr: "443".into() },
+        )
+        .await
+        .unwrap();
+
+        // Force the claim to expire soon so lease renewal is observable —
+        // otherwise `create_active_task` already stamped `now + 3600`, which
+        // `renew_task_lease`'s `MAX(...)` cannot advance.
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE claims SET expires_at = ?1 \
+                 WHERE holder = 'Spool' AND target = 'task#1' AND active = 1",
+                rusqlite::params![now_unix() + 60],
+            )
+            .unwrap();
+        }
+        let expires_before_renewal: i64 = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT expires_at FROM claims \
+                 WHERE holder = 'Spool' AND target = 'task#1' AND active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let disposition = dispose_dead_turn_runner_worker(
+            &db_path,
+            1,
+            "Spool",
+            "process exited",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            disposition,
+            tasks::DeadTurnRunnerDisposition::DeliveryRecorded,
+            "production classifier must still route a normal Codex exit through DeliveryRecorded"
+        );
+
+        // Build a live Codex slot so the shared park-or-cleanup helper reaps
+        // a real turn process and installs the dormant continuation.
+        let dead_proc = launch_test_codex(&repo, None).await;
+        let mut dead = slot_with_process(dead_proc);
+        dead.agent_name = "Spool".into();
+        dead.task_id = 1;
+        dead.pr = Some(443);
+        dead.branch = "daemon/spool-t1".into();
+        dead.remote_branch = "daemon/spool-t1".into();
+        dead.continuation_id = Some("thread-parked".into());
+        dead.draining = true;
+        dead.worktree_path = repo.clone();
+
+        let config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Spool").unwrap();
+        let mut workers: Vec<SlotState> = Vec::new();
+
+        // Drive the exact helper both `DeliveryRecorded` tick branches call.
+        // A regression that stops reinserting the parked slot must leave
+        // `workers` empty here.
+        park_or_cleanup_delivered_worker_slot(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            dead,
+        )
+        .await;
+        assert_eq!(
+            workers.len(),
+            1,
+            "the DeliveryRecorded helper must reinsert the parked slot into the real workers collection"
+        );
+        assert!(
+            matches!(workers[0].proc, SlotProcess::Dormant { .. }),
+            "the reinserted slot must be dormant"
+        );
+        assert_eq!(workers[0].pr, Some(443));
+
+        // Capacity accounting: the parked slot still consumes a worker cap
+        // slot through the exact production accounting function.
+        assert_eq!(available_worker_slots(1, workers.len()), 0);
+        assert_eq!(available_worker_slots(2, workers.len()), 1);
+
+        // Idle watchdog exemption via the production predicate.
+        workers[0].turn_ended_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3600));
+        assert!(
+            !slot_is_idle_zombie_candidate(&workers[0], 300),
+            "watchdog must not reap a dormant awaiting-review slot"
+        );
+
+        // Phase 5 reviewer eligibility via the production predicate.
+        let no_reviewers: Vec<SlotState> = Vec::new();
+        assert_eq!(
+            slot_needs_reviewer_provisioning(&workers[0], &no_reviewers),
+            Some(443),
+            "parked slot must still ask Phase 5 for a reviewer"
+        );
+
+        // Phase 4d lease renewal via the shared production helper. A
+        // regression that filters dormant slots out of the renewal set — or
+        // that stops iterating the workers vec — must leave the claim
+        // expires_at short of the renewed baseline.
+        renew_active_worker_task_leases(&db_path, &workers).await;
+        let expires_after_renewal: i64 = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT expires_at FROM claims \
+                 WHERE holder = 'Spool' AND target = 'task#1' AND active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            expires_after_renewal > expires_before_renewal,
+            "Phase 4d must advance the claim expiry for a dormant awaiting-review slot \
+             ({expires_after_renewal} !> {expires_before_renewal})"
+        );
+        assert!(
+            expires_after_renewal >= now_unix() + quorum_core::tasks::DEFAULT_LEASE_TTL_SECS - 5,
+            "renewed expiry must reach the default TTL baseline"
+        );
+
+        // Assigned lifecycle contract: no duplicate lifecycle transition on
+        // exit-time park — the mailbox-driven Done handling already fired
+        // the task_in_review row; park itself must not re-fire it.
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let in_review_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE subject='task#1' AND kind='task_in_review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            in_review_events, 1,
+            "park must not emit a second in-review event"
+        );
+
+        // Journal contract: awaiting-review phase and pid=None so restart
+        // recovery does not target the reaped process group.
+        let entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent, "Spool");
+        assert_eq!(entries[0].phase, "awaiting-review");
+        assert_eq!(entries[0].pr, Some(443));
+        assert!(entries[0].pid.is_none());
+
+        // Task-level survival: PR/author retained on the row.
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.author.as_deref(), Some("Spool"));
+        assert_eq!(tasks::extract_pr_number(&task.refs), Some(443));
+
+        for w in workers {
+            w.kill_and_reap().await;
         }
     }
 
@@ -16342,6 +19987,7 @@ mod tests {
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
             codex_sandbox: "danger-full-access".into(),
+            pr_target_program: None,
         }
     }
 
@@ -16359,11 +20005,11 @@ mod tests {
         let now = std::time::Instant::now();
         SlotState {
             agent_name: "live-worker".into(),
-            proc: runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+            proc: SlotProcess::running(runner::RunnerProc::Claude(agent::AgentProc::from_parts(
                 child,
                 stdin,
                 BufReader::new(stdout),
-            )),
+            ))),
             task_id,
             session_id: agent::new_session_id(),
             model: "claude-sonnet-5".into(),
@@ -16378,6 +20024,7 @@ mod tests {
             cost_usd: 0.0,
             task_started_at: now,
             turn_started_at: now,
+            last_event_at: now,
             turn_ended_at: None,
             agent_state: None,
             session_log: None,
@@ -16677,10 +20324,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_block_persistence_fails_loud_before_cleanup() {
+    async fn provider_block_persistence_failure_keeps_name_release_loud() {
         let dir = tempfile::tempdir().unwrap();
         let impossible = dir.path().join("missing-parent").join("quorum.db");
-        let error = persist_runner_provider_block(
+        let expectation = persist_provider_blocked_retry_for_name_retention(
             &impossible,
             1,
             "quota",
@@ -16694,12 +20341,32 @@ mod tests {
                 requested: false,
             },
         )
-        .await
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("provider-block")
-                || error.to_string().contains("unable to open"),
-            "unexpected durable-write error: {error}"
+        .await;
+        assert_eq!(expectation, WorkerNameReleaseExpectation::Released);
+
+        // The early retry policy-rejection caller uses this expectation when
+        // cleaning up a still-active worker lease. Its failed durable write
+        // must therefore take the normal, error-recording guard path rather
+        // than silently retaining an ownerless task.
+        let db_path = dir.path().join("q.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+        seed_task_with_worker_claim(&db_path, 1, &agent);
+        guarded_worker_name_release_with_expectation(&db_path, &mut pool, &agent, 1, expectation)
+            .await;
+
+        assert_eq!(pool.in_use_count(), 1);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='name_release'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 1,
+            "failed provider-block persistence must retain the normal name-release alert"
         );
     }
 
@@ -16799,6 +20466,73 @@ mod tests {
     }
 
     #[test]
+    fn actively_emitting_slot_is_not_reaped_after_old_turn_wall_limit() {
+        let mut slot = make_dummy_slot();
+        let now = std::time::Instant::now();
+        slot.turn_started_at = now - std::time::Duration::from_secs(2_701);
+        slot.last_event_at = now;
+        let limits = CostLimits {
+            max_idle_secs: Some(60),
+            ..Default::default()
+        };
+
+        assert!(check_wall_clock_limits(&limits, &slot).is_none());
+        assert!(check_post_result_limits(&limits, 0, 0, Some(0.0), 0.0, &slot).is_none());
+    }
+
+    #[test]
+    fn stale_event_breaches_idle_limit_in_both_limit_checks() {
+        let mut slot = make_dummy_slot();
+        slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        let limits = CostLimits {
+            max_idle_secs: Some(60),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            check_wall_clock_limits(&limits, &slot),
+            Some(LimitBreached::IdleSecs { max: 60, .. })
+        ));
+        assert!(matches!(
+            check_post_result_limits(&limits, 0, 0, Some(0.0), 0.0, &slot),
+            Some(LimitBreached::IdleSecs { max: 60, .. })
+        ));
+    }
+
+    #[test]
+    fn default_idle_limit_reaps_a_silent_active_slot() {
+        let mut slot = make_dummy_slot();
+        slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(901);
+
+        assert!(matches!(
+            check_wall_clock_limits(&CostLimits::default(), &slot),
+            Some(LimitBreached::IdleSecs { max: 900, .. })
+        ));
+    }
+
+    #[test]
+    fn task_wall_limit_breaches_independently_of_idle_state() {
+        let mut slot = make_dummy_slot();
+        let now = std::time::Instant::now();
+        slot.task_started_at = now - std::time::Duration::from_secs(61);
+        slot.last_event_at = now;
+        let limits = CostLimits {
+            max_idle_secs: Some(60),
+            max_task_wall_secs: Some(60),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            check_wall_clock_limits(&limits, &slot),
+            Some(LimitBreached::TaskWallSecs { max: 60, .. })
+        ));
+        assert!(matches!(
+            check_post_result_limits(&limits, 0, 0, Some(0.0), 0.0, &slot),
+            Some(LimitBreached::TaskWallSecs { max: 60, .. })
+        ));
+    }
+
+    #[test]
     fn limit_breached_display_all_variants() {
         let cases: Vec<LimitBreached> = vec![
             LimitBreached::TurnTokens { turn: 100, max: 50 },
@@ -16814,7 +20548,7 @@ mod tests {
                 total: 1.0,
                 max: 0.5,
             },
-            LimitBreached::TurnWallSecs {
+            LimitBreached::IdleSecs {
                 elapsed: 120,
                 max: 60,
             },
@@ -16836,13 +20570,13 @@ mod tests {
     }
 
     #[test]
-    fn cost_limits_default_is_unlimited() {
+    fn cost_limits_default_leaves_optional_limits_unset() {
         let limits = CostLimits::default();
         assert!(limits.max_turn_tokens.is_none());
         assert!(limits.max_task_tokens.is_none());
         assert!(limits.max_turn_cost_usd.is_none());
         assert!(limits.max_task_cost_usd.is_none());
-        assert!(limits.max_turn_wall_secs.is_none());
+        assert!(limits.max_idle_secs.is_none());
         assert!(limits.max_task_wall_secs.is_none());
         assert!(limits.idle_timeout_secs.is_none());
     }
@@ -16877,6 +20611,42 @@ mod tests {
                 .turn_ended_at
                 .is_some_and(|t| t.elapsed().as_secs() > timeout);
         assert!(!is_zombie);
+    }
+
+    #[tokio::test]
+    async fn slot_is_idle_zombie_candidate_excludes_dormant_awaiting_review_slot() {
+        // Regression guard: the production idle watchdog consults this exact
+        // predicate. Removing the dormancy exclusion inside
+        // `slot_is_idle_zombie_candidate` must break this test.
+        let worktree = tempfile::tempdir().unwrap();
+        let mut slot = slot_with_process(launch_test_codex(worktree.path(), None).await);
+        slot.continuation_id = Some("thread-parked".into());
+        let old = slot.become_dormant().unwrap();
+        old.kill_and_reap().await;
+        slot.draining = false;
+        slot.error_turn_count = 0;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+
+        assert!(
+            !slot_is_idle_zombie_candidate(&slot, 300),
+            "dormant awaiting-review slot must survive the idle watchdog"
+        );
+    }
+
+    #[test]
+    fn slot_is_idle_zombie_candidate_matches_watchdog_shape_for_running_slot() {
+        // Sanity: a running slot past its idle limit still counts as a zombie
+        // so removing the dormancy branch cannot flip this into a green test.
+        let mut slot = make_dummy_slot();
+        slot.draining = false;
+        slot.error_turn_count = 0;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+        assert!(slot_is_idle_zombie_candidate(&slot, 300));
+        slot.draining = true;
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
+        slot.draining = false;
+        slot.error_turn_count = 1;
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
     }
 
     #[test]
@@ -16951,6 +20721,21 @@ mod tests {
         tracker.clear(1);
         assert_eq!(tracker.strikes(1), 0);
         assert_eq!(tracker.strikes(2), 1);
+    }
+
+    #[test]
+    fn claim_skip_logging_is_rate_limited_per_task_and_bounded() {
+        let mut limiter = ClaimSkipLogLimiter::new();
+        let start = std::time::Instant::now();
+        assert!(limiter.should_log(1, start));
+        assert!(!limiter.should_log(1, start + Duration::from_secs(1)));
+        assert!(limiter.should_log(2, start + Duration::from_secs(1)));
+        assert!(limiter.should_log(1, start + CLAIM_SKIP_LOG_INTERVAL));
+
+        for task_id in 3..=(CLAIM_SKIP_LOG_CAPACITY as i64 + 3) {
+            limiter.should_log(task_id, start);
+        }
+        assert_eq!(limiter.logged.len(), CLAIM_SKIP_LOG_CAPACITY);
     }
 
     // ── Drain state unit tests ────────────────────────────────────────
@@ -18073,6 +21858,737 @@ mod tests {
             .contains("no durable spawn-time"));
     }
 
+    fn seed_sticky_rework_task(
+        conn: &mut quorum_core::Connection,
+        pr: i64,
+        intent_baseline: Option<&str>,
+    ) -> i64 {
+        let now = now_unix();
+        let task_id = tasks::create(
+            conn,
+            "owner",
+            "sticky rework fixture",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        tasks::update_refs_daemon(
+            conn,
+            task_id,
+            r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            now,
+        )
+        .unwrap();
+        tasks::claim(conn, "live-worker", Some(task_id), &[], 3600, now)
+            .unwrap()
+            .expect("worker must claim");
+        tasks::apply_event(
+            conn,
+            "live-worker",
+            task_id,
+            &Event::SignaledDone { pr: pr.to_string() },
+            now + 1,
+        )
+        .unwrap();
+        tasks::apply_event(
+            conn,
+            "reviewer",
+            task_id,
+            &Event::ReviewerAttached {
+                agent: "reviewer".into(),
+            },
+            now + 2,
+        )
+        .unwrap();
+        tasks::apply_event(conn, "reviewer", task_id, &Event::VerdictChanges, now + 3).unwrap();
+        let intent = PublicationIntent {
+            branch: format!("daemon/live-worker-t{pr}"),
+            local_sha: "local-sha".into(),
+            pr: Some(pr),
+            stage: "verified".into(),
+            expected_remote_sha: intent_baseline.map(str::to_string),
+        };
+        let json = serde_json::to_string(&intent).unwrap();
+        tasks::set_publication_intent(conn, task_id, &json, now_unix()).unwrap();
+        task_id
+    }
+
+    fn load_intent_baseline(conn: &quorum_core::Connection, task_id: i64) -> Option<String> {
+        let task = tasks::get(conn, task_id).unwrap().unwrap();
+        publication_intent_from_refs(task.refs.as_deref())
+            .and_then(|intent| intent.expected_remote_sha)
+    }
+
+    fn seed_ci_remediation_intent(
+        conn: &quorum_core::Connection,
+        task_id: i64,
+        pr: i64,
+        head_sha: &str,
+    ) {
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(
+                 COALESCE(refs, '{}'),
+                 '$.ci_remediation_requested', json('true'),
+                 '$.ci_remediation_pr', ?2,
+                 '$.ci_remediation_head_sha', ?3,
+                 '$.ci_remediation_feedback', 'fix failed CI',
+                 '$.ci_remediation_checks', json('[\"test\"]'),
+                 '$.ci_remediation_attempts', 0
+             ) WHERE id=?1",
+            rusqlite::params![task_id, pr, head_sha],
+        )
+        .unwrap();
+    }
+
+    fn sticky_baseline_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
+        pre_review_ci_test_config(db_path, repo_dir)
+    }
+
+    #[cfg(unix)]
+    fn write_fake_gh_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn fake_gh_returning(dir: &Path, name: &str, json: &str) -> PathBuf {
+        // gh pr view PR --json ... --repo NWO → emit fixed JSON on stdout.
+        let script = format!("#!/bin/sh\ncat <<'JSON'\n{json}\nJSON\n");
+        write_fake_gh_script(dir, name, &script)
+    }
+
+    #[cfg(unix)]
+    fn fake_gh_failing(dir: &Path, name: &str, stderr: &str) -> PathBuf {
+        let script = format!("#!/bin/sh\nprintf '%s\\n' '{stderr}' >&2\nexit 1\n");
+        write_fake_gh_script(dir, name, &script)
+    }
+
+    #[cfg(unix)]
+    fn open_pr_target_json(head_ref: &str, head_sha: &str, base: &str) -> String {
+        format!(
+            "{{\"headRefName\":\"{head_ref}\",\"headRefOid\":\"{head_sha}\",\
+             \"isCrossRepository\":false,\"baseRefName\":\"{base}\",\"state\":\"OPEN\"}}"
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_resolves_live_and_verifies_persisted_match() {
+        // Live head MUST match the immutable persisted baseline every turn.
+        // The intent's expected_remote_sha stays populated when it already
+        // agrees with the live head.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-verifies-persisted.db");
+        let pr: i64 = 597;
+        let baseline_sha = "018904b901234567deadbeefcafebabe01234567";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(baseline_sha));
+            pr_targets::upsert(
+                &mut conn,
+                id,
+                pr,
+                "daemon/live-worker-t597",
+                baseline_sha,
+                false,
+            )
+            .unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-live-match",
+            &open_pr_target_json("daemon/live-worker-t597", baseline_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect("live head matching the immutable baseline must succeed");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(baseline_sha)
+        );
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, baseline_sha);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_fills_missing_intent_from_live_when_persisted_matches() {
+        // #448 regression: pr_targets seeded from a prior spawn but the initial
+        // publication intent still carries expected_remote_sha=None. The live
+        // head confirms the persisted baseline and populates the intent.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fill-intent-from-live.db");
+        let pr: i64 = 605;
+        let baseline_sha = "1234567890abcdef1234567890abcdef12345678";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, None);
+            pr_targets::upsert(
+                &mut conn,
+                id,
+                pr,
+                "daemon/live-worker-t605",
+                baseline_sha,
+                false,
+            )
+            .unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-fill-intent",
+            &open_pr_target_json("daemon/live-worker-t605", baseline_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect("live head matching persisted must fill missing intent");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(baseline_sha)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_head_moved_outside_persisted_baseline() {
+        // Reviewer's blocker: a moved live head must fail loudly even when a
+        // persisted pr_targets row exists.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-moved-outside.db");
+        let pr: i64 = 598;
+        let persisted_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let live_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(persisted_sha));
+            pr_targets::upsert(
+                &mut conn,
+                id,
+                pr,
+                "daemon/live-worker-t598",
+                persisted_sha,
+                false,
+            )
+            .unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-live-moved",
+            &open_pr_target_json("daemon/live-worker-t598", live_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("live head movement outside persisted baseline must fail");
+        assert!(error.contains("moved outside"), "unexpected error: {error}");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        // Persisted baseline unchanged.
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, persisted_sha);
+        // Intent baseline untouched.
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(persisted_sha)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_pr_closed_even_when_persisted_matches() {
+        // A closed PR is not a safe push target regardless of pr_targets state.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-closed.db");
+        let pr: i64 = 599;
+        let sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(sha));
+            pr_targets::upsert(&mut conn, id, pr, "daemon/live-worker-t599", sha, false).unwrap();
+            id
+        };
+        let json = format!(
+            "{{\"headRefName\":\"daemon/live-worker-t599\",\"headRefOid\":\"{sha}\",\
+             \"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"CLOSED\"}}"
+        );
+        let gh = fake_gh_returning(dir.path(), "gh-closed", &json);
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("a closed PR must not receive a remediation turn");
+        assert!(error.contains("not open"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_pr_retargeted_even_when_persisted_matches() {
+        // A retargeted base branch is a lease violation and blocks the turn.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-retargeted.db");
+        let pr: i64 = 620;
+        let sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(sha));
+            pr_targets::upsert(&mut conn, id, pr, "daemon/live-worker-t620", sha, false).unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-retargeted",
+            &open_pr_target_json("daemon/live-worker-t620", sha, "develop"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("a retargeted PR must not receive a remediation turn");
+        assert!(error.contains("targets base"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_pr_head_ref_renamed_even_when_persisted_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-headref-renamed.db");
+        let pr: i64 = 621;
+        let sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(sha));
+            pr_targets::upsert(&mut conn, id, pr, "daemon/live-worker-t621", sha, false).unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-renamed",
+            &open_pr_target_json("someone-else-branch", sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("a renamed head_ref must not receive a remediation turn");
+        assert!(error.contains("moved outside"), "unexpected error: {error}");
+
+        // Persisted baseline still intact.
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_ref,
+            "daemon/live-worker-t621"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_lookup_failure_even_when_persisted_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-lookup-fail.db");
+        let pr: i64 = 622;
+        let sha = "ffffffffffffffffffffffffffffffffffffffff";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(sha));
+            pr_targets::upsert(&mut conn, id, pr, "daemon/live-worker-t622", sha, false).unwrap();
+            id
+        };
+        let gh = fake_gh_failing(dir.path(), "gh-fail", "network unreachable");
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("an unavailable live target must not authorize the turn");
+        assert!(error.contains("live PR"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_fork_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-fork.db");
+        let pr: i64 = 600;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_sticky_rework_task(&mut conn, pr, None)
+        };
+        let json = "{\"headRefName\":\"fork-branch\",\"headRefOid\":\"abc\",\
+             \"isCrossRepository\":true,\"baseRefName\":\"main\",\"state\":\"OPEN\"}";
+        let gh = fake_gh_returning(dir.path(), "gh-fork", json);
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("fork PR must not be pushed by the daemon");
+        assert!(error.contains("fork"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_bootstraps_missing_persisted_from_live_and_fills_intent() {
+        // #447 root-cause path: initial publication left both pr_targets AND
+        // intent.expected_remote_sha unset. Live gh bootstraps both.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bootstrap-missing.db");
+        let pr: i64 = 623;
+        let live_sha = "018904b9000000000000000000000000018904b9";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_sticky_rework_task(&mut conn, pr, None)
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-bootstrap",
+            &open_pr_target_json("daemon/live-worker-t623", live_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect("missing persisted must be bootstrapped from live head");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, live_sha);
+        assert_eq!(stored.head_ref, "daemon/live-worker-t623");
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(live_sha)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_ci_missing_target_rejects_live_head_after_gated_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-missing-target-moved.db");
+        let pr: i64 = 624;
+        let gated_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let live_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, None);
+            seed_ci_remediation_intent(&conn, id, pr, gated_sha);
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-ci-moved-before-bootstrap",
+            &open_pr_target_json("daemon/live-worker-t624", live_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let installed = install_sticky_remediation_lease_and_baseline(
+            &config,
+            "live-worker".to_string(),
+            task_id,
+            pr,
+            "fix failed CI",
+        )
+        .await;
+        assert!(
+            !installed,
+            "a moved head must not authorize a provider turn"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(
+            pr_targets::get(&conn, task_id, pr).unwrap().is_none(),
+            "the live outside head must not become durable authority"
+        );
+        assert_eq!(load_intent_baseline(&conn, task_id), None);
+        assert_eq!(
+            tasks::ci_remediation_intent(
+                tasks::get(&conn, task_id).unwrap().unwrap().refs.as_deref()
+            )
+            .unwrap()
+            .unwrap()
+            .head_sha,
+            gated_sha
+        );
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked"], true);
+        assert_eq!(
+            refs["daemon_resume_status"], "rework",
+            "the rejected turn must remain owner-retry recoverable"
+        );
+        let active_claim: Option<String> = conn
+            .query_row(
+                "SELECT holder FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .ok();
+        assert!(
+            active_claim.is_none(),
+            "rejected turn must release its lease"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_ci_missing_target_binds_exact_gated_head_for_descendant_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-missing-target-exact.db");
+        let pr: i64 = 625;
+        let gated_sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, None);
+            seed_ci_remediation_intent(&conn, id, pr, gated_sha);
+            id
+        };
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t625".into(),
+            head_sha: gated_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-ci-exact-before-bootstrap",
+            &open_pr_target_json(&target.head_ref, gated_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let installed = install_sticky_remediation_lease_and_baseline(
+            &config,
+            "live-worker".to_string(),
+            task_id,
+            pr,
+            "fix failed CI",
+        )
+        .await;
+        assert!(installed, "the exact gated head must authorize the turn");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, gated_sha);
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let publication = publication_intent_from_refs(task.refs.as_deref()).unwrap();
+        assert_eq!(publication.expected_remote_sha.as_deref(), Some(gated_sha));
+        assert_eq!(
+            existing_pr_lease_baseline(&publication, &target, "main").unwrap(),
+            Some(gated_sha),
+            "a descendant delivery must use the exact gated head as its push lease"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_sticky_remediation_lease_and_baseline_releases_lease_on_bind_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("lease-release.db");
+        let pr: i64 = 601;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_sticky_rework_task(&mut conn, pr, None)
+        };
+        let gh = fake_gh_failing(dir.path(), "gh-lease-fail", "boom");
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let installed = install_sticky_remediation_lease_and_baseline(
+            &config,
+            "live-worker".to_string(),
+            task_id,
+            pr,
+            "fix the failing check",
+        )
+        .await;
+        assert!(
+            !installed,
+            "baseline bind failure must reject the sticky turn"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let active_claim: Option<String> = conn
+            .query_row(
+                "SELECT holder FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .ok();
+        assert!(
+            active_claim.is_none(),
+            "lease must be released after bind failure, got {:?}",
+            active_claim
+        );
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked"], true);
+        assert!(refs["daemon_parked_reason"]
+            .as_str()
+            .unwrap()
+            .contains("sticky remediation baseline"));
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_inserts_missing_row_and_fills_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-insert.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let pr: i64 = 610;
+        let target_sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let task_id = seed_sticky_rework_task(&mut conn, pr, None);
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t610".into(),
+            head_sha: target_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target).unwrap();
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, target_sha);
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(target_sha)
+        );
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_rejects_moved_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-moved.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let pr: i64 = 611;
+        let old_sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let new_sha = "ffffffffffffffffffffffffffffffffffffffff";
+        let task_id = seed_sticky_rework_task(&mut conn, pr, None);
+        pr_targets::upsert(
+            &mut conn,
+            task_id,
+            pr,
+            "daemon/live-worker-t611",
+            old_sha,
+            false,
+        )
+        .unwrap();
+        let live = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t611".into(),
+            head_sha: new_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let error = persist_sticky_remediation_baseline(&mut conn, task_id, pr, &live)
+            .expect_err("head movement outside baseline must fail");
+        assert!(error.to_string().contains("moved outside"));
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(
+            stored.head_sha, old_sha,
+            "durable baseline must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_rejects_intent_conflict_with_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-intent-conflict.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let pr: i64 = 613;
+        let intent_sha = "1111111111111111111111111111111111111111";
+        let live_sha = "2222222222222222222222222222222222222222";
+        let task_id = seed_sticky_rework_task(&mut conn, pr, Some(intent_sha));
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t613".into(),
+            head_sha: live_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let error = persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target)
+            .expect_err("intent baseline vs live head mismatch must fail");
+        assert!(
+            error.to_string().contains("intent baseline"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(intent_sha)
+        );
+        assert!(pr_targets::get(&conn, task_id, pr).unwrap().is_none());
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_rejects_non_rework_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-status.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let now = now_unix();
+        let pr: i64 = 612;
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "wrong status",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET refs = json_set(COALESCE(refs, '{}'), '$.pr', ?2), status='open' WHERE id=?1",
+            rusqlite::params![task_id, pr],
+        )
+        .unwrap();
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/x".into(),
+            head_sha: "1234".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let error = persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target)
+            .expect_err("only rework tasks may receive a sticky baseline");
+        assert!(error.to_string().contains("not in rework"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn publication_gh_timeout_kills_and_reaps_hung_child() {
@@ -18400,7 +22916,7 @@ mod tests {
             stage: "verified".into(),
             expected_remote_sha: Some("sha-x".into()),
         };
-        let conn = quorum_core::db::open(&db_path).unwrap();
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
         tasks::set_publication_intent(
             &conn,
             id,
@@ -18408,14 +22924,17 @@ mod tests {
             now_unix(),
         )
         .unwrap();
+        pr_targets::upsert(&mut conn, id, 482, "daemon/publisher-t1", "sha-x", false).unwrap();
         drop(conn);
 
         let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let publication = published_completion(intent, 482);
         tasks::apply_published_worker_event(
             &mut conn,
             "Publisher",
             id,
             &Event::SignaledDone { pr: "482".into() },
+            &publication,
             now_unix(),
         )
         .unwrap();
@@ -18429,125 +22948,340 @@ mod tests {
             "committed lifecycle must not leave stale SHA A for later rework"
         );
         assert_eq!(task.status, "in-review");
+        assert_eq!(
+            pr_targets::get(&conn, id, 482).unwrap().unwrap().head_sha,
+            "sha-a"
+        );
     }
 
-    // ── resolve_or_load_pr_target (persisted fallback) ───────────────────
+    #[test]
+    fn published_lifecycle_converges_when_target_already_equals_exact_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("published-replay.db");
+        let id = working_task(&db_path, "Publisher", None);
+        let intent = PublicationIntent {
+            branch: "daemon/publisher-t1".into(),
+            local_sha: "sha-a".into(),
+            pr: Some(482),
+            stage: "verified".into(),
+            expected_remote_sha: Some("sha-x".into()),
+        };
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::set_publication_intent(
+            &conn,
+            id,
+            &serde_json::to_string(&intent).unwrap(),
+            now_unix(),
+        )
+        .unwrap();
+        pr_targets::upsert(&mut conn, id, 482, "daemon/publisher-t1", "sha-a", false).unwrap();
+        let publication = published_completion(intent, 482);
+
+        tasks::apply_published_worker_event(
+            &mut conn,
+            "Publisher",
+            id,
+            &Event::SignaledDone { pr: "482".into() },
+            &publication,
+            now_unix(),
+        )
+        .unwrap();
+
+        let task = tasks::get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get("daemon_publication").is_none());
+        assert_eq!(
+            pr_targets::get(&conn, id, 482).unwrap().unwrap().head_sha,
+            "sha-a"
+        );
+    }
+
+    #[test]
+    fn published_lifecycle_rejects_unrelated_durable_head_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("published-authority-mismatch.db");
+        let id = working_task(&db_path, "Publisher", None);
+        let intent = PublicationIntent {
+            branch: "daemon/publisher-t1".into(),
+            local_sha: "sha-a".into(),
+            pr: Some(482),
+            stage: "verified".into(),
+            expected_remote_sha: Some("sha-x".into()),
+        };
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::set_publication_intent(
+            &conn,
+            id,
+            &serde_json::to_string(&intent).unwrap(),
+            now_unix(),
+        )
+        .unwrap();
+        pr_targets::upsert(
+            &mut conn,
+            id,
+            482,
+            "daemon/publisher-t1",
+            "unrelated-z",
+            false,
+        )
+        .unwrap();
+        let publication = published_completion(intent, 482);
+
+        let error = tasks::apply_published_worker_event(
+            &mut conn,
+            "Publisher",
+            id,
+            &Event::SignaledDone { pr: "482".into() },
+            &publication,
+            now_unix(),
+        )
+        .err()
+        .expect("an unrelated durable head must fail settlement");
+        assert!(error.to_string().contains("target authority changed"));
+
+        let task = tasks::get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_publication"]["local_sha"], "sha-a");
+        assert_eq!(
+            pr_targets::get(&conn, id, 482).unwrap().unwrap().head_sha,
+            "unrelated-z"
+        );
+    }
+
+    // ── reviewer PR target acceptance ────────────────────────────────────
 
     fn open_test_db(dir: &std::path::Path) -> quorum_core::Connection {
         quorum_core::db::open(&dir.join("q.db")).unwrap()
     }
 
-    #[test]
-    fn persisted_target_reused_when_gh_unavailable() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 10, 42, "daemon/lever-t10", "abc123", false).unwrap();
-        drop(conn);
+    fn seed_reserved_review_task(conn: &mut quorum_core::Connection, pr: i64, token: &str) -> i64 {
+        let task_id = tasks::create(
+            conn,
+            "owner",
+            "review target guard",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null}"#),
+            None,
+            Some(pr),
+            100,
+        )
+        .unwrap();
+        assert!(tasks::reserve_reviewer_provision(conn, task_id, token, "r1", 101).unwrap());
+        task_id
+    }
 
-        // gh will fail (fake repo_dir), so fallback kicks in
-        let result = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo"));
-        let t = result.unwrap();
-        assert_eq!(t.pr, 42);
-        assert_eq!(t.head_ref, "daemon/lever-t10");
-        assert_eq!(t.head_sha, "abc123");
-        assert!(!t.is_fork);
+    fn live_reviewer_target(pr: i64, branch: &str, sha: &str) -> ResolvedReviewerPrTarget {
+        ResolvedReviewerPrTarget {
+            target: PrTarget {
+                pr,
+                head_ref: branch.into(),
+                head_sha: sha.into(),
+                is_fork: false,
+                base_ref: Some("main".into()),
+                state: Some("OPEN".into()),
+            },
+            source: ReviewerPrTargetSource::Live,
+        }
     }
 
     #[test]
-    fn persisted_fork_target_reused() {
+    fn matching_gated_reviewer_target_persists_under_exact_reservation() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
         let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 10, 42, "fix-bug", "def456", true).unwrap();
-        drop(conn);
+        let task_id = seed_reserved_review_task(&mut conn, 42, "winner");
+        let resolved = live_reviewer_target(42, "feature/review", "gated-sha");
 
-        let t = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).unwrap();
-        assert!(t.is_fork);
-        assert_eq!(t.head_ref, "fix-bug");
+        validate_reviewer_pr_target(&resolved, 42, "gated-sha", "main").unwrap();
+        assert!(persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "winner",
+            "r1",
+            &resolved,
+            "gated-sha",
+        )
+        .unwrap());
+
+        let stored = pr_targets::get(&conn, task_id, 42).unwrap().unwrap();
+        assert_eq!(stored.head_ref, "feature/review");
+        assert_eq!(stored.head_sha, "gated-sha");
+        assert!(!stored.is_fork);
     }
 
     #[test]
-    fn persisted_target_wrong_pr_returns_none() {
+    fn reviewer_target_persists_under_active_decomposition_freeze() {
+        // Deadlock regression: an in-review PR's reviewer target MUST persist
+        // while an unrelated decomposition freeze is draining. The freeze's
+        // drain predicate waits for reviewers==0; blocking persistence here
+        // would strand the reviewer and deadlock the freeze against its drain.
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
         let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 10, 42, "branch", "sha1", false).unwrap();
-        drop(conn);
+        let task_id = seed_reserved_review_task(&mut conn, 42, "winner");
+        // The freeze belongs to a SEPARATE decomposition source task (status
+        // 'decomposed'), not the in-review task under test — this models the
+        // real scenario: an unrelated graph draining must not block this PR's
+        // reviewer target from persisting.
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('decomp source','decomposed','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let source_task_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,1,1)",
+            [source_task_id],
+        )
+        .unwrap();
+        let resolved = live_reviewer_target(42, "feature/review", "gated-sha");
 
-        // PR 99 doesn't match persisted PR 42
-        assert!(
-            resolve_or_load_pr_target(99, 10, &db_path, dir.path(), Some("fake/repo")).is_none()
+        validate_reviewer_pr_target(&resolved, 42, "gated-sha", "main").unwrap();
+        assert!(persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "winner",
+            "r1",
+            &resolved,
+            "gated-sha",
+        )
+        .unwrap());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            "gated-sha"
         );
     }
 
     #[test]
-    fn no_persisted_target_no_gh_returns_none() {
+    fn reviewer_target_identity_mismatches_leave_durable_tuple_byte_for_byte_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let _conn = open_test_db(dir.path());
+        let mut conn = open_test_db(dir.path());
+        let task_id = seed_reserved_review_task(&mut conn, 42, "winner");
+        pr_targets::upsert(
+            &mut conn,
+            task_id,
+            42,
+            "feature/review",
+            "accepted-sha",
+            false,
+        )
+        .unwrap();
+        let before = pr_targets::get(&conn, task_id, 42).unwrap().unwrap();
 
-        // No persisted target, gh will fail
-        assert!(
-            resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).is_none()
+        for mut moved in [
+            live_reviewer_target(42, "wrong-branch", "gated-sha"),
+            live_reviewer_target(42, "feature/review", "gated-sha"),
+        ] {
+            if moved.target.head_ref == "feature/review" {
+                moved.target.is_fork = true;
+            }
+            validate_reviewer_pr_target(&moved, 42, "gated-sha", "main").unwrap();
+            assert!(matches!(
+                persist_reviewer_pr_target(&mut conn, task_id, "winner", "r1", &moved, "gated-sha",),
+                Err(QuorumError::Usage(_))
+            ));
+            assert_eq!(
+                pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+                before
+            );
+        }
+
+        for invalid in [
+            live_reviewer_target(42, "feature/review", "moved-sha"),
+            live_reviewer_target(99, "feature/review", "gated-sha"),
+        ] {
+            assert!(validate_reviewer_pr_target(&invalid, 42, "gated-sha", "main").is_err());
+            assert_eq!(
+                pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+                before
+            );
+        }
+        let mut wrong_base = live_reviewer_target(42, "feature/review", "gated-sha");
+        wrong_base.target.base_ref = Some("release".into());
+        assert!(validate_reviewer_pr_target(&wrong_base, 42, "gated-sha", "main").is_err());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+            before
         );
     }
 
     #[test]
-    fn persisted_target_stale_head_still_returned() {
-        // Stale head_sha is returned — SHA verification happens downstream
-        // at worktree checkout, not here
+    fn reviewer_target_authority_loss_reservation_loss_and_replay_do_not_mutate_target() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
         let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 10, 42, "branch", "old_sha", false).unwrap();
-        drop(conn);
+        let task_id = seed_reserved_review_task(&mut conn, 42, "winner");
+        pr_targets::upsert(
+            &mut conn,
+            task_id,
+            42,
+            "feature/review",
+            "accepted-sha",
+            false,
+        )
+        .unwrap();
+        let before = pr_targets::get(&conn, task_id, 42).unwrap().unwrap();
+        let advanced = live_reviewer_target(42, "feature/review", "next-gated-sha");
 
-        let t = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).unwrap();
-        assert_eq!(t.head_sha, "old_sha");
-    }
-
-    #[test]
-    fn review_only_no_gh_no_persisted_returns_none() {
-        // Review-only tasks: orphan_worker_branch returns None AND no persisted
-        // target → no worker spawned (the fail-safe)
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let _conn = open_test_db(dir.path());
-
-        assert!(orphan_worker_branch("Anvil", 15, true).is_none());
-        assert!(
-            resolve_or_load_pr_target(42, 15, &db_path, dir.path(), Some("fake/repo")).is_none()
+        conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [task_id])
+            .unwrap();
+        assert!(!persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "winner",
+            "r1",
+            &advanced,
+            "next-gated-sha",
+        )
+        .unwrap());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+            before
         );
-    }
 
-    #[test]
-    fn review_only_with_persisted_target_succeeds() {
-        // Review-only tasks with a persisted target CAN spawn
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 15, 42, "external/pr-branch", "sha999", false).unwrap();
-        drop(conn);
+        conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [task_id])
+            .unwrap();
+        let mut concurrent = open_test_db(dir.path());
+        assert!(tasks::release_reviewer_provision(&mut concurrent, task_id, "winner").unwrap());
+        drop(concurrent);
+        assert!(!persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "winner",
+            "r1",
+            &advanced,
+            "next-gated-sha",
+        )
+        .unwrap());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+            before
+        );
 
-        assert!(orphan_worker_branch("Anvil", 15, true).is_none());
-        let t = resolve_or_load_pr_target(42, 15, &db_path, dir.path(), Some("fake/repo")).unwrap();
-        assert_eq!(t.head_ref, "external/pr-branch");
-    }
-
-    #[test]
-    fn persisted_target_updated_on_upsert() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let mut conn = open_test_db(dir.path());
-        pr_targets::upsert(&mut conn, 10, 42, "old-branch", "sha1", false).unwrap();
-        pr_targets::upsert(&mut conn, 10, 42, "new-branch", "sha2", true).unwrap();
-        drop(conn);
-
-        let t = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).unwrap();
-        assert_eq!(t.head_ref, "new-branch");
-        assert_eq!(t.head_sha, "sha2");
-        assert!(t.is_fork);
+        assert!(tasks::reserve_reviewer_provision(&mut conn, task_id, "next", "r1", 102).unwrap());
+        assert!(tasks::release_reviewer_provision(&mut conn, task_id, "next").unwrap());
+        assert!(!persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "next",
+            "r1",
+            &advanced,
+            "next-gated-sha",
+        )
+        .unwrap());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42).unwrap().unwrap(),
+            before,
+            "released-token replay must be read-only"
+        );
     }
 
     // ── per-task provider routing (#195/#203) ────────────────────────────
@@ -19209,7 +23943,7 @@ mod tests {
     fn codex_usd_guard_allows_token_and_wall_limits() {
         let limits = CostLimits {
             max_task_tokens: Some(100_000),
-            max_turn_wall_secs: Some(600),
+            max_idle_secs: Some(600),
             ..Default::default()
         };
         let kind = runner::AgentKind::Codex;
@@ -19291,6 +24025,24 @@ mod tests {
             turn_kind: "initial".into(),
             continuation_id: Some("thread-live".into()),
             requested: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authoritative_managed_outcomes_gate_runner_failure_taxonomy() {
+        // OutcomePending/Recorded cover worker submissions and reviewer
+        // verdicts/findings. OwnershipTransferred covers authoritative agent
+        // failed/blocked/needs-info reactions and already-advanced tasks.
+        for disposition in [
+            tasks::ManagedExitDisposition::OutcomePending,
+            tasks::ManagedExitDisposition::OutcomeRecorded,
+            tasks::ManagedExitDisposition::OwnershipTransferred,
+        ] {
+            assert!(
+                !managed_exit_permits_runner_failure(&disposition),
+                "authoritative outcome entered runner failure taxonomy"
+            );
         }
     }
 
@@ -20374,6 +25126,7 @@ mod tests {
                 implementation_delta: "change layer a".into(),
                 affected_paths: vec!["src/a.rs".into()],
                 observable_outcome: "a works".into(),
+                deliverables: writable_deliverables("src/a.rs"),
                 acceptance_criteria: vec!["a".into()],
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
@@ -20385,6 +25138,7 @@ mod tests {
                 key: "b".into(),
                 title: "b".into(),
                 observable_outcome: "b works".into(),
+                deliverables: writable_deliverables("src/b.rs"),
                 acceptance_criteria: vec!["b".into()],
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
@@ -20414,14 +25168,28 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].local_key, "a");
         assert_eq!(children[1].prerequisite_keys, ["a"]);
-        let body: serde_json::Value = serde_json::from_str(&children[0].body).unwrap();
-        assert_eq!(body["implementation_delta"], "change layer a");
-        assert_eq!(body["affected_paths"], serde_json::json!(["src/a.rs"]));
-        assert_eq!(body["non_goals"], serde_json::json!(["do not change b"]));
+        let child_body: serde_json::Value = serde_json::from_str(&children[0].body).unwrap();
+        assert_eq!(child_body["implementation_delta"], "change layer a");
         assert_eq!(
-            body["preserved_literals"],
+            child_body["affected_paths"],
+            serde_json::json!(["src/a.rs"])
+        );
+        assert_eq!(
+            child_body["non_goals"],
+            serde_json::json!(["do not change b"])
+        );
+        assert_eq!(
+            child_body["preserved_literals"],
             serde_json::json!(["EXACT_LABEL"])
         );
+        assert!(child_body["source_constraints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|constraint| constraint == planner::WORKER_WRITABILITY_GUIDANCE));
+        let worker_prompt =
+            reviewer::build_worker_prompt("worker", 7, &children[0].title, &children[0].body, None);
+        assert!(worker_prompt.contains(planner::WORKER_WRITABILITY_GUIDANCE));
 
         let mut not_ready = valid.clone();
         not_ready[0].ready = false;
@@ -20471,6 +25239,7 @@ mod tests {
             implementation_delta: "change the bounded planner seam".into(),
             affected_paths: vec!["src/bounded.rs".into()],
             observable_outcome: "bounded evidence persists".into(),
+            deliverables: writable_deliverables("src/bounded.rs"),
             acceptance_criteria: vec!["bounded".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["test".into()],
@@ -20519,6 +25288,7 @@ mod tests {
             key: "readiness".into(),
             title: "readiness".into(),
             observable_outcome: "readiness is observable".into(),
+            deliverables: writable_deliverables("src/readiness.rs"),
             acceptance_criteria: vec!["readiness".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["test".into()],
@@ -20587,6 +25357,177 @@ mod tests {
                 "child readiness rejected by preclassification: ready=false (not_ready_reason: owner must select the storage format)".into(),
             )
         );
+    }
+
+    #[tokio::test]
+    async fn escaping_later_child_rejects_proposal_before_any_activation_or_provisioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_dir = dir.path().join("repo");
+        let sibling_dir = dir.path().join("sibling");
+        std::fs::create_dir(&repo_dir).unwrap();
+        std::fs::create_dir(&sibling_dir).unwrap();
+        let db_path = dir.path().join("escaping-proposal.db");
+        let proposal = vec![
+            planner::ProposedTask {
+                key: "permitted-first".into(),
+                title: "permitted first child".into(),
+                implementation_delta: "change the permitted implementation".into(),
+                affected_paths: vec!["src/permitted.rs".into()],
+                observable_outcome: "the first child remains inside the repository".into(),
+                deliverables: writable_deliverables("src/permitted.rs"),
+                acceptance_criteria: vec!["permitted child works".into()],
+                source_constraints: vec!["preserve atomic activation".into()],
+                verification_expectations: vec!["focused test passes".into()],
+                non_goals: vec!["do not write outside the repository".into()],
+                preserved_literals: vec![],
+                prerequisites: vec![],
+            },
+            planner::ProposedTask {
+                key: "escaping-second".into(),
+                title: "escaping second child".into(),
+                implementation_delta: "attempt the declared external output".into(),
+                affected_paths: vec!["../sibling/escaped.rs".into()],
+                observable_outcome: "the second child writes outside the repository".into(),
+                deliverables: writable_deliverables("../sibling/escaped.rs"),
+                acceptance_criteria: vec!["escaping child is rejected".into()],
+                source_constraints: vec!["preserve atomic activation".into()],
+                verification_expectations: vec!["negative path is durable".into()],
+                non_goals: vec!["do not activate any child".into()],
+                preserved_literals: vec![],
+                prerequisites: vec!["permitted-first".into()],
+            },
+        ];
+
+        let (source_id, graph_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source_id = tasks::create(
+                &mut conn,
+                "owner",
+                "large source",
+                Some("split this source safely"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph_id = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id: source_id,
+                    expected_revision: 1,
+                    provider: "claude",
+                    model: "opus",
+                    frozen_base_sha: "0123456789abcdef0123456789abcdef01234567",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph_id,
+                "freeze-requested",
+                "planning",
+                None,
+                3,
+            )
+            .unwrap();
+            let proposal_json = serde_json::to_string(&proposal).unwrap();
+            assert!(quorum_core::decomposition::accept_proposal(
+                &mut conn,
+                graph_id,
+                &proposal_json,
+                4,
+            )
+            .unwrap());
+            (source_id, graph_id)
+        };
+
+        let config = pre_review_checks_config(db_path.clone(), repo_dir);
+        let mut coordinator = DecompositionCoordinator {
+            graph_id: Some(graph_id),
+            proposal: Some(proposal),
+            ..DecompositionCoordinator::default()
+        };
+        assert!(tick_decomposition(
+            &config,
+            &mut coordinator,
+            &[],
+            &[],
+            DecompositionLiveWork::default(),
+        )
+        .await
+        .unwrap());
+        assert!(coordinator.proposal.is_none());
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let lifecycle: (String, bool, bool, i64, Option<String>, String) = conn
+            .query_row(
+                "SELECT d.state,d.freeze_active,d.active,d.proposal_attempts,
+                        d.accepted_proposal_json,t.status
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            ("planning".into(), true, false, 1, None, "planning".into())
+        );
+
+        let attempt: (String, String) = conn
+            .query_row(
+                "SELECT reason_code,summary FROM decomposition_attempts WHERE graph_id=?1",
+                [graph_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt.0, "deterministic-validation");
+        assert!(attempt.1.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
+        assert!(attempt.1.contains("child escaping-second"), "{}", attempt.1);
+        assert!(attempt.1.contains("../sibling/escaped.rs"), "{}", attempt.1);
+        assert!(
+            attempt.1.contains("in-repository write path"),
+            "{}",
+            attempt.1
+        );
+
+        let authority: (i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM tasks WHERE id<>?1),
+                    (SELECT count(*) FROM tasks WHERE status='open'),
+                    (SELECT count(*) FROM task_graph_members),
+                    (SELECT count(*) FROM role_assignments),
+                    (SELECT count(*) FROM agent_runs),
+                    (SELECT count(*) FROM journal)",
+                [source_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(authority, (0, 0, 0, 0, 0, 0));
     }
 
     #[test]
@@ -20676,9 +25617,18 @@ mod tests {
             0,
             0,
             0,
+            0,
             DecompositionLiveWork::default()
         ));
         assert!(!decomposition_drain_ready(
+            1,
+            0,
+            0,
+            0,
+            DecompositionLiveWork::default()
+        ));
+        assert!(!decomposition_drain_ready(
+            0,
             1,
             0,
             0,
@@ -20686,11 +25636,15 @@ mod tests {
         ));
         assert!(!decomposition_drain_ready(
             0,
+            0,
             1,
             0,
             DecompositionLiveWork::default()
         ));
+        // A started-but-not-terminal task (e.g. in-review with no reviewer
+        // yet) holds drain open even when every live slot is empty.
         assert!(!decomposition_drain_ready(
+            0,
             0,
             0,
             1,
@@ -20710,7 +25664,7 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(!decomposition_drain_ready(0, 0, 0, live));
+            assert!(!decomposition_drain_ready(0, 0, 0, 0, live));
         }
     }
 
@@ -20784,6 +25738,7 @@ mod tests {
                         implementation_delta: "change a seam".into(),
                         affected_paths: vec!["src/a.rs".into()],
                         observable_outcome: "a".into(),
+                        deliverables: writable_deliverables("src/a.rs"),
                         acceptance_criteria: vec!["a".into()],
                         source_constraints: vec!["a".into()],
                         verification_expectations: vec!["a".into()],
@@ -20797,6 +25752,7 @@ mod tests {
                         implementation_delta: "change b seam".into(),
                         affected_paths: vec!["src/b.rs".into()],
                         observable_outcome: "b".into(),
+                        deliverables: writable_deliverables("src/b.rs"),
                         acceptance_criteria: vec!["b".into()],
                         source_constraints: vec!["b".into()],
                         verification_expectations: vec!["b".into()],
@@ -21126,6 +26082,7 @@ mod tests {
             planner_slot: Some(planner_slot),
             classifier_slot: Some(classifier_slot),
             planner_view: None,
+            writable_path_resolver: planner::WritablePathResolver::default(),
         };
 
         // An accepted pre-materialization edit removes the aggregate, so the
@@ -21567,5 +26524,192 @@ mod tests {
                 && error.detail.contains("PR #37")
                 && error.detail.contains("index.lock")
         }));
+    }
+
+    /// The daemon-owned name-release guard is the seam that stops a delivered
+    /// identity from being recycled while its task lease is still live. The
+    /// three tests below cover the disposition set from #427: active lease
+    /// (retain), released/terminal ownership (permit exactly one release),
+    /// and a DB failure at check time (retain).
+    fn seed_task_with_worker_claim(db_path: &Path, task_id: i64, agent: &str) {
+        // Lease `expires_at` must sit ahead of the wall clock the async guard
+        // observes via `now_unix()`; a hardcoded epoch would already look
+        // expired and defeat the "live claim retains name" contract.
+        let now = now_unix();
+        let ttl = 3_600_i64;
+        let conn = quorum_core::db::open(db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,assignee,created_by,created_at,updated_at)
+                 VALUES (?1,'t','working',?2,'owner',?3,?3)",
+            rusqlite::params![task_id, agent, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+                 VALUES (?1,?2,?3,?4,1)",
+            rusqlite::params![
+                quorum_core::tasks::lease_target(task_id),
+                agent,
+                now,
+                now + ttl,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guard_retains_name_while_worker_claim_is_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+        seed_task_with_worker_claim(&db_path, 42, &agent);
+
+        guarded_worker_name_release(&db_path, &mut pool, &agent, 42).await;
+
+        assert_eq!(
+            pool.in_use_count(),
+            1,
+            "an active task lease must prevent recycling the delivered identity"
+        );
+        // Re-acquisition must not return this name.
+        let next = pool.acquire().into_name();
+        assert_ne!(next, agent);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='name_release'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 1,
+            "abnormal name-release retention must be surfaced as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_blocked_retry_retains_active_worker_name_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+        seed_task_with_worker_claim(&db_path, 43, &agent);
+        let expectation = persist_provider_blocked_retry_for_name_retention(
+            &db_path,
+            43,
+            "turn-oriented runner exited before task submission",
+            &PendingTurn {
+                provider: "codex".into(),
+                model: "gpt-test".into(),
+                effort: "high".into(),
+                prompt: "continue exact work".into(),
+                turn_kind: "rework".into(),
+                continuation_id: Some("thread-43".into()),
+                requested: false,
+            },
+        )
+        .await;
+        assert_eq!(
+            expectation,
+            WorkerNameReleaseExpectation::RetainedForProviderRetry
+        );
+
+        guarded_worker_name_release_with_expectation(&db_path, &mut pool, &agent, 43, expectation)
+            .await;
+
+        assert_eq!(
+            pool.in_use_count(),
+            1,
+            "provider-blocked retry must retain its worker identity"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='name_release'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 0,
+            "intentional provider-blocked name retention must not raise an alert"
+        );
+    }
+
+    #[test]
+    fn only_provider_blocked_cleanup_expects_a_live_worker_lease() {
+        assert_eq!(
+            worker_name_release_expectation("provider_blocked"),
+            WorkerNameReleaseExpectation::RetainedForProviderRetry
+        );
+        assert_eq!(
+            worker_name_release_expectation("done"),
+            WorkerNameReleaseExpectation::Released
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_releases_name_after_claim_is_deactivated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+        seed_task_with_worker_claim(&db_path, 7, &agent);
+
+        // Terminal disposition would deactivate the lease before teardown.
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND holder=?2",
+            rusqlite::params![quorum_core::tasks::lease_target(7), agent],
+        )
+        .unwrap();
+        drop(conn);
+
+        guarded_worker_name_release(&db_path, &mut pool, &agent, 7).await;
+        assert_eq!(
+            pool.in_use_count(),
+            0,
+            "released lease must return the name"
+        );
+
+        // Idempotent: repeating the guarded release on a name that is already
+        // out of the in-use set is a no-op — no double-release, no error row.
+        guarded_worker_name_release(&db_path, &mut pool, &agent, 7).await;
+        assert_eq!(pool.in_use_count(), 0);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='name_release'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 0,
+            "clean teardown must not emit a name-release error"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_retains_name_when_claim_check_fails() {
+        // A DB open failure at check time must NEVER be treated as "no active
+        // claim" — the safe default is to leak the identity, not silently
+        // recycle it.
+        let dir = tempfile::tempdir().unwrap();
+        let missing_db = dir.path().join("does-not-exist").join("q.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+
+        guarded_worker_name_release(&missing_db, &mut pool, &agent, 99).await;
+
+        assert_eq!(
+            pool.in_use_count(),
+            1,
+            "a DB failure during the guard must retain the name"
+        );
     }
 }

@@ -59,6 +59,7 @@ struct ServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
+    gh_state: std::path::PathBuf,
     _sentinel: Option<tempfile::TempDir>,
     _gh_shim: Option<tempfile::TempDir>,
 }
@@ -119,6 +120,24 @@ elif [ "$cmd" = "pr list" ]; then
 elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  case "$*" in
+    *headRefName*)
+      if [ -f "$QUORUM_TEST_GH_STATE/fail_target" ]; then
+        printf 'target lookup unavailable\n' >&2
+        exit 1
+      fi
+      if [ -f "$QUORUM_TEST_GH_STATE/move_on_target" ]; then
+        rm "$QUORUM_TEST_GH_STATE/move_on_target"
+        git -C "$QUORUM_TEST_REPO" commit --allow-empty -m reviewer-target-moved >/dev/null
+        moved_sha="$(git -C "$QUORUM_TEST_REPO" rev-parse HEAD)"
+        git -C "$QUORUM_TEST_REPO" update-ref "refs/heads/$branch" "$moved_sha"
+        printf '%s' "$moved_sha" > "$QUORUM_TEST_GH_STATE/moved_sha"
+        if [ -f "$QUORUM_TEST_GH_STATE/checks_path" ]; then
+          printf 'pending\n' > "$(cat "$QUORUM_TEST_GH_STATE/checks_path")"
+        fi
+      fi
+      ;;
+  esac
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
@@ -188,6 +207,7 @@ fi
             child,
             rx,
             lines: Vec::new(),
+            gh_state,
             _sentinel: Some(sentinel),
             _gh_shim: Some(gh_shim),
         }
@@ -376,6 +396,41 @@ fn task_state(home: &std::path::Path) -> (String, i64, i64) {
         )
         .unwrap();
     (task.status, task.rework_round, reviewer_runs)
+}
+
+fn persisted_pr_target(home: &std::path::Path) -> (i64, String, String, i64, i64) {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    conn.query_row(
+        "SELECT pr_number,head_ref,head_sha,is_fork,resolved_at
+         FROM pr_targets WHERE task_id=1",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )
+    .unwrap()
+}
+
+fn reviewer_resource_counts(home: &std::path::Path) -> (i64, i64, i64) {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    conn.query_row(
+        "SELECT
+           (SELECT count(*) FROM agent_runs WHERE task_id=1 AND role='reviewer'),
+           (SELECT count(*) FROM journal WHERE task_id=1 AND role='reviewer'),
+           (SELECT count(*) FROM run_capabilities
+            WHERE task_id=1 AND role='reviewer' AND revoked_at IS NULL)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap()
 }
 
 fn drive_to_rework(home: &std::path::Path, handle: &mut ServeHandle) -> (String, String) {
@@ -645,6 +700,129 @@ fn head_move_during_ci_wait_discards_old_gate_before_reviewer_spawn() {
         String::from_utf8_lossy(&current_sha.stdout).trim(),
         "reviewer worktree must be the newly gated head"
     );
+    handle.force_stop();
+}
+
+#[test]
+fn reviewer_target_move_after_exact_head_check_never_poisoned_durable_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("reviewer_target_checks");
+    std::fs::write(&checks_state, "pending\n").unwrap();
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "reviewer target TOCTOU");
+
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+    assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+    assert!(
+        handle.wait_for("waiting for checks before reviewer provisioning", 15),
+        "initial reviewer gate did not start: {:?}",
+        handle.lines
+    );
+
+    let accepted_branch = std::fs::read_to_string(handle.gh_state.join("1")).unwrap();
+    let accepted_sha = Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "rev-parse",
+            &format!("refs/heads/{accepted_branch}"),
+        ])
+        .output()
+        .unwrap();
+    let accepted_sha = String::from_utf8_lossy(&accepted_sha.stdout)
+        .trim()
+        .to_string();
+    let db = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    quorum_core::pr_targets::upsert(&mut conn, 1, 1, &accepted_branch, &accepted_sha, false)
+        .unwrap();
+    drop(conn);
+    let accepted = persisted_pr_target(home.path());
+    std::fs::write(
+        handle.gh_state.join("checks_path"),
+        checks_state.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(handle.gh_state.join("move_on_target"), b"1").unwrap();
+    std::fs::write(&checks_state, "ready\n").unwrap();
+
+    assert!(
+        handle.wait_for("resolved target moved after CI gate", 20),
+        "target resolution did not deterministically move after the exact head check: {:?}",
+        handle.lines
+    );
+    let moved_sha = std::fs::read_to_string(handle.gh_state.join("moved_sha")).unwrap();
+    assert_ne!(accepted.2, moved_sha);
+    assert_eq!(
+        persisted_pr_target(home.path()),
+        accepted,
+        "the rejected moved target must not change any durable tuple byte"
+    );
+    assert_eq!(
+        reviewer_resource_counts(home.path()),
+        (0, 0, 0),
+        "the rejected moved target must acquire no reviewer resources"
+    );
+
+    std::fs::write(handle.gh_state.join("fail_target"), b"1").unwrap();
+    std::fs::write(&checks_state, "ready\n").unwrap();
+    assert!(
+        handle.wait_for("trying accepted durable target", 20),
+        "GitHub failure did not enter the durable fallback path: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("resolved target moved after CI gate", 20),
+        "fallback did not expose the prior accepted head against the newly gated head: {:?}",
+        handle.lines
+    );
+    assert_eq!(persisted_pr_target(home.path()), accepted);
+    assert_eq!(reviewer_resource_counts(home.path()), (0, 0, 0));
+
+    std::fs::remove_file(handle.gh_state.join("fail_target")).unwrap();
+    std::fs::write(&checks_state, "ready\n").unwrap();
+    assert!(
+        handle.wait_for("spawning reviewer", 20),
+        "matching live target did not proceed normally: {:?}",
+        handle.lines
+    );
+    let persisted = persisted_pr_target(home.path());
+    assert_eq!(persisted.0, 1);
+    assert_eq!(persisted.1, accepted.1);
+    assert_eq!(persisted.2, moved_sha);
+    assert_eq!(persisted.3, accepted.3);
     handle.force_stop();
 }
 
