@@ -19,11 +19,15 @@ pub const CLAUDE_PLANNER_MODEL: &str = "claude-opus-4-6";
 pub const PLANNER_EFFORT: &str = "high";
 pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
-pub const MAX_STDOUT_BYTES: usize = 256 * 1024;
+pub const MAX_STDOUT_BYTES: usize = 128 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const WRITABLE_PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
 pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigned worktree and repository are writable. This defense-in-depth guidance does not itself enforce that boundary.";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
+// Keep all required literal payload within one text field's budget so a plan
+// carrying every required value still has ample space under the 64 KiB response
+// and durable-proposal limits for its mandatory task structure.
+const MAX_REQUIRED_LITERAL_BYTES: usize = MAX_TEXT_BYTES;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
@@ -104,18 +108,27 @@ pub enum PlannerResponse {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposedTask {
     pub key: String,
     pub title: String,
+    #[serde(default)]
+    pub implementation_delta: String,
+    #[serde(default)]
+    pub affected_paths: Vec<String>,
     pub observable_outcome: String,
     /// Explicit child file contract. Writes and contextual references are
     /// distinct so downstream enforcement need not infer intent from prose.
+    #[serde(default)]
     pub deliverables: quorum_core::decomposition::ChildDeliverables,
     pub acceptance_criteria: Vec<String>,
     pub source_constraints: Vec<String>,
     pub verification_expectations: Vec<String>,
+    #[serde(default)]
+    pub non_goals: Vec<String>,
+    #[serde(default)]
+    pub preserved_literals: Vec<String>,
     #[serde(default)]
     pub prerequisites: Vec<String>,
 }
@@ -143,10 +156,30 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
     )
     .expect("rejection summaries serialize");
     format!(
-        "You are Quorum's bounded decomposition planner. Split the source outcome into one \
+        "You are Quorum's repository-grounded implementation-boundary planner. Produce one \
          closed DAG of 2-8 independently deliverable implementation tasks, each size S or M. \
-         Preserve every source constraint. Do not create synthetic integration work, recursive \
-         planning, or unrelated scope. Dependencies must be real delivery prerequisites and may \
+         Identify concrete implementation deltas and split at real code or ownership seams; do \
+         not turn each desired product outcome into a separate task. Preserved behavior, \
+         compatibility requirements, and regression-only expectations belong in acceptance \
+         criteria or non_goals, not standalone implementation tasks. Multiple files may belong \
+         to one child when they implement one coherent seam; split a child when it combines \
+         independently deliverable changes across layers or components. The execution-size \
+         rubric is: S = focused/local; M = bounded coherent work; L = broad cross-component \
+         coherent delivery; XL = compound work needing decomposition. Do not estimate human time. \
+         Inspect the repository only to ground the plan: start with source-named paths and symbols, \
+         use targeted Grep or Glob, read focused excerpts, follow observed calls at most one hop, \
+         and stop once each child has a concrete delta and path set. Use at most 5 Grep/Glob calls \
+         and 10 Read calls. Do not browse unrelated directories or read whole large files. \
+         Preserve every source constraint. Copy exact required text, literals, commands, schemas, \
+         labels, tags, messages, identifiers, and other verbatim source material byte-for-byte \
+         without normalization or paraphrase. Put each value in the required literal set in \
+         preserved_literals on at least one child. That set is the lexicographically sorted, \
+         distinct source-marked values of at most 8 KiB whose prefix fits an 8 KiB aggregate; \
+         do not put larger values or values beyond that set there because they exceed the bounded \
+         response and proposal capacity. Every source requirement must be represented by a child delta, criterion, \
+         constraint, verification expectation, or non-goal. Do not create synthetic integration \
+         work, recursive planning, no-op/regression-only tasks, or unrelated scope. Dependencies \
+         must be real delivery prerequisites and may \
          reference another task key or source:<dependency-id>. Every PLAN task's \
          `source_constraints` must include this worker-facing guidance: \
          \"{WORKER_WRITABILITY_GUIDANCE}\". The daemon adds it deterministically, so it is \
@@ -155,7 +188,7 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          `write` only for requested changes and `read_only_reference` only for context. Use no \
          markdown or commentary. The object must be exactly one of these closed \
          shapes: do not omit, rename, or add fields.\n\
-         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"observable_outcome\":\"<observable-outcome>\",\"deliverables\":[{{\"kind\":\"write\",\"path\":\"<repo-relative-path>\"}},{{\"kind\":\"read_only_reference\",\"path\":\"<contextual-path>\"}}],\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
+         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"implementation_delta\":\"<new-code-or-documentation-change>\",\"affected_paths\":[\"<repo-relative-path-or-narrow-pattern>\"],\"observable_outcome\":\"<observable-outcome>\",\"deliverables\":[{{\"kind\":\"write\",\"path\":\"<repo-relative-path>\"}},{{\"kind\":\"read_only_reference\",\"path\":\"<contextual-path>\"}}],\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"non_goals\":[\"<preserved-or-explicitly-excluded-behavior>\"],\"preserved_literals\":[\"<exact-source-literal>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
          BLOCKER={{\"outcome\":\"blocker\",\"category\":\"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>\",\"evidence\":[\"<evidence>\"],\"required_decision\":\"<decision>\",\"why_no_safe_split\":\"<reason>\"}}\n\
          `outcome` must be exactly `plan` or `blocker`; use PLAN only when it has 2-8 tasks. \
          PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
@@ -196,9 +229,13 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 pub async fn validate_for_source(
     tasks: &[ProposedTask],
     source_dependency_ids: &[i64],
+    source_title: &str,
+    source_body: Option<&str>,
     repo_root: &Path,
     path_resolver: &WritablePathResolver,
 ) -> Result<(), PlannerParseError> {
+    validate_plan_tasks(tasks)?;
+    validate_source_literals(tasks, source_title, source_body)?;
     validate_for_source_with_resolver(
         tasks,
         source_dependency_ids,
@@ -277,6 +314,35 @@ where
     }
 }
 
+fn validate_source_literals(
+    tasks: &[ProposedTask],
+    source_title: &str,
+    source_body: Option<&str>,
+) -> Result<(), PlannerParseError> {
+    let source_text = format!("{source_title}\n{}", source_body.unwrap_or_default());
+    let preserved: HashSet<&str> = tasks
+        .iter()
+        .flat_map(|task| task.preserved_literals.iter().map(String::as_str))
+        .collect();
+    for literal in &preserved {
+        if !source_text.contains(literal) {
+            return semantic("preserved literal must match source bytes exactly");
+        }
+    }
+    for (index, literal) in required_source_literals(&source_text)
+        .into_iter()
+        .enumerate()
+    {
+        if !preserved.contains(literal.as_str()) {
+            return semantic(&format!(
+                "missing byte-exact source literal at source marker {}",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn escaping_write<T>(task: &ProposedTask, path: &str) -> Result<T, PlannerParseError> {
     const MAX_PATH_BYTES: usize = 512;
     const ELLIPSIS: &str = "…";
@@ -296,6 +362,104 @@ fn escaping_write<T>(task: &ProposedTask, path: &str) -> Result<T, PlannerParseE
     );
     debug_assert!(message.len() <= MAX_REJECTION_SUMMARY_BYTES);
     semantic(&message)
+}
+
+/// Extract source-marked literals that can be checked without asking a model
+/// to decide which spelling is authoritative. Markdown inline/fenced code is
+/// explicit literal syntax. Quoted values immediately associated with the
+/// words literal, label, tag, or message receive the same protection.
+fn required_source_literals(source: &str) -> Vec<String> {
+    let mut literals = Vec::new();
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    while let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'`') {
+        let delimiter_start = cursor + relative;
+        let delimiter_len = bytes[delimiter_start..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        let content_start = delimiter_start + delimiter_len;
+        let mut search_from = content_start;
+        let mut content_end = None;
+        while let Some(relative) = bytes[search_from..].iter().position(|byte| *byte == b'`') {
+            let run_start = search_from + relative;
+            let run_len = bytes[run_start..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            if run_len == delimiter_len {
+                content_end = Some(run_start);
+                break;
+            }
+            search_from = run_start + run_len;
+        }
+        let Some(content_end) = content_end else {
+            // Do not reinterpret shorter runs inside an unclosed region as a
+            // new span: that can turn a malformed load-bearing value into a
+            // misleading suffix literal.
+            break;
+        };
+        if content_end > content_start && content_end - content_start <= MAX_TEXT_BYTES {
+            literals.push(source[content_start..content_end].to_string());
+        }
+        cursor = content_end + delimiter_len;
+    }
+
+    let lower = source.to_ascii_lowercase();
+    for keyword in ["literal", "label", "tag", "message"] {
+        let mut search_from = 0;
+        while let Some(relative) = lower[search_from..].find(keyword) {
+            let after_keyword = search_from + relative + keyword.len();
+            let bytes = source.as_bytes();
+            let mut open = after_keyword;
+            if bytes.get(open) == Some(&b'"') {
+                open += 1;
+            }
+            while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
+                open += 1;
+            }
+            if matches!(bytes.get(open), Some(b':') | Some(b'=')) {
+                open += 1;
+                while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
+                    open += 1;
+                }
+            }
+            if bytes.get(open) != Some(&b'"') || open.saturating_sub(after_keyword) > 24 {
+                search_from = after_keyword;
+                continue;
+            }
+            let value_start = open + 1;
+            let Some(close_relative) = source[value_start..].find('"') else {
+                break;
+            };
+            let value_end = value_start + close_relative;
+            // A quoted label/tag/message never spans lines; a newline before the
+            // closing quote means the opening quote was unpaired. Skip it so a
+            // stray quote cannot manufacture an unsatisfiable required literal.
+            if source[value_start..value_end].contains('\n') {
+                search_from = value_start;
+                continue;
+            }
+            if value_end > value_start && value_end - value_start <= MAX_TEXT_BYTES {
+                literals.push(source[value_start..value_end].to_string());
+            }
+            search_from = value_end + 1;
+        }
+    }
+    literals.sort();
+    literals.dedup();
+
+    let mut required = Vec::new();
+    let mut required_bytes: usize = 0;
+    for literal in literals {
+        let next = required_bytes.saturating_add(literal.len());
+        if next > MAX_REQUIRED_LITERAL_BYTES {
+            break;
+        }
+        required_bytes = next;
+        required.push(literal);
+    }
+    required
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,13 +497,24 @@ pub fn parse_response(text: &str) -> Result<PlannerResponse, PlannerParseError> 
 
 /// Rehydrate the durable task-list form accepted by the planner coordinator.
 /// This shares `ProposedTask` with the live response parser, so a persisted
-/// deliverables manifest always has the same explicit write/reference shape
-/// before deterministic source validation runs.
+/// proposal receives the complete closed-plan semantic validation before any
+/// downstream phase resumes.
 pub fn parse_accepted_proposal(text: &str) -> Result<Vec<ProposedTask>, PlannerParseError> {
+    let tasks = rehydrate_accepted_proposal(text)?;
+    validate_plan_tasks(&tasks)?;
+    Ok(tasks)
+}
+
+/// Decode a durable proposal before semantic revalidation. Compatibility
+/// defaults let the coordinator recover proposals written before required
+/// fields were introduced; `validate_plan_tasks` rejects those defaults and
+/// returns the graph to planning before classification or materialization.
+pub(super) fn rehydrate_accepted_proposal(
+    text: &str,
+) -> Result<Vec<ProposedTask>, PlannerParseError> {
     let tasks: Vec<ProposedTask> = serde_json::from_str(text).map_err(|error| {
         PlannerParseError::Provider(format!("invalid accepted proposal: {error}"))
     })?;
-    validate_plan_tasks(&tasks)?;
     Ok(tasks)
 }
 
@@ -369,7 +544,7 @@ fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseErro
     Ok(())
 }
 
-fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> {
+pub(super) fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> {
     if !(2..=8).contains(&tasks.len()) {
         return semantic("plan must contain between 2 and 8 tasks");
     }
@@ -380,6 +555,8 @@ fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> 
             return semantic("task keys must be unique");
         }
         validate_text("title", &task.title)?;
+        validate_text("implementation delta", &task.implementation_delta)?;
+        validate_list("affected paths", &task.affected_paths, 1)?;
         validate_text("observable outcome", &task.observable_outcome)?;
         validate_deliverables(&task.deliverables)?;
         validate_list("acceptance criteria", &task.acceptance_criteria, 1)?;
@@ -396,6 +573,8 @@ fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> 
             &task.verification_expectations,
             1,
         )?;
+        validate_list("non-goals", &task.non_goals, 1)?;
+        validate_list("preserved literals", &task.preserved_literals, 0)?;
         if task.prerequisites.len() > MAX_LIST_ITEMS {
             return semantic("too many prerequisites");
         }
@@ -656,16 +835,18 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                 break;
             }
             Ok(Err(_)) => {
-                return Some(PlannerPoll::ProviderFailed(
-                    "planner stdout exceeded 256 KiB".into(),
-                ));
+                return Some(PlannerPoll::ProviderFailed(format!(
+                    "planner stdout exceeded {} KiB",
+                    MAX_STDOUT_BYTES / 1024
+                )));
             }
         };
         slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
         if slot.stdout_bytes > MAX_STDOUT_BYTES {
-            return Some(PlannerPoll::ProviderFailed(
-                "planner stdout exceeded 256 KiB".into(),
-            ));
+            return Some(PlannerPoll::ProviderFailed(format!(
+                "planner stdout exceeded {} KiB",
+                MAX_STDOUT_BYTES / 1024
+            )));
         }
         if slot.codex_terminal_candidate {
             return Some(PlannerPoll::ProviderFailed(
@@ -829,13 +1010,23 @@ mod tests {
         serde_json::json!({
             "key": key,
             "title": format!("Implement {key}"),
+            "implementation_delta": format!("change the {key} implementation seam"),
+            "affected_paths": [format!("src/{key}.rs")],
             "observable_outcome": format!("{key} works"),
             "deliverables": [{"kind": "write", "path": format!("src/{key}.rs")}],
             "acceptance_criteria": ["behavior is covered"],
             "source_constraints": ["preserve atomicity"],
             "verification_expectations": ["focused tests pass"],
+            "non_goals": ["do not change adjacent behavior"],
+            "preserved_literals": [],
             "prerequisites": prerequisites,
         })
+    }
+
+    fn writable_deliverables(path: &str) -> quorum_core::decomposition::ChildDeliverables {
+        quorum_core::decomposition::ChildDeliverables(vec![
+            quorum_core::decomposition::ChildDeliverable::Write { path: path.into() },
+        ])
     }
 
     #[test]
@@ -864,6 +1055,8 @@ mod tests {
                 {
                     "key": "daemon",
                     "title": "Implement daemon boundary",
+                    "implementation_delta": "change the daemon boundary",
+                    "affected_paths": ["quorum/src/serve/mod.rs"],
                     "observable_outcome": "daemon boundary works",
                     "deliverables": [
                         {"kind": "write", "path": "quorum/src/serve/mod.rs"},
@@ -872,6 +1065,8 @@ mod tests {
                     "acceptance_criteria": ["boundary is covered"],
                     "source_constraints": ["preserve atomicity"],
                     "verification_expectations": ["focused tests pass"],
+                    "non_goals": ["do not change decomposition storage"],
+                    "preserved_literals": [],
                     "prerequisites": ["core"]
                 }
             ]
@@ -895,6 +1090,8 @@ mod tests {
             {
                 "key": "core",
                 "title": "Implement core boundary",
+                "implementation_delta": "change the core boundary",
+                "affected_paths": ["quorum-core/src/decomposition.rs"],
                 "observable_outcome": "core boundary works",
                 "deliverables": [
                     {"kind": "write", "path": "quorum-core/src/decomposition.rs"},
@@ -903,6 +1100,8 @@ mod tests {
                 "acceptance_criteria": ["boundary is covered"],
                 "source_constraints": ["preserve atomicity"],
                 "verification_expectations": ["focused tests pass"],
+                "non_goals": ["do not change daemon behavior"],
+                "preserved_literals": [],
                 "prerequisites": []
             },
             task("other", &[])
@@ -944,6 +1143,49 @@ mod tests {
         assert!(matches!(
             parse_response(&cycle.to_string()),
             Err(PlannerParseError::Semantic(_))
+        ));
+    }
+
+    #[test]
+    fn plan_rejects_missing_repository_grounding_fields() {
+        for field in ["implementation_delta", "affected_paths", "non_goals"] {
+            let mut first = task("a", &[]);
+            first.as_object_mut().unwrap().remove(field);
+            let plan = serde_json::json!({
+                "outcome": "plan",
+                "tasks": [first, task("b", &["a"])]
+            });
+            assert!(matches!(
+                parse_response(&plan.to_string()),
+                Err(PlannerParseError::Semantic(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn durable_legacy_plan_defaults_are_rejected_before_resume() {
+        let legacy = serde_json::json!([
+            {
+                "key": "a", "title": "a", "observable_outcome": "a works",
+                "deliverables": [{"kind": "write", "path": "src/a.rs"}],
+                "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
+                "verification_expectations": ["tests"], "prerequisites": []
+            },
+            {
+                "key": "b", "title": "b", "observable_outcome": "b works",
+                "deliverables": [{"kind": "write", "path": "src/b.rs"}],
+                "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
+                "verification_expectations": ["tests"], "prerequisites": ["a"]
+            }
+        ]);
+        let tasks: Vec<ProposedTask> = serde_json::from_value(legacy).unwrap();
+        assert!(tasks
+            .iter()
+            .all(|task| task.implementation_delta.is_empty()));
+        assert!(matches!(
+            validate_plan_tasks(&tasks),
+            Err(PlannerParseError::Semantic(message))
+                if message.contains("implementation delta must not be empty")
         ));
     }
 
@@ -1330,6 +1572,8 @@ mod tests {
         let foreign = ProposedTask {
             key: "a".into(),
             title: "Implement a".into(),
+            implementation_delta: "change dependency handling".into(),
+            affected_paths: vec!["src/a.rs".into()],
             observable_outcome: "a works".into(),
             deliverables: quorum_core::decomposition::ChildDeliverables(vec![
                 quorum_core::decomposition::ChildDeliverable::Write {
@@ -1339,15 +1583,27 @@ mod tests {
             acceptance_criteria: vec!["covered".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["tests".into()],
+            non_goals: vec!["no unrelated changes".into()],
             prerequisites: vec!["source:9".into()],
+            ..Default::default()
         };
         assert!(matches!(
-            validate_for_source(&[foreign], &[7], Path::new("."), &path_resolver).await,
+            validate_for_source(
+                &[foreign],
+                &[7],
+                "source",
+                None,
+                Path::new("."),
+                &path_resolver,
+            )
+            .await,
             Err(PlannerParseError::Semantic(_))
         ));
         let synthetic = ProposedTask {
             key: "integration".into(),
             title: "Integration task".into(),
+            implementation_delta: "merge sibling changes".into(),
+            affected_paths: vec!["src/integration.rs".into()],
             observable_outcome: "merge all siblings".into(),
             deliverables: quorum_core::decomposition::ChildDeliverables(vec![
                 quorum_core::decomposition::ChildDeliverable::Write {
@@ -1357,10 +1613,20 @@ mod tests {
             acceptance_criteria: vec!["covered".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["tests".into()],
+            non_goals: vec!["no unrelated changes".into()],
             prerequisites: vec![],
+            ..Default::default()
         };
         assert!(matches!(
-            validate_for_source(&[synthetic], &[], Path::new("."), &path_resolver).await,
+            validate_for_source(
+                &[synthetic],
+                &[],
+                "source",
+                None,
+                Path::new("."),
+                &path_resolver,
+            )
+            .await,
             Err(PlannerParseError::Semantic(_))
         ));
     }
@@ -1377,6 +1643,8 @@ mod tests {
         let task = ProposedTask {
             key: "bounded".into(),
             title: "Implement bounded change".into(),
+            implementation_delta: "change the bounded implementation".into(),
+            affected_paths: vec!["src/in_repo.rs".into()],
             observable_outcome: "bounded change works".into(),
             deliverables: quorum_core::decomposition::ChildDeliverables(vec![
                 quorum_core::decomposition::ChildDeliverable::Write {
@@ -1390,11 +1658,27 @@ mod tests {
             acceptance_criteria: vec!["covered".into()],
             source_constraints: vec!["bounded".into()],
             verification_expectations: vec!["tests".into()],
+            non_goals: vec!["do not change external references".into()],
             prerequisites: vec![],
+            ..Default::default()
         };
 
         assert_eq!(
-            validate_for_source(&[task], &[], &repo, &path_resolver).await,
+            validate_for_source_with_resolver(
+                &[task],
+                &[],
+                &repo,
+                &path_resolver,
+                WRITABLE_PATH_RESOLUTION_TIMEOUT,
+                |repo_root, paths| {
+                    paths.iter().all(|path| {
+                        quorum_core::decomposition::classify_writable_deliverable_path_blocking(
+                            &repo_root, path,
+                        ) == quorum_core::decomposition::WritableDeliverablePath::Permitted
+                    })
+                },
+            )
+            .await,
             Ok(())
         );
     }
@@ -1419,6 +1703,8 @@ mod tests {
             let task = ProposedTask {
                 key: "escaping".into(),
                 title: "Implement escaping change".into(),
+                implementation_delta: "write the declared output".into(),
+                affected_paths: vec![path.clone()],
                 observable_outcome: "escaping change works".into(),
                 deliverables: quorum_core::decomposition::ChildDeliverables(vec![
                     quorum_core::decomposition::ChildDeliverable::Write { path: path.clone() },
@@ -1426,11 +1712,27 @@ mod tests {
                 acceptance_criteria: vec!["covered".into()],
                 source_constraints: vec!["bounded".into()],
                 verification_expectations: vec!["tests".into()],
+                non_goals: vec!["do not write external paths".into()],
                 prerequisites: vec![],
+                ..Default::default()
             };
             assert!(
                 matches!(
-                    validate_for_source(&[task], &[], &repo, &path_resolver).await,
+                    validate_for_source_with_resolver(
+                        &[task],
+                        &[],
+                        &repo,
+                        &path_resolver,
+                        WRITABLE_PATH_RESOLUTION_TIMEOUT,
+                        |repo_root, paths| {
+                            paths.iter().all(|path| {
+                                quorum_core::decomposition::classify_writable_deliverable_path_blocking(
+                                    &repo_root, path,
+                                ) == quorum_core::decomposition::WritableDeliverablePath::Permitted
+                            })
+                        },
+                    )
+                    .await,
                     Err(PlannerParseError::Semantic(ref error))
                         if error.contains("writable deliverable")
                             && error.contains("managed repository")
@@ -1458,6 +1760,7 @@ mod tests {
             source_constraints: vec!["bounded".into()],
             verification_expectations: vec!["tests".into()],
             prerequisites: vec![],
+            ..Default::default()
         };
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let started = std::time::Instant::now();
@@ -1514,6 +1817,7 @@ mod tests {
                 source_constraints: vec!["bounded".into()],
                 verification_expectations: vec!["tests".into()],
                 prerequisites: vec![],
+                ..Default::default()
             };
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let calls_in_resolver = Arc::clone(&calls);
@@ -1592,6 +1896,7 @@ mod tests {
             source_constraints: vec!["bounded".into()],
             verification_expectations: vec!["tests".into()],
             prerequisites: vec![],
+            ..Default::default()
         };
 
         let outcome = validate_for_source_with_resolver(
@@ -1624,17 +1929,180 @@ mod tests {
         };
         let prompt = build_prompt(&source, &[]);
         assert!(prompt.contains("do not omit, rename, or add fields"));
-        assert!(prompt.contains(
-            r#"PLAN={"outcome":"plan","tasks":[{"key":"<lowercase-ascii-key>","title":"<title>","observable_outcome":"<observable-outcome>","deliverables":[{"kind":"write","path":"<repo-relative-path>"},{"kind":"read_only_reference","path":"<contextual-path>"}],"acceptance_criteria":["<criterion>"],"source_constraints":["<constraint>"],"verification_expectations":["<verification>"],"prerequisites":["<task-key-or-source:positive-id>"]}]}"#
-        ));
+        assert!(prompt.contains(r#""implementation_delta":"<new-code-or-documentation-change>""#));
+        assert!(prompt.contains(r#""affected_paths":["<repo-relative-path-or-narrow-pattern>"]"#));
+        assert!(prompt.contains(r#""deliverables":[{"kind":"write""#));
+        assert!(prompt.contains(r#""non_goals":["<preserved-or-explicitly-excluded-behavior>"]"#));
+        assert!(prompt.contains(r#""preserved_literals":["<exact-source-literal>"]"#));
         assert!(prompt.contains(
             r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#
         ));
         assert!(prompt.contains("`outcome` must be exactly `plan` or `blocker`"));
+        assert!(prompt.contains("S = focused/local; M = bounded coherent work"));
+        assert!(prompt.contains("Use at most 5 Grep/Glob calls and 10 Read calls"));
+        assert!(prompt.contains("labels, tags, messages, identifiers"));
         assert!(prompt.contains(&format!(
             "Every PLAN task's `source_constraints` must include this worker-facing guidance: \"{WORKER_WRITABILITY_GUIDANCE}\""
         )));
         assert!(prompt.contains("The daemon adds it deterministically"));
+    }
+
+    #[test]
+    fn source_validation_requires_marked_literals_byte_for_byte() {
+        let title = "Keep label \"review-ready\"";
+        let source = "Keep `type:feature`, tag \"security\", literal \"EXACT\", and message \"Merge ready\" exactly.";
+        let mut proposed = ProposedTask {
+            key: "routing".into(),
+            title: "Change routing".into(),
+            implementation_delta: "change one routing seam".into(),
+            affected_paths: vec!["src/routing.rs".into()],
+            observable_outcome: "routing works".into(),
+            deliverables: writable_deliverables("src/routing.rs"),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["preserve literals".into()],
+            verification_expectations: vec!["tests pass".into()],
+            non_goals: vec!["no unrelated changes".into()],
+            preserved_literals: vec![
+                "type:feature".into(),
+                "security".into(),
+                "EXACT".into(),
+                "Merge ready".into(),
+                "review-ready".into(),
+            ],
+            prerequisites: vec![],
+        };
+        let companion = ProposedTask {
+            key: "verification".into(),
+            title: "Verify routing".into(),
+            implementation_delta: "add focused routing verification".into(),
+            affected_paths: vec!["tests/routing.rs".into()],
+            observable_outcome: "routing verification works".into(),
+            deliverables: writable_deliverables("tests/routing.rs"),
+            acceptance_criteria: vec!["verification is covered".into()],
+            source_constraints: vec!["preserve literals".into()],
+            verification_expectations: vec!["tests pass".into()],
+            non_goals: vec!["no unrelated changes".into()],
+            preserved_literals: vec![],
+            prerequisites: vec!["routing".into()],
+        };
+        assert!(validate_source_literals(
+            &[proposed.clone(), companion.clone()],
+            title,
+            Some(source),
+        )
+        .is_ok());
+        proposed.preserved_literals[3] = "merge ready".into();
+        assert!(matches!(
+            validate_source_literals(&[proposed, companion], title, Some(source)),
+            Err(PlannerParseError::Semantic(message))
+                if message.contains("match source bytes exactly")
+        ));
+    }
+
+    #[test]
+    fn unpaired_quote_does_not_manufacture_required_literal() {
+        let source = "A stray label \"unclosed\ntag \"three\" stays protected.";
+        let literals = required_source_literals(source);
+        assert_eq!(literals, vec!["three".to_string()]);
+    }
+
+    #[test]
+    fn matching_backtick_runs_preserve_complete_markdown_code_literals() {
+        let source = "Keep ``value with a ` backtick`` and ````\nfence ``` content\n```` exactly.";
+        assert_eq!(
+            required_source_literals(source),
+            vec![
+                "\nfence ``` content\n".to_string(),
+                "value with a ` backtick".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mismatched_or_unclosed_backtick_runs_do_not_preserve_suffixes() {
+        for source in [
+            "``value with a ` suffix`",
+            "``value closed by the wrong run```",
+            "````fenced content```",
+        ] {
+            assert!(required_source_literals(source).is_empty(), "{source}");
+        }
+        let bounded_source = format!("``{} `suffix`", "x".repeat(MAX_PROMPT_BYTES));
+        assert!(required_source_literals(&bounded_source).is_empty());
+    }
+
+    #[test]
+    fn source_validation_skips_marked_literals_larger_than_the_preservation_field() {
+        let literal = "x".repeat(MAX_TEXT_BYTES + 1);
+        let proposed = ProposedTask {
+            key: "routing".into(),
+            title: "Change routing".into(),
+            implementation_delta: "change one routing seam".into(),
+            affected_paths: vec!["src/routing.rs".into()],
+            observable_outcome: "routing works".into(),
+            deliverables: writable_deliverables("src/routing.rs"),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["preserve behavior".into()],
+            verification_expectations: vec!["tests pass".into()],
+            non_goals: vec!["no unrelated changes".into()],
+            preserved_literals: vec![],
+            prerequisites: vec![],
+        };
+        let companion = ProposedTask {
+            key: "verification".into(),
+            title: "Verify routing".into(),
+            implementation_delta: "add focused routing verification".into(),
+            affected_paths: vec!["tests/routing.rs".into()],
+            observable_outcome: "routing verification works".into(),
+            deliverables: writable_deliverables("tests/routing.rs"),
+            acceptance_criteria: vec!["verification is covered".into()],
+            source_constraints: vec!["preserve behavior".into()],
+            verification_expectations: vec!["tests pass".into()],
+            non_goals: vec!["no unrelated changes".into()],
+            preserved_literals: vec![],
+            prerequisites: vec!["routing".into()],
+        };
+
+        for source in [
+            format!("Keep this inline literal exactly: `{literal}`"),
+            format!("Keep this double-delimited literal exactly: ``{literal}``"),
+            format!("Keep this fenced literal exactly:\n```\n{literal}\n```"),
+        ] {
+            assert!(required_source_literals(&source).is_empty());
+            assert!(validate_source_literals(
+                &[proposed.clone(), companion.clone()],
+                "source",
+                Some(&source),
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn source_validation_bounds_required_literals_to_the_response_and_proposal_budget() {
+        let source = (0..8)
+            .map(|index| {
+                let mut literal = format!("{index:02}");
+                literal.push_str(&"x".repeat(MAX_TEXT_BYTES - literal.len()));
+                format!("literal \"{literal}\"")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let required = required_source_literals(&source);
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].len(), MAX_TEXT_BYTES);
+
+        let mut first = task("a", &[]);
+        first["preserved_literals"] = serde_json::json!([required[0]]);
+        let plan = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [first, task("b", &["a"])]
+        });
+        assert!(plan.to_string().len() <= MAX_RESPONSE_BYTES);
+        let PlannerResponse::Plan { tasks } = parse_response(&plan.to_string()).unwrap() else {
+            panic!("plan response expected");
+        };
+        assert!(validate_source_literals(&tasks, "source", Some(&source)).is_ok());
     }
 
     #[test]
