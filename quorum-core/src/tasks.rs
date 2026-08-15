@@ -3381,6 +3381,10 @@ pub fn retry_parked(
     if policy_parked {
         // Retry of a policy park is a request to estimate remaining work.  Keep
         // the durable park/resume context but make it a classifier candidate.
+        // Also strip `daemon_parked_unsatisfiable` as defense in depth: the
+        // sweep's convergence pass excludes classifier-policy parks, but any
+        // future path that sets the marker on a policy park would otherwise
+        // leave a stale `true` here (policy retry keeps status='failed').
         tx.execute(
             "UPDATE tasks
              SET refs=json_remove(
@@ -3390,7 +3394,8 @@ pub fn retry_parked(
                      '$.cx_ready',
                      '$.cx_not_ready_reason',
                      '$.cx_by',
-                     '$.cx_dup_of'
+                     '$.cx_dup_of',
+                     '$.daemon_parked_unsatisfiable'
                  ),
                  recovery_attempts=CASE WHEN ?3 THEN 0 ELSE recovery_attempts END,
                  updated_at=?2
@@ -10890,6 +10895,53 @@ mod tests {
             refs.get(PARKED_UNSATISFIABLE_REF).is_none(),
             "successful retry must strip the unsatisfiable marker; leftover refs: {refs}"
         );
+    }
+
+    /// Task #473 R4 defense: `retry_parked`'s policy branch keeps
+    /// `status='failed'` (a policy retry is a reclassification request),
+    /// so a stale `daemon_parked_unsatisfiable=true` from any prior path
+    /// would persist across the retry and keep a false unsatisfiable row
+    /// in status BLOCKED. The policy branch must strip the marker.
+    #[test]
+    fn retry_parked_policy_branch_clears_unsatisfiable_marker() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "policy-parked",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'classifier declined',
+                 'daemon_resume_status', 'open',
+                 'classifier_policy_parked', json('true'),
+                 'daemon_parked_unsatisfiable', json('true'),
+                 'cx_est', 3
+             ) WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        let restored = retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("policy retry succeeds");
+        assert_eq!(restored.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(restored.refs.as_deref().unwrap()).unwrap();
+        assert!(
+            refs.get(PARKED_UNSATISFIABLE_REF).is_none(),
+            "policy retry must strip the stale unsatisfiable marker: {refs}"
+        );
+        assert_eq!(refs[CLASSIFIER_POLICY_PARKED_REF], true);
+        assert!(refs.get("cx_est").is_none());
     }
 
     /// Task #473 review blocker: `set_parked_refs` is the shared builder for

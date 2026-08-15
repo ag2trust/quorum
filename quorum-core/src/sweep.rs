@@ -554,6 +554,15 @@ fn upgrade_stale_recoverable_parks(conn: &Connection, now: i64, limit: usize) ->
                AND t.depends_on IS NOT NULL
                AND json_valid(t.refs)
                AND json_extract(t.refs, '$.daemon_parked')=1
+               -- Classifier-policy parks are not dependency-driven; their
+               -- park reason is 'classifier declined'. Retrying a policy
+               -- park stays in `failed` and does not clear the marker, so
+               -- upgrading one here would leave a durable false
+               -- unsatisfiable row after the operator's supported edit+
+               -- retry disposition. Skip them.
+               AND COALESCE(
+                   json_extract(t.refs, '$.classifier_policy_parked'), 0
+               ) != 1
                AND COALESCE(
                    json_extract(t.refs, '$.daemon_parked_unsatisfiable'), 0
                ) != 1
@@ -1384,6 +1393,74 @@ mod tests {
             evs.iter().any(|e| e.kind == "task_parked_upgraded"),
             "task_parked_upgraded event must be emitted"
         );
+    }
+
+    /// Task #473 R4 blocker: a classifier-policy park is not
+    /// dependency-driven — its reason is "classifier declined" and
+    /// `retry_parked` for policy parks stays in `failed` without clearing
+    /// the marker. If the convergence pass upgraded a policy-parked row
+    /// that happened to have a cancelled dep, the supported edit+retry
+    /// disposition would leave a durable false unsatisfiable row in
+    /// BLOCKED. The upgrade must exclude classifier-policy parks.
+    #[test]
+    fn cascade_upgrade_skips_classifier_policy_parks() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(
+            &mut c,
+            "boss",
+            "cancelled dep",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let policy_parked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "policy-parked with dep",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled', updated_at=200 WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'classifier declined',
+                 'daemon_resume_status', 'open',
+                 'classifier_policy_parked', json('true')
+             ), updated_at=200 WHERE id=?1",
+            params![policy_parked],
+        )
+        .unwrap();
+        assert_eq!(cascade_dead_deps(&c, 300, SWEEP_LIMIT).unwrap(), 0);
+        let refs: serde_json::Value = serde_json::from_str(
+            crate::tasks::get(&c, policy_parked)
+                .unwrap()
+                .unwrap()
+                .refs
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            refs.get("daemon_parked_unsatisfiable").is_none(),
+            "policy park must not gain the unsatisfiable marker; refs: {refs}"
+        );
+        assert_eq!(refs["daemon_parked_reason"], "classifier declined");
     }
 
     fn active_graph_with_dependency_park_child(
