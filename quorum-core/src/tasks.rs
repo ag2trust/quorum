@@ -3267,12 +3267,47 @@ pub fn retain_blocked_remediation_retry(
     Ok(updated == 1)
 }
 
+/// Cancelled dep ids in a task's `depends_on`. Cancelled is terminal, so
+/// these are the ones a bare `task-retry` cannot re-satisfy; the operator
+/// must edit `depends_on` or close the dependent. Empty when `depends_on`
+/// is NULL/empty or no dep is cancelled.
+pub fn cancelled_dep_ids(conn: &Connection, id: i64) -> Result<Vec<i64>> {
+    let depends_on: Option<String> = conn
+        .query_row(
+            "SELECT depends_on FROM tasks WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(json) = depends_on else {
+        return Ok(vec![]);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT j.value FROM json_each(?1) j
+         JOIN tasks d ON d.id = j.value
+         WHERE d.status = 'cancelled'
+         ORDER BY j.value",
+    )?;
+    let ids = stmt
+        .query_map(params![json], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
 /// Explicitly resume the same task after an automatic park. PR, branch,
 /// dependency, approval, author, and rework context remain untouched.
 ///
 /// `reset_recovery_budget`: true for an explicit owner `task-retry` (fresh
 /// budget); false for daemon-initiated auto-retries, whose respawns must
 /// stay bounded by the recovery budget spent at park time.
+///
+/// Refuses to restore when `depends_on` contains a cancelled task — that
+/// dependency is terminal-terminal, so the sweep would just re-park the
+/// dependent on the next tick while the operator sees a "restored" outcome
+/// and no signal that disposition (dep edit or close) is required. Callers
+/// see `Ok(None)`; [`cancelled_dep_ids`] surfaces the specific ids so the
+/// CLI can name them in the exit-1 payload.
 pub fn retry_parked(
     conn: &mut Connection,
     id: i64,
@@ -3298,6 +3333,14 @@ pub fn retry_parked(
         tx.commit()?;
         return Ok(None);
     };
+    // A parked task whose depends_on contains a cancelled id is unsatisfiable:
+    // cancelled is terminal, so the sweep will just re-park immediately. Refuse
+    // the restore so the operator has a clear disposition prompt via the CLI
+    // exit-1 path instead of a false "restored" outcome.
+    if !cancelled_dep_ids(&tx, id)?.is_empty() {
+        tx.commit()?;
+        return Ok(None);
+    }
     let policy_parked: bool = tx.query_row(
         "SELECT COALESCE(
              json_valid(refs)
@@ -5752,12 +5795,15 @@ mod tests {
             release(&mut c, "boss", dep, 1003),
             Err(QuorumError::NotHolder)
         ));
-        // Resume preserves the cancelled dependency and remains gated.
-        let resumed = retry_parked(&mut c, child, "boss", true, 1004)
+        // Task #473: cancelled dep is unsatisfiable — `retry_parked` refuses
+        // rather than silently restoring a task the sweep would re-park on
+        // the next tick. The child stays failed/parked; only a `depends_on`
+        // edit or explicit close clears the disposition.
+        assert!(retry_parked(&mut c, child, "boss", true, 1004)
             .unwrap()
-            .unwrap();
-        assert_eq!(resumed.status, "open");
-        assert!(!resumed.ready);
+            .is_none());
+        let child_row = get(&c, child).unwrap().unwrap();
+        assert_eq!(child_row.status, "failed");
         assert!(claim(&mut c, "A", Some(child), &[], TTL, 1005)
             .unwrap()
             .is_none());
@@ -10727,5 +10773,96 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, "failed");
+    }
+
+    /// Task #473: a parked task whose depends_on contains a cancelled id
+    /// cannot be silently restored — the sweep would just re-park it. The
+    /// operator's disposition (dep edit or close) is required. After a
+    /// depends_on edit drops the cancelled id, retry restores normally.
+    #[test]
+    fn retry_parked_refuses_when_depends_on_contains_cancelled() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        let id = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_unsatisfiable', json('true'),
+                 'daemon_parked_reason', 'dependency #' || ?2 || ' is cancelled — unsatisfiable',
+                 'daemon_resume_status', 'open'
+             ) WHERE id=?1",
+            params![id, dep],
+        )
+        .unwrap();
+
+        // Guard fires: no restore, no error.
+        let out = retry_parked(&mut c, id, "operator", true, 1001).unwrap();
+        assert!(
+            out.is_none(),
+            "retry must refuse silently; CLI surfaces the cancelled dep"
+        );
+        let status: String = c
+            .query_row("SELECT status FROM tasks WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "failed");
+
+        // Operator edits depends_on to drop the cancelled id → retry proceeds.
+        c.execute("UPDATE tasks SET depends_on='[]' WHERE id=?1", params![id])
+            .unwrap();
+        let restored = retry_parked(&mut c, id, "operator", true, 1002)
+            .unwrap()
+            .expect("dep edit clears the guard");
+        assert_eq!(restored.status, "open");
+    }
+
+    #[test]
+    fn cancelled_dep_ids_lists_only_cancelled_deps() {
+        let (_d, mut c) = open_tmp();
+        let a = create(&mut c, "boss", "a", None, 0, None, None, None, None, 1).unwrap();
+        let b = create(&mut c, "boss", "b", None, 0, None, None, None, None, 1).unwrap();
+        let d = create(&mut c, "boss", "d", None, 0, None, None, None, None, 1).unwrap();
+        let dependent = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{a},{b},{d}]")),
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            params![a],
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", params![b])
+            .unwrap();
+        c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![d])
+            .unwrap();
+        let ids = cancelled_dep_ids(&c, dependent).unwrap();
+        assert_eq!(ids, vec![a]);
     }
 }

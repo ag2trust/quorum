@@ -913,7 +913,7 @@ fn restart_after_checks_failed_recovers_exact_same_pr_remediation() {
     handle.sigkill();
 }
 
-/// A durable CI remediation with a terminal-not-done dependency must park
+/// A durable CI remediation with a cancelled (unsatisfiable) dependency must park
 /// instead of retrying its clean-negative claim on every daemon tick.
 #[test]
 fn terminal_dependency_parks_durable_ci_remediation() {
@@ -992,7 +992,7 @@ fn terminal_dependency_parks_durable_ci_remediation() {
     assert!(refs["daemon_parked_reason"]
         .as_str()
         .unwrap()
-        .contains("terminal-not-done"));
+        .contains("cancelled — unsatisfiable"));
     assert!(
         quorum_core::tasks::ci_remediation_intent(task.refs.as_deref())
             .unwrap()

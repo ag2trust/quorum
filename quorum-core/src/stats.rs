@@ -791,11 +791,24 @@ fn queue_by_tier(conn: &Connection) -> Result<Vec<TierQueueCount>> {
         .collect())
 }
 
-/// Open tasks blocked by unmet dependencies (#86). Returns each blocked task with the
-/// list of dep ids it's waiting on (only deps that are NOT yet `closed`).
+/// Open tasks blocked by unmet dependencies (#86) plus tasks the daemon has
+/// parked because a dependency is cancelled (unsatisfiable). The latter carry
+/// `status='failed'` so they no longer surface via the normal open-task query;
+/// without this join the operator has no signal that disposition (dep edit or
+/// close) is required — `task-retry` alone silently re-parks on the next sweep.
 fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, labels, depends_on FROM tasks WHERE status='open' AND depends_on IS NOT NULL",
+        "SELECT id, title, labels, depends_on, status FROM tasks
+         WHERE depends_on IS NOT NULL
+           AND (
+               status='open'
+               OR (
+                   status='failed'
+                   AND json_valid(refs)
+                   AND json_extract(refs, '$.daemon_parked')=1
+                   AND json_extract(refs, '$.daemon_parked_unsatisfiable')=1
+               )
+           )",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -803,14 +816,19 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
             let title: String = r.get(1)?;
             let labels: Option<String> = r.get(2)?;
             let depends_on: Option<String> = r.get(3)?;
-            Ok((id, title, labels, depends_on))
+            let status: String = r.get(4)?;
+            Ok((id, title, labels, depends_on, status))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut blocked = Vec::new();
-    for (id, title, labels, depends_on) in rows {
-        let ready = crate::tasks::compute_ready(conn, &depends_on)?;
-        if ready {
-            continue;
+    for (id, title, labels, depends_on, status) in rows {
+        // Parked-unsatisfiable rows always render (they are the disposition
+        // queue). Open rows only render when they are actually blocked.
+        if status == "open" {
+            let ready = crate::tasks::compute_ready(conn, &depends_on)?;
+            if ready {
+                continue;
+            }
         }
         let waiting_on = unmet_deps(conn, &depends_on)?;
         let deadlocked_on = cancelled_deps(conn, &depends_on)?;
@@ -2689,6 +2707,55 @@ mod tests {
         assert_eq!(s.blocked.len(), 1);
         let b = &s.blocked[0];
         assert_eq!(b.id, child);
+        assert_eq!(b.deadlocked_on, vec![dep]);
+    }
+
+    /// Task #473: a parked-unsatisfiable task (status='failed',
+    /// daemon_parked_unsatisfiable=1) surfaces in the BLOCKED section with
+    /// the cancelled dep id in `deadlocked_on`. Without this, the operator
+    /// has to spelunk the DB to find the disposition queue after the sweep
+    /// moves the task out of `status='open'`.
+    #[test]
+    fn blocked_section_surfaces_parked_unsatisfiable_tasks() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let parked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "parked-by-cancelled-dep",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![dep],
+        )
+        .unwrap();
+        // Simulate the sweep parking the dependent with unsatisfiable=true.
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_unsatisfiable', json('true'),
+                 'daemon_resume_status', 'open',
+                 'daemon_parked_reason', 'dependency #' || ?2 || ' is cancelled — unsatisfiable'
+             ) WHERE id=?1",
+            rusqlite::params![parked, dep],
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let b = s
+            .blocked
+            .iter()
+            .find(|task| task.id == parked)
+            .expect("parked-unsatisfiable task must render in the BLOCKED section");
         assert_eq!(b.deadlocked_on, vec![dep]);
     }
 
