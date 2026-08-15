@@ -64,6 +64,10 @@ SUPERVISOR_TIMEOUT_ENV = "TIMING_TEST_SUPERVISOR_TIMEOUT"
 SUPERVISOR_GRACE_ENV = "TIMING_TEST_SUPERVISOR_GRACE"
 SUPERVISOR_DISPLAY_ENV = "TIMING_TEST_SUPERVISOR_DISPLAY"
 PROCESS_TABLE_FAULT_ENV = "TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES"
+DARWIN_PARTIAL_PID_FILE_ENV = "TIMING_TEST_DARWIN_PARTIAL_PID_FILE"
+DARWIN_PARTIAL_CHILD_LIST_PID_FILE_ENV = (
+    "TIMING_TEST_DARWIN_PARTIAL_CHILD_LIST_PID_FILE"
+)
 
 DEFAULT_TEST_TIMEOUT_SECS = 120.0
 DEFAULT_TERM_GRACE_SECS = 2.0
@@ -401,10 +405,13 @@ def _linux_process_table() -> dict[int, tuple[int, int]] | None:
     return rows
 
 
-def _darwin_process_table() -> dict[int, tuple[int, int]] | None:
-    """Read PID -> (PPID, PGID) without spawning under macOS."""
+def _darwin_process_table(
+    root_pid: int,
+    known: set[int],
+) -> tuple[dict[int, tuple[int, int]] | None, str | None]:
+    """Read the retained process tree without spawning under macOS."""
     if sys.platform != "darwin":
-        return None
+        return None, None
     try:
         import ctypes
 
@@ -435,8 +442,12 @@ def _darwin_process_table() -> dict[int, tuple[int, int]] | None:
             ]
 
         libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-        libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        libproc.proc_listallpids.restype = ctypes.c_int
+        libproc.proc_listchildpids.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        libproc.proc_listchildpids.restype = ctypes.c_int
         libproc.proc_pidinfo.argtypes = [
             ctypes.c_int,
             ctypes.c_int,
@@ -446,19 +457,34 @@ def _darwin_process_table() -> dict[int, tuple[int, int]] | None:
         ]
         libproc.proc_pidinfo.restype = ctypes.c_int
 
-        count = libproc.proc_listallpids(None, 0)
-        if count <= 0:
-            return None
-        capacity = count + 64
-        pids = (ctypes.c_int * capacity)()
-        count = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
-        if count < 0:
-            return None
+        partial_pid: int | None = None
+        partial_pid_file = os.environ.get(DARWIN_PARTIAL_PID_FILE_ENV)
+        if partial_pid_file:
+            try:
+                partial_pid = int(Path(partial_pid_file).read_text().strip())
+            except (OSError, ValueError):
+                pass
+        partial_child_list_pid: int | None = None
+        partial_child_list_pid_file = os.environ.get(
+            DARWIN_PARTIAL_CHILD_LIST_PID_FILE_ENV
+        )
+        if partial_child_list_pid_file:
+            try:
+                partial_child_list_pid = int(
+                    Path(partial_child_list_pid_file).read_text().strip()
+                )
+            except (OSError, ValueError):
+                pass
 
         rows: dict[int, tuple[int, int]] = {}
-        for pid in pids[:min(count, capacity)]:
-            if pid <= 0:
+        listed_children: dict[int, set[int]] = {}
+        pending = list({root_pid, *known})
+        visited: set[int] = set()
+        while pending:
+            pid = pending.pop()
+            if pid <= 0 or pid in visited:
                 continue
+            visited.add(pid)
             info = ProcBsdInfo()
             copied = libproc.proc_pidinfo(
                 pid,
@@ -467,26 +493,87 @@ def _darwin_process_table() -> dict[int, tuple[int, int]] | None:
                 ctypes.byref(info),
                 ctypes.sizeof(info),
             )
+            if pid == partial_pid:
+                copied = 0
             if copied == ctypes.sizeof(info):
                 rows[pid] = (int(info.pbi_ppid), int(info.pbi_pgid))
-        return rows
+            else:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    # The process exited between the retained PID and detail
+                    # snapshots.
+                    continue
+                except PermissionError:
+                    pass
+                return None, f"libproc snapshot incomplete for live PID {pid}"
+
+            count = libproc.proc_listchildpids(pid, None, 0)
+            if count < 0:
+                return None, f"libproc could not size children of live PID {pid}"
+            if count == 0:
+                listed_children[pid] = set()
+                continue
+            capacity = count + 16
+            children = (ctypes.c_int * capacity)()
+            count = libproc.proc_listchildpids(
+                pid, children, ctypes.sizeof(children)
+            )
+            if pid == partial_child_list_pid:
+                count = 0
+            if count < 0:
+                return None, f"libproc returned partial children for live PID {pid}"
+            if count == 0:
+                listed_children[pid] = set()
+                continue
+            if count >= capacity:
+                return None, f"libproc children of live PID {pid} exceeded its buffer"
+            children_found = {
+                child_pid
+                for child_pid in children[:min(count, capacity)]
+                if child_pid > 0
+            }
+            listed_children[pid] = children_found
+            pending.extend(children_found)
+
+        # A zero or shortened child-list result is only distinguishable from
+        # a real leaf when it contradicts a retained live child's BSD info.
+        # Treat that contradiction as partial instead of certifying the tree.
+        for child_pid, (parent_pid, _pgid) in rows.items():
+            if (
+                child_pid in known
+                and parent_pid in listed_children
+                and child_pid not in listed_children[parent_pid]
+            ):
+                return (
+                    None,
+                    f"libproc child list incomplete for live PID {parent_pid}",
+                )
+        return rows, None
     except (AttributeError, ImportError, OSError, ValueError):
-        return None
+        return None, "libproc process snapshot failed"
 
 
 def _process_table_failure(
     error: str,
+    root_pid: int,
+    known: set[int],
 ) -> tuple[dict[int, tuple[int, int]], str]:
     rows = _linux_process_table()
     if rows is not None:
         return rows, f"process-tree discovery degraded: {error}; used /proc fallback"
-    rows = _darwin_process_table()
+    rows, darwin_error = _darwin_process_table(root_pid, known)
     if rows is not None:
         return rows, f"process-tree discovery degraded: {error}; used libproc fallback"
+    if darwin_error is not None:
+        error = f"{error}; {darwin_error}"
     return {}, error
 
 
-def _process_table() -> tuple[dict[int, tuple[int, int]], str | None]:
+def _process_table(
+    root_pid: int,
+    known: set[int],
+) -> tuple[dict[int, tuple[int, int]], str | None]:
     """Return PID -> (PPID, PGID) from a bounded POSIX process snapshot."""
     try:
         injected_failures = int(os.environ.get(PROCESS_TABLE_FAULT_ENV, "0"))
@@ -504,14 +591,16 @@ def _process_table() -> tuple[dict[int, tuple[int, int]], str | None]:
         )
     except OSError as exc:
         return _process_table_failure(
-            f"process-tree discovery could not start: {exc}"
+            f"process-tree discovery could not start: {exc}", root_pid, known
         )
     try:
         stdout, stderr = ps_proc.communicate(timeout=0.5)
     except subprocess.TimeoutExpired:
         ps_proc.kill()
         ps_proc.wait()
-        return _process_table_failure("process-tree discovery timed out")
+        return _process_table_failure(
+            "process-tree discovery timed out", root_pid, known
+        )
     except OSError as exc:
         try:
             ps_proc.kill()
@@ -522,11 +611,15 @@ def _process_table() -> tuple[dict[int, tuple[int, int]], str | None]:
         except (OSError, subprocess.TimeoutExpired):
             pass
         return _process_table_failure(
-            f"process-tree discovery failed while reading: {exc}"
+            f"process-tree discovery failed while reading: {exc}",
+            root_pid,
+            known,
         )
     if ps_proc.returncode != 0:
         return _process_table_failure(
-            f"process-tree discovery failed: {stderr.strip()}"
+            f"process-tree discovery failed: {stderr.strip()}",
+            root_pid,
+            known,
         )
 
     rows: dict[int, tuple[int, int]] = {}
@@ -540,11 +633,11 @@ def _process_table() -> tuple[dict[int, tuple[int, int]], str | None]:
     return rows, None
 
 
-def _discover_descendants(
-    root_pid: int, known: set[int]
-) -> tuple[dict[int, tuple[int, int]], str | None]:
-    rows, error = _process_table()
-
+def _extend_known_descendants(
+    root_pid: int,
+    known: set[int],
+    rows: dict[int, tuple[int, int]],
+) -> None:
     # Keep every PID ever observed: a descendant can be reparented after its
     # parent is killed, or can move into a new process group. Linux subreaper
     # adoptees appear as direct supervisor children. The original group is
@@ -560,16 +653,26 @@ def _discover_descendants(
             if pid not in known and ppid in known:
                 known.add(pid)
                 changed = True
+
+
+def _discover_descendants(
+    root_pid: int, known: set[int]
+) -> tuple[dict[int, tuple[int, int]], str | None]:
+    rows, error = _process_table(root_pid, known)
+    _extend_known_descendants(root_pid, known, rows)
     return {pid: rows[pid] for pid in known if pid in rows}, error
 
 
 def _cleanup_process_tree(
-    proc: subprocess.Popen, grace_secs: float
+    proc: subprocess.Popen,
+    grace_secs: float,
+    previously_known: set[int] | None = None,
 ) -> dict:
     """Bounded TERM/KILL cleanup for every descendant of ``proc``."""
     root_pgid = proc.pid
     supervisor_pgid = os.getpgrp()
-    known = {proc.pid}
+    known = set(previously_known or ())
+    known.add(proc.pid)
     discovery_error: str | None = None
     discovery_errors: list[str] = []
     signal_errors: list[str] = []
@@ -620,7 +723,13 @@ def _cleanup_process_tree(
                 pass
             except OSError as exc:
                 signal_errors.append(f"killpg({pgid}, {sig.name}): {exc}")
-        for pid in live:
+        target_pids = set(live)
+        if discovery_error is not None:
+            # A partial snapshot cannot prove whether a retained descendant is
+            # still live. Signal its recorded PID so discovery failure cannot
+            # orphan an escaped process group when the root group exits.
+            target_pids.update(known)
+        for pid in target_pids:
             try:
                 os.kill(pid, sig)
                 sent = True
@@ -700,7 +809,14 @@ def _cleanup_process_tree(
                 f"process group {root_pgid} still exists after SIGKILL"
             )
     elif discovery_errors:
-        cleanup["error"] = discovery_errors[-1]
+        incomplete = [
+            error
+            for error in discovery_errors
+            if not error.startswith("process-tree discovery degraded:")
+        ]
+        cleanup["error"] = "; ".join(
+            (incomplete or discovery_errors)[-4:]
+        )
     return cleanup
 
 
@@ -765,6 +881,7 @@ def _test_supervisor() -> int:
     started = now()
     proc: subprocess.Popen | None = None
     result: dict | None = None
+    known_descendants: set[int] = set()
 
     def interrupted(signum: int, _frame: object) -> None:
         raise SupervisorInterrupted(signum)
@@ -803,6 +920,8 @@ def _test_supervisor() -> int:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
         deadline = started + timeout_secs
+        known_descendants.add(proc.pid)
+        next_darwin_snapshot = started
         outcome = "failed"
         rc = 1
         while True:
@@ -816,6 +935,15 @@ def _test_supervisor() -> int:
                 rc = TIMEOUT_EXIT_CODE
                 outcome = "timed_out"
                 break
+            if sys.platform == "darwin" and now() >= next_darwin_snapshot:
+                rows, _error = _darwin_process_table(
+                    proc.pid, known_descendants
+                )
+                if rows is not None:
+                    _extend_known_descendants(
+                        proc.pid, known_descendants, rows
+                    )
+                next_darwin_snapshot = now() + 0.25
             readable, _, _ = select.select(
                 [owner_fd], [], [], min(remaining, 0.05)
             )
@@ -824,7 +952,9 @@ def _test_supervisor() -> int:
                 outcome = "owner_lost"
                 break
 
-        cleanup = _cleanup_process_tree(proc, grace_secs)
+        cleanup = _cleanup_process_tree(
+            proc, grace_secs, known_descendants
+        )
         result = _run_result(started, rc, outcome, timeout_secs, cleanup)
         if outcome == "timed_out":
             print(
@@ -847,7 +977,7 @@ def _test_supervisor() -> int:
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, signal.SIG_IGN)
         cleanup = (
-            _cleanup_process_tree(proc, grace_secs)
+            _cleanup_process_tree(proc, grace_secs, known_descendants)
             if proc is not None
             else {
                 "attempted": False,
@@ -864,7 +994,7 @@ def _test_supervisor() -> int:
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, signal.SIG_IGN)
         cleanup = (
-            _cleanup_process_tree(proc, grace_secs)
+            _cleanup_process_tree(proc, grace_secs, known_descendants)
             if proc is not None
             else {
                 "attempted": False,

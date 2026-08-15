@@ -6,6 +6,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
+    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
@@ -15,6 +16,13 @@ use tempfile::TempDir;
 
 const COMPILE_DIAGNOSTIC: &str = "fixture compile failure: unresolved import fixture_missing";
 const TEST_DIAGNOSTIC: &str = "fixture test failure: assertion failed";
+static PROCESS_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+fn process_fixture_guard() -> MutexGuard<'static, ()> {
+    PROCESS_FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Clone, Copy)]
 enum Scenario {
@@ -23,6 +31,8 @@ enum Scenario {
     CompileFailure,
     Timeout,
     DiscoverySpawnFailure,
+    DarwinPartialFallback,
+    DarwinPartialChildList,
     Interrupted,
     AbruptOwnerDeath,
 }
@@ -35,6 +45,8 @@ impl Scenario {
             Self::CompileFailure => "compile-failure",
             Self::Timeout => "timeout",
             Self::DiscoverySpawnFailure => "discovery-spawn-failure",
+            Self::DarwinPartialFallback => "darwin-partial-fallback",
+            Self::DarwinPartialChildList => "darwin-partial-child-list",
             Self::Interrupted => "interrupted",
             Self::AbruptOwnerDeath => "abrupt-owner-death",
         }
@@ -107,6 +119,8 @@ impl Fixture {
                     Scenario::TestFailure => self.repo.join("fixture-test-failure"),
                     Scenario::Timeout
                     | Scenario::DiscoverySpawnFailure
+                    | Scenario::DarwinPartialFallback
+                    | Scenario::DarwinPartialChildList
                     | Scenario::Interrupted
                     | Scenario::AbruptOwnerDeath => self.repo.join("fixture-test-blocking"),
                     _ => self.repo.join("fixture-test-unused"),
@@ -123,6 +137,32 @@ impl Fixture {
                 // Keep external discovery unavailable throughout both cleanup
                 // stages so the platform's spawn-free fallback owns teardown.
                 .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000");
+        }
+        if matches!(scenario, Scenario::DarwinPartialFallback) {
+            command
+                .env("PREFLIGHT_TEST_TIMEOUT_SECS", "2")
+                .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000")
+                .env(
+                    "TIMING_TEST_DARWIN_PARTIAL_PID_FILE",
+                    self.pid_file().with_extension("partial"),
+                )
+                .env(
+                    "PREFLIGHT_FIXTURE_PARTIAL_PID_FILE",
+                    self.pid_file().with_extension("partial"),
+                );
+        }
+        if matches!(scenario, Scenario::DarwinPartialChildList) {
+            command
+                .env("PREFLIGHT_TEST_TIMEOUT_SECS", "2")
+                .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000")
+                .env(
+                    "TIMING_TEST_DARWIN_PARTIAL_CHILD_LIST_PID_FILE",
+                    self.pid_file().with_extension("partial-list"),
+                )
+                .env(
+                    "PREFLIGHT_FIXTURE_PARTIAL_LIST_PID_FILE",
+                    self.pid_file().with_extension("partial-list"),
+                );
         }
         command.output().expect("run preflight")
     }
@@ -341,6 +381,7 @@ fn compilation_failure_preserves_diagnostics_and_timing() {
 
 #[test]
 fn timeout_reaps_descendants_in_separate_process_groups() {
+    let _guard = process_fixture_guard();
     let fixture = Fixture::new();
     let output = fixture.preflight(Scenario::Timeout);
 
@@ -368,6 +409,7 @@ fn timeout_reaps_descendants_in_separate_process_groups() {
 
 #[test]
 fn sustained_process_discovery_failure_is_bounded_and_reaps_descendants() {
+    let _guard = process_fixture_guard();
     let fixture = Fixture::new();
     let started = Instant::now();
     let output = fixture.preflight(Scenario::DiscoverySpawnFailure);
@@ -396,22 +438,91 @@ fn sustained_process_discovery_failure_is_bounded_and_reaps_descendants() {
         "test supervisor exceeded its bounded cleanup window"
     );
     assert_eq!(binary["cleanup"]["complete"], true);
+    let cleanup_error = binary["cleanup"]["error"]
+        .as_str()
+        .expect("cleanup error is recorded");
+    assert!(
+        cleanup_error.contains("process-tree discovery could not start"),
+        "cleanup error={cleanup_error}"
+    );
+    if cfg!(target_os = "macos") {
+        assert!(
+            cleanup_error.contains("used libproc fallback")
+                || cleanup_error.contains("libproc snapshot incomplete"),
+            "cleanup error={cleanup_error}"
+        );
+    }
+    fixture.assert_fixture_uses_separate_process_groups();
+    assert_processes_gone(&fixture.wait_for_fixture_pids());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn partial_darwin_fallback_is_loud_and_reaps_retained_descendants() {
+    let _guard = process_fixture_guard();
+    let fixture = Fixture::new();
+    let started = Instant::now();
+    let output = fixture.preflight(Scenario::DarwinPartialFallback);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "partial Darwin fallback did not terminate promptly"
+    );
+    let timing = fixture.timing();
+    assert_branch_base(&timing);
+    assert_gate(&timing, "test_execute", 124);
+    let binary = &timing["test_binaries"][0];
+    assert_eq!(binary["execute_outcome"], "timed_out");
+    assert_eq!(binary["cleanup"]["term_sent"], true);
+    assert_eq!(binary["cleanup"]["kill_sent"], true);
+    assert_eq!(
+        binary["cleanup"]["complete"], true,
+        "cleanup={}",
+        binary["cleanup"]
+    );
     assert!(binary["cleanup"]["error"]
         .as_str()
-        .expect("cleanup error is recorded")
-        .contains("process-tree discovery could not start"));
-    if cfg!(target_os = "macos") {
-        assert!(binary["cleanup"]["error"]
-            .as_str()
-            .unwrap()
-            .contains("used libproc fallback"));
-    }
+        .expect("partial snapshot diagnostic is retained")
+        .contains("libproc snapshot incomplete for live PID"));
+    fixture.assert_fixture_uses_separate_process_groups();
+    assert_processes_gone(&fixture.wait_for_fixture_pids());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn partial_darwin_child_list_is_loud_and_reaps_retained_descendants() {
+    let _guard = process_fixture_guard();
+    let fixture = Fixture::new();
+    let output = fixture.preflight(Scenario::DarwinPartialChildList);
+
+    assert_eq!(output.status.code(), Some(1));
+    let timing = fixture.timing();
+    assert_branch_base(&timing);
+    assert_gate(&timing, "test_execute", 124);
+    let binary = &timing["test_binaries"][0];
+    assert_eq!(binary["execute_outcome"], "timed_out");
+    assert_eq!(binary["cleanup"]["term_sent"], true);
+    assert_eq!(binary["cleanup"]["kill_sent"], true);
+    assert_eq!(
+        binary["cleanup"]["complete"], true,
+        "cleanup={}",
+        binary["cleanup"]
+    );
+    let cleanup_error = binary["cleanup"]["error"]
+        .as_str()
+        .expect("partial child-list diagnostic is retained");
+    assert!(
+        cleanup_error.contains("libproc child list incomplete for live PID"),
+        "cleanup error={cleanup_error}"
+    );
     fixture.assert_fixture_uses_separate_process_groups();
     assert_processes_gone(&fixture.wait_for_fixture_pids());
 }
 
 #[test]
 fn interruption_reaps_the_complete_descendant_tree() {
+    let _guard = process_fixture_guard();
     let fixture = Fixture::new();
     let mut collector = fixture.interrupted_timing();
     let pid_deadline = Instant::now() + Duration::from_secs(10);
@@ -477,6 +588,7 @@ fn interruption_reaps_the_complete_descendant_tree() {
 
 #[test]
 fn abrupt_owner_group_death_reaps_separate_descendant_groups() {
+    let _guard = process_fixture_guard();
     let fixture = Fixture::new();
     let collector = fixture.abruptly_owned_timing();
     let fixture_pids = fixture.wait_for_fixture_pids();
@@ -542,6 +654,14 @@ while not ready_file.exists():
     time.sleep(0.01)
 groups_file.write_text(f"{os.getpgrp()} {os.getpgid(child.pid)}\n")
 pid_file.write_text(f"{os.getpid()} {child.pid}\n")
+partial_file = os.environ.get("PREFLIGHT_FIXTURE_PARTIAL_PID_FILE")
+if partial_file:
+    time.sleep(0.75)
+    Path(partial_file).write_text(str(child.pid))
+partial_list_file = os.environ.get("PREFLIGHT_FIXTURE_PARTIAL_LIST_PID_FILE")
+if partial_list_file:
+    time.sleep(0.75)
+    Path(partial_list_file).write_text(str(os.getpid()))
 while True:
     time.sleep(1)
 "##;
