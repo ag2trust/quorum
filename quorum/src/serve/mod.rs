@@ -5130,22 +5130,31 @@ async fn tick_decomposition(
                 snapshot.state
             )));
         };
-        if let Err(error) = planner::validate_plan_tasks(proposal) {
+        if planner::validate_plan_tasks(proposal).is_err() {
             let phase = match snapshot.state.as_str() {
                 "validating" => "validating",
                 "preclassifying" => "preclassifying",
                 _ => unreachable!("resumable phase was matched above"),
             };
-            reject_decomposition_proposal(
-                config,
-                snapshot.graph_id,
-                phase,
-                "durable-proposal-validation",
-                &error.to_string(),
-            )
-            .await?;
+            let path = config.db_path.clone();
+            let graph_id = snapshot.graph_id;
+            let reset = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let mut conn = quorum_core::db::open(&path)?;
+                quorum_core::decomposition::reset_accepted_proposal_to_planning(
+                    &mut conn,
+                    graph_id,
+                    phase,
+                    now_unix(),
+                )
+            })
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!(
+                    "durable proposal compatibility reset join: {error}"
+                ))
+            })??;
             coordinator.proposal = None;
-            return Ok(true);
+            return Ok(reset);
         }
     }
 
@@ -25794,106 +25803,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_durable_proposal_replans_before_preclassification() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("legacy-proposal.db");
-        let mut conn = quorum_core::db::open(&db_path).unwrap();
-        let source = tasks::create(
-            &mut conn,
-            "owner",
-            "large",
-            Some("outcome"),
-            1,
-            None,
-            None,
-            None,
-            None,
-            1,
-        )
-        .unwrap();
-        let graph = quorum_core::decomposition::begin_planning(
-            &mut conn,
-            &quorum_core::decomposition::BeginPlanning {
-                source_task_id: source,
-                expected_revision: 1,
-                provider: "claude",
-                model: "opus",
-                frozen_base_sha: "abc",
-                now: 2,
-            },
-        )
-        .unwrap()
-        .unwrap();
-        quorum_core::decomposition::set_frozen_phase(
-            &mut conn,
-            graph,
-            "freeze-requested",
-            "draining",
-            None,
-            3,
-        )
-        .unwrap();
-        quorum_core::decomposition::set_frozen_phase(
-            &mut conn, graph, "draining", "planning", None, 4,
-        )
-        .unwrap();
-        let legacy = serde_json::json!([
-            {
-                "key": "a", "title": "a", "observable_outcome": "a works",
-                "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
-                "verification_expectations": ["tests"], "prerequisites": []
-            },
-            {
-                "key": "b", "title": "b", "observable_outcome": "b works",
-                "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
-                "verification_expectations": ["tests"], "prerequisites": ["a"]
+    async fn legacy_durable_proposals_replan_without_charging_attempt_budget() {
+        for phase in ["validating", "preclassifying"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("legacy-proposal-{phase}.db"));
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source = tasks::create(
+                &mut conn,
+                "owner",
+                "large",
+                Some("outcome"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id: source,
+                    expected_revision: 1,
+                    provider: "claude",
+                    model: "opus",
+                    frozen_base_sha: "abc",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph,
+                "freeze-requested",
+                "draining",
+                None,
+                3,
+            )
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn, graph, "draining", "planning", None, 4,
+            )
+            .unwrap();
+            let legacy = serde_json::json!([
+                {
+                    "key": "a", "title": "a", "observable_outcome": "a works",
+                    "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
+                    "verification_expectations": ["tests"], "prerequisites": []
+                },
+                {
+                    "key": "b", "title": "b", "observable_outcome": "b works",
+                    "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
+                    "verification_expectations": ["tests"], "prerequisites": ["a"]
+                }
+            ]);
+            for attempt in 1..=2 {
+                quorum_core::decomposition::accept_proposal(
+                    &mut conn,
+                    graph,
+                    &legacy.to_string(),
+                    4 + attempt * 2,
+                )
+                .unwrap();
+                quorum_core::decomposition::reject_frozen_proposal(
+                    &mut conn,
+                    graph,
+                    "validating",
+                    "prior-semantic-rejection",
+                    "proposal rejected by the prior binary",
+                    5 + attempt * 2,
+                )
+                .unwrap();
             }
-        ]);
-        quorum_core::decomposition::accept_proposal(&mut conn, graph, &legacy.to_string(), 5)
-            .unwrap();
-        quorum_core::decomposition::set_frozen_phase(
-            &mut conn,
-            graph,
-            "validating",
-            "preclassifying",
-            None,
-            6,
-        )
-        .unwrap();
-        drop(conn);
+            quorum_core::decomposition::accept_proposal(&mut conn, graph, &legacy.to_string(), 10)
+                .unwrap();
+            if phase == "preclassifying" {
+                quorum_core::decomposition::set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "validating",
+                    "preclassifying",
+                    None,
+                    11,
+                )
+                .unwrap();
+            }
+            drop(conn);
 
-        let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
-        let mut coordinator = DecompositionCoordinator::default();
-        assert!(tick_decomposition(
-            &config,
-            &mut coordinator,
-            &[],
-            &[],
-            DecompositionLiveWork::default(),
-        )
-        .await
-        .unwrap());
+            let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+            let mut coordinator = DecompositionCoordinator::default();
+            assert!(tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap());
 
-        let conn = quorum_core::db::open(&db_path).unwrap();
-        let state: (String, Option<String>) = conn
-            .query_row(
-                "SELECT state,accepted_proposal_json FROM task_decompositions WHERE id=?1",
-                [graph],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(state, ("planning".into(), None));
-        let attempt: (String, String, String) = conn
-            .query_row(
-                "SELECT kind,reason_code,summary FROM decomposition_attempts
-                 WHERE graph_id=?1 ORDER BY id DESC LIMIT 1",
-                [graph],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(attempt.0, "proposal");
-        assert_eq!(attempt.1, "durable-proposal-validation");
-        assert!(attempt.2.contains("implementation delta must not be empty"));
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let state: (String, Option<String>, i64) = conn
+                .query_row(
+                    "SELECT state,accepted_proposal_json,proposal_attempts
+                     FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("planning".into(), None, 2), "phase {phase}");
+            let attempts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM decomposition_attempts WHERE graph_id=?1",
+                    [graph],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(attempts, 2, "compatibility reset charged phase {phase}");
+            assert_ne!(
+                tasks::get(&conn, source).unwrap().unwrap().status,
+                "failed",
+                "compatibility reset failed source in phase {phase}"
+            );
+        }
     }
 
     #[test]

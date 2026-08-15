@@ -316,8 +316,9 @@ spelling is load-bearing and fits both bounds.
 
 Durable accepted proposals are revalidated against the complete closed-plan semantic contract
 before a restart resumes validating or preclassifying. Compatibility defaults for newly added
-fields never admit an older stored proposal with empty required fields; it returns to planning as
-a deterministic semantic rejection.
+fields never admit an older stored proposal with empty required fields; an atomic compatibility
+reset clears the accepted JSON and returns it to planning without consuming the current semantic
+proposal-rejection budget.
 
 A syntactically valid blocker that lacks a supported category, concrete evidence, required
 decision, or the explanation of why no safe split exists is a semantic rejection, not a valid
