@@ -4224,6 +4224,56 @@ mod tests {
     }
 
     #[test]
+    fn blocked_graph_member_is_not_selected_until_graph_reactivates() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[
+                child("prerequisite", &[]),
+                child("ready", &["prerequisite"]),
+            ],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        conn.execute(
+            "UPDATE task_decompositions SET state='blocked' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+
+        let selected = crate::tasks::list_implementation_ready_open(&conn).unwrap();
+        assert!(
+            selected.is_empty(),
+            "blocked graph member must not be selected"
+        );
+        let claims: i64 = conn
+            .query_row("SELECT count(*) FROM claims", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(claims, 0, "selection must not attempt a claim");
+
+        conn.execute(
+            "UPDATE task_decompositions SET state='active',active=1 WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        let selected = crate::tasks::list_implementation_ready_open(&conn).unwrap();
+        assert_eq!(
+            selected.iter().map(|task| task.id).collect::<Vec<_>>(),
+            [ids[1]]
+        );
+        let claimed = crate::tasks::claim(&mut conn, "worker", Some(ids[1]), &[], 60, 5)
+            .unwrap()
+            .expect("reactivated graph member must claim on the next tick");
+        assert_eq!(claimed.id, ids[1]);
+    }
+
+    #[test]
     fn failed_sibling_stops_new_implementation_claims() {
         let mut conn = setup();
         let graph = begin(&mut conn);

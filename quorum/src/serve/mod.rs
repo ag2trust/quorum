@@ -75,6 +75,8 @@ const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 /// Limit per-slot stream work so one noisy provider cannot starve other slots.
 const MAX_STREAM_LINES_PER_TICK: usize = 64;
+const CLAIM_SKIP_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const CLAIM_SKIP_LOG_CAPACITY: usize = 64;
 const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLICATION_GH_PIPE_LIMIT: usize = 1024 * 1024;
 const SELF_UPDATE_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -240,6 +242,10 @@ struct PoisonTracker {
     strikes: HashMap<i64, u32>,
 }
 
+struct ClaimSkipLogLimiter {
+    logged: VecDeque<(i64, std::time::Instant)>,
+}
+
 enum PreReviewChecksState {
     Waiting(tokio::task::JoinHandle<merge::ChecksOutcome>),
     Retry,
@@ -288,6 +294,28 @@ impl PoisonTracker {
     #[cfg(test)]
     fn strikes(&self, task_id: i64) -> u32 {
         self.strikes.get(&task_id).copied().unwrap_or(0)
+    }
+}
+
+impl ClaimSkipLogLimiter {
+    fn new() -> Self {
+        Self {
+            logged: VecDeque::new(),
+        }
+    }
+
+    fn should_log(&mut self, task_id: i64, now: std::time::Instant) -> bool {
+        if let Some(index) = self.logged.iter().position(|(id, _)| *id == task_id) {
+            if now.saturating_duration_since(self.logged[index].1) < CLAIM_SKIP_LOG_INTERVAL {
+                return false;
+            }
+            self.logged.remove(index);
+        }
+        if self.logged.len() == CLAIM_SKIP_LOG_CAPACITY {
+            self.logged.pop_front();
+        }
+        self.logged.push_back((task_id, now));
+        true
     }
 }
 
@@ -6263,6 +6291,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut pre_review_checks: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
     let mut pending_reviewer_resumes: HashMap<i64, i64> = HashMap::new();
     let mut poison_tracker = PoisonTracker::new();
+    let mut claim_skip_logs = ClaimSkipLogLimiter::new();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
@@ -6677,6 +6706,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut pre_review_checks,
             &mut pending_reviewer_resumes,
             &mut poison_tracker,
+            &mut claim_skip_logs,
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -6742,6 +6772,7 @@ async fn tick(
     pre_review_checks: &mut HashMap<i64, PreReviewChecksEntry>,
     pending_reviewer_resumes: &mut HashMap<i64, i64>,
     poison_tracker: &mut PoisonTracker,
+    claim_skip_logs: &mut ClaimSkipLogLimiter,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
@@ -11049,6 +11080,7 @@ async fn tick(
                 name_pool,
                 workers,
                 poison_tracker,
+                claim_skip_logs,
                 lifetime_roster,
             )
             .await?
@@ -13986,6 +14018,7 @@ async fn spawn_worker(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     poison_tracker: &mut PoisonTracker,
+    claim_skip_logs: &mut ClaimSkipLogLimiter,
     lifetime_roster: &mut LifetimeRoster,
 ) -> Result<bool> {
     let db_path = config.db_path.clone();
@@ -14001,7 +14034,7 @@ async fn spawn_worker(
 
     let ready_task = tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
-        let mut available = tasks::list(&conn, Some("open"), None, None)?;
+        let mut available = tasks::list_implementation_ready_open(&conn)?;
         available.extend(
             tasks::list(&conn, Some("rework"), None, None)?
                 .into_iter()
@@ -14116,10 +14149,12 @@ async fn spawn_worker(
 
     match claimed {
         Ok(None) => {
-            log(&format!(
-                "task #{} no longer claimable after selection; skipping",
-                task.id
-            ));
+            if claim_skip_logs.should_log(task.id, std::time::Instant::now()) {
+                log(&format!(
+                    "task #{} no longer claimable after selection; skipping",
+                    task.id
+                ));
+            }
             name_pool.release(&agent_name);
             return Ok(false);
         }
@@ -20247,6 +20282,21 @@ mod tests {
         tracker.clear(1);
         assert_eq!(tracker.strikes(1), 0);
         assert_eq!(tracker.strikes(2), 1);
+    }
+
+    #[test]
+    fn claim_skip_logging_is_rate_limited_per_task_and_bounded() {
+        let mut limiter = ClaimSkipLogLimiter::new();
+        let start = std::time::Instant::now();
+        assert!(limiter.should_log(1, start));
+        assert!(!limiter.should_log(1, start + Duration::from_secs(1)));
+        assert!(limiter.should_log(2, start + Duration::from_secs(1)));
+        assert!(limiter.should_log(1, start + CLAIM_SKIP_LOG_INTERVAL));
+
+        for task_id in 3..=(CLAIM_SKIP_LOG_CAPACITY as i64 + 3) {
+            limiter.should_log(task_id, start);
+        }
+        assert_eq!(limiter.logged.len(), CLAIM_SKIP_LOG_CAPACITY);
     }
 
     // ── Drain state unit tests ────────────────────────────────────────

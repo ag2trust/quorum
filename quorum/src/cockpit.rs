@@ -546,6 +546,13 @@ fn render_decomposition(
         "      attempts proposal={}/3 provider={}/3",
         graph.proposal_attempts, graph.provider_failures
     );
+    if let Some(hold) = &graph.dispatch_hold {
+        let _ = writeln!(
+            w,
+            "      hold: {}",
+            truncate(hold, width.saturating_sub(12))
+        );
+    }
     for member in &graph.members {
         let prerequisites = if member.prerequisites.is_empty() {
             "—".to_string()
@@ -797,6 +804,9 @@ mod tests {
             source_title: "deliver the requested outcome".into(),
             source_status: "decomposed".into(),
             graph_state: "blocked".into(),
+            dispatch_hold: Some(
+                "implementation dispatch held: graph state=blocked, active=1".into(),
+            ),
             proposal_attempts: 2,
             provider_failures: 1,
             planner_provider: Some("codex".into()),
@@ -822,6 +832,7 @@ mod tests {
         assert!(output.contains("source #40"));
         assert!(output.contains("children=1/2"));
         assert!(output.contains("proposal=2/3 provider=1/3"));
+        assert!(output.contains("hold: implementation dispatch held: graph state=blocked"));
         assert!(output.contains("#42") && output.contains("deps #41"));
         assert!(output.contains("blocker: child failed review"));
     }
