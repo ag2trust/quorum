@@ -316,6 +316,7 @@ fn reconstruct_dormant_slots(
             cost_usd: recovery.entry.cost_usd,
             task_started_at: now,
             turn_started_at: now,
+            last_event_at: now,
             turn_ended_at: Some(now),
             agent_state: recovery.entry.agent_state.clone(),
             session_log: None,
