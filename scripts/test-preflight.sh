@@ -16,10 +16,17 @@ mkdir -p "$BIN"
 
 cat >"$BIN/cargo" <<'EOF'
 #!/bin/sh
-[ "${PREFLIGHT_CARGO_FAIL:-0}" = 0 ] || exit 1
 if [ -n "${PREFLIGHT_CARGO_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$PREFLIGHT_CARGO_LOG"
 fi
+[ "${PREFLIGHT_CARGO_FAIL:-0}" = 0 ] || {
+  printf 'forced cargo diagnostic\n' >&2
+  exit 1
+}
+[ "${PREFLIGHT_CARGO_FAIL:-0}" != compile ] || [ "$1" != test ] || {
+  printf 'forced cargo test diagnostic\n' >&2
+  exit 17
+}
 exit 0
 EOF
 chmod +x "$BIN/cargo"
@@ -53,6 +60,9 @@ git merge -q --no-ff origin/develop -m 'integrate develop' \
   -m 'Co-Authored-By: Merge-agent <merge@example.invalid>'
 cp "$ROOT/preflight.sh" ./preflight.sh
 chmod +x ./preflight.sh
+mkdir -p scripts/preflight
+cp "$ROOT/scripts/preflight/timing.sh" scripts/preflight/timing.sh
+chmod +x scripts/preflight/timing.sh
 PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/integration.out"
 grep -q 'PREFLIGHT: PASS (quick' "$TMP/integration.out"
 
@@ -65,6 +75,9 @@ git add feature
 git commit -qm 'feature work' -m 'Co-Authored-By: Feature-agent <feature@example.invalid>'
 cp "$ROOT/preflight.sh" ./preflight.sh
 chmod +x ./preflight.sh
+mkdir -p scripts/preflight
+cp "$ROOT/scripts/preflight/timing.sh" scripts/preflight/timing.sh
+chmod +x scripts/preflight/timing.sh
 if PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/feature.out" 2>&1; then
   echo 'expected develop-based feature branch to fail preflight' >&2
   exit 1
@@ -87,6 +100,7 @@ if PREFLIGHT_CARGO_FAIL=1 PATH="$BIN:$PATH" git push -q origin main \
   exit 1
 fi
 grep -q 'PREFLIGHT: FAIL (cargo fmt)' "$TMP/noop-format.out"
+grep -q 'forced cargo diagnostic' "$TMP/noop-format.out"
 PATH="$BIN:$PATH" git push -q origin main >"$TMP/noop.out" 2>&1
 grep -q 'PREFLIGHT: PASS (quick' "$TMP/noop.out"
 
@@ -402,12 +416,27 @@ grep -q 'require --quick' "$TMP/full-continuation.out"
 cat >"$TMP/full-cargo.expected" <<'EOF'
 fmt --all -- --check
 clippy --all-targets --all-features --features quorum-core/test-support -- -D warnings
-test --workspace --all-features --features quorum-core/test-support
+test --no-run --message-format=json --workspace --all-features --features quorum-core/test-support
 EOF
 PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
   ./preflight.sh >"$TMP/full.out"
 cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
 grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/full.out"
+grep -q '^  branch_base .*  ok$' target/preflight-timing/summary.txt
+grep -q '"name": "branch_base"' target/preflight-timing/timing.json
+grep -q 'slowest test binaries (top 0 of 0):' \
+  target/preflight-timing/summary.txt
+
+# Cargo's compile/no-run diagnostics are captured by the structured collector,
+# then replayed by preflight before it returns the same failure status as the
+# former direct `cargo test` gate.
+if PREFLIGHT_CARGO_FAIL=compile PATH="$BIN:$PATH" ./preflight.sh \
+  >"$TMP/full-compile-failure.out" 2>&1; then
+  echo 'expected compile/no-run failure to reject full preflight' >&2
+  exit 1
+fi
+grep -q 'forced cargo test diagnostic' "$TMP/full-compile-failure.out"
+grep -q 'PREFLIGHT: FAIL (cargo test)' "$TMP/full-compile-failure.out"
 
 # CI must preserve the same explicit feature at the test boundary. Its test
 # command is what builds the real helper binary in a clean installed toolchain.
