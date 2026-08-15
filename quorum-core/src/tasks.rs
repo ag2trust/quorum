@@ -537,6 +537,25 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
     Ok(unmet == 0)
 }
 
+/// Count tasks that have already started but not yet reached a terminal
+/// state, excluding one task id (the planning source itself, which sits in
+/// `planning` while draining and is not "started work" for this predicate).
+///
+/// Used by the decomposition drain-readiness gate: draining must wait for
+/// every already-started task to run through review/rework/remediation/merge
+/// to `done`/`failed`/`cancelled` before capturing the frozen base and
+/// entering `planning`. `open` tasks never started; the freeze blocks new
+/// claims, so the counted set can only shrink under drain.
+pub fn count_started_non_terminal_excluding(conn: &Connection, exclude_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM tasks
+         WHERE status IN ('working','in-review','rework')
+           AND id != ?1",
+        params![exclude_id],
+        |r| r.get(0),
+    )?)
+}
+
 fn merge_pr_into_refs(existing: &Option<String>, pr: &str) -> String {
     let pr_val: serde_json::Value = pr
         .parse::<i64>()
@@ -3286,6 +3305,25 @@ pub fn retry_parked(
         params![id],
         |row| row.get(0),
     )?;
+    // Non-growth under a decomposition freeze: restoring a parked task to a
+    // non-terminal status while `freeze_active=1` would add started work to
+    // the drain-quiescence set that the frozen-base capture waits on. Refuse
+    // the restore; the operator can rerun once planning materializes and the
+    // freeze clears. The policy-parked branch keeps status='failed', so it
+    // does not grow the counted set and is allowed under a freeze.
+    if !policy_parked {
+        let freeze_active: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM task_decompositions WHERE freeze_active=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if freeze_active > 0 {
+            return Err(QuorumError::Usage(format!(
+                "cannot retry task #{id}: a decomposition freeze is active; \
+                 wait for planning to materialize before retrying"
+            )));
+        }
+    }
     if policy_parked {
         // Retry of a policy park is a request to estimate remaining work.  Keep
         // the durable park/resume context but make it a classifier candidate.
@@ -10503,5 +10541,119 @@ mod tests {
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         // No claim was ever taken (e.g., worker died before insert).
         assert!(!worker_lease_active_for(&mut c, "W1", id, 1001).unwrap());
+    }
+
+    #[test]
+    fn count_started_non_terminal_excludes_source_open_and_terminals() {
+        let (_d, mut c) = open_tmp();
+        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
+        let working = create(&mut c, "boss", "w", None, 0, None, None, None, None, 1000).unwrap();
+        let in_review = create(&mut c, "boss", "r", None, 0, None, None, None, None, 1000).unwrap();
+        let rework = create(&mut c, "boss", "k", None, 0, None, None, None, None, 1000).unwrap();
+        let open_task = create(&mut c, "boss", "o", None, 0, None, None, None, None, 1000).unwrap();
+        let merging = create(&mut c, "boss", "m", None, 0, None, None, None, None, 1000).unwrap();
+        let done = create(&mut c, "boss", "d", None, 0, None, None, None, None, 1000).unwrap();
+        let failed = create(&mut c, "boss", "f", None, 0, None, None, None, None, 1000).unwrap();
+        let cancelled = create(&mut c, "boss", "x", None, 0, None, None, None, None, 1000).unwrap();
+
+        for (id, status) in [
+            (working, "working"),
+            (in_review, "in-review"),
+            (rework, "rework"),
+            (merging, "merging"),
+            (done, "done"),
+            (failed, "failed"),
+            (cancelled, "cancelled"),
+        ] {
+            c.execute(
+                "UPDATE tasks SET status=?2 WHERE id=?1",
+                params![id, status],
+            )
+            .unwrap();
+        }
+
+        // working+in-review+rework block; source, open, merging, and terminals do not.
+        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 3);
+
+        // Excluding an actual started task drops its count.
+        assert_eq!(
+            count_started_non_terminal_excluding(&c, in_review).unwrap(),
+            2
+        );
+
+        // Move the last blocker to done → predicate releases (returns 0).
+        for id in [working, rework] {
+            c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![id])
+                .unwrap();
+        }
+        c.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            params![in_review],
+        )
+        .unwrap();
+        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 0);
+
+        let _ = open_task; // silence "unused" — open row also present in DB
+    }
+
+    #[test]
+    fn retry_parked_refuses_under_a_decomposition_freeze() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        // Park the task with a non-terminal resume status so restoration would
+        // grow the drain-quiescence set.
+        c.execute(
+            "UPDATE tasks SET status='failed',refs=json_set(
+                json_object(
+                    'cx_est',2,'cx_size','S','cx_ready',true,
+                    'cx_not_ready_reason',NULL,'cx_by','test:v2'
+                ),
+                '$.daemon_parked', json('true'),
+                '$.daemon_parked_reason','test',
+                '$.daemon_resume_status','in-review'
+             ) WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+
+        // No freeze: retry restores to in-review.
+        let restored = retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("parked task restored when no freeze");
+        assert_eq!(restored.status, "in-review");
+
+        // Re-park then start a freeze; retry must fail Usage.
+        c.execute(
+            "UPDATE tasks SET status='failed',refs=json_set(
+                refs,
+                '$.daemon_parked', json('true'),
+                '$.daemon_resume_status','in-review'
+             ) WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,1000,1000)",
+            params![source],
+        )
+        .unwrap();
+        let err = retry_parked(&mut c, id, "operator", true, 1002).unwrap_err();
+        match err {
+            QuorumError::Usage(msg) => {
+                assert!(msg.contains("decomposition freeze"), "unexpected: {msg}")
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        // Task stays failed — non-growth invariant preserved.
+        let status: String = c
+            .query_row("SELECT status FROM tasks WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "failed");
     }
 }

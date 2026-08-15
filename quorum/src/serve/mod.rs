@@ -3757,8 +3757,11 @@ const FROZEN_BASE_CAPTURE_PIPE_BYTES: usize = 4096;
 struct DecompositionLiveWork {
     // These are the only provider/network futures retained across tick
     // boundaries. Merge, publication, collector, and recovery calls are
-    // awaited inline, so tick cannot begin the drain transition concurrently
-    // with one of those operations.
+    // awaited inline. Inline execution keeps no future here, but a task can
+    // still sit at a non-terminal status ('working' after worker teardown but
+    // before reviewer attach, 'in-review' between reviewers, 'rework' waiting
+    // for a rework worker) across ticks. The `started_non_terminal` gate at
+    // the call site closes that gap; these flags alone are not sufficient.
     ordinary_classifier: bool,
     doctor: bool,
     pre_review_checks: bool,
@@ -3768,11 +3771,13 @@ fn decomposition_drain_ready(
     workers: usize,
     reviewers: usize,
     durable_journal: i64,
+    started_non_terminal: i64,
     live: DecompositionLiveWork,
 ) -> bool {
     workers == 0
         && reviewers == 0
         && durable_journal == 0
+        && started_non_terminal == 0
         && !live.ordinary_classifier
         && !live.doctor
         && !live.pre_review_checks
@@ -5034,6 +5039,14 @@ async fn tick_decomposition(
             row.get::<_, i64>(0)
         })?
     };
+    // Every task that had already started (working/in-review/rework) must reach
+    // a terminal state before we capture the frozen base. The planning source
+    // itself sits in 'planning' — exclude it. Live-process counts alone miss
+    // the `in-review` gap between worker teardown and reviewer attach.
+    let started_non_terminal = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        quorum_core::tasks::count_started_non_terminal_excluding(&conn, snapshot.source_task_id)?
+    };
     if snapshot.state == "freeze-requested" {
         let path = config.db_path.clone();
         let graph_id = snapshot.graph_id;
@@ -5054,7 +5067,13 @@ async fn tick_decomposition(
         return Ok(true);
     }
     if snapshot.state == "draining"
-        && decomposition_drain_ready(workers.len(), reviewers.len(), durable_in_flight, live)
+        && decomposition_drain_ready(
+            workers.len(),
+            reviewers.len(),
+            durable_in_flight,
+            started_non_terminal,
+            live,
+        )
     {
         let sha = repository_head_sha(&config.repo_dir).await?;
         let path = config.db_path.clone();
@@ -10424,12 +10443,13 @@ async fn tick(
     // A decomposition freeze must NOT skip this. Phase 5 only ever serves
     // workers that already exist (phase 6 spawns none during the freeze), and
     // the freeze's own drain predicate (decomposition_drain_ready) requires
-    // reviewers==0 && workers==0. Gating reviewer provisioning on the freeze
-    // strands a retained worker awaiting review: it keeps the drain predicate
-    // false forever, and the freeze keeps its reviewer from spawning — a
-    // deadlock against the very drain the freeze waits for. Letting the
-    // reviewer run lets the retained worker settle and drives workers/reviewers
-    // toward zero, which is exactly what the frozen-base capture waits for.
+    // reviewers==0 && workers==0 && started_non_terminal==0. Gating reviewer
+    // provisioning on the freeze strands a retained worker awaiting review: it
+    // keeps the drain predicate false forever, and the freeze keeps its
+    // reviewer from spawning — a deadlock against the very drain the freeze
+    // waits for. Letting the reviewer run lets the retained worker settle and
+    // drives every started task toward a terminal state, which is exactly what
+    // the frozen-base capture waits for.
     if !drain_state.draining {
         let active_in_review = {
             let p = db_path.clone();
@@ -24343,9 +24363,18 @@ mod tests {
             0,
             0,
             0,
+            0,
             DecompositionLiveWork::default()
         ));
         assert!(!decomposition_drain_ready(
+            1,
+            0,
+            0,
+            0,
+            DecompositionLiveWork::default()
+        ));
+        assert!(!decomposition_drain_ready(
+            0,
             1,
             0,
             0,
@@ -24353,11 +24382,15 @@ mod tests {
         ));
         assert!(!decomposition_drain_ready(
             0,
+            0,
             1,
             0,
             DecompositionLiveWork::default()
         ));
+        // A started-but-not-terminal task (e.g. in-review with no reviewer
+        // yet) holds drain open even when every live slot is empty.
         assert!(!decomposition_drain_ready(
+            0,
             0,
             0,
             1,
@@ -24377,7 +24410,7 @@ mod tests {
                 ..Default::default()
             },
         ] {
-            assert!(!decomposition_drain_ready(0, 0, 0, live));
+            assert!(!decomposition_drain_ready(0, 0, 0, 0, live));
         }
     }
 
