@@ -3953,7 +3953,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
     let source_bytes = usize::try_from(source_bytes)
         .map_err(|_| QuorumError::Io("invalid planning source byte count".into()))?;
     let accepted_proposal = accepted_proposal_json
-        .map(|json| planner::parse_accepted_proposal(&json))
+        .map(|json| planner::rehydrate_accepted_proposal(&json))
         .transpose()
         .map_err(|error| QuorumError::Io(format!("invalid durable accepted proposal: {error}")))?;
     let mut statement = conn.prepare(
@@ -4034,7 +4034,7 @@ fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupD
         let raw = proposal.ok_or_else(|| {
             QuorumError::Io(format!("{state} decomposition lacks accepted proposal"))
         })?;
-        planner::parse_accepted_proposal(&raw).map_err(|error| {
+        planner::rehydrate_accepted_proposal(&raw).map_err(|error| {
             QuorumError::Io(format!(
                 "{state} decomposition proposal is invalid: {error}"
             ))
@@ -4612,6 +4612,7 @@ const CHILD_REJECTION_READY_WRAPPER_BYTES: usize =
 const CHILD_REJECTION_SIZE_MAX_BYTES: usize = "size=".len() + "XL".len();
 const CHILD_REJECTION_DUPLICATE_LABEL_BYTES: usize = "duplicate_of=".len();
 const CHILD_REJECTION_SEPARATORS_MAX_BYTES: usize = 2 * "; ".len();
+const CHILD_REJECTION_CONTEXT_MAX_BYTES: usize = 272;
 // Keep the complete combined rejection within the planner retry-feedback
 // consumer's bound. Reserve fixed space for every dimension, then divide the
 // variable space between the readiness reason and duplicate task IDs.
@@ -4723,7 +4724,7 @@ fn bounded_duplicate_ids(ids: &[i64], limit: usize) -> String {
 }
 
 fn child_preclassification_rejection(
-    task_key: &str,
+    task: &planner::ProposedTask,
     result: &quorum_core::classify::TaskClassification,
 ) -> Option<String> {
     let mut failed_dimensions = Vec::new();
@@ -4741,20 +4742,39 @@ fn child_preclassification_rejection(
         failed_dimensions.push(format!("size={}", result.size));
     }
     if !result.duplicate_of.is_empty() {
+        let duplicate_limit = if !matches!(result.size.as_str(), "S" | "M")
+            && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty())
+        {
+            CHILD_REJECTION_DUPLICATES_MAX_BYTES.saturating_sub(CHILD_REJECTION_CONTEXT_MAX_BYTES)
+        } else {
+            CHILD_REJECTION_DUPLICATES_MAX_BYTES
+        };
         failed_dimensions.push(format!(
             "duplicate_of={}",
-            bounded_duplicate_ids(&result.duplicate_of, CHILD_REJECTION_DUPLICATES_MAX_BYTES)
+            bounded_duplicate_ids(&result.duplicate_of, duplicate_limit)
         ));
     }
     if failed_dimensions.is_empty() {
         return None;
     }
-    let summary = format!(
-        "child {task_key} rejected by preclassification: {}",
+    let mut summary = format!(
+        "child {} rejected by preclassification: {}",
+        task.key,
         failed_dimensions.join("; ")
     );
-    debug_assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
-    Some(summary)
+    if !matches!(result.size.as_str(), "S" | "M")
+        && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty())
+    {
+        let paths = bounded_with_ellipsis(&task.affected_paths.join(", "), 96);
+        let delta = bounded_with_ellipsis(&task.implementation_delta, 128);
+        summary.push_str(&format!(
+            "; rejected_delta={delta}; affected_paths=[{paths}]"
+        ));
+    }
+    Some(bounded_with_ellipsis(
+        &summary,
+        planner::MAX_REJECTION_SUMMARY_BYTES,
+    ))
 }
 
 async fn reject_decomposition_proposal(
@@ -4797,6 +4817,8 @@ fn proposed_classifier_tasks(
                 title: task.title.clone(),
                 body: Some(
                     serde_json::json!({
+                        "implementation_delta": task.implementation_delta,
+                        "affected_paths": task.affected_paths,
                         "observable_outcome": task.observable_outcome,
                         "deliverables": task.deliverables,
                         "acceptance_criteria": task.acceptance_criteria,
@@ -4804,6 +4826,8 @@ fn proposed_classifier_tasks(
                             &task.source_constraints,
                         ),
                         "verification_expectations": task.verification_expectations,
+                        "non_goals": task.non_goals,
+                        "preserved_literals": task.preserved_literals,
                     })
                     .to_string(),
                 ),
@@ -4830,7 +4854,7 @@ fn planned_children(
             let result = by_id
                 .get(&id)
                 .ok_or_else(|| format!("missing classification for {}", task.key))?;
-            if let Some(summary) = child_preclassification_rejection(&task.key, result) {
+            if let Some(summary) = child_preclassification_rejection(task, result) {
                 return Err(summary);
             }
             let mut prerequisite_keys = Vec::new();
@@ -4849,6 +4873,8 @@ fn planned_children(
                 local_key: task.key.clone(),
                 title: task.title.clone(),
                 body: serde_json::json!({
+                    "implementation_delta": task.implementation_delta,
+                    "affected_paths": task.affected_paths,
                     "observable_outcome": task.observable_outcome,
                     "deliverables": task.deliverables,
                     "acceptance_criteria": task.acceptance_criteria,
@@ -4856,6 +4882,8 @@ fn planned_children(
                         &task.source_constraints,
                     ),
                     "verification_expectations": task.verification_expectations,
+                    "non_goals": task.non_goals,
+                    "preserved_literals": task.preserved_literals,
                 })
                 .to_string(),
                 labels: Some("[\"type:implementation\",\"generated:decomposition\"]".into()),
@@ -5109,6 +5137,45 @@ async fn tick_decomposition(
         coordinator.proposal = snapshot.accepted_proposal.clone();
     }
 
+    // Older durable proposals deserialize newly introduced grounding fields
+    // through serde defaults. Reapply closed-plan validation before either
+    // resumable phase so such a proposal returns to planning instead of being
+    // classified or materialized with empty grounding fields.
+    if matches!(snapshot.state.as_str(), "validating" | "preclassifying") {
+        let Some(proposal) = coordinator.proposal.as_ref() else {
+            return Err(QuorumError::Io(format!(
+                "{} decomposition lacks its durable accepted proposal",
+                snapshot.state
+            )));
+        };
+        if planner::validate_plan_tasks(proposal).is_err() {
+            let phase = match snapshot.state.as_str() {
+                "validating" => "validating",
+                "preclassifying" => "preclassifying",
+                _ => unreachable!("resumable phase was matched above"),
+            };
+            let path = config.db_path.clone();
+            let graph_id = snapshot.graph_id;
+            let reset = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let mut conn = quorum_core::db::open(&path)?;
+                quorum_core::decomposition::reset_accepted_proposal_to_planning(
+                    &mut conn,
+                    graph_id,
+                    phase,
+                    now_unix(),
+                )
+            })
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!(
+                    "durable proposal compatibility reset join: {error}"
+                ))
+            })??;
+            coordinator.proposal = None;
+            return Ok(reset);
+        }
+    }
+
     if snapshot.state == "provider-backoff" {
         if now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS {
             let path = config.db_path.clone();
@@ -5282,6 +5349,8 @@ async fn tick_decomposition(
         match planner::validate_for_source(
             proposal,
             &snapshot.dependencies,
+            &snapshot.title,
+            snapshot.body.as_deref(),
             &config.repo_dir,
             &coordinator.writable_path_resolver,
         )
@@ -25119,11 +25188,15 @@ mod tests {
             planner::ProposedTask {
                 key: "a".into(),
                 title: "a".into(),
+                implementation_delta: "change layer a".into(),
+                affected_paths: vec!["src/a.rs".into()],
                 observable_outcome: "a works".into(),
                 deliverables: writable_deliverables("src/a.rs"),
                 acceptance_criteria: vec!["a".into()],
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
+                non_goals: vec!["do not change b".into()],
+                preserved_literals: vec!["EXACT_LABEL".into()],
                 prerequisites: vec![],
             },
             planner::ProposedTask {
@@ -25135,6 +25208,7 @@ mod tests {
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
                 prerequisites: vec!["a".into()],
+                ..Default::default()
             },
         ];
         let valid = vec![
@@ -25160,6 +25234,19 @@ mod tests {
         assert_eq!(children[0].local_key, "a");
         assert_eq!(children[1].prerequisite_keys, ["a"]);
         let child_body: serde_json::Value = serde_json::from_str(&children[0].body).unwrap();
+        assert_eq!(child_body["implementation_delta"], "change layer a");
+        assert_eq!(
+            child_body["affected_paths"],
+            serde_json::json!(["src/a.rs"])
+        );
+        assert_eq!(
+            child_body["non_goals"],
+            serde_json::json!(["do not change b"])
+        );
+        assert_eq!(
+            child_body["preserved_literals"],
+            serde_json::json!(["EXACT_LABEL"])
+        );
         assert!(child_body["source_constraints"]
             .as_array()
             .unwrap()
@@ -25200,7 +25287,7 @@ mod tests {
         combined[0].duplicate_of = vec![301, 302];
         assert_eq!(
             planned_children(&proposal, &combined).unwrap_err(),
-            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL; duplicate_of=[301, 302]"
+            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL; duplicate_of=[301, 302]; rejected_delta=change layer a; affected_paths=[src/a.rs]"
         );
 
         assert_eq!(
@@ -25214,12 +25301,15 @@ mod tests {
         let proposal = vec![planner::ProposedTask {
             key: "bounded-child".into(),
             title: "bounded child".into(),
+            implementation_delta: "change the bounded planner seam".into(),
+            affected_paths: vec!["src/bounded.rs".into()],
             observable_outcome: "bounded evidence persists".into(),
             deliverables: writable_deliverables("src/bounded.rs"),
             acceptance_criteria: vec!["bounded".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["test".into()],
             prerequisites: vec![],
+            ..Default::default()
         }];
         let classifications = vec![quorum_core::classify::TaskClassification {
             task_id: -1,
@@ -25236,7 +25326,11 @@ mod tests {
         assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
         assert!(summary.contains("ready=false (not_ready_reason: é"));
         assert!(summary.contains("…); size=XL; duplicate_of=[1, 2"));
-        assert!(summary.ends_with("...]"), "{summary}");
+        assert!(summary.contains("rejected_delta=change the bounded planner seam"));
+        assert!(
+            summary.ends_with("affected_paths=[src/bounded.rs]"),
+            "{summary}"
+        );
 
         let source = planner::PlanningSource {
             task_id: 301,
@@ -25264,6 +25358,7 @@ mod tests {
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["test".into()],
             prerequisites: vec![],
+            ..Default::default()
         }];
         let classifications = vec![quorum_core::classify::TaskClassification {
             task_id: -1,
@@ -25341,21 +25436,29 @@ mod tests {
             planner::ProposedTask {
                 key: "permitted-first".into(),
                 title: "permitted first child".into(),
+                implementation_delta: "change the permitted implementation".into(),
+                affected_paths: vec!["src/permitted.rs".into()],
                 observable_outcome: "the first child remains inside the repository".into(),
                 deliverables: writable_deliverables("src/permitted.rs"),
                 acceptance_criteria: vec!["permitted child works".into()],
                 source_constraints: vec!["preserve atomic activation".into()],
                 verification_expectations: vec!["focused test passes".into()],
+                non_goals: vec!["do not write outside the repository".into()],
+                preserved_literals: vec![],
                 prerequisites: vec![],
             },
             planner::ProposedTask {
                 key: "escaping-second".into(),
                 title: "escaping second child".into(),
+                implementation_delta: "attempt the declared external output".into(),
+                affected_paths: vec!["../sibling/escaped.rs".into()],
                 observable_outcome: "the second child writes outside the repository".into(),
                 deliverables: writable_deliverables("../sibling/escaped.rs"),
                 acceptance_criteria: vec!["escaping child is rejected".into()],
                 source_constraints: vec!["preserve atomic activation".into()],
                 verification_expectations: vec!["negative path is durable".into()],
+                non_goals: vec!["do not activate any child".into()],
+                preserved_literals: vec![],
                 prerequisites: vec!["permitted-first".into()],
             },
         ];
@@ -25700,22 +25803,30 @@ mod tests {
                     planner::ProposedTask {
                         key: "a".into(),
                         title: "a".into(),
+                        implementation_delta: "change a seam".into(),
+                        affected_paths: vec!["src/a.rs".into()],
                         observable_outcome: "a".into(),
                         deliverables: writable_deliverables("src/a.rs"),
                         acceptance_criteria: vec!["a".into()],
                         source_constraints: vec!["a".into()],
                         verification_expectations: vec!["a".into()],
+                        non_goals: vec!["no adjacent change".into()],
                         prerequisites: vec![],
+                        ..Default::default()
                     },
                     planner::ProposedTask {
                         key: "b".into(),
                         title: "b".into(),
+                        implementation_delta: "change b seam".into(),
+                        affected_paths: vec!["src/b.rs".into()],
                         observable_outcome: "b".into(),
                         deliverables: writable_deliverables("src/b.rs"),
                         acceptance_criteria: vec!["b".into()],
                         source_constraints: vec!["b".into()],
                         verification_expectations: vec!["b".into()],
+                        non_goals: vec!["no adjacent change".into()],
                         prerequisites: vec!["a".into()],
+                        ..Default::default()
                     },
                 ])
                 .unwrap();
@@ -25747,6 +25858,134 @@ mod tests {
                     .unwrap();
                 assert_eq!(attempts, 0, "restart inspection charged {phase}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_durable_proposals_replan_without_charging_attempt_budget() {
+        for phase in ["validating", "preclassifying"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("legacy-proposal-{phase}.db"));
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source = tasks::create(
+                &mut conn,
+                "owner",
+                "large",
+                Some("outcome"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id: source,
+                    expected_revision: 1,
+                    provider: "claude",
+                    model: "opus",
+                    frozen_base_sha: "abc",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph,
+                "freeze-requested",
+                "draining",
+                None,
+                3,
+            )
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn, graph, "draining", "planning", None, 4,
+            )
+            .unwrap();
+            let legacy = serde_json::json!([
+                {
+                    "key": "a", "title": "a", "observable_outcome": "a works",
+                    "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
+                    "verification_expectations": ["tests"], "prerequisites": []
+                },
+                {
+                    "key": "b", "title": "b", "observable_outcome": "b works",
+                    "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
+                    "verification_expectations": ["tests"], "prerequisites": ["a"]
+                }
+            ]);
+            for attempt in 1..=2 {
+                quorum_core::decomposition::accept_proposal(
+                    &mut conn,
+                    graph,
+                    &legacy.to_string(),
+                    4 + attempt * 2,
+                )
+                .unwrap();
+                quorum_core::decomposition::reject_frozen_proposal(
+                    &mut conn,
+                    graph,
+                    "validating",
+                    "prior-semantic-rejection",
+                    "proposal rejected by the prior binary",
+                    5 + attempt * 2,
+                )
+                .unwrap();
+            }
+            quorum_core::decomposition::accept_proposal(&mut conn, graph, &legacy.to_string(), 10)
+                .unwrap();
+            if phase == "preclassifying" {
+                quorum_core::decomposition::set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "validating",
+                    "preclassifying",
+                    None,
+                    11,
+                )
+                .unwrap();
+            }
+            drop(conn);
+
+            let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+            let mut coordinator = DecompositionCoordinator::default();
+            assert!(tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap());
+
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let state: (String, Option<String>, i64) = conn
+                .query_row(
+                    "SELECT state,accepted_proposal_json,proposal_attempts
+                     FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("planning".into(), None, 2), "phase {phase}");
+            let attempts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM decomposition_attempts WHERE graph_id=?1",
+                    [graph],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(attempts, 2, "compatibility reset charged phase {phase}");
+            assert_ne!(
+                tasks::get(&conn, source).unwrap().unwrap().status,
+                "failed",
+                "compatibility reset failed source in phase {phase}"
+            );
         }
     }
 
