@@ -502,11 +502,6 @@ pub(crate) async fn recover(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let dormant_candidate_names = dormant_entries
-        .iter()
-        .map(|entry| entry.agent.clone())
-        .collect::<std::collections::HashSet<_>>();
-
     // #130: all unjournaled working/rework tasks are orphaned and follow
     // normal recovery (no passive exemption). Journal entries identify
     // daemon-managed agents whose stale processes must be killed.
@@ -531,16 +526,6 @@ pub(crate) async fn recover(
                 }
             }
         }
-    }
-
-    if let Some(entry) = entries
-        .iter()
-        .find(|entry| entry.pid.is_none() && !dormant_candidate_names.contains(&entry.agent))
-    {
-        return Err(QuorumError::Io(format!(
-            "recovery rejected pid-less journal row for '{}' in phase '{}'; only explicit dormant awaiting-review workers may omit a PID",
-            entry.agent, entry.phase
-        )));
     }
 
     // Reserve every candidate identity before validation. A corrupt dormant
@@ -1172,6 +1157,109 @@ mod tests {
             )
             .unwrap();
         assert_eq!(durable, (0, 1, 0));
+        assert!(!fixture.worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn pidless_remediation_provision_follows_generic_cleanup() {
+        let fixture = dormant_fixture();
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Reviewer",
+            fixture.task_id,
+            &Event::ReviewerAttached {
+                agent: "Reviewer".into(),
+            },
+            super::super::now_unix() + 3,
+        )
+        .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Reviewer",
+            fixture.task_id,
+            &Event::VerdictChanges,
+            super::super::now_unix() + 4,
+        )
+        .unwrap();
+        tasks::claim_remediation_rework(
+            &mut conn,
+            "Remediation",
+            fixture.task_id,
+            3600,
+            super::super::now_unix() + 5,
+        )
+        .unwrap()
+        .unwrap();
+        journal::delete(&mut conn, "Dormant").unwrap();
+        quorum_core::capabilities::issue(
+            &mut conn,
+            "cap-remediation",
+            fixture.task_id,
+            "Remediation",
+            "worker",
+            super::super::now_unix() + 5,
+        )
+        .unwrap();
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: "Remediation".into(),
+                role: "worker".into(),
+                task_id: Some(fixture.task_id),
+                session_id: "session-remediation".into(),
+                worktree: Some(fixture.worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/original-pr-head".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(901),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: Some("daemon/remediation-t1".into()),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            workers.is_empty(),
+            "pre-spawn rows cannot create a live slot"
+        );
+        assert!(!roster.owns("Remediation"));
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert!(journal::list_in_flight(&conn)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.agent != "Remediation"));
+        let active_capabilities: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM run_capabilities
+                 WHERE run_id='cap-remediation' AND revoked_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_capabilities, 0);
         assert!(!fixture.worktree.exists());
     }
 
