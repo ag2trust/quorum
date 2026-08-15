@@ -3305,6 +3305,25 @@ pub fn retry_parked(
         params![id],
         |row| row.get(0),
     )?;
+    // Non-growth under a decomposition freeze: restoring a parked task to a
+    // non-terminal status while `freeze_active=1` would add started work to
+    // the drain-quiescence set that the frozen-base capture waits on. Refuse
+    // the restore; the operator can rerun once planning materializes and the
+    // freeze clears. The policy-parked branch keeps status='failed', so it
+    // does not grow the counted set and is allowed under a freeze.
+    if !policy_parked {
+        let freeze_active: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM task_decompositions WHERE freeze_active=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if freeze_active > 0 {
+            return Err(QuorumError::Usage(format!(
+                "cannot retry task #{id}: a decomposition freeze is active; \
+                 wait for planning to materialize before retrying"
+            )));
+        }
+    }
     if policy_parked {
         // Retry of a policy park is a request to estimate remaining work.  Keep
         // the durable park/resume context but make it a classifier candidate.
@@ -10575,5 +10594,66 @@ mod tests {
         assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 0);
 
         let _ = open_task; // silence "unused" — open row also present in DB
+    }
+
+    #[test]
+    fn retry_parked_refuses_under_a_decomposition_freeze() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        // Park the task with a non-terminal resume status so restoration would
+        // grow the drain-quiescence set.
+        c.execute(
+            "UPDATE tasks SET status='failed',refs=json_set(
+                json_object(
+                    'cx_est',2,'cx_size','S','cx_ready',true,
+                    'cx_not_ready_reason',NULL,'cx_by','test:v2'
+                ),
+                '$.daemon_parked', json('true'),
+                '$.daemon_parked_reason','test',
+                '$.daemon_resume_status','in-review'
+             ) WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+
+        // No freeze: retry restores to in-review.
+        let restored = retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("parked task restored when no freeze");
+        assert_eq!(restored.status, "in-review");
+
+        // Re-park then start a freeze; retry must fail Usage.
+        c.execute(
+            "UPDATE tasks SET status='failed',refs=json_set(
+                refs,
+                '$.daemon_parked', json('true'),
+                '$.daemon_resume_status','in-review'
+             ) WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,1000,1000)",
+            params![source],
+        )
+        .unwrap();
+        let err = retry_parked(&mut c, id, "operator", true, 1002).unwrap_err();
+        match err {
+            QuorumError::Usage(msg) => {
+                assert!(msg.contains("decomposition freeze"), "unexpected: {msg}")
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        // Task stays failed — non-growth invariant preserved.
+        let status: String = c
+            .query_row("SELECT status FROM tasks WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "failed");
     }
 }
