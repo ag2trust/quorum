@@ -30,6 +30,38 @@ pub struct ReviewerSpec {
     pub reviewer_name: String,
 }
 
+pub fn task_review_contract(
+    task_id: i64,
+    title: &str,
+    body: Option<&str>,
+    depends_on: Option<&str>,
+    recovery_notes: &[String],
+) -> String {
+    let body = body.unwrap_or("<no task body>");
+    let depends_on = depends_on.unwrap_or("[]");
+    let notes = if recovery_notes.is_empty() {
+        "<none>".to_string()
+    } else {
+        recovery_notes
+            .iter()
+            .enumerate()
+            .map(|(index, note)| format!("{}. {}", index + 1, note))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let context = format!(
+        "task_id: {task_id}\ntitle: {title}\ndepends_on: {depends_on}\n\nbody:\n{body}\n\nrecent recovery notes:\n{notes}"
+    )
+    .replace('\n', "\n    ");
+    format!(
+        "## Authoritative managed-task contract\n\n\
+         Review the PR against this task context, not the generic PR title or body. The task body \
+         defines the assigned outcome, constraints, and verification expectations; dependencies \
+         are scheduler-enforced assumptions, and recovery notes are bounded operational context.\n\n\
+             {context}\n"
+    )
+}
+
 /// Reviewers must finish the planned audit for a SHA before their lifecycle
 /// verdict. This deliberately asks for coverage of related paths without
 /// demanding speculative findings or an audit of unrelated code.
@@ -716,6 +748,24 @@ pub fn build_remediation_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_review_contract_carries_bounded_authoritative_fields() {
+        let contract = task_review_contract(
+            473,
+            "Surface cancelled dependencies",
+            Some("Expected\nCancelled dependency parks are visible."),
+            Some("[461,462]"),
+            &["recovery attempt preserved PR #618".into()],
+        );
+        assert!(contract.contains("Authoritative managed-task contract"));
+        assert!(contract.contains("task_id: 473"));
+        assert!(contract.contains("title: Surface cancelled dependencies"));
+        assert!(contract.contains("depends_on: [461,462]"));
+        assert!(contract.contains("Cancelled dependency parks are visible."));
+        assert!(contract.contains("recovery attempt preserved PR #618"));
+        assert!(contract.contains("not the generic PR title or body"));
+    }
 
     #[test]
     fn review_prompt_contains_agent_names_and_pr() {
