@@ -14495,7 +14495,18 @@ async fn spawn_worker(
         }
         wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(&config.repo_dir, &branch).await;
-        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
+        guarded_worker_name_release_with_expectation(
+            &db_path,
+            name_pool,
+            &agent_name,
+            task.id,
+            if retry_turn.is_some() {
+                WorkerNameReleaseExpectation::RetainedForProviderRetry
+            } else {
+                WorkerNameReleaseExpectation::Released
+            },
+        )
+        .await;
         return Ok(false);
     }
 
@@ -15138,6 +15149,24 @@ async fn lookup_task_refs(db_path: &std::path::Path, task_id: i64) -> Option<Str
     .flatten()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerNameReleaseExpectation {
+    /// The caller has settled the worker lease before cleanup, so a live lease
+    /// is an abnormal condition that must stay loud.
+    Released,
+    /// A provider-blocked retry deliberately preserves the worker lease and
+    /// its daemon-issued name for the continuation.
+    RetainedForProviderRetry,
+}
+
+fn worker_name_release_expectation(end_reason: &str) -> WorkerNameReleaseExpectation {
+    if end_reason == "provider_blocked" {
+        WorkerNameReleaseExpectation::RetainedForProviderRetry
+    } else {
+        WorkerNameReleaseExpectation::Released
+    }
+}
+
 /// Guarded release of a worker's daemon-issued identity back to the name pool.
 ///
 /// Names are shared authority: an identity that is still tied to a live task
@@ -15146,15 +15175,34 @@ async fn lookup_task_refs(db_path: &std::path::Path, task_id: i64) -> Option<Str
 /// teardown — it verifies inside a `BEGIN IMMEDIATE` snapshot that no active,
 /// unexpired lease on `task#<id>` is still held by this agent before the pool
 /// release. If the lease is still live, or the DB check itself fails, the name
-/// is intentionally leaked (retained in `in_use`) and the abnormal condition is
-/// recorded — a leaked name is strictly safer than one recycled under an active
-/// claim. Filesystem and process cleanup is done by the caller before invoking
-/// this guard so the DB check/settlement stays a short transaction.
+/// is retained in `in_use` — a leaked name is strictly safer than one recycled
+/// under an active claim. A retained lease is only expected for a
+/// provider-blocked retry; every other live lease and all DB/spawn failures are
+/// recorded as errors. Filesystem and process cleanup is done by the caller
+/// before invoking this guard so the DB check/settlement stays a short
+/// transaction.
 async fn guarded_worker_name_release(
     db_path: &Path,
     name_pool: &mut Pool,
     agent: &str,
     task_id: i64,
+) {
+    guarded_worker_name_release_with_expectation(
+        db_path,
+        name_pool,
+        agent,
+        task_id,
+        WorkerNameReleaseExpectation::Released,
+    )
+    .await;
+}
+
+async fn guarded_worker_name_release_with_expectation(
+    db_path: &Path,
+    name_pool: &mut Pool,
+    agent: &str,
+    task_id: i64,
+    expectation: WorkerNameReleaseExpectation,
 ) {
     let p = db_path.to_path_buf();
     let agent_owned = agent.to_string();
@@ -15188,7 +15236,9 @@ async fn guarded_worker_name_release(
         let detail =
             format!("worker name release retained: task#{task_id} claim still active for {agent}");
         log(&detail);
-        persist_name_release_error(db_path, agent, task_id, &detail).await;
+        if expectation == WorkerNameReleaseExpectation::Released {
+            persist_name_release_error(db_path, agent, task_id, &detail).await;
+        }
         return;
     }
 
@@ -15277,7 +15327,14 @@ async fn cleanup_slot_inner(
         wt_mgr.delete_branch(repo_dir, &state.branch).await;
     }
 
-    guarded_worker_name_release(&config.db_path, name_pool, &state.agent_name, state.task_id).await;
+    guarded_worker_name_release_with_expectation(
+        &config.db_path,
+        name_pool,
+        &state.agent_name,
+        state.task_id,
+        worker_name_release_expectation(end_reason),
+    )
+    .await;
 }
 
 /// Tear down a worker agent: kill process, update task, clean up journal/worktree/name.
@@ -25047,6 +25104,54 @@ mod tests {
         assert_eq!(
             recorded, 1,
             "abnormal name-release retention must be surfaced as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_blocked_retry_retains_active_worker_name_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+        seed_task_with_worker_claim(&db_path, 43, &agent);
+
+        guarded_worker_name_release_with_expectation(
+            &db_path,
+            &mut pool,
+            &agent,
+            43,
+            worker_name_release_expectation("provider_blocked"),
+        )
+        .await;
+
+        assert_eq!(
+            pool.in_use_count(),
+            1,
+            "provider-blocked retry must retain its worker identity"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='name_release'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 0,
+            "intentional provider-blocked name retention must not raise an alert"
+        );
+    }
+
+    #[test]
+    fn only_provider_blocked_cleanup_expects_a_live_worker_lease() {
+        assert_eq!(
+            worker_name_release_expectation("provider_blocked"),
+            WorkerNameReleaseExpectation::RetainedForProviderRetry
+        );
+        assert_eq!(
+            worker_name_release_expectation("done"),
+            WorkerNameReleaseExpectation::Released
         );
     }
 
