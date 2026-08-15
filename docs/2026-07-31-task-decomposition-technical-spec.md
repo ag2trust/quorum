@@ -300,9 +300,11 @@ multiple outcomes, oversized output, malformed JSON, and sandbox violations are 
 failures.
 
 Literal preservation is byte-exact and bounded by the 8 KiB `preserved_literals` field and an
-8 KiB aggregate across all extracted values. Inline/fenced Markdown code and quoted values
-attached to the words `literal`, `label`, `tag`, or `message` are sorted and deduplicated; their
-lexicographic prefix is deterministically extracted only while it fits both bounds. Every
+8 KiB aggregate across all extracted values. Inline/fenced Markdown code uses matching backtick
+delimiter runs of any positive length; mismatched or unclosed runs are not extracted. Those code
+values and quoted values attached to the words `literal`, `label`, `tag`, or `message` are sorted
+and deduplicated; their lexicographic prefix is deterministically extracted only while it fits
+both bounds. Every
 extracted value must appear
 unchanged in at least one child's
 `preserved_literals`; every planner-declared preserved literal must occur in the source bytes.

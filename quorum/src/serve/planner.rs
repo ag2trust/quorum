@@ -120,6 +120,7 @@ pub struct ProposedTask {
     pub observable_outcome: String,
     /// Explicit child file contract. Writes and contextual references are
     /// distinct so downstream enforcement need not infer intent from prose.
+    #[serde(default)]
     pub deliverables: quorum_core::decomposition::ChildDeliverables,
     pub acceptance_criteria: Vec<String>,
     pub source_constraints: Vec<String>,
@@ -369,24 +370,39 @@ fn escaping_write<T>(task: &ProposedTask, path: &str) -> Result<T, PlannerParseE
 /// words literal, label, tag, or message receive the same protection.
 fn required_source_literals(source: &str) -> Vec<String> {
     let mut literals = Vec::new();
+    let bytes = source.as_bytes();
     let mut cursor = 0;
-    while let Some(relative) = source[cursor..].find('`') {
-        let start = cursor + relative;
-        let fence = if source[start..].starts_with("```") {
-            3
-        } else {
-            1
-        };
-        let content_start = start + fence;
-        let Some(end_relative) = source[content_start..].find(if fence == 3 { "```" } else { "`" })
-        else {
+    while let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'`') {
+        let delimiter_start = cursor + relative;
+        let delimiter_len = bytes[delimiter_start..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        let content_start = delimiter_start + delimiter_len;
+        let mut search_from = content_start;
+        let mut content_end = None;
+        while let Some(relative) = bytes[search_from..].iter().position(|byte| *byte == b'`') {
+            let run_start = search_from + relative;
+            let run_len = bytes[run_start..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            if run_len == delimiter_len {
+                content_end = Some(run_start);
+                break;
+            }
+            search_from = run_start + run_len;
+        }
+        let Some(content_end) = content_end else {
+            // Do not reinterpret shorter runs inside an unclosed region as a
+            // new span: that can turn a malformed load-bearing value into a
+            // misleading suffix literal.
             break;
         };
-        let end = content_start + end_relative;
-        if end > content_start && end - content_start <= MAX_TEXT_BYTES {
-            literals.push(source[content_start..end].to_string());
+        if content_end > content_start && content_end - content_start <= MAX_TEXT_BYTES {
+            literals.push(source[content_start..content_end].to_string());
         }
-        cursor = end + fence;
+        cursor = content_end + delimiter_len;
     }
 
     let lower = source.to_ascii_lowercase();
@@ -484,10 +500,21 @@ pub fn parse_response(text: &str) -> Result<PlannerResponse, PlannerParseError> 
 /// proposal receives the complete closed-plan semantic validation before any
 /// downstream phase resumes.
 pub fn parse_accepted_proposal(text: &str) -> Result<Vec<ProposedTask>, PlannerParseError> {
+    let tasks = rehydrate_accepted_proposal(text)?;
+    validate_plan_tasks(&tasks)?;
+    Ok(tasks)
+}
+
+/// Decode a durable proposal before semantic revalidation. Compatibility
+/// defaults let the coordinator recover proposals written before required
+/// fields were introduced; `validate_plan_tasks` rejects those defaults and
+/// returns the graph to planning before classification or materialization.
+pub(super) fn rehydrate_accepted_proposal(
+    text: &str,
+) -> Result<Vec<ProposedTask>, PlannerParseError> {
     let tasks: Vec<ProposedTask> = serde_json::from_str(text).map_err(|error| {
         PlannerParseError::Provider(format!("invalid accepted proposal: {error}"))
     })?;
-    validate_plan_tasks(&tasks)?;
     Ok(tasks)
 }
 
@@ -1980,6 +2007,31 @@ mod tests {
     }
 
     #[test]
+    fn matching_backtick_runs_preserve_complete_markdown_code_literals() {
+        let source = "Keep ``value with a ` backtick`` and ````\nfence ``` content\n```` exactly.";
+        assert_eq!(
+            required_source_literals(source),
+            vec![
+                "\nfence ``` content\n".to_string(),
+                "value with a ` backtick".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn mismatched_or_unclosed_backtick_runs_do_not_preserve_suffixes() {
+        for source in [
+            "``value with a ` suffix`",
+            "``value closed by the wrong run```",
+            "````fenced content```",
+        ] {
+            assert!(required_source_literals(source).is_empty(), "{source}");
+        }
+        let bounded_source = format!("``{} `suffix`", "x".repeat(MAX_PROMPT_BYTES));
+        assert!(required_source_literals(&bounded_source).is_empty());
+    }
+
+    #[test]
     fn source_validation_skips_marked_literals_larger_than_the_preservation_field() {
         let literal = "x".repeat(MAX_TEXT_BYTES + 1);
         let proposed = ProposedTask {
@@ -2013,6 +2065,7 @@ mod tests {
 
         for source in [
             format!("Keep this inline literal exactly: `{literal}`"),
+            format!("Keep this double-delimited literal exactly: ``{literal}``"),
             format!("Keep this fenced literal exactly:\n```\n{literal}\n```"),
         ] {
             assert!(required_source_literals(&source).is_empty());
