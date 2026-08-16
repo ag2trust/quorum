@@ -11766,16 +11766,42 @@ mod tests {
     #[test]
     fn target_branch_concurrent_resolve() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("q.db");
-        let mut c1 = crate::db::open(&path).unwrap();
-        let id = create(&mut c1, "a", "t", None, 0, None, None, None, None, 1).unwrap();
-
-        let mut c2 = crate::db::open(&path).unwrap();
-        assert!(resolve_target_branch(&mut c1, id, "main", 2).unwrap());
-        assert!(!resolve_target_branch(&mut c2, id, "develop", 3).unwrap());
-
-        let task = get(&c1, id).unwrap().unwrap();
-        assert_eq!(task.target_branch.as_deref(), Some("main"));
+        let db_path = dir.path().join("q.db");
+        {
+            let mut conn = crate::db::open(&db_path).unwrap();
+            create(&mut conn, "a", "t", None, 0, None, None, None, None, 1).unwrap();
+        }
+        let contenders = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(contenders));
+        let handles: Vec<_> = (0..contenders)
+            .map(|i| {
+                let path = db_path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    resolve_target_branch(&mut conn, 1, &format!("branch-{i}"), 100 + i as i64)
+                        .unwrap()
+                })
+            })
+            .collect();
+        let outcomes: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            outcomes.iter().filter(|&&won| won).count(),
+            1,
+            "exactly one resolver must win: {outcomes:?}"
+        );
+        assert_eq!(outcomes.iter().filter(|&&won| !won).count(), contenders - 1,);
+        let conn = crate::db::open(&db_path).unwrap();
+        let task = get(&conn, 1).unwrap().unwrap();
+        assert!(
+            task.target_branch
+                .as_deref()
+                .unwrap()
+                .starts_with("branch-"),
+            "durable value must be from one contender: {:?}",
+            task.target_branch,
+        );
     }
 
     #[test]
