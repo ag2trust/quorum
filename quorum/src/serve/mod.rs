@@ -1382,14 +1382,23 @@ async fn publish_worker_completion(
     known_pr: Option<i64>,
 ) -> std::result::Result<PublishedCompletion, String> {
     let (prior, supersede_source) = load_publication_state(&config.db_path, task_id).await?;
-    // The task target is captured on the first publication for a task —
-    // fresh initial delivery or first existing-PR continuation. A prior
-    // intent already carries its own target and must not be overwritten.
-    let fresh_intent_target_branch = if prior.is_none() {
-        task_target_branch(&config.db_path, task_id).await?
-    } else {
-        None
-    };
+    // The task target is authoritative and immutable. Every publish reads it
+    // so that any prior intent missing the field (written by a preceding
+    // daemon version before the intent carried a target) is backfilled from
+    // the task's target on this restart instead of falling through to the
+    // configured base. Legacy tasks predate authoritative targets and return
+    // None; only they may fall back to `config.base_branch`.
+    let authoritative_task_target = task_target_branch(&config.db_path, task_id).await?;
+    if let (Some(prior_target), Some(task_target)) = (
+        prior.as_ref().and_then(|prior| prior.target_branch.as_deref()),
+        authoritative_task_target.as_deref(),
+    ) {
+        if prior_target != task_target {
+            return Err(format!(
+                "durable publication target branch {prior_target} conflicts with task target {task_target}"
+            ));
+        }
+    }
     if let Some(prior) = &prior {
         if prior.branch != branch {
             return Err(format!(
@@ -1468,7 +1477,7 @@ async fn publish_worker_completion(
         local_sha: local_sha.clone(),
         pr: known_pr,
         stage: "intent".into(),
-        target_branch: fresh_intent_target_branch,
+        target_branch: authoritative_task_target.clone(),
         expected_remote_sha: expected_remote_sha.clone(),
     });
     if supersede_source {
@@ -1477,6 +1486,14 @@ async fn publish_worker_completion(
     }
     intent.pr = known_pr;
     intent.expected_remote_sha = expected_remote_sha;
+    // A targetless prior intent (written by a preceding daemon version) is
+    // backfilled from the authoritative task target so retry and
+    // reconciliation validate and publish against the exact task target
+    // rather than the configured base. Legacy tasks without an authoritative
+    // target remain None and retain the configured-base fallback.
+    if intent.target_branch.is_none() {
+        intent.target_branch = authoritative_task_target;
+    }
     let publication_base_branch = publication_base_branch(&intent, &config.base_branch)?;
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
@@ -22284,6 +22301,45 @@ mod tests {
             publication_base_branch(&intent, "main").unwrap(),
             "main",
             "legacy tasks without an authoritative target fall back to the configured base",
+        );
+    }
+
+    #[test]
+    fn targetless_prior_intent_backfills_from_task_target_on_restart() {
+        let mut intent = PublicationIntent {
+            branch: "daemon/worker-t1".into(),
+            local_sha: "source-a".into(),
+            pr: Some(482),
+            stage: "pr_created".into(),
+            target_branch: None,
+            expected_remote_sha: Some("spawn-x".into()),
+        };
+        let task_target: Option<String> = Some("develop".into());
+        if intent.target_branch.is_none() {
+            intent.target_branch = task_target.clone();
+        }
+        assert_eq!(
+            publication_base_branch(&intent, "main").unwrap(),
+            "develop",
+            "an in-flight prior intent from the preceding daemon version must publish to the task's authoritative target on restart",
+        );
+
+        let mut legacy = PublicationIntent {
+            branch: "daemon/worker-t1".into(),
+            local_sha: "source-a".into(),
+            pr: Some(482),
+            stage: "pr_created".into(),
+            target_branch: None,
+            expected_remote_sha: Some("spawn-x".into()),
+        };
+        let no_task_target: Option<String> = None;
+        if legacy.target_branch.is_none() {
+            legacy.target_branch = no_task_target;
+        }
+        assert_eq!(
+            publication_base_branch(&legacy, "main").unwrap(),
+            "main",
+            "genuinely legacy tasks (no authoritative target) retain the configured-base fallback",
         );
     }
 
