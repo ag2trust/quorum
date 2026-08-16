@@ -6978,7 +6978,7 @@ async fn tick(
     .await?;
 
     if !decomposition_freeze && !drain_state.draining {
-        resume_recovered_dormant_reworks(config, wt_mgr, name_pool, workers).await;
+        resume_recovered_dormant_reworks(config, wt_mgr, name_pool, workers).await?;
     }
 
     // Graph consistency authority runs first. Exact merged-continuation
@@ -12228,12 +12228,49 @@ async fn handle_dormant_worker_feed_failure(
     worker_index: usize,
     error: &std::io::Error,
 ) -> bool {
+    match settle_dormant_worker_feed_failure(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        worker_index,
+        error,
+    )
+    .await
+    {
+        Ok(DormantWorkerFeedFailureDisposition::LiveProcess) => false,
+        Ok(DormantWorkerFeedFailureDisposition::Settled)
+        | Ok(DormantWorkerFeedFailureDisposition::Retained)
+        | Err(_) => true,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DormantWorkerFeedFailureDisposition {
+    LiveProcess,
+    Settled,
+    Retained,
+}
+
+/// Classify and settle a failed dormant turn. Unlike the compatibility wrapper
+/// above, this returns durable-classification errors so startup recovery can
+/// fail the tick instead of repeatedly selecting an unchanged slot.
+async fn settle_dormant_worker_feed_failure(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    worker_index: usize,
+    error: &std::io::Error,
+) -> Result<DormantWorkerFeedFailureDisposition> {
     let (provider, continuation_id) = match &workers[worker_index].proc {
         SlotProcess::Dormant {
             kind,
             continuation_id,
         } => (kind.to_string(), continuation_id.clone()),
-        SlotProcess::Running(_) => return false,
+        SlotProcess::Running(_) => {
+            return Ok(DormantWorkerFeedFailureDisposition::LiveProcess);
+        }
     };
     let pending = PendingTurn {
         provider,
@@ -12259,6 +12296,7 @@ async fn handle_dormant_worker_feed_failure(
             )
             .await;
             cleanup_slot(config, wt_mgr, name_pool, worker, None, "provider_blocked").await;
+            Ok(DormantWorkerFeedFailureDisposition::Settled)
         }
         Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
             let worker = workers.remove(worker_index);
@@ -12278,20 +12316,22 @@ async fn handle_dormant_worker_feed_failure(
                 "ownership_transferred",
             )
             .await;
+            Ok(DormantWorkerFeedFailureDisposition::Settled)
         }
         Ok(tasks::DeadTurnRunnerDisposition::DonePending)
         | Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
             log(&format!(
                 "dormant worker {agent} feed failure raced a durable delivery for task #{task_id}; retaining slot"
             ));
+            Ok(DormantWorkerFeedFailureDisposition::Retained)
         }
         Err(classification_error) => {
             log(&format!(
                 "FATAL: dormant worker {agent} feed failed for task #{task_id} and exact turn could not be parked: {classification_error}; retaining slot"
             ));
+            Err(classification_error)
         }
     }
-    true
 }
 
 fn should_replace_pending_prompt(prompt: &str) -> bool {
@@ -16015,13 +16055,16 @@ async fn resume_recovered_dormant_reworks(
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
-) {
-    while let Some(worker_index) = workers.iter().position(|worker| {
-        worker.pending_turn_kind == "recovered-rework"
-            && matches!(worker.proc, SlotProcess::Dormant { .. })
-    }) {
+) -> Result<()> {
+    // A delivery can race the failed launch, in which case disposition must
+    // retain the dormant slot for the mailbox phase later in this tick. Work
+    // from an attempted-identity set so that retained slot is attempted at
+    // most once instead of being immediately rediscovered forever.
+    let mut attempted = HashSet::new();
+    while let Some(worker_index) = next_recovered_dormant_rework(workers, &attempted) {
         let task_id = workers[worker_index].task_id;
         let agent = workers[worker_index].agent_name.clone();
+        attempted.insert((task_id, agent.clone()));
         let pr = workers[worker_index].pr.unwrap_or_default();
         let feedback = workers[worker_index].pending_prompt.clone();
         if !bind_claimed_sticky_remediation_baseline(config, &agent, task_id, pr, &feedback).await {
@@ -16050,7 +16093,7 @@ async fn resume_recovered_dormant_reworks(
             log(&format!(
                 "recovered sticky remediation feed failed for task #{task_id}: {error}"
             ));
-            if !handle_dormant_worker_feed_failure(
+            if settle_dormant_worker_feed_failure(
                 config,
                 wt_mgr,
                 name_pool,
@@ -16058,7 +16101,8 @@ async fn resume_recovered_dormant_reworks(
                 worker_index,
                 &error,
             )
-            .await
+            .await?
+                == DormantWorkerFeedFailureDisposition::LiveProcess
             {
                 let worker = workers.remove(worker_index);
                 fire_event(
@@ -16080,6 +16124,18 @@ async fn resume_recovered_dormant_reworks(
             ));
         }
     }
+    Ok(())
+}
+
+fn next_recovered_dormant_rework(
+    workers: &[SlotState],
+    attempted: &HashSet<(i64, String)>,
+) -> Option<usize> {
+    workers.iter().position(|worker| {
+        worker.pending_turn_kind == "recovered-rework"
+            && matches!(worker.proc, SlotProcess::Dormant { .. })
+            && !attempted.contains(&(worker.task_id, worker.agent_name.clone()))
+    })
 }
 
 async fn release_sticky_remediation_lease(db_path: &Path, agent: &str, task_id: i64) {
@@ -19770,6 +19826,125 @@ mod tests {
         let requested = runner_state::requested_retry(&retried_refs, "codex").unwrap();
         assert_eq!(requested.prompt, prompt);
         assert_eq!(requested.continuation_id.as_deref(), Some("thread-exact"));
+    }
+
+    #[tokio::test]
+    async fn retained_recovered_rework_is_not_rediscovered_in_the_same_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retained-recovered-rework.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (mut slot, _old_run_id, _old_capability) =
+            dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
+        slot.pending_prompt = "exact recovered feedback".into();
+        slot.pending_turn_kind = "recovered-rework".into();
+        let config = dormant_codex_test_config(db_path.clone(), worktree, None);
+        assert!(
+            install_live_worker_remediation_lease(
+                &config,
+                slot.agent_name.clone(),
+                slot.task_id,
+                443,
+                "exact recovered feedback",
+            )
+            .await
+        );
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: slot.agent_name.clone(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(slot.task_id),
+                    pr: Some(443),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut workers = vec![slot];
+        let mut attempted = HashSet::new();
+        let worker_index = next_recovered_dormant_rework(&workers, &attempted)
+            .expect("recovered slot must be attempted once");
+        attempted.insert((
+            workers[worker_index].task_id,
+            workers[worker_index].agent_name.clone(),
+        ));
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Dormant").unwrap();
+        let disposition = settle_dormant_worker_feed_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            worker_index,
+            &std::io::Error::other("provider launch failed"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(disposition, DormantWorkerFeedFailureDisposition::Retained);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].pending_turn_kind, "recovered-rework");
+        assert!(
+            next_recovered_dormant_rework(&workers, &attempted).is_none(),
+            "the retained slot must not be selected again before mailbox processing"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(
+            mailbox::has_unconsumed(
+                &conn,
+                "Dormant",
+                mailbox::MailboxKind::Done,
+                workers[0].task_id,
+            )
+            .unwrap(),
+            "the later mailbox phase must retain authority over the delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_rework_disposition_error_is_propagated() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture_db = dir.path().join("fixture.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (mut slot, _old_run_id, _old_capability) = dormant_codex_rework_fixture(
+            &fixture_db,
+            &worktree,
+            Some("thread-exact"),
+            "thread-exact",
+        );
+        slot.pending_prompt = "exact recovered feedback".into();
+        slot.pending_turn_kind = "recovered-rework".into();
+        let unavailable_db = dir.path().join("missing-parent").join("classification.db");
+        let config = dormant_codex_test_config(unavailable_db, worktree, None);
+        let mut workers = vec![slot];
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Dormant").unwrap();
+
+        let error = settle_dormant_worker_feed_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            &std::io::Error::other("provider launch failed"),
+        )
+        .await
+        .expect_err("durable disposition failure must abort recovered startup");
+
+        assert!(error.to_string().contains("open database"), "{error}");
+        assert_eq!(workers.len(), 1, "failed classification retains the slot");
+        assert_eq!(workers[0].pending_turn_kind, "recovered-rework");
     }
 
     #[test]
