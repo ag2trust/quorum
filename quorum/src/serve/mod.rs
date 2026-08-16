@@ -20,6 +20,7 @@ pub mod names;
 pub mod planner;
 pub mod recovery;
 pub mod render;
+pub mod review_cycle_context;
 pub mod reviewer;
 pub mod runner;
 pub mod session_log;
@@ -81,6 +82,19 @@ fn load_task_review_contract(db_path: &Path, task_id: i64) -> Result<String> {
         depends_on.as_deref(),
         &recovery_notes,
     ))
+}
+
+fn load_review_cycle_context(
+    db_path: &Path,
+    task_id: i64,
+) -> Result<review_cycle_context::ReviewCycleContext> {
+    let conn = quorum_core::db::open(db_path)?;
+    let rework_round = conn.query_row(
+        "SELECT rework_round FROM tasks WHERE id=?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    Ok(review_cycle_context::ReviewCycleContext::from_persisted_rework_round(rework_round))
 }
 
 fn prepare_reviewer_authority(
@@ -2720,6 +2734,9 @@ pub struct ServeConfig {
     pub r2_steady_state_p: f64,
     /// Codex sandbox mode (default: "danger-full-access").
     pub codex_sandbox: String,
+    /// Test-only override for the `gh` binary used by sticky remediation
+    /// baseline resolution. None → look up "gh" on PATH.
+    pub pr_target_program: Option<PathBuf>,
 }
 
 /// Supervisor handoff: a daemon which has drained for a self-update exits 75.
@@ -3921,7 +3938,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
     let source_bytes = usize::try_from(source_bytes)
         .map_err(|_| QuorumError::Io("invalid planning source byte count".into()))?;
     let accepted_proposal = accepted_proposal_json
-        .map(|json| planner::parse_accepted_proposal(&json))
+        .map(|json| planner::rehydrate_accepted_proposal(&json))
         .transpose()
         .map_err(|error| QuorumError::Io(format!("invalid durable accepted proposal: {error}")))?;
     let mut statement = conn.prepare(
@@ -4002,7 +4019,7 @@ fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupD
         let raw = proposal.ok_or_else(|| {
             QuorumError::Io(format!("{state} decomposition lacks accepted proposal"))
         })?;
-        planner::parse_accepted_proposal(&raw).map_err(|error| {
+        planner::rehydrate_accepted_proposal(&raw).map_err(|error| {
             QuorumError::Io(format!(
                 "{state} decomposition proposal is invalid: {error}"
             ))
@@ -4577,6 +4594,7 @@ const CHILD_REJECTION_READY_WRAPPER_BYTES: usize =
 const CHILD_REJECTION_SIZE_MAX_BYTES: usize = "size=".len() + "XL".len();
 const CHILD_REJECTION_DUPLICATE_LABEL_BYTES: usize = "duplicate_of=".len();
 const CHILD_REJECTION_SEPARATORS_MAX_BYTES: usize = 2 * "; ".len();
+const CHILD_REJECTION_CONTEXT_MAX_BYTES: usize = 272;
 // Keep the complete combined rejection within the planner retry-feedback
 // consumer's bound. Reserve fixed space for every dimension, then divide the
 // variable space between the readiness reason and duplicate task IDs.
@@ -4688,7 +4706,7 @@ fn bounded_duplicate_ids(ids: &[i64], limit: usize) -> String {
 }
 
 fn child_preclassification_rejection(
-    task_key: &str,
+    task: &planner::ProposedTask,
     result: &quorum_core::classify::TaskClassification,
 ) -> Option<String> {
     let mut failed_dimensions = Vec::new();
@@ -4706,20 +4724,39 @@ fn child_preclassification_rejection(
         failed_dimensions.push(format!("size={}", result.size));
     }
     if !result.duplicate_of.is_empty() {
+        let duplicate_limit = if !matches!(result.size.as_str(), "S" | "M")
+            && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty())
+        {
+            CHILD_REJECTION_DUPLICATES_MAX_BYTES.saturating_sub(CHILD_REJECTION_CONTEXT_MAX_BYTES)
+        } else {
+            CHILD_REJECTION_DUPLICATES_MAX_BYTES
+        };
         failed_dimensions.push(format!(
             "duplicate_of={}",
-            bounded_duplicate_ids(&result.duplicate_of, CHILD_REJECTION_DUPLICATES_MAX_BYTES)
+            bounded_duplicate_ids(&result.duplicate_of, duplicate_limit)
         ));
     }
     if failed_dimensions.is_empty() {
         return None;
     }
-    let summary = format!(
-        "child {task_key} rejected by preclassification: {}",
+    let mut summary = format!(
+        "child {} rejected by preclassification: {}",
+        task.key,
         failed_dimensions.join("; ")
     );
-    debug_assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
-    Some(summary)
+    if !matches!(result.size.as_str(), "S" | "M")
+        && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty())
+    {
+        let paths = bounded_with_ellipsis(&task.affected_paths.join(", "), 96);
+        let delta = bounded_with_ellipsis(&task.implementation_delta, 128);
+        summary.push_str(&format!(
+            "; rejected_delta={delta}; affected_paths=[{paths}]"
+        ));
+    }
+    Some(bounded_with_ellipsis(
+        &summary,
+        planner::MAX_REJECTION_SUMMARY_BYTES,
+    ))
 }
 
 async fn reject_decomposition_proposal(
@@ -4762,6 +4799,8 @@ fn proposed_classifier_tasks(
                 title: task.title.clone(),
                 body: Some(
                     serde_json::json!({
+                        "implementation_delta": task.implementation_delta,
+                        "affected_paths": task.affected_paths,
                         "observable_outcome": task.observable_outcome,
                         "deliverables": task.deliverables,
                         "acceptance_criteria": task.acceptance_criteria,
@@ -4769,6 +4808,8 @@ fn proposed_classifier_tasks(
                             &task.source_constraints,
                         ),
                         "verification_expectations": task.verification_expectations,
+                        "non_goals": task.non_goals,
+                        "preserved_literals": task.preserved_literals,
                     })
                     .to_string(),
                 ),
@@ -4795,7 +4836,7 @@ fn planned_children(
             let result = by_id
                 .get(&id)
                 .ok_or_else(|| format!("missing classification for {}", task.key))?;
-            if let Some(summary) = child_preclassification_rejection(&task.key, result) {
+            if let Some(summary) = child_preclassification_rejection(task, result) {
                 return Err(summary);
             }
             let mut prerequisite_keys = Vec::new();
@@ -4814,6 +4855,8 @@ fn planned_children(
                 local_key: task.key.clone(),
                 title: task.title.clone(),
                 body: serde_json::json!({
+                    "implementation_delta": task.implementation_delta,
+                    "affected_paths": task.affected_paths,
                     "observable_outcome": task.observable_outcome,
                     "deliverables": task.deliverables,
                     "acceptance_criteria": task.acceptance_criteria,
@@ -4821,6 +4864,8 @@ fn planned_children(
                         &task.source_constraints,
                     ),
                     "verification_expectations": task.verification_expectations,
+                    "non_goals": task.non_goals,
+                    "preserved_literals": task.preserved_literals,
                 })
                 .to_string(),
                 labels: Some("[\"type:implementation\",\"generated:decomposition\"]".into()),
@@ -5074,6 +5119,45 @@ async fn tick_decomposition(
         coordinator.proposal = snapshot.accepted_proposal.clone();
     }
 
+    // Older durable proposals deserialize newly introduced grounding fields
+    // through serde defaults. Reapply closed-plan validation before either
+    // resumable phase so such a proposal returns to planning instead of being
+    // classified or materialized with empty grounding fields.
+    if matches!(snapshot.state.as_str(), "validating" | "preclassifying") {
+        let Some(proposal) = coordinator.proposal.as_ref() else {
+            return Err(QuorumError::Io(format!(
+                "{} decomposition lacks its durable accepted proposal",
+                snapshot.state
+            )));
+        };
+        if planner::validate_plan_tasks(proposal).is_err() {
+            let phase = match snapshot.state.as_str() {
+                "validating" => "validating",
+                "preclassifying" => "preclassifying",
+                _ => unreachable!("resumable phase was matched above"),
+            };
+            let path = config.db_path.clone();
+            let graph_id = snapshot.graph_id;
+            let reset = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let mut conn = quorum_core::db::open(&path)?;
+                quorum_core::decomposition::reset_accepted_proposal_to_planning(
+                    &mut conn,
+                    graph_id,
+                    phase,
+                    now_unix(),
+                )
+            })
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!(
+                    "durable proposal compatibility reset join: {error}"
+                ))
+            })??;
+            coordinator.proposal = None;
+            return Ok(reset);
+        }
+    }
+
     if snapshot.state == "provider-backoff" {
         if now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS {
             let path = config.db_path.clone();
@@ -5247,6 +5331,8 @@ async fn tick_decomposition(
         match planner::validate_for_source(
             proposal,
             &snapshot.dependencies,
+            &snapshot.title,
+            snapshot.body.as_deref(),
             &config.repo_dir,
             &coordinator.writable_path_resolver,
         )
@@ -5762,7 +5848,7 @@ async fn handle_pre_review_checks_failure(
     match transition {
         Some(ref result) if result.task.status == "rework" => {
             if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
-                if !install_live_worker_remediation_lease(
+                if !install_sticky_remediation_lease_and_baseline(
                     config,
                     workers[worker_index].agent_name.clone(),
                     task_id,
@@ -5949,6 +6035,14 @@ async fn resume_reviewer_after_ci(
             .await
             .map_err(|error| QuorumError::Io(format!("task review context join: {error}")))??
     };
+    // Reload from durable task state: sticky reviewer continuation and daemon
+    // recovery must not depend on an in-memory slot counter.
+    let review_cycle = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
+    };
     let rereview_turn = format!(
         "{}\n\n{}",
         reviewer::build_rereview_turn_with_context(
@@ -5957,6 +6051,7 @@ async fn resume_reviewer_after_ci(
             &workers[worker_index].agent_name,
             &reviewers[reviewer_index].effort,
             graph_context.as_deref(),
+            review_cycle,
         ),
         task_contract
     );
@@ -5974,6 +6069,19 @@ async fn resume_reviewer_after_ci(
     if current_graph_context != graph_context {
         return Err(QuorumError::Io(format!(
             "graph review authority changed before re-review feed for task #{task_id}"
+        )));
+    }
+    let current_review_cycle = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!("review-cycle rereview revalidation join: {error}"))
+            })??
+    };
+    if current_review_cycle != review_cycle {
+        return Err(QuorumError::Io(format!(
+            "review-cycle context changed before re-review feed for task #{task_id}"
         )));
     }
     if let Err(error) = reviewers[reviewer_index]
@@ -7702,7 +7810,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        if !install_live_worker_remediation_lease(
+                                        if !install_sticky_remediation_lease_and_baseline(
                                             config,
                                             workers[wi].agent_name.clone(),
                                             reviewer_task_id,
@@ -7993,7 +8101,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        if !install_live_worker_remediation_lease(
+                                        if !install_sticky_remediation_lease_and_baseline(
                                             config,
                                             workers[wi].agent_name.clone(),
                                             reviewer_task_id,
@@ -8213,7 +8321,7 @@ async fn tick(
                                             .iter()
                                             .position(|w| w.task_id == reviewer_task_id)
                                         {
-                                            if !install_live_worker_remediation_lease(
+                                            if !install_sticky_remediation_lease_and_baseline(
                                                 config,
                                                 workers[wi].agent_name.clone(),
                                                 reviewer_task_id,
@@ -8563,7 +8671,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        if !install_live_worker_remediation_lease(
+                                        if !install_sticky_remediation_lease_and_baseline(
                                             config,
                                             workers[wi].agent_name.clone(),
                                             reviewer_task_id,
@@ -8959,7 +9067,7 @@ async fn tick(
                                                 .iter()
                                                 .position(|w| w.task_id == reviewer_task_id)
                                             {
-                                                if !install_live_worker_remediation_lease(
+                                                if !install_sticky_remediation_lease_and_baseline(
                                                     config,
                                                     workers[wi].agent_name.clone(),
                                                     reviewer_task_id,
@@ -9241,7 +9349,7 @@ async fn tick(
                                     ));
                                     0
                                 });
-                                if !install_live_worker_remediation_lease(
+                                if !install_sticky_remediation_lease_and_baseline(
                                     config,
                                     workers[wi].agent_name.clone(),
                                     reviewer_task_id,
@@ -13667,6 +13775,17 @@ async fn provision_reviewer_reserved(
             }
         }
     };
+    // Replacement R1/R2 reviewers, including daemon-restart recovery, are
+    // fresh processes. Carry the durable lifecycle count into their initial
+    // turn whenever they are actually reviewing a remediated task.
+    let review_cycle = {
+        let db_path = config.db_path.clone();
+        let task_id = worker.task_id;
+        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
+    };
+    let review_cycle = (review_cycle.rework_round != 0).then_some(review_cycle);
 
     // Prompt composition remains role- and provider-aware; the runner adapter
     // owns how that neutral prompt reaches the CLI.
@@ -13677,11 +13796,12 @@ async fn provision_reviewer_reserved(
                 worker_agent: worker.agent_name.to_string(),
                 reviewer_name: reviewer_name.clone(),
             };
-            reviewer::build_review_prompt_for_kind_with_context(
+            reviewer::build_review_prompt_for_kind_with_context_and_cycle(
                 reviewer_kind,
                 &spec,
                 &reviewer_effort,
                 graph_context.as_deref(),
+                review_cycle,
             )
         }
         ReviewRole::R2 { r1_reviewer, .. } => {
@@ -13691,11 +13811,12 @@ async fn provision_reviewer_reserved(
                 r1_reviewer: r1_reviewer.clone(),
                 r2_name: reviewer_name.clone(),
             };
-            reviewer::build_r2_review_prompt_for_kind_with_context(
+            reviewer::build_r2_review_prompt_for_kind_with_context_and_cycle(
                 reviewer_kind,
                 &spec,
                 &reviewer_effort,
                 graph_context.as_deref(),
+                review_cycle,
             )
         }
     };
@@ -15745,6 +15866,224 @@ async fn install_live_worker_remediation_lease(
     }
 }
 
+/// One shared entry point for every sticky-worker remediation call site: install
+/// the fresh remediation lease AND durably bind the exact daemon-owned PR head
+/// as the pre-turn baseline, in that order. Feed the pending turn only after
+/// both operations succeed under guarded authority.
+///
+/// Task #448 root cause: initial publication legitimately records an intent
+/// with `expected_remote_sha = NULL` (new branch push). Without binding the
+/// exact head before the next remediation turn, the subsequent existing-PR
+/// push cannot prove its compare-and-swap baseline and fails safe. Every
+/// sticky call site now goes through this helper.
+async fn install_sticky_remediation_lease_and_baseline(
+    config: &ServeConfig,
+    agent: String,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) -> bool {
+    if !install_live_worker_remediation_lease(config, agent.clone(), task_id, pr, feedback).await {
+        return false;
+    }
+    if pr <= 0 {
+        log(&format!(
+            "sticky remediation: task #{task_id} has no PR to bind — releasing lease and parking"
+        ));
+        release_sticky_remediation_lease(&config.db_path, &agent, task_id).await;
+        let cause = classified_provisioning_cause(
+            "sticky remediation baseline binding failed: no PR identity",
+        );
+        park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
+        return false;
+    }
+    if let Err(error) = bind_sticky_remediation_pr_baseline(config, task_id, pr).await {
+        log(&format!(
+            "sticky remediation: baseline bind failed for task #{task_id} PR #{pr}: {error} \
+             — releasing lease and parking"
+        ));
+        release_sticky_remediation_lease(&config.db_path, &agent, task_id).await;
+        let cause = classified_provisioning_cause(&format!(
+            "sticky remediation baseline binding failed: {error}"
+        ));
+        park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
+        return false;
+    }
+    true
+}
+
+async fn release_sticky_remediation_lease(db_path: &Path, agent: &str, task_id: i64) {
+    let p = db_path.to_path_buf();
+    let name = agent.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!(
+            "sticky remediation: lease release failed for task #{task_id}: {error}"
+        )),
+        Err(error) => log(&format!(
+            "sticky remediation: lease release join failed for task #{task_id}: {error}"
+        )),
+    }
+}
+
+/// Resolve the current daemon-owned PR target for every sticky remediation
+/// turn and atomically persist its exact head SHA as the durable baseline for
+/// the next publication push. The spawn-time `pr_targets` row is IMMUTABLE
+/// authority: when it already exists, the resolved live target MUST match it
+/// on head_ref, head_sha, and fork status; any drift means the head moved
+/// outside the daemon's lease and fails loudly. When the durable row is
+/// missing (the #447 initial-publication gap), the live target may bootstrap
+/// it only after matching any exact failed-CI head retained in task refs.
+///
+/// The GitHub lookup runs BEFORE the DB transaction; the transaction only
+/// upserts pr_targets and fills a missing `intent.expected_remote_sha`. A
+/// closed PR, cross-repo fork, wrong base, moved head, or unavailable lookup
+/// returns Err and does not touch state; the caller releases the lease and
+/// parks.
+async fn bind_sticky_remediation_pr_baseline(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+) -> std::result::Result<(), String> {
+    let program = config
+        .pr_target_program
+        .as_deref()
+        .unwrap_or(Path::new("gh"));
+    let target = resolve_pr_target_with_program(
+        pr,
+        &config.repo_dir,
+        Some(&config.repo),
+        PUBLICATION_GH_TIMEOUT,
+        program,
+    )
+    .await
+    .map_err(|error| format!("live PR #{pr} target lookup failed: {error}"))?;
+    if target.pr != pr {
+        return Err(format!(
+            "PR identity changed: expected #{pr}, got #{}",
+            target.pr
+        ));
+    }
+    if target.state.as_deref() != Some("OPEN") {
+        return Err(format!("PR #{pr} is not open"));
+    }
+    if target.is_fork {
+        return Err(format!(
+            "PR #{pr} is a fork head; daemon has no supported safe push mechanism"
+        ));
+    }
+    if target.base_ref.as_deref() != Some(&config.base_branch) {
+        return Err(format!(
+            "PR #{pr} targets base {:?}, expected {}",
+            target.base_ref, config.base_branch
+        ));
+    }
+
+    let db_path = config.db_path.clone();
+    let target_owned = target.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target_owned)
+    })
+    .await
+    .map_err(|error| format!("sticky baseline persistence join failure: {error}"))?
+    .map_err(|error| format!("sticky baseline persistence failed: {error}"))
+}
+
+/// Guarded write: upsert the durable `pr_targets` baseline and, if the current
+/// publication intent still carries no `expected_remote_sha`, install the exact
+/// live PR head as that immutable baseline. Never overwrites an existing intent
+/// baseline (immutability of spawn-time authority) and never rewrites the
+/// durable `pr_targets` row when it already contradicts the live head — that
+/// contradiction means the head moved outside our lease and must fail loudly.
+/// A retained failed-CI intent is a second exact-head authority and must also
+/// match before a missing target row can adopt the live target.
+fn persist_sticky_remediation_baseline(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    pr: i64,
+    target: &PrTarget,
+) -> Result<()> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let task = tasks::get(&tx, task_id)?
+        .ok_or_else(|| QuorumError::Usage(format!("task #{task_id} no longer exists")))?;
+    if task.status != "rework" {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} is not in rework (status={})",
+            task.status
+        )));
+    }
+    if tasks::extract_pr_number(&task.refs) != Some(pr) {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} is not bound to PR #{pr}"
+        )));
+    }
+    let target_missing = if let Some(existing) = pr_targets::get(&tx, task_id, pr)? {
+        if existing.is_fork != target.is_fork
+            || existing.head_ref != target.head_ref
+            || existing.head_sha != target.head_sha
+        {
+            return Err(QuorumError::Usage(format!(
+                "PR #{pr} moved outside its durable baseline (recorded {}@{}, live {}@{})",
+                existing.head_ref, existing.head_sha, target.head_ref, target.head_sha
+            )));
+        }
+        false
+    } else {
+        true
+    };
+    if let Some(ci_intent) = tasks::ci_remediation_intent(task.refs.as_deref())? {
+        if ci_intent.pr != pr || ci_intent.head_sha != target.head_sha {
+            return Err(QuorumError::Usage(format!(
+                "PR #{pr} live head {} does not match failed-CI head {} for PR #{}",
+                target.head_sha, ci_intent.head_sha, ci_intent.pr
+            )));
+        }
+    }
+    if target_missing {
+        tx.execute(
+            "INSERT INTO pr_targets
+               (task_id, pr_number, head_ref, head_sha, is_fork, resolved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                task_id,
+                pr,
+                target.head_ref.as_str(),
+                target.head_sha.as_str(),
+                target.is_fork as i64,
+                now_unix(),
+            ),
+        )?;
+    }
+    if let Some(mut intent) = publication_intent_from_refs(task.refs.as_deref()) {
+        if intent.pr == Some(pr) {
+            match intent.expected_remote_sha.as_deref() {
+                Some(existing) if existing != target.head_sha => {
+                    return Err(QuorumError::Usage(format!(
+                        "PR #{pr} intent baseline {existing} conflicts with live head {}",
+                        target.head_sha
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    intent.expected_remote_sha = Some(target.head_sha.clone());
+                    let json = serde_json::to_string(&intent).map_err(|error| {
+                        QuorumError::Io(format!("publication intent JSON: {error}"))
+                    })?;
+                    tasks::set_publication_intent(&tx, task_id, &json, now_unix())?;
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 async fn retain_blocked_remediation_retry_for_spawn(
     db_path: PathBuf,
     task_id: i64,
@@ -16500,6 +16839,41 @@ mod tests {
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    #[test]
+    fn review_cycle_context_reloads_persisted_rework_round_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("review-cycle.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "creator",
+                "review-cycle context",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET rework_round=?1 WHERE id=?2",
+                rusqlite::params![quorum_core::lifecycle::REWORK_CAP, task_id],
+            )
+            .unwrap();
+            task_id
+        };
+
+        let resumed = load_review_cycle_context(&db_path, task_id).unwrap();
+        assert_eq!(
+            resumed.rework_round,
+            i64::from(quorum_core::lifecycle::REWORK_CAP)
+        );
+        assert!(resumed.final_opportunity);
+    }
+
     fn writable_deliverables(path: &str) -> quorum_core::decomposition::ChildDeliverables {
         quorum_core::decomposition::ChildDeliverables(vec![
             quorum_core::decomposition::ChildDeliverable::Write { path: path.into() },
@@ -16585,6 +16959,7 @@ mod tests {
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
             codex_sandbox: "danger-full-access".into(),
+            pr_target_program: None,
         }
     }
 
@@ -17175,10 +17550,34 @@ mod tests {
                 now + 1,
             )
             .unwrap();
+            // Seed the durable spawn-time PR baseline so the sticky remediation
+            // baseline binding takes the short-circuit path and skips the live
+            // `gh pr view` lookup that would fail in a hermetic test.
+            pr_targets::upsert(
+                &mut conn,
+                task_id,
+                553,
+                "daemon/live-worker-t553",
+                "0123456789abcdef0123456789abcdef01234567",
+                false,
+            )
+            .unwrap();
             task_id
         };
 
-        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        // Inject a fake `gh pr view` returning the same head the pr_targets
+        // seed recorded so the sticky baseline binding confirms the live
+        // target matches the immutable durable authority.
+        #[cfg(unix)]
+        {
+            let json = open_pr_target_json(
+                "daemon/live-worker-t553",
+                "0123456789abcdef0123456789abcdef01234567",
+                "main",
+            );
+            config.pr_target_program = Some(fake_gh_returning(dir.path(), "gh-pre-review", &json));
+        }
         let mut name_pool = Pool::new_generated();
         let wt_mgr = WorktreeManager::new();
         let mut workers =
@@ -19597,6 +19996,7 @@ mod tests {
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
             codex_sandbox: "danger-full-access".into(),
+            pr_target_program: None,
         }
     }
 
@@ -21465,6 +21865,737 @@ mod tests {
         assert!(existing_pr_lease_baseline(&legacy_intent, &target, "main")
             .unwrap_err()
             .contains("no durable spawn-time"));
+    }
+
+    fn seed_sticky_rework_task(
+        conn: &mut quorum_core::Connection,
+        pr: i64,
+        intent_baseline: Option<&str>,
+    ) -> i64 {
+        let now = now_unix();
+        let task_id = tasks::create(
+            conn,
+            "owner",
+            "sticky rework fixture",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        tasks::update_refs_daemon(
+            conn,
+            task_id,
+            r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            now,
+        )
+        .unwrap();
+        tasks::claim(conn, "live-worker", Some(task_id), &[], 3600, now)
+            .unwrap()
+            .expect("worker must claim");
+        tasks::apply_event(
+            conn,
+            "live-worker",
+            task_id,
+            &Event::SignaledDone { pr: pr.to_string() },
+            now + 1,
+        )
+        .unwrap();
+        tasks::apply_event(
+            conn,
+            "reviewer",
+            task_id,
+            &Event::ReviewerAttached {
+                agent: "reviewer".into(),
+            },
+            now + 2,
+        )
+        .unwrap();
+        tasks::apply_event(conn, "reviewer", task_id, &Event::VerdictChanges, now + 3).unwrap();
+        let intent = PublicationIntent {
+            branch: format!("daemon/live-worker-t{pr}"),
+            local_sha: "local-sha".into(),
+            pr: Some(pr),
+            stage: "verified".into(),
+            expected_remote_sha: intent_baseline.map(str::to_string),
+        };
+        let json = serde_json::to_string(&intent).unwrap();
+        tasks::set_publication_intent(conn, task_id, &json, now_unix()).unwrap();
+        task_id
+    }
+
+    fn load_intent_baseline(conn: &quorum_core::Connection, task_id: i64) -> Option<String> {
+        let task = tasks::get(conn, task_id).unwrap().unwrap();
+        publication_intent_from_refs(task.refs.as_deref())
+            .and_then(|intent| intent.expected_remote_sha)
+    }
+
+    fn seed_ci_remediation_intent(
+        conn: &quorum_core::Connection,
+        task_id: i64,
+        pr: i64,
+        head_sha: &str,
+    ) {
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(
+                 COALESCE(refs, '{}'),
+                 '$.ci_remediation_requested', json('true'),
+                 '$.ci_remediation_pr', ?2,
+                 '$.ci_remediation_head_sha', ?3,
+                 '$.ci_remediation_feedback', 'fix failed CI',
+                 '$.ci_remediation_checks', json('[\"test\"]'),
+                 '$.ci_remediation_attempts', 0
+             ) WHERE id=?1",
+            rusqlite::params![task_id, pr, head_sha],
+        )
+        .unwrap();
+    }
+
+    fn sticky_baseline_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
+        pre_review_ci_test_config(db_path, repo_dir)
+    }
+
+    #[cfg(unix)]
+    fn write_fake_gh_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn fake_gh_returning(dir: &Path, name: &str, json: &str) -> PathBuf {
+        // gh pr view PR --json ... --repo NWO → emit fixed JSON on stdout.
+        let script = format!("#!/bin/sh\ncat <<'JSON'\n{json}\nJSON\n");
+        write_fake_gh_script(dir, name, &script)
+    }
+
+    #[cfg(unix)]
+    fn fake_gh_failing(dir: &Path, name: &str, stderr: &str) -> PathBuf {
+        let script = format!("#!/bin/sh\nprintf '%s\\n' '{stderr}' >&2\nexit 1\n");
+        write_fake_gh_script(dir, name, &script)
+    }
+
+    #[cfg(unix)]
+    fn open_pr_target_json(head_ref: &str, head_sha: &str, base: &str) -> String {
+        format!(
+            "{{\"headRefName\":\"{head_ref}\",\"headRefOid\":\"{head_sha}\",\
+             \"isCrossRepository\":false,\"baseRefName\":\"{base}\",\"state\":\"OPEN\"}}"
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_resolves_live_and_verifies_persisted_match() {
+        // Live head MUST match the immutable persisted baseline every turn.
+        // The intent's expected_remote_sha stays populated when it already
+        // agrees with the live head.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-verifies-persisted.db");
+        let pr: i64 = 597;
+        let baseline_sha = "018904b901234567deadbeefcafebabe01234567";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(baseline_sha));
+            pr_targets::upsert(
+                &mut conn,
+                id,
+                pr,
+                "daemon/live-worker-t597",
+                baseline_sha,
+                false,
+            )
+            .unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-live-match",
+            &open_pr_target_json("daemon/live-worker-t597", baseline_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect("live head matching the immutable baseline must succeed");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(baseline_sha)
+        );
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, baseline_sha);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_fills_missing_intent_from_live_when_persisted_matches() {
+        // #448 regression: pr_targets seeded from a prior spawn but the initial
+        // publication intent still carries expected_remote_sha=None. The live
+        // head confirms the persisted baseline and populates the intent.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fill-intent-from-live.db");
+        let pr: i64 = 605;
+        let baseline_sha = "1234567890abcdef1234567890abcdef12345678";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, None);
+            pr_targets::upsert(
+                &mut conn,
+                id,
+                pr,
+                "daemon/live-worker-t605",
+                baseline_sha,
+                false,
+            )
+            .unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-fill-intent",
+            &open_pr_target_json("daemon/live-worker-t605", baseline_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect("live head matching persisted must fill missing intent");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(baseline_sha)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_head_moved_outside_persisted_baseline() {
+        // Reviewer's blocker: a moved live head must fail loudly even when a
+        // persisted pr_targets row exists.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-moved-outside.db");
+        let pr: i64 = 598;
+        let persisted_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let live_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(persisted_sha));
+            pr_targets::upsert(
+                &mut conn,
+                id,
+                pr,
+                "daemon/live-worker-t598",
+                persisted_sha,
+                false,
+            )
+            .unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-live-moved",
+            &open_pr_target_json("daemon/live-worker-t598", live_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("live head movement outside persisted baseline must fail");
+        assert!(error.contains("moved outside"), "unexpected error: {error}");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        // Persisted baseline unchanged.
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, persisted_sha);
+        // Intent baseline untouched.
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(persisted_sha)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_pr_closed_even_when_persisted_matches() {
+        // A closed PR is not a safe push target regardless of pr_targets state.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-closed.db");
+        let pr: i64 = 599;
+        let sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(sha));
+            pr_targets::upsert(&mut conn, id, pr, "daemon/live-worker-t599", sha, false).unwrap();
+            id
+        };
+        let json = format!(
+            "{{\"headRefName\":\"daemon/live-worker-t599\",\"headRefOid\":\"{sha}\",\
+             \"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"CLOSED\"}}"
+        );
+        let gh = fake_gh_returning(dir.path(), "gh-closed", &json);
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("a closed PR must not receive a remediation turn");
+        assert!(error.contains("not open"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_pr_retargeted_even_when_persisted_matches() {
+        // A retargeted base branch is a lease violation and blocks the turn.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-retargeted.db");
+        let pr: i64 = 620;
+        let sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(sha));
+            pr_targets::upsert(&mut conn, id, pr, "daemon/live-worker-t620", sha, false).unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-retargeted",
+            &open_pr_target_json("daemon/live-worker-t620", sha, "develop"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("a retargeted PR must not receive a remediation turn");
+        assert!(error.contains("targets base"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_pr_head_ref_renamed_even_when_persisted_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-headref-renamed.db");
+        let pr: i64 = 621;
+        let sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(sha));
+            pr_targets::upsert(&mut conn, id, pr, "daemon/live-worker-t621", sha, false).unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-renamed",
+            &open_pr_target_json("someone-else-branch", sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("a renamed head_ref must not receive a remediation turn");
+        assert!(error.contains("moved outside"), "unexpected error: {error}");
+
+        // Persisted baseline still intact.
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_ref,
+            "daemon/live-worker-t621"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_lookup_failure_even_when_persisted_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-lookup-fail.db");
+        let pr: i64 = 622;
+        let sha = "ffffffffffffffffffffffffffffffffffffffff";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(sha));
+            pr_targets::upsert(&mut conn, id, pr, "daemon/live-worker-t622", sha, false).unwrap();
+            id
+        };
+        let gh = fake_gh_failing(dir.path(), "gh-fail", "network unreachable");
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("an unavailable live target must not authorize the turn");
+        assert!(error.contains("live PR"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_rejects_live_fork_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-fork.db");
+        let pr: i64 = 600;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_sticky_rework_task(&mut conn, pr, None)
+        };
+        let json = "{\"headRefName\":\"fork-branch\",\"headRefOid\":\"abc\",\
+             \"isCrossRepository\":true,\"baseRefName\":\"main\",\"state\":\"OPEN\"}";
+        let gh = fake_gh_returning(dir.path(), "gh-fork", json);
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("fork PR must not be pushed by the daemon");
+        assert!(error.contains("fork"), "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_bootstraps_missing_persisted_from_live_and_fills_intent() {
+        // #447 root-cause path: initial publication left both pr_targets AND
+        // intent.expected_remote_sha unset. Live gh bootstraps both.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bootstrap-missing.db");
+        let pr: i64 = 623;
+        let live_sha = "018904b9000000000000000000000000018904b9";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_sticky_rework_task(&mut conn, pr, None)
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-bootstrap",
+            &open_pr_target_json("daemon/live-worker-t623", live_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect("missing persisted must be bootstrapped from live head");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, live_sha);
+        assert_eq!(stored.head_ref, "daemon/live-worker-t623");
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(live_sha)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_ci_missing_target_rejects_live_head_after_gated_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-missing-target-moved.db");
+        let pr: i64 = 624;
+        let gated_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let live_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, None);
+            seed_ci_remediation_intent(&conn, id, pr, gated_sha);
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-ci-moved-before-bootstrap",
+            &open_pr_target_json("daemon/live-worker-t624", live_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let installed = install_sticky_remediation_lease_and_baseline(
+            &config,
+            "live-worker".to_string(),
+            task_id,
+            pr,
+            "fix failed CI",
+        )
+        .await;
+        assert!(
+            !installed,
+            "a moved head must not authorize a provider turn"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(
+            pr_targets::get(&conn, task_id, pr).unwrap().is_none(),
+            "the live outside head must not become durable authority"
+        );
+        assert_eq!(load_intent_baseline(&conn, task_id), None);
+        assert_eq!(
+            tasks::ci_remediation_intent(
+                tasks::get(&conn, task_id).unwrap().unwrap().refs.as_deref()
+            )
+            .unwrap()
+            .unwrap()
+            .head_sha,
+            gated_sha
+        );
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked"], true);
+        assert_eq!(
+            refs["daemon_resume_status"], "rework",
+            "the rejected turn must remain owner-retry recoverable"
+        );
+        let active_claim: Option<String> = conn
+            .query_row(
+                "SELECT holder FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .ok();
+        assert!(
+            active_claim.is_none(),
+            "rejected turn must release its lease"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_ci_missing_target_binds_exact_gated_head_for_descendant_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-missing-target-exact.db");
+        let pr: i64 = 625;
+        let gated_sha = "cccccccccccccccccccccccccccccccccccccccc";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, None);
+            seed_ci_remediation_intent(&conn, id, pr, gated_sha);
+            id
+        };
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t625".into(),
+            head_sha: gated_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-ci-exact-before-bootstrap",
+            &open_pr_target_json(&target.head_ref, gated_sha, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let installed = install_sticky_remediation_lease_and_baseline(
+            &config,
+            "live-worker".to_string(),
+            task_id,
+            pr,
+            "fix failed CI",
+        )
+        .await;
+        assert!(installed, "the exact gated head must authorize the turn");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, gated_sha);
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let publication = publication_intent_from_refs(task.refs.as_deref()).unwrap();
+        assert_eq!(publication.expected_remote_sha.as_deref(), Some(gated_sha));
+        assert_eq!(
+            existing_pr_lease_baseline(&publication, &target, "main").unwrap(),
+            Some(gated_sha),
+            "a descendant delivery must use the exact gated head as its push lease"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn install_sticky_remediation_lease_and_baseline_releases_lease_on_bind_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("lease-release.db");
+        let pr: i64 = 601;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_sticky_rework_task(&mut conn, pr, None)
+        };
+        let gh = fake_gh_failing(dir.path(), "gh-lease-fail", "boom");
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        let installed = install_sticky_remediation_lease_and_baseline(
+            &config,
+            "live-worker".to_string(),
+            task_id,
+            pr,
+            "fix the failing check",
+        )
+        .await;
+        assert!(
+            !installed,
+            "baseline bind failure must reject the sticky turn"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let active_claim: Option<String> = conn
+            .query_row(
+                "SELECT holder FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .ok();
+        assert!(
+            active_claim.is_none(),
+            "lease must be released after bind failure, got {:?}",
+            active_claim
+        );
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked"], true);
+        assert!(refs["daemon_parked_reason"]
+            .as_str()
+            .unwrap()
+            .contains("sticky remediation baseline"));
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_inserts_missing_row_and_fills_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-insert.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let pr: i64 = 610;
+        let target_sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let task_id = seed_sticky_rework_task(&mut conn, pr, None);
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t610".into(),
+            head_sha: target_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target).unwrap();
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(stored.head_sha, target_sha);
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(target_sha)
+        );
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_rejects_moved_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-moved.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let pr: i64 = 611;
+        let old_sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let new_sha = "ffffffffffffffffffffffffffffffffffffffff";
+        let task_id = seed_sticky_rework_task(&mut conn, pr, None);
+        pr_targets::upsert(
+            &mut conn,
+            task_id,
+            pr,
+            "daemon/live-worker-t611",
+            old_sha,
+            false,
+        )
+        .unwrap();
+        let live = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t611".into(),
+            head_sha: new_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let error = persist_sticky_remediation_baseline(&mut conn, task_id, pr, &live)
+            .expect_err("head movement outside baseline must fail");
+        assert!(error.to_string().contains("moved outside"));
+        let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
+        assert_eq!(
+            stored.head_sha, old_sha,
+            "durable baseline must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_rejects_intent_conflict_with_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-intent-conflict.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let pr: i64 = 613;
+        let intent_sha = "1111111111111111111111111111111111111111";
+        let live_sha = "2222222222222222222222222222222222222222";
+        let task_id = seed_sticky_rework_task(&mut conn, pr, Some(intent_sha));
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/live-worker-t613".into(),
+            head_sha: live_sha.into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let error = persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target)
+            .expect_err("intent baseline vs live head mismatch must fail");
+        assert!(
+            error.to_string().contains("intent baseline"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(intent_sha)
+        );
+        assert!(pr_targets::get(&conn, task_id, pr).unwrap().is_none());
+    }
+
+    #[test]
+    fn persist_sticky_remediation_baseline_rejects_non_rework_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist-status.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let now = now_unix();
+        let pr: i64 = 612;
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "wrong status",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET refs = json_set(COALESCE(refs, '{}'), '$.pr', ?2), status='open' WHERE id=?1",
+            rusqlite::params![task_id, pr],
+        )
+        .unwrap();
+        let target = PrTarget {
+            pr,
+            head_ref: "daemon/x".into(),
+            head_sha: "1234".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let error = persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target)
+            .expect_err("only rework tasks may receive a sticky baseline");
+        assert!(error.to_string().contains("not in rework"));
     }
 
     #[cfg(unix)]
@@ -24001,11 +25132,15 @@ mod tests {
             planner::ProposedTask {
                 key: "a".into(),
                 title: "a".into(),
+                implementation_delta: "change layer a".into(),
+                affected_paths: vec!["src/a.rs".into()],
                 observable_outcome: "a works".into(),
                 deliverables: writable_deliverables("src/a.rs"),
                 acceptance_criteria: vec!["a".into()],
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
+                non_goals: vec!["do not change b".into()],
+                preserved_literals: vec!["EXACT_LABEL".into()],
                 prerequisites: vec![],
             },
             planner::ProposedTask {
@@ -24017,6 +25152,7 @@ mod tests {
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
                 prerequisites: vec!["a".into()],
+                ..Default::default()
             },
         ];
         let valid = vec![
@@ -24042,6 +25178,19 @@ mod tests {
         assert_eq!(children[0].local_key, "a");
         assert_eq!(children[1].prerequisite_keys, ["a"]);
         let child_body: serde_json::Value = serde_json::from_str(&children[0].body).unwrap();
+        assert_eq!(child_body["implementation_delta"], "change layer a");
+        assert_eq!(
+            child_body["affected_paths"],
+            serde_json::json!(["src/a.rs"])
+        );
+        assert_eq!(
+            child_body["non_goals"],
+            serde_json::json!(["do not change b"])
+        );
+        assert_eq!(
+            child_body["preserved_literals"],
+            serde_json::json!(["EXACT_LABEL"])
+        );
         assert!(child_body["source_constraints"]
             .as_array()
             .unwrap()
@@ -24082,7 +25231,7 @@ mod tests {
         combined[0].duplicate_of = vec![301, 302];
         assert_eq!(
             planned_children(&proposal, &combined).unwrap_err(),
-            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL; duplicate_of=[301, 302]"
+            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL; duplicate_of=[301, 302]; rejected_delta=change layer a; affected_paths=[src/a.rs]"
         );
 
         assert_eq!(
@@ -24096,12 +25245,15 @@ mod tests {
         let proposal = vec![planner::ProposedTask {
             key: "bounded-child".into(),
             title: "bounded child".into(),
+            implementation_delta: "change the bounded planner seam".into(),
+            affected_paths: vec!["src/bounded.rs".into()],
             observable_outcome: "bounded evidence persists".into(),
             deliverables: writable_deliverables("src/bounded.rs"),
             acceptance_criteria: vec!["bounded".into()],
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["test".into()],
             prerequisites: vec![],
+            ..Default::default()
         }];
         let classifications = vec![quorum_core::classify::TaskClassification {
             task_id: -1,
@@ -24118,7 +25270,11 @@ mod tests {
         assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
         assert!(summary.contains("ready=false (not_ready_reason: é"));
         assert!(summary.contains("…); size=XL; duplicate_of=[1, 2"));
-        assert!(summary.ends_with("...]"), "{summary}");
+        assert!(summary.contains("rejected_delta=change the bounded planner seam"));
+        assert!(
+            summary.ends_with("affected_paths=[src/bounded.rs]"),
+            "{summary}"
+        );
 
         let source = planner::PlanningSource {
             task_id: 301,
@@ -24146,6 +25302,7 @@ mod tests {
             source_constraints: vec!["atomic".into()],
             verification_expectations: vec!["test".into()],
             prerequisites: vec![],
+            ..Default::default()
         }];
         let classifications = vec![quorum_core::classify::TaskClassification {
             task_id: -1,
@@ -24223,21 +25380,29 @@ mod tests {
             planner::ProposedTask {
                 key: "permitted-first".into(),
                 title: "permitted first child".into(),
+                implementation_delta: "change the permitted implementation".into(),
+                affected_paths: vec!["src/permitted.rs".into()],
                 observable_outcome: "the first child remains inside the repository".into(),
                 deliverables: writable_deliverables("src/permitted.rs"),
                 acceptance_criteria: vec!["permitted child works".into()],
                 source_constraints: vec!["preserve atomic activation".into()],
                 verification_expectations: vec!["focused test passes".into()],
+                non_goals: vec!["do not write outside the repository".into()],
+                preserved_literals: vec![],
                 prerequisites: vec![],
             },
             planner::ProposedTask {
                 key: "escaping-second".into(),
                 title: "escaping second child".into(),
+                implementation_delta: "attempt the declared external output".into(),
+                affected_paths: vec!["../sibling/escaped.rs".into()],
                 observable_outcome: "the second child writes outside the repository".into(),
                 deliverables: writable_deliverables("../sibling/escaped.rs"),
                 acceptance_criteria: vec!["escaping child is rejected".into()],
                 source_constraints: vec!["preserve atomic activation".into()],
                 verification_expectations: vec!["negative path is durable".into()],
+                non_goals: vec!["do not activate any child".into()],
+                preserved_literals: vec![],
                 prerequisites: vec!["permitted-first".into()],
             },
         ];
@@ -24579,22 +25744,30 @@ mod tests {
                     planner::ProposedTask {
                         key: "a".into(),
                         title: "a".into(),
+                        implementation_delta: "change a seam".into(),
+                        affected_paths: vec!["src/a.rs".into()],
                         observable_outcome: "a".into(),
                         deliverables: writable_deliverables("src/a.rs"),
                         acceptance_criteria: vec!["a".into()],
                         source_constraints: vec!["a".into()],
                         verification_expectations: vec!["a".into()],
+                        non_goals: vec!["no adjacent change".into()],
                         prerequisites: vec![],
+                        ..Default::default()
                     },
                     planner::ProposedTask {
                         key: "b".into(),
                         title: "b".into(),
+                        implementation_delta: "change b seam".into(),
+                        affected_paths: vec!["src/b.rs".into()],
                         observable_outcome: "b".into(),
                         deliverables: writable_deliverables("src/b.rs"),
                         acceptance_criteria: vec!["b".into()],
                         source_constraints: vec!["b".into()],
                         verification_expectations: vec!["b".into()],
+                        non_goals: vec!["no adjacent change".into()],
                         prerequisites: vec!["a".into()],
+                        ..Default::default()
                     },
                 ])
                 .unwrap();
@@ -24626,6 +25799,134 @@ mod tests {
                     .unwrap();
                 assert_eq!(attempts, 0, "restart inspection charged {phase}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_durable_proposals_replan_without_charging_attempt_budget() {
+        for phase in ["validating", "preclassifying"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("legacy-proposal-{phase}.db"));
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source = tasks::create(
+                &mut conn,
+                "owner",
+                "large",
+                Some("outcome"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id: source,
+                    expected_revision: 1,
+                    provider: "claude",
+                    model: "opus",
+                    frozen_base_sha: "abc",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph,
+                "freeze-requested",
+                "draining",
+                None,
+                3,
+            )
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn, graph, "draining", "planning", None, 4,
+            )
+            .unwrap();
+            let legacy = serde_json::json!([
+                {
+                    "key": "a", "title": "a", "observable_outcome": "a works",
+                    "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
+                    "verification_expectations": ["tests"], "prerequisites": []
+                },
+                {
+                    "key": "b", "title": "b", "observable_outcome": "b works",
+                    "acceptance_criteria": ["covered"], "source_constraints": ["atomic"],
+                    "verification_expectations": ["tests"], "prerequisites": ["a"]
+                }
+            ]);
+            for attempt in 1..=2 {
+                quorum_core::decomposition::accept_proposal(
+                    &mut conn,
+                    graph,
+                    &legacy.to_string(),
+                    4 + attempt * 2,
+                )
+                .unwrap();
+                quorum_core::decomposition::reject_frozen_proposal(
+                    &mut conn,
+                    graph,
+                    "validating",
+                    "prior-semantic-rejection",
+                    "proposal rejected by the prior binary",
+                    5 + attempt * 2,
+                )
+                .unwrap();
+            }
+            quorum_core::decomposition::accept_proposal(&mut conn, graph, &legacy.to_string(), 10)
+                .unwrap();
+            if phase == "preclassifying" {
+                quorum_core::decomposition::set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "validating",
+                    "preclassifying",
+                    None,
+                    11,
+                )
+                .unwrap();
+            }
+            drop(conn);
+
+            let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+            let mut coordinator = DecompositionCoordinator::default();
+            assert!(tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap());
+
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let state: (String, Option<String>, i64) = conn
+                .query_row(
+                    "SELECT state,accepted_proposal_json,proposal_attempts
+                     FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("planning".into(), None, 2), "phase {phase}");
+            let attempts: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM decomposition_attempts WHERE graph_id=?1",
+                    [graph],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(attempts, 2, "compatibility reset charged phase {phase}");
+            assert_ne!(
+                tasks::get(&conn, source).unwrap().unwrap().status,
+                "failed",
+                "compatibility reset failed source in phase {phase}"
+            );
         }
     }
 

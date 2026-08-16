@@ -1399,6 +1399,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 names_file: r_names.value.map(std::path::PathBuf::from),
                 agent_bin: r_agent_bin.value,
                 codex_sandbox,
+                pr_target_program: None,
                 model_profiles,
                 routing,
                 merge_executor,
