@@ -20,7 +20,9 @@ pub mod names;
 pub mod planner;
 pub mod recovery;
 pub mod render;
+pub mod rereview_builder;
 pub mod review_cycle_context;
+pub mod review_ledger;
 pub mod reviewer;
 pub mod runner;
 pub mod session_log;
@@ -17043,6 +17045,25 @@ mod tests {
             i64::from(quorum_core::lifecycle::REWORK_CAP)
         );
         assert!(resumed.final_opportunity);
+
+        let spec = reviewer::ReviewerSpec {
+            pr: 491,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Reviewer-1".into(),
+        };
+        for kind in [runner::AgentKind::Claude, runner::AgentKind::Codex] {
+            let prompt = reviewer::build_review_prompt_for_kind_with_context_and_cycle(
+                kind,
+                &spec,
+                "high",
+                None,
+                Some(resumed),
+            );
+            assert!(prompt.contains("Required cumulative cross-round review ledger"));
+            assert!(prompt.contains("### Prior BLOCKING findings"));
+            assert!(prompt.contains("### Newly discovered findings"));
+            assert!(prompt.contains("read PR #491 discussion for authoritative history"));
+        }
     }
 
     fn writable_deliverables(path: &str) -> quorum_core::decomposition::ChildDeliverables {

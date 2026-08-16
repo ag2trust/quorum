@@ -1053,6 +1053,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::TaskRetry { task_id, by } => {
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let cancelled = quorum_core::tasks::cancelled_dep_ids(&conn, task_id)?;
+            if !cancelled.is_empty() {
+                output::emit(&serde_json::json!({
+                    "ok": false,
+                    "reason": "dependency cancelled — unsatisfiable; \
+                               edit depends_on or close the dependent",
+                    "cancelled_deps": cancelled,
+                }));
+                return Ok(1);
+            }
             let retried =
                 match quorum_core::tasks::retry_parked(&mut conn, task_id, &by, true, now)? {
                     some @ Some(_) => some,
