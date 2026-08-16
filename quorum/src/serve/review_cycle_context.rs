@@ -40,7 +40,7 @@ impl ReviewCycleContext {
         }
 
         let final_opportunity = if self.final_opportunity {
-            "This is the final review opportunity: another changes verdict cannot enter rework."
+            "## Final-opportunity calibration\n\nThis is the final review opportunity. A changes verdict with any valid remaining BLOCKING findings will cause the daemon to fail the task because the rework cap is exhausted.\nDo not approve, downgrade, omit, or defer a valid BLOCKING finding merely to avoid task failure. Apply the BLOCKING/FOLLOW-UP rules exactly as written: do not relax them or manufacture findings. Zero blockers is valid only after a complete independent review."
         } else {
             "This is not the final review opportunity."
         };
@@ -81,6 +81,21 @@ mod tests {
         assert!(initial.contains("0 completed changes-to-rework transitions"));
         assert!(initial.contains("not the final"));
         assert!(final_round.contains("final review opportunity"));
+        assert!(final_round.contains("changes verdict with any valid remaining BLOCKING findings"));
+        assert!(final_round.contains("daemon to fail the task"));
+        assert!(final_round.contains("rework cap is exhausted"));
+        assert!(final_round.contains("Do not approve, downgrade, omit, or defer"));
+        assert!(final_round.contains("BLOCKING/FOLLOW-UP rules exactly as written"));
+        assert!(final_round.contains("do not relax them or manufacture findings"));
+        assert!(
+            final_round.contains("Zero blockers is valid only after a complete independent review")
+        );
+        for coercive_phrase in ["approve because", "must approve", "approval to avoid"] {
+            assert!(
+                !final_round.contains(coercive_phrase),
+                "final-opportunity calibration must not pressure approval: {coercive_phrase}"
+            );
+        }
         assert!(invalid.contains("invalid"));
         for prompt in [initial, final_round, invalid] {
             assert!(!prompt.contains("review round"));
