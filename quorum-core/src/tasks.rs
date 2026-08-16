@@ -3366,7 +3366,7 @@ fn process_cancelled_dependency_reconciliation(
         [cancelled_id],
         |row| row.get(0),
     )?;
-    let page_limit = limit.min(CONVERGE_LIMIT).max(1);
+    let page_limit = limit.clamp(1, CONVERGE_LIMIT);
     let page: Vec<(i64, String, Option<String>, Option<String>)> = {
         let mut stmt = tx.prepare(
             "SELECT id, status, depends_on, refs

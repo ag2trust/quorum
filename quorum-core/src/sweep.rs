@@ -261,6 +261,7 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
 /// review-follow-up history. Add here whenever a new durable FK to tasks(id) is
 /// introduced; the FK inventory test below fails when a new one is missed.
 const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
+    ("cancelled_dependency_reconciliation", "cancelled_task_id"),
     ("task_decompositions", "source_task_id"),
     ("task_graph_members", "task_id"),
     ("decomposition_cleanup", "task_id"),
