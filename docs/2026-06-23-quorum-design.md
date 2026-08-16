@@ -210,9 +210,10 @@ NULL · `created_at` · `updated_at` · `refs` TEXT (json) · `author` TEXT · `
 from `refs.pr`) · `completion_provenance` TEXT NULL (`merged`/`manual`; NULL is
 legacy or unknown and is never inferred from status or `refs.pr`) ·
 `depends_on` TEXT (json array of task IDs) ·
-`target_branch` TEXT NULL (authoritative PR base branch; NULL for legacy tasks
-and new tasks before first execution. Resolved once by the daemon to the
-configured base before execution begins; immutable once populated).
+`target_branch` TEXT NULL (authoritative PR base branch; NULL for legacy tasks.
+`task-create` persists its validated `--base-branch` or the configured base at
+creation; legacy rows resolve once before execution. Immutable once populated;
+storage alone does not yet alter lifecycle targeting).
 
 ### `errors` — observable *abnormal* failures
 `id` INTEGER PK · `ts` · `source` TEXT · `detail` TEXT · `expires_at` INTEGER NOT NULL.

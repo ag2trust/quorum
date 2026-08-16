@@ -76,6 +76,9 @@ pub enum Command {
         /// the daemon provisions the worker from this PR rather than the configured base.
         #[arg(long = "continue-pr", conflicts_with = "review_pr")]
         continue_pr: Option<i64>,
+        /// Local branch to target. Defaults to this repository's configured daemon base branch.
+        #[arg(long = "base-branch")]
+        base_branch: Option<String>,
         #[arg(long = "body-stdin")]
         body_stdin: bool,
         #[arg(long = "body-file")]
