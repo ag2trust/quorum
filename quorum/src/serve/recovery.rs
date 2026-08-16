@@ -54,15 +54,22 @@ fn dormant_recovery_error(agent: &str, detail: impl std::fmt::Display) -> Quorum
     ))
 }
 
+fn is_explicit_dormant_recovery_entry(entry: &JournalEntry) -> bool {
+    entry.role == "worker"
+        && ((entry.phase == "awaiting-review" && entry.pid.is_none())
+            || (entry.phase == "resuming-rework" && entry.pid.is_some()))
+}
+
 fn validate_dormant_recovery(
     conn: &rusqlite::Connection,
     entry: &JournalEntry,
     now: i64,
 ) -> Result<DormantRecoveryDisposition> {
     let invalid = |detail: String| dormant_recovery_error(&entry.agent, detail);
-    if entry.role != "worker" || entry.phase != "awaiting-review" || entry.pid.is_some() {
+    if !is_explicit_dormant_recovery_entry(entry) {
         return Err(invalid(
-            "journal phase/process shape is not explicitly dormant".into(),
+            "journal phase/process shape is neither dormant nor an interrupted recovered rework"
+                .into(),
         ));
     }
     let task_id = entry
@@ -318,6 +325,11 @@ fn validate_dormant_recovery(
         rework_feedback,
         needs_rework_claim,
     };
+    if entry.phase == "resuming-rework" && recovery.rework_feedback.is_none() {
+        return Err(invalid(
+            "interrupted recovered rework has no exact pending remediation turn".into(),
+        ));
+    }
     Ok(match task_disposition {
         Some(reason) => DormantRecoveryDisposition::Retire {
             entry: entry.clone(),
@@ -325,6 +337,38 @@ fn validate_dormant_recovery(
         },
         None => DormantRecoveryDisposition::Reconstruct(recovery),
     })
+}
+
+fn normalize_interrupted_rework_journals(
+    conn: &mut rusqlite::Connection,
+    recoveries: &mut [DormantRecovery],
+) -> Result<()> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    for recovery in recoveries.iter_mut() {
+        if recovery.entry.phase != "resuming-rework" {
+            continue;
+        }
+        let changed = tx.execute(
+            "UPDATE journal SET phase='awaiting-review',pid=NULL,updated_at=?4
+              WHERE agent=?1 AND task_id=?2 AND phase='resuming-rework' AND pid=?3",
+            rusqlite::params![
+                recovery.entry.agent,
+                recovery.task_id,
+                recovery.entry.pid,
+                super::now_unix(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(dormant_recovery_error(
+                &recovery.entry.agent,
+                "interrupted rework journal binding changed before normalization",
+            ));
+        }
+        recovery.entry.phase = "awaiting-review".into();
+        recovery.entry.pid = None;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 async fn verify_dormant_worktree(
@@ -567,9 +611,7 @@ pub(crate) async fn recover(
 
     let dormant_entries = entries
         .iter()
-        .filter(|entry| {
-            entry.role == "worker" && entry.phase == "awaiting-review" && entry.pid.is_none()
-        })
+        .filter(|entry| is_explicit_dormant_recovery_entry(entry))
         .cloned()
         .collect::<Vec<_>>();
     // #130: all unjournaled working/rework tasks are orphaned and follow
@@ -643,6 +685,20 @@ pub(crate) async fn recover(
     }
     for recovery in &recoveries {
         install_recovered_rework_claim(&config.db_path, recovery).await?;
+    }
+    {
+        let path = db_path.clone();
+        recoveries = tokio::task::spawn_blocking(move || -> Result<Vec<DormantRecovery>> {
+            let mut conn = quorum_core::db::open(&path)?;
+            normalize_interrupted_rework_journals(&mut conn, &mut recoveries)?;
+            Ok(recoveries)
+        })
+        .await
+        .map_err(|error| {
+            QuorumError::Io(format!(
+                "interrupted rework journal normalization join failed: {error}"
+            ))
+        })??;
     }
 
     // ── Phase 1b: Revoke run capabilities for stale agents (#130) ──────
@@ -1246,6 +1302,126 @@ mod tests {
         .unwrap();
     }
 
+    fn add_dormant_worker(
+        fixture: &DormantFixture,
+        agent: &str,
+        branch: &str,
+        pr: i64,
+        continuation: &str,
+    ) -> i64 {
+        let worktree = fixture.config.worktree_base.join(format!("{agent}-t2"));
+        run_git(&fixture.config.repo_dir, &["branch", branch]);
+        run_git(
+            &fixture.config.repo_dir,
+            &["worktree", "add", worktree.to_str().unwrap(), branch],
+        );
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let now = super::super::now_unix();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "second dormant worker",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        tasks::claim(&mut conn, agent, Some(task_id), &[], 3600, now)
+            .unwrap()
+            .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            agent,
+            task_id,
+            &Event::SignaledDone { pr: pr.to_string() },
+            now + 1,
+        )
+        .unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let mut refs: serde_json::Value =
+            serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        runner_state::set_continuation(
+            &mut refs,
+            ContinuationSlot::Worker,
+            &runner_state::ContinuationIdentity {
+                provider: "codex".into(),
+                id: continuation.into(),
+            },
+        );
+        tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now + 2).unwrap();
+        conn.execute(
+            "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at)
+             VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![task_id, branch, worktree.to_string_lossy(), agent, now],
+        )
+        .unwrap();
+        quorum_core::agent_runs::insert(
+            &conn,
+            task_id,
+            agent,
+            "worker",
+            "gpt-5.6-terra",
+            "medium",
+            "codex",
+            now,
+        )
+        .unwrap();
+        quorum_core::capabilities::issue(
+            &mut conn,
+            &format!("cap-{agent}"),
+            task_id,
+            agent,
+            "worker",
+            now,
+        )
+        .unwrap();
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent.into(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: format!("session-{agent}"),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some(branch.into()),
+                phase: "awaiting-review".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(pr),
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: Some(continuation.into()),
+                local_branch: Some(branch.into()),
+            },
+        )
+        .unwrap();
+        task_id
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    fn reaped_pid_from_error(error: &str) -> i32 {
+        error
+            .split("launched pid ")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .and_then(|pid| pid.parse().ok())
+            .expect("journal handoff error records the synchronously reaped PID")
+    }
+
     fn begin_unrelated_decomposition_freeze(
         conn: &mut quorum_core::Connection,
         frozen_base_sha: &str,
@@ -1461,6 +1637,239 @@ mod tests {
             journal::list_in_flight(&conn).unwrap()[0].phase,
             "awaiting-review"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn later_recovered_failure_reaps_and_preserves_earlier_exact_turn() {
+        let mut fixture = dormant_fixture();
+        fixture.config.cap = 2;
+        let second_task = add_dormant_worker(
+            &fixture,
+            "Dormant-Z",
+            "daemon/dormant-z-t2",
+            902,
+            "thread-dormant-z",
+        );
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.config.repo_dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        {
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            enter_merge_conflict_rework(
+                &mut conn,
+                fixture.task_id,
+                "preserve worker A's exact pending turn",
+            );
+            enter_merge_conflict_rework(
+                &mut conn,
+                second_task,
+                "worker B fails durable disposition",
+            );
+            conn.execute(
+                "UPDATE agent_runs SET effort='' WHERE task_id=?1 AND role='worker'",
+                [second_task],
+            )
+            .unwrap();
+        }
+
+        let codex = fixture._dir.path().join("fake-codex");
+        write_executable(&codex, "#!/bin/sh\nexec sleep 30\n");
+        let gh = fixture._dir.path().join("fake-gh");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in *902*) branch=daemon/dormant-z-t2;; *) branch=daemon/dormant-t1;; esac\nprintf '{{\"headRefName\":\"%s\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"OPEN\"}}\\n' \"$branch\"\n"
+            ),
+        );
+        fixture.config.agent_bin = Some(codex.to_string_lossy().into_owned());
+        fixture.config.pr_target_program = Some(gh);
+
+        let daemon_pid = std::process::id() as i64;
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        quorum_core::daemon_lock::try_acquire(
+            &mut conn,
+            daemon_pid,
+            super::super::now_unix(),
+            30,
+            |_| false,
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = super::super::tick_loop(&fixture.config, daemon_pid)
+            .await
+            .expect_err("worker B's durable disposition error must abort startup");
+        assert_eq!(error.exit_code(), 3);
+
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let staged = journal::list_in_flight(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.agent == "Dormant")
+            .unwrap();
+        assert_eq!(staged.phase, "resuming-rework");
+        let first_pid = staged.pid.expect("worker A staged its launched PID");
+        assert!(
+            !process_is_alive(first_pid),
+            "worker A must be fully reaped"
+        );
+        drop(conn);
+
+        let mut workers = Vec::new();
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut super::super::names::Pool::new_generated(),
+            &mut workers,
+            &mut LifetimeRoster::new(),
+        )
+        .await
+        .expect("next restart reconstructs both exact dormant turns");
+        let worker_a = workers
+            .iter()
+            .find(|worker| worker.agent_name == "Dormant")
+            .unwrap();
+        assert_eq!(
+            worker_a.pending_prompt,
+            "preserve worker A's exact pending turn"
+        );
+        assert_eq!(
+            worker_a.continuation_id_for_launch(),
+            Some("thread-dormant")
+        );
+        assert!(matches!(worker_a.proc, SlotProcess::Dormant { .. }));
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let normalized = journal::list_in_flight(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.agent == "Dormant")
+            .unwrap();
+        assert_eq!(normalized.phase, "awaiting-review");
+        assert_eq!(normalized.pid, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_launch_journal_failure_is_loud_reaped_and_retryable_once() {
+        let mut fixture = dormant_fixture();
+        let feedback = "retry the exact turn after journal handoff failure";
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.config.repo_dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        {
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            enter_merge_conflict_rework(&mut conn, fixture.task_id, feedback);
+            conn.execute_batch(
+                "CREATE TRIGGER reject_recovered_journal_handoff
+                   BEFORE UPDATE ON journal
+                   WHEN NEW.phase='resuming-rework'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected recovered journal failure');
+                 END;",
+            )
+            .unwrap();
+        }
+        let codex = fixture._dir.path().join("fake-codex");
+        write_executable(&codex, "#!/bin/sh\nexec sleep 30\n");
+        let gh = fixture._dir.path().join("fake-gh");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"headRefName\":\"daemon/dormant-t1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"OPEN\"}}'\n"
+            ),
+        );
+        fixture.config.agent_bin = Some(codex.to_string_lossy().into_owned());
+        fixture.config.pr_target_program = Some(gh);
+
+        let daemon_pid = std::process::id() as i64;
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        quorum_core::daemon_lock::try_acquire(
+            &mut conn,
+            daemon_pid,
+            super::super::now_unix(),
+            30,
+            |_| false,
+        )
+        .unwrap();
+        drop(conn);
+        let error = super::super::tick_loop(&fixture.config, daemon_pid)
+            .await
+            .expect_err("post-launch journal failure must abort startup");
+        assert_eq!(error.exit_code(), 3);
+        assert!(
+            error.to_string().contains("journal handoff failed"),
+            "{error}"
+        );
+        let first_pid = reaped_pid_from_error(&error.to_string());
+        assert!(
+            !process_is_alive(first_pid),
+            "failed launch must be fully reaped"
+        );
+
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let entry = journal::list_in_flight(&conn).unwrap().remove(0);
+        assert_eq!(entry.phase, "awaiting-review");
+        assert_eq!(entry.pid, None);
+        let live_authority: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                   (SELECT count(*) FROM agent_runs WHERE task_id=?1 AND role='worker' AND ended_at IS NULL),
+                   (SELECT count(*) FROM run_capabilities WHERE task_id=?1 AND role='worker' AND revoked_at IS NULL)",
+                [fixture.task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(live_authority, (1, 1));
+        conn.execute_batch("DROP TRIGGER reject_recovered_journal_handoff")
+            .unwrap();
+        drop(conn);
+
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+        super::super::resume_recovered_dormant_reworks(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut names,
+            &mut workers,
+        )
+        .await
+        .expect("the next restart launches the preserved exact turn once");
+        assert_eq!(workers.len(), 1);
+        assert!(matches!(workers[0].proc, SlotProcess::Running(_)));
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let authority: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                   (SELECT count(*) FROM agent_runs WHERE task_id=?1 AND role='worker'),
+                   (SELECT count(*) FROM agent_runs WHERE task_id=?1 AND role='worker' AND ended_at IS NULL)",
+                [fixture.task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(authority, (3, 1), "restart launches one replacement run");
+        drop(conn);
+        workers.remove(0).kill_and_reap().await;
     }
 
     #[tokio::test]

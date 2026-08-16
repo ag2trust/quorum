@@ -3162,7 +3162,7 @@ fn worker_done_event(rework_count: u32, pr: i64) -> Event {
 /// Start another turn on a live worker after the daemon has moved its task to
 /// rework.  The PR belongs to the daemon for the lifetime of this worker: a
 /// rework turn must retain it both in memory and in the crash-recovery journal.
-async fn begin_sticky_worker_rework(slot: &mut SlotState, db_path: &Path) {
+async fn begin_sticky_worker_rework(slot: &mut SlotState, db_path: &Path) -> Result<()> {
     debug_assert!(
         slot.pr.is_some(),
         "a sticky rework worker must retain its daemon-owned PR"
@@ -3175,14 +3175,43 @@ async fn begin_sticky_worker_rework(slot: &mut SlotState, db_path: &Path) {
     if let Some(ref mut session_log) = slot.session_log {
         session_log.log_rework(slot.rework_count);
     }
-    let p = db_path.to_path_buf();
-    let entry = slot_journal_entry(slot, "worker", "working");
+    // Respawn-per-turn workers cross the durable journal boundary inside
+    // `feed_worker_turn`, while the launched child is still locally owned and
+    // can be synchronously reaped on failure. Persistent-child workers retain
+    // the established post-feed journal update, but its result is no longer
+    // discarded.
+    if slot.process_kind().turn_mode() != runner::TurnMode::RespawnPerTurn {
+        persist_worker_journal(db_path, slot_journal_entry(slot, "worker", "working")).await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DurableWorkerJournalHandoffError(String);
+
+impl std::fmt::Display for DurableWorkerJournalHandoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DurableWorkerJournalHandoffError {}
+
+fn durable_worker_journal_handoff_failed(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<DurableWorkerJournalHandoffError>())
+        .is_some()
+}
+
+async fn persist_worker_journal(db_path: &Path, entry: JournalEntry) -> Result<()> {
+    let path = db_path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = quorum_core::db::open(&p)?;
+        let mut conn = quorum_core::db::open(&path)?;
         journal::upsert(&mut conn, &entry)
     })
     .await
-    .ok();
+    .map_err(|error| QuorumError::Io(format!("worker journal handoff join failed: {error}")))?
 }
 
 /// Resolve a worker's publication target without granting the worker any PR
@@ -5933,7 +5962,15 @@ async fn handle_pre_review_checks_failure(
                         }
                     } else {
                         let worker = &mut workers[worker_index];
-                        begin_sticky_worker_rework(worker, &config.db_path).await;
+                        if let Err(error) =
+                            begin_sticky_worker_rework(worker, &config.db_path).await
+                        {
+                            log(&format!(
+                                "FATAL: worker {} rework journal handoff failed: {error}",
+                                worker.agent_name
+                            ));
+                            return;
+                        }
                         log(&format!(
                             "worker {} rework #{} (pre-review CI failure)",
                             worker.agent_name, worker.rework_count
@@ -7931,7 +7968,7 @@ async fn tick(
                                                 }
                                             } else {
                                                 let w = &mut workers[wi];
-                                                begin_sticky_worker_rework(w, &db_path).await;
+                                                begin_sticky_worker_rework(w, &db_path).await?;
                                                 log(&format!(
                                                     "worker {} rework #{} (pre-merge conflict)",
                                                     w.agent_name, w.rework_count
@@ -8223,7 +8260,7 @@ async fn tick(
                                                 }
                                             } else {
                                                 let w = &mut workers[wi];
-                                                begin_sticky_worker_rework(w, &db_path).await;
+                                                begin_sticky_worker_rework(w, &db_path).await?;
                                                 log(&format!(
                                                     "worker {} rework #{} (checks failure)",
                                                     w.agent_name, w.rework_count
@@ -8445,7 +8482,7 @@ async fn tick(
                                                     }
                                                 } else {
                                                     let w = &mut workers[wi];
-                                                    begin_sticky_worker_rework(w, &db_path).await;
+                                                    begin_sticky_worker_rework(w, &db_path).await?;
                                                     log(&format!(
                                                         "worker {} rework #{} \
                                                      (timeout + conflict)",
@@ -8796,7 +8833,7 @@ async fn tick(
                                                 }
                                             } else {
                                                 let w = &mut workers[wi];
-                                                begin_sticky_worker_rework(w, &db_path).await;
+                                                begin_sticky_worker_rework(w, &db_path).await?;
                                                 log(&format!(
                                                     "worker {} rework #{} \
                                                  (pre-merge conflict recheck)",
@@ -9195,7 +9232,7 @@ async fn tick(
                                                     } else {
                                                         let w = &mut workers[wi];
                                                         begin_sticky_worker_rework(w, &db_path)
-                                                            .await;
+                                                            .await?;
                                                         log(&format!(
                                                             "worker {} rework #{} (merge failure)",
                                                             w.agent_name, w.rework_count
@@ -9468,7 +9505,7 @@ async fn tick(
                                         }
                                     } else {
                                         let w = &mut workers[wi];
-                                        begin_sticky_worker_rework(w, &db_path).await;
+                                        begin_sticky_worker_rework(w, &db_path).await?;
                                         log(&format!(
                                             "worker {} rework #{} started",
                                             w.agent_name, w.rework_count
@@ -11849,7 +11886,8 @@ async fn feed_worker_turn(
     config: &ServeConfig,
 ) -> std::io::Result<()> {
     if slot.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
-        if should_replace_pending_prompt(raw_prompt) {
+        let recovered_startup = slot.pending_turn_kind == "recovered-rework";
+        if !recovered_startup && should_replace_pending_prompt(raw_prompt) {
             slot.pending_prompt = raw_prompt.to_string();
             slot.pending_turn_kind = if slot.pr.is_some() {
                 "rework".into()
@@ -11915,6 +11953,37 @@ async fn feed_worker_turn(
             slot.cap_run_id = Some(authority.cap_run_id);
             slot.live_stats = LiveStats::new();
             slot.turn_ended_at = None;
+        }
+
+        // A launched turn is not recoverably installed until its exact PID is
+        // in the journal. Keep ownership of the child until this write
+        // succeeds so a BUSY/IO/join failure can synchronously kill and reap
+        // it while the prior PID-less dormant row remains authoritative. A
+        // recovered startup turn uses an intermediate phase: if a later slot
+        // fails, restart can reconstruct this exact pending turn instead of
+        // treating it as generic stale `working` state.
+        let mut entry = slot_journal_entry(
+            slot,
+            "worker",
+            if recovered_startup {
+                "resuming-rework"
+            } else {
+                "working"
+            },
+        );
+        entry.pid = new_proc.pid();
+        if !recovered_startup && slot.pr.is_some() {
+            entry.rework_count = entry.rework_count.saturating_add(1);
+        }
+        if let Err(error) = persist_worker_journal(&config.db_path, entry).await {
+            let launched_pid = new_proc.pid();
+            let _terminal_output = new_proc.kill_and_reap().await;
+            return Err(std::io::Error::other(DurableWorkerJournalHandoffError(
+                format!(
+                    "{error}; launched pid {} was killed and reaped",
+                    launched_pid.unwrap_or_default()
+                ),
+            )));
         }
 
         if let Some(old) = slot.replace_with_launched_turn(new_proc)? {
@@ -16065,6 +16134,60 @@ async fn bind_claimed_sticky_remediation_baseline(
     true
 }
 
+/// Commit every recovered startup launch as ordinary live work in one write
+/// transaction. Until this succeeds, each child remains journaled as
+/// `resuming-rework`, which recovery treats as an interrupted exact handoff.
+/// Atomic promotion prevents a later slot's DB failure from stranding an
+/// earlier slot as generic stale `working` state.
+async fn promote_recovered_rework_journals(db_path: &Path, workers: &[SlotState]) -> Result<()> {
+    let staged = workers
+        .iter()
+        .filter(|worker| {
+            worker.pending_turn_kind == "recovered-rework"
+                && matches!(worker.proc, SlotProcess::Running(_))
+        })
+        .map(|worker| {
+            (
+                worker.agent_name.clone(),
+                worker.task_id,
+                worker.pid(),
+                worker.pr,
+            )
+        })
+        .collect::<Vec<_>>();
+    if staged.is_empty() {
+        return Ok(());
+    }
+    let path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let now = now_unix();
+        for (agent, task_id, pid, pr) in staged {
+            let changed = tx.execute(
+                "UPDATE journal
+                    SET phase='working',rework_count=rework_count+1,updated_at=?5
+                  WHERE agent=?1 AND role='worker' AND task_id=?2
+                    AND phase='resuming-rework' AND pid=?3 AND pr=?4",
+                rusqlite::params![agent, task_id, pid, pr, now],
+            )?;
+            if changed != 1 {
+                return Err(QuorumError::Io(format!(
+                    "recovered worker {agent} lost its staged journal binding for task #{task_id}"
+                )));
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "recovered rework journal promotion join failed: {error}"
+        ))
+    })?
+}
+
 /// Finish a sticky dormant-worker handoff that was interrupted after the
 /// lifecycle entered rework. Generic recovery has already revalidated the
 /// exact continuation/worktree/run identity and re-installed any missing
@@ -16113,6 +16236,11 @@ async fn resume_recovered_dormant_reworks(
             log(&format!(
                 "recovered sticky remediation feed failed for task #{task_id}: {error}"
             ));
+            if durable_worker_journal_handoff_failed(&error) {
+                return Err(QuorumError::Io(format!(
+                    "recovered worker {agent} post-launch journal handoff failed for task #{task_id}: {error}"
+                )));
+            }
             if settle_dormant_worker_feed_failure(
                 config,
                 wt_mgr,
@@ -16136,13 +16264,18 @@ async fn resume_recovered_dormant_reworks(
                 .await;
                 cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
             }
-        } else {
-            begin_sticky_worker_rework(&mut workers[worker_index], &config.db_path).await;
-            log(&format!(
-                "worker {agent} resumed recovered rework #{} for task #{task_id}",
-                workers[worker_index].rework_count
-            ));
         }
+    }
+    promote_recovered_rework_journals(&config.db_path, workers).await?;
+    for worker in workers.iter_mut().filter(|worker| {
+        worker.pending_turn_kind == "recovered-rework"
+            && matches!(worker.proc, SlotProcess::Running(_))
+    }) {
+        begin_sticky_worker_rework(worker, &config.db_path).await?;
+        log(&format!(
+            "worker {} resumed recovered rework #{} for task #{}",
+            worker.agent_name, worker.rework_count, worker.task_id
+        ));
     }
     Ok(())
 }
@@ -17909,7 +18042,9 @@ mod tests {
         let mut worker = make_live_pre_review_ci_slot(414, dir.path().to_path_buf()).await;
         worker.pr = Some(571);
 
-        begin_sticky_worker_rework(&mut worker, &db_path).await;
+        begin_sticky_worker_rework(&mut worker, &db_path)
+            .await
+            .unwrap();
 
         assert!(worker.draining);
         assert_eq!(worker.pr, Some(571));
@@ -19602,7 +19737,9 @@ mod tests {
         feed_worker_turn(&mut slot, prompt, &config)
             .await
             .expect("exact dormant continuation resumes");
-        begin_sticky_worker_rework(&mut slot, &db_path).await;
+        begin_sticky_worker_rework(&mut slot, &db_path)
+            .await
+            .unwrap();
 
         for _ in 0..1000 {
             if args_path.exists() && env_path.exists() && cwd_path.exists() {
