@@ -644,7 +644,9 @@ fn normalize_event(event: Event) -> Vec<AgentEvent> {
         } => {
             let usage = usage.map(|usage| TokenUsage {
                 input_tokens: usage.input_tokens,
-                uncached_input_tokens: usage.input_tokens,
+                uncached_input_tokens: usage
+                    .input_tokens
+                    .saturating_sub(usage.cache_read_input_tokens),
                 cached_input_tokens: usage.cache_read_input_tokens,
                 cache_write_input_tokens: usage.cache_creation_input_tokens,
                 output_tokens: usage.output_tokens,
@@ -740,6 +742,27 @@ fn strip_coordination_env(cmd: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_usage_separates_uncached_and_cache_read_input() {
+        let event = stream::parse_line(
+            r#"{"type":"result","result":"done","usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":5,"output_tokens":7}}"#,
+        )
+        .unwrap();
+        let events = normalize_event(event);
+        match events.as_slice() {
+            [AgentEvent::TurnCompleted {
+                usage: Some(usage), ..
+            }] => {
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.uncached_input_tokens, 20);
+                assert_eq!(usage.cached_input_tokens, 80);
+                assert_eq!(usage.cache_write_input_tokens, 5);
+                assert_eq!(usage.output_tokens, 7);
+            }
+            other => panic!("expected completed event, got {other:?}"),
+        }
+    }
 
     async fn shell_proc(script: &str) -> AgentProc {
         let mut command = Command::new("/bin/sh");
