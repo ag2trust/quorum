@@ -8,7 +8,7 @@ use super::agent::{self, AgentProc, AgentSpec};
 use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, RunnerProc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,6 +21,9 @@ pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_STDOUT_BYTES: usize = 128 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
+const MAX_FAILURE_SUMMARY_BYTES: usize = 2048;
+const MAX_FAILURE_REASON_BYTES: usize = 256;
+const DIAGNOSTIC_SAMPLE_LINES: usize = 2;
 const WRITABLE_PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
 pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigned worktree and repository are writable. This defense-in-depth guidance does not itself enforce that boundary.";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
@@ -700,6 +703,94 @@ pub struct PlannerSlot {
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
     codex_terminal_candidate: bool,
+    diagnostics: PlannerDiagnostics,
+}
+
+#[derive(Default)]
+struct PlannerDiagnostics {
+    lines: u64,
+    event_types: BTreeMap<&'static str, u64>,
+    beginning: Vec<String>,
+    end: VecDeque<String>,
+    terminal_response_seen: bool,
+    read_boundary_truncated: bool,
+}
+
+impl PlannerDiagnostics {
+    fn observe_line(&mut self, provider: AgentKind, raw: &str) {
+        self.lines = self.lines.saturating_add(1);
+        let event_type = safe_event_type(provider, raw);
+        *self.event_types.entry(event_type).or_default() += 1;
+        self.terminal_response_seen |=
+            matches!(event_type, "result" | "turn.completed" | "turn.failed");
+
+        // Samples deliberately retain only a structural description. Provider
+        // payload strings (including tool output and assistant text) can contain
+        // inherited credentials, so they never enter a durable diagnostic.
+        let sample = format!("line={} event={event_type} bytes={}", self.lines, raw.len());
+        if self.beginning.len() < DIAGNOSTIC_SAMPLE_LINES {
+            self.beginning.push(sample.clone());
+        }
+        if self.end.len() == DIAGNOSTIC_SAMPLE_LINES {
+            self.end.pop_front();
+        }
+        self.end.push_back(sample);
+    }
+
+    fn note_read_boundary_truncation(&mut self) {
+        self.read_boundary_truncated = true;
+    }
+}
+
+fn safe_event_type(provider: AgentKind, raw: &str) -> &'static str {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return if raw.trim().is_empty() {
+            "blank"
+        } else {
+            "malformed-json"
+        };
+    };
+    let event_type = value.get("type").and_then(serde_json::Value::as_str);
+    match (provider, event_type) {
+        (AgentKind::Codex, Some("thread.started")) => "thread.started",
+        (AgentKind::Codex, Some("turn.started")) => "turn.started",
+        (AgentKind::Codex, Some("turn.completed")) => "turn.completed",
+        (AgentKind::Codex, Some("turn.failed")) => "turn.failed",
+        (AgentKind::Codex, Some("error")) => "error",
+        (AgentKind::Codex, Some("item.started" | "item.completed")) => {
+            match (
+                event_type,
+                value
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                (Some("item.started"), Some("agent_message")) => "item.started/agent_message",
+                (Some("item.started"), Some("command_execution")) => {
+                    "item.started/command_execution"
+                }
+                (Some("item.started"), Some("file_change")) => "item.started/file_change",
+                (Some("item.started"), Some("mcp_call")) => "item.started/mcp_call",
+                (Some("item.started"), Some("error")) => "item.started/error",
+                (Some("item.completed"), Some("agent_message")) => "item.completed/agent_message",
+                (Some("item.completed"), Some("command_execution")) => {
+                    "item.completed/command_execution"
+                }
+                (Some("item.completed"), Some("file_change")) => "item.completed/file_change",
+                (Some("item.completed"), Some("mcp_call")) => "item.completed/mcp_call",
+                (Some("item.completed"), Some("error")) => "item.completed/error",
+                (Some("item.started"), _) => "item.started/other",
+                _ => "item.completed/other",
+            }
+        }
+        (AgentKind::Claude, Some("assistant")) => "assistant",
+        (AgentKind::Claude, Some("tool_use")) => "tool_use",
+        (AgentKind::Claude, Some("result")) => "result",
+        (AgentKind::Claude, Some("system")) => "system",
+        (AgentKind::Grok, Some("end")) => "end",
+        (_, Some(_)) => "other-json-event",
+        (_, None) => "json-without-type",
+    }
 }
 
 impl PlannerSlot {
@@ -806,14 +897,57 @@ async fn spawn_planner_with_timeout(
         started_at,
         stdout_bytes: 0,
         codex_terminal_candidate: false,
+        diagnostics: PlannerDiagnostics::default(),
     })
+}
+
+fn provider_failure(slot: &PlannerSlot, reason: &str, byte_count_kind: &str) -> PlannerPoll {
+    let bounded_reason = truncate_utf8(reason, MAX_FAILURE_REASON_BYTES);
+    let reason_truncated = bounded_reason.len() != reason.len();
+    let beginning = &slot.diagnostics.beginning;
+    let end = slot.diagnostics.end.iter().collect::<Vec<_>>();
+    let samples_truncated = slot.diagnostics.read_boundary_truncated
+        || slot.diagnostics.lines as usize > DIAGNOSTIC_SAMPLE_LINES.saturating_mul(2);
+    let diagnostic = serde_json::json!({
+        "failure": bounded_reason,
+        "failure_reason_truncated": reason_truncated,
+        "planner_diagnostic": {
+            "provider": match slot.proc.kind() {
+                AgentKind::Claude => "claude",
+                AgentKind::Codex => "codex",
+                AgentKind::Grok => "grok",
+            },
+            "stdout_bytes_observed": slot.stdout_bytes,
+            "stdout_byte_count_kind": byte_count_kind,
+            "stdout_lines": slot.diagnostics.lines,
+            "event_types": slot.diagnostics.event_types,
+            "terminal_response_seen": slot.diagnostics.terminal_response_seen,
+            "samples": {
+                "beginning": beginning,
+                "end": end,
+                "payloads_redacted": true,
+                "truncated": samples_truncated,
+                "read_boundary_truncated": slot.diagnostics.read_boundary_truncated,
+            }
+        }
+    });
+    let mut summary = serde_json::to_string(&diagnostic).expect("planner diagnostic serializes");
+    if summary.len() > MAX_FAILURE_SUMMARY_BYTES {
+        const SUFFIX: &str = "... [planner diagnostic truncated]";
+        let prefix = truncate_utf8(
+            &summary,
+            MAX_FAILURE_SUMMARY_BYTES.saturating_sub(SUFFIX.len()),
+        );
+        summary = format!("{prefix}{SUFFIX}");
+    }
+    PlannerPoll::ProviderFailed(summary)
 }
 
 /// Drain a bounded amount of output. Timeout and output violations are
 /// provider failures; the caller must kill and reap the returned terminal slot.
 pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
     if slot.started_at.elapsed() >= PLANNER_TIMEOUT {
-        return Some(PlannerPoll::ProviderFailed("planner timed out".into()));
+        return Some(provider_failure(slot, "planner timed out", "lower-bound"));
     }
     let remaining = PLANNER_TIMEOUT.saturating_sub(slot.started_at.elapsed());
     let poll_for = remaining.min(Duration::from_secs(2));
@@ -834,31 +968,54 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                 stdout_complete = true;
                 break;
             }
-            Ok(Err(_)) => {
-                return Some(PlannerPoll::ProviderFailed(format!(
-                    "planner stdout exceeded {} KiB",
-                    MAX_STDOUT_BYTES / 1024
-                )));
+            Ok(Err(error)) => {
+                slot.diagnostics.note_read_boundary_truncation();
+                let exceeded = error.to_string().contains("exceeded");
+                if exceeded {
+                    slot.stdout_bytes = MAX_STDOUT_BYTES.saturating_add(1);
+                }
+                let reason = if exceeded {
+                    format!("planner stdout exceeded {} KiB", MAX_STDOUT_BYTES / 1024)
+                } else {
+                    format!("planner stdout read failed: {error}")
+                };
+                return Some(provider_failure(
+                    slot,
+                    &reason,
+                    if exceeded {
+                        "lower-bound"
+                    } else {
+                        "completed-lines-only"
+                    },
+                ));
             }
         };
         slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
+        slot.diagnostics.observe_line(slot.proc.kind(), &raw);
         if slot.stdout_bytes > MAX_STDOUT_BYTES {
-            return Some(PlannerPoll::ProviderFailed(format!(
-                "planner stdout exceeded {} KiB",
-                MAX_STDOUT_BYTES / 1024
-            )));
+            return Some(provider_failure(
+                slot,
+                &format!("planner stdout exceeded {} KiB", MAX_STDOUT_BYTES / 1024),
+                "exact-through-last-line",
+            ));
         }
         if slot.codex_terminal_candidate {
-            return Some(PlannerPoll::ProviderFailed(
-                "planner provider emitted output after terminal response".into(),
+            return Some(provider_failure(
+                slot,
+                "planner provider emitted output after terminal response",
+                "exact-through-last-line",
             ));
         }
         if slot.proc.kind() == AgentKind::Codex {
             if let Some(failure) = slot.proc.observed_pre_authoritative_failure() {
-                return Some(PlannerPoll::ProviderFailed(format!(
-                    "planner provider protocol failed: {}",
-                    failure.detail()
-                )));
+                return Some(provider_failure(
+                    slot,
+                    &format!(
+                        "planner provider protocol failed ({})",
+                        failure.disposition()
+                    ),
+                    "exact-through-last-line",
+                ));
             }
         }
         if slot.proc.kind() == AgentKind::Claude {
@@ -867,15 +1024,17 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
             }) = super::stream::parse_line(&raw)
             {
                 if is_error.unwrap_or(false) {
-                    return Some(PlannerPoll::ProviderFailed(
-                        "planner provider returned an error".into(),
+                    return Some(provider_failure(
+                        slot,
+                        "planner provider returned an error",
+                        "exact-through-last-line",
                     ));
                 }
                 let text = super::stream::result_text(&result);
                 if !text.is_empty() {
                     slot.response_text = text;
                 }
-                return Some(parsed_poll(&slot.response_text));
+                return Some(parsed_poll(slot));
             }
         }
         for event in match slot.proc.kind() {
@@ -885,21 +1044,25 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
         } {
             match event {
                 AgentEvent::TurnFailed { .. } => {
-                    return Some(PlannerPoll::ProviderFailed(
-                        "planner provider turn failed".into(),
+                    return Some(provider_failure(
+                        slot,
+                        "planner provider turn failed",
+                        "exact-through-last-line",
                     ));
                 }
                 AgentEvent::TurnCompleted { .. } => {
                     if slot.proc.kind() == AgentKind::Codex {
                         slot.codex_terminal_candidate = true;
                     } else {
-                        return Some(parsed_poll(&slot.response_text));
+                        return Some(parsed_poll(slot));
                     }
                 }
                 AgentEvent::AssistantText { text } => {
                     if slot.response_text.len().saturating_add(text.len()) > MAX_RESPONSE_BYTES {
-                        return Some(PlannerPoll::ProviderFailed(
-                            "planner response exceeded 64 KiB".into(),
+                        return Some(provider_failure(
+                            slot,
+                            "planner response exceeded 64 KiB",
+                            "exact-through-last-line",
                         ));
                     }
                     slot.response_text.push_str(&text);
@@ -908,45 +1071,59 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
             }
         }
         if slot.started_at.elapsed() >= PLANNER_TIMEOUT {
-            return Some(PlannerPoll::ProviderFailed("planner timed out".into()));
+            return Some(provider_failure(slot, "planner timed out", "lower-bound"));
         }
     }
     let status = match slot.proc.try_wait() {
         Ok(status) => status,
         Err(error) => {
-            return Some(PlannerPoll::ProviderFailed(format!(
-                "planner process status unavailable: {error}"
-            )));
+            return Some(provider_failure(
+                slot,
+                &format!("planner process status unavailable: {error}"),
+                "completed-lines-only",
+            ));
         }
     };
     if slot.proc.kind() == AgentKind::Codex && slot.codex_terminal_candidate && stdout_complete {
         let status = status?;
         let _ = slot.proc.finalize_pre_authoritative_evidence().await;
         if !status.success() {
-            return Some(PlannerPoll::ProviderFailed(format!(
-                "planner provider exited unsuccessfully after terminal response: {status}"
-            )));
+            return Some(provider_failure(
+                slot,
+                &format!(
+                    "planner provider exited unsuccessfully after terminal response: {status}"
+                ),
+                "exact",
+            ));
         }
         if let Some(failure) = slot.proc.observed_strict_pre_authoritative_failure() {
-            return Some(PlannerPoll::ProviderFailed(format!(
-                "planner provider terminal evidence failed: {}",
-                failure.detail()
-            )));
+            return Some(provider_failure(
+                slot,
+                &format!(
+                    "planner provider terminal evidence failed ({})",
+                    failure.disposition()
+                ),
+                "exact",
+            ));
         }
-        return Some(parsed_poll(&slot.response_text));
+        return Some(parsed_poll(slot));
     }
     if status.is_some() {
-        return Some(PlannerPoll::ProviderFailed(
-            "planner exited without a terminal response".into(),
+        return Some(provider_failure(
+            slot,
+            "planner exited without a terminal response",
+            "exact",
         ));
     }
     None
 }
 
-fn parsed_poll(text: &str) -> PlannerPoll {
-    match parse_response(text) {
+fn parsed_poll(slot: &PlannerSlot) -> PlannerPoll {
+    match parse_response(&slot.response_text) {
         Ok(response) => PlannerPoll::Done(response),
-        Err(PlannerParseError::Provider(error)) => PlannerPoll::ProviderFailed(error),
+        Err(PlannerParseError::Provider(error)) => {
+            provider_failure(slot, &error, "exact-through-terminal")
+        }
         Err(PlannerParseError::Semantic(error)) => PlannerPoll::SemanticRejected(error),
     }
 }
@@ -1004,6 +1181,18 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn failure_json(outcome: &PlannerPoll) -> serde_json::Value {
+        let PlannerPoll::ProviderFailed(summary) = outcome else {
+            panic!("expected provider failure");
+        };
+        assert!(
+            summary.len() <= MAX_FAILURE_SUMMARY_BYTES,
+            "durable planner diagnostic was {} bytes",
+            summary.len()
+        );
+        serde_json::from_str(summary).expect("planner failure remains inspectable JSON")
     }
 
     fn task(key: &str, prerequisites: &[&str]) -> serde_json::Value {
@@ -1229,12 +1418,12 @@ mod tests {
     #[test]
     fn polling_result_preserves_independent_failure_budgets() {
         assert!(matches!(
-            parsed_poll("not json"),
-            PlannerPoll::ProviderFailed(_)
+            parse_response("not json"),
+            Err(PlannerParseError::Provider(_))
         ));
         assert!(matches!(
-            parsed_poll(r#"{"outcome":"plan","tasks":[]}"#),
-            PlannerPoll::SemanticRejected(_)
+            parse_response(r#"{"outcome":"plan","tasks":[]}"#),
+            Err(PlannerParseError::Semantic(_))
         ));
     }
 
@@ -1345,6 +1534,19 @@ mod tests {
             outcome,
             PlannerPoll::ProviderFailed(ref message) if message.contains("stdout exceeded")
         ));
+        let diagnostic = failure_json(&outcome);
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["stdout_bytes_observed"],
+            MAX_STDOUT_BYTES + 1
+        );
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["stdout_byte_count_kind"],
+            "lower-bound"
+        );
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["samples"]["read_boundary_truncated"],
+            true
+        );
 
         slot.kill_and_reap().await;
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
@@ -1480,6 +1682,10 @@ mod tests {
                 "missing-terminal",
                 "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"id\":\"m1\",\"text\":\"{}\"}}\n",
             ),
+            (
+                "malformed-terminal",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"id\":\"m1\",\"text\":\"provider-credential-must-not-persist\"}}\n{\"type\":\"turn.completed\"}\n",
+            ),
         ];
         for (name, stdout) in cases {
             let dir = tempfile::tempdir().unwrap();
@@ -1489,8 +1695,96 @@ mod tests {
                 matches!(outcome, PlannerPoll::ProviderFailed(_)),
                 "{name} stream created planner authority"
             );
+            let diagnostic = failure_json(&outcome);
+            assert_eq!(diagnostic["planner_diagnostic"]["provider"], "codex");
+            assert_eq!(
+                diagnostic["planner_diagnostic"]["samples"]["payloads_redacted"],
+                true
+            );
+            assert!(
+                !diagnostic
+                    .to_string()
+                    .contains("provider-credential-must-not-persist"),
+                "{name} persisted provider payload text"
+            );
+            if name == "malformed-terminal" {
+                assert_eq!(
+                    diagnostic["planner_diagnostic"]["terminal_response_seen"],
+                    true
+                );
+                assert_eq!(
+                    diagnostic["planner_diagnostic"]["event_types"]["item.completed/agent_message"],
+                    1
+                );
+                assert_eq!(
+                    diagnostic["planner_diagnostic"]["event_types"]["turn.completed"],
+                    1
+                );
+            }
             slot.kill_and_reap().await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_protocol_events_retain_bounded_head_tail_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = "{\"type\":\"turn.started\"}\n".repeat(8_000);
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let pid = slot.pid().unwrap();
+        let outcome = poll_to_terminal(&mut slot).await;
+        let diagnostic = failure_json(&outcome);
+        let planner = &diagnostic["planner_diagnostic"];
+        assert!(planner["event_types"]["turn.started"].as_u64().unwrap() > 1_000);
+        assert_eq!(planner["terminal_response_seen"], false);
+        assert_eq!(planner["samples"]["truncated"], true);
+        assert_eq!(
+            planner["samples"]["beginning"].as_array().unwrap().len(),
+            DIAGNOSTIC_SAMPLE_LINES
+        );
+        assert_eq!(
+            planner["samples"]["end"].as_array().unwrap().len(),
+            DIAGNOSTIC_SAMPLE_LINES
+        );
+        assert!(planner["samples"]["beginning"][0]
+            .as_str()
+            .unwrap()
+            .contains("event=turn.started"));
+        slot.kill_and_reap().await;
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_utf8_read_failure_retains_text_safe_bounded_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = executable_script(dir.path(), "codex", "printf '\\377\\n'");
+        let mut slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::ProviderFailed(ref summary) if summary.contains("stdout read failed")
+        ));
+        let diagnostic = failure_json(&outcome);
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["stdout_byte_count_kind"],
+            "completed-lines-only"
+        );
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["samples"]["read_boundary_truncated"],
+            true
+        );
+        slot.kill_and_reap().await;
     }
 
     #[cfg(unix)]
@@ -1511,6 +1805,16 @@ mod tests {
             outcome,
             PlannerPoll::ProviderFailed(ref message) if message.contains("response exceeded")
         ));
+        let response_diagnostic = failure_json(&outcome);
+        assert_eq!(
+            response_diagnostic["planner_diagnostic"]["event_types"]
+                ["item.completed/agent_message"],
+            1
+        );
+        assert_eq!(
+            response_diagnostic["planner_diagnostic"]["terminal_response_seen"],
+            false
+        );
         slot.kill_and_reap().await;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1532,6 +1836,11 @@ mod tests {
             outcome,
             PlannerPoll::ProviderFailed(ref message) if message.contains("stdout exceeded")
         ));
+        let stdout_diagnostic = failure_json(&outcome);
+        assert_eq!(
+            stdout_diagnostic["planner_diagnostic"]["stdout_bytes_observed"],
+            MAX_STDOUT_BYTES + 1
+        );
         slot.kill_and_reap().await;
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
     }
@@ -1556,10 +1865,21 @@ mod tests {
             let pid = slot.pid().unwrap();
             if timed_out {
                 slot.started_at = tokio::time::Instant::now() - PLANNER_TIMEOUT;
+                let outcome = poll_planner(&mut slot).await.expect("timeout is terminal");
                 assert!(matches!(
-                    poll_planner(&mut slot).await,
-                    Some(PlannerPoll::ProviderFailed(ref message)) if message.contains("timed out")
+                    outcome,
+                    PlannerPoll::ProviderFailed(ref message) if message.contains("timed out")
                 ));
+                let diagnostic = failure_json(&outcome);
+                assert_eq!(diagnostic["planner_diagnostic"]["stdout_bytes_observed"], 0);
+                assert_eq!(
+                    diagnostic["planner_diagnostic"]["stdout_byte_count_kind"],
+                    "lower-bound"
+                );
+                assert_eq!(
+                    diagnostic["planner_diagnostic"]["terminal_response_seen"],
+                    false
+                );
             }
             slot.kill_and_reap().await;
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
