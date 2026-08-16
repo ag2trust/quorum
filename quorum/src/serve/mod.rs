@@ -7822,22 +7822,23 @@ async fn tick(
                             log(&format!(
                                 "PR #{pr_num} is CONFLICTING — firing MergeConflict"
                             ));
-                            let mc = fire_event(
+                            let rework_msg = format!(
+                                "PR #{pr_num} has conflicts with {} \
+                                 (a sibling PR likely merged first).\n\n\
+                                 Preserve the published PR head, merge {} into the PR branch, \
+                                 resolve conflicts, commit, and submit without pushing. Never rebase.",
+                                config.base_branch, config.base_branch
+                            );
+                            let mc = fire_actionable_rework_event(
                                 &db_path,
                                 "system",
                                 reviewer_task_id,
                                 &Event::MergeConflict,
+                                &rework_msg,
                             )
                             .await;
                             match mc {
                                 Some(ref tr) if tr.task.status == "rework" => {
-                                    let rework_msg = format!(
-                                        "PR #{pr_num} has conflicts with {} \
-                                     (a sibling PR likely merged first).\n\n\
-                                     Preserve the published PR head, merge {} into the PR branch, \
-                                     resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                        config.base_branch, config.base_branch
-                                    );
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
@@ -8115,19 +8116,20 @@ async fn tick(
                             .await;
                             // in-review → rework (lifecycle checks rework cap)
                             let reviewer_name = reviewers[ri].agent_name.clone();
-                            let vc = fire_event(
+                            let rework_msg = format!(
+                                "CI checks failed for PR #{pr_num}: {names}\n\n\
+                                 Fix the failing checks, commit, and submit again without pushing.",
+                            );
+                            let vc = fire_actionable_rework_event(
                                 &db_path,
                                 &reviewer_name,
                                 reviewer_task_id,
                                 &Event::VerdictChanges,
+                                &rework_msg,
                             )
                             .await;
                             match vc {
                                 Some(ref tr) if tr.task.status == "rework" => {
-                                    let rework_msg = format!(
-                                        "CI checks failed for PR #{pr_num}: {names}\n\n\
-                                         Fix the failing checks, commit, and submit again without pushing.",
-                                    );
                                     // Reviewer stays alive (sticky-agent).
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
@@ -8332,22 +8334,23 @@ async fn tick(
                                     "PR #{pr_num} became CONFLICTING during checks \
                                      wait — firing MergeConflict"
                                 ));
-                                let mc = fire_event(
+                                let rework_msg = format!(
+                                    "PR #{pr_num} has conflicts with {} \
+                                     (detected after checks timeout).\n\n\
+                                     Preserve the published PR head, merge {} into the PR branch, \
+                                     resolve conflicts, commit, and submit without pushing. Never rebase.",
+                                    config.base_branch, config.base_branch
+                                );
+                                let mc = fire_actionable_rework_event(
                                     &db_path,
                                     "system",
                                     reviewer_task_id,
                                     &Event::MergeConflict,
+                                    &rework_msg,
                                 )
                                 .await;
                                 match mc {
                                     Some(ref tr) if tr.task.status == "rework" => {
-                                        let rework_msg = format!(
-                                            "PR #{pr_num} has conflicts with {} \
-                                             (detected after checks timeout).\n\n\
-                                             Preserve the published PR head, merge {} into the PR branch, \
-                                             resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                            config.base_branch, config.base_branch
-                                        );
                                         if let Some(wi) = workers
                                             .iter()
                                             .position(|w| w.task_id == reviewer_task_id)
@@ -8683,22 +8686,23 @@ async fn tick(
                                 "PR #{pr_num} is CONFLICTING at merge time \
                                  — firing MergeConflict"
                             ));
-                            let mc = fire_event(
+                            let rework_msg = format!(
+                                "PR #{pr_num} has conflicts with {} \
+                                 (detected at merge time).\n\n\
+                                 Preserve the published PR head, merge {} into the PR branch, \
+                                 resolve conflicts, commit, and submit without pushing. Never rebase.",
+                                config.base_branch, config.base_branch
+                            );
+                            let mc = fire_actionable_rework_event(
                                 &db_path,
                                 "system",
                                 reviewer_task_id,
                                 &Event::MergeConflict,
+                                &rework_msg,
                             )
                             .await;
                             match mc {
                                 Some(ref tr) if tr.task.status == "rework" => {
-                                    let rework_msg = format!(
-                                        "PR #{pr_num} has conflicts with {} \
-                                         (detected at merge time).\n\n\
-                                         Preserve the published PR head, merge {} into the PR branch, \
-                                         resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                        config.base_branch, config.base_branch
-                                    );
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
@@ -9078,21 +9082,22 @@ async fn tick(
                                 } else {
                                     // in-review → rework
                                     let reviewer_name = reviewers[ri].agent_name.clone();
-                                    let vc = fire_event(
+                                    let rework_msg = format!(
+                                        "Merge of PR #{pr_num} failed: {}\n\n\
+                                         Preserve the published PR head, merge {} into the PR branch, \
+                                         resolve conflicts, commit, and submit without pushing. Never rebase.",
+                                        merge_result.message, config.base_branch
+                                    );
+                                    let vc = fire_actionable_rework_event(
                                         &db_path,
                                         &reviewer_name,
                                         reviewer_task_id,
                                         &Event::VerdictChanges,
+                                        &rework_msg,
                                     )
                                     .await;
                                     match vc {
                                         Some(ref tr) if tr.task.status == "rework" => {
-                                            let rework_msg = format!(
-                                                "Merge of PR #{pr_num} failed: {}\n\n\
-                                             Preserve the published PR head, merge {} into the PR branch, \
-                                             resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                                merge_result.message, config.base_branch
-                                            );
                                             // Reviewer stays alive (sticky-agent).
                                             if let Some(wi) = workers
                                                 .iter()
@@ -9360,11 +9365,12 @@ async fn tick(
 
                     // Fire VerdictChanges lifecycle event (lifecycle enforces rework cap).
                     let reviewer_name = reviewers[ri].agent_name.clone();
-                    let vc = fire_event(
+                    let vc = fire_actionable_rework_event(
                         &db_path,
                         &reviewer_name,
                         reviewer_task_id,
                         &Event::VerdictChanges,
+                        feedback,
                     )
                     .await;
                     match vc {
@@ -15020,7 +15026,7 @@ async fn fire_event_result(
     task_id: i64,
     event: &Event,
 ) -> std::result::Result<tasks::TransitionResult, String> {
-    fire_event_result_inner(db_path, agent, task_id, event, None).await
+    fire_event_result_inner(db_path, agent, task_id, event, None, None).await
 }
 
 async fn fire_published_event_result(
@@ -15030,7 +15036,15 @@ async fn fire_published_event_result(
     event: &Event,
     publication: &PublishedCompletion,
 ) -> std::result::Result<tasks::TransitionResult, String> {
-    fire_event_result_inner(db_path, agent, task_id, event, Some(publication.clone())).await
+    fire_event_result_inner(
+        db_path,
+        agent,
+        task_id,
+        event,
+        Some(publication.clone()),
+        None,
+    )
+    .await
 }
 
 async fn fire_event_result_inner(
@@ -15039,6 +15053,7 @@ async fn fire_event_result_inner(
     task_id: i64,
     event: &Event,
     publication: Option<PublishedCompletion>,
+    remediation_feedback: Option<String>,
 ) -> std::result::Result<tasks::TransitionResult, String> {
     let p = db_path.to_path_buf();
     let a = agent.to_string();
@@ -15049,6 +15064,8 @@ async fn fire_event_result_inner(
         let now = now_unix();
         if let Some(publication) = publication {
             tasks::apply_published_worker_event(&mut conn, &a, task_id, &ev, &publication, now)
+        } else if let Some(feedback) = remediation_feedback {
+            tasks::apply_actionable_rework_event(&mut conn, &a, task_id, &ev, &feedback, now)
         } else {
             tasks::apply_event(&mut conn, &a, task_id, &ev, now)
         }
@@ -15094,6 +15111,25 @@ async fn fire_event(
     event: &Event,
 ) -> Option<tasks::TransitionResult> {
     fire_event_result(db_path, agent, task_id, event).await.ok()
+}
+
+async fn fire_actionable_rework_event(
+    db_path: &std::path::Path,
+    agent: &str,
+    task_id: i64,
+    event: &Event,
+    feedback: &str,
+) -> Option<tasks::TransitionResult> {
+    fire_event_result_inner(
+        db_path,
+        agent,
+        task_id,
+        event,
+        None,
+        Some(feedback.to_string()),
+    )
+    .await
+    .ok()
 }
 
 /// Atomically fail a reviewer only if it still owns `in-review`.

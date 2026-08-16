@@ -1373,6 +1373,40 @@ pub fn apply_event(
     apply_event_tx(tx, agent, id, event, now, |_| Ok(()))
 }
 
+/// Apply an actionable rework transition and persist the exact pending turn
+/// in the same transaction. Sticky turn-oriented workers may be dormant when
+/// the daemon dies, so the lifecycle destination must never become visible
+/// without the prompt that restart will replay.
+pub fn apply_actionable_rework_event(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    event: &Event,
+    feedback: &str,
+    now: i64,
+) -> Result<TransitionResult> {
+    if feedback.trim().is_empty() || feedback.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "actionable rework feedback must be non-empty and contain no NUL".into(),
+        ));
+    }
+    if !matches!(event, Event::VerdictChanges | Event::MergeConflict) {
+        return Err(QuorumError::BadInput(
+            "actionable rework persistence requires VerdictChanges or MergeConflict".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    apply_event_tx(tx, agent, id, event, now, |tx| {
+        tx.execute(
+            "UPDATE tasks
+             SET refs=json_set(COALESCE(refs, '{}'), '$.remediation_feedback', ?2)
+             WHERE id=?1 AND status='rework'",
+            params![id, feedback],
+        )?;
+        Ok(())
+    })
+}
+
 /// Apply a daemon-verified worker publication and retire its durable intent in
 /// the same transaction as the lifecycle transition.
 pub fn apply_published_worker_event(
@@ -4818,6 +4852,40 @@ mod tests {
         assert_eq!(r.task.rework_round, 1);
         assert!(r.effects.contains(&Effect::IncrementReworkRound));
         assert!(r.effects.contains(&Effect::ResumeWorker));
+    }
+
+    #[test]
+    fn actionable_rework_event_persists_exact_turn_atomically() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone { pr: "99".into() },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+        let feedback = "Preserve the published head; merge main and never rebase.";
+        let result =
+            apply_actionable_rework_event(&mut c, "R", id, &Event::VerdictChanges, feedback, 1003)
+                .unwrap();
+
+        assert_eq!(result.task.status, "rework");
+        let refs: serde_json::Value =
+            serde_json::from_str(result.task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["remediation_feedback"], feedback);
+        assert!(c
+            .query_row(
+                "SELECT 1 FROM claims WHERE target=?1 AND active=1",
+                [lease_target(id)],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_none());
     }
 
     #[test]

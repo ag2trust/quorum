@@ -189,13 +189,11 @@ fn validate_dormant_recovery(
                         )));
                     }
                 }
-                rework_feedback = Some(feedback.unwrap_or_else(|| {
-                    format!(
-                        "Daemon restart interrupted the pending rework handoff for PR #{pr}. \
-                         Inspect the current review, CI, and merge state; resolve the actionable \
-                         blocker, commit, and submit the existing PR again without pushing."
-                    )
-                }));
+                rework_feedback = Some(feedback.ok_or_else(|| {
+                    invalid(format!(
+                        "stale journal: sticky rework task #{task_id} is missing its exact pending turn"
+                    ))
+                })?);
                 None
             }
         }
@@ -1186,12 +1184,16 @@ mod tests {
         }
     }
 
-    fn assert_recovered_sticky_rework(fixture: &DormantFixture, workers: &[SlotState]) {
+    fn assert_recovered_sticky_rework(
+        fixture: &DormantFixture,
+        workers: &[SlotState],
+        expected_feedback: &str,
+    ) {
         assert_eq!(workers.len(), 1);
         let worker = &workers[0];
         assert_eq!(worker.agent_name, "Dormant");
         assert_eq!(worker.pending_turn_kind, "recovered-rework");
-        assert!(!worker.pending_prompt.trim().is_empty());
+        assert_eq!(worker.pending_prompt, expected_feedback);
         assert!(matches!(worker.proc, SlotProcess::Dormant { .. }));
         let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
         let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
@@ -1216,22 +1218,40 @@ mod tests {
         assert_eq!(holders, vec!["Dormant".to_string()]);
     }
 
+    fn enter_merge_conflict_rework(
+        conn: &mut quorum_core::Connection,
+        task_id: i64,
+        feedback: &str,
+    ) {
+        let now = super::super::now_unix();
+        tasks::apply_event(
+            conn,
+            "Reviewer",
+            task_id,
+            &Event::ReviewerAttached {
+                agent: "Reviewer".into(),
+            },
+            now + 1,
+        )
+        .unwrap();
+        tasks::apply_event(conn, "Reviewer", task_id, &Event::VerdictApprove, now + 2).unwrap();
+        tasks::apply_actionable_rework_event(
+            conn,
+            "system",
+            task_id,
+            &Event::MergeConflict,
+            feedback,
+            now + 3,
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn restart_recovers_sticky_rework_before_replacement_lease() {
         let fixture = dormant_fixture();
-        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
-        conn.execute(
-            "UPDATE tasks SET status='rework',assignee='Dormant',
-                 refs=json_set(refs,'$.remediation_feedback','fix the reviewer blocker')
-             WHERE id=?1",
-            [fixture.task_id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE claims SET active=0 WHERE target=?1",
-            [tasks::lease_target(fixture.task_id)],
-        )
-        .unwrap();
+        let feedback = "Preserve the published PR head, merge main into the PR branch, resolve conflicts, commit, and submit without pushing. Never rebase.";
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        enter_merge_conflict_rework(&mut conn, fixture.task_id, feedback);
         drop(conn);
 
         let mut names = super::super::names::Pool::new_generated();
@@ -1246,7 +1266,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_recovered_sticky_rework(&fixture, &workers);
+        assert_recovered_sticky_rework(&fixture, &workers, feedback);
 
         recover(
             &fixture.config,
@@ -1257,30 +1277,22 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_recovered_sticky_rework(&fixture, &workers);
+        assert_recovered_sticky_rework(&fixture, &workers, feedback);
     }
 
     #[tokio::test]
     async fn restart_recovers_sticky_rework_after_replacement_lease() {
         let fixture = dormant_fixture();
+        let feedback = "Preserve the published PR head, merge main into the PR branch, resolve conflicts, commit, and submit without pushing. Never rebase.";
         let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
-        conn.execute(
-            "UPDATE tasks SET status='rework',assignee=NULL WHERE id=?1",
-            [fixture.task_id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE claims SET active=0 WHERE target=?1",
-            [tasks::lease_target(fixture.task_id)],
-        )
-        .unwrap();
+        enter_merge_conflict_rework(&mut conn, fixture.task_id, feedback);
         tasks::claim_remediation_rework_with_feedback(
             &mut conn,
             "Dormant",
             fixture.task_id,
             tasks::DEFAULT_LEASE_TTL_SECS,
             super::super::now_unix(),
-            Some("fix the reviewer blocker"),
+            Some(feedback),
         )
         .unwrap()
         .unwrap();
@@ -1296,7 +1308,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_recovered_sticky_rework(&fixture, &workers);
+        assert_recovered_sticky_rework(&fixture, &workers, feedback);
     }
 
     #[tokio::test]
@@ -1325,8 +1337,66 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_recovered_sticky_rework(&fixture, &workers);
+        assert_recovered_sticky_rework(&fixture, &workers, "fix failing CI");
         assert_eq!(workers[0].pending_prompt, "fix failing CI");
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_exact_retryable_merge_failure_turn() {
+        let fixture = dormant_fixture();
+        let feedback = "Merge of PR #901 failed: head branch was modified.\n\nPreserve the published PR head, merge main into the PR branch, resolve conflicts, commit, and submit without pushing. Never rebase.";
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let now = super::super::now_unix();
+        tasks::apply_event(
+            &mut conn,
+            "Reviewer",
+            fixture.task_id,
+            &Event::ReviewerAttached {
+                agent: "Reviewer".into(),
+            },
+            now + 1,
+        )
+        .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Reviewer",
+            fixture.task_id,
+            &Event::VerdictApprove,
+            now + 2,
+        )
+        .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "system",
+            fixture.task_id,
+            &Event::MergeFailed {
+                reason: "head branch was modified".into(),
+            },
+            now + 3,
+        )
+        .unwrap();
+        tasks::apply_actionable_rework_event(
+            &mut conn,
+            "Reviewer",
+            fixture.task_id,
+            &Event::VerdictChanges,
+            feedback,
+            now + 4,
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut workers = Vec::new();
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut super::super::names::Pool::new_generated(),
+            &mut workers,
+            &mut LifetimeRoster::new(),
+        )
+        .await
+        .unwrap();
+        assert_recovered_sticky_rework(&fixture, &workers, feedback);
     }
 
     #[tokio::test]
@@ -1633,6 +1703,11 @@ mod tests {
                      '$.daemon_rework_retry_requested',json('true'),
                      '$.remediation_feedback','fix blocker')",
                 "retained runtime ownership",
+            ),
+            (
+                "UPDATE tasks SET status='rework',assignee='Dormant';
+                 UPDATE claims SET active=0 WHERE active=1",
+                "missing its exact pending turn",
             ),
             (
                 "UPDATE tasks SET status='rework',assignee='Other';
