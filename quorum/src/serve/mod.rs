@@ -22400,8 +22400,9 @@ mod tests {
             ..targetless_prior_intent(482)
         };
         reject_prior_target_conflict(Some(&prior), Some("develop")).unwrap();
-        let error = reject_prior_target_conflict(Some(&prior), Some("main"))
-            .expect_err("a durable prior target that disagrees with the task target must fail closed");
+        let error = reject_prior_target_conflict(Some(&prior), Some("main")).expect_err(
+            "a durable prior target that disagrees with the task target must fail closed",
+        );
         assert!(error.contains("conflicts with task target"));
 
         let targetless = targetless_prior_intent(482);
@@ -22486,14 +22487,9 @@ mod tests {
         );
 
         let mut intent = prior.clone();
-        reconcile_publication_intent_with_task_target(
-            &db_path,
-            task_id,
-            Some(&prior),
-            &mut intent,
-        )
-        .await
-        .unwrap();
+        reconcile_publication_intent_with_task_target(&db_path, task_id, Some(&prior), &mut intent)
+            .await
+            .unwrap();
         assert_eq!(
             intent.target_branch.as_deref(),
             Some("develop"),
@@ -22597,10 +22593,7 @@ mod tests {
             intent.target_branch, None,
             "a legacy task without an authoritative target keeps the intent's None so downstream falls back to config.base_branch",
         );
-        assert_eq!(
-            publication_base_branch(&intent, "main").unwrap(),
-            "main",
-        );
+        assert_eq!(publication_base_branch(&intent, "main").unwrap(), "main",);
     }
 
     #[tokio::test]
