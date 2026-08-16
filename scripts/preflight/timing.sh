@@ -25,12 +25,17 @@ Outputs (under ``target/preflight-timing/`` by default):
 
 Usage:
     scripts/preflight/timing.sh [--top-n N] [--out DIR] [--test-threads N]
+                                [--test-timeout-secs N]
+                                [--term-grace-secs N]
                                 [--skip-fmt] [--skip-clippy] [--self-test]
 
 Defaults: --top-n 10, --out target/preflight-timing,
-          --test-threads $RUST_TEST_THREADS or 4.
+          --test-threads $RUST_TEST_THREADS or 4,
+          --test-timeout-secs $PREFLIGHT_TEST_TIMEOUT_SECS or 120,
+          --term-grace-secs $PREFLIGHT_TERM_GRACE_SECS or 2.
 
-Exit codes mirror preflight.sh: 0 pass, 1 gate failure, 2 usage.
+Exit codes mirror preflight.sh: 0 pass, 1 gate failure, 2 usage; an interrupted
+test-execution phase returns 128 plus the received signal number.
 """
 
 from __future__ import annotations
@@ -38,6 +43,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -48,6 +56,27 @@ CARGO_FEATURES = ["--all-features", "--features", "quorum-core/test-support"]
 
 WRAPPER_ACTIVE_ENV = "TIMING_RUSTC_WRAPPER_ACTIVE"
 WRAPPER_LOG_ENV = "TIMING_RUSTC_LOG"
+SUPERVISOR_ACTIVE_ENV = "TIMING_TEST_SUPERVISOR_ACTIVE"
+SUPERVISOR_OWNER_FD_ENV = "TIMING_TEST_SUPERVISOR_OWNER_FD"
+SUPERVISOR_RESULT_FD_ENV = "TIMING_TEST_SUPERVISOR_RESULT_FD"
+SUPERVISOR_ARGV_ENV = "TIMING_TEST_SUPERVISOR_ARGV"
+SUPERVISOR_TIMEOUT_ENV = "TIMING_TEST_SUPERVISOR_TIMEOUT"
+SUPERVISOR_GRACE_ENV = "TIMING_TEST_SUPERVISOR_GRACE"
+SUPERVISOR_DISPLAY_ENV = "TIMING_TEST_SUPERVISOR_DISPLAY"
+PROCESS_TABLE_FAULT_ENV = "TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES"
+DARWIN_PARTIAL_PID_FILE_ENV = "TIMING_TEST_DARWIN_PARTIAL_PID_FILE"
+DARWIN_PARTIAL_CHILD_LIST_PID_FILE_ENV = (
+    "TIMING_TEST_DARWIN_PARTIAL_CHILD_LIST_PID_FILE"
+)
+DARWIN_REUSED_PID_FILE_ENV = "TIMING_TEST_DARWIN_REUSED_PID_FILE"
+DARWIN_REUSED_ROOT_PID_FILE_ENV = "TIMING_TEST_DARWIN_REUSED_ROOT_PID_FILE"
+
+DEFAULT_TEST_TIMEOUT_SECS = 120.0
+DEFAULT_TERM_GRACE_SECS = 2.0
+TIMEOUT_EXIT_CODE = 124
+
+ProcessStart = tuple[int, int]
+RetainedProcesses = dict[int, ProcessStart | None]
 
 
 def now() -> float:
@@ -304,11 +333,923 @@ def compile_tests(
     return now() - t0, proc.returncode, binaries, matched, log_entries
 
 
-def run_test_binary(exe: str, threads: int) -> tuple[float, int]:
+class CollectorInterrupted(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+        self.result: dict | None = None
+
+
+def _process_group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reap_children() -> None:
+    """Reap direct children, including Linux subreaper adoptees."""
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
+def _enable_child_subreaper() -> None:
+    """Keep orphaned test descendants reparented here on Linux.
+
+    Other POSIX systems reap orphans through their normal init process. Linux
+    lets the test supervisor become the nearest subreaper so killed
+    grandchildren do not accumulate as zombies beneath a container's PID 1.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+    except (ImportError, OSError) as exc:
+        print(
+            f"preflight timing: could not become child subreaper: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _linux_process_table() -> dict[int, tuple[int, int]] | None:
+    """Read PID -> (PPID, PGID) without spawning under Linux."""
+    proc_root = Path("/proc")
+    if not (proc_root / "self/stat").exists():
+        return None
+    rows: dict[int, tuple[int, int]] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(errors="replace")
+            # The command name in field 2 may contain spaces or parentheses.
+            # Fields following its final ')' start with state, PPID, and PGID.
+            fields = stat[stat.rfind(")") + 2:].split()
+            rows[int(entry.name)] = (int(fields[1]), int(fields[2]))
+        except (IndexError, OSError, ValueError):
+            # Processes may disappear while /proc is being traversed.
+            continue
+    return rows
+
+
+def _darwin_process_table(
+    root_pid: int,
+    known: RetainedProcesses,
+) -> tuple[dict[int, tuple[int, int]] | None, str | None]:
+    """Read the retained process tree without spawning under macOS."""
+    if sys.platform != "darwin":
+        return None, None
+    try:
+        import ctypes
+
+        class ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        libproc.proc_listchildpids.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        libproc.proc_listchildpids.restype = ctypes.c_int
+        libproc.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        libproc.proc_pidinfo.restype = ctypes.c_int
+
+        partial_pid: int | None = None
+        partial_pid_file = os.environ.get(DARWIN_PARTIAL_PID_FILE_ENV)
+        if partial_pid_file:
+            try:
+                partial_pid = int(Path(partial_pid_file).read_text().strip())
+            except (OSError, ValueError):
+                pass
+        partial_child_list_pid: int | None = None
+        partial_child_list_pid_file = os.environ.get(
+            DARWIN_PARTIAL_CHILD_LIST_PID_FILE_ENV
+        )
+        if partial_child_list_pid_file:
+            try:
+                partial_child_list_pid = int(
+                    Path(partial_child_list_pid_file).read_text().strip()
+                )
+            except (OSError, ValueError):
+                pass
+
+        rows: dict[int, tuple[int, int]] = {}
+        listed_children: dict[int, set[int]] = {}
+        pending = [(pid, None) for pid in known if pid != root_pid]
+        if root_pid in known:
+            pending.append((root_pid, None))
+        visited: set[int] = set()
+        while pending:
+            pid, discovered_parent = pending.pop()
+            if pid <= 0 or pid in visited:
+                continue
+            visited.add(pid)
+            info = ProcBsdInfo()
+            copied = libproc.proc_pidinfo(
+                pid,
+                3,  # PROC_PIDTBSDINFO
+                0,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            if pid == partial_pid:
+                copied = 0
+            if copied == ctypes.sizeof(info):
+                start = (
+                    int(info.pbi_start_tvsec),
+                    int(info.pbi_start_tvusec),
+                )
+                parent_pid = int(info.pbi_ppid)
+                retained_start = known.get(pid)
+                if retained_start is not None and retained_start != start:
+                    # This PID now identifies another process. Do not traverse
+                    # it or trust its current process group during cleanup,
+                    # unless it was independently rediscovered as a current
+                    # child of the retained tree.
+                    known.pop(pid, None)
+                    if discovered_parent is None or parent_pid != discovered_parent:
+                        continue
+                elif (
+                    pid not in known
+                    and discovered_parent is not None
+                    and parent_pid != discovered_parent
+                ):
+                    # The listed child exited and its PID was reused before
+                    # its detail snapshot. The replacement is not ours.
+                    continue
+                known[pid] = start
+                rows[pid] = (parent_pid, int(info.pbi_pgid))
+            else:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    # The process exited between the retained PID and detail
+                    # snapshots.
+                    known.pop(pid, None)
+                    continue
+                except PermissionError:
+                    pass
+                return None, f"libproc snapshot incomplete for live PID {pid}"
+
+            count = libproc.proc_listchildpids(pid, None, 0)
+            if count < 0:
+                return None, f"libproc could not size children of live PID {pid}"
+            if count == 0:
+                listed_children[pid] = set()
+                continue
+            capacity = count + 16
+            children = (ctypes.c_int * capacity)()
+            count = libproc.proc_listchildpids(
+                pid, children, ctypes.sizeof(children)
+            )
+            if pid == partial_child_list_pid:
+                count = 0
+            if count < 0:
+                return None, f"libproc returned partial children for live PID {pid}"
+            if count == 0:
+                listed_children[pid] = set()
+                continue
+            if count >= capacity:
+                return None, f"libproc children of live PID {pid} exceeded its buffer"
+            children_found = {
+                child_pid
+                for child_pid in children[:min(count, capacity)]
+                if child_pid > 0
+            }
+            listed_children[pid] = children_found
+            pending.extend((child_pid, pid) for child_pid in children_found)
+
+        # A zero or shortened child-list result is only distinguishable from
+        # a real leaf when it contradicts a retained live child's BSD info.
+        # Treat that contradiction as partial instead of certifying the tree.
+        for child_pid, (parent_pid, _pgid) in rows.items():
+            if (
+                child_pid in known
+                and parent_pid in listed_children
+                and child_pid not in listed_children[parent_pid]
+            ):
+                return (
+                    None,
+                    f"libproc child list incomplete for live PID {parent_pid}",
+                )
+        return rows, None
+    except (AttributeError, ImportError, OSError, ValueError):
+        return None, "libproc process snapshot failed"
+
+
+def _process_table_failure(
+    error: str,
+    root_pid: int,
+    known: RetainedProcesses,
+) -> tuple[dict[int, tuple[int, int]], str]:
+    rows = _linux_process_table()
+    if rows is not None:
+        return rows, f"process-tree discovery degraded: {error}; used /proc fallback"
+    rows, darwin_error = _darwin_process_table(root_pid, known)
+    if rows is not None:
+        return rows, f"process-tree discovery degraded: {error}; used libproc fallback"
+    if darwin_error is not None:
+        error = f"{error}; {darwin_error}"
+    return {}, error
+
+
+def _process_table(
+    root_pid: int,
+    known: RetainedProcesses,
+) -> tuple[dict[int, tuple[int, int]], str | None]:
+    """Return PID -> (PPID, PGID) from a bounded POSIX process snapshot."""
+    try:
+        injected_failures = int(os.environ.get(PROCESS_TABLE_FAULT_ENV, "0"))
+    except ValueError:
+        injected_failures = 0
+    try:
+        if injected_failures > 0:
+            os.environ[PROCESS_TABLE_FAULT_ENV] = str(injected_failures - 1)
+            raise OSError("injected process-table spawn failure")
+        ps_proc = subprocess.Popen(
+            ["ps", "-axo", "pid=,ppid=,pgid="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        return _process_table_failure(
+            f"process-tree discovery could not start: {exc}", root_pid, known
+        )
+    try:
+        stdout, stderr = ps_proc.communicate(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        ps_proc.kill()
+        ps_proc.wait()
+        return _process_table_failure(
+            "process-tree discovery timed out", root_pid, known
+        )
+    except OSError as exc:
+        try:
+            ps_proc.kill()
+        except OSError:
+            pass
+        try:
+            ps_proc.wait(timeout=0.5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return _process_table_failure(
+            f"process-tree discovery failed while reading: {exc}",
+            root_pid,
+            known,
+        )
+    if ps_proc.returncode != 0:
+        return _process_table_failure(
+            f"process-tree discovery failed: {stderr.strip()}",
+            root_pid,
+            known,
+        )
+
+    rows: dict[int, tuple[int, int]] = {}
+    try:
+        for line in stdout.splitlines():
+            pid, ppid, pgid = (int(value) for value in line.split())
+            if pid != ps_proc.pid:
+                rows[pid] = (ppid, pgid)
+    except ValueError as exc:
+        return {}, f"invalid process-tree snapshot: {exc}"
+    if sys.platform == "darwin":
+        # A ps row carries no stable process identity. Make libproc's start
+        # timestamp authoritative before retained PIDs can reach signaling.
+        darwin_rows, darwin_error = _darwin_process_table(root_pid, known)
+        if darwin_rows is None:
+            return {}, darwin_error or "libproc process snapshot failed"
+        return darwin_rows, None
+    return rows, None
+
+
+def _extend_known_descendants(
+    root_pid: int,
+    known: RetainedProcesses,
+    rows: dict[int, tuple[int, int]],
+) -> None:
+    # Keep the stable identity of every live PID observed: a descendant can be
+    # reparented after its parent is killed, or can move into a new process
+    # group. Linux subreaper adoptees appear as direct supervisor children.
+    # Darwin's libproc traversal adds the root with its start time; do not
+    # recreate a root entry after an identity mismatch discarded it.
+    if sys.platform != "darwin":
+        known.setdefault(root_pid, None)
+    for pid, (ppid, pgid) in rows.items():
+        if ppid == os.getpid() or pgid == root_pid:
+            known.setdefault(pid, None)
+    changed = True
+    while changed:
+        changed = False
+        for pid, (ppid, _pgid) in rows.items():
+            if pid not in known and ppid in known:
+                known[pid] = None
+                changed = True
+
+
+def _discover_descendants(
+    root_pid: int, known: RetainedProcesses
+) -> tuple[dict[int, tuple[int, int]], str | None]:
+    rows, error = _process_table(root_pid, known)
+    _extend_known_descendants(root_pid, known, rows)
+    return {pid: rows[pid] for pid in known if pid in rows}, error
+
+
+def _cleanup_process_tree(
+    proc: subprocess.Popen,
+    grace_secs: float,
+    previously_known: RetainedProcesses | None = None,
+) -> dict:
+    """Bounded TERM/KILL cleanup for every descendant of ``proc``."""
+    root_pgid = proc.pid
+    supervisor_pgid = os.getpgrp()
+    known = dict(previously_known or {})
+    root_running = proc.poll() is None
+    if (
+        sys.platform == "darwin"
+        and not root_running
+        and proc.pid in known
+        and known[proc.pid] is None
+    ):
+        # Once waitpid has reaped an unidentified leader, its PID can identify
+        # an unrelated process. It is no longer safe to discover or signal by
+        # that bare number.
+        known.pop(proc.pid)
+    if previously_known is None or root_running:
+        known.setdefault(proc.pid, None)
+    discovery_error: str | None = None
+    discovery_errors: list[str] = []
+    signal_errors: list[str] = []
+    cleanup = {
+        "attempted": False,
+        "term_sent": False,
+        "kill_sent": False,
+        "complete": False,
+        "error": None,
+    }
+
+    def snapshot() -> dict[int, tuple[int, int]]:
+        nonlocal discovery_error
+        proc.poll()
+        if (
+            sys.platform == "darwin"
+            and proc.returncode is not None
+            and proc.pid in known
+            and known[proc.pid] is None
+        ):
+            known.pop(proc.pid)
+        _reap_children()
+        live, error = _discover_descendants(proc.pid, known)
+        if error is not None and error not in discovery_errors:
+            discovery_errors.append(error)
+        # A Linux /proc fallback is a complete snapshot, while a later clean
+        # ps snapshot proves that a transient startup failure has recovered.
+        discovery_error = (
+            error
+            if error is not None
+            and not error.startswith("process-tree discovery degraded:")
+            else None
+        )
+        return live
+
+    def signal_targets(
+        live: dict[int, tuple[int, int]],
+        sig: signal.Signals,
+        key: str,
+    ) -> None:
+        groups = {
+            pgid for _pid, (_ppid, pgid) in live.items()
+            if pgid > 0 and pgid != supervisor_pgid
+        }
+        # Keep the original group as a fallback if discovery raced its leader
+        # or failed. On Darwin, require a retained process to remain in the
+        # isolated test session before trusting a group from a degraded
+        # snapshot; a reused PID cannot join that existing session.
+        def in_root_session(pid: int) -> bool:
+            try:
+                return os.getsid(pid) == root_pgid
+            except (OSError, ProcessLookupError):
+                return False
+
+        if (
+            sys.platform != "darwin"
+            or any(pgid == root_pgid for _ppid, pgid in live.values())
+            or any(in_root_session(pid) for pid in known)
+        ):
+            groups.add(root_pgid)
+        sent = False
+        for pgid in groups:
+            try:
+                os.killpg(pgid, sig)
+                sent = True
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                signal_errors.append(f"killpg({pgid}, {sig.name}): {exc}")
+        target_pids = set(live)
+        if discovery_error is not None:
+            # A partial snapshot cannot prove whether a retained descendant is
+            # still live. Signal its recorded PID so discovery failure cannot
+            # orphan an escaped process group when the root group exits.
+            if sys.platform == "darwin":
+                target_pids.update(pid for pid in known if in_root_session(pid))
+            else:
+                target_pids.update(known)
+        for pid in target_pids:
+            try:
+                os.kill(pid, sig)
+                sent = True
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                signal_errors.append(f"kill({pid}, {sig.name}): {exc}")
+        cleanup["attempted"] = cleanup["attempted"] or sent
+        cleanup[key] = cleanup[key] or sent
+
+    def send(sig: signal.Signals, key: str) -> None:
+        signal_targets(snapshot(), sig, key)
+
+    def wait_until_gone(
+        deadline: float, sig: signal.Signals, key: str
+    ) -> bool:
+        while True:
+            live = snapshot()
+            if (
+                not live
+                and not _process_group_exists(root_pgid)
+                and discovery_error is None
+            ):
+                return True
+            if now() >= deadline:
+                return False
+            # Close process-creation and process-group-change races by applying
+            # the current cleanup stage to every newly discovered survivor.
+            if live:
+                signal_targets(live, sig, key)
+            time.sleep(min(0.02, max(0.0, deadline - now())))
+
+    live = snapshot()
+    if live or _process_group_exists(root_pgid):
+        send(signal.SIGTERM, "term_sent")
+        gone = wait_until_gone(
+            now() + grace_secs, signal.SIGTERM, "term_sent"
+        )
+        if not gone:
+            send(signal.SIGKILL, "kill_sent")
+            gone = wait_until_gone(
+                now() + grace_secs, signal.SIGKILL, "kill_sent"
+            )
+    else:
+        gone = True
+
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=max(grace_secs, 0.01))
+        except subprocess.TimeoutExpired:
+            gone = False
+            cleanup["error"] = cleanup["error"] or (
+                f"group leader {proc.pid} did not exit after SIGKILL"
+            )
+    _reap_children()
+    final_live = snapshot()
+    cleanup["complete"] = (
+        gone
+        and not final_live
+        and not _process_group_exists(root_pgid)
+        and discovery_error is None
+    )
+    if not cleanup["complete"]:
+        survivors = sorted(final_live)
+        if discovery_error is not None:
+            cleanup["error"] = discovery_error
+        elif survivors:
+            cleanup["error"] = (
+                f"descendant processes still exist after SIGKILL: {survivors}"
+            )
+        elif signal_errors:
+            cleanup["error"] = signal_errors[-1]
+        elif cleanup["error"] is not None:
+            pass
+        else:
+            cleanup["error"] = (
+                f"process group {root_pgid} still exists after SIGKILL"
+            )
+    elif discovery_errors:
+        incomplete = [
+            error
+            for error in discovery_errors
+            if not error.startswith("process-tree discovery degraded:")
+        ]
+        cleanup["error"] = "; ".join(
+            (incomplete or discovery_errors)[-4:]
+        )
+    return cleanup
+
+
+def _run_result(
+    started: float,
+    rc: int,
+    outcome: str,
+    timeout_secs: float,
+    cleanup: dict,
+) -> dict:
+    return {
+        "duration_secs": now() - started,
+        "exit_code": rc,
+        "outcome": outcome,
+        "timed_out": outcome == "timed_out",
+        "timeout_secs": timeout_secs,
+        "cleanup": cleanup,
+    }
+
+
+def _cleanup_diagnostic(cleanup: dict) -> str:
+    actions = []
+    if cleanup["term_sent"]:
+        actions.append("SIGTERM sent")
+    if cleanup["kill_sent"]:
+        actions.append("SIGKILL sent")
+    actions.append(
+        "descendant tree reaped" if cleanup["complete"]
+        else f"cleanup incomplete: {cleanup['error']}"
+    )
+    if cleanup["complete"] and cleanup["error"] is not None:
+        actions.append(f"discovery diagnostic: {cleanup['error']}")
+    return ", ".join(actions)
+
+
+class SupervisorInterrupted(BaseException):
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _write_supervisor_result(fd: int, result: dict) -> None:
+    payload = (json.dumps(result, sort_keys=True) + "\n").encode()
+    try:
+        while payload:
+            written = os.write(fd, payload)
+            payload = payload[written:]
+    except (BrokenPipeError, OSError):
+        # Abrupt owner death normally removes the result reader. Cleanup is
+        # still complete, so the supervisor can exit without reporting back.
+        pass
+
+
+def _test_supervisor() -> int:
+    """Own one isolated test group, even if the timing collector is killed."""
+    owner_fd = int(os.environ[SUPERVISOR_OWNER_FD_ENV])
+    result_fd = int(os.environ[SUPERVISOR_RESULT_FD_ENV])
+    argv = json.loads(os.environ[SUPERVISOR_ARGV_ENV])
+    timeout_secs = float(os.environ[SUPERVISOR_TIMEOUT_ENV])
+    grace_secs = float(os.environ[SUPERVISOR_GRACE_ENV])
+    display_name = os.environ[SUPERVISOR_DISPLAY_ENV]
+    started = now()
+    proc: subprocess.Popen | None = None
+    result: dict | None = None
+    known_descendants: RetainedProcesses = {}
+
+    def interrupted(signum: int, _frame: object) -> None:
+        raise SupervisorInterrupted(signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, interrupted)
+
+    try:
+        _enable_child_subreaper()
+        old_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+
+        def restore_child_signal_mask() -> None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+        test_env = os.environ.copy()
+        for key in (
+            SUPERVISOR_ACTIVE_ENV,
+            SUPERVISOR_OWNER_FD_ENV,
+            SUPERVISOR_RESULT_FD_ENV,
+            SUPERVISOR_ARGV_ENV,
+            SUPERVISOR_TIMEOUT_ENV,
+            SUPERVISOR_GRACE_ENV,
+            SUPERVISOR_DISPLAY_ENV,
+        ):
+            test_env.pop(key, None)
+        try:
+            proc = subprocess.Popen(
+                argv,
+                env=test_env,
+                start_new_session=True,
+                preexec_fn=restore_child_signal_mask,
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+        deadline = started + timeout_secs
+        known_descendants[proc.pid] = None
+        if sys.platform == "darwin":
+            # Capture the leader's stable start identity before poll()/waitpid
+            # can reap it and make the PID reusable. A short-lived child is
+            # still owned here even if it has already become a zombie.
+            _darwin_process_table(proc.pid, known_descendants)
+            reused_pid_file = os.environ.get(DARWIN_REUSED_PID_FILE_ENV)
+            if reused_pid_file:
+                try:
+                    reused_pid = int(Path(reused_pid_file).read_text().strip())
+                    if reused_pid > 0:
+                        # Test-only stale identity: this models a retained PID
+                        # whose original process exited and whose number now
+                        # belongs to an unrelated live process.
+                        known_descendants[reused_pid] = (0, 0)
+                except (OSError, ValueError):
+                    pass
+        next_darwin_snapshot = started
+        outcome = "failed"
+        rc = 1
+        while True:
+            polled = proc.poll()
+            if polled is not None:
+                rc = polled
+                outcome = "passed" if rc == 0 else "failed"
+                break
+            remaining = deadline - now()
+            if remaining <= 0:
+                rc = TIMEOUT_EXIT_CODE
+                outcome = "timed_out"
+                break
+            if sys.platform == "darwin" and now() >= next_darwin_snapshot:
+                rows, _error = _darwin_process_table(
+                    proc.pid, known_descendants
+                )
+                if rows is not None:
+                    _extend_known_descendants(
+                        proc.pid, known_descendants, rows
+                    )
+                next_darwin_snapshot = now() + 0.25
+            readable, _, _ = select.select(
+                [owner_fd], [], [], min(remaining, 0.05)
+            )
+            if readable and os.read(owner_fd, 1) == b"":
+                rc = 1
+                outcome = "owner_lost"
+                break
+
+        if sys.platform == "darwin":
+            reused_root_pid_file = os.environ.get(
+                DARWIN_REUSED_ROOT_PID_FILE_ENV
+            )
+            if reused_root_pid_file:
+                try:
+                    reused_root_pid = int(
+                        Path(reused_root_pid_file).read_text().strip()
+                    )
+                    if reused_root_pid > 0 and proc.returncode is not None:
+                        # Test-only post-reap reuse: cleanup must reject this
+                        # unidentified replacement instead of signaling it.
+                        known_descendants.pop(proc.pid, None)
+                        proc.pid = reused_root_pid
+                        known_descendants[proc.pid] = None
+                except (OSError, ValueError):
+                    pass
+
+        cleanup = _cleanup_process_tree(
+            proc, grace_secs, known_descendants
+        )
+        result = _run_result(started, rc, outcome, timeout_secs, cleanup)
+        if outcome == "timed_out":
+            print(
+                f"preflight timing: test binary {display_name!r} timed out "
+                f"after {result['duration_secs']:.2f}s "
+                f"(deadline {timeout_secs:.2f}s); "
+                f"{_cleanup_diagnostic(cleanup)}. Re-run "
+                f"{shlex.join([*argv, '--nocapture'])} to diagnose.",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif outcome != "owner_lost" and not cleanup["complete"]:
+            print(
+                f"preflight timing: test binary {display_name!r} exited "
+                f"but {_cleanup_diagnostic(cleanup)}",
+                file=sys.stderr,
+                flush=True,
+            )
+    except SupervisorInterrupted as exc:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, signal.SIG_IGN)
+        cleanup = (
+            _cleanup_process_tree(proc, grace_secs, known_descendants)
+            if proc is not None
+            else {
+                "attempted": False,
+                "term_sent": False,
+                "kill_sent": False,
+                "complete": True,
+                "error": None,
+            }
+        )
+        result = _run_result(
+            started, 128 + exc.signum, "interrupted", timeout_secs, cleanup
+        )
+    except BaseException as exc:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, signal.SIG_IGN)
+        cleanup = (
+            _cleanup_process_tree(proc, grace_secs, known_descendants)
+            if proc is not None
+            else {
+                "attempted": False,
+                "term_sent": False,
+                "kill_sent": False,
+                "complete": True,
+                "error": None,
+            }
+        )
+        cleanup["error"] = cleanup["error"] or f"supervisor failure: {exc}"
+        result = _run_result(started, 1, "failed", timeout_secs, cleanup)
+    finally:
+        if result is not None:
+            _write_supervisor_result(result_fd, result)
+        os.close(owner_fd)
+        os.close(result_fd)
+    return 0
+
+
+def _read_supervisor_result(fd: int) -> dict:
+    payload = bytearray()
+    while True:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        payload.extend(chunk)
+    if not payload:
+        raise RuntimeError("test supervisor exited without a result")
+    return json.loads(payload)
+
+
+def run_test_binary(
+    exe: str,
+    threads: int,
+    timeout_secs: float,
+    term_grace_secs: float,
+    display_name: str,
+) -> dict:
     argv = [exe, "--test-threads", str(threads)]
     t0 = now()
-    proc = subprocess.run(argv)
-    return now() - t0, proc.returncode
+    proc: subprocess.Popen | None = None
+    owner_read, owner_write = os.pipe()
+    result_read, result_write = os.pipe()
+    previous_handlers: dict[signal.Signals, object] = {}
+
+    def interrupted(signum: int, _frame: object) -> None:
+        raise CollectorInterrupted(signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sig] = signal.signal(sig, interrupted)
+
+    try:
+        env = os.environ.copy()
+        env.update({
+            SUPERVISOR_ACTIVE_ENV: "1",
+            SUPERVISOR_OWNER_FD_ENV: str(owner_read),
+            SUPERVISOR_RESULT_FD_ENV: str(result_write),
+            SUPERVISOR_ARGV_ENV: json.dumps(argv),
+            SUPERVISOR_TIMEOUT_ENV: str(timeout_secs),
+            SUPERVISOR_GRACE_ENV: str(term_grace_secs),
+            SUPERVISOR_DISPLAY_ENV: display_name,
+        })
+
+        # The supervisor leaves the daemon-owned worker group before it starts
+        # the test. If the collector is SIGKILLed, EOF on owner_read tells the
+        # independently live supervisor to clean and reap the test group.
+        old_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+
+        def restore_child_signal_mask() -> None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve())],
+                env=env,
+                pass_fds=(owner_read, result_write),
+                start_new_session=True,
+                preexec_fn=restore_child_signal_mask,
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        os.close(owner_read)
+        owner_read = -1
+        os.close(result_write)
+        result_write = -1
+        proc.wait()
+        return _read_supervisor_result(result_read)
+    except CollectorInterrupted as exc:
+        for sig in previous_handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        if owner_read >= 0:
+            os.close(owner_read)
+            owner_read = -1
+        if result_write >= 0:
+            os.close(result_write)
+            result_write = -1
+        os.close(owner_write)
+        owner_write = -1
+        if proc is not None:
+            proc.wait(timeout=(2 * term_grace_secs) + 2)
+            result = _read_supervisor_result(result_read)
+        else:
+            result = _run_result(
+                t0,
+                128 + exc.signum,
+                "interrupted",
+                timeout_secs,
+                {
+                    "attempted": False,
+                    "term_sent": False,
+                    "kill_sent": False,
+                    "complete": True,
+                    "error": None,
+                },
+            )
+        result["exit_code"] = 128 + exc.signum
+        result["outcome"] = "interrupted"
+        result["timed_out"] = False
+        exc.result = result
+        print(
+            f"preflight timing: interrupted while running test binary "
+            f"{display_name!r} after {exc.result['duration_secs']:.2f}s; "
+            f"{_cleanup_diagnostic(result['cleanup'])}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
+    except BaseException:
+        for sig in previous_handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        if owner_write >= 0:
+            os.close(owner_write)
+            owner_write = -1
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.wait(timeout=(2 * term_grace_secs) + 2)
+            except subprocess.TimeoutExpired:
+                pass
+        raise
+    finally:
+        for fd in (owner_read, owner_write, result_read, result_write):
+            if fd >= 0:
+                os.close(fd)
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +1276,9 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
     lines: list[str] = []
     lines.append("=== preflight timing summary ===")
     lines.append(f"timestamp_utc: {data['timestamp_utc']}")
+    lines.append(
+        f"test_timeout_secs: {data.get('test_timeout_secs', 'n/a')}"
+    )
     wrapper = data.get("rustc_wrapper") or {}
     if wrapper:
         lines.append(
@@ -356,14 +1300,17 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
         f"slowest test binaries (top {len(top)} of {len(binaries)}):"
     )
     lines.append(
-        f"  {'binary':<48} {'compile_no_run':>16} {'execute':>12}"
+        f"  {'binary':<40} {'compile_no_run':>16} {'execute':>12}  outcome"
     )
     for b in top:
         name = b.get("target_name") or Path(b["executable"]).name
         c = b.get("compile_no_run_secs")
         e = b.get("execute_secs") or 0.0
         c_str = f"{c:>14.2f}s" if c is not None else f"{'n/a':>15}"
-        lines.append(f"  {name[:48]:<48} {c_str} {e:>10.2f}s")
+        outcome = b.get("execute_outcome", "unknown")
+        lines.append(
+            f"  {name[:40]:<40} {c_str} {e:>10.2f}s  {outcome}"
+        )
     lines.append("")
     path.write_text("\n".join(lines) + "\n")
 
@@ -386,6 +1333,7 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
     binaries: list[dict] = []
     wrapper_stats: dict = {}
     status = 0
+    interrupted_signal: int | None = None
 
     def add_gate(name: str, duration: float, rc: int) -> None:
         nonlocal status
@@ -433,24 +1381,51 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
     if status == 0:
         print(
             f"=== timing 4/4: run {len(binaries)} test binaries "
-            f"(--test-threads {args.test_threads}) ===",
+            f"(--test-threads {args.test_threads}, "
+            f"{args.test_timeout_secs:g}s deadline each) ===",
             flush=True,
         )
         t0 = now()
         exec_rc = 0
         for b in binaries:
-            edur, erc = run_test_binary(b["executable"], args.test_threads)
-            b["execute_secs"] = round(edur, 3)
-            b["execute_exit_code"] = erc
-            if erc != 0 and exec_rc == 0:
-                exec_rc = erc
+            name = b.get("target_name") or Path(b["executable"]).name
+            try:
+                result = run_test_binary(
+                    b["executable"],
+                    args.test_threads,
+                    args.test_timeout_secs,
+                    args.term_grace_secs,
+                    name,
+                )
+            except CollectorInterrupted as exc:
+                assert exc.result is not None
+                result = exc.result
+                interrupted_signal = exc.signum
+            b["execute_secs"] = round(result["duration_secs"], 3)
+            b["execute_exit_code"] = result["exit_code"]
+            b["execute_outcome"] = result["outcome"]
+            b["execute_timed_out"] = result["timed_out"]
+            b["execute_timeout_secs"] = result["timeout_secs"]
+            b["cleanup"] = result["cleanup"]
+            if (
+                result["exit_code"] != 0
+                or not result["cleanup"]["complete"]
+            ) and exec_rc == 0:
+                exec_rc = result["exit_code"] or 1
+            if interrupted_signal is not None:
+                break
         add_gate("test_execute", now() - t0, exec_rc)
+        if interrupted_signal is not None:
+            status = 128 + interrupted_signal
 
     data = {
-        "version": 2,
+        "version": 3,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "top_n": args.top_n,
         "test_threads": args.test_threads,
+        "test_timeout_secs": args.test_timeout_secs,
+        "term_grace_secs": args.term_grace_secs,
+        "interrupted_signal": interrupted_signal,
         "gates": gates,
         "test_binaries": binaries,
         "top_n_slowest": slowest(binaries, args.top_n),
@@ -642,10 +1617,13 @@ def self_test() -> int:
             for i in range(20)
         ]
         data = {
-            "version": 2,
+            "version": 3,
             "timestamp_utc": "2026-08-14T00:00:00Z",
             "top_n": 5,
             "test_threads": 4,
+            "test_timeout_secs": 120.0,
+            "term_grace_secs": 2.0,
+            "interrupted_signal": None,
             "gates": [
                 {"name": "cargo_fmt", "duration_secs": 1.2, "exit_code": 0},
                 {"name": "cargo_clippy", "duration_secs": 45.6,
@@ -661,7 +1639,7 @@ def self_test() -> int:
         emit_artifact(artifact, data)
 
         parsed = json.loads(artifact.read_text())
-        assert parsed["version"] == 2
+        assert parsed["version"] == 3
         assert len(parsed["test_binaries"]) == 20
         assert len(parsed["top_n_slowest"]) == 5
 
@@ -698,6 +1676,8 @@ def self_test() -> int:
 def main() -> int:
     if os.environ.get(WRAPPER_ACTIVE_ENV) == "1":
         return _rustc_wrapper()
+    if os.environ.get(SUPERVISOR_ACTIVE_ENV) == "1":
+        return _test_supervisor()
 
     p = argparse.ArgumentParser(
         description=(
@@ -711,6 +1691,22 @@ def main() -> int:
         type=int,
         default=int(os.environ.get("RUST_TEST_THREADS", "4")),
     )
+    p.add_argument(
+        "--test-timeout-secs",
+        type=float,
+        default=float(os.environ.get(
+            "PREFLIGHT_TEST_TIMEOUT_SECS", DEFAULT_TEST_TIMEOUT_SECS
+        )),
+        help="deadline for each test executable (default: 120 seconds)",
+    )
+    p.add_argument(
+        "--term-grace-secs",
+        type=float,
+        default=float(os.environ.get(
+            "PREFLIGHT_TERM_GRACE_SECS", DEFAULT_TERM_GRACE_SECS
+        )),
+        help="grace after TERM and KILL while reaping a test process group",
+    )
     p.add_argument("--skip-fmt", action="store_true")
     p.add_argument("--skip-clippy", action="store_true")
     p.add_argument(
@@ -722,6 +1718,10 @@ def main() -> int:
         p.error("--top-n must be positive")
     if args.test_threads <= 0:
         p.error("--test-threads must be positive")
+    if args.test_timeout_secs <= 0:
+        p.error("--test-timeout-secs must be positive")
+    if args.term_grace_secs <= 0:
+        p.error("--term-grace-secs must be positive")
 
     if args.self_test_mode:
         return self_test()
