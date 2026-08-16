@@ -1534,6 +1534,28 @@ mod tests {
             );
             assert!(r1.contains("final review opportunity"));
             assert!(r2.contains("final review opportunity"));
+            for (role, prompt) in [("R1", r1), ("R2", r2)] {
+                assert!(
+                    prompt.contains("daemon to fail the task because the rework cap is exhausted"),
+                    "{kind:?} {role} must state the lifecycle-owned final consequence"
+                );
+                assert!(
+                    prompt.contains(
+                        "Do not approve, downgrade, omit, or defer a valid BLOCKING finding"
+                    ),
+                    "{kind:?} {role} must resist final-round approval pressure"
+                );
+                assert!(
+                    prompt.contains(
+                        "Zero blockers is valid only after a complete independent review"
+                    ),
+                    "{kind:?} {role} must retain independent zero-blocker calibration"
+                );
+                assert!(
+                    !prompt.contains("approve because") && !prompt.contains("must approve"),
+                    "{kind:?} {role} must not pressure approval on the final opportunity"
+                );
+            }
         }
         let claude_turn =
             build_rereview_turn_with_context("Rev-1", 42, "Worker-1", "high", None, context);
@@ -1544,6 +1566,13 @@ mod tests {
             "the runner receives one neutral turn"
         );
         assert!(claude_turn.contains("final review opportunity"));
+        assert!(claude_turn.contains("daemon to fail the task because the rework cap is exhausted"));
+        assert!(claude_turn
+            .contains("Do not approve, downgrade, omit, or defer a valid BLOCKING finding"));
+        assert!(
+            claude_turn.contains("Zero blockers is valid only after a complete independent review")
+        );
+        assert!(!claude_turn.contains("approve because") && !claude_turn.contains("must approve"));
         assert!(!claude_turn.contains("review round"));
     }
 
