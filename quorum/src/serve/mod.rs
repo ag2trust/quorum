@@ -1033,8 +1033,11 @@ struct PublicationIntent {
     local_sha: String,
     pr: Option<i64>,
     stage: String,
-    /// The immutable task target used only for a fresh initial delivery.
-    /// Absent on historical and continuation intents.
+    /// The immutable task target captured on the first publication for a
+    /// task (fresh initial delivery or first existing-PR continuation). It is
+    /// preserved across retry and reconciliation, and is the authoritative
+    /// base for validation and publication. Absent on historical intents and
+    /// on legacy tasks that predate authoritative targets.
     #[serde(default)]
     target_branch: Option<String>,
     #[serde(default)]
@@ -1089,10 +1092,10 @@ async fn load_publication_state(
     Ok((intent, supersede_source))
 }
 
-/// Return the authoritative target for a new initial delivery. Task creation
-/// persists this field before the daemon can claim the task. Legacy tasks that
-/// predate that contract return `None` and retain the configured-base path.
-async fn initial_task_target_branch(
+/// Return the authoritative target for a task. Task creation persists this
+/// field before the daemon can claim the task. Legacy tasks that predate that
+/// contract return `None` and retain the configured-base path.
+async fn task_target_branch(
     db_path: &Path,
     task_id: i64,
 ) -> std::result::Result<Option<String>, String> {
@@ -1122,7 +1125,7 @@ fn publication_base_branch(
     match intent.target_branch.as_deref() {
         Some(branch) => {
             tasks::validate_target_branch(branch).map_err(|error| {
-                format!("publication intent has invalid initial target branch: {error}")
+                format!("publication intent has invalid task target branch: {error}")
             })?;
             Ok(branch.to_string())
         }
@@ -1379,8 +1382,11 @@ async fn publish_worker_completion(
     known_pr: Option<i64>,
 ) -> std::result::Result<PublishedCompletion, String> {
     let (prior, supersede_source) = load_publication_state(&config.db_path, task_id).await?;
-    let initial_target_branch = if prior.is_none() && known_pr.is_none() {
-        initial_task_target_branch(&config.db_path, task_id).await?
+    // The task target is captured on the first publication for a task —
+    // fresh initial delivery or first existing-PR continuation. A prior
+    // intent already carries its own target and must not be overwritten.
+    let fresh_intent_target_branch = if prior.is_none() {
+        task_target_branch(&config.db_path, task_id).await?
     } else {
         None
     };
@@ -1462,7 +1468,7 @@ async fn publish_worker_completion(
         local_sha: local_sha.clone(),
         pr: known_pr,
         stage: "intent".into(),
-        target_branch: initial_target_branch,
+        target_branch: fresh_intent_target_branch,
         expected_remote_sha: expected_remote_sha.clone(),
     });
     if supersede_source {
@@ -1961,11 +1967,12 @@ async fn resolve_and_persist_continue_pr_target(
     config: &ServeConfig,
     task_id: i64,
     pr: i64,
+    base_branch: &str,
 ) -> std::result::Result<PrTarget, String> {
     // GitHub resolution is deliberately complete before opening the SQLite
     // write transaction below.
     let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
-    validate_continue_pr_target(&target, pr, &config.base_branch)?;
+    validate_continue_pr_target(&target, pr, base_branch)?;
     let db_path = config.db_path.clone();
     let persisted = target.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -14583,13 +14590,35 @@ async fn spawn_worker(
 
     let worker_repo_dir = &config.repo_dir;
 
+    // Task creation persists the authoritative target before the daemon can
+    // claim. Every provisioning path — fresh initial, continue-pr — uses this
+    // exact branch. Legacy tasks (target_branch absent) fall back to the
+    // configured base. An invalid persisted value fails closed here.
+    let task_target = match task.target_branch.as_deref() {
+        Some(target) => match tasks::validate_target_branch(target) {
+            Ok(()) => Some(target),
+            Err(error) => {
+                let reason =
+                    format!("worker has invalid authoritative task target branch: {error}");
+                persist_provisioning_failure(&db_path, task.id, &reason).await;
+                park_task(&db_path, task.id, &reason, "open").await;
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
+                return Ok(false);
+            }
+        },
+        None => None,
+    };
+    let effective_base_branch = task_target.unwrap_or(&config.base_branch);
+
     // A continuation assignment is bound to the live PR target resolved after
     // the atomic claim. Explicit --continue-pr remains authoritative. A
     // parked-rework retry may recover the same authority only from a complete
     // daemon publication lease; it must never adopt a mutable refs.pr value or
     // fall through to base-derived provisioning once that lease exists.
     let (continue_target, parked_rework_continuation) = if let Some(pr) = task.continue_pr {
-        match resolve_and_persist_continue_pr_target(config, task.id, pr).await {
+        match resolve_and_persist_continue_pr_target(config, task.id, pr, effective_base_branch)
+            .await
+        {
             Ok(target) => (Some(target), false),
             Err(error) => {
                 let reason = format!("continue PR #{pr} provisioning rejected: {error}");
@@ -14636,31 +14665,6 @@ async fn spawn_worker(
     } else {
         0
     };
-    // Only a brand-new implementation is based on the task's authoritative
-    // target. Continuations and rework retain their existing provisioning
-    // rules in this slice.
-    let initial_target_branch = if continue_target.is_none() && task.rework_round == 0 {
-        match task.target_branch.as_deref() {
-            Some(target) => match tasks::validate_target_branch(target) {
-                Ok(()) => Some(target),
-                Err(error) => {
-                    let reason =
-                        format!("initial worker has invalid authoritative target branch: {error}");
-                    persist_provisioning_failure(&db_path, task.id, &reason).await;
-                    park_task(&db_path, task.id, &reason, "open").await;
-                    guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
-                    return Ok(false);
-                }
-            },
-            // Legacy tasks predate authoritative targets. They retain the
-            // configured-base provisioning behavior, including recovery.
-            None => None,
-        }
-    } else {
-        None
-    };
-    let initial_base_branch = initial_target_branch.unwrap_or(&config.base_branch);
-
     // Branch keyed to task + original author, not current assignee — a rework
     // re-claim by a different agent continues the original branch instead of
     // forking a duplicate PR (#340).
@@ -14708,7 +14712,7 @@ async fn spawn_worker(
     // Persist immutable allocation provenance before git creates anything.
     // Ref resolution is external I/O and completes before the short DB write.
     if continue_target.is_none() {
-        let base_ref = format!("origin/{initial_base_branch}");
+        let base_ref = format!("origin/{effective_base_branch}");
         let resolved_provenance = match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
             Ok(sha) => sha,
             Err(error) => {
@@ -14770,11 +14774,11 @@ async fn spawn_worker(
             &branch,
             &wt_path,
             target,
-            &config.base_branch,
+            effective_base_branch,
         )
         .await
         .map(|(path, base_merge)| {
-            let context = continuation_worker_context(target, &config.base_branch, base_merge);
+            let context = continuation_worker_context(target, effective_base_branch, base_merge);
             (path, Some(context))
         })
     } else {
@@ -14783,7 +14787,7 @@ async fn spawn_worker(
                 worker_repo_dir,
                 &branch,
                 &wt_path,
-                &format!("origin/{initial_base_branch}"),
+                &format!("origin/{effective_base_branch}"),
             )
             .await
             .map(|path| (path, None))
@@ -22240,7 +22244,89 @@ mod tests {
         invalid.target_branch = Some("origin/main".into());
         assert!(publication_base_branch(&invalid, "main")
             .expect_err("invalid durable target must reject publication")
-            .contains("invalid initial target"));
+            .contains("invalid task target branch"));
+    }
+
+    #[test]
+    fn continuation_publication_intent_uses_task_target_over_configured_base() {
+        let mut intent = PublicationIntent {
+            branch: "external/pr-head".into(),
+            local_sha: "source-a".into(),
+            pr: Some(482),
+            stage: "intent".into(),
+            target_branch: Some("develop".into()),
+            expected_remote_sha: Some("spawn-x".into()),
+        };
+        assert_eq!(
+            publication_base_branch(&intent, "main").unwrap(),
+            "develop",
+            "a continuation intent must publish to the durable task target",
+        );
+
+        let live = PrTarget {
+            pr: 482,
+            head_ref: "external/pr-head".into(),
+            head_sha: "spawn-x".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let error = existing_pr_lease_baseline(&intent, &live, "develop").expect_err(
+            "a PR whose live base drifted from the task target must fail closed with no push",
+        );
+        assert!(
+            error.contains("targets base") && error.contains("expected develop"),
+            "unexpected error: {error}"
+        );
+
+        intent.target_branch = None;
+        assert_eq!(
+            publication_base_branch(&intent, "main").unwrap(),
+            "main",
+            "legacy tasks without an authoritative target fall back to the configured base",
+        );
+    }
+
+    #[tokio::test]
+    async fn task_target_branch_reads_persisted_task_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("task-target.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let legacy_id = tasks::create(
+            &mut conn,
+            "owner",
+            "legacy",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now_unix(),
+        )
+        .unwrap();
+        let develop_id = tasks::create_with_continue_pr_and_target_branch(
+            &mut conn,
+            "owner",
+            "targeted",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("develop"),
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(task_target_branch(&db_path, legacy_id).await.unwrap(), None);
+        assert_eq!(
+            task_target_branch(&db_path, develop_id).await.unwrap(),
+            Some("develop".to_string()),
+        );
     }
 
     #[test]
@@ -22349,6 +22435,31 @@ mod tests {
     }
 
     #[test]
+    fn continue_pr_target_binds_to_the_exact_task_target_branch() {
+        for target_branch in ["main", "develop"] {
+            let target = PrTarget {
+                pr: 19,
+                head_ref: "feature/existing".into(),
+                head_sha: "abc123".into(),
+                is_fork: false,
+                base_ref: Some(target_branch.into()),
+                state: Some("OPEN".into()),
+            };
+            validate_continue_pr_target(&target, 19, target_branch).unwrap();
+
+            let other = if target_branch == "main" {
+                "develop"
+            } else {
+                "main"
+            };
+            let error = validate_continue_pr_target(&target, 19, other).expect_err(
+                "a continuation whose live PR base differs from the task target must fail closed",
+            );
+            assert!(error.contains(&format!("expected {other}")));
+        }
+    }
+
+    #[test]
     fn continue_pr_target_rejects_missing_live_state_and_wrong_identity() {
         let mut target = PrTarget {
             pr: 20,
@@ -22387,6 +22498,24 @@ mod tests {
         assert!(conflicted.contains("still in progress because of conflicts"));
         assert!(conflicted.contains("commit the merge before"));
         assert!(conflicted.contains("Do not abort the prepared merge"));
+    }
+
+    #[test]
+    fn continuation_worker_context_directs_merge_to_the_task_target_branch() {
+        let target = PrTarget {
+            pr: 601,
+            head_ref: "feature/existing".into(),
+            head_sha: "0eb645bb".into(),
+            is_fork: false,
+            base_ref: Some("develop".into()),
+            state: Some("OPEN".into()),
+        };
+        let clean = continuation_worker_context(&target, "develop", ContinuationBaseMerge::Clean);
+        assert!(clean.contains("git merge --ff --no-edit origin/develop"));
+        assert!(
+            !clean.contains("origin/main"),
+            "a develop-target continuation must not reference the configured base"
+        );
     }
 
     #[test]
