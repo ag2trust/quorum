@@ -1372,6 +1372,65 @@ fn existing_pr_lease_baseline<'a>(
     Ok(Some(expected))
 }
 
+/// Reject a durable prior intent whose recorded target branch conflicts with
+/// the authoritative task target. The task target is immutable; a mismatch
+/// indicates a durable corruption and must fail closed before any publication
+/// I/O runs. A prior intent with no recorded target is legal here — it will
+/// be backfilled after materialization by [`backfill_intent_target_branch`].
+fn reject_prior_target_conflict(
+    prior: Option<&PublicationIntent>,
+    authoritative_task_target: Option<&str>,
+) -> std::result::Result<(), String> {
+    let Some(prior_target) = prior.and_then(|intent| intent.target_branch.as_deref()) else {
+        return Ok(());
+    };
+    let Some(task_target) = authoritative_task_target else {
+        return Ok(());
+    };
+    if prior_target != task_target {
+        return Err(format!(
+            "durable publication target branch {prior_target} conflicts with task target {task_target}"
+        ));
+    }
+    Ok(())
+}
+
+/// Backfill a targetless prior publication intent (written by a preceding
+/// daemon version before the intent carried a target) from the authoritative
+/// task target so retry and reconciliation validate and publish against the
+/// exact task target rather than the configured base. Legacy tasks without
+/// an authoritative target remain None and retain the configured-base
+/// fallback. Intents that already carry a target are left untouched.
+fn backfill_intent_target_branch(
+    intent: &mut PublicationIntent,
+    authoritative_task_target: Option<String>,
+) {
+    if intent.target_branch.is_none() {
+        intent.target_branch = authoritative_task_target;
+    }
+}
+
+/// Single orchestrator called by [`publish_worker_completion`] before any
+/// publication I/O. Resolves the authoritative task target, rejects a
+/// durable prior intent whose target disagrees, and backfills a targetless
+/// prior intent so the intent handed to publication I/O binds to the exact
+/// task target on every restart. Extracted so DB-fixture tests can exercise
+/// the exact production path — removing this call from
+/// `publish_worker_completion` would leave a targetless prior intent
+/// falling through to `config.base_branch` and is directly covered by
+/// `reconcile_publication_intent_with_task_target_*` tests.
+async fn reconcile_publication_intent_with_task_target(
+    db_path: &Path,
+    task_id: i64,
+    prior: Option<&PublicationIntent>,
+    intent: &mut PublicationIntent,
+) -> std::result::Result<(), String> {
+    let authoritative_task_target = task_target_branch(db_path, task_id).await?;
+    reject_prior_target_conflict(prior, authoritative_task_target.as_deref())?;
+    backfill_intent_target_branch(intent, authoritative_task_target);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_worker_completion(
     config: &ServeConfig,
@@ -1382,25 +1441,6 @@ async fn publish_worker_completion(
     known_pr: Option<i64>,
 ) -> std::result::Result<PublishedCompletion, String> {
     let (prior, supersede_source) = load_publication_state(&config.db_path, task_id).await?;
-    // The task target is authoritative and immutable. Every publish reads it
-    // so that any prior intent missing the field (written by a preceding
-    // daemon version before the intent carried a target) is backfilled from
-    // the task's target on this restart instead of falling through to the
-    // configured base. Legacy tasks predate authoritative targets and return
-    // None; only they may fall back to `config.base_branch`.
-    let authoritative_task_target = task_target_branch(&config.db_path, task_id).await?;
-    if let (Some(prior_target), Some(task_target)) = (
-        prior
-            .as_ref()
-            .and_then(|prior| prior.target_branch.as_deref()),
-        authoritative_task_target.as_deref(),
-    ) {
-        if prior_target != task_target {
-            return Err(format!(
-                "durable publication target branch {prior_target} conflicts with task target {task_target}"
-            ));
-        }
-    }
     if let Some(prior) = &prior {
         if prior.branch != branch {
             return Err(format!(
@@ -1474,12 +1514,17 @@ async fn publish_worker_completion(
         }
         (None, None) => None,
     };
+    // Materialize with a null target — the single reconciliation call below
+    // resolves the authoritative task target, rejects a durable prior target
+    // conflict, and backfills for both the fresh and prior-intent paths. All
+    // publication I/O below sees the intent bound to the exact task target.
+    let prior_snapshot = prior.clone();
     let mut intent = prior.unwrap_or(PublicationIntent {
         branch: branch.to_string(),
         local_sha: local_sha.clone(),
         pr: known_pr,
         stage: "intent".into(),
-        target_branch: authoritative_task_target.clone(),
+        target_branch: None,
         expected_remote_sha: expected_remote_sha.clone(),
     });
     if supersede_source {
@@ -1488,14 +1533,13 @@ async fn publish_worker_completion(
     }
     intent.pr = known_pr;
     intent.expected_remote_sha = expected_remote_sha;
-    // A targetless prior intent (written by a preceding daemon version) is
-    // backfilled from the authoritative task target so retry and
-    // reconciliation validate and publish against the exact task target
-    // rather than the configured base. Legacy tasks without an authoritative
-    // target remain None and retain the configured-base fallback.
-    if intent.target_branch.is_none() {
-        intent.target_branch = authoritative_task_target;
-    }
+    reconcile_publication_intent_with_task_target(
+        &config.db_path,
+        task_id,
+        prior_snapshot.as_ref(),
+        &mut intent,
+    )
+    .await?;
     let publication_base_branch = publication_base_branch(&intent, &config.base_branch)?;
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
@@ -22306,42 +22350,256 @@ mod tests {
         );
     }
 
-    #[test]
-    fn targetless_prior_intent_backfills_from_task_target_on_restart() {
-        let mut intent = PublicationIntent {
+    fn targetless_prior_intent(pr: i64) -> PublicationIntent {
+        PublicationIntent {
             branch: "daemon/worker-t1".into(),
             local_sha: "source-a".into(),
-            pr: Some(482),
+            pr: Some(pr),
             stage: "pr_created".into(),
             target_branch: None,
             expected_remote_sha: Some("spawn-x".into()),
-        };
-        let task_target: Option<String> = Some("develop".into());
-        if intent.target_branch.is_none() {
-            intent.target_branch = task_target.clone();
         }
+    }
+
+    #[test]
+    fn backfill_intent_target_branch_binds_prior_targetless_intent_to_task_target() {
+        let mut intent = targetless_prior_intent(482);
+        backfill_intent_target_branch(&mut intent, Some("develop".into()));
+        assert_eq!(intent.target_branch.as_deref(), Some("develop"));
         assert_eq!(
             publication_base_branch(&intent, "main").unwrap(),
             "develop",
             "an in-flight prior intent from the preceding daemon version must publish to the task's authoritative target on restart",
         );
 
-        let mut legacy = PublicationIntent {
-            branch: "daemon/worker-t1".into(),
-            local_sha: "source-a".into(),
-            pr: Some(482),
-            stage: "pr_created".into(),
-            target_branch: None,
-            expected_remote_sha: Some("spawn-x".into()),
-        };
-        let no_task_target: Option<String> = None;
-        if legacy.target_branch.is_none() {
-            legacy.target_branch = no_task_target;
-        }
+        let mut legacy = targetless_prior_intent(482);
+        backfill_intent_target_branch(&mut legacy, None);
+        assert_eq!(legacy.target_branch, None);
         assert_eq!(
             publication_base_branch(&legacy, "main").unwrap(),
             "main",
             "genuinely legacy tasks (no authoritative target) retain the configured-base fallback",
+        );
+
+        let mut already_targeted = PublicationIntent {
+            target_branch: Some("develop".into()),
+            ..targetless_prior_intent(482)
+        };
+        backfill_intent_target_branch(&mut already_targeted, Some("main".into()));
+        assert_eq!(
+            already_targeted.target_branch.as_deref(),
+            Some("develop"),
+            "an intent that already carries a target must not be overwritten",
+        );
+    }
+
+    #[test]
+    fn reject_prior_target_conflict_fails_closed_when_prior_disagrees_with_task_target() {
+        let prior = PublicationIntent {
+            target_branch: Some("develop".into()),
+            ..targetless_prior_intent(482)
+        };
+        reject_prior_target_conflict(Some(&prior), Some("develop")).unwrap();
+        let error = reject_prior_target_conflict(Some(&prior), Some("main"))
+            .expect_err("a durable prior target that disagrees with the task target must fail closed");
+        assert!(error.contains("conflicts with task target"));
+
+        let targetless = targetless_prior_intent(482);
+        reject_prior_target_conflict(Some(&targetless), Some("develop")).unwrap();
+        reject_prior_target_conflict(None, Some("develop")).unwrap();
+        reject_prior_target_conflict(Some(&targetless), None).unwrap();
+    }
+
+    #[test]
+    fn backfilled_intent_blocks_push_when_live_pr_base_differs_from_task_target() {
+        let mut intent = targetless_prior_intent(482);
+        backfill_intent_target_branch(&mut intent, Some("develop".into()));
+        assert_eq!(intent.target_branch.as_deref(), Some("develop"));
+
+        let live_wrong_base = PrTarget {
+            pr: 482,
+            head_ref: "daemon/worker-t1".into(),
+            head_sha: "spawn-x".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let publish_base = publication_base_branch(&intent, "main").unwrap();
+        let error = existing_pr_lease_baseline(&intent, &live_wrong_base, &publish_base)
+            .expect_err(
+                "a targeted task whose live PR base differs from the authoritative target must fail closed with no push and no lifecycle advancement",
+            );
+        assert!(
+            error.contains("targets base") && error.contains("expected develop"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            intent.stage, "pr_created",
+            "no push means no stage advancement to verified",
+        );
+
+        let live_matching_base = PrTarget {
+            base_ref: Some("develop".into()),
+            ..live_wrong_base
+        };
+        existing_pr_lease_baseline(&intent, &live_matching_base, &publish_base).expect(
+            "a live PR whose base matches the authoritative task target must pass the lease check",
+        );
+    }
+
+    /// Exercises the exact orchestrator [`publish_worker_completion`] runs
+    /// before any publication I/O. Removing the reconcile call from
+    /// `publish_worker_completion` would leave a targetless prior intent
+    /// falling through to `config.base_branch` and this test would fail.
+    #[tokio::test]
+    async fn reconcile_publication_intent_with_task_target_backfills_targetless_prior_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reconcile-backfill.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = tasks::create_with_continue_pr_and_target_branch(
+            &mut conn,
+            "owner",
+            "targeted continuation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("develop"),
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let legacy_intent = targetless_prior_intent(482);
+        persist_publication_intent(&db_path, task_id, &legacy_intent)
+            .await
+            .unwrap();
+
+        let (prior, _) = load_publication_state(&db_path, task_id).await.unwrap();
+        let prior = prior.expect("legacy prior must load from refs");
+        assert_eq!(
+            prior.target_branch, None,
+            "the pre-restart intent has no recorded target",
+        );
+
+        let mut intent = prior.clone();
+        reconcile_publication_intent_with_task_target(
+            &db_path,
+            task_id,
+            Some(&prior),
+            &mut intent,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            intent.target_branch.as_deref(),
+            Some("develop"),
+            "the orchestrator must backfill the targetless prior intent from the authoritative task target",
+        );
+        assert_eq!(
+            publication_base_branch(&intent, "main").unwrap(),
+            "develop",
+            "downstream publication must bind to the task target, not the configured base",
+        );
+
+        persist_publication_intent(&db_path, task_id, &intent)
+            .await
+            .unwrap();
+        let (reloaded, _) = load_publication_state(&db_path, task_id).await.unwrap();
+        let reloaded = reloaded.expect("intent must reload after backfill");
+        assert_eq!(
+            reloaded.target_branch.as_deref(),
+            Some("develop"),
+            "the durable intent must now carry the authoritative task target on subsequent restarts",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_publication_intent_with_task_target_rejects_durable_target_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reconcile-conflict.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = tasks::create_with_continue_pr_and_target_branch(
+            &mut conn,
+            "owner",
+            "targeted continuation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("develop"),
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let conflicting_prior = PublicationIntent {
+            target_branch: Some("main".into()),
+            ..targetless_prior_intent(482)
+        };
+        let mut intent = conflicting_prior.clone();
+        let error = reconcile_publication_intent_with_task_target(
+            &db_path,
+            task_id,
+            Some(&conflicting_prior),
+            &mut intent,
+        )
+        .await
+        .expect_err("a durable prior target that disagrees with the task target must fail closed");
+        assert!(
+            error.contains("conflicts with task target develop"),
+            "unexpected error: {error}",
+        );
+        assert_eq!(
+            intent.target_branch.as_deref(),
+            Some("main"),
+            "a rejected reconciliation must not mutate the intent",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_publication_intent_with_task_target_preserves_legacy_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reconcile-legacy.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let legacy_task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "legacy",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let prior = targetless_prior_intent(482);
+        let mut intent = prior.clone();
+        reconcile_publication_intent_with_task_target(
+            &db_path,
+            legacy_task_id,
+            Some(&prior),
+            &mut intent,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            intent.target_branch, None,
+            "a legacy task without an authoritative target keeps the intent's None so downstream falls back to config.base_branch",
+        );
+        assert_eq!(
+            publication_base_branch(&intent, "main").unwrap(),
+            "main",
         );
     }
 
