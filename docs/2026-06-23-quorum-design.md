@@ -746,7 +746,21 @@ conversation. Concretely:
   sibling paths, rather than only the most recent remediation commit. A new
   blocker in unchanged behavior must explain why it was not reasonably
   discoverable in the prior complete audit. Reviewers respond to author
-  pushback on the PR itself.
+  pushback on the PR itself. Each re-review publishes a cumulative disposition
+  section that lists prior BLOCKING findings, the author's claimed remedy or
+  response, and the current reviewer's independently determined disposition:
+  fixed, reaffirmed, downgraded/follow-up, overridden/accepted, or unresolved.
+  Findings first discovered in the current review are listed separately and
+  retain the late-blocker explanation requirement above. Because Quorum does
+  not currently have reliable structured extraction of PR review threads, the
+  daemon requires this standardized section rather than synthesizing finding
+  status. A daemon-provided ledger may later serve only as navigation context;
+  the PR discussion remains authoritative, and neither a pushed commit nor an
+  author's claim resolves a finding without the reviewer's current disposition.
+  Both prior and new sections have fixed entry limits, and each field has a
+  fixed Unicode-scalar limit. Explicit entry and field truncation directs the
+  reader to the PR for omitted authoritative history; omitted current blockers
+  still count in the verdict.
   Encouraged GitHub operations are normal comments, inline comments, and review
   summary comments. Formal APPROVE and REQUEST_CHANGES reviews remain daemon-owned
   because managed reviewers use the same GitHub account as PR authors.
