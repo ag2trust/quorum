@@ -1185,9 +1185,9 @@ pub fn default_config_path(repo: &str) -> Result<std::path::PathBuf> {
 
 /// Resolve the base branch that a task created outside the daemon should store.
 ///
-/// This intentionally reads only `base_branch`: task creation must not require the
-/// daemon's routing configuration, but it must use the same per-repository config
-/// location and built-in `main` fallback as `serve`.
+/// This does not require the daemon's routing configuration, but it deserializes
+/// the same config shape so unknown keys fail exactly as they do for `serve`.
+/// It uses the same per-repository config location and built-in `main` fallback.
 pub fn task_create_base_branch(repo: &str) -> Result<String> {
     let path = default_config_path(repo)?;
     let contents = match std::fs::read_to_string(&path) {
@@ -1200,11 +1200,7 @@ pub fn task_create_base_branch(repo: &str) -> Result<String> {
             )))
         }
     };
-    #[derive(Deserialize)]
-    struct BaseBranchConfig {
-        base_branch: Option<String>,
-    }
-    let config: BaseBranchConfig = toml::from_str(&contents).map_err(|error| {
+    let config: ServeFileConfig = toml::from_str(&contents).map_err(|error| {
         QuorumError::Usage(format!("bad serve config {}: {error}", path.display()))
     })?;
     Ok(config.base_branch.unwrap_or_else(|| "main".into()))

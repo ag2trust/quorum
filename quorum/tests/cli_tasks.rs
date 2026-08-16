@@ -240,6 +240,35 @@ fn task_create_rejects_invalid_base_branch_inputs() {
 }
 
 #[test]
+fn task_create_rejects_unknown_daemon_config_keys() {
+    let home = tempfile::tempdir().unwrap();
+    let serve_dir = home.path().join("serve");
+    std::fs::create_dir_all(&serve_dir).unwrap();
+    std::fs::write(
+        serve_dir.join("test__repo.toml"),
+        "base_branhc = \"develop\"\n",
+    )
+    .unwrap();
+
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "typo must not fall back",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("unknown field `base_branhc`"));
+
+    assert!(
+        !home.path().join("repos/test__repo/quorum.db").exists(),
+        "an invalid daemon config must not create a task database"
+    );
+}
+
+#[test]
 fn continue_pr_is_authoritative_and_exposed() {
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())
