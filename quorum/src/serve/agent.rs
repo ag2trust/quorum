@@ -47,7 +47,6 @@ pub struct AgentProc {
 /// (#206) — without it the Skill call is silently denied and the review
 /// degrades to an unstructured read.
 pub(crate) const ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,Skill";
-
 /// Build a stream-json user turn. The claude CLI requires `message.role` and
 /// exits 1 on the first message without it — every turn fed to an agent MUST
 /// go through this helper (first live run died instantly on a role-less turn).
@@ -906,6 +905,43 @@ mod tests {
             event.is_some(),
             "claude rejected the planner argument boundary before authentication"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_launch_passes_no_provider_budget() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let args_path = tmp.path().join("args");
+        let fake = tmp.path().join("claude");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nwhile IFS= read -r _line; do :; done\n",
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut spec = classifier_spec(tmp.path(), false);
+        spec.model = "claude-opus-4-6".into();
+        spec.effort = "high".into();
+        spec.allowed_tools = "Read,Glob,Grep".into();
+
+        let proc = AgentProc::spawn_planner(&spec, fake.to_str()).unwrap();
+        for _ in 0..100 {
+            if args_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let args = std::fs::read_to_string(&args_path)
+            .expect("fake planner did not capture its bounded argument surface");
+        let args: Vec<&str> = args.lines().collect();
+        // Owner decision: no provider spend ceiling on planning turns for now.
+        assert!(!args.contains(&"--max-budget-usd"));
+        let _ = proc.kill_and_reap().await;
     }
 
     /// Negative control pinning the #297 failure mode: a non-UUID session id
