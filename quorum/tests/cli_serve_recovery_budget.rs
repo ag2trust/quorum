@@ -10,7 +10,10 @@
 //!
 //! Asserts task/event/error/agent-run state in the DB, not only console lines.
 
+use std::env;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -63,6 +66,7 @@ struct ServeHandle {
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
     _sentinel: Option<tempfile::TempDir>,
+    _gh_shim: Option<tempfile::TempDir>,
 }
 
 impl Drop for ServeHandle {
@@ -87,9 +91,60 @@ impl ServeHandle {
     ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let gh_shim = tempfile::tempdir().unwrap();
+        let gh_state = gh_shim.path().join("state");
+        std::fs::create_dir_all(&gh_state).unwrap();
+        let gh_path = gh_shim.path().join("gh");
+        std::fs::write(
+            &gh_path,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-} ${2:-}"
+if [ "$cmd" = "pr create" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  printf '%s' "$head" > "$QUORUM_TEST_GH_STATE/$pr"
+  printf 'https://github.com/test/repo/pull/%s\n' "$pr"
+elif [ "$cmd" = "pr list" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    printf '[{"number":%s,"state":"OPEN"}]\n' "$pr"
+  else
+    printf '[]\n'
+  fi
+elif [ "$cmd" = "pr view" ]; then
+  pr="$3"
+  branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+else
+  printf 'unsupported gh invocation: %s\n' "$*" >&2
+  exit 1
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            gh_shim.path().display(),
+            env::var("PATH").unwrap_or_default()
+        );
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
+            .env("PATH", path)
+            .env("QUORUM_TEST_GH_STATE", &gh_state)
+            .env("QUORUM_TEST_REPO", repo)
             .args([
                 "serve",
                 "--repo",
@@ -130,6 +185,7 @@ impl ServeHandle {
             rx,
             lines: Vec::new(),
             _sentinel: Some(sentinel),
+            _gh_shim: Some(gh_shim),
         }
     }
 
@@ -338,6 +394,25 @@ fn seed_task(home: &std::path::Path, title: &str) {
         "task-create failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let db = home.join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    let task_id: i64 = conn
+        .query_row("SELECT MAX(id) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }],
+        "test-classifier:v2",
+        quorum_core::clock::now(),
+    )
+    .unwrap();
 }
 
 /// Core regression test: recovery budget persists across daemon restarts and
@@ -369,7 +444,7 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
             None,
             0,
             None,
-            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,
@@ -518,7 +593,7 @@ fn explicit_retry_of_parked_rework_spawns_replacement_worker() {
             Some("preserve original context"),
             0,
             None,
-            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             Some(1),
             now,
@@ -660,6 +735,18 @@ fn recovery_budget_resets_on_successful_replacement() {
         "worker result not seen. Lines: {:?}",
         handle.lines
     );
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &env.wt_base.path().join("Agent0-t1").to_string_lossy(),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "replacement completed",
+        ])
+        .status()
+        .unwrap()
+        .success());
 
     // Extract agent name for the done signal
     let agent_name = handle
@@ -691,7 +778,7 @@ fn recovery_budget_resets_on_successful_replacement() {
         .env("QUORUM_HOME", env.home.path())
         .env("QUORUM_REPO", "test/repo")
         .env("QUORUM_RUN_ID", &run_id)
-        .args(["done", "--agent", &agent_name, "--pr", "42"])
+        .args(["done", "--agent", &agent_name])
         .output()
         .unwrap();
     assert!(
@@ -702,7 +789,7 @@ fn recovery_budget_resets_on_successful_replacement() {
 
     // Wait for daemon to acknowledge
     assert!(
-        handle.wait_for("PR #42 ready for review", 15),
+        handle.wait_for("PR #1 ready for review", 15),
         "daemon did not acknowledge PR. Lines: {:?}",
         handle.lines
     );
@@ -825,7 +912,7 @@ fn consecutive_restarts_accumulate_recovery_count() {
             None,
             0,
             None,
-            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,
@@ -910,7 +997,7 @@ fn exhaustion_produces_durable_diagnostics() {
             None,
             0,
             None,
-            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,

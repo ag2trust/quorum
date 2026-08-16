@@ -5,20 +5,306 @@
 //! Quorum consumes are parsed into normalized events. Unknown events are inert.
 //!
 //! `journal.session_id` is an opaque runner continuation ID: Claude receives a
-//! Quorum-generated UUID before spawn; Codex will persist the thread ID from
-//! `thread.started`. The column name is retained for schema compatibility.
+//! Quorum-generated UUID before spawn; Codex persists the thread ID from
+//! `thread.started`; Grok persists the session ID from terminal `end`. The
+//! column name is retained for schema compatibility.
 
 use super::agent::AgentProc;
 use super::codex_agent::CodexProc;
+use super::grok_agent::{GrokAdapterConfig, GrokProc};
+use quorum_core::runner_state::{self, PendingTurn};
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
 
 const DIAGNOSTIC_CAPACITY: usize = 256;
 const DIAGNOSTIC_LINE_BYTES: usize = 16 * 1024;
+const EXIT_EVIDENCE_LINES: usize = 256;
+const EXIT_EVIDENCE_LINE_BYTES: usize = 16 * 1024;
+const EXIT_EVIDENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Closed, provider-neutral classification for runner failures observed before
+/// a managed agent has produced an authoritative task or review outcome.
+///
+/// This is evidence only. It does not authorize route selection, assignment
+/// replacement, lifecycle mutation, or recovery accounting by itself.
+pub use quorum_core::routing_attempts::FailureDisposition;
+
+/// Classified runner-boundary failure plus a bounded, non-authoritative
+/// diagnostic. Lifecycle callers may report this value but must independently
+/// prove that no managed task/review outcome exists before acting on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerFailure {
+    disposition: FailureDisposition,
+    detail: String,
+    io_kind: std::io::ErrorKind,
+}
+
+impl RunnerFailure {
+    const DETAIL_BYTES: usize = 512;
+
+    fn new(disposition: FailureDisposition, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        let detail = if detail.len() <= Self::DETAIL_BYTES {
+            detail
+        } else {
+            let mut end = Self::DETAIL_BYTES;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", &detail[..end])
+        };
+        Self {
+            disposition,
+            detail,
+            io_kind: std::io::ErrorKind::Other,
+        }
+    }
+
+    fn with_io_kind(mut self, kind: std::io::ErrorKind) -> Self {
+        self.io_kind = kind;
+        self
+    }
+
+    pub fn disposition(&self) -> FailureDisposition {
+        self.disposition
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.io_kind
+    }
+}
+
+impl std::fmt::Display for RunnerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.disposition, self.detail)
+    }
+}
+
+impl std::error::Error for RunnerFailure {}
+
+impl From<RunnerFailure> for std::io::Error {
+    fn from(error: RunnerFailure) -> Self {
+        std::io::Error::new(error.io_kind, error)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FailureObservation {
+    pub disposition: Option<FailureDisposition>,
+    pub detail: Option<String>,
+    pub terminal_success: bool,
+    pub unknown_failure: bool,
+}
+
+impl FailureObservation {
+    pub fn inert() -> Self {
+        Self {
+            disposition: None,
+            detail: None,
+            terminal_success: false,
+            unknown_failure: false,
+        }
+    }
+
+    pub fn classified(disposition: FailureDisposition, detail: impl Into<String>) -> Self {
+        Self {
+            disposition: Some(disposition),
+            detail: Some(detail.into()),
+            terminal_success: false,
+            unknown_failure: false,
+        }
+    }
+
+    pub fn unknown_failure(detail: impl Into<String>) -> Self {
+        Self {
+            disposition: None,
+            detail: Some(detail.into()),
+            terminal_success: false,
+            unknown_failure: true,
+        }
+    }
+
+    pub fn success() -> Self {
+        Self {
+            terminal_success: true,
+            ..Self::inert()
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct FailureTracker(Arc<Mutex<FailureTrackerState>>);
+
+#[derive(Default)]
+struct FailureTrackerState {
+    kind: Option<AgentKind>,
+    classified: Option<RunnerFailure>,
+    conflicting: bool,
+    terminal_success: bool,
+    saw_protocol_line: bool,
+    unknown_failure: Option<String>,
+    incomplete_evidence: Option<String>,
+}
+
+impl FailureTracker {
+    pub fn for_kind(kind: AgentKind) -> Self {
+        Self(Arc::new(Mutex::new(FailureTrackerState {
+            kind: Some(kind),
+            ..FailureTrackerState::default()
+        })))
+    }
+
+    pub fn observe_stdout(&self, raw: &str) {
+        if raw.is_empty() {
+            return;
+        }
+        let kind = self.0.lock().expect("failure tracker poisoned").kind;
+        let observation = match kind {
+            Some(AgentKind::Claude) => AgentProc::failure_observation(raw),
+            Some(AgentKind::Codex) => CodexProc::failure_observation(raw),
+            Some(AgentKind::Grok) => GrokProc::failure_observation(raw),
+            None => return,
+        };
+        self.record(observation, true);
+    }
+
+    pub fn observe_stderr(&self, text: &str) {
+        let kind = self.0.lock().expect("failure tracker poisoned").kind;
+        let observation = match kind {
+            Some(AgentKind::Claude) => AgentProc::stderr_failure_observation(text),
+            Some(AgentKind::Codex) => CodexProc::stderr_failure_observation(text),
+            Some(AgentKind::Grok) => GrokProc::stderr_failure_observation(text),
+            None => return,
+        };
+        self.record(observation, false);
+    }
+
+    pub fn observe_protocol_read_error(&self, detail: impl Into<String>) {
+        self.record(
+            FailureObservation::classified(FailureDisposition::NonFailover, detail),
+            false,
+        );
+    }
+
+    /// Start a fresh managed turn on a persistent provider process. Failure
+    /// evidence is authoritative only within one pre-outcome turn; retaining
+    /// success or conflicting evidence across rework/re-review turns would
+    /// suppress or corrupt the later turn's classification.
+    pub fn begin_turn(&self) {
+        let mut state = self.0.lock().expect("failure tracker poisoned");
+        let kind = state.kind;
+        *state = FailureTrackerState {
+            kind,
+            ..FailureTrackerState::default()
+        };
+    }
+
+    pub fn note_incomplete_evidence(&self, detail: impl Into<String>) {
+        let mut state = self.0.lock().expect("failure tracker poisoned");
+        if state.incomplete_evidence.is_none() {
+            state.incomplete_evidence = Some(detail.into());
+        }
+    }
+
+    fn record(&self, observation: FailureObservation, protocol_line: bool) {
+        let mut state = self.0.lock().expect("failure tracker poisoned");
+        state.saw_protocol_line |= protocol_line;
+        state.terminal_success |= observation.terminal_success;
+        if observation.unknown_failure && state.unknown_failure.is_none() {
+            state.unknown_failure = observation.detail.clone();
+        }
+        let Some(disposition) = observation.disposition else {
+            return;
+        };
+        let failure = RunnerFailure::new(
+            disposition,
+            observation
+                .detail
+                .unwrap_or_else(|| "provider failure".into()),
+        );
+        match &state.classified {
+            None => state.classified = Some(failure),
+            Some(existing) if existing.disposition == disposition => {}
+            Some(_) => state.conflicting = true,
+        }
+    }
+
+    pub fn classify_exit(&self, status: std::process::ExitStatus) -> Option<RunnerFailure> {
+        let state = self.0.lock().expect("failure tracker poisoned");
+        if let Some(failure) = observed_failure(&state) {
+            return Some(failure);
+        }
+        if state.terminal_success {
+            return None;
+        }
+        if status.success() || state.saw_protocol_line {
+            return Some(RunnerFailure::new(
+                FailureDisposition::RetryableSameRoute,
+                "provider reached EOF before a terminal protocol event",
+            ));
+        }
+        Some(RunnerFailure::new(
+            FailureDisposition::NonFailover,
+            format!("provider exited with {status} without other failure evidence"),
+        ))
+    }
+
+    pub fn observed_failure(&self) -> Option<RunnerFailure> {
+        let state = self.0.lock().expect("failure tracker poisoned");
+        observed_failure(&state)
+    }
+
+    /// Grok withholds terminal success until EOF and zero exit, so any earlier
+    /// protocol/diagnostic failure remains authoritative even if a later
+    /// syntactically valid `end` was observed. Other providers retain their
+    /// established terminal-success precedence through `observed_failure`.
+    pub fn observed_strict_failure(&self) -> Option<RunnerFailure> {
+        let state = self.0.lock().expect("failure tracker poisoned");
+        observed_strict_failure(&state)
+    }
+}
+
+fn observed_failure(state: &FailureTrackerState) -> Option<RunnerFailure> {
+    if state.terminal_success {
+        return None;
+    }
+    observed_strict_failure(state)
+}
+
+fn observed_strict_failure(state: &FailureTrackerState) -> Option<RunnerFailure> {
+    if let Some(detail) = &state.incomplete_evidence {
+        return Some(RunnerFailure::new(
+            FailureDisposition::Unclassified,
+            detail.clone(),
+        ));
+    }
+    if state.conflicting {
+        return Some(RunnerFailure::new(
+            FailureDisposition::Unclassified,
+            "provider emitted conflicting failure evidence",
+        ));
+    }
+    if let Some(failure) = &state.classified {
+        return Some(failure.clone());
+    }
+    if let Some(detail) = &state.unknown_failure {
+        return Some(RunnerFailure::new(
+            FailureDisposition::Unclassified,
+            detail.clone(),
+        ));
+    }
+    None
+}
 
 pub enum CapturedOutput {
     Stdout(String),
+    StdoutTruncated { dropped: usize },
     Stderr(String),
     StderrTruncated { dropped: usize },
     StderrBytesTruncated { dropped: usize },
@@ -28,6 +314,11 @@ impl CapturedOutput {
     pub fn session_line(&self) -> String {
         match self {
             Self::Stdout(line) => line.clone(),
+            Self::StdoutTruncated { dropped } => serde_json::json!({
+                "type":"provider.stdout_truncated",
+                "dropped_lines":dropped
+            })
+            .to_string(),
             Self::Stderr(text) => {
                 serde_json::json!({"type":"provider.stderr","text":text}).to_string()
             }
@@ -46,7 +337,10 @@ impl CapturedOutput {
 }
 
 #[derive(Clone, Default)]
-pub struct DiagnosticBuffer(Arc<Mutex<DiagnosticState>>);
+pub struct DiagnosticBuffer {
+    state: Arc<Mutex<DiagnosticState>>,
+    failures: FailureTracker,
+}
 
 #[derive(Default)]
 struct DiagnosticState {
@@ -56,8 +350,20 @@ struct DiagnosticState {
 }
 
 impl DiagnosticBuffer {
+    pub(super) fn for_kind(kind: AgentKind) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DiagnosticState::default())),
+            failures: FailureTracker::for_kind(kind),
+        }
+    }
+
+    pub(super) fn failures(&self) -> FailureTracker {
+        self.failures.clone()
+    }
+
     pub fn push(&self, line: String) {
-        let mut state = self.0.lock().expect("diagnostic buffer poisoned");
+        self.failures.observe_stderr(&line);
+        let mut state = self.state.lock().expect("diagnostic buffer poisoned");
         if state.lines.len() == DIAGNOSTIC_CAPACITY {
             state.lines.pop_front();
             state.dropped += 1;
@@ -66,7 +372,7 @@ impl DiagnosticBuffer {
     }
 
     pub fn drain(&self) -> Vec<CapturedOutput> {
-        let mut state = self.0.lock().expect("diagnostic buffer poisoned");
+        let mut state = self.state.lock().expect("diagnostic buffer poisoned");
         let mut output = Vec::with_capacity(
             state.lines.len()
                 + usize::from(state.dropped > 0)
@@ -89,8 +395,14 @@ impl DiagnosticBuffer {
     }
 
     fn note_dropped_bytes(&self, count: usize) {
-        let mut state = self.0.lock().expect("diagnostic buffer poisoned");
+        let mut state = self.state.lock().expect("diagnostic buffer poisoned");
         state.dropped_bytes = state.dropped_bytes.saturating_add(count);
+    }
+
+    fn note_read_error(&self, error: &std::io::Error) {
+        self.failures.note_incomplete_evidence(format!(
+            "provider stderr evidence could not be read: {error}"
+        ));
     }
 }
 
@@ -103,7 +415,11 @@ where
     let mut line_dropped = 0usize;
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(error) => {
+                diagnostics.note_read_error(&error);
+                break;
+            }
             Ok(read) => {
                 for &byte in &chunk[..read] {
                     if byte == b'\n' {
@@ -132,27 +448,227 @@ where
         diagnostics.note_dropped_bytes(line_dropped);
     }
 }
-use super::{codex_stream, stream};
-
 /// Closed runner enum — supporting another runner requires an explicit code
 /// change, not configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     Claude,
     Codex,
+    Grok,
+}
+
+/// Process lifetime declared by a runner adapter. Lifecycle orchestration uses
+/// this capability instead of branching on a provider name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnMode {
+    /// One persistent child accepts later turns over its input stream.
+    PersistentChild,
+    /// Each turn is a new process and later turns resume opaque provider state.
+    RespawnPerTurn,
+}
+
+/// Provider-neutral inputs for starting one runner turn.
+///
+/// Provider adapters translate this request into their private command specs.
+/// The model is resolved through [`AgentKind::for_model`]; callers cannot pair
+/// an arbitrary runner with a model or fall back after an adapter fails.
+pub struct LaunchRequest<'a> {
+    pub model: &'a str,
+    pub effort: &'a str,
+    pub worktree: &'a Path,
+    /// Raw prompt text. The Claude adapter wraps it as a stream-json user turn;
+    /// turn-oriented adapters pass it through their command boundary.
+    pub prompt: &'a str,
+    pub environment: &'a [(String, String)],
+    pub mode: LaunchMode,
+    /// Opaque provider identity. Claude uses it as its pre-spawn session UUID;
+    /// Codex uses it to resume the exact provider-issued thread; Grok uses it
+    /// with the official CLI's exact-session `--resume` command.
+    pub continuation_id: Option<&'a str>,
+}
+
+/// Complete identity for one internally exercised managed worker launch.
+/// Public/configured Grok role selection remains rejected elsewhere; this
+/// request exists so transport plumbing cannot drop task, assignment, role,
+/// or pending-turn identity between launch and terminal persistence.
+#[allow(dead_code)] // constructed only by the dormant internal Grok worker exercise today
+pub struct RunnerRequest<'a> {
+    pub launch: LaunchRequest<'a>,
+    pub task_id: i64,
+    pub role_assignment_id: i64,
+    pub responsibility_key: &'a str,
+    pub agent: &'a str,
+    pub role: &'a str,
+    pub pending_turn: PendingTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerTurnRequest {
+    pub task_id: i64,
+    pub role_assignment_id: i64,
+    pub responsibility_key: String,
+    pub agent: String,
+    pub role: String,
+    pub provider: String,
+    pub runner: String,
+    pub model: String,
+    pub effort: String,
+    pub pending_turn: PendingTurn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    Normal,
+    Restricted,
+}
+
+/// Installed-runner settings interpreted only by the corresponding adapter.
+/// These are deliberately separate from the neutral turn identity above.
+pub struct AdapterConfig<'a> {
+    pub executable: Option<&'a str>,
+    pub claude_bare: bool,
+    pub claude_allowed_tools: &'a str,
+    pub codex_sandbox: &'a str,
+    pub grok: GrokAdapterConfig<'a>,
+}
+
+/// One raw provider line plus its normalized lifecycle events.
+///
+/// Claude's terminal `result` can carry the classifier's response without an
+/// assistant event, so adapters expose that text without leaking raw protocol
+/// parsing back into role orchestration.
+pub struct NormalizedLine {
+    pub events: Vec<AgentEvent>,
+    pub terminal_text: Option<String>,
 }
 
 /// Provider-specific process transport behind the normalized runner boundary.
 pub enum RunnerProc {
     Claude(AgentProc),
     Codex(CodexProc),
+    Grok(GrokProc),
 }
 
 impl RunnerProc {
+    /// Exercise an initial Grok worker through the shared request/process
+    /// boundary without making the provider selectable by managed routing.
+    #[allow(dead_code)] // activation gate intentionally leaves this unreachable in production
+    pub async fn launch_internal_worker(
+        request: &RunnerRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> Result<Self, RunnerFailure> {
+        let kind = AgentKind::for_model(request.launch.model).map_err(|error| {
+            RunnerFailure::new(FailureDisposition::Unclassified, error)
+                .with_io_kind(std::io::ErrorKind::InvalidInput)
+        })?;
+        if kind != AgentKind::Grok
+            || request.task_id <= 0
+            || request.role_assignment_id <= 0
+            || request.responsibility_key.is_empty()
+            || request.agent.is_empty()
+            || request.role != "worker"
+            || request.launch.continuation_id.is_some()
+            || request.pending_turn.turn_kind != "initial"
+            || request.pending_turn.continuation_id.is_some()
+            || request.pending_turn.requested
+            || request.pending_turn.provider != kind.to_string()
+            || request.pending_turn.model != request.launch.model
+            || request.pending_turn.effort != request.launch.effort
+            || request.pending_turn.prompt != request.launch.prompt
+            || !runner_state::pending_turn_is_complete(&request.pending_turn)
+        {
+            return Err(RunnerFailure::new(
+                FailureDisposition::NonFailover,
+                "internal Grok worker request has incomplete or mismatched task, assignment, role, model, effort, or pending-turn identity",
+            )
+            .with_io_kind(std::io::ErrorKind::InvalidInput));
+        }
+        let identity = WorkerTurnRequest {
+            task_id: request.task_id,
+            role_assignment_id: request.role_assignment_id,
+            responsibility_key: request.responsibility_key.to_string(),
+            agent: request.agent.to_string(),
+            role: request.role.to_string(),
+            provider: kind.to_string(),
+            runner: kind.to_string(),
+            model: request.launch.model.to_string(),
+            effort: request.launch.effort.to_string(),
+            pending_turn: request.pending_turn.clone(),
+        };
+        match Self::launch(&request.launch, config).await? {
+            Self::Grok(mut proc) => {
+                proc.set_worker_request(identity);
+                Ok(Self::Grok(proc))
+            }
+            _ => unreachable!("internal worker boundary accepted only Grok above"),
+        }
+    }
+
+    /// Resolve and launch the explicit built-in adapter for this model.
+    pub async fn launch(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> Result<Self, RunnerFailure> {
+        let kind = AgentKind::for_model(request.model).map_err(|error| {
+            RunnerFailure::new(FailureDisposition::Unclassified, error)
+                .with_io_kind(std::io::ErrorKind::InvalidInput)
+        })?;
+        let result = match kind {
+            AgentKind::Claude => AgentProc::launch(request, config).await.map(Self::Claude),
+            AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
+            AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
+        };
+        result.map_err(|error| classify_launch_error(kind, error))
+    }
+
+    /// Restricted classifier launch whose deadline covers Claude's initial
+    /// stdin feed as well as the returned slot lifetime. Single-turn adapters
+    /// receive their prompt in argv and therefore have no pre-slot pipe wait.
+    pub async fn launch_restricted_until(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, RunnerFailure> {
+        if request.mode != LaunchMode::Restricted {
+            return Err(RunnerFailure::new(
+                FailureDisposition::NonFailover,
+                "bounded restricted launch requires restricted mode",
+            )
+            .with_io_kind(std::io::ErrorKind::InvalidInput));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RunnerFailure::new(
+                FailureDisposition::RetryableSameRoute,
+                "restricted provider launch timed out",
+            )
+            .with_io_kind(std::io::ErrorKind::TimedOut));
+        }
+        let kind = AgentKind::for_model(request.model).map_err(|error| {
+            RunnerFailure::new(FailureDisposition::Unclassified, error)
+                .with_io_kind(std::io::ErrorKind::InvalidInput)
+        })?;
+        let result = match kind {
+            AgentKind::Claude => AgentProc::launch_restricted_until(request, config, deadline)
+                .await
+                .map(Self::Claude),
+            AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
+            AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
+        };
+        result.map_err(|error| classify_launch_error(kind, error))
+    }
+
     pub fn kind(&self) -> AgentKind {
         match self {
             Self::Claude(_) => AgentKind::Claude,
             Self::Codex(_) => AgentKind::Codex,
+            Self::Grok(_) => AgentKind::Grok,
+        }
+    }
+
+    pub fn worker_request(&self) -> Option<&WorkerTurnRequest> {
+        match self {
+            Self::Grok(proc) => proc.worker_request(),
+            Self::Claude(_) | Self::Codex(_) => None,
         }
     }
 
@@ -160,6 +676,103 @@ impl RunnerProc {
         match self {
             Self::Claude(proc) => proc.kill_and_reap().await,
             Self::Codex(proc) => proc.kill_and_reap().await,
+            Self::Grok(proc) => proc.kill_and_reap().await,
+        }
+    }
+
+    /// After `try_wait` proves that the provider leader exited, consume the
+    /// remaining bounded stdout records and join the stderr reader before a
+    /// caller snapshots failure evidence. Descendants may retain pipes, so
+    /// both work and allocation are bounded; incomplete evidence fails safe.
+    pub async fn finalize_pre_authoritative_evidence(&mut self) -> Vec<CapturedOutput> {
+        let deadline = tokio::time::Instant::now() + EXIT_EVIDENCE_TIMEOUT;
+        let mut stdout = VecDeque::new();
+        let mut dropped = 0usize;
+        let mut stdout_complete = false;
+
+        for index in 0..=EXIT_EVIDENCE_LINES {
+            match tokio::time::timeout_at(
+                deadline,
+                self.next_exit_evidence_line_bounded(EXIT_EVIDENCE_LINE_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(Some(line))) => {
+                    if stdout.len() == EXIT_EVIDENCE_LINES {
+                        stdout.pop_front();
+                        dropped = dropped.saturating_add(1);
+                    }
+                    stdout.push_back(CapturedOutput::Stdout(line));
+                    if index == EXIT_EVIDENCE_LINES {
+                        self.failure_tracker().note_incomplete_evidence(format!(
+                            "provider exit evidence exceeded {EXIT_EVIDENCE_LINES} stdout records"
+                        ));
+                        break;
+                    }
+                }
+                Ok(Ok(None)) => {
+                    stdout_complete = true;
+                    break;
+                }
+                Ok(Err(error)) => {
+                    self.failure_tracker().note_incomplete_evidence(format!(
+                        "provider exit stdout could not be finalized: {error}"
+                    ));
+                    break;
+                }
+                Err(_) => {
+                    self.failure_tracker()
+                        .note_incomplete_evidence("provider exit stdout finalization timed out");
+                    break;
+                }
+            }
+        }
+
+        if !stdout_complete && dropped == 0 {
+            // The specific read/timeout path above records a diagnostic. This
+            // fallback covers any future loop exit that does not reach EOF.
+            self.failure_tracker()
+                .note_incomplete_evidence("provider exit stdout evidence was incomplete");
+        }
+        if !self.finish_stderr_until(deadline).await {
+            self.failure_tracker()
+                .note_incomplete_evidence("provider exit stderr evidence was incomplete");
+        }
+
+        let mut output =
+            Vec::with_capacity(stdout.len() + usize::from(dropped > 0) + DIAGNOSTIC_CAPACITY);
+        if dropped > 0 {
+            output.push(CapturedOutput::StdoutTruncated { dropped });
+        }
+        output.extend(stdout);
+        output.extend(self.drain_diagnostics());
+        output
+    }
+
+    fn failure_tracker(&self) -> FailureTracker {
+        match self {
+            Self::Claude(proc) => proc.failure_tracker(),
+            Self::Codex(proc) => proc.failure_tracker(),
+            Self::Grok(proc) => proc.failure_tracker(),
+        }
+    }
+
+    async fn finish_stderr_until(&mut self, deadline: tokio::time::Instant) -> bool {
+        match self {
+            Self::Claude(proc) => proc.finish_stderr_until(deadline).await,
+            Self::Codex(proc) => proc.finish_stderr_until(deadline).await,
+            Self::Grok(proc) => proc.finish_stderr_until(deadline).await,
+        }
+    }
+
+    async fn next_exit_evidence_line_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        match self {
+            Self::Claude(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::Codex(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::Grok(proc) => proc.next_raw_line_bounded(max_bytes).await,
         }
     }
 
@@ -167,6 +780,7 @@ impl RunnerProc {
         match self {
             Self::Claude(proc) => proc.pid(),
             Self::Codex(proc) => proc.pid(),
+            Self::Grok(proc) => proc.pid(),
         }
     }
 
@@ -174,13 +788,113 @@ impl RunnerProc {
         match self {
             Self::Claude(proc) => proc.try_wait(),
             Self::Codex(proc) => proc.try_wait(),
+            Self::Grok(proc) => proc.try_wait(),
         }
+    }
+
+    /// Return pre-authoritative runner evidence for an exited process. The
+    /// lifecycle must call this only after independently proving there is no
+    /// completion, submission, agent reaction, or review verdict.
+    pub fn classify_pre_authoritative_exit(
+        &self,
+        status: std::process::ExitStatus,
+    ) -> Option<RunnerFailure> {
+        match self {
+            Self::Claude(proc) => proc.classify_pre_authoritative_exit(status),
+            Self::Codex(proc) => proc.classify_pre_authoritative_exit(status),
+            Self::Grok(proc) => proc.classify_pre_authoritative_exit(status),
+        }
+    }
+
+    pub fn observed_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
+        match self {
+            Self::Claude(proc) => proc.observed_pre_authoritative_failure(),
+            Self::Codex(proc) => proc.observed_pre_authoritative_failure(),
+            Self::Grok(proc) => proc.observed_pre_authoritative_failure(),
+        }
+    }
+
+    /// Return any failure or incomplete evidence even after a syntactic
+    /// terminal-success record. Callers must first finalize bounded process
+    /// evidence and prove the provider process exited successfully.
+    pub fn observed_strict_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
+        self.failure_tracker().observed_strict_failure()
     }
 
     pub async fn next_raw_line(&mut self) -> Option<String> {
         match self {
             Self::Claude(proc) => proc.next_raw_line().await,
             Self::Codex(proc) => proc.next_raw_line().await,
+            Self::Grok(proc) => proc.next_raw_line().await,
+        }
+    }
+
+    /// Normalize a line for immediate stream delivery. Grok terminal records
+    /// are raw evidence first; their lifecycle events are exposed separately
+    /// only after the adapter proves terminal process evidence is complete.
+    pub fn normalize_stream_line(&self, raw: &str) -> Vec<AgentEvent> {
+        match self {
+            Self::Grok(_) => GrokProc::normalize_stream_line(raw),
+            Self::Claude(_) | Self::Codex(_) => normalize_line(self.kind(), raw),
+        }
+    }
+
+    pub async fn authorized_grok_terminal(&mut self) -> Option<String> {
+        match self {
+            Self::Grok(proc) => proc.authorized_terminal().await,
+            Self::Claude(_) | Self::Codex(_) => None,
+        }
+    }
+
+    pub fn grok_terminal_evidence_pending(&self) -> bool {
+        matches!(self, Self::Grok(proc) if proc.terminal_evidence_pending())
+    }
+
+    pub fn grok_terminal_candidate_pending(&self) -> bool {
+        matches!(self, Self::Grok(proc) if proc.terminal_candidate_pending())
+    }
+
+    #[cfg(test)]
+    pub fn inject_grok_stdout_read_error_after_lines(&mut self, lines: usize) {
+        if let Self::Grok(proc) = self {
+            proc.inject_stdout_read_error_after_lines(lines);
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn inject_grok_stderr_read_error(&mut self) {
+        if let Self::Grok(proc) = self {
+            proc.inject_stderr_read_error().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn grok_stderr_evidence_pending(&self) -> bool {
+        matches!(self, Self::Grok(proc) if proc.stderr_evidence_pending())
+    }
+
+    /// Read one line with a hard boundary on bytes accumulated before a line
+    /// terminator. Classifier and planner roles use this cancellation-safe
+    /// boundary before accepting provider output into role-owned buffers.
+    pub async fn next_raw_line_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        match self {
+            Self::Claude(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::Codex(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::Grok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bounded role reads are unavailable for the Grok adapter",
+            )),
+        }
+    }
+
+    pub fn normalize_line(&self, raw: &str) -> NormalizedLine {
+        match self {
+            Self::Claude(_) => AgentProc::normalize_line(raw),
+            Self::Codex(_) => CodexProc::normalize_line(raw),
+            Self::Grok(_) => GrokProc::normalize_line(raw),
         }
     }
 
@@ -191,28 +905,62 @@ impl RunnerProc {
                 std::io::ErrorKind::Unsupported,
                 "Codex is turn-oriented — respawn with its thread ID",
             )),
+            Self::Grok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Grok is turn-oriented — respawn with its session ID",
+            )),
         }
-    }
-
-    pub fn is_codex(&self) -> bool {
-        matches!(self, Self::Codex(_))
     }
 
     pub fn drain_diagnostics(&mut self) -> Vec<CapturedOutput> {
         match self {
             Self::Claude(proc) => proc.drain_diagnostics(),
             Self::Codex(proc) => proc.drain_diagnostics(),
+            Self::Grok(proc) => proc.drain_diagnostics(),
         }
     }
 }
 
+fn classify_launch_error(kind: AgentKind, error: std::io::Error) -> RunnerFailure {
+    let disposition = match error.kind() {
+        std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionRefused => FailureDisposition::RetryableSameRoute,
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::PermissionDenied
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::Unsupported => FailureDisposition::NonFailover,
+        _ => FailureDisposition::Unclassified,
+    };
+    RunnerFailure::new(
+        disposition,
+        format!("{kind} runner startup failed: {error}"),
+    )
+    .with_io_kind(error.kind())
+}
+
 impl AgentKind {
+    pub fn turn_mode(self) -> TurnMode {
+        match self {
+            Self::Claude => TurnMode::PersistentChild,
+            Self::Codex => TurnMode::RespawnPerTurn,
+            Self::Grok => TurnMode::RespawnPerTurn,
+        }
+    }
+
     /// Resolve the provider from the model string chosen for a managed run.
     ///
     /// This is the authoritative model-to-runner mapping. Unknown models are
     /// rejected so callers cannot spawn one runner and persist another.
     pub fn for_model(model: &str) -> Result<Self, String> {
-        if model == "o1"
+        if model == super::grok_agent::SUPPORTED_MODEL {
+            Ok(Self::Grok)
+        } else if model == "o1"
             || model == "o3"
             || model.starts_with("o1-")
             || model.starts_with("o3-")
@@ -232,7 +980,7 @@ impl AgentKind {
         } else {
             Err(format!(
                 "unknown model '{model}': cannot resolve provider \
-                 (expected claude-*/Claude alias or supported OpenAI model)"
+                 (expected claude-*/Claude alias, supported OpenAI model, or grok-4.5)"
             ))
         }
     }
@@ -243,6 +991,7 @@ impl std::fmt::Display for AgentKind {
         match self {
             Self::Claude => f.write_str("claude"),
             Self::Codex => f.write_str("codex"),
+            Self::Grok => f.write_str("grok"),
         }
     }
 }
@@ -257,6 +1006,19 @@ mod provider_tests {
         assert_eq!(AgentKind::for_model("o3").unwrap(), AgentKind::Codex);
         assert_eq!(AgentKind::for_model("o4-mini").unwrap(), AgentKind::Codex);
     }
+
+    #[test]
+    fn adapters_declare_their_process_lifetime() {
+        assert_eq!(
+            AgentKind::Claude.turn_mode(),
+            super::TurnMode::PersistentChild
+        );
+        assert_eq!(
+            AgentKind::Codex.turn_mode(),
+            super::TurnMode::RespawnPerTurn
+        );
+        assert_eq!(AgentKind::Grok.turn_mode(), super::TurnMode::RespawnPerTurn);
+    }
 }
 
 /// Normalized event consumed by the daemon lifecycle.
@@ -266,8 +1028,9 @@ pub enum AgentEvent {
         thread_id: String,
     },
     /// Runner session identity established. For Claude this fires on the
-    /// first assistant event (identity is pre-spawn); for Codex it will fire
-    /// on `thread.started`.
+    /// first assistant event (identity is pre-spawn); for Codex it fires on
+    /// `thread.started`; for Grok it fires immediately before terminal success
+    /// when the `end` event provides `sessionId`.
     AssistantText {
         text: String,
     },
@@ -276,7 +1039,8 @@ pub enum AgentEvent {
         summary: String,
     },
     /// Terminal success. `cost_usd` is provider-optional (Claude provides
-    /// session-cumulative USD; Codex does not).
+    /// session-cumulative USD; Codex does not; Grok provides it only when its
+    /// structured terminal protocol marks the ledger complete).
     TurnCompleted {
         usage: Option<TokenUsage>,
         cost_usd: Option<f64>,
@@ -300,12 +1064,8 @@ pub enum ActivityKind {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
-    /// Provider-reported input used by the established live gauge and token
-    /// caps. Codex reports an inclusive value here.
+    /// Provider-reported input retained for existing live gauges and caps.
     pub input_tokens: u64,
-    /// Provider-defined uncached input retained for durable telemetry. Codex
-    /// reports inclusive input, so its normalizer subtracts cached input only
-    /// for this field.
     pub uncached_input_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_write_input_tokens: u64,
@@ -314,9 +1074,8 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Established live/cap measurement. Cache activity is retained in the
-    /// durable breakdown but must not change configured token-limit behavior
-    /// or the existing live gauge.
+    /// Cache activity is persisted separately and does not alter established
+    /// live token-limit behavior.
     pub fn live_total_tokens(self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
@@ -337,183 +1096,34 @@ impl TokenUsage {
     }
 }
 
-/// Normalize a raw Claude stream-json line into zero or more `AgentEvent`s.
-///
-/// A single Claude line can produce multiple normalized events (e.g. an
-/// Assistant message with inline tool_use blocks yields both AssistantText
-/// and Activity events). Unknown/unparseable lines produce an empty vec —
-/// they are inert and must not advance lifecycle state.
+/// Compatibility entry point for sites that do not hold a process instance.
+/// Provider-specific raw parsing remains owned by the Claude adapter.
 pub fn normalize_claude_line(raw: &str) -> Vec<AgentEvent> {
-    let event = match stream::parse_line(raw) {
-        Some(e) => e,
-        None => return vec![],
-    };
-
-    match event {
-        stream::Event::Result {
-            result,
-            usage,
-            total_cost_usd,
-            is_error,
-            ..
-        } => {
-            let tok = usage.map(|u| TokenUsage {
-                input_tokens: u.input_tokens,
-                uncached_input_tokens: u.input_tokens,
-                cached_input_tokens: u.cache_read_input_tokens,
-                cache_write_input_tokens: u.cache_creation_input_tokens,
-                output_tokens: u.output_tokens,
-                reasoning_tokens: 0,
-            });
-            if is_error.unwrap_or(false) {
-                let message = stream::result_text(&result);
-                vec![AgentEvent::TurnFailed {
-                    message: if message.is_empty() {
-                        "agent returned an error result".into()
-                    } else {
-                        message
-                    },
-                    usage: tok,
-                    cost_usd: total_cost_usd,
-                }]
-            } else {
-                vec![AgentEvent::TurnCompleted {
-                    usage: tok,
-                    cost_usd: total_cost_usd,
-                }]
-            }
-        }
-
-        stream::Event::Assistant { message } => {
-            let mut events = Vec::new();
-
-            if let Some(text) = stream::assistant_text(&message) {
-                events.push(AgentEvent::AssistantText { text });
-            }
-
-            // Inline tool_use blocks in content array
-            if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
-                for block in blocks {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
-                            let input = block
-                                .get("input")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            let summary = tool_summary(name, &input);
-                            events.push(AgentEvent::Activity {
-                                kind: ActivityKind::ToolUse,
-                                summary,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Mid-turn usage on assistant messages
-            if let Some(usage) = message.get("usage") {
-                let input = usage
-                    .get("input_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let output = usage
-                    .get("output_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                if input + output > 0 {
-                    events.push(AgentEvent::MidTurnUsage {
-                        tokens: input + output,
-                    });
-                }
-            }
-
-            events
-        }
-
-        stream::Event::ToolUse { name, input } => {
-            let summary = tool_summary(&name, &input);
-            vec![AgentEvent::Activity {
-                kind: ActivityKind::ToolUse,
-                summary,
-            }]
-        }
-
-        stream::Event::Other => vec![],
-    }
+    AgentProc::normalize_line(raw).events
 }
 
+/// Compatibility entry point for sites that do not hold a process instance.
+/// Provider-specific raw parsing remains owned by the Codex adapter.
 pub fn normalize_codex_line(raw: &str) -> Vec<AgentEvent> {
-    let event = match codex_stream::parse_line(raw) {
-        Some(event) => event,
-        None => return vec![],
-    };
-    match event {
-        codex_stream::Event::ThreadStarted { thread_id } => {
-            vec![AgentEvent::ThreadStarted { thread_id }]
-        }
-        codex_stream::Event::ItemStarted { item } | codex_stream::Event::ItemCompleted { item } => {
-            match item {
-                codex_stream::Item::AgentMessage { text, .. } if !text.is_empty() => {
-                    vec![AgentEvent::AssistantText { text }]
-                }
-                codex_stream::Item::CommandExecution { command, .. } => {
-                    vec![AgentEvent::Activity {
-                        kind: ActivityKind::ToolUse,
-                        summary: tool_summary("command", &serde_json::json!({"command": command})),
-                    }]
-                }
-                codex_stream::Item::FileChange { changes, .. } => {
-                    let path = changes
-                        .first()
-                        .map(|change| change.path.as_str())
-                        .unwrap_or("file");
-                    vec![AgentEvent::Activity {
-                        kind: ActivityKind::ToolUse,
-                        summary: tool_summary(
-                            "file_change",
-                            &serde_json::json!({"file_path": path}),
-                        ),
-                    }]
-                }
-                _ => vec![],
-            }
-        }
-        codex_stream::Event::TurnCompleted { usage } => vec![AgentEvent::TurnCompleted {
-            usage: usage.map(|usage| TokenUsage {
-                input_tokens: usage.input_tokens,
-                uncached_input_tokens: usage.input_tokens.saturating_sub(usage.cached_input_tokens),
-                cached_input_tokens: usage.cached_input_tokens,
-                cache_write_input_tokens: usage.cache_write_input_tokens,
-                output_tokens: usage.output_tokens,
-                reasoning_tokens: usage.reasoning_output_tokens,
-            }),
-            cost_usd: None,
-        }],
-        codex_stream::Event::TurnFailed { error } => vec![AgentEvent::TurnFailed {
-            message: error
-                .map(|error| error.message)
-                .filter(|message| !message.is_empty())
-                .unwrap_or_else(|| "Codex turn failed".into()),
-            usage: None,
-            cost_usd: None,
-        }],
-        // Codex emits top-level Error events for retryable transport/reconnect
-        // warnings before a later terminal turn event. Lifecycle state changes
-        // only on turn.completed/turn.failed or authoritative process exit.
-        codex_stream::Event::Error { .. } => vec![],
-        _ => vec![],
-    }
+    CodexProc::normalize_line(raw).events
+}
+
+/// Compatibility entry point for sites that do not hold a process instance.
+/// Provider-specific raw parsing remains owned by the Grok adapter.
+pub fn normalize_grok_line(raw: &str) -> Vec<AgentEvent> {
+    GrokProc::normalize_line(raw).events
 }
 
 pub fn normalize_line(kind: AgentKind, raw: &str) -> Vec<AgentEvent> {
     match kind {
         AgentKind::Claude => normalize_claude_line(raw),
         AgentKind::Codex => normalize_codex_line(raw),
+        AgentKind::Grok => normalize_grok_line(raw),
     }
 }
 
 /// Compact tool label for live stats (matches existing `now_label` behavior).
-fn tool_summary(name: &str, input: &serde_json::Value) -> String {
+pub(super) fn tool_summary(name: &str, input: &serde_json::Value) -> String {
     let snippet = match name {
         "Bash" => input
             .get("command")
@@ -559,6 +1169,370 @@ fn truncate_label(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn recording_runner(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runner = dir.join("recording-runner");
+        let args = dir.join("args.log");
+        let turn = dir.join("turn.log");
+        let environment = dir.join("environment.log");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\n\
+                 for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done > '{}'\n\
+                 printf '%s\\n' \"$QUORUM_ADAPTER_TEST\" > '{}'\n\
+                 if [ \"$1\" = '-p' ]; then\n\
+                   IFS= read -r line\n\
+                   printf '%s\\n' \"$line\" > '{}'\n\
+                   printf '%s\\n' '{{\"type\":\"result\",\"result\":\"done\",\"is_error\":false}}'\n\
+                 else\n\
+                   printf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"runner-thread\"}}'\n\
+                   printf '%s\\n' '{{\"type\":\"turn.completed\"}}'\n\
+                 fi\n",
+                args.display(),
+                environment.display(),
+                turn.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        runner
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_launch_dispatches_to_each_explicit_adapter() {
+        let claude_dir = tempfile::tempdir().unwrap();
+        let claude_bin = recording_runner(claude_dir.path());
+        let claude_environment = vec![("QUORUM_ADAPTER_TEST".into(), "claude-env".into())];
+        let mut claude = RunnerProc::launch(
+            &LaunchRequest {
+                model: "claude-sonnet-5",
+                effort: "high",
+                worktree: claude_dir.path(),
+                prompt: "claude prompt",
+                environment: &claude_environment,
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &AdapterConfig {
+                executable: claude_bin.to_str(),
+                claude_bare: true,
+                claude_allowed_tools: "Bash,Read",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(claude.kind(), AgentKind::Claude);
+        let _ = claude.next_raw_line().await;
+        claude.kill_and_reap().await;
+        let args = std::fs::read_to_string(claude_dir.path().join("args.log")).unwrap();
+        assert!(args.contains("<--add-dir>"), "{args}");
+        assert!(args.contains("<--bare>"), "{args}");
+        assert!(args.contains("<Bash,Read>"), "{args}");
+        assert!(!args.contains("<--safe-mode>"), "{args}");
+        let argv: Vec<&str> = args.lines().collect();
+        let session_flag = argv
+            .iter()
+            .position(|arg| *arg == "<--session-id>")
+            .unwrap();
+        let session_id = argv[session_flag + 1]
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(session_id).is_ok(), "{args}");
+        let turn = std::fs::read_to_string(claude_dir.path().join("turn.log")).unwrap();
+        let turn: serde_json::Value = serde_json::from_str(turn.trim()).unwrap();
+        assert_eq!(turn["message"]["content"], "claude prompt");
+        assert_eq!(
+            std::fs::read_to_string(claude_dir.path().join("environment.log"))
+                .unwrap()
+                .trim(),
+            "claude-env"
+        );
+
+        let codex_dir = tempfile::tempdir().unwrap();
+        let codex_bin = recording_runner(codex_dir.path());
+        let codex_environment = vec![("QUORUM_ADAPTER_TEST".into(), "codex-env".into())];
+        let mut codex = RunnerProc::launch(
+            &LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "medium",
+                worktree: codex_dir.path(),
+                prompt: "codex prompt",
+                environment: &codex_environment,
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &AdapterConfig {
+                executable: codex_bin.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "workspace-write",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(codex.kind(), AgentKind::Codex);
+        while codex.next_raw_line().await.is_some() {}
+        codex.kill_and_reap().await;
+        let args = std::fs::read_to_string(codex_dir.path().join("args.log")).unwrap();
+        assert!(
+            args.contains("<--dangerously-bypass-approvals-and-sandbox>"),
+            "{args}"
+        );
+        assert!(args.contains("<workspace-write>"), "{args}");
+        assert!(args.contains("<codex prompt>"), "{args}");
+        assert_eq!(
+            std::fs::read_to_string(codex_dir.path().join("environment.log"))
+                .unwrap()
+                .trim(),
+            "codex-env"
+        );
+
+        let grok_dir = tempfile::tempdir().unwrap();
+        let grok_bin = recording_runner(grok_dir.path());
+        let grok_environment = vec![("QUORUM_ADAPTER_TEST".into(), "grok-env".into())];
+        let mut grok = RunnerProc::launch(
+            &LaunchRequest {
+                model: "grok-4.5",
+                effort: "high",
+                worktree: grok_dir.path(),
+                prompt: "grok prompt",
+                environment: &grok_environment,
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &AdapterConfig {
+                executable: grok_bin.to_str(),
+                claude_bare: true,
+                claude_allowed_tools: "Bash,Read",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(grok.kind(), AgentKind::Grok);
+        while grok.next_raw_line().await.is_some() {}
+        grok.kill_and_reap().await;
+        let args = std::fs::read_to_string(grok_dir.path().join("args.log")).unwrap();
+        assert!(args.contains("<streaming-json>"), "{args}");
+        assert!(args.contains("<grok-4.5>"), "{args}");
+        assert!(args.contains("<grok prompt>"), "{args}");
+        assert!(!args.contains("<--bare>"), "{args}");
+        assert!(!args.contains("<Bash,Read>"), "{args}");
+        assert_eq!(
+            std::fs::read_to_string(grok_dir.path().join("environment.log"))
+                .unwrap()
+                .trim(),
+            "grok-env"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_launch_dispatches_to_each_safe_adapter() {
+        for (model, expected_kind) in [
+            ("claude-haiku-4-5-20251001", AgentKind::Claude),
+            ("gpt-5.6-terra", AgentKind::Codex),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let executable = recording_runner(dir.path());
+            let mut proc = RunnerProc::launch(
+                &LaunchRequest {
+                    model,
+                    effort: "low",
+                    worktree: dir.path(),
+                    prompt: "restricted prompt",
+                    environment: &[],
+                    mode: LaunchMode::Restricted,
+                    continuation_id: None,
+                },
+                &AdapterConfig {
+                    executable: executable.to_str(),
+                    claude_bare: false,
+                    claude_allowed_tools: "",
+                    codex_sandbox: "danger-full-access",
+                    grok: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(proc.kind(), expected_kind);
+            while proc.next_raw_line().await.is_some() {}
+            proc.kill_and_reap().await;
+            let args = std::fs::read_to_string(dir.path().join("args.log")).unwrap();
+            match expected_kind {
+                AgentKind::Claude => {
+                    assert!(args.contains("<--safe-mode>"), "{args}");
+                    assert!(args.contains("<--no-session-persistence>"), "{args}");
+                    assert!(!args.contains("<--add-dir>"), "{args}");
+                }
+                AgentKind::Codex => {
+                    assert!(args.contains("<read-only>"), "{args}");
+                    assert!(
+                        !args.contains("<--dangerously-bypass-approvals-and-sandbox>"),
+                        "{args}"
+                    );
+                }
+                AgentKind::Grok => unreachable!("fixture contains only Claude and Codex"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_rejects_unknown_model_before_adapter_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match RunnerProc::launch(
+            &LaunchRequest {
+                model: "unknown-runner-model",
+                effort: "low",
+                worktree: dir.path(),
+                prompt: "prompt",
+                environment: &[],
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &AdapterConfig {
+                executable: Some("/definitely/not/a/runner"),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "read-only",
+                grok: Default::default(),
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("unknown model unexpectedly launched"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("unknown model"));
+        assert_eq!(error.disposition(), FailureDisposition::Unclassified);
+    }
+
+    #[tokio::test]
+    async fn missing_runner_binary_is_non_failover_startup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match RunnerProc::launch(
+            &LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "medium",
+                worktree: dir.path(),
+                prompt: "prompt",
+                environment: &[],
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &AdapterConfig {
+                executable: Some("/definitely/not/a/runner"),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "read-only",
+                grok: Default::default(),
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("missing binary unexpectedly launched"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.disposition(), FailureDisposition::NonFailover);
+    }
+
+    #[test]
+    fn failure_disposition_is_a_closed_five_way_contract() {
+        let dispositions = [
+            FailureDisposition::ProviderUnavailable,
+            FailureDisposition::ProfileUnavailable,
+            FailureDisposition::RetryableSameRoute,
+            FailureDisposition::NonFailover,
+            FailureDisposition::Unclassified,
+        ];
+        assert_eq!(dispositions.len(), 5);
+        assert_eq!(FailureDisposition::Unclassified.to_string(), "unclassified");
+    }
+
+    #[test]
+    fn blank_provider_records_leave_failure_tracking_inert() {
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok] {
+            let tracker = FailureTracker::for_kind(kind);
+            tracker.observe_stdout("");
+            let state = tracker.0.lock().unwrap();
+            assert!(
+                !state.saw_protocol_line,
+                "{kind} blank line became protocol evidence"
+            );
+            assert!(state.classified.is_none());
+            assert!(state.unknown_failure.is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continuation_identity_dispatches_to_codex_resume_only_in_normal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = recording_runner(dir.path());
+        let mut proc = RunnerProc::launch(
+            &LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: dir.path(),
+                prompt: "continue exactly",
+                environment: &[],
+                mode: LaunchMode::Normal,
+                continuation_id: Some("provider-thread-7"),
+            },
+            &AdapterConfig {
+                executable: executable.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        while proc.next_raw_line().await.is_some() {}
+        proc.kill_and_reap().await;
+        let args = std::fs::read_to_string(dir.path().join("args.log")).unwrap();
+        let argv: Vec<&str> = args.lines().collect();
+        assert_eq!(&argv[..3], &["<exec>", "<resume>", "<provider-thread-7>"]);
+        assert!(args.contains("<continue exactly>"), "{args}");
+
+        let error = match RunnerProc::launch(
+            &LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: dir.path(),
+                prompt: "invalid restricted resume",
+                environment: &[],
+                mode: LaunchMode::Restricted,
+                continuation_id: Some("provider-thread-7"),
+            },
+            &AdapterConfig {
+                executable: executable.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("restricted continuation unexpectedly launched"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
     #[test]
     fn normalize_result_success() {
         let line = r#"{"type":"result","result":"done","usage":{"input_tokens":100,"output_tokens":50},"total_cost_usd":0.05}"#;
@@ -568,65 +1542,11 @@ mod tests {
             AgentEvent::TurnCompleted { usage, cost_usd } => {
                 let u = usage.unwrap();
                 assert_eq!(u.input_tokens, 100);
-                assert_eq!(u.uncached_input_tokens, 100);
                 assert_eq!(u.output_tokens, 50);
                 assert!((cost_usd.unwrap() - 0.05).abs() < f64::EPSILON);
             }
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn codex_usage_preserves_legacy_live_meter_and_durable_cache_breakdown() {
-        let line = r#"{"type":"turn.completed","usage":{"input_tokens":1376345,"cached_input_tokens":1294080,"cache_write_input_tokens":0,"output_tokens":6691,"reasoning_output_tokens":3518}}"#;
-        let events = normalize_codex_line(line);
-        match events.as_slice() {
-            [AgentEvent::TurnCompleted {
-                usage: Some(usage), ..
-            }] => {
-                assert_eq!(usage.input_tokens, 1_376_345);
-                assert_eq!(usage.uncached_input_tokens, 82_265);
-                assert_eq!(usage.cached_input_tokens, 1_294_080);
-                assert_eq!(usage.output_tokens, 6_691);
-                assert_eq!(usage.reasoning_tokens, 3_518);
-                assert_eq!(usage.live_total_tokens(), 1_383_036);
-            }
-            other => panic!("expected one completed event, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn claude_usage_preserves_cache_read_and_creation_fields() {
-        let line = r#"{"type":"result","result":"done","usage":{"input_tokens":100,"cache_read_input_tokens":900,"cache_creation_input_tokens":50,"output_tokens":25}}"#;
-        let events = normalize_claude_line(line);
-        match events.as_slice() {
-            [AgentEvent::TurnCompleted {
-                usage: Some(usage), ..
-            }] => {
-                assert_eq!(usage.input_tokens, 100);
-                assert_eq!(usage.uncached_input_tokens, 100);
-                assert_eq!(usage.cached_input_tokens, 900);
-                assert_eq!(usage.cache_write_input_tokens, 50);
-                assert_eq!(usage.output_tokens, 25);
-            }
-            other => panic!("expected one completed event, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn live_total_excludes_durable_cache_breakdown() {
-        let usage = TokenUsage {
-            input_tokens: 100,
-            uncached_input_tokens: 100,
-            cached_input_tokens: 900,
-            cache_write_input_tokens: 50,
-            output_tokens: 25,
-            reasoning_tokens: 10,
-        };
-
-        assert_eq!(usage.live_total_tokens(), 125);
-        assert_eq!(usage.cached_input_tokens, 900);
-        assert_eq!(usage.cache_write_input_tokens, 50);
     }
 
     #[test]
@@ -764,6 +1684,7 @@ mod tests {
     fn agent_kind_display() {
         assert_eq!(AgentKind::Claude.to_string(), "claude");
         assert_eq!(AgentKind::Codex.to_string(), "codex");
+        assert_eq!(AgentKind::Grok.to_string(), "grok");
     }
 
     #[test]
@@ -798,6 +1719,14 @@ mod tests {
             AgentKind::for_model("gpt-5.6-terra").unwrap(),
             AgentKind::Codex
         );
+    }
+
+    #[test]
+    fn for_model_grok_is_exact_and_closed() {
+        assert_eq!(AgentKind::for_model("grok-4.5").unwrap(), AgentKind::Grok);
+        assert!(AgentKind::for_model("grok").is_err());
+        assert!(AgentKind::for_model("grok-4.6").is_err());
+        assert!(AgentKind::for_model("/opt/bin/grok").is_err());
     }
 
     #[test]

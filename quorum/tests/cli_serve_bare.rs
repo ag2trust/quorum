@@ -299,10 +299,9 @@ fn task_get_json(home: &std::path::Path, task_id: u32) -> String {
 /// 2026-07-10 live incident: spawn_classifier hardcoded bare:true, so on
 /// subscription-auth machines every classifier turn failed "Not logged in"
 /// and the daemon respawn-looped. These two tests pin the classifier spawn
-/// to the daemon's bare_agent config end-to-end: fake-agent answers the
-/// classifier prompt with an `area:fake-bare` / `area:fake-nobare` cx tag
-/// depending on whether it was spawned with --bare, and we assert the tag
-/// that lands in the task's refs.
+/// to the daemon's bare_agent config end-to-end: fake-agent varies its
+/// classifier size based on whether it was spawned with --bare, and we assert
+/// the value that lands in the task's refs.
 ///
 /// #180: default changed from bare to system-login (no_bare_agent=true).
 #[test]
@@ -340,7 +339,7 @@ fn classifier_spawn_uses_system_login_by_default() {
 
     let refs = task_get_json(home.path(), 1);
     assert!(
-        refs.contains("area:fake-nobare"),
+        refs.contains(r#"\"cx_size\":\"S\""#),
         "classifier should NOT get --bare by default (system login); task refs: {refs}"
     );
 }
@@ -380,7 +379,7 @@ fn classifier_spawn_respects_no_bare_agent() {
 
     let refs = task_get_json(home.path(), 1);
     assert!(
-        refs.contains("area:fake-nobare"),
+        refs.contains(r#"\"cx_size\":\"S\""#),
         "classifier agent must NOT get --bare under --no-bare-agent; task refs: {refs}"
     );
 }
@@ -408,7 +407,29 @@ fn config_file_bare_false_enables_bare_mode() {
     std::fs::write(
         &config_path,
         format!(
-            "repo = \"test/repo\"\nrepo_dir = \"{}\"\nworktree_base = \"{}\"\nno_bare_agent = false\n",
+            concat!(
+                "repo = \"test/repo\"\n",
+                "repo_dir = \"{}\"\n",
+                "worktree_base = \"{}\"\n",
+                "no_bare_agent = false\n",
+                "[model_profiles.primary]\n",
+                "runner = \"claude\"\n",
+                "model = \"claude-opus-4-6\"\n",
+                "effort = \"high\"\n",
+                "[routing.classifier]\nprimary = 100\n",
+                "[routing.planner]\nprimary = 100\n",
+                "[routing.collector]\nprimary = 100\n",
+                "[routing.worker.\"1\"]\nprimary = 100\n",
+                "[routing.worker.\"2\"]\nprimary = 100\n",
+                "[routing.worker.\"3\"]\nprimary = 100\n",
+                "[routing.worker.\"4\"]\nprimary = 100\n",
+                "[routing.worker.\"5\"]\nprimary = 100\n",
+                "[routing.reviewer.\"1\"]\nprimary = 100\n",
+                "[routing.reviewer.\"2\"]\nprimary = 100\n",
+                "[routing.reviewer.\"3\"]\nprimary = 100\n",
+                "[routing.reviewer.\"4\"]\nprimary = 100\n",
+                "[routing.reviewer.\"5\"]\nprimary = 100\n",
+            ),
             repo_dir.path().display(),
             wt_base.path().display(),
         ),

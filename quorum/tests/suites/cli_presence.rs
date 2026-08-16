@@ -5,7 +5,7 @@
 //! (1) a lost race still bumps presence, (2) a pre-write usage error leaves no trace,
 //! (3) pure-read commands never create/bump an agent row.
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;

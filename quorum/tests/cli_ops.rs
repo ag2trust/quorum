@@ -51,7 +51,7 @@ fn status_dashboard_emits_all_sections() {
     // agents-by-tier, queue, active claims with TTL, throughput, recent feed.
     let home = tempfile::tempdir().unwrap();
 
-    // Seed: one open tiered task (queue), one claimed task (its lease = the active claim),
+    // Seed: one open task (queue), one claimed task (its lease = the active claim),
     // one feed message — every section gets a row.
     quorum(home.path())
         .args([
@@ -61,7 +61,7 @@ fn status_dashboard_emits_all_sections() {
             "--title",
             "ship-it",
             "--labels",
-            r#"["tier:opus-47"]"#,
+            r#"["component:release"]"#,
         ])
         .assert()
         .success();
@@ -86,8 +86,7 @@ fn status_dashboard_emits_all_sections() {
         .stdout(predicates::str::contains("PIPELINE"))
         .stdout(predicates::str::contains("ERRORS"))
         .stdout(predicates::str::contains("ship-it"))
-        .stdout(predicates::str::contains("claude"))
-        .stdout(predicates::str::contains("claude-opus-4-7"));
+        .stdout(predicates::str::contains("pending"));
 }
 
 #[test]
@@ -102,7 +101,7 @@ fn status_json_includes_dashboard_fields() {
             "--title",
             "x",
             "--labels",
-            r#"["tier:opus-46"]"#,
+            r#"["component:release"]"#,
         ])
         .assert()
         .success();
@@ -136,13 +135,13 @@ fn status_json_includes_dashboard_fields() {
     );
     assert!(json.get("claim_ttls").is_some(), "claim_ttls field missing");
     assert!(json.get("throughput").is_some(), "throughput field missing");
-    // Data: one open task with tier:opus-46.
+    // Data: creator-owned labels do not assign a routing tier.
     let queue = json["queue_by_tier"].as_array().unwrap();
     assert!(
         queue
             .iter()
-            .any(|q| q["tier"] == "tier:opus-46" && q["open"] == 1),
-        "expected tier:opus-46 bucket with 1 open, got: {queue:?}"
+            .any(|q| q["tier"] == "untiered" && q["open"] == 1),
+        "expected untiered bucket with 1 open, got: {queue:?}"
     );
     // throughput keys present (numbers — counts are 0 in this fresh test).
     let tp = &json["throughput"];

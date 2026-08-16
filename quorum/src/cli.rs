@@ -17,11 +17,18 @@ pub fn short_version() -> &'static str {
     env!("QUORUM_GIT_DESCRIBE")
 }
 
+/// Commit SHA embedded independently of the human-readable version string.
+/// `git describe` is just a tag for an exact-tag release, so it cannot be the
+/// sole source of the running build's identity.
+pub fn build_sha_short() -> &'static str {
+    env!("QUORUM_GIT_SHA_SHORT")
+}
+
 #[derive(Parser)]
 #[command(
     name = "quorum",
     version = long_version(),
-    about = "Local agent coordination (by agents, for agents)",
+    about = "Local, daemon-managed coding agents",
     // We define our own `help` subcommand below (the agent cheat-sheet, recovery-safe).
     // Without this, clap auto-generates a generic `help` that would collide with ours.
     disable_help_subcommand = true
@@ -53,7 +60,8 @@ pub enum Command {
         /// JSON array of labels, e.g. '["ui","p1"]'.
         #[arg(long)]
         labels: Option<String>,
-        /// JSON of external refs, e.g. '{"pr":2459}'.
+        /// JSON of non-authoritative external refs. PR association requires --review-pr or
+        /// --continue-pr; refs.pr is rejected.
         #[arg(long)]
         refs: Option<String>,
         /// JSON array of task ids this task depends on, e.g. '[1,3]'. Claim (auto-pick AND
@@ -62,8 +70,15 @@ pub enum Command {
         #[arg(long = "depends-on")]
         depends_on: Option<String>,
         /// Create as a review-only task (starts in in-review). The PR number is stored in refs.pr.
-        #[arg(long = "review-pr")]
+        #[arg(long = "review-pr", conflicts_with = "continue_pr")]
         review_pr: Option<i64>,
+        /// Continue implementation from an existing PR. Starts as an open implementation task;
+        /// the daemon provisions the worker from this PR rather than the configured base.
+        #[arg(long = "continue-pr", conflicts_with = "review_pr")]
+        continue_pr: Option<i64>,
+        /// Local branch to target. Defaults to this repository's configured daemon base branch.
+        #[arg(long = "base-branch")]
+        base_branch: Option<String>,
         #[arg(long = "body-stdin")]
         body_stdin: bool,
         #[arg(long = "body-file")]
@@ -90,12 +105,15 @@ pub enum Command {
     /// have **no assignee guard** (any agent can leave one) and can be combined with the
     /// other field updates in the same call.
     ///
-    /// Verdict transitions are daemon-managed only — use `quorum submit --verdict` (#130).
+    /// Verdict transitions are daemon-managed only — use `quorum submit --verdict`.
     TaskUpdate {
         #[arg(long)]
         agent: String,
         #[arg(long = "task-id")]
         task_id: i64,
+        /// Current task revision. Required when changing body, refs, or dependencies.
+        #[arg(long = "expected-revision")]
+        expected_revision: Option<i64>,
         #[arg(long)]
         status: Option<String>,
         #[arg(long)]
@@ -223,7 +241,7 @@ pub enum Command {
     },
     /// List every active stop (global and per-agent). Read-only.
     Stops,
-    /// Post a pinned standing notice (issue #78). Non-expiring, cursor-independent —
+    /// Post a pinned standing notice. Non-expiring and cursor-independent —
     /// surfaced in EVERY agent's `sync.pinned` until explicitly unpinned. Body (free
     /// text) via --body-stdin or --body-file.
     Pin {
@@ -265,9 +283,21 @@ pub enum Command {
         #[arg(long)]
         agents: bool,
     },
+    /// Serve the read-only local dashboard (binds to 127.0.0.1 by default).
+    Web {
+        /// TCP port for the dashboard.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Loopback address (127.0.0.1 or ::1 only; remote serving is unsupported).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Session-log root. Defaults to ~/.quorum/logs; set this to the daemon's --log-dir.
+        #[arg(long)]
+        log_dir: Option<PathBuf>,
+    },
     /// Reclaim all expired rows and checkpoint the WAL.
     Sweep,
-    /// EXPERIMENTAL (issue #101) — register a Claude session UUID → agent name
+    /// EXPERIMENTAL — register a Claude session UUID → agent name
     /// for the optional PostToolUse activity hook. Stats-only; no workflow
     /// impact. Idempotent; re-register extends the session TTL (48h).
     SessionRegister {
@@ -276,7 +306,7 @@ pub enum Command {
         #[arg(long)]
         session: String,
     },
-    /// EXPERIMENTAL (issue #101) — record one tool-use event for the activity
+    /// EXPERIMENTAL — record one tool-use event for the activity
     /// stats surface. Resolves `--session` → agent name via the
     /// `session-register` mapping; fail-open (unregistered session is still
     /// recorded with `agent_name = NULL` → counted as "unknown" in stats).
@@ -334,11 +364,18 @@ pub enum Command {
         /// Review verdict: approved or changes.
         #[arg(long)]
         verdict: Option<String>,
-        /// Review feedback (required with --verdict changes — it becomes the
-        /// worker's rework instructions).
-        #[arg(long)]
+        /// Compatibility input for short review feedback. Prefer --feedback-file because
+        /// feedback becomes free-text rework instructions.
+        #[arg(long, conflicts_with = "feedback_file")]
         feedback: Option<String>,
-        /// Count of BLOCKING findings in your review (#206). `--verdict approved`
+        /// Read review feedback from a file. Required with --verdict changes unless the
+        /// compatibility --feedback flag is supplied.
+        #[arg(long = "feedback-file")]
+        feedback_file: Option<PathBuf>,
+        /// Closed bounded JSON evidence for `--verdict graph-blocker`.
+        #[arg(long = "feedback-json", conflicts_with_all = ["feedback", "feedback_file", "blocking"])]
+        feedback_json: Option<String>,
+        /// Count of BLOCKING findings in your review. `--verdict approved`
         /// requires `--blocking 0` — any blocking finding requires
         /// `--verdict changes`.
         #[arg(long)]
@@ -347,8 +384,8 @@ pub enum Command {
         #[arg(long = "run-id")]
         run_id: Option<String>,
     },
-    /// Launch the agent-manager daemon. Spawns and drives Claude Code agents as
-    /// persistent stdin-fed processes, polls the mailbox, and shuts down on Ctrl-C.
+    /// Launch the agent-manager daemon. Spawns and drives Claude or Codex agents,
+    /// polls their lifecycle signals, and shuts down on Ctrl-C.
     Serve {
         /// Path to a TOML config file. Default: ~/.quorum/serve/<owner>__<repo>.toml
         /// if present. CLI flags override config-file values.
@@ -367,18 +404,9 @@ pub enum Command {
         /// When absent, names are auto-generated.
         #[arg(long)]
         names_file: Option<String>,
-        /// Runner type: "claude" (default) or "codex".
-        #[arg(long)]
-        agent: Option<String>,
         /// Override the agent binary (default: "claude" or "codex" per runner).
         #[arg(long)]
         agent_bin: Option<String>,
-        /// Model to pass to spawned agents (default: sonnet).
-        #[arg(long)]
-        model: Option<String>,
-        /// Effort level to pass to spawned agents (default: high).
-        #[arg(long)]
-        effort: Option<String>,
         /// Path to a file containing a GitHub token for merging PRs.
         /// Read at merge time; never passed to agent processes.
         #[arg(long)]
@@ -421,14 +449,16 @@ pub enum Command {
         /// Max cumulative USD cost per task.
         #[arg(long)]
         max_task_cost_usd: Option<f64>,
-        /// Max wall-clock seconds per single turn.
+        /// Deprecated alias for --max-idle-secs.
         #[arg(long)]
         max_turn_wall_secs: Option<u64>,
+        /// Max seconds an active worker/reviewer may go without emitting an event.
+        #[arg(long)]
+        max_idle_secs: Option<u64>,
         /// Max wall-clock seconds per task (across all turns).
         #[arg(long)]
         max_task_wall_secs: Option<u64>,
-        /// Max seconds a worker/reviewer may sit idle between turns before
-        /// the watchdog kills it (default: 300). Catches zombies.
+        /// Legacy idle limit. Prefer max_idle_secs (default: 900).
         #[arg(long)]
         idle_timeout_secs: Option<u64>,
         /// Comma-separated tool allowlist for spawned agents (overrides built-in default).
@@ -451,7 +481,7 @@ pub enum Command {
         /// Default: derived from --repo-dir's origin remote via `gh repo view`.
         #[arg(long)]
         self_repo: Option<String>,
-        /// Interval between git ls-remote sha polls in seconds (default: 60).
+        /// Interval between git ls-remote build-staleness checks in seconds (default: 600).
         #[arg(long, hide = true)]
         sha_poll_interval_secs: Option<u64>,
         /// Repo this daemon manages (e.g. "ag2trust/quorum"). Required
@@ -500,11 +530,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Classify tasks: assign complexity scores, shape-lint flags, type tags,
-    /// and duplicate-of hints. Primarily driven by the daemon; this command is
-    /// for manual backfill of historical tasks.
+    /// Classify tasks: assign complexity, size, readiness, readiness reason,
+    /// and duplicate candidates. Primarily driven by the daemon; this command
+    /// is for manual backfill of historical tasks.
     Classify {
-        /// Backfill all tasks (any status) that lack a complexity score.
+        /// Backfill all tasks (any status) that lack a complete classification.
         #[arg(long)]
         backfill: bool,
         /// Override the agent binary (default: "claude").
@@ -513,7 +543,7 @@ pub enum Command {
         /// Use the operator's installed Claude login (default: true).
         /// Set to false to pass --bare, requiring non-interactive credentials
         /// in the environment.
-        #[arg(long)]
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
         no_bare_agent: bool,
     },
     /// Interpret PR review comments: fetch both comment endpoints, run a cheap
@@ -567,6 +597,23 @@ pub enum Command {
         #[arg(long)]
         by: String,
     },
+    /// Explicitly adopt one completed managed continuation as the exact
+    /// delivery of the final failed member of an active decomposition. This
+    /// operator-only incident recovery requires durable publication, managed
+    /// approval, exact approved-head, and merge evidence; it never infers a
+    /// relationship from task text or a shared PR alone. Replay or any
+    /// mismatched evidence is a clean negative (exit 1).
+    DecompositionAdoptRecovery {
+        /// Exact failed generated child to complete.
+        #[arg(long = "original-child-id")]
+        original_child_id: i64,
+        /// Exact completed continuation whose delivery is being adopted.
+        #[arg(long = "recovery-task-id")]
+        recovery_task_id: i64,
+        /// Coordinator/operator identity recorded in durable recovery provenance.
+        #[arg(long)]
+        by: String,
+    },
     /// Hard-terminate a daemon-managed agent. Writes a kill request to the
     /// mailbox; the daemon consumes it and SIGTERM→SIGKILL the child process,
     /// releases the slot, and runs the post-mortem ladder on any held task.
@@ -590,7 +637,7 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
+    /// Print a short role-based workflow guide. Use `<command> --help` for exact flags.
     /// `help-agent` is kept as a back-compat alias.
     #[command(name = "help", alias = "help-agent")]
     Help,
@@ -681,4 +728,27 @@ pub enum Command {
         #[arg(long)]
         raw: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn classify_defaults_to_operator_login_and_allows_explicit_bare_auth() {
+        let default = Cli::try_parse_from(["quorum", "classify", "--backfill"]).unwrap();
+        let Command::Classify { no_bare_agent, .. } = default.command else {
+            panic!("expected classify command");
+        };
+        assert!(no_bare_agent);
+
+        let explicit_bare =
+            Cli::try_parse_from(["quorum", "classify", "--backfill", "--no-bare-agent=false"])
+                .unwrap();
+        let Command::Classify { no_bare_agent, .. } = explicit_bare.command else {
+            panic!("expected classify command");
+        };
+        assert!(!no_bare_agent);
+    }
 }

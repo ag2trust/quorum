@@ -10,7 +10,7 @@
 //! - `throughput` — closed-last-hour + oldest-done-awaiting-review (catches review-loop stalls).
 
 use crate::error::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 /// How many recent messages to surface on `status`. Bounded to keep the output cheap.
@@ -21,6 +21,10 @@ pub const MSG_PREVIEW_CHARS: usize = 80;
 pub const DONE_STUCK_THRESHOLD_SECS: i64 = 30 * 60;
 /// Alerts older than this stay in the feed but no longer affect the status snapshot.
 pub const ALERT_WINDOW_SECS: i64 = 12 * 60 * 60;
+const ALERT_DISPLAY_LIMIT: i64 = 10;
+/// Durable post-submit tasks to surface in REVIEWING. Bounded so `status --watch`
+/// remains cheap if review-only tasks accumulate.
+pub const REVIEWING_TASK_LIMIT: i64 = 20;
 
 /// Sidecar file written by the daemon per agent slot — carries live progress
 /// stats that the status reader picks up without a DB schema change.
@@ -226,7 +230,19 @@ pub struct QueueTask {
     pub pr: Option<i64>,
 }
 
-/// Task pipeline row: `done` (awaiting review) + tasks closed/merged in the last hour (#204).
+/// A task in the post-submit review or merge band, shown in REVIEWING.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ReviewingTask {
+    pub id: i64,
+    pub title: String,
+    pub pr: Option<i64>,
+    /// The in-flight reviewer agent, if the daemon currently has one for this task.
+    pub reviewer: Option<String>,
+    /// `reviewing`, `awaiting reviewer`, or `merging`.
+    pub state: String,
+}
+
+/// Task pipeline row: active daemon-owned coordinators plus tasks merged in the last hour (#204).
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct PipelineTask {
     pub id: i64,
@@ -239,6 +255,39 @@ pub struct PipelineTask {
     pub status: String,
     pub pr: Option<i64>,
     pub blocked: bool,
+}
+
+/// Bounded child projection for the repository's current decomposition graph.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DecompositionMemberView {
+    pub task_id: i64,
+    pub local_key: String,
+    pub title: String,
+    pub status: String,
+    pub prerequisites: Vec<i64>,
+}
+
+/// Read-only projection of the single current decomposition graph.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DecompositionStatusView {
+    pub graph_id: i64,
+    pub source_task_id: i64,
+    pub source_title: String,
+    pub source_status: String,
+    pub graph_state: String,
+    /// Stable reason new graph-member implementation work cannot dispatch.
+    pub dispatch_hold: Option<String>,
+    pub proposal_attempts: i64,
+    pub provider_failures: i64,
+    pub planner_provider: Option<String>,
+    pub planner_model: Option<String>,
+    pub accepted_plan_revision: Option<i64>,
+    pub completed_children: i64,
+    pub total_children: i64,
+    pub child_statuses: Vec<StatusCount>,
+    pub failed_children: Vec<i64>,
+    pub reasons: Vec<String>,
+    pub members: Vec<DecompositionMemberView>,
 }
 
 /// Deduped error for the ERRORS section — groups repeated messages.
@@ -341,8 +390,12 @@ pub struct Stats {
     pub daemon_agents: Vec<DaemonAgentView>,
     /// #204: individual claimable tasks for QUEUE section.
     pub queue_tasks: Vec<QueueTask>,
+    /// Tasks in the durable post-submit review/merge band.
+    pub reviewing: Vec<ReviewingTask>,
     /// #204: task pipeline view (all active + recently closed).
     pub pipeline: Vec<PipelineTask>,
+    /// Current planning cycle or active/held decomposition graph, if any.
+    pub decomposition: Option<DecompositionStatusView>,
     /// #204: deduped errors from last hour.
     pub recent_errors: Vec<DedupedError>,
     /// #204: count of older errors silenced (>1h).
@@ -431,7 +484,9 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let activity = crate::activity::activity_summary(conn, now)?;
     let daemon_agents = daemon_agents_view(conn, now)?;
     let queue_tasks_list = queue_tasks(conn)?;
+    let reviewing = reviewing_tasks(conn, &daemon_agents)?;
     let pipeline = pipeline_tasks(conn, now)?;
+    let decomposition = decomposition_status(conn)?;
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
     let alerts = alert_messages(conn, now)?;
     let merge_blockers = merge_blockers(conn, now)?;
@@ -471,7 +526,9 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         activity,
         daemon_agents,
         queue_tasks: queue_tasks_list,
+        reviewing,
         pipeline,
+        decomposition,
         recent_errors,
         older_errors_silenced,
         health,
@@ -483,6 +540,39 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         merge_blockers,
         daemon: DaemonLiveness::default(),
     })
+}
+
+/// Small, bounded pieces of the status snapshot used by the polling web dashboard.
+/// Keep this separate from [`stats`]: the terminal status command intentionally includes
+/// complete persistent collections, which are unsuitable for a request made every 2s.
+pub fn web_task_counts(conn: &Connection) -> Result<Vec<StatusCount>> {
+    let mut stmt = conn
+        .prepare("SELECT status, count(*) FROM tasks GROUP BY status ORDER BY status LIMIT 32")?;
+    let counts = stmt
+        .query_map([], |r| {
+            Ok(StatusCount {
+                status: r.get(0)?,
+                count: r.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(counts)
+}
+
+/// The dashboard alert pane has the same bounded semantics as `status`.
+pub fn web_alerts(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
+    alert_messages(conn, now)
+}
+
+/// The dashboard error pane has the same bounded semantics as `status`.
+pub fn web_recent_errors(conn: &Connection, now: i64) -> Result<Vec<DedupedError>> {
+    Ok(deduped_errors(conn, now)?.0)
+}
+
+/// The dashboard's bounded live-agent view. Reuse the journal-backed projection
+/// from `quorum status` so both surfaces agree about current daemon work.
+pub fn web_daemon_agents(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView>> {
+    daemon_agents_view(conn, now)
 }
 
 /// Per-online-agent view. Tier read from the stored `agents.tier` column (persisted on
@@ -701,11 +791,38 @@ fn queue_by_tier(conn: &Connection) -> Result<Vec<TierQueueCount>> {
         .collect())
 }
 
-/// Open tasks blocked by unmet dependencies (#86). Returns each blocked task with the
-/// list of dep ids it's waiting on (only deps that are NOT yet `closed`).
+/// Open tasks blocked by unmet dependencies (#86) plus daemon-parked
+/// (`status='failed'`) tasks whose `depends_on` currently contains any
+/// cancelled dep. The latter are the operator disposition queue — task-retry
+/// refuses until `depends_on` is edited or the dependent is closed.
+///
+/// Deliberately infers the unsatisfiable condition from the live dep graph
+/// instead of gating on the durable `daemon_parked_unsatisfiable` marker.
+/// Reason: cancellation writes commit before any subsequent sweep would set
+/// that marker (sweep_on_write runs before the mutator writes), so a purely
+/// marker-gated read would hide the row for an unbounded interval after
+/// cancellation. Inference is authoritative regardless of when refs get
+/// refreshed by `converge_parked_dependents_of_cancelled`. Also covers
+/// classifier-policy parks (their `daemon_parked_reason` stays "classifier
+/// declined" so refs never gain the marker, but the cancelled dep is still
+/// the operator disposition and must surface).
 fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, labels, depends_on FROM tasks WHERE status='open' AND depends_on IS NOT NULL",
+        "SELECT t.id, t.title, t.labels, t.depends_on, t.status FROM tasks t
+         WHERE t.depends_on IS NOT NULL
+           AND (
+               t.status='open'
+               OR (
+                   t.status='failed'
+                   AND json_valid(t.refs)
+                   AND json_extract(t.refs, '$.daemon_parked')=1
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(t.depends_on) j
+                       JOIN tasks d ON d.id = j.value
+                       WHERE d.status = 'cancelled'
+                   )
+               )
+           )",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -713,14 +830,19 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
             let title: String = r.get(1)?;
             let labels: Option<String> = r.get(2)?;
             let depends_on: Option<String> = r.get(3)?;
-            Ok((id, title, labels, depends_on))
+            let status: String = r.get(4)?;
+            Ok((id, title, labels, depends_on, status))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut blocked = Vec::new();
-    for (id, title, labels, depends_on) in rows {
-        let ready = crate::tasks::compute_ready(conn, &depends_on)?;
-        if ready {
-            continue;
+    for (id, title, labels, depends_on, status) in rows {
+        // Parked-unsatisfiable rows always render (they are the disposition
+        // queue). Open rows only render when they are actually blocked.
+        if status == "open" {
+            let ready = crate::tasks::compute_ready(conn, &depends_on)?;
+            if ready {
+                continue;
+            }
         }
         let waiting_on = unmet_deps(conn, &depends_on)?;
         let deadlocked_on = cancelled_deps(conn, &depends_on)?;
@@ -1143,13 +1265,79 @@ fn extract_pr_from_refs(refs_json: Option<&str>) -> Option<i64> {
     v.get("pr")?.as_i64()
 }
 
-/// Task pipeline view: tasks in active lifecycle stages + recently done/closed (#204).
+/// Tasks that have been submitted and still require review or merging.
+///
+/// This is derived from durable task state so CI waits and reviewer-spawn failures
+/// remain visible when no reviewer process is live.
+fn reviewing_tasks(
+    conn: &Connection,
+    daemon_agents: &[DaemonAgentView],
+) -> Result<Vec<ReviewingTask>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, status, refs FROM (
+             SELECT id, title, status, refs, updated_at FROM (
+                 SELECT id, title, status, refs, updated_at FROM tasks
+                 WHERE status='in-review'
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT ?1
+             )
+             UNION ALL
+             SELECT id, title, status, refs, updated_at FROM (
+                 SELECT id, title, status, refs, updated_at FROM tasks
+                 WHERE status='merging'
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT ?1
+             )
+         )
+         ORDER BY updated_at DESC, id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![REVIEWING_TASK_LIMIT], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, title, status, refs)| {
+            let reviewer = daemon_agents
+                .iter()
+                .find(|agent| agent.role == "reviewer" && agent.task_id == Some(id))
+                .map(|agent| agent.agent.clone());
+            let state = if status == "merging" {
+                "merging".to_string()
+            } else if reviewer.is_some() {
+                "reviewing".to_string()
+            } else {
+                "awaiting reviewer".to_string()
+            };
+            ReviewingTask {
+                id,
+                title,
+                pr: extract_pr_from_refs(refs.as_deref()),
+                reviewer,
+                state,
+            }
+        })
+        .collect())
+}
+
+/// Task pipeline view: daemon-owned source stages + recently done/closed (#204).
 /// Done/closed tasks are time-windowed to the last hour to avoid unbounded growth.
 /// Excludes `open` (already in QUEUE/BLOCKED), `cancelled`, and `parked`.
 fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
     let hour_ago = now - 3600;
     let mut stmt = conn.prepare(
         "SELECT id, title, status, refs, depends_on FROM tasks
+         WHERE status IN ('planning', 'decomposed')
+         UNION ALL
+         SELECT id, title, status, refs, depends_on FROM tasks
          WHERE status = 'done' AND updated_at > ?1
          UNION ALL
          SELECT id, title, status, refs, depends_on FROM tasks
@@ -1205,6 +1393,148 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
         });
     }
     Ok(result)
+}
+
+/// The schema guarantees at most one active graph/freeze. A held planning result is
+/// also useful owner-facing state, so fall back to the newest non-completed aggregate.
+fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusView>> {
+    let graph = conn
+        .query_row(
+            "SELECT d.id, d.source_task_id, t.title, t.status, d.state, d.active,
+                    d.proposal_attempts, d.provider_failures, d.planner_provider,
+                    d.planner_model, d.accepted_plan_revision, d.hold_summary
+             FROM task_decompositions d
+             JOIN tasks t ON t.id=d.source_task_id
+             WHERE d.active=1 OR d.freeze_active=1
+                OR d.state NOT IN ('completed','cancelled')
+             ORDER BY (d.active=1 OR d.freeze_active=1) DESC, d.updated_at DESC, d.id DESC
+             LIMIT 1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, bool>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                    r.get::<_, Option<i64>>(10)?,
+                    r.get::<_, Option<String>>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        graph_id,
+        source_task_id,
+        source_title,
+        source_status,
+        graph_state,
+        graph_active,
+        proposal_attempts,
+        provider_failures,
+        planner_provider,
+        planner_model,
+        accepted_plan_revision,
+        hold_summary,
+    )) = graph
+    else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT m.task_id, m.local_key, t.title, t.status, t.depends_on
+         FROM task_graph_members m JOIN tasks t ON t.id=m.task_id
+         WHERE m.graph_id=?1 AND m.active=1
+         ORDER BY m.local_key, m.task_id",
+    )?;
+    let members = stmt
+        .query_map(params![graph_id], |r| {
+            let depends_on: Option<String> = r.get(4)?;
+            let prerequisites = depends_on
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Vec<i64>>(json).ok())
+                .unwrap_or_default();
+            Ok(DecompositionMemberView {
+                task_id: r.get(0)?,
+                local_key: r.get(1)?,
+                title: r.get(2)?,
+                status: r.get(3)?,
+                prerequisites,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut counts = std::collections::BTreeMap::<String, i64>::new();
+    let mut failed_children = Vec::new();
+    let mut completed_children = 0;
+    for member in &members {
+        *counts.entry(member.status.clone()).or_default() += 1;
+        if member.status == "done" || member.status == "closed" {
+            completed_children += 1;
+        }
+        if member.status == "failed" || member.status == "cancelled" {
+            failed_children.push(member.task_id);
+        }
+    }
+    let child_statuses = counts
+        .into_iter()
+        .map(|(status, count)| StatusCount { status, count })
+        .collect();
+
+    // Keep reasons bounded independently of graph history. Summaries are already
+    // length-bounded at their write boundary; no prompt or transcript is selected.
+    let mut reasons = hold_summary.into_iter().collect::<Vec<_>>();
+    let mut reason_stmt = conn.prepare(
+        "SELECT summary FROM decomposition_attempts WHERE graph_id=?1
+         ORDER BY id DESC LIMIT 6",
+    )?;
+    for reason in reason_stmt
+        .query_map(params![graph_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    {
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    reasons.truncate(6);
+
+    let dispatch_hold = if graph_state != "active" || !graph_active {
+        Some(format!(
+            "implementation dispatch held: graph state={graph_state}, active={}",
+            i64::from(graph_active)
+        ))
+    } else if source_status != "decomposed" {
+        Some(format!(
+            "implementation dispatch held: source status={source_status}"
+        ))
+    } else {
+        None
+    };
+
+    Ok(Some(DecompositionStatusView {
+        graph_id,
+        source_task_id,
+        source_title,
+        source_status,
+        graph_state,
+        dispatch_hold,
+        proposal_attempts,
+        provider_failures,
+        planner_provider,
+        planner_model,
+        accepted_plan_revision,
+        completed_children,
+        total_children: members.len() as i64,
+        child_statuses,
+        failed_children,
+        reasons,
+        members,
+    }))
 }
 
 /// Resolve only an explicit task tier into a display identity. Queue/blocked status
@@ -1264,26 +1594,77 @@ fn deduped_errors(conn: &Connection, now: i64) -> Result<(Vec<DedupedError>, i64
     Ok((recent, older))
 }
 
-/// Owner-alert messages from the last 12 hours for the ALERTS cockpit section (#88).
+/// Owner-alert messages from the last 12 hours plus synthetic health alerts for
+/// terminal tasks that still carry runnable daemon retry state.  The latter is
+/// intentionally read-only so `quorum status` exposes latent corruption before
+/// daemon startup reconciliation gets a chance to clean it.
 fn alert_messages(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
-    let window_start = now - ALERT_WINDOW_SECS;
-    let mut stmt = conn.prepare(
-        "SELECT body, refs, ts, kind
-         FROM messages
-         WHERE expires_at > ?1 AND ts > ?2 AND kind IN ('alert', 'critical')
-         ORDER BY ts DESC
-         LIMIT 10",
+    // Corrupt terminal retry authority is the signal this read-only surface
+    // exists to expose before daemon reconciliation. Reserve display capacity
+    // for it before ordinary persisted alerts, especially during alert-heavy
+    // incidents.
+    let mut terminal = conn.prepare(
+        "SELECT id, status, updated_at
+         FROM tasks INDEXED BY tasks_terminal_retry_recent
+         WHERE status IN ('done','failed','cancelled')
+           AND json_valid(refs)
+           AND (
+               json_type(refs, '$.daemon_rework_retry_requested')='true'
+               OR json_type(refs, '$.daemon_parked_head_check')='true'
+               OR (
+                   status IN ('done','cancelled')
+                   AND (
+                       json_type(refs, '$.daemon_parked') IS NOT NULL
+                       OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                   )
+               )
+               OR (
+                   status='failed'
+                   AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                   AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
+               )
+           )
+         ORDER BY updated_at DESC, id DESC
+         LIMIT ?1",
     )?;
-    let rows = stmt
-        .query_map(params![now, window_start], |r| {
+    let mut rows = terminal
+        .query_map(params![ALERT_DISPLAY_LIMIT], |row| {
+            let id = row.get::<_, i64>(0)?;
+            let status = row.get::<_, String>(1)?;
+            let updated_at = row.get::<_, i64>(2)?;
             Ok(AlertMessage {
-                body: r.get(0)?,
-                refs: r.get(1)?,
-                age_secs: (now - r.get::<_, i64>(2)?).max(0),
-                kind: r.get(3)?,
+                body: format!(
+                    "task #{id} is terminal ({status}) but carries runnable daemon retry markers"
+                ),
+                refs: Some(format!("task#{id}")),
+                age_secs: (now - updated_at).max(0),
+                kind: "critical".into(),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let remaining = ALERT_DISPLAY_LIMIT - rows.len() as i64;
+    if remaining > 0 {
+        let window_start = now - ALERT_WINDOW_SECS;
+        let mut stmt = conn.prepare(
+            "SELECT body, refs, ts, kind
+             FROM messages
+             WHERE expires_at > ?1 AND ts > ?2 AND kind IN ('alert', 'critical')
+             ORDER BY ts DESC
+             LIMIT ?3",
+        )?;
+        let persisted = stmt
+            .query_map(params![now, window_start, remaining], |r| {
+                Ok(AlertMessage {
+                    body: r.get(0)?,
+                    refs: r.get(1)?,
+                    age_secs: (now - r.get::<_, i64>(2)?).max(0),
+                    kind: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.extend(persisted);
+    }
     Ok(rows)
 }
 
@@ -1432,6 +1813,33 @@ mod tests {
         (dir, c)
     }
 
+    fn ready_claim(
+        c: &mut Connection,
+        agent: &str,
+        task_id: Option<i64>,
+        labels: &[&str],
+        ttl: i64,
+        now: i64,
+    ) -> Result<Option<crate::tasks::Task>> {
+        let ids = task_id.into_iter().collect::<Vec<_>>();
+        for id in ids {
+            crate::classify::store_classifications(
+                c,
+                &[crate::classify::TaskClassification {
+                    task_id: id,
+                    cx_est: 3,
+                    size: "M".into(),
+                    ready: true,
+                    not_ready_reason: None,
+                    duplicate_of: vec![],
+                }],
+                "unit-test:v2",
+                now,
+            )?;
+        }
+        crate::tasks::claim(c, agent, task_id, labels, ttl, now)
+    }
+
     #[test]
     fn legacy_null_run_provider_displays_as_claude_live_and_pipeline() {
         let (_d, mut c) = open_tmp();
@@ -1471,6 +1879,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -1551,7 +1962,7 @@ mod tests {
             100,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "Worker", Some(tid), &[], 3600, 100).unwrap();
+        ready_claim(&mut c, "Worker", Some(tid), &[], 3600, 100).unwrap();
         crate::agents::set_tier(&c, "Worker", Some("tier:opus-46")).unwrap();
         // now=2000: both agents last_seen=100 (1900s stale > 900 window).
         // "boss" has no claims → offline. "Worker" holds task claim (expires 3700 > 2000) → online.
@@ -1627,8 +2038,8 @@ mod tests {
             100,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "Alice", Some(t46), &[], 1000, 100).unwrap();
-        crate::tasks::claim(&mut c, "Bob", Some(t47), &[], 1000, 100).unwrap();
+        ready_claim(&mut c, "Alice", Some(t46), &[], 1000, 100).unwrap();
+        ready_claim(&mut c, "Bob", Some(t47), &[], 1000, 100).unwrap();
         // Persist tiers on the agent rows (as sync would do).
         crate::agents::set_tier(&c, "Alice", Some("tier:opus-46")).unwrap();
         crate::agents::set_tier(&c, "Bob", Some("tier:opus-47")).unwrap();
@@ -1859,7 +2270,10 @@ mod tests {
     // ── Agent load score (#95 Phase 1) ─────────────────────────────────
 
     fn make_task(c: &mut Connection, title: &str, now: i64) -> i64 {
-        crate::tasks::create(c, "boss", title, None, 0, None, None, None, None, now).unwrap()
+        let id =
+            crate::tasks::create(c, "boss", title, None, 0, None, None, None, None, now).unwrap();
+        c.execute("UPDATE tasks SET refs=json_object('cx_est',3,'cx_size','M','cx_ready',true,'cx_by','test:v2') WHERE id=?1", [id]).unwrap();
+        id
     }
 
     /// Drive one task through claim → done as `agent`, preserving assignee for
@@ -1867,7 +2281,7 @@ mod tests {
     /// (close_after_merge, close_manual) clear assignee — a separate issue (#114 note).
     fn complete_task_as(c: &mut Connection, agent: &str, claim_ts: i64, done_ts: i64) -> i64 {
         let id = make_task(c, &format!("t-{claim_ts}"), claim_ts - 1);
-        crate::tasks::claim(c, agent, Some(id), &[], 3600, claim_ts).unwrap();
+        ready_claim(c, agent, Some(id), &[], 3600, claim_ts).unwrap();
         c.execute(
             "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
             rusqlite::params![id, done_ts],
@@ -1947,7 +2361,7 @@ mod tests {
         let t3_open =
             crate::tasks::create(&mut c, "boss", "t3", None, 0, None, None, None, None, 300)
                 .unwrap();
-        crate::tasks::claim(&mut c, "Alice", Some(t1), &[], 1000, 400).unwrap();
+        ready_claim(&mut c, "Alice", Some(t1), &[], 1000, 400).unwrap();
         crate::tasks::apply_event(
             &mut c,
             "Alice",
@@ -1956,7 +2370,7 @@ mod tests {
             400,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "Bob", Some(t2), &[], 1000, 500).unwrap();
+        ready_claim(&mut c, "Bob", Some(t2), &[], 1000, 500).unwrap();
         crate::tasks::apply_event(
             &mut c,
             "Bob",
@@ -2023,7 +2437,7 @@ mod tests {
             &mut c, "boss", "stuck", None, 0, None, None, None, None, 100,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "Alice", Some(t), &[], 10000, 100).unwrap();
+        ready_claim(&mut c, "Alice", Some(t), &[], 10000, 100).unwrap();
         crate::tasks::apply_event(
             &mut c,
             "Alice",
@@ -2167,7 +2581,7 @@ mod tests {
             100,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "Alice", Some(t1), &[], 10000, 100).unwrap();
+        ready_claim(&mut c, "Alice", Some(t1), &[], 10000, 100).unwrap();
         crate::tasks::close_after_merge(&mut c, t1, "merged", 100).unwrap();
 
         let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
@@ -2293,7 +2707,7 @@ mod tests {
         )
         .unwrap();
         // Cancel the dep
-        crate::tasks::claim(&mut c, "W", Some(dep), &[], 10000, 100).unwrap();
+        ready_claim(&mut c, "W", Some(dep), &[], 10000, 100).unwrap();
         crate::tasks::update(
             &mut c,
             "W",
@@ -2310,6 +2724,105 @@ mod tests {
         assert_eq!(s.blocked.len(), 1);
         let b = &s.blocked[0];
         assert_eq!(b.id, child);
+        assert_eq!(b.deadlocked_on, vec![dep]);
+    }
+
+    /// Task #473: a parked-unsatisfiable task (status='failed',
+    /// daemon_parked_unsatisfiable=1) surfaces in the BLOCKED section with
+    /// the cancelled dep id in `deadlocked_on`. Without this, the operator
+    /// has to spelunk the DB to find the disposition queue after the sweep
+    /// moves the task out of `status='open'`.
+    #[test]
+    fn blocked_section_surfaces_parked_unsatisfiable_tasks() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let parked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "parked-by-cancelled-dep",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![dep],
+        )
+        .unwrap();
+        // Simulate the sweep parking the dependent with unsatisfiable=true.
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_unsatisfiable', json('true'),
+                 'daemon_resume_status', 'open',
+                 'daemon_parked_reason', 'dependency #' || ?2 || ' is cancelled — unsatisfiable'
+             ) WHERE id=?1",
+            rusqlite::params![parked, dep],
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let b = s
+            .blocked
+            .iter()
+            .find(|task| task.id == parked)
+            .expect("parked-unsatisfiable task must render in the BLOCKED section");
+        assert_eq!(b.deadlocked_on, vec![dep]);
+    }
+
+    /// Task #473 R6 blocker 3: a classifier-policy park keeps its
+    /// authoritative "classifier declined" reason (retry is a
+    /// reclassification, not a dep restore), so the durable
+    /// `daemon_parked_unsatisfiable` marker is never set on it. BLOCKED
+    /// must still surface it when a dep is cancelled, otherwise the
+    /// operator disposition signal disappears after the generic alert
+    /// expires. Live dep-graph inference in `blocked_tasks` covers it.
+    #[test]
+    fn blocked_section_surfaces_policy_park_with_cancelled_dep() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let policy_parked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "policy-parked with cancelled dep",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![dep],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'classifier declined',
+                 'daemon_resume_status', 'open',
+                 'classifier_policy_parked', json('true')
+             ) WHERE id=?1",
+            rusqlite::params![policy_parked],
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let b = s
+            .blocked
+            .iter()
+            .find(|task| task.id == policy_parked)
+            .expect("policy park with cancelled dep must render in BLOCKED");
         assert_eq!(b.deadlocked_on, vec![dep]);
     }
 
@@ -2394,6 +2907,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -2414,6 +2930,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -2464,6 +2983,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -2730,6 +3252,311 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_tasks_always_surface_decomposition_sources() {
+        let (_d, mut c) = open_tmp();
+        let now = 10_000_i64;
+        let planning = crate::tasks::create(
+            &mut c, "A", "planning", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        let decomposed = crate::tasks::create(
+            &mut c,
+            "A",
+            "decomposed",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='planning', updated_at=1 WHERE id=?1",
+            rusqlite::params![planning],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='decomposed', updated_at=1 WHERE id=?1",
+            rusqlite::params![decomposed],
+        )
+        .unwrap();
+
+        let tasks = pipeline_tasks(&c, now).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, planning);
+        assert_eq!(tasks[0].status, "planning");
+        assert_eq!(tasks[1].id, decomposed);
+        assert_eq!(tasks[1].status, "decomposed");
+    }
+
+    #[test]
+    fn decomposition_status_is_bounded_and_excludes_attempt_transcripts() {
+        let (_d, mut c) = open_tmp();
+        let source =
+            crate::tasks::create(&mut c, "A", "source", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let child_a =
+            crate::tasks::create(&mut c, "A", "child a", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let child_b = crate::tasks::create(
+            &mut c,
+            "A",
+            "child b",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{child_a}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='decomposed' WHERE id=?1",
+            params![source],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed' WHERE id=?1",
+            params![child_b],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions
+             (source_task_id,state,active,planned_source_revision,proposal_attempts,
+              provider_failures,planner_provider,planner_model,accepted_plan_revision,
+              hold_summary,created_at,updated_at)
+             VALUES (?1,'blocked',1,1,2,1,'codex','gpt-5.6-sol',3,'child failed',100,100)",
+            params![source],
+        )
+        .unwrap();
+        let graph_id = c.last_insert_rowid();
+        for (task_id, local_key) in [(child_a, "a"), (child_b, "b")] {
+            c.execute(
+                "INSERT INTO task_graph_members
+                 (graph_id,task_id,local_key,plan_revision) VALUES (?1,?2,?3,3)",
+                params![graph_id, task_id, local_key],
+            )
+            .unwrap();
+        }
+        for ordinal in 1..=8 {
+            c.execute(
+                "INSERT INTO decomposition_attempts
+                 (graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+                 VALUES (?1,1,'proposal',?2,'invalid',?3,100)",
+                params![graph_id, ordinal, format!("reason {ordinal}")],
+            )
+            .unwrap();
+        }
+
+        let graph = decomposition_status(&c).unwrap().unwrap();
+        assert_eq!(graph.source_task_id, source);
+        assert_eq!(
+            graph.dispatch_hold.as_deref(),
+            Some("implementation dispatch held: graph state=blocked, active=1")
+        );
+        assert_eq!(graph.completed_children, 0);
+        assert_eq!(graph.total_children, 2);
+        assert_eq!(graph.failed_children, vec![child_b]);
+        assert_eq!(graph.members[1].prerequisites, vec![child_a]);
+        assert_eq!(graph.reasons.len(), 6, "owner-facing reasons stay bounded");
+        assert_eq!(graph.reasons[0], "child failed");
+    }
+
+    #[test]
+    fn reviewing_tasks_cover_post_submit_band_and_json() {
+        let (_d, mut c) = open_tmp();
+        let awaiting = crate::tasks::create(
+            &mut c,
+            "A",
+            "await reviewer",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let live = crate::tasks::create(
+            &mut c,
+            "A",
+            "live reviewer",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let merging = crate::tasks::create(
+            &mut c,
+            "A",
+            "merge pending",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='in-review', refs='{\"pr\":101}' WHERE id=?1",
+            params![awaiting],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='in-review', refs='{\"pr\":102}' WHERE id=?1",
+            params![live],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='merging', refs='{\"pr\":103}' WHERE id=?1",
+            params![merging],
+        )
+        .unwrap();
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(102),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        let snapshot = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(snapshot.reviewing.len(), 3);
+        assert_eq!(
+            snapshot
+                .reviewing
+                .iter()
+                .find(|task| task.id == awaiting)
+                .unwrap()
+                .state,
+            "awaiting reviewer"
+        );
+        let live_row = snapshot
+            .reviewing
+            .iter()
+            .find(|task| task.id == live)
+            .unwrap();
+        assert_eq!(live_row.reviewer.as_deref(), Some("R1"));
+        assert_eq!(live_row.state, "reviewing");
+        assert_eq!(
+            snapshot
+                .reviewing
+                .iter()
+                .find(|task| task.id == merging)
+                .unwrap()
+                .state,
+            "merging"
+        );
+
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let rows = json["reviewing"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "status --json serializes the reviewing rows");
+        assert!(rows.iter().any(|row| {
+            row["id"] == awaiting
+                && row["state"] == "awaiting reviewer"
+                && row["reviewer"].is_null()
+        }));
+    }
+
+    #[test]
+    fn reviewing_tasks_limit_newest_rows_when_review_only_tasks_accumulate() {
+        let (_d, mut c) = open_tmp();
+        let mut ids = Vec::new();
+        for i in 0..=REVIEWING_TASK_LIMIT {
+            let id = crate::tasks::create(
+                &mut c,
+                "A",
+                &format!("review-only backlog {i}"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                100 + i,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', updated_at=?1 WHERE id=?2",
+                params![100 + i, id],
+            )
+            .unwrap();
+            ids.push(id);
+        }
+
+        let snapshot = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(snapshot.reviewing.len() as i64, REVIEWING_TASK_LIMIT);
+        assert_eq!(snapshot.reviewing[0].id, *ids.last().unwrap());
+        assert!(
+            snapshot.reviewing.iter().all(|task| task.id != ids[0]),
+            "the oldest overflow row must not be materialized"
+        );
+    }
+
+    #[test]
+    fn reviewing_tasks_query_uses_indexed_bounded_candidates() {
+        let (_d, c) = open_tmp();
+        let plan = c
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, title, status, refs FROM (
+                     SELECT id, title, status, refs, updated_at FROM (
+                         SELECT id, title, status, refs, updated_at FROM tasks
+                         WHERE status='in-review'
+                         ORDER BY updated_at DESC, id DESC LIMIT ?1
+                     )
+                     UNION ALL
+                     SELECT id, title, status, refs, updated_at FROM (
+                         SELECT id, title, status, refs, updated_at FROM tasks
+                         WHERE status='merging'
+                         ORDER BY updated_at DESC, id DESC LIMIT ?1
+                     )
+                 )
+                 ORDER BY updated_at DESC, id DESC LIMIT ?1",
+            )
+            .unwrap()
+            .query_map(params![REVIEWING_TASK_LIMIT], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("tasks_reviewing_newest"),
+            "REVIEWING must use its bounded newest-first index: {plan}"
+        );
+        assert!(
+            plan.matches("tasks_reviewing_newest").count() == 2,
+            "REVIEWING must use the index for each bounded status candidate set: {plan}"
+        );
+    }
+
+    #[test]
     fn alerts_older_than_twelve_hours_leave_status_and_health() {
         let (_d, mut c) = open_tmp();
         let now = 100_000_i64;
@@ -2768,6 +3595,98 @@ mod tests {
         let after_window = stats(&c, now + 2, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         assert!(after_window.alerts.is_empty());
         assert_eq!(after_window.health, HealthVerdict::OnTrack);
+    }
+
+    #[test]
+    fn terminal_runnable_retry_marker_is_a_health_alert_until_reconciled() {
+        let (_d, mut c) = open_tmp();
+        let now = 100_000;
+        let id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "legacy terminal retry",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"daemon_parked":true,"daemon_resume_status":"rework",
+                    "daemon_rework_retry_requested":true}"#,
+            ),
+            None,
+            None,
+            now - 10,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", params![id])
+            .unwrap();
+
+        let before = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(before.health, HealthVerdict::Attention);
+        assert!(before.alerts.iter().any(|alert| {
+            alert.kind == "critical"
+                && alert.body.contains(&format!("task #{id}"))
+                && alert.body.contains("runnable daemon retry markers")
+        }));
+
+        crate::tasks::reconcile_terminal_retry_markers(&mut c, now + 1).unwrap();
+        let after = stats(&c, now + 1, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert!(after.alerts.is_empty());
+        assert_eq!(after.health, HealthVerdict::OnTrack);
+    }
+
+    #[test]
+    fn terminal_retry_health_alert_is_not_starved_by_persisted_alert_cap() {
+        let (_d, mut c) = open_tmp();
+        let now = 100_000;
+        for index in 0..ALERT_DISPLAY_LIMIT {
+            crate::feed::post(
+                &mut c,
+                "daemon",
+                "critical",
+                None,
+                &format!("persisted alert {index}"),
+                None,
+                None,
+                ALERT_WINDOW_SECS,
+                now - index,
+            )
+            .unwrap();
+        }
+        let id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "legacy terminal retry",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"daemon_parked":true,"daemon_resume_status":"rework",
+                    "daemon_rework_retry_requested":true}"#,
+            ),
+            None,
+            None,
+            now - 20,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", params![id])
+            .unwrap();
+
+        let view = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let task_ref = format!("task#{id}");
+        assert_eq!(view.alerts.len(), ALERT_DISPLAY_LIMIT as usize);
+        assert!(view.alerts.iter().any(|alert| {
+            alert.kind == "critical"
+                && alert.refs.as_deref() == Some(task_ref.as_str())
+                && alert.body.contains("runnable daemon retry markers")
+        }));
+        assert_eq!(
+            view.alerts
+                .iter()
+                .filter(|alert| alert.body.starts_with("persisted alert"))
+                .count(),
+            ALERT_DISPLAY_LIMIT as usize - 1,
+            "one persisted slot must yield to the terminal corruption signal"
+        );
     }
 
     #[test]

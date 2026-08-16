@@ -208,22 +208,61 @@ pub fn mark_retired(conn: &Connection, id: &str, now: i64) -> Result<()> {
 /// An agent is online if it acted within `online_window` seconds OR holds an active claim
 /// (#100 — claim-holders are by definition working).
 pub fn roster(conn: &Connection, now: i64, online_window: i64) -> Result<Vec<AgentView>> {
-    let mut stmt = conn.prepare(
+    roster_with_limit(conn, now, online_window, None)
+}
+
+/// Bounded roster for polling UIs.  This deliberately orders by recent activity so a
+/// dashboard does not repeatedly serialize every persistent historical agent.
+pub fn roster_limited(
+    conn: &Connection,
+    now: i64,
+    online_window: i64,
+    limit: i64,
+) -> Result<Vec<AgentView>> {
+    roster_with_limit(conn, now, online_window, Some(limit))
+}
+
+fn roster_with_limit(
+    conn: &Connection,
+    now: i64,
+    online_window: i64,
+    limit: Option<i64>,
+) -> Result<Vec<AgentView>> {
+    let order_and_limit = if limit.is_some() {
+        "ORDER BY a.last_seen DESC, a.id ASC LIMIT ?3"
+    } else {
+        "ORDER BY a.id"
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT a.id, a.last_seen,
                 CASE WHEN (?1 - a.last_seen) < ?2
                        OR EXISTS (SELECT 1 FROM claims c
                                   WHERE c.holder = a.id AND c.active = 1 AND c.expires_at > ?1)
                      THEN 1 ELSE 0 END AS online
-         FROM agents a ORDER BY a.id",
-    )?;
-    let rows = stmt.query_map(params![now, online_window], |r| {
-        Ok(AgentView {
-            id: r.get(0)?,
-            last_seen: r.get(1)?,
-            online: r.get::<_, i64>(2)? != 0,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+         FROM agents a {order_and_limit}"
+    ))?;
+    match limit {
+        Some(limit) => stmt
+            .query_map(params![now, online_window, limit], |r| {
+                Ok(AgentView {
+                    id: r.get(0)?,
+                    last_seen: r.get(1)?,
+                    online: r.get::<_, i64>(2)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into),
+        None => stmt
+            .query_map(params![now, online_window], |r| {
+                Ok(AgentView {
+                    id: r.get(0)?,
+                    last_seen: r.get(1)?,
+                    online: r.get::<_, i64>(2)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into),
+    }
 }
 
 #[cfg(test)]

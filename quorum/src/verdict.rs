@@ -56,8 +56,8 @@ pub fn validate(
             }
             if changes_requires_feedback && feedback.is_none_or(|f| f.trim().is_empty()) {
                 return Err(
-                    "--verdict changes requires --feedback describing what must be fixed \
-                     (it becomes the worker's rework instructions)"
+                    "--verdict changes requires --feedback-file (or compatibility \
+                     --feedback) describing what must be fixed"
                         .to_string(),
                 );
             }

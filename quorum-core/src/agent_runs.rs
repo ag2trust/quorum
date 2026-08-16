@@ -2,6 +2,112 @@
 
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLaunch {
+    pub agent_run_id: i64,
+    pub task_id: i64,
+    pub agent_name: String,
+    pub cap_run_id: String,
+    pub pr: i64,
+    pub head_sha: String,
+}
+
+/// Bind the immutable daemon-captured review target to the exact persisted
+/// reviewer run before lifecycle attachment becomes visible.
+#[cfg(test)]
+pub fn bind_review_launch(
+    conn: &Connection,
+    agent_run_id: i64,
+    cap_run_id: &str,
+    pr: i64,
+    head_sha: &str,
+) -> Result<bool> {
+    if cap_run_id.is_empty()
+        || cap_run_id.contains('\0')
+        || pr <= 0
+        || head_sha.len() != 40
+        || !head_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(false);
+    }
+    Ok(conn.execute(
+        "UPDATE agent_runs SET review_cap_run_id=?2,review_pr=?3,review_head_sha=?4
+         WHERE id=?1 AND role='reviewer' AND ended_at IS NULL
+           AND review_cap_run_id IS NULL AND review_pr IS NULL AND review_head_sha IS NULL",
+        params![agent_run_id, cap_run_id, pr, head_sha],
+    )? == 1)
+}
+
+/// Atomically create a reviewer run together with its immutable launch
+/// authority. No observer can see an authoritative run without the binding.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_reviewer_with_launch(
+    conn: &Connection,
+    task_id: i64,
+    agent_name: &str,
+    model: &str,
+    effort: &str,
+    provider: &str,
+    role_assignment_id: Option<i64>,
+    spawned_at: i64,
+    sub_role: Option<&str>,
+    cap_run_id: &str,
+    pr: i64,
+    head_sha: &str,
+) -> Result<Option<i64>> {
+    if cap_run_id.is_empty()
+        || cap_run_id.contains('\0')
+        || pr <= 0
+        || head_sha.len() != 40
+        || !head_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !matches!(sub_role, None | Some("r2"))
+    {
+        return Ok(None);
+    }
+    conn.execute(
+        "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+             role_assignment_id,spawned_at,sub_role,review_cap_run_id,review_pr,review_head_sha)
+         VALUES (?1,?2,'reviewer',?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            task_id,
+            agent_name,
+            model,
+            effort,
+            provider,
+            role_assignment_id,
+            spawned_at,
+            sub_role,
+            cap_run_id,
+            pr,
+            head_sha
+        ],
+    )?;
+    Ok(Some(conn.last_insert_rowid()))
+}
+
+pub fn review_launch_for_capability(
+    conn: &Connection,
+    cap_run_id: &str,
+) -> Result<Option<ReviewLaunch>> {
+    Ok(conn
+        .query_row(
+            "SELECT id,task_id,agent_name,review_cap_run_id,review_pr,review_head_sha
+         FROM agent_runs WHERE review_cap_run_id=?1 AND role='reviewer' AND ended_at IS NULL",
+            [cap_run_id],
+            |row| {
+                Ok(ReviewLaunch {
+                    agent_run_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent_name: row.get(2)?,
+                    cap_run_id: row.get(3)?,
+                    pr: row.get(4)?,
+                    head_sha: row.get(5)?,
+                })
+            },
+        )
+        .optional()?)
+}
 use serde::Serialize;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -13,6 +119,7 @@ pub struct AgentRun {
     pub model: String,
     pub effort: String,
     pub provider: Option<String>,
+    pub role_assignment_id: Option<i64>,
     pub spawned_at: i64,
     pub ended_at: Option<i64>,
     pub end_reason: Option<String>,
@@ -31,9 +138,56 @@ pub fn insert(
     spawned_at: i64,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider, spawned_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider,
+             role_assignment_id, spawned_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
         params![task_id, agent_name, role, model, effort, provider, spawned_at],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Insert canonical worker-run evidence only when its assignment link matches
+/// the complete responsibility and executable profile used for the spawn.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_worker_with_assignment(
+    conn: &Connection,
+    task_id: i64,
+    agent_name: &str,
+    responsibility_key: &str,
+    model: &str,
+    effort: &str,
+    provider: &str,
+    runner: &str,
+    role_assignment_id: Option<i64>,
+    spawned_at: i64,
+) -> Result<i64> {
+    let context = crate::role_assignments::EvidenceAssignmentContext {
+        role_assignment_id,
+        task_id: Some(task_id),
+        responsibility_key,
+        role: "worker",
+        provider,
+        runner,
+        model,
+        effort,
+    };
+    crate::role_assignments::guarded_evidence_insert(
+        conn,
+        "worker agent run",
+        &context,
+        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider,
+             role_assignment_id, spawned_at)
+         SELECT :task_id, :agent_name, 'worker', :model, :effort, :provider,
+                :quorum_assignment_id, :spawned_at
+         /* quorum-role-assignment-guard */",
+        &[
+            (":task_id", &task_id),
+            (":agent_name", &agent_name),
+            (":model", &model),
+            (":effort", &effort),
+            (":provider", &provider),
+            (":spawned_at", &spawned_at),
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -49,40 +203,77 @@ pub fn insert_r2(
     provider: &str,
     spawned_at: i64,
 ) -> Result<i64> {
+    insert_r2_with_assignment(
+        conn, task_id, agent_name, model, effort, provider, None, spawned_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_r2_with_assignment(
+    conn: &Connection,
+    task_id: i64,
+    agent_name: &str,
+    model: &str,
+    effort: &str,
+    provider: &str,
+    role_assignment_id: Option<i64>,
+    spawned_at: i64,
+) -> Result<i64> {
     conn.execute(
-        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider, spawned_at, sub_role)
-         VALUES (?1, ?2, 'reviewer', ?3, ?4, ?5, ?6, 'r2')",
-        params![task_id, agent_name, model, effort, provider, spawned_at],
+        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider,
+             role_assignment_id, spawned_at, sub_role)
+         VALUES (?1, ?2, 'reviewer', ?3, ?4, ?5, ?6, ?7, 'r2')",
+        params![
+            task_id,
+            agent_name,
+            model,
+            effort,
+            provider,
+            role_assignment_id,
+            spawned_at
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
+/// Return the immutable execution layout used by the first worker agent_run
+/// for a task, if any. Remediation resumes this snapshot rather than routing a
+/// new worker profile under the daemon's current policy.
+pub fn first_worker(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>> {
+    conn.query_row(
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
+         FROM agent_runs
+         WHERE task_id = ?1 AND role = 'worker'
+         ORDER BY spawned_at ASC LIMIT 1",
+        params![task_id],
+        |r| {
+            Ok(AgentRun {
+                id: r.get(0)?,
+                agent: r.get(1)?,
+                role: r.get(2)?,
+                sub_role: r.get(3)?,
+                model: r.get(4)?,
+                effort: r.get(5)?,
+                provider: r.get(6)?,
+                role_assignment_id: r.get(7)?,
+                spawned_at: r.get(8)?,
+                ended_at: r.get(9)?,
+                end_reason: r.get(10)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Return the model used by the first worker agent_run for a task, if any.
 pub fn worker_model(conn: &Connection, task_id: i64) -> Result<Option<String>> {
-    let model = conn
-        .query_row(
-            "SELECT model FROM agent_runs \
-             WHERE task_id = ?1 AND role = 'worker' \
-             ORDER BY spawned_at ASC LIMIT 1",
-            params![task_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(model)
+    Ok(first_worker(conn, task_id)?.map(|run| run.model))
 }
 
 /// Return the provider used by the first worker agent_run for a task, if any.
 pub fn worker_provider(conn: &Connection, task_id: i64) -> Result<Option<String>> {
-    let provider = conn
-        .query_row(
-            "SELECT provider FROM agent_runs \
-             WHERE task_id = ?1 AND role = 'worker' \
-             ORDER BY spawned_at ASC LIMIT 1",
-            params![task_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(provider)
+    Ok(first_worker(conn, task_id)?.and_then(|run| run.provider))
 }
 
 /// Latest interrupted reviewer run for a role, if any.
@@ -95,7 +286,7 @@ pub fn interrupted_reviewer(
     is_r2: bool,
 ) -> Result<Option<AgentRun>> {
     conn.query_row(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, spawned_at, ended_at, end_reason
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
          FROM agent_runs
          WHERE task_id = ?1
            AND role = 'reviewer'
@@ -113,9 +304,10 @@ pub fn interrupted_reviewer(
                 model: r.get(4)?,
                 effort: r.get(5)?,
                 provider: r.get(6)?,
-                spawned_at: r.get(7)?,
-                ended_at: r.get(8)?,
-                end_reason: r.get(9)?,
+                role_assignment_id: r.get(7)?,
+                spawned_at: r.get(8)?,
+                ended_at: r.get(9)?,
+                end_reason: r.get(10)?,
             })
         },
     )
@@ -126,7 +318,7 @@ pub fn interrupted_reviewer(
 /// All runs for a task, ordered by id.
 pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
     let mut stmt = conn.prepare(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, spawned_at, ended_at, end_reason \
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason \
          FROM agent_runs WHERE task_id = ?1 ORDER BY id ASC",
     )?;
     let runs = stmt
@@ -139,13 +331,28 @@ pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
                 model: r.get(4)?,
                 effort: r.get(5)?,
                 provider: r.get(6)?,
-                spawned_at: r.get(7)?,
-                ended_at: r.get(8)?,
-                end_reason: r.get(9)?,
+                role_assignment_id: r.get(7)?,
+                spawned_at: r.get(8)?,
+                ended_at: r.get(9)?,
+                end_reason: r.get(10)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(runs)
+}
+
+/// Latest run identity for a task, without materializing its complete history.
+pub fn latest_for_task(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>> {
+    conn.query_row(
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
+         FROM agent_runs WHERE task_id = ?1 ORDER BY spawned_at DESC, id DESC LIMIT 1",
+        params![task_id],
+        |r| Ok(AgentRun {
+            id: r.get(0)?, agent: r.get(1)?, role: r.get(2)?, sub_role: r.get(3)?,
+            model: r.get(4)?, effort: r.get(5)?, provider: r.get(6)?, role_assignment_id: r.get(7)?,
+            spawned_at: r.get(8)?, ended_at: r.get(9)?, end_reason: r.get(10)?,
+        }),
+    ).optional().map_err(Into::into)
 }
 
 /// Close an open run row at teardown/terminal.
@@ -207,6 +414,182 @@ mod tests {
             .unwrap();
         assert_eq!(ended, 200);
         assert_eq!(reason, "done");
+    }
+
+    #[test]
+    fn review_launch_is_immutable_capability_bound_and_fail_closed() {
+        let (_d, c) = open_tmp();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let run = insert(&c, 7, "R", "reviewer", "model", "high", "codex", 10).unwrap();
+        assert!(bind_review_launch(&c, run, "cap-7", 71, sha).unwrap());
+        assert!(!bind_review_launch(&c, run, "other", 72, sha).unwrap());
+        assert!(!bind_review_launch(&c, run, "bad", 71, "not-a-sha").unwrap());
+        assert_eq!(
+            review_launch_for_capability(&c, "cap-7").unwrap(),
+            Some(ReviewLaunch {
+                agent_run_id: run,
+                task_id: 7,
+                agent_name: "R".into(),
+                cap_run_id: "cap-7".into(),
+                pr: 71,
+                head_sha: sha.into(),
+            })
+        );
+        assert_eq!(review_launch_for_capability(&c, "other").unwrap(), None);
+        close(&c, run, 20, "done").unwrap();
+        assert_eq!(review_launch_for_capability(&c, "cap-7").unwrap(), None);
+    }
+
+    #[test]
+    fn reviewer_insert_persists_launch_authority_in_one_row() {
+        let (_d, c) = open_tmp();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let run = insert_reviewer_with_launch(
+            &c,
+            9,
+            "R2",
+            "model",
+            "high",
+            "codex",
+            None,
+            10,
+            Some("r2"),
+            "cap-9",
+            79,
+            sha,
+        )
+        .unwrap()
+        .unwrap();
+        let launch = review_launch_for_capability(&c, "cap-9").unwrap().unwrap();
+        assert_eq!(launch.agent_run_id, run);
+        assert_eq!(
+            (launch.task_id, launch.pr, launch.head_sha.as_str()),
+            (9, 79, sha)
+        );
+        assert!(insert_reviewer_with_launch(
+            &c, 10, "bad", "model", "high", "codex", None, 11, None, "", 79, sha,
+        )
+        .unwrap()
+        .is_none());
+        let bad_rows: i64 = c
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE agent_name='bad'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad_rows, 0);
+    }
+
+    #[test]
+    fn worker_assignment_insert_succeeds_for_matching_context() {
+        let (_d, mut c) = open_tmp();
+        let tid = crate::tasks::create(
+            &mut c, "boss", "routed", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        let responsibility_key = format!("worker:task:{tid}:revision:1");
+        c.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (42,?1,?2,'worker','sol','codex','codex','gpt-5.6-sol','high',
+                     'worker:M','g1',100)",
+            params![responsibility_key, tid],
+        )
+        .unwrap();
+        let run_id = insert_worker_with_assignment(
+            &c,
+            tid,
+            "Routed",
+            &responsibility_key,
+            "gpt-5.6-sol",
+            "high",
+            "codex",
+            "codex",
+            Some(42),
+            101,
+        )
+        .unwrap();
+        let run = latest_for_task(&c, tid).unwrap().unwrap();
+        assert_eq!(run.id, run_id);
+        assert_eq!(run.role_assignment_id, Some(42));
+        assert_eq!(
+            worker_model(&c, tid).unwrap().as_deref(),
+            Some("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn worker_assignment_insert_rejects_wrong_context_and_rolls_back_lifecycle() {
+        let (_d, mut c) = open_tmp();
+        let tid = crate::tasks::create(
+            &mut c, "boss", "guarded", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        let other_tid = crate::tasks::create(
+            &mut c,
+            "boss",
+            "different worker context",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let other_responsibility = format!("worker:task:{other_tid}:revision:1");
+        c.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (42,?1,?2,'worker','sol','codex','codex','gpt-5.6-sol','high',
+                     'worker:M','g1',100)",
+            params![other_responsibility, other_tid],
+        )
+        .unwrap();
+
+        let result = (|| -> Result<()> {
+            let tx = crate::db::begin_immediate(&mut c)?;
+            tx.execute(
+                "UPDATE tasks SET status='working',updated_at=101 WHERE id=?1",
+                [tid],
+            )?;
+            insert_worker_with_assignment(
+                &tx,
+                tid,
+                "WrongContext",
+                &format!("worker:task:{tid}:revision:1"),
+                "gpt-5.6-sol",
+                "high",
+                "codex",
+                "codex",
+                Some(42),
+                101,
+            )?;
+            tx.commit().map_err(crate::db::map_sql_err)?;
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM agent_runs WHERE role='worker'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row("SELECT status FROM tasks WHERE id=?1", [tid], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "open"
+        );
     }
 
     #[test]
@@ -279,6 +662,17 @@ mod tests {
         assert_eq!(
             worker_model(&c, 1).unwrap().as_deref(),
             Some("claude-opus-4-6")
+        );
+        let snapshot = first_worker(&c, 1).unwrap().unwrap();
+        assert_eq!(
+            (
+                snapshot.agent.as_str(),
+                snapshot.model.as_str(),
+                snapshot.effort.as_str(),
+                snapshot.provider.as_deref(),
+            ),
+            ("Alice", "claude-opus-4-6", "high", Some("claude")),
+            "remediation must recover the complete first-worker layout"
         );
     }
 

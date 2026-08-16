@@ -15,7 +15,12 @@
 //! - No duplicate PR, branch, merge, or lifecycle event under rapid ticks/restart
 //! - agent_runs end reasons are truthful
 
+mod common;
+
+use std::env;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -66,6 +71,7 @@ struct ServeHandle {
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
     _sentinel: Option<tempfile::TempDir>,
+    _gh_shim: Option<tempfile::TempDir>,
 }
 
 impl Drop for ServeHandle {
@@ -91,6 +97,58 @@ impl ServeHandle {
     ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let gh_shim = tempfile::tempdir().unwrap();
+        let gh_state = gh_shim.path().join("state");
+        std::fs::create_dir_all(&gh_state).unwrap();
+        let gh_path = gh_shim.path().join("gh");
+        std::fs::write(
+            &gh_path,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-} ${2:-}"
+if [ "$cmd" = "pr create" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  printf '%s' "$head" > "$QUORUM_TEST_GH_STATE/$pr"
+  printf 'https://github.com/test/repo/pull/%s\n' "$pr"
+elif [ "$cmd" = "pr list" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    printf '[{"number":%s,"state":"OPEN"}]\n' "$pr"
+  else
+    printf '[]\n'
+  fi
+elif [ "$cmd" = "pr view" ]; then
+  pr="$3"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  else
+    branch="daemon/origworker-t$pr"
+  fi
+  sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+else
+  printf 'unsupported gh invocation: %s\n' "$*" >&2
+  exit 1
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            gh_shim.path().display(),
+            env::var("PATH").unwrap_or_default()
+        );
         let fake_agent = cargo_bin("fake-agent");
         let mut args = vec![
             "serve",
@@ -121,6 +179,9 @@ impl ServeHandle {
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
+            .env("PATH", path)
+            .env("QUORUM_TEST_GH_STATE", &gh_state)
+            .env("QUORUM_TEST_REPO", repo)
             .env(
                 "FAKE_AGENT_PROMPT_LOG",
                 home.join("fake-agent-prompts.jsonl"),
@@ -147,6 +208,7 @@ impl ServeHandle {
             rx,
             lines: Vec::new(),
             _sentinel: Some(sentinel),
+            _gh_shim: Some(gh_shim),
         }
     }
 
@@ -162,17 +224,51 @@ impl ServeHandle {
                         return true;
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => return false,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.record_process_state("output wait timed out");
+                    return false;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.record_process_state("stderr disconnected");
+                    return false;
+                }
             }
         }
+        self.record_process_state("output wait deadline elapsed");
         false
     }
 
-    fn drain_pending_lines(&mut self) {
-        while let Ok(line) = self.rx.try_recv() {
-            self.lines.push(line);
-        }
+    fn wait_for_count(&mut self, needle: &str, count: usize, timeout_secs: u64) -> bool {
+        common::wait_for_count(
+            &mut self.child,
+            &self.rx,
+            &mut self.lines,
+            needle,
+            count,
+            timeout_secs,
+        )
+    }
+
+    fn wait_until<F>(&mut self, description: &str, timeout_secs: u64, ready: F)
+    where
+        F: FnMut() -> bool,
+    {
+        common::wait_for_daemon_state(
+            &mut self.child,
+            &self.rx,
+            &mut self.lines,
+            description,
+            timeout_secs,
+            ready,
+        );
+    }
+
+    fn terminate_and_drain(&mut self) {
+        common::terminate_and_drain(&mut self.child, &self.rx, &mut self.lines);
+    }
+
+    fn record_process_state(&mut self, context: &str) {
+        common::record_process_state(&mut self.child, &mut self.lines, context);
     }
 
     fn extract_agent_name(&self, prefix: &str) -> Option<String> {
@@ -351,7 +447,7 @@ fn drive_to_approved_after(
     );
 
     let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
-    quorum_done(home, &["--agent", &worker_name, "--pr", pr]);
+    quorum_done(home, &["--agent", &worker_name]);
 
     assert!(
         handle.wait_for("spawning reviewer", 15),
@@ -401,6 +497,20 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
         None,
         None,
         None,
+        now,
+    )
+    .unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id: id,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }],
+        "test:v2",
         now,
     )
     .unwrap();
@@ -579,9 +689,13 @@ fn scenario_a_merge_wait_with_dependents() {
         "dependent must stay not-ready during merge-wait"
     );
 
-    // No new worker spawns after merge-wait entered.
-    std::thread::sleep(Duration::from_millis(2000));
-    handle.drain_pending_lines();
+    // Observe another concrete merge-wait retry before asserting that the
+    // daemon did not provision a worker between polling ticks.
+    assert!(
+        handle.wait_for_count("merge wait", 2, 15),
+        "second merge-wait retry not seen. Lines: {:?}",
+        handle.lines
+    );
     let mw_idx = handle
         .lines
         .iter()
@@ -610,8 +724,9 @@ fn scenario_a_merge_wait_with_dependents() {
         handle.lines
     );
 
-    // Wait for DB update to complete after merge.
-    std::thread::sleep(Duration::from_millis(1000));
+    handle.wait_until("merged task completion and dependent readiness", 15, || {
+        get_task(home.path(), 1).status == "done" && get_task(home.path(), 2).ready
+    });
 
     // Verify prerequisite done, dependent ready.
     let task = get_task(home.path(), 1);
@@ -679,6 +794,9 @@ fn scenario_a_restart_pending_then_ready_merges() {
         "merge-wait not entered. Lines: {:?}",
         handle.lines
     );
+    handle.wait_until("both SHA-bound approvals to become durable", 15, || {
+        get_approvals(home.path(), 1).len() == 2
+    });
 
     // Stop and flip checks to ready (matching the proven pattern from
     // checks_pending_survives_restart — flip before restart so
@@ -709,8 +827,9 @@ fn scenario_a_restart_pending_then_ready_merges() {
         handle2.lines
     );
 
-    // Wait for DB update to complete after merge.
-    std::thread::sleep(Duration::from_millis(1500));
+    handle2.wait_until("restart merge to commit and clear approvals", 15, || {
+        get_task(home.path(), 1).status == "done" && get_approvals(home.path(), 1).is_empty()
+    });
 
     // Task must be done after the merge.
     let task = get_task(home.path(), 1);
@@ -771,6 +890,25 @@ fn scenario_b_failed_checks_absent_worker_replacement_cycle() {
     let pr: i64 = 1;
     let task_id = seed_in_review_task(home.path(), author, pr);
     create_pr_branch(repo_dir.path(), author, task_id);
+    let head_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    {
+        let mut conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        let branch = format!("daemon/{}-t{}", author.to_lowercase(), task_id);
+        quorum_core::pr_targets::upsert(&mut conn, task_id, pr, &branch, head_sha.trim(), false)
+            .unwrap();
+    }
 
     // Start daemon — reviewer provisioned by Phase 5b recovery.
     let mut handle = ServeHandle::start(
@@ -940,14 +1078,17 @@ fn repeated_pending_never_increments_counters() {
         std::fs::write(&checks_state, "pending").unwrap();
     });
 
-    // Wait for multiple merge-wait ticks (at least 3 seconds of retries).
+    // Wait for three observable merge-wait retries.
     assert!(
         handle.wait_for("merge wait", 15),
         "first merge-wait not seen. Lines: {:?}",
         handle.lines
     );
-    std::thread::sleep(Duration::from_secs(4));
-    handle.drain_pending_lines();
+    assert!(
+        handle.wait_for_count("merge wait", 3, 15),
+        "three merge-wait retries not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Verify counters have NOT changed.
     let task = get_task(home.path(), 1);
@@ -1019,6 +1160,9 @@ fn head_sha_change_invalidates_approvals() {
         "merge-wait not entered. Lines: {:?}",
         handle.lines
     );
+    handle.wait_until("both SHA-bound approvals to become durable", 15, || {
+        get_approvals(home.path(), 1).len() == 2
+    });
 
     // Stop daemon.
     handle.stop();
@@ -1050,9 +1194,15 @@ fn head_sha_change_invalidates_approvals() {
         ],
     );
 
-    // Wait for recovery — should see "demoted" (stale head) rather than merge.
-    std::thread::sleep(Duration::from_secs(5));
-    handle2.drain_pending_lines();
+    assert!(
+        handle2.wait_for("demoted", 15),
+        "stale-head approval demotion not seen. Lines: {:?}",
+        handle2.lines
+    );
+    handle2.wait_until("stale approvals to be deleted", 15, || {
+        get_approvals(home.path(), 1).is_empty()
+    });
+    handle2.terminate_and_drain();
 
     // The approval must be invalidated — either "demoted" log or no merge.
     let saw_demotion = handle2
@@ -1077,8 +1227,6 @@ fn head_sha_change_invalidates_approvals() {
         "approvals must be cleared after head SHA demotion, found: {:?}",
         approvals
     );
-
-    handle2.sigkill();
 }
 
 /// Implementation task + merge conflict + absent worker → MergeConflict
@@ -1170,21 +1318,20 @@ fn merge_conflict_absent_worker_spawns_remediation() {
         handle.lines
     );
 
-    std::thread::sleep(Duration::from_secs(2));
-    handle.drain_pending_lines();
-
     assert!(
-        handle
-            .lines
-            .iter()
-            .any(|line| line.contains("spawning remediation worker"))
-            || handle.wait_for("spawning remediation worker", 15),
+        handle.wait_for_count("spawning remediation worker ", 1, 15),
         "remediation worker was not spawned. Lines: {:?}",
         handle.lines
     );
     let remediation_name = handle
         .extract_agent_name("spawning remediation worker ")
         .expect("could not extract remediation worker name");
+    handle.wait_until("remediation lease and journal provisioning", 15, || {
+        get_task(home.path(), task_id).status == "rework"
+            && active_claim(home.path(), task_id)
+                .is_some_and(|(holder, _)| holder == remediation_name)
+            && worker_journal_target(home.path(), task_id).is_some()
+    });
 
     // Persisted implementation responsibility drives MergeConflict → rework.
     let task = get_task(home.path(), task_id);
@@ -1228,7 +1375,11 @@ fn merge_conflict_absent_worker_spawns_remediation() {
     );
     assert!(
         prompts.contains("has conflicts with main")
-            && prompts.contains("Rebase on main, resolve conflicts"),
+            && prompts.contains("Preserve the published PR head")
+            && prompts.contains("merge main into the PR branch")
+            && prompts.contains("Never rebase")
+            && prompts.contains("The daemon already ran `git merge --ff --no-edit origin/main`")
+            && prompts.contains("must remain an ancestor"),
         "remediation turn must include conflict instructions: {prompts}"
     );
 
@@ -1446,7 +1597,7 @@ fn replacement_instant_death_stops_at_budget() {
             None,
             0,
             None,
-            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,
@@ -1541,6 +1692,7 @@ fn replacement_instant_death_stops_at_budget() {
         rx,
         lines: Vec::new(),
         _sentinel: Some(sentinel),
+        _gh_shim: None,
     };
 
     // Recovery fires AgentFailed → budget exhausted → durably parked.
@@ -1550,8 +1702,20 @@ fn replacement_instant_death_stops_at_budget() {
         handle.lines
     );
 
-    std::thread::sleep(Duration::from_millis(500));
-    handle.drain_pending_lines();
+    handle.wait_until(
+        "failed task, owner alert, and ended worker runs",
+        15,
+        || {
+            get_task(home.path(), task_id).status == "failed"
+                && get_messages(home.path(), task_id).iter().any(|message| {
+                    message.contains("recovery budget exhausted") || message.contains("budget")
+                })
+                && get_agent_runs(home.path(), task_id)
+                    .iter()
+                    .filter(|run| run.role == "worker")
+                    .all(|run| run.ended_at.is_some())
+        },
+    );
 
     // Verify final state.
     let task = get_task(home.path(), task_id);
@@ -1635,6 +1799,9 @@ fn no_duplicate_events_under_restart() {
         "merge-wait not entered. Lines: {:?}",
         handle.lines
     );
+    handle.wait_until("both SHA-bound approvals to become durable", 15, || {
+        get_approvals(home.path(), 1).len() == 2
+    });
     handle.stop();
 
     // Flip to ready.
@@ -1663,8 +1830,10 @@ fn no_duplicate_events_under_restart() {
         handle2.lines
     );
 
-    std::thread::sleep(Duration::from_millis(500));
-    handle2.drain_pending_lines();
+    handle2.wait_until("single restart merge to commit", 15, || {
+        get_task(home.path(), 1).status == "done" && get_approvals(home.path(), 1).is_empty()
+    });
+    handle2.terminate_and_drain();
 
     // No duplicate merges in the log lines. Filter for actual merge actions,
     // not summary stats like "merged=1".
@@ -1682,8 +1851,6 @@ fn no_duplicate_events_under_restart() {
         all_lines.len(),
         all_lines
     );
-
-    handle2.sigkill();
 
     // Count lifecycle events — exactly one task_done/task_merged event.
     let events = get_events(home.path(), 1);
@@ -1747,7 +1914,7 @@ fn agent_runs_end_reasons_truthful() {
     );
 
     let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
-    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+    quorum_done(home.path(), &["--agent", &worker_name]);
 
     // Wait for reviewer cycle.
     assert!(
@@ -1782,6 +1949,12 @@ fn agent_runs_end_reasons_truthful() {
         "merge not seen. Lines: {:?}",
         handle.lines
     );
+    handle.wait_until("merged task and agent-run completion", 15, || {
+        get_task(home.path(), 1).status == "done"
+            && get_agent_runs(home.path(), 1)
+                .iter()
+                .all(|run| run.ended_at.is_some())
+    });
     handle.stop();
 
     // Check agent_runs for truthful end reasons.

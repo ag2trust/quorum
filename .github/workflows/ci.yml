@@ -35,17 +35,19 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
+    env:
+      RUST_TEST_THREADS: 4
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Includes the N-process claim-race canary (quorum/tests/race.rs).
-      - run: cargo test --workspace
+      # Keeps the real-process helper canaries in the standard threaded suite.
+      - run: cargo test --workspace --all-features --features quorum-core/test-support
 
   shell-tests:
     name: shell-tests
@@ -57,3 +59,6 @@ jobs:
           git config --global user.email "ci@test.com"
           git config --global user.name "CI"
       - run: scripts/test-serve-supervisor.sh
+      - run: scripts/test-dev-install.sh
+      - run: scripts/test-dogfood-install.sh
+      - run: scripts/test-preflight.sh

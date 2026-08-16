@@ -162,6 +162,12 @@ fn init_creates_serve_config_scaffold() {
         content.contains("R2 pre-merge review sampling"),
         "scaffold must document R2 sampling"
     );
+    assert!(
+        content.contains("[model_profiles.primary]")
+            && content.contains("[routing.classifier]")
+            && content.contains("[routing.reviewer.\"1\"]"),
+        "scaffold must document the required hard-cutover routing policy"
+    );
 }
 
 #[test]
@@ -223,6 +229,56 @@ fn init_idempotent_serve_config_and_skill() {
     );
 }
 
+#[test]
+fn init_installs_current_embedded_recovery_skill() {
+    let repo = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    let out = Command::cargo_bin("quorum")
+        .unwrap()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .current_dir(repo.path())
+        .arg("init")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "init must install the embedded skill");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["skill"]["action"], "created");
+    let skill =
+        std::fs::read_to_string(repo.path().join(".claude/skills/quorum/SKILL.md")).unwrap();
+    assert!(
+        skill.contains("task-retry")
+            && skill.contains("decomposition-adopt-recovery")
+            && skill.contains("task-close"),
+        "fresh installs must include recovery decision procedures"
+    );
+    assert!(
+        skill.contains("--continue-pr <PR>")
+            && skill.contains("review-only task skips the initial")
+            && skill.contains("bounded daemon-managed remediation"),
+        "fresh installs must distinguish continuations from review-only tasks"
+    );
+    assert!(
+        skill.contains("--repo owner/name")
+            && skill.contains("QUORUM_REPO")
+            && skill.contains("outside-repository change is not a managed deliverable"),
+        "fresh installs must preserve repository targeting and write boundaries"
+    );
+    assert!(
+        skill.contains("no public successor-task creation interface")
+            && skill.contains("Do not manufacture `refs.source_task`")
+            && skill.contains("does not block this explicit path"),
+        "the skill must reject invented provenance while preserving exact-pair adoption"
+    );
+}
+
 // -- upgrade command (task #106 amendment) -------------------------------------------------
 
 #[test]
@@ -259,8 +315,15 @@ fn upgrade_replaces_stale_skill() {
         "embedded skill must mention quorum"
     );
     assert!(
-        after.contains("Transferring implementation responsibility outside Quorum"),
+        after.contains("cancel that task before external")
+            && after.contains("create a new `--review-pr` task"),
         "embedded skill must document external transfer protocol"
+    );
+    assert!(
+        after.contains("init` installs the embedded")
+            && after.contains("upgrade` publishes the embedded skill artifact")
+            && after.contains("upgrade --check` to detect drift without writing"),
+        "upgraded skill must explain how init and upgrade publish the artifact"
     );
 }
 

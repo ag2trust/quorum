@@ -1,12 +1,15 @@
 //! Recovery acceptance tests: after a daemon restart, in-review tasks must
 //! get reviewers provisioned (via Phase 5b) without re-executing the worker.
 //!
-//! Stateless recovery (2026-07-09 refactor) kills stale processes, wipes the
-//! journal, GCs worktrees, and resets non-terminal tasks. In-review tasks are
-//! left as-is — the normal tick loop's Phase 5b queries the DB for in-review
-//! tasks with a PR but no live worker/reviewer and provisions a reviewer.
+//! Generic recovery kills stale processes, wipes their journal rows, GCs their
+//! worktrees, and resets non-terminal tasks. Explicit dormant awaiting-review
+//! workers are reconstructed separately. Other in-review tasks are left as-is
+//! so Phase 5b can provision a reviewer without re-executing the worker.
 
+use std::env;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -57,6 +60,7 @@ struct ServeHandle {
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
     _sentinel: Option<tempfile::TempDir>,
+    _gh_shim: Option<tempfile::TempDir>,
 }
 
 impl Drop for ServeHandle {
@@ -80,10 +84,65 @@ impl ServeHandle {
     ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let gh_shim = tempfile::tempdir().unwrap();
+        let gh_state = gh_shim.path().join("state");
+        std::fs::create_dir_all(&gh_state).unwrap();
+        let gh_path = gh_shim.path().join("gh");
+        std::fs::write(
+            &gh_path,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-} ${2:-}"
+if [ "$cmd" = "pr create" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  printf '%s' "$head" > "$QUORUM_TEST_GH_STATE/$pr"
+  printf 'https://github.com/test/repo/pull/%s\n' "$pr"
+elif [ "$cmd" = "pr list" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    printf '[{"number":%s,"state":"OPEN"}]\n' "$pr"
+  else
+    printf '[]\n'
+  fi
+elif [ "$cmd" = "pr view" ]; then
+  pr="$3"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  else
+    branch="daemon/agent0-t$pr"
+  fi
+  sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+else
+  printf 'unsupported gh invocation: %s\n' "$*" >&2
+  exit 1
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            gh_shim.path().display(),
+            env::var("PATH").unwrap_or_default()
+        );
         let fake_agent = cargo_bin("fake-agent");
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
+            .env("PATH", path)
+            .env("QUORUM_TEST_GH_STATE", &gh_state)
+            .env("QUORUM_TEST_REPO", repo)
             .args([
                 "serve",
                 "--repo",
@@ -124,6 +183,7 @@ impl ServeHandle {
             rx,
             lines: Vec::new(),
             _sentinel: Some(sentinel),
+            _gh_shim: Some(gh_shim),
         }
     }
 
@@ -149,6 +209,42 @@ impl ServeHandle {
     fn drain_pending_lines(&mut self) {
         while let Ok(line) = self.rx.try_recv() {
             self.lines.push(line);
+        }
+    }
+
+    /// Wait until the daemon has completed at least one full scheduling tick.
+    ///
+    /// Phase 2 consumes each mailbox marker. Inserting the second marker only
+    /// after the first is consumed makes its observation prove that the prior
+    /// tick reached the later recovery and provisioning phases.
+    fn wait_for_completed_tick(&mut self, home: &std::path::Path) {
+        let db_path = home.join("repos/test__repo/quorum.db");
+        for marker in ["RecoveryTick0", "RecoveryTick1"] {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            quorum_core::mailbox::append(
+                &mut conn,
+                &quorum_core::mailbox::MailboxRow {
+                    agent: marker.into(),
+                    kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
+                    task_id: None,
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: Some("readiness barrier".into()),
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            drop(conn);
+            assert!(
+                self.wait_for(
+                    &format!("consuming unmatched task_update from {marker}"),
+                    15,
+                ),
+                "daemon did not consume readiness marker {marker}. Lines: {:?}",
+                self.lines
+            );
         }
     }
 
@@ -213,6 +309,7 @@ impl ServeHandle {
             rx,
             lines: Vec::new(),
             _sentinel: Some(sentinel),
+            _gh_shim: None,
         }
     }
 
@@ -274,7 +371,19 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     };
     let run_id = resolve_run_id(home, agent, role);
     let mut cmd_args = vec!["done"];
-    cmd_args.extend_from_slice(args);
+    if role == "worker" {
+        let mut index = 0;
+        while index < args.len() {
+            if args[index] == "--pr" {
+                index += 2;
+            } else {
+                cmd_args.push(args[index]);
+                index += 1;
+            }
+        }
+    } else {
+        cmd_args.extend_from_slice(args);
+    }
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
@@ -358,8 +467,7 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
         "reviewer not provisioned for in-review task after restart. Lines: {:?}",
         handle2.lines
     );
-
-    std::thread::sleep(Duration::from_millis(500));
+    handle2.wait_for_completed_tick(home.path());
     handle2.drain_pending_lines();
 
     // ── Invariant: NO fresh worker spawn for task #1 after restart. ──
@@ -411,7 +519,7 @@ fn orphan_in_review_task_gets_reviewer_on_startup() {
             None,
             0,
             None,
-            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,
@@ -483,7 +591,7 @@ fn double_restart_in_review_stays_in_review() {
             None,
             0,
             None,
-            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,
@@ -588,10 +696,11 @@ fn in_review_journal_row_survives_shutdown() {
     );
 }
 
-/// Exit-75 (self-update) recovery: journal row survives, task stays in-review,
-/// Phase 5b provisions a reviewer — no duplicate worker execution.
+/// Reviewer pre-spawn crash recovery: a PID-less reviewer journal is stale,
+/// so startup removes it and provisions one replacement reviewer without
+/// re-executing the worker.
 #[test]
-fn exit75_in_review_recovered_without_worker_respawn() {
+fn pidless_reviewer_provision_recovers_without_worker_respawn() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -624,7 +733,7 @@ fn exit75_in_review_recovered_without_worker_respawn() {
             None,
             0,
             None,
-            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,
@@ -650,12 +759,12 @@ fn exit75_in_review_recovered_without_worker_respawn() {
 
         let entry = quorum_core::journal::JournalEntry {
             agent: "Agent0".into(),
-            role: "worker".into(),
+            role: "reviewer".into(),
             task_id: Some(id),
             session_id: "sess-exit75".into(),
             worktree: Some(fake_wt.to_string_lossy().into()),
             branch: Some("feat/test-exit75".into()),
-            phase: "awaiting-review".into(),
+            phase: "reviewing".into(),
             cost_tokens: 500,
             agent_state: None,
             cost_usd: 0.01,
@@ -663,6 +772,9 @@ fn exit75_in_review_recovered_without_worker_respawn() {
             pid: None,
             pr: Some(99),
             rework_count: 0,
+            provider: None,
+            continuation_id: None,
+            local_branch: None,
         };
         quorum_core::journal::upsert(&mut conn, &entry).unwrap();
     }
@@ -675,9 +787,17 @@ fn exit75_in_review_recovered_without_worker_respawn() {
         "recovery did not complete. Lines: {:?}",
         handle.lines
     );
+    handle.wait_for_completed_tick(home.path());
 
-    std::thread::sleep(Duration::from_millis(500));
-    handle.drain_pending_lines();
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    assert!(
+        quorum_core::journal::list_in_flight(&conn)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.session_id != "sess-exit75"),
+        "the PID-less pre-spawn reviewer row must be removed before replacement provisioning"
+    );
+    drop(conn);
 
     // Task stays in-review.
     let conn = quorum_core::db::open(&db_path).unwrap();
@@ -764,11 +884,82 @@ impl TestEnv {
         )
     }
 
+    fn seed_merged_continuation_graph(&self) {
+        let conn = quorum_core::db::open(&self.db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs,depends_on)
+             VALUES
+               (299,'graph source','decomposed','owner',1,1,'{}',NULL),
+               (300,'released dependent','open','owner',1,1,
+                '{\"cx_est\":2,\"cx_size\":\"S\",\"cx_ready\":true,\"cx_not_ready_reason\":null,\"cx_by\":\"test:v2\"}',
+                '[299]'),
+               (304,'sibling one','done','owner',1,1,'{}',NULL),
+               (305,'sibling two','done','owner',1,1,'{}',NULL),
+               (306,'sibling three','done','owner',1,1,'{}',NULL),
+               (307,'failed child','failed','owner',1,1,
+                '{\"pr\":526,\"daemon_parked\":true,\"daemon_parked_reason\":\"publication failed\",\"daemon_resume_status\":\"rework\",\"daemon_publication\":{\"pr\":526}}',NULL);
+
+             INSERT INTO task_decompositions(
+                 id,source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,created_at,updated_at)
+             VALUES (4,299,'active',1,0,1,1,1,1,1);
+             INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (4,304,'one',1,1),(4,305,'two',1,1),
+                    (4,306,'three',1,1),(4,307,'failed',1,1);
+             INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+             VALUES (307,526,'daemon/original','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,8);",
+        )
+        .unwrap();
+    }
+
+    fn seed_merged_continuation_delivery(&self) {
+        let conn = quorum_core::db::open(&self.db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs,continue_pr)
+             VALUES (320,'merged continuation','done','owner',9,40,
+                     '{\"pr\":526,\"source_task\":307}',526);
+             INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+             VALUES (320,526,'daemon/original','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',0,25);
+
+             INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                 profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES
+               (700,'worker:task:320:revision:1',320,NULL,'worker',NULL,'M',
+                'worker','codex','codex','sol','high','worker','test',9),
+               (701,'reviewer:task:320:r1',320,526,'reviewer','r1','M',
+                'reviewer','codex','codex','sol','high','reviewer','test',21);
+             INSERT INTO agent_runs(
+                 task_id,agent_name,role,model,effort,spawned_at,ended_at,end_reason,
+                 sub_role,provider,review_cap_run_id,review_pr,review_head_sha,role_assignment_id)
+             VALUES
+               (320,'worker','worker','sol','high',10,20,'completed',NULL,'codex',NULL,NULL,NULL,700),
+               (320,'reviewer','reviewer','sol','high',21,40,'verdict:approved',NULL,'codex',
+                'review-cap',526,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',701);
+             INSERT INTO r2_sampling_decisions(pr_number,head_sha,task_id,required,created_at)
+             VALUES (526,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',320,0,29);
+             INSERT INTO events(ts,kind,subject,body,expires_at)
+             VALUES (15,'task_in_review','task#320','by worker',4000000000),
+                    (30,'task_merging','task#320','by reviewer',4000000000),
+                    (40,'task_done','task#320','by system',4000000000);",
+        )
+        .unwrap();
+    }
+
     fn seed_claimed_task(&self, title: &str, agent: &str) -> i64 {
         let mut conn = quorum_core::db::open(&self.db_path).unwrap();
         let now = quorum_core::clock::now();
         let id = quorum_core::tasks::create(
-            &mut conn, "test", title, None, 0, None, None, None, None, now,
+            &mut conn,
+            "test",
+            title,
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
+            None,
+            None,
+            now,
         )
         .unwrap();
         quorum_core::tasks::claim(&mut conn, agent, Some(id), &[], 86400, now).unwrap();
@@ -792,6 +983,47 @@ impl TestEnv {
     }
 }
 
+#[test]
+fn merged_continuation_is_reconciled_by_production_startup_callsite() {
+    let env = TestEnv::new();
+    env.seed_merged_continuation_graph();
+    env.seed_merged_continuation_delivery();
+
+    let mut handle = env.start_serve();
+    assert!(
+        handle.wait_for("merged-continuation startup reconciliation adopted", 15),
+        "production startup callsite did not reconcile incident. Lines: {:?}",
+        handle.lines
+    );
+    assert_eq!(env.task_status(307), "done");
+    assert_eq!(env.task_status(299), "done");
+    handle.sigkill();
+}
+
+#[test]
+fn merged_continuation_created_after_startup_is_reconciled_by_production_tick_callsite() {
+    let env = TestEnv::new();
+    env.seed_merged_continuation_graph();
+
+    let mut handle = env.start_serve();
+    assert!(
+        handle.wait_for("recovery: complete", 15),
+        "daemon did not finish startup without a recovery delivery. Lines: {:?}",
+        handle.lines
+    );
+    assert_eq!(env.task_status(307), "failed");
+
+    env.seed_merged_continuation_delivery();
+    assert!(
+        handle.wait_for("merged-continuation tick reconciliation adopted", 15),
+        "production tick callsite did not reconcile later delivery. Lines: {:?}",
+        handle.lines
+    );
+    assert_eq!(env.task_status(307), "done");
+    assert_eq!(env.task_status(299), "done");
+    handle.sigkill();
+}
+
 fn make_journal_entry(
     agent: &str,
     role: &str,
@@ -812,16 +1044,21 @@ fn make_journal_entry(
         agent_state: None,
         cost_usd: 0.01,
         log_dir: None,
+        // Provisioners persist this row before child launch and add the PID
+        // afterward. Recovery must accept and clean that crash window.
         pid: None,
         pr,
         rework_count: 0,
+        provider: None,
+        continuation_id: None,
+        local_branch: None,
     }
 }
 
-/// Stateless recovery: working task with journal entry → AgentFailed → open,
-/// journal wiped, worktree GC'd, Phase 6 re-spawns a fresh worker.
+/// Worker pre-spawn crash recovery: the PID-less journal is removed, the task
+/// returns to open, and Phase 6 spawns exactly one replacement worker.
 #[test]
-fn recovery_working_task_reset_to_open_and_respawned() {
+fn pidless_worker_provision_resets_to_open_and_respawns() {
     let env = TestEnv::new();
     let id = env.seed_claimed_task("Working task with worktree", "Agent0");
 
@@ -1008,17 +1245,20 @@ fn recovery_stale_mailbox_drained_on_respawn() {
 
     let mut handle = env.start_serve();
 
-    // Recovery resets task to open, then Phase 6 spawns Agent0. The tick loop
-    // consumes stale mailbox rows (either via F9 drain or message processing).
+    // Recovery resets task to open. With no live Agent0 slot yet, Phase 4c
+    // consumes both stale messages before Phase 6 logs the replacement spawn.
+    for _ in 0..2 {
+        assert!(
+            handle.wait_for("consuming message from Agent0 with no to_agent", 15),
+            "stale mailbox row was not consumed. Lines: {:?}",
+            handle.lines
+        );
+    }
     assert!(
         handle.wait_for("spawning agent Agent0", 15),
         "Phase 6 did not re-spawn Agent0. Lines: {:?}",
         handle.lines
     );
-
-    // Give the spawn + mailbox processing a moment to settle.
-    std::thread::sleep(Duration::from_millis(500));
-    handle.drain_pending_lines();
 
     // Verify the stale mailbox rows are consumed (no unconsumed rows remain).
     {
@@ -1184,14 +1424,18 @@ fn recovery_journal_phase_irrelevant_db_status_drives_reset() {
     let wt = env.wt_base.path().join("Agent0");
     std::fs::create_dir_all(&wt).unwrap();
 
-    env.seed_journal(&make_journal_entry(
+    let mut entry = make_journal_entry(
         "Agent0",
         "worker",
         "awaiting-review",
         Some(id),
         Some(&wt.to_string_lossy()),
         None,
-    ));
+    );
+    // A PID-backed awaiting-review row predates the dormant handoff and is
+    // therefore ordinary stale state rather than an explicit dormant row.
+    entry.pid = Some(999_999);
+    env.seed_journal(&entry);
 
     let mut handle = env.start_serve();
 

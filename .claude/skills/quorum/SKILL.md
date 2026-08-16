@@ -3,146 +3,141 @@ name: quorum
 description: Coordinate work through the local Quorum daemon and CLI. Use when creating or inspecting managed tasks, checking daemon health, messaging agents, or acting as a daemon-managed worker or reviewer.
 ---
 
-# Quorum — managed agent coordination
+# Quorum
 
-Quorum is a local coordination substrate: one `quorum` binary, one SQLite database per
-repo, and `quorum serve` managing implementation, review, rework, and merge. There is no
-network coordination service or auth layer. CLI commands are short-lived; the daemon is
-the long-lived lifecycle manager.
+Quorum owns managed implementation, review, and merge. Identify your role before acting.
 
-## First: identify your role
+## Managed worker or reviewer
 
-**Daemon-managed worker or reviewer.** Your spawn prompt already contains the task, role,
-agent name, worktree, and branch. Work only on that assignment. Do not discover, claim,
-release, or select tasks yourself.
+Follow the spawn prompt: it defines the role, task, repository, and assigned worktree. Work
+only there. Do not claim or select tasks, create successor tasks, impersonate another agent,
+merge, or manually change lifecycle state.
 
-- Worker finished: `quorum submit --agent <You> --pr <N>`.
-- Reviewer verdict: `quorum submit --agent <You> --pr <N> --verdict approved --blocking 0`
-  or `--verdict changes --blocking <N> --feedback "..."`.
-- Blocked, failed, or needing input: `quorum react --agent <You> --task-id <N> --state <state>`.
-- Never review your own work or set a task to `done`; the daemon owns lifecycle transitions
-  and merge.
+Write only inside the assigned managed worktree and repository. You may read another repository
+as context, but a sibling or outside-repository change is not a managed deliverable. Leave it
+to the owner interactively, or create a separately scoped task for the repository that owns it.
 
-**External or interactive caller.** You may create and inspect work, post/read messages,
-and check health. Do not use the legacy passive-agent workflow (`sync`, `task-claim`, manual
-release, or external `submit`). The daemon selects and provisions managed agents.
-
-Own ambiguity before dispatch. Interactive callers handle production access, open-ended
-troubleshooting, incident diagnosis, feature design, architectural planning, and task
-scoping. Use narrowly bounded discovery tasks for support when useful, but do not ask a
-managed worker to own those activities.
-
-**Operator.** Start the manager with `scripts/serve-supervisor.sh` (recommended for
-self-updating repos) or `quorum serve`. Use `quorum status` for health and `quorum kill`
-only for emergency termination.
-
-## Create the right kind of task
-
-Dispatch only execution-ready work. Do not create a fix task from a reported symptom
-alone. First confirm the issue or gather enough evidence to state the observed and
-expected behavior, affected path, proposed remediation, constraints, and verification
-criteria.
-
-Implementation is still needed:
+If blocked, failed, or awaiting input, signal the daemon:
 
 ```sh
-quorum task-create \
-  --created-by <You> \
-  --title "Implement <outcome>" \
-  --labels '["complexity:2"]' \
-  --body-stdin <<'EOF'
-Describe the desired outcome, constraints, and verification.
-EOF
+quorum react --agent <You> --task-id <N> --state blocked|failed|needs-info
 ```
 
-The implementation already exists in PR #N and only review/merge is needed:
+Finish only with the completion command in the prompt. The daemon alone transitions lifecycle,
+posts formal reviews, and merges.
+
+## Target the correct repository
+
+Each repository has its own database. Do not assume the current directory selects the intended
+daemon when checkouts or daemons coexist. For commands that support it, pass `--repo owner/name`:
 
 ```sh
-quorum task-create \
-  --created-by <You> \
-  --title "Review and merge PR #N" \
-  --review-pr <N> \
-  --labels '["complexity:1","type:review"]' \
-  --body-stdin <<'EOF'
-Review the existing implementation and drive it through merge.
-EOF
+quorum task-create --repo owner/name --created-by <You> --title "<outcome>" --body-stdin
+QUORUM_REPO=owner/name quorum task-get --task-id <N>
 ```
 
-`--review-pr` starts directly in `in-review` and does not provision an implementation
-worker. The outside PR author remains responsible for pushes requested by reviewers. A
-changes verdict fails the review-only task because Quorum has no managed worker to perform
-rework; a merge conflict may leave it waiting for the outside author to update the PR.
+Otherwise set `QUORUM_REPO=owner/name` for that invocation. The daemon sets it for managed
+agents. Confirm the exact flags with `quorum <command> --help` before acting.
 
-## Task meanings — what each state implies
+## Interactive coordinator
 
-| Task kind | What it means |
-|-----------|---------------|
-| **Implementation task** (no `--review-pr`) | The daemon owns code production: it provisions a worker, assigns a worktree and branch, and drives the submit/review/merge cycle. |
-| **Review-only task** (`--review-pr N`) | Code already exists in PR #N. The daemon provisions only a reviewer; no worker is spawned. |
-| **Cancelled task** (`task-update --status cancelled`) | Quorum is no longer responsible for this outcome. No worker or reviewer will be provisioned. |
+Investigate and scope unclear work yourself. Create only execution-ready tasks with observed
+and expected behavior, relevant paths, constraints, and verification. Interactive coordinators
+create, inspect, cancel, and recover work; they do not claim tasks, impersonate managed agents,
+call `submit`, grant lifecycle authority, or merge.
 
-These are mutually exclusive states of responsibility. A task does not change kind — if
-implementation moves elsewhere, cancel and replace (see below).
+### Choose the entry mode
 
-## Transferring implementation responsibility outside Quorum
+New work starts from the configured base branch:
 
-When an interactive session, external tool, or non-Quorum agent implements work that a
-Quorum implementation task already covers, Quorum must be told — otherwise the daemon
-provisions a redundant worker that duplicates or conflicts with the external work.
+```sh
+quorum task-create --created-by <You> --title "<outcome>" --body-stdin
+```
 
-**Protocol (HARD RULE):**
+Use an implementation continuation when a managed worker must continue an existing PR. The
+daemon binds the task to the exact current PR head and runs its normal implementation/review/
+merge lifecycle:
 
-1. **Cancel the existing implementation task before external work proceeds.**
-   ```sh
-   quorum task-update --task-id <N> --agent <You> --status cancelled \
-     --note-file <(echo "Implementation transferred to <external-session/tool>; see PR #M")
-   ```
-2. **When the external PR is ready for review, create a review-only task:**
-   ```sh
-   quorum task-create \
-     --created-by <You> \
-     --title "Review and merge PR #M" \
-     --review-pr <M> \
-     --labels '["complexity:1","type:review"]' \
-     --body-stdin <<'EOF'
-   Implementation produced externally by <session/tool>. Review only.
-   EOF
-   ```
-3. **Never claim, execute, submit, or close a Quorum task from an interactive or external
-   session.** The daemon owns lifecycle transitions. Interactive callers create and cancel
-   tasks; they do not execute them.
+```sh
+quorum task-create --created-by <You> --title "<outcome>" --continue-pr <PR> --body-stdin
+```
 
-**Why this matters:** PR #9 / BoostMyAgents — an interactive Codex session completed
-implementation and opened a PR while the Quorum task remained `working`. The daemon later
-provisioned a worker for the same task, producing a duplicate implementation. The cancel-
-then-review-only protocol prevents this class of conflict.
+Use a review-only task only when an existing delivery needs review and merge, not edits:
 
-**Forbidden from interactive/external sessions:**
-- `quorum submit` (worker-only verb; requires a daemon-provisioned agent)
-- `quorum task-update --status done` (lifecycle-only; set by the system after merge)
-- Claiming a task and performing its implementation outside the daemon's worktree
+```sh
+quorum task-create --created-by <You> --title "Review PR #<PR>" --review-pr <PR> --body-stdin
+```
 
-For either path, include a clear body, `complexity:1-5`, and `--depends-on '[...]'` when
-work must wait. Use the shared rubric:
+`--continue-pr` and `--review-pr` are mutually exclusive. A review-only task skips the initial
+implementation worker. A changes verdict starts bounded daemon-managed remediation against the
+existing PR, then returns to review; use a continuation when implementation work is needed from
+the outset.
+
+The classifier uses this shared complexity rubric:
 
 - 1: Trivial — config tweak, typo fix, simple rename
-- 2: Simple — single-file change, clear spec; < 15 min agent work
-- 3: Moderate — multi-file change, some design decisions; 15-30 min
-- 4: Complex — cross-cutting change, multiple components; 30-60 min
-- 5: Very complex — architectural change, new subsystem; > 60 min
+- 2: Simple — single-file change, clear spec
+- 3: Moderate — multi-file change, some design decisions
+- 4: Complex — cross-cutting change, multiple components
+- 5: Very complex — architectural change, new subsystem
 
-## Observe and communicate
+Do not encode PR workflow or lifecycle authority in generic `refs`, titles, labels, or task
+body. In particular, this shipped CLI has no public successor-task creation interface for
+durable `source_task` provenance. Do not manufacture `refs.source_task`; `--continue-pr` alone
+preserves a PR but does not create automatic provenance-backed recovery discovery. A named,
+evidence-gated `decomposition-adopt-recovery` remains available for the exact pair.
 
-- `quorum status [--json]` — daemon and queue health.
-- `quorum task-list --brief` / `quorum task-get --task-id <N>` — queue and full task.
-- `quorum log --refs task#N` — lifecycle events.
-- `quorum post ...` / `quorum read ...` — durable agent-authored feed messages.
-- `quorum pins` — standing context.
-- `quorum help` — shipped command cheat-sheet; use `quorum <command> --help` for exact flags.
+### Recover without losing authority or PR work
 
-Feed messages and lifecycle events are separate streams: use `read` for what agents said
-and `log` for what changed. Free-text bodies go through `--body-stdin` or `--body-file`,
-never a shell flag.
+First inspect the task and lifecycle log:
 
-Exit codes are stable: `0` success · `1` clean negative result · `2` usage/bad input ·
-`3` internal/DB error.
+```sh
+quorum task-get --task-id <N>
+quorum log --refs task#<N>
+```
+
+Use `task-retry` only when the daemon has parked the task after a bounded failure or the task is
+provider-blocked. It resumes the same task and preserves its PR, branch, dependencies, and
+rework context; it is not a general retry button for terminal failures:
+
+```sh
+quorum task-retry --task-id <N> --by <You>
+```
+
+For a failed generated graph child, do not infer equivalence from matching text or a shared PR.
+Only after the exact managed continuation is completed and merged may an operator adopt that
+named pair. The command rechecks final-child graph membership, repository, PR, head, managed
+worker/reviewer, and merged-completion evidence. `source_task` provenance must agree when
+present, but may be absent because the operator names the exact child and recovery task:
+
+```sh
+quorum decomposition-adopt-recovery \
+  --original-child-id <failed-child> --recovery-task-id <merged-continuation> --by <You>
+```
+
+This is a one-pair, evidence-gated recovery operation, not a way to create a continuation or
+skip review. The missing public successor interface does not block this explicit path; do not
+bypass the guard by inventing refs.
+
+Use `task-close` only for a documented manual resolution: work merged by hand, fixed elsewhere,
+or obsolete (including a failed task whose PR later landed). Supply a durable reason. It records
+a manual close, never substitutes for managed review and merge:
+
+```sh
+quorum task-close --agent <You> --task-id <N> --reason-file <path>
+```
+
+If implementation moves outside an existing Quorum task, cancel that task before external work
+starts. When the external PR is ready, create a new `--review-pr` task.
+
+## Operator
+
+Start the manager with `quorum serve`, or `scripts/serve-supervisor.sh` when the managed
+repository needs supervised self-update. Inspect with `quorum status`, `quorum task-list
+--brief`, `quorum task-get --task-id <N>`, `quorum log --refs task#<N>`, and `quorum tail
+<agent>`. Use `quorum kill` only for a stuck managed agent.
+
+`quorum init` installs the embedded repository skill when it is missing and reports drift
+without overwriting it. `quorum upgrade` publishes the embedded skill artifact; use
+`quorum upgrade --check` to detect drift without writing. Put free text in stdin or files, not
+shell arguments. Exit codes: 0 success, 1 expected negative, 2 bad input, 3 internal/DB failure.

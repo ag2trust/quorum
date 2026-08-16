@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 34;
+pub const SCHEMA_VERSION: i64 = 54;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -31,6 +31,13 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 pub fn apply_pragmas(conn: &Connection) -> Result<()> {
     // busy_timeout MUST be first so every subsequent lock acquisition honors it.
     conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    apply_persistent_pragmas(conn)
+}
+
+/// Apply the PRAGMAs that follow `busy_timeout`. Kept separate so open can
+/// perform its read-only schema compatibility check before the persistent WAL
+/// switch without moving that check ahead of the mandatory timeout.
+fn apply_persistent_pragmas(conn: &Connection) -> Result<()> {
     set_journal_wal(conn)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
@@ -100,11 +107,14 @@ pub struct MigrateResult {
     pub schema_version: i64,
 }
 
-/// Open the store at `path`, applying PRAGMAs and running migrations. The returned
-/// connection is ready for use.
+/// Open the store at `path`, refusing an unsupported newer schema before applying
+/// any persistent PRAGMA, then applying PRAGMAs and running migrations. The
+/// returned connection is ready for use.
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    apply_pragmas(&conn)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    ensure_schema_supported(&conn)?;
+    apply_persistent_pragmas(&conn)?;
     migrate(&conn)?;
     Ok(conn)
 }
@@ -112,9 +122,27 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// Like [`open`], but also returns the migration outcome so callers can report what changed.
 pub fn open_init(path: &Path) -> Result<(Connection, MigrateResult)> {
     let conn = Connection::open(path)?;
-    apply_pragmas(&conn)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    ensure_schema_supported(&conn)?;
+    apply_persistent_pragmas(&conn)?;
     let info = migrate(&conn)?;
     Ok((conn, info))
+}
+
+/// Read the on-disk version and reject unsupported schemas without changing
+/// connection or database state. This must run before
+/// [`apply_persistent_pragmas`]: switching `journal_mode` to WAL is persistent
+/// and would otherwise mutate a newer database that this binary has no
+/// authority to open.
+fn ensure_schema_supported(conn: &Connection) -> Result<i64> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > SCHEMA_VERSION {
+        return Err(QuorumError::SchemaTooNew {
+            db: current,
+            bin: SCHEMA_VERSION,
+        });
+    }
+    Ok(current)
 }
 
 /// Bring the on-disk schema up to [`SCHEMA_VERSION`].
@@ -122,8 +150,7 @@ pub fn open_init(path: &Path) -> Result<(Connection, MigrateResult)> {
 /// Forward-only and idempotent. Runs under `BEGIN IMMEDIATE` so concurrent first-runs are
 /// safe. Refuses (fails loud) if the DB was written by a newer binary.
 pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    ensure_schema_supported(current, SCHEMA_VERSION)?;
+    let current = ensure_schema_supported(conn)?;
     if current == SCHEMA_VERSION {
         return Ok(MigrateResult {
             migrated_from: current,
@@ -467,13 +494,345 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // sampled R2 skip is merge-gate authority. Landing at v33 forces live
         // v32 databases through SCHEMA_SQL so the net-new table is present.
 
-        // v34 = durable per-invocation token usage (#229). Two net-new tables
-        // are created by SCHEMA_SQL: token_usage_runs stores the provider
-        // breakdown and token_usage_run_tasks maps batched classifier runs to
-        // every task they classified. Keeping this separate from agent_runs
-        // also represents collector/classifier invocations without synthetic
-        // managed-agent identities.
+        // v34 = bounded REVIEWING status projection (#239). The partial index
+        // matches each durable status and newest-first order. Status reads at
+        // most REVIEWING_TASK_LIMIT candidates per status before merging, rather
+        // than sorting every historical review-only task. Bumping is required
+        // for live v33 databases, where SCHEMA_SQL would otherwise be skipped.
 
+        // v36 reconciles the two independently shipped v35 additions: bounded task
+        // decomposition and authoritative existing-PR implementation intent. Check
+        // every column so a database created by either v35 lineage gains the other.
+        // The aggregate/member/attempt/cleanup
+        // tables are created by SCHEMA_SQL. Task revisions are additive so a
+        // populated database preserves every existing task at revision 1 with
+        // no accepted edits.
+        if current < 36 {
+            if !column_exists(conn, "tasks", "revision")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "tasks", "edit_count")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN edit_count INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            // Nullable preserves every historical task as ordinary/review-only;
+            // the CLI/core boundary validates writes on upgraded databases.
+            if !column_exists(conn, "tasks", "continue_pr")? {
+                conn.execute("ALTER TABLE tasks ADD COLUMN continue_pr INTEGER", [])?;
+            }
+        }
+
+        // v37 persists an accepted bounded proposal across daemon restarts.
+        // The reservation table is created by SCHEMA_SQL.
+        if current < 37 && !column_exists(conn, "task_decompositions", "accepted_proposal_json")? {
+            conn.execute(
+                "ALTER TABLE task_decompositions ADD COLUMN accepted_proposal_json TEXT",
+                [],
+            )?;
+        }
+
+        // v36 = indexed corrupt terminal retry candidates (#270). The two
+        // partial indexes are created by SCHEMA_SQL: one supports the daemon's
+        // oldest-first bounded reconciliation batch, and one supports the
+        // newest-first bounded status projection. A live v35 database must run
+        // SCHEMA_SQL once so both indexes are materialized.
+
+        // v38 repairs the split v36 lineages. Decomposition's v36 added optimistic
+        // task-edit columns, while main's independently shipped v36 did not. A main
+        // database could therefore be stamped v37 by the integration binary without
+        // receiving either column. Guard each ALTER independently so every historical
+        // shape converges without changing existing task data.
+        if current < 38 {
+            if !column_exists(conn, "tasks", "revision")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "tasks", "edit_count")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN edit_count INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+        }
+
+        // v39 makes decomposition cleanup crash-recoverable. SQLite cannot
+        // alter a CHECK constraint, so rebuild the table under the same write
+        // lock. Historical `complete` rows remain terminal; historical
+        // `failed` rows become retryable pending work.
+        if current < 39 {
+            conn.execute_batch(
+                "CREATE TABLE decomposition_cleanup_v39 (
+                     graph_id       INTEGER NOT NULL REFERENCES task_decompositions(id),
+                     task_id        INTEGER NOT NULL REFERENCES tasks(id),
+                     artifact_kind  TEXT NOT NULL,
+                     artifact_ref   TEXT NOT NULL,
+                     state          TEXT NOT NULL DEFAULT 'pending'
+                                          CHECK(state IN ('pending','running','done','exhausted')),
+                     attempts       INTEGER NOT NULL DEFAULT 0,
+                     last_error     TEXT,
+                     updated_at     INTEGER NOT NULL,
+                     PRIMARY KEY (graph_id, task_id, artifact_kind, artifact_ref)
+                 );
+                 INSERT INTO decomposition_cleanup_v39(
+                     graph_id,task_id,artifact_kind,artifact_ref,state,attempts,last_error,updated_at)
+                 SELECT graph_id,task_id,artifact_kind,artifact_ref,
+                        CASE state WHEN 'complete' THEN 'done'
+                                   WHEN 'failed' THEN 'pending' ELSE state END,
+                        attempts,last_error,updated_at
+                 FROM decomposition_cleanup;
+                 DROP TABLE decomposition_cleanup;
+                 ALTER TABLE decomposition_cleanup_v39 RENAME TO decomposition_cleanup;",
+            )?;
+        }
+
+        // v40 binds a task-owned branch allocation to the immutable commit it
+        // was provisioned from. Historical allocations remain NULL and are
+        // deliberately ineligible for destructive branch discovery.
+        if current < 40 && !column_exists(conn, "task_branches", "provenance_sha")? {
+            conn.execute(
+                "ALTER TABLE task_branches ADD COLUMN provenance_sha TEXT",
+                [],
+            )?;
+        }
+
+        // v41 persists the immutable PR head assigned to an exact reviewer
+        // capability. Restart recovery must never infer review authority from
+        // a mutable worktree checkout.
+        if current < 41 {
+            if !column_exists(conn, "agent_runs", "review_cap_run_id")? {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN review_cap_run_id TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "agent_runs", "review_pr")? {
+                conn.execute("ALTER TABLE agent_runs ADD COLUMN review_pr INTEGER", [])?;
+            }
+            if !column_exists(conn, "agent_runs", "review_head_sha")? {
+                conn.execute("ALTER TABLE agent_runs ADD COLUMN review_head_sha TEXT", [])?;
+            }
+        }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_review_cap
+             ON agent_runs(review_cap_run_id) WHERE review_cap_run_id IS NOT NULL",
+            [],
+        )?;
+
+        // v42 = durable weighted model routing. Net-new authority tables are created by
+        // SCHEMA_SQL; these nullable links extend existing canonical evidence without
+        // reinterpreting historical rows.
+        if current < 42 {
+            if !column_exists(conn, "agent_runs", "role_assignment_id")? {
+                conn.execute("ALTER TABLE agent_runs ADD COLUMN role_assignment_id INTEGER REFERENCES role_assignments(id)", [])?;
+            }
+            if !column_exists(conn, "task_decompositions", "planner_assignment_id")? {
+                conn.execute("ALTER TABLE task_decompositions ADD COLUMN planner_assignment_id INTEGER REFERENCES role_assignments(id)", [])?;
+            }
+            if !column_exists(conn, "review_collection_runs", "role_assignment_id")? {
+                conn.execute("ALTER TABLE review_collection_runs ADD COLUMN role_assignment_id INTEGER REFERENCES role_assignments(id)", [])?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS agent_runs_role_assignment
+                     ON agent_runs(role_assignment_id);
+                 CREATE INDEX IF NOT EXISTS review_collection_runs_role_assignment
+                     ON review_collection_runs(role_assignment_id);
+                 CREATE INDEX IF NOT EXISTS task_decompositions_planner_assignment
+                     ON task_decompositions(planner_assignment_id);",
+            )?;
+        }
+
+        // v43 adds dormant durable review follow-up batches and artifacts via
+        // SCHEMA_SQL. The run-count column is additive; historical collection
+        // rows retain the default zero without reinterpretation or backfill.
+        if current < 43 && !column_exists(conn, "review_collection_runs", "followup_count")? {
+            conn.execute(
+                "ALTER TABLE review_collection_runs ADD COLUMN followup_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // v44 adds dormant follow-up assessment aggregates and artifact
+        // membership via SCHEMA_SQL. v45 adds counter-bound and membership-
+        // immutability triggers, also via SCHEMA_SQL. v46 adds a durable,
+        // irreversible membership seal. Existing assessments are sealed by
+        // default; only the atomic materializer explicitly creates an open row.
+        if current < 46 && !column_exists(conn, "review_followup_assessments", "membership_sealed")?
+        {
+            conn.execute(
+                "ALTER TABLE review_followup_assessments
+                 ADD COLUMN membership_sealed INTEGER NOT NULL DEFAULT 1
+                 CHECK(membership_sealed IN (0,1))",
+                [],
+            )?;
+        }
+        if current < 46 {
+            conn.execute_batch(
+                "CREATE TRIGGER IF NOT EXISTS review_followup_membership_insert_unsealed
+                 BEFORE INSERT ON review_followup_assessment_artifacts
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM review_followup_assessments
+                     WHERE id=NEW.assessment_id AND membership_sealed=0
+                       AND state='pending' AND active=0
+                 )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'follow-up assessment membership is sealed');
+                 END;
+
+                 CREATE TRIGGER IF NOT EXISTS review_followup_membership_no_unseal
+                 BEFORE UPDATE OF membership_sealed ON review_followup_assessments
+                 WHEN OLD.membership_sealed=1 AND NEW.membership_sealed!=1
+                 BEGIN
+                     SELECT RAISE(ABORT, 'follow-up assessment membership seal is irreversible');
+                 END;",
+            )?;
+        }
+        // v47 records daemon-owned terminal provenance without reinterpreting
+        // history. Existing done rows remain NULL: refs.pr alone cannot prove
+        // whether task-close represented a merge, an external fix, or obsolescence.
+        // The column check deliberately extends through v48: v47 was also used
+        // by PR #565 before main's completion-provenance migration landed, so
+        // either v47 shape must converge safely when the lineages merge.
+        if current < 48 && !column_exists(conn, "tasks", "completion_provenance")? {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN completion_provenance TEXT
+                 CHECK(completion_provenance IS NULL
+                       OR completion_provenance IN ('merged','manual'))",
+                [],
+            )?;
+        }
+        // Guarded core write APIs remain dormant until later daemon activation
+        // work.
+
+        // v48 bounds sweep's REFERENCES tasks(id) guards (task #395). Schema 46
+        // and main's independently shipped v47 left six durable FK columns
+        // unindexed; sweep_on_write runs inside every mutation's write
+        // transaction and would otherwise scan each retained provenance table
+        // once per candidate task. SCHEMA_SQL (which runs at the top of
+        // migrate) declares the six indexes and rotating sweep cursor so fresh
+        // DBs get them, but the v39 block below drops+recreates
+        // `decomposition_cleanup` via a rename that also drops its indexes;
+        // recreate every durable-ref index here so both fresh and upgraded
+        // databases end up with the same shape. `CREATE INDEX IF NOT EXISTS`
+        // is idempotent so re-running the migration (crash between blocks) is
+        // safe. Bumping SCHEMA_VERSION to 48 is load-bearing: the
+        // `current == SCHEMA_VERSION` early-return above short-circuits
+        // SCHEMA_SQL, so a live DB stopped at either v47 lineage would
+        // otherwise retain an incomplete schema.
+        if current < 48 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS decomposition_cleanup_task
+                     ON decomposition_cleanup(task_id);
+                 CREATE INDEX IF NOT EXISTS review_followup_batches_task
+                     ON review_followup_batches(task_id);
+                 CREATE INDEX IF NOT EXISTS review_followup_batches_source_task
+                     ON review_followup_batches(source_task_id);
+                 CREATE INDEX IF NOT EXISTS review_followup_artifacts_linked_task
+                     ON review_followup_artifacts(linked_task_id)
+                     WHERE linked_task_id IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS review_followup_artifacts_created_task
+                     ON review_followup_artifacts(created_task_id)
+                     WHERE created_task_id IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS review_followup_assessments_source_task
+                     ON review_followup_assessments(source_task_id);",
+            )?;
+        }
+        // v49 adds immutable responsibility-scoped routing-attempt evidence.
+        // The table, assignment guard, immutability triggers, and read index are
+        // all additive and created idempotently by SCHEMA_SQL above.
+
+        // v50 backfills task #473's durable `daemon_parked_unsatisfiable` bit
+        // and the distinct "cancelled — unsatisfiable" reason onto rows already
+        // parked before this binary shipped. Without this, live examples
+        // (#308/#309, #313/#314, #318, #421/#422 in ag2trust/quorum on
+        // 2026-08-15) stay hidden from the BLOCKED disposition queue and
+        // indistinguishable from recoverable failed-dep parks — the exact
+        // operator symptom task #473 was opened to fix. Idempotent: the guard
+        // requires the marker to be missing/false, so a re-run at v50 is a
+        // no-op. Data-only backfill; no schema shape change.
+        // Run through v51 as well: task #426 independently shipped v50 for
+        // dormant-worker journal identity, so that lineage has not applied
+        // main's v50 data migration. The UPDATE remains idempotent by marker.
+        if current < 52 && column_exists(conn, "tasks", "depends_on")? {
+            conn.execute(
+                "UPDATE tasks
+                 SET refs = json_set(
+                         refs,
+                         '$.daemon_parked_unsatisfiable', json('true'),
+                         '$.daemon_parked_reason',
+                         'dependency #' ||
+                         (SELECT j.value FROM json_each(tasks.depends_on) j
+                          JOIN tasks d ON d.id = j.value
+                          WHERE d.status IN ('cancelled')
+                          ORDER BY j.value LIMIT 1)
+                         || ' is cancelled — unsatisfiable'
+                     )
+                 WHERE status='failed'
+                   AND depends_on IS NOT NULL
+                   AND json_valid(refs)
+                   AND json_extract(refs, '$.daemon_parked')=1
+                   -- Same rule as `upgrade_stale_recoverable_parks` in
+                   -- sweep.rs: classifier-policy parks own their own
+                   -- lifecycle (reason 'classifier declined', retry stays
+                   -- in `failed` as a reclassification request) and must
+                   -- not be relabeled as unsatisfiable-dep parks.
+                   -- Diverging here would make behavior depend on upgrade
+                   -- timing.
+                   AND COALESCE(
+                       json_extract(refs, '$.classifier_policy_parked'), 0
+                   ) != 1
+                   AND COALESCE(
+                       json_extract(refs, '$.daemon_parked_unsatisfiable'), 0
+                   ) != 1
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(tasks.depends_on) j
+                       JOIN tasks d ON d.id = j.value
+                       WHERE d.status IN ('cancelled')
+                   )",
+                [],
+            )?;
+        }
+        // v51 adds a durable cursor queue for bounded cancelled-dependency
+        // reconciliation. The idempotent table is declared in SCHEMA_SQL;
+        // repeat it here to make the versioned shape explicit.
+        if current < 51 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cancelled_dependency_reconciliation (
+                     cancelled_task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+                     task_cursor       INTEGER NOT NULL DEFAULT 0,
+                     updated_at        INTEGER NOT NULL
+                 );",
+            )?;
+        }
+        // v52 converges main's v50/v51 migrations with task #426's
+        // independently shipped v50 dormant-worker journal identity. Fresh
+        // databases receive these nullable columns from SCHEMA_SQL; guarded
+        // ALTERs upgrade either published lineage without rewriting history.
+        if current < 52 {
+            if !column_exists(conn, "journal", "provider")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN provider TEXT", [])?;
+            }
+            if !column_exists(conn, "journal", "continuation_id")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN continuation_id TEXT", [])?;
+            }
+            if !column_exists(conn, "journal", "local_branch")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN local_branch TEXT", [])?;
+            }
+        }
+        // v53 = authoritative nullable target-branch on tasks. Resolved to
+        // the daemon-configured base before first execution; immutable once
+        // populated. NULL preserves every historical task without reinterpreting.
+        if current < 53 && !column_exists(conn, "tasks", "target_branch")? {
+            conn.execute("ALTER TABLE tasks ADD COLUMN target_branch TEXT", [])?;
+        }
+        // v54 = durable, per-invocation token usage. Both new tables are
+        // created idempotently by SCHEMA_SQL; historic agent runs remain
+        // untouched and no usage is fabricated during migration.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -490,16 +849,6 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
             Err(e)
         }
     }
-}
-
-fn ensure_schema_supported(db_version: i64, binary_version: i64) -> Result<()> {
-    if db_version > binary_version {
-        return Err(QuorumError::SchemaTooNew {
-            db: db_version,
-            bin: binary_version,
-        });
-    }
-    Ok(())
 }
 
 fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool> {
@@ -547,6 +896,11 @@ mod tests {
             "journal",
             "daemon_lock",
             "agent_runs",
+            "token_usage_runs",
+            "token_usage_run_tasks",
+            "role_assignments",
+            "routing_cursors",
+            "routing_attempts",
             "task_messages",
             "task_message_deliveries",
         ] {
@@ -572,6 +926,1241 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn main_v49_migration_adds_dormant_journal_identity_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main-v49-dormant-journal.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO journal(agent,role,task_id,session_id,phase,updated_at)
+                 VALUES ('legacy','worker',7,'session','working',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE journal DROP COLUMN provider;
+                 ALTER TABLE journal DROP COLUMN continuation_id;
+                 ALTER TABLE journal DROP COLUMN local_branch;
+                 PRAGMA user_version=49;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        for column in ["provider", "continuation_id", "local_branch"] {
+            assert!(column_exists(&conn, "journal", column).unwrap());
+        }
+        let legacy: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT provider,continuation_id,local_branch FROM journal WHERE agent='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (None, None, None));
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn dormant_worker_v49_migration_adds_immutable_routing_attempts_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dormant-worker-v49.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE role_assignments (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     responsibility_key TEXT NOT NULL UNIQUE,
+                     task_id INTEGER,
+                     pr_number INTEGER,
+                     role TEXT NOT NULL,
+                     review_stage TEXT,
+                     complexity TEXT,
+                     profile_id TEXT NOT NULL,
+                     provider TEXT NOT NULL,
+                     runner TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     effort TEXT NOT NULL,
+                     pool_key TEXT NOT NULL,
+                     policy_generation TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,role,complexity,profile_id,provider,
+                     runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (9,'worker:task:9',9,'worker','M','opus','claude','claude',
+                         'claude-opus-4-8','high','worker.M','generation-1',10);
+                 PRAGMA user_version=49;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT responsibility_key,profile_id FROM role_assignments WHERE id=9",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            ("worker:task:9".into(), "opus".into())
+        );
+        for object in [
+            "routing_attempts",
+            "routing_attempts_responsibility",
+            "routing_attempts_assignment_guard",
+            "routing_attempts_no_update",
+            "routing_attempts_no_delete",
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name=?1",
+                    [object],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "missing migrated object {object}"
+            );
+        }
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM role_assignments", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn fresh_schema_has_exact_dormant_review_followup_shape_and_constraints() {
+        fn columns(
+            conn: &Connection,
+            table: &str,
+        ) -> Vec<(String, String, i64, Option<String>, i64)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name,type,\"notnull\",dflt_value,pk
+                     FROM pragma_table_info(?1) ORDER BY cid",
+                )
+                .unwrap();
+            stmt.query_map([table], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        }
+
+        fn foreign_keys(conn: &Connection, table: &str) -> Vec<(String, String, String)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT \"from\",\"table\",\"to\"
+                     FROM pragma_foreign_key_list(?1) ORDER BY \"from\"",
+                )
+                .unwrap();
+            stmt.query_map([table], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("followups.db")).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+
+        assert_eq!(
+            columns(&conn, "review_followup_batches"),
+            vec![
+                ("pr_number".into(), "INTEGER".into(), 0, None, 1),
+                ("task_id".into(), "INTEGER".into(), 1, None, 0),
+                ("graph_id".into(), "INTEGER".into(), 0, None, 0),
+                ("source_task_id".into(), "INTEGER".into(), 1, None, 0),
+                ("collector_version".into(), "TEXT".into(), 1, None, 0),
+                ("artifact_count".into(), "INTEGER".into(), 1, None, 0),
+                ("state".into(), "TEXT".into(), 1, None, 0),
+                ("created_at".into(), "INTEGER".into(), 1, None, 0),
+                ("updated_at".into(), "INTEGER".into(), 1, None, 0),
+            ]
+        );
+        assert_eq!(
+            columns(&conn, "review_followup_artifacts"),
+            vec![
+                ("id".into(), "INTEGER".into(), 0, None, 1),
+                ("pr_number".into(), "INTEGER".into(), 1, None, 0),
+                ("ordinal".into(), "INTEGER".into(), 1, None, 0),
+                ("technical_impact".into(), "TEXT".into(), 1, None, 0),
+                ("scope_relationship".into(), "TEXT".into(), 1, None, 0),
+                ("concern".into(), "TEXT".into(), 1, None, 0),
+                ("non_blocking_reason".into(), "TEXT".into(), 1, None, 0),
+                ("affected_behavior".into(), "TEXT".into(), 1, None, 0),
+                ("desired_outcome".into(), "TEXT".into(), 1, None, 0),
+                (
+                    "verification_expectations".into(),
+                    "TEXT".into(),
+                    1,
+                    None,
+                    0,
+                ),
+                ("evidence_ids".into(), "TEXT".into(), 1, None, 0),
+                ("disposition".into(), "TEXT".into(), 0, None, 0),
+                ("disposition_reason".into(), "TEXT".into(), 0, None, 0),
+                ("linked_task_id".into(), "INTEGER".into(), 0, None, 0),
+                ("created_task_id".into(), "INTEGER".into(), 0, None, 0),
+                ("created_at".into(), "INTEGER".into(), 1, None, 0),
+                ("updated_at".into(), "INTEGER".into(), 1, None, 0),
+            ]
+        );
+        assert_eq!(
+            foreign_keys(&conn, "review_followup_batches"),
+            vec![
+                ("graph_id".into(), "task_decompositions".into(), "id".into()),
+                ("source_task_id".into(), "tasks".into(), "id".into()),
+                ("task_id".into(), "tasks".into(), "id".into()),
+            ]
+        );
+        assert_eq!(
+            foreign_keys(&conn, "review_followup_artifacts"),
+            vec![
+                ("created_task_id".into(), "tasks".into(), "id".into()),
+                ("linked_task_id".into(), "tasks".into(), "id".into()),
+                (
+                    "pr_number".into(),
+                    "review_followup_batches".into(),
+                    "pr_number".into(),
+                ),
+            ]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT type,\"notnull\",dflt_value
+                 FROM pragma_table_info('review_collection_runs')
+                 WHERE name='followup_count'",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?
+                )),
+            )
+            .unwrap(),
+            ("INTEGER".into(), 1, "0".into())
+        );
+
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at) VALUES
+                 (1,'source','done','owner',1,1),
+                 (2,'linked','open','owner',1,1),
+                 (3,'created','open','owner',1,1);
+             INSERT INTO task_decompositions(
+                 id,source_task_id,state,active,freeze_active,planned_source_revision,
+                 created_at,updated_at)
+             VALUES (10,1,'completed',0,0,1,1,1);",
+        )
+        .unwrap();
+
+        let insert_batch = |pr_number: i64,
+                            task_id: i64,
+                            graph_id: Option<i64>,
+                            source_task_id: i64,
+                            state: &str| {
+            conn.execute(
+                "INSERT INTO review_followup_batches(
+                     pr_number,task_id,graph_id,source_task_id,collector_version,
+                     artifact_count,state,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,'followups-v1',6,?5,1,1)",
+                rusqlite::params![pr_number, task_id, graph_id, source_task_id, state],
+            )
+        };
+        insert_batch(100, 1, Some(10), 1, "collected").unwrap();
+        conn.execute(
+            "UPDATE review_followup_batches SET state='assessing' WHERE pr_number=100",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE review_followup_batches SET state='resolved' WHERE pr_number=100",
+            [],
+        )
+        .unwrap();
+        assert!(insert_batch(101, 1, None, 1, "invalid").is_err());
+        assert!(insert_batch(102, 999, None, 1, "collected").is_err());
+        assert!(insert_batch(103, 1, Some(999), 1, "collected").is_err());
+        assert!(insert_batch(104, 1, None, 999, "collected").is_err());
+
+        let insert_artifact = |ordinal: i64,
+                               impact: &str,
+                               scope: &str,
+                               disposition: Option<&str>,
+                               linked_task_id: Option<i64>,
+                               created_task_id: Option<i64>| {
+            conn.execute(
+                "INSERT INTO review_followup_artifacts(
+                     pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,disposition,
+                     disposition_reason,linked_task_id,created_task_id,created_at,updated_at)
+                 VALUES (100,?1,?2,?3,'concern','reason','behavior','outcome',
+                         '[\"verify\"]','[1]',?4,NULL,?5,?6,1,1)",
+                rusqlite::params![
+                    ordinal,
+                    impact,
+                    scope,
+                    disposition,
+                    linked_task_id,
+                    created_task_id
+                ],
+            )
+        };
+
+        for (ordinal, impact, scope, disposition, linked, created) in [
+            (0, "critical", "pre_existing", None, None, None),
+            (1, "major", "out_of_scope", Some("linked"), Some(2), None),
+            (
+                2,
+                "minor",
+                "threat_model_expansion",
+                Some("created"),
+                None,
+                Some(3),
+            ),
+            (3, "nit", "defense_in_depth", Some("dismissed"), None, None),
+            (
+                4,
+                "critical",
+                "future_requirement",
+                Some("deferred"),
+                None,
+                None,
+            ),
+            (5, "major", "design_debt", None, None, None),
+        ] {
+            insert_artifact(ordinal, impact, scope, disposition, linked, created).unwrap();
+        }
+
+        assert!(insert_artifact(6, "invalid", "pre_existing", None, None, None).is_err());
+        assert!(insert_artifact(6, "major", "invalid", None, None, None).is_err());
+        assert!(insert_artifact(6, "major", "pre_existing", Some("invalid"), None, None).is_err());
+        assert!(insert_artifact(6, "major", "pre_existing", None, Some(2), None).is_err());
+        assert!(insert_artifact(6, "major", "pre_existing", Some("linked"), None, None).is_err());
+        assert!(insert_artifact(
+            6,
+            "major",
+            "pre_existing",
+            Some("created"),
+            Some(2),
+            Some(3)
+        )
+        .is_err());
+        assert!(
+            insert_artifact(6, "major", "pre_existing", Some("dismissed"), None, Some(3)).is_err()
+        );
+        assert!(
+            insert_artifact(6, "major", "pre_existing", Some("linked"), Some(999), None).is_err()
+        );
+        assert!(insert_artifact(0, "major", "pre_existing", None, None, None).is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_artifacts(
+                     pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES (999,0,'major','pre_existing','c','r','b','o','[]','[]',1,1)",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn populated_v42_migration_adds_dormant_followups_without_changing_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v42-followups.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,body,status,priority,labels,assignee,created_by,
+                     created_at,updated_at,refs,author,reviewer,rework_round,review_only)
+                 VALUES (41,'historical task','body','done',7,'[\"old\"]','worker','owner',
+                         10,20,'{\"pr\":410}','worker','reviewer',2,0);
+                 INSERT INTO review_findings(
+                     id,pr_number,task_id,reviewer,kind,author_pushback,pushback_accepted,
+                     severity,text,source_endpoint,created_at,addressed_status,evidence_ids,
+                     collector_model,collector_version)
+                 VALUES (51,410,41,'reviewer','suggestion',1,0,'minor','historical finding',
+                         'pulls',30,'unaddressed','[{\"kind\":\"review\",\"id\":1}]',
+                         'old-model','old-v1');
+                 INSERT INTO review_collection_runs(
+                     pr_number,task_id,status,error,collector_model,collector_version,
+                     findings_count,attempted_at,completed_at,role_assignment_id)
+                 VALUES (410,41,'success',NULL,'old-model','old-v1',1,30,31,NULL);
+                 DROP TABLE review_followup_artifacts;
+                 DROP TABLE review_followup_batches;
+                 ALTER TABLE review_collection_runs DROP COLUMN followup_count;
+                 PRAGMA user_version=42;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert!(column_exists(&conn, "review_collection_runs", "followup_count").unwrap());
+        for table in ["review_followup_batches", "review_followup_artifacts"] {
+            assert!(conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+        let historical_json = |sql| {
+            conn.query_row(sql, [], |row| row.get::<_, String>(0))
+                .unwrap()
+        };
+        assert_eq!(
+            historical_json(
+                "SELECT json_array(id,title,body,status,priority,labels,assignee,created_by,
+                        created_at,updated_at,refs,author,reviewer,rework_round,review_only)
+                 FROM tasks WHERE id=41"
+            ),
+            r#"[41,"historical task","body","done",7,"[\"old\"]","worker","owner",10,20,"{\"pr\":410}","worker","reviewer",2,0]"#
+        );
+        assert_eq!(
+            historical_json(
+                "SELECT json_array(id,pr_number,task_id,reviewer,kind,author_pushback,
+                        pushback_accepted,severity,text,source_endpoint,created_at,
+                        addressed_status,evidence_ids,collector_model,collector_version)
+                 FROM review_findings WHERE id=51"
+            ),
+            r#"[51,410,41,"reviewer","suggestion",1,0,"minor","historical finding","pulls",30,"unaddressed","[{\"kind\":\"review\",\"id\":1}]","old-model","old-v1"]"#
+        );
+        assert_eq!(
+            historical_json(
+                "SELECT json_array(pr_number,task_id,status,error,collector_model,
+                        collector_version,findings_count,followup_count,attempted_at,
+                        completed_at,role_assignment_id)
+                 FROM review_collection_runs WHERE pr_number=410"
+            ),
+            r#"[410,41,"success",null,"old-model","old-v1",1,0,30,31,null]"#
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(conn);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT findings_count,followup_count FROM review_collection_runs
+                     WHERE pr_number=410",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn populated_v43_migration_adds_assessment_tables_and_enforces_all_authority() {
+        fn unique_indexes(conn: &Connection, table: &str) -> Vec<(String, bool, Vec<String>)> {
+            let mut stmt = conn
+                .prepare("SELECT name,partial FROM pragma_index_list(?1) WHERE \"unique\"=1")
+                .unwrap();
+            let indexes = stmt
+                .query_map([table], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            indexes
+                .into_iter()
+                .map(|(name, partial)| {
+                    let columns = conn
+                        .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                        .unwrap()
+                        .query_map([&name], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .unwrap();
+                    (name, partial, columns)
+                })
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v43-assessments.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at) VALUES
+                     (1,'source one','done','owner',1,1),
+                     (2,'source two','done','owner',1,1);
+                 INSERT INTO review_followup_batches(
+                     pr_number,task_id,source_task_id,collector_version,
+                     artifact_count,state,created_at,updated_at)
+                 VALUES (100,1,1,'followups-v1',2,'collected',1,1);
+                 INSERT INTO review_followup_artifacts(
+                     id,pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES
+                     (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1),
+                     (12,100,1,'minor','design_debt','two','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":2}]',1,1);
+                 DROP TABLE review_followup_assessment_artifacts;
+                 DROP TABLE review_followup_assessments;
+                 PRAGMA user_version=43;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for table in [
+            "review_followup_assessments",
+            "review_followup_assessment_artifacts",
+        ] {
+            assert!(conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+
+        let assessment_indexes = unique_indexes(&conn, "review_followup_assessments");
+        assert!(assessment_indexes
+            .iter()
+            .any(|(_, partial, columns)| !partial && columns == &["scope_kind", "scope_id"]));
+        assert!(assessment_indexes.iter().any(|(name, partial, columns)| {
+            name == "one_active_followup_assessment" && *partial && columns == &["target"]
+        }));
+        let membership_indexes = unique_indexes(&conn, "review_followup_assessment_artifacts");
+        assert!(membership_indexes
+            .iter()
+            .any(|(_, _, columns)| columns == &["artifact_id"]));
+
+        let insert_assessment = |id: i64,
+                                 target: &str,
+                                 scope_kind: &str,
+                                 scope_id: i64,
+                                 source_task_id: i64,
+                                 active: i64| {
+            conn.execute(
+                "INSERT INTO review_followup_assessments(
+                     id,target,scope_kind,scope_id,source_task_id,state,active,
+                     membership_sealed,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,'pending',?6,0,1,1)",
+                rusqlite::params![id, target, scope_kind, scope_id, source_task_id, active],
+            )
+        };
+        insert_assessment(21, "shared-authority", "task", 1, 1, 0).unwrap();
+        assert!(insert_assessment(22, "another-target", "task", 1, 1, 0).is_err());
+        insert_assessment(22, "shared-authority", "graph", 10, 1, 1).unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET active=1 WHERE id=21",
+                [],
+            )
+            .is_err());
+        insert_assessment(23, "followup:task:2", "task", 2, 2, 0).unwrap();
+        assert!(insert_assessment(24, "invalid-scope", "repo", 3, 1, 0).is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessments(
+                     id,target,scope_kind,scope_id,source_task_id,state,active,
+                     created_at,updated_at)
+                 VALUES (24,'invalid-state','graph',11,1,'retrying',0,1,1)",
+                [],
+            )
+            .is_err());
+
+        conn.execute(
+            "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+             VALUES (21,11)",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (23,11)",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+             VALUES (23,12)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE review_followup_assessments SET membership_sealed=1
+             WHERE id IN (21,23)",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET membership_sealed=0 WHERE id=21",
+                [],
+            )
+            .is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn populated_v44_migration_seals_existing_membership_and_bounds_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v44-assessment-guards.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER review_followup_membership_no_update;
+                 DROP TRIGGER review_followup_membership_no_delete;
+                 DROP TRIGGER review_followup_assessment_counter_insert_bound;
+                 DROP TRIGGER review_followup_assessment_counter_update_bound;
+                 DROP TRIGGER review_followup_membership_insert_unsealed;
+                 DROP TRIGGER review_followup_membership_no_unseal;
+                 ALTER TABLE review_followup_assessments DROP COLUMN membership_sealed;
+                 INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'source','done','owner',1,1),
+                        (2,'other','done','owner',1,1);
+                 INSERT INTO review_followup_batches(
+                     pr_number,task_id,source_task_id,collector_version,
+                     artifact_count,state,created_at,updated_at)
+                 VALUES (100,1,1,'followups-v1',1,'collected',1,1),
+                        (200,2,2,'followups-v1',1,'collected',1,1);
+                 INSERT INTO review_followup_artifacts(
+                     id,pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES
+                     (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1),
+                     (12,200,0,'minor','design_debt','two','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":2}]',1,1);
+                 INSERT INTO review_followup_assessments(
+                     id,target,scope_kind,scope_id,source_task_id,state,active,
+                     proposal_attempts,provider_failures,created_at,updated_at)
+                 VALUES (21,'followup:task:1','task',1,1,'pending',0,2,1,2,2);
+                 INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (21,11);
+                 PRAGMA user_version=44;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state,membership_sealed,proposal_attempts,provider_failures,
+                        (SELECT artifact_id FROM review_followup_assessment_artifacts
+                         WHERE assessment_id=21)
+                 FROM review_followup_assessments WHERE id=21",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                )),
+            )
+            .unwrap(),
+            ("pending".into(), 1, 2, 1, 11)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='trigger' AND name IN (
+                     'review_followup_membership_no_update',
+                     'review_followup_membership_no_delete',
+                     'review_followup_assessment_counter_insert_bound',
+                     'review_followup_assessment_counter_update_bound',
+                     'review_followup_membership_insert_unsealed',
+                     'review_followup_membership_no_unseal')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            6
+        );
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessment_artifacts
+                 SET artifact_id=12 WHERE assessment_id=21",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM review_followup_assessment_artifacts WHERE assessment_id=21",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (21,12)",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET membership_sealed=0 WHERE id=21",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET proposal_attempts=4 WHERE id=21",
+                [],
+            )
+            .is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn populated_v46_migration_adds_closed_completion_provenance_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v46-completion-provenance.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(
+                     id,title,status,created_by,created_at,updated_at,refs,
+                     completion_provenance)
+                 VALUES
+                     (71,'legacy done with PR','done','owner',1,1,'{\"pr\":701}','merged'),
+                     (72,'legacy open','open','owner',1,1,NULL,NULL);
+                 ALTER TABLE tasks DROP COLUMN completion_provenance;
+                 PRAGMA user_version=46;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert!(column_exists(&conn, "tasks", "completion_provenance").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT completion_provenance FROM tasks WHERE id=71",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+            None,
+            "migration must not infer merge provenance from legacy done + refs.pr"
+        );
+        conn.execute(
+            "UPDATE tasks SET completion_provenance='merged' WHERE id=71",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET completion_provenance='manual' WHERE id=72",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE tasks SET completion_provenance='unknown' WHERE id=72",
+                [],
+            )
+            .is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(conn);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT json_array(
+                         (SELECT completion_provenance FROM tasks WHERE id=71),
+                         (SELECT completion_provenance FROM tasks WHERE id=72))",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            r#"["merged","manual"]"#
+        );
+    }
+
+    #[test]
+    fn v47_split_lineages_converge_on_complete_v48_schema() {
+        // Main and PR #565 independently used schema version 47: main added
+        // completion_provenance, while the PR added the durable-reference
+        // indexes later consumed by the rotating task-sweep cursor. Model
+        // both deployed shapes and prove either one upgrades to the complete
+        // merged schema instead of short-circuiting at the shared version.
+        let dir = tempfile::tempdir().unwrap();
+        let main_v47 = dir.path().join("main-v47.db");
+        {
+            let conn = open(&main_v47).unwrap();
+            conn.execute_batch(
+                "DROP TABLE sweep_cursors;
+                 DROP INDEX decomposition_cleanup_task;
+                 DROP INDEX review_followup_batches_task;
+                 DROP INDEX review_followup_batches_source_task;
+                 DROP INDEX review_followup_artifacts_linked_task;
+                 DROP INDEX review_followup_artifacts_created_task;
+                 DROP INDEX review_followup_assessments_source_task;
+                 PRAGMA user_version=47;",
+            )
+            .unwrap();
+            assert!(column_exists(&conn, "tasks", "completion_provenance").unwrap());
+        }
+
+        let pr_v47 = dir.path().join("pr-v47.db");
+        {
+            let conn = open(&pr_v47).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE tasks DROP COLUMN completion_provenance;
+                 PRAGMA user_version=47;",
+            )
+            .unwrap();
+        }
+
+        for path in [&main_v47, &pr_v47] {
+            let conn = open(path).unwrap();
+            assert!(column_exists(&conn, "tasks", "completion_provenance").unwrap());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type='table' AND name='sweep_cursors'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type='index' AND name IN (
+                         'decomposition_cleanup_task',
+                         'review_followup_batches_task',
+                         'review_followup_batches_source_task',
+                         'review_followup_artifacts_linked_task',
+                         'review_followup_artifacts_created_task',
+                         'review_followup_assessments_source_task')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                6
+            );
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            drop(conn);
+
+            // The converged schema is stable on the normal equal-version path.
+            assert_eq!(
+                open(path)
+                    .unwrap()
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+        }
+    }
+
+    #[test]
+    fn v38_to_v42_migration_adds_routing_authority_and_nullable_evidence_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v38.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_runs(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
+                    agent_name TEXT NOT NULL, role TEXT NOT NULL, model TEXT NOT NULL,
+                    effort TEXT NOT NULL, spawned_at INTEGER NOT NULL, ended_at INTEGER,
+                    end_reason TEXT, sub_role TEXT, provider TEXT
+                 );
+                 CREATE TABLE task_decompositions(
+                    id INTEGER PRIMARY KEY, active INTEGER NOT NULL DEFAULT 0,
+                    freeze_active INTEGER NOT NULL DEFAULT 0,
+                    accepted_proposal_json TEXT
+                 );
+                 CREATE TABLE review_collection_runs(
+                    pr_number INTEGER PRIMARY KEY, task_id INTEGER, status TEXT,
+                    error TEXT, collector_model TEXT, collector_version TEXT,
+                    findings_count INTEGER, attempted_at INTEGER, completed_at INTEGER
+                 );
+                 INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at)
+                    VALUES (1,'old-worker','worker','old-model','high','codex',2);
+                 PRAGMA user_version=38;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        for table in ["role_assignments", "routing_cursors"] {
+            assert!(conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+        assert!(column_exists(&conn, "agent_runs", "role_assignment_id").unwrap());
+        assert!(column_exists(&conn, "task_decompositions", "planner_assignment_id").unwrap());
+        assert!(column_exists(&conn, "review_collection_runs", "role_assignment_id").unwrap());
+        let historical: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT model,role_assignment_id FROM agent_runs WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(historical, ("old-model".into(), None));
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn v34_migration_adds_nullable_continue_pr_without_reinterpreting_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v34.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL, body TEXT, status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0, labels TEXT, assignee TEXT,
+                    created_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL, refs TEXT, depends_on TEXT,
+                    sticky_until INTEGER, orig TEXT, author TEXT, reviewer TEXT,
+                    rework_round INTEGER NOT NULL DEFAULT 0,
+                    review_only INTEGER NOT NULL DEFAULT 0,
+                    recovery_attempts INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO tasks
+                    (title,status,created_by,created_at,updated_at,refs)
+                    VALUES ('historical','failed','boss',1,1,'{\"pr\":19}');
+                 PRAGMA user_version = 34;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let continue_pr: Option<i64> = conn
+            .query_row("SELECT continue_pr FROM tasks WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(continue_pr, None);
+        drop(conn);
+
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "tasks", "continue_pr").unwrap());
+    }
+
+    #[test]
+    fn migrates_v35_to_v36_adds_bounded_terminal_retry_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v35.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE tasks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     title TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     priority INTEGER NOT NULL DEFAULT 0,
+                     created_by TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     refs TEXT
+                 );
+                 INSERT INTO tasks(title,status,created_by,created_at,updated_at,refs)
+                     VALUES
+                     ('clean terminal','done','boss',1,1,'{\"pr\":1}'),
+                     ('corrupt terminal','failed','boss',2,2,
+                      '{\"daemon_rework_retry_requested\":true}'),
+                     ('malformed refs','cancelled','boss',3,3,'{');
+                 PRAGMA user_version = 35;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index'
+                   AND name IN ('tasks_terminal_retry_id',
+                                'tasks_terminal_retry_recent')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_count, 2,
+            "v35 database must gain both candidate indexes"
+        );
+
+        let predicate = "status IN ('done','failed','cancelled')
+             AND json_valid(refs)
+             AND (
+                 json_type(refs, '$.daemon_rework_retry_requested')='true'
+                 OR json_type(refs, '$.daemon_parked_head_check')='true'
+                 OR (
+                     status IN ('done','cancelled')
+                     AND (
+                         json_type(refs, '$.daemon_parked') IS NOT NULL
+                         OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                     )
+                 )
+                 OR (
+                     status='failed'
+                     AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                     AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
+                 )
+             )";
+        let plan = |sql: &str| {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ")
+        };
+        let reconcile_plan = plan(&format!(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM tasks INDEXED BY tasks_terminal_retry_id
+             WHERE {predicate} ORDER BY id LIMIT 8"
+        ));
+        assert!(
+            reconcile_plan.contains("tasks_terminal_retry_id"),
+            "reconciliation must use its candidate-only index: {reconcile_plan}"
+        );
+        assert!(
+            !reconcile_plan.contains("USE TEMP B-TREE"),
+            "reconciliation must not sort the candidate set: {reconcile_plan}"
+        );
+
+        let status_plan = plan(&format!(
+            "EXPLAIN QUERY PLAN
+             SELECT id,status,updated_at
+             FROM tasks INDEXED BY tasks_terminal_retry_recent
+             WHERE {predicate}
+             ORDER BY updated_at DESC,id DESC LIMIT 10"
+        ));
+        assert!(
+            status_plan.contains("tasks_terminal_retry_recent"),
+            "status must use its candidate-only index: {status_plan}"
+        );
+        assert!(
+            !status_plan.contains("USE TEMP B-TREE"),
+            "status must not sort the candidate set: {status_plan}"
+        );
+
+        let candidates: Vec<i64> = conn
+            .prepare(&format!(
+                "SELECT id FROM tasks INDEXED BY tasks_terminal_retry_id
+                 WHERE {predicate} ORDER BY id"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            candidates,
+            vec![2],
+            "clean terminal history stays outside the index"
+        );
+    }
+
+    #[test]
+    fn migrates_split_lineage_v37_adds_task_revision_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("split-v37.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE tasks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     title TEXT NOT NULL,
+                     body TEXT,
+                     status TEXT NOT NULL,
+                     priority INTEGER NOT NULL DEFAULT 0,
+                     labels TEXT,
+                     assignee TEXT,
+                     created_by TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     refs TEXT,
+                     depends_on TEXT,
+                     sticky_until INTEGER,
+                     orig TEXT,
+                     author TEXT,
+                     reviewer TEXT,
+                     rework_round INTEGER NOT NULL DEFAULT 0,
+                     review_only INTEGER NOT NULL DEFAULT 0,
+                     recovery_attempts INTEGER NOT NULL DEFAULT 0,
+                     continue_pr INTEGER
+                 );
+                 INSERT INTO tasks(
+                     title,body,status,priority,created_by,created_at,updated_at,refs
+                 ) VALUES ('preserved','body','done',7,'owner',10,11,'{\"pr\":493}');
+                 PRAGMA user_version = 37;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let row: (String, String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT title,status,priority,revision,edit_count FROM tasks WHERE id=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, ("preserved".into(), "done".into(), 7, 1, 0));
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "tasks", "revision").unwrap());
+        assert!(column_exists(&reopened, "tasks", "edit_count").unwrap());
+    }
+
+    #[test]
+    fn migrates_v39_branch_allocations_with_nullable_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v39-branch-provenance.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE task_branches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL UNIQUE,
+                    branch TEXT NOT NULL UNIQUE,
+                    worktree TEXT NOT NULL,
+                    allocated_by TEXT NOT NULL,
+                    allocated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO task_branches(
+                    task_id,branch,worktree,allocated_by,allocated_at)
+                 VALUES (7,'daemon/legacy-t7','/tmp/legacy-t7','legacy',10);
+                 PRAGMA user_version = 39;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let row: (i64, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT task_id,branch,worktree,provenance_sha FROM task_branches WHERE task_id=7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (7, "daemon/legacy-t7".into(), "/tmp/legacy-t7".into(), None)
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "task_branches", "provenance_sha").unwrap());
+        assert!(reopened
+            .query_row(
+                "SELECT provenance_sha IS NULL FROM task_branches WHERE task_id=7",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
     }
 
     #[test]
@@ -1039,16 +2628,64 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("q.db");
         {
-            let c = open(&p).unwrap();
-            c.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
-                .unwrap();
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(&format!(
+                "CREATE TABLE newer_marker(value TEXT NOT NULL);
+                 INSERT INTO newer_marker(value) VALUES ('untouched');
+                 PRAGMA user_version={};",
+                SCHEMA_VERSION + 1
+            ))
+            .unwrap();
+            assert_eq!(
+                c.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "delete"
+            );
         }
+        let bytes_before = std::fs::read(&p).unwrap();
         match open(&p) {
             Err(QuorumError::SchemaTooNew { db, bin }) => {
                 assert_eq!(db, SCHEMA_VERSION + 1);
                 assert_eq!(bin, SCHEMA_VERSION);
             }
             other => panic!("expected SchemaTooNew, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            bytes_before,
+            "newer-schema refusal must not modify the database file"
+        );
+        let c = Connection::open(&p).unwrap();
+        assert_eq!(
+            c.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete",
+            "newer-schema refusal must not persistently switch journal mode"
+        );
+        assert_eq!(
+            c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION + 1
+        );
+        assert_eq!(
+            c.query_row("SELECT value FROM newer_marker", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "untouched"
+        );
+        for table in [
+            "review_followup_assessments",
+            "review_followup_assessment_artifacts",
+        ] {
+            assert!(!c
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
         }
     }
 
@@ -2103,61 +3740,449 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v33_to_v34_preserving_existing_agent_runs() {
+    fn migrates_v33_to_v34_adds_reviewing_newest_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("q.db");
         let raw = Connection::open(&path).unwrap();
         apply_pragmas(&raw).unwrap();
         raw.execute_batch(
             "BEGIN;
-             CREATE TABLE agent_runs (
+             CREATE TABLE tasks (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 task_id INTEGER NOT NULL,
-                 agent_name TEXT NOT NULL,
-                 role TEXT NOT NULL,
-                 model TEXT NOT NULL,
-                 effort TEXT NOT NULL,
-                 spawned_at INTEGER NOT NULL,
-                 ended_at INTEGER,
-                 end_reason TEXT,
-                 sub_role TEXT,
-                 provider TEXT
+                 title TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 priority INTEGER NOT NULL DEFAULT 0,
+                 created_by TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 refs TEXT
              );
-             INSERT INTO agent_runs
-                 (task_id, agent_name, role, model, effort, spawned_at, provider)
-             VALUES (229, 'Beacon', 'worker', 'gpt-5.6-sol', 'high', 100, 'codex');
+             INSERT INTO tasks(title, status, created_by, created_at, updated_at)
+                 VALUES ('pre-v34', 'in-review', 'boss', 100, 100);
              PRAGMA user_version = 33;
              COMMIT;",
         )
         .unwrap();
         drop(raw);
 
-        let conn = open(&path).unwrap();
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
+        let c = open(&path).unwrap();
+        let version: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        let run: (String, Option<i64>) = conn
+        let index: i64 = c
             .query_row(
-                "SELECT agent_name, ended_at FROM agent_runs WHERE task_id=229",
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='index' AND name='tasks_reviewing_newest'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1, "v33 database must gain the REVIEWING index");
+
+        let plan = c
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, title, status, refs FROM (
+                     SELECT id, title, status, refs, updated_at FROM (
+                         SELECT id, title, status, refs, updated_at FROM tasks
+                         WHERE status='in-review'
+                         ORDER BY updated_at DESC, id DESC LIMIT 20
+                     )
+                     UNION ALL
+                     SELECT id, title, status, refs, updated_at FROM (
+                         SELECT id, title, status, refs, updated_at FROM tasks
+                         WHERE status='merging'
+                         ORDER BY updated_at DESC, id DESC LIMIT 20
+                     )
+                 )
+                 ORDER BY updated_at DESC, id DESC LIMIT 20",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert_eq!(
+            plan.matches("tasks_reviewing_newest").count(),
+            2,
+            "plan: {plan}"
+        );
+    }
+
+    #[test]
+    fn migrates_v34_to_v35_adds_decomposition_authority_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE tasks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 title TEXT NOT NULL, body TEXT, status TEXT NOT NULL,
+                 priority INTEGER NOT NULL DEFAULT 0, labels TEXT, assignee TEXT,
+                 created_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, refs TEXT, depends_on TEXT,
+                 sticky_until INTEGER, orig TEXT, author TEXT, reviewer TEXT,
+                 rework_round INTEGER NOT NULL DEFAULT 0,
+                 review_only INTEGER NOT NULL DEFAULT 0,
+                 recovery_attempts INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('existing', 'open', 'owner', 100, 100);
+             PRAGMA user_version = 34;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let conn = open(&path).unwrap();
+        let task: (i64, i64) = conn
+            .query_row(
+                "SELECT revision,edit_count FROM tasks WHERE id=1",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(run, ("Beacon".to_string(), None));
-        let count: i64 = conn
-            .query_row("SELECT count(*) FROM token_usage_runs", [], |row| {
-                row.get(0)
-            })
+        assert_eq!(task, (1, 0));
+        for table in [
+            "task_decompositions",
+            "task_graph_members",
+            "decomposition_attempts",
+            "decomposition_cleanup",
+            "reviewer_provision_reservations",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "{table} missing after v34 migration");
+        }
+        assert!(column_exists(&conn, "task_decompositions", "accepted_proposal_json").unwrap());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 0, "migration must not invent historical usage");
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
-    fn v33_binary_refuses_resulting_v34_schema() {
+    fn populated_v36_to_v37_preserves_graph_and_matches_proposal_write_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v36.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                    source_task_id,state,freeze_active,planned_source_revision,
+                    planner_provider,planner_model,created_at,updated_at)
+                 VALUES (1,'planning',1,1,'claude','opus',2,2)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE task_decompositions DROP COLUMN accepted_proposal_json;
+                 PRAGMA user_version=36;",
+            )
+            .unwrap();
+        }
+
+        let mut upgraded = open(&path).unwrap();
+        assert!(column_exists(&upgraded, "task_decompositions", "accepted_proposal_json").unwrap());
+        let preserved: (String, String, String, i64) = upgraded
+            .query_row(
+                "SELECT state,planner_provider,planner_model,planned_source_revision
+                 FROM task_decompositions WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("planning".into(), "claude".into(), "opus".into(), 1)
+        );
+
+        let exact = format!("\"{}\"", "a".repeat(65_534));
+        assert_eq!(exact.len(), 65_536);
+        assert!(crate::decomposition::accept_proposal(&mut upgraded, 1, &exact, 3).unwrap());
+        upgraded
+            .execute(
+                "UPDATE task_decompositions SET state='planning',accepted_proposal_json=NULL WHERE id=1",
+                [],
+            )
+            .unwrap();
+        let over = format!("\"{}\"", "é".repeat(32_768));
+        assert!(over.len() > 65_536);
+        assert!(crate::decomposition::accept_proposal(&mut upgraded, 1, &over, 4).is_err());
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(reopened);
+
+        let newer_path = dir.path().join("newer.db");
+        let newer = Connection::open(&newer_path).unwrap();
+        newer
+            .execute_batch(&format!("PRAGMA user_version={}", SCHEMA_VERSION + 1))
+            .unwrap();
+        drop(newer);
         assert!(matches!(
-            ensure_schema_supported(34, 33),
-            Err(QuorumError::SchemaTooNew { db: 34, bin: 33 })
+            open(&newer_path),
+            Err(QuorumError::SchemaTooNew { .. })
         ));
+    }
+
+    #[test]
+    fn populated_v40_to_v41_adds_immutable_review_launch_authority_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v40-review-launch.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at)
+                 VALUES (7,'historical','reviewer','model','high','codex',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS agent_runs_review_cap;
+                 ALTER TABLE agent_runs DROP COLUMN review_cap_run_id;
+                 ALTER TABLE agent_runs DROP COLUMN review_pr;
+                 ALTER TABLE agent_runs DROP COLUMN review_head_sha;
+                 PRAGMA user_version=40;",
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        for column in ["review_cap_run_id", "review_pr", "review_head_sha"] {
+            assert!(column_exists(&conn, "agent_runs", column).unwrap());
+        }
+        assert!(
+            crate::agent_runs::review_launch_for_capability(&conn, "historical")
+                .unwrap()
+                .is_none()
+        );
+        let first =
+            crate::agent_runs::insert(&conn, 7, "R1", "reviewer", "model", "high", "codex", 2)
+                .unwrap();
+        assert!(crate::agent_runs::bind_review_launch(
+            &conn,
+            first,
+            "cap",
+            71,
+            "0123456789abcdef0123456789abcdef01234567"
+        )
+        .unwrap());
+        let second =
+            crate::agent_runs::insert(&conn, 8, "R2", "reviewer", "model", "high", "codex", 3)
+                .unwrap();
+        assert!(crate::agent_runs::bind_review_launch(
+            &conn,
+            second,
+            "cap",
+            72,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        .is_err());
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            crate::agent_runs::review_launch_for_capability(&reopened, "cap")
+                .unwrap()
+                .unwrap()
+                .pr,
+            71
+        );
+    }
+
+    /// Task #473: rows parked before this binary shipped carry the legacy
+    /// `terminal-not-done` reason and lack the new `daemon_parked_unsatisfiable`
+    /// bit, so `stats::blocked_tasks` (which requires the bit) would hide the
+    /// exact operator disposition queue the task was opened to surface. The
+    /// v50 migration must backfill both refs onto the pre-existing rows,
+    /// leave recoverable failed-dep parks untouched, and be idempotent.
+    #[test]
+    fn migrates_v49_to_v50_backfills_cancelled_dependency_park_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v49-backfill.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                     VALUES
+                         (1,'cancelled-dep','cancelled','owner',1,1),
+                         (2,'failed-dep','failed','owner',1,1),
+                         (3,'legacy park cancelled','failed','owner',1,1),
+                         (4,'legacy park failed only','failed','owner',1,1),
+                         (5,'legacy park no deps','failed','owner',1,1),
+                         (6,'open with cancelled dep','open','owner',1,1),
+                         (7,'v49 policy park cancelled dep','failed','owner',1,1);
+                 UPDATE tasks SET depends_on='[1,2]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"dependency #1 is terminal-not-done\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=3;
+                 UPDATE tasks SET depends_on='[2]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"dependency #2 is terminal-not-done\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=4;
+                 UPDATE tasks SET refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"other reason\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=5;
+                 UPDATE tasks SET depends_on='[1]' WHERE id=6;
+                 UPDATE tasks SET depends_on='[1]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"classifier declined\",
+                             \"daemon_resume_status\": \"open\",
+                             \"classifier_policy_parked\": true}'
+                     WHERE id=7;
+                 PRAGMA user_version=49;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let refs3: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=3", [], |r| r.get(0))
+            .unwrap();
+        let v3: serde_json::Value = serde_json::from_str(&refs3).unwrap();
+        assert_eq!(v3["daemon_parked_unsatisfiable"], true);
+        assert_eq!(
+            v3["daemon_parked_reason"],
+            "dependency #1 is cancelled — unsatisfiable"
+        );
+
+        // Recoverable failed-only park stays untouched: no marker, original
+        // terminal-not-done reason preserved so operators still see the
+        // recoverable text.
+        let refs4: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=4", [], |r| r.get(0))
+            .unwrap();
+        let v4: serde_json::Value = serde_json::from_str(&refs4).unwrap();
+        assert!(v4.get("daemon_parked_unsatisfiable").is_none());
+        assert_eq!(
+            v4["daemon_parked_reason"],
+            "dependency #2 is terminal-not-done"
+        );
+
+        // Parks without any depends_on aren't touched.
+        let refs5: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=5", [], |r| r.get(0))
+            .unwrap();
+        let v5: serde_json::Value = serde_json::from_str(&refs5).unwrap();
+        assert!(v5.get("daemon_parked_unsatisfiable").is_none());
+        assert_eq!(v5["daemon_parked_reason"], "other reason");
+
+        // Open (non-failed) rows aren't touched by the parked-only backfill;
+        // the cascade will park them via the new production path.
+        let refs6: Option<String> = conn
+            .query_row("SELECT refs FROM tasks WHERE id=6", [], |r| r.get(0))
+            .unwrap();
+        assert!(refs6.is_none());
+
+        // Classifier-policy parks with a cancelled dep are NOT relabeled:
+        // the migration and the runtime convergence pass must apply one
+        // coherent rule, and policy parks own their own lifecycle.
+        let refs7: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=7", [], |r| r.get(0))
+            .unwrap();
+        let v7: serde_json::Value = serde_json::from_str(&refs7).unwrap();
+        assert!(v7.get("daemon_parked_unsatisfiable").is_none());
+        assert_eq!(v7["daemon_parked_reason"], "classifier declined");
+        assert_eq!(v7["classifier_policy_parked"], true);
+
+        // Idempotent: re-opening from the migrated DB does not double-write.
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        let refs3_again: String = reopened
+            .query_row("SELECT refs FROM tasks WHERE id=3", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refs3_again, refs3);
+    }
+
+    #[test]
+    fn migrates_colliding_v50_to_v52_with_backfill_queue_and_journal_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("colliding-v50.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                     VALUES
+                         (1,'cancelled','cancelled','owner',1,1),
+                         (2,'legacy park','failed','owner',1,1);
+                 UPDATE tasks SET depends_on='[1]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"dependency #1 is terminal-not-done\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=2;
+                 DROP TABLE cancelled_dependency_reconciliation;
+                 PRAGMA user_version=50;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let refs: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=2", [], |row| row.get(0))
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["daemon_parked_unsatisfiable"], true);
+        for column in ["provider", "continuation_id", "local_branch"] {
+            assert!(column_exists(&conn, "journal", column).unwrap());
+        }
+        conn.execute(
+            "INSERT INTO cancelled_dependency_reconciliation(
+                 cancelled_task_id,task_cursor,updated_at
+             ) VALUES (1,64,2)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT task_cursor FROM cancelled_dependency_reconciliation
+                 WHERE cancelled_task_id=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            64
+        );
     }
 }

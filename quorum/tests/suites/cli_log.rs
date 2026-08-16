@@ -2,7 +2,7 @@
 //! `events` stream (not the message feed), `quorum log` reads them, `--refs` filters by
 //! subject, `--since <seq>` is a strict delta, and `post`/`read` are NOT affected.
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;

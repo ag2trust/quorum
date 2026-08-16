@@ -49,7 +49,7 @@ pub struct ReviewFinding {
     pub text: String,
     #[serde(default = "default_source")]
     pub source_endpoint: String,
-    /// v24: 'addressed' | 'unaddressed' | 'partial' | 'unclear'.
+    /// v24: 'addressed' | 'unaddressed' | 'partial' | 'unclear' | 'withdrawn'.
     /// A blocking finding that merged as `unaddressed` is a review-quality
     /// signal; the collector must never mutate the merge outcome regardless.
     #[serde(default)]
@@ -91,7 +91,18 @@ pub fn replace_for_pr(
 ) -> Result<()> {
     let now = clock::now();
     let tx = begin_immediate(conn)?;
-    tx.execute(
+    replace_for_pr_inner(&tx, pr_number, findings, now)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn replace_for_pr_inner(
+    conn: &Connection,
+    pr_number: i64,
+    findings: &[ReviewFinding],
+    now: i64,
+) -> Result<()> {
+    conn.execute(
         "DELETE FROM review_findings WHERE pr_number = ?1",
         params![pr_number],
     )?;
@@ -101,7 +112,7 @@ pub fn replace_for_pr(
         } else {
             Some(serde_json::to_string(&f.evidence).unwrap_or_else(|_| "[]".to_string()))
         };
-        tx.execute(
+        conn.execute(
             "INSERT INTO review_findings
                 (pr_number, task_id, reviewer, kind, author_pushback, pushback_accepted,
                  severity, text, source_endpoint, created_at,
@@ -125,7 +136,6 @@ pub fn replace_for_pr(
             ],
         )?;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -190,50 +200,110 @@ pub struct CollectionRun {
     pub status: RunStatus,
     pub error: Option<String>,
     pub collector_model: String,
+    /// Launch identity used only to validate a managed assignment link. The
+    /// durable assignment row remains the canonical source for these fields.
+    pub collector_provider: Option<String>,
+    pub collector_runner: Option<String>,
+    pub collector_effort: Option<String>,
     pub collector_version: String,
     pub findings_count: i64,
     pub attempted_at: i64,
     pub completed_at: Option<i64>,
+    /// Durable routing decision for the collector responsibility, when managed.
+    pub role_assignment_id: Option<i64>,
 }
 
 /// UPSERT a run record for a PR — the primary-key REPLACE keeps at most one row
 /// per PR, so retries overwrite instead of accumulating history rows.
 pub fn record_run(conn: &Connection, run: &CollectionRun) -> Result<()> {
-    conn.execute(
-        "INSERT INTO review_collection_runs
-            (pr_number, task_id, status, error, collector_model, collector_version,
-             findings_count, attempted_at, completed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-         ON CONFLICT(pr_number) DO UPDATE SET
-            task_id = excluded.task_id,
-            status = excluded.status,
-            error = excluded.error,
-            collector_model = excluded.collector_model,
-            collector_version = excluded.collector_version,
-            findings_count = excluded.findings_count,
-            attempted_at = excluded.attempted_at,
-            completed_at = excluded.completed_at",
-        params![
-            run.pr_number,
-            run.task_id,
-            run.status.as_str(),
-            run.error,
-            run.collector_model,
-            run.collector_version,
-            run.findings_count,
-            run.attempted_at,
-            run.completed_at,
+    record_run_inner(conn, run)
+}
+
+const COLLECTION_RUN_INSERT: &str = "INSERT INTO review_collection_runs(
+        pr_number,task_id,status,error,collector_model,collector_version,
+        findings_count,attempted_at,completed_at,role_assignment_id)
+    SELECT :pr_number,:task_id,:status,:error,:collector_model,:collector_version,
+        :findings_count,:attempted_at,:completed_at,:quorum_assignment_id
+    /* quorum-role-assignment-guard */
+      AND (:quorum_assignment_id IS NULL OR EXISTS(
+          SELECT 1 FROM role_assignments AS collector_assignment
+          WHERE collector_assignment.id=:quorum_assignment_id
+            AND collector_assignment.pr_number=:pr_number
+            AND collector_assignment.review_stage IS NULL
+            AND collector_assignment.complexity IS NULL
+      ))
+    ON CONFLICT(pr_number) DO UPDATE SET
+        task_id=excluded.task_id,
+        status=excluded.status,
+        error=excluded.error,
+        collector_model=excluded.collector_model,
+        collector_version=excluded.collector_version,
+        findings_count=excluded.findings_count,
+        attempted_at=excluded.attempted_at,
+        completed_at=excluded.completed_at,
+        role_assignment_id=excluded.role_assignment_id";
+
+fn record_run_inner(conn: &Connection, run: &CollectionRun) -> Result<()> {
+    let responsibility = format!("collector:pr:{}", run.pr_number);
+    let context = crate::role_assignments::EvidenceAssignmentContext {
+        role_assignment_id: run.role_assignment_id,
+        task_id: run.task_id,
+        responsibility_key: &responsibility,
+        role: "collector",
+        provider: run.collector_provider.as_deref().unwrap_or_default(),
+        runner: run.collector_runner.as_deref().unwrap_or_default(),
+        model: &run.collector_model,
+        effort: run.collector_effort.as_deref().unwrap_or_default(),
+    };
+    let status = run.status.as_str();
+    crate::role_assignments::guarded_evidence_insert(
+        conn,
+        "collector run",
+        &context,
+        COLLECTION_RUN_INSERT,
+        &[
+            (":pr_number", &run.pr_number),
+            (":task_id", &run.task_id),
+            (":status", &status),
+            (":error", &run.error),
+            (":collector_model", &run.collector_model),
+            (":collector_version", &run.collector_version),
+            (":findings_count", &run.findings_count),
+            (":attempted_at", &run.attempted_at),
+            (":completed_at", &run.completed_at),
         ],
-    )?;
+    )
+}
+
+/// Replace a collector's findings and persist its successful run as one
+/// canonical evidence write. A mismatched assignment aborts the guarded run
+/// insert and rolls the findings replacement back with it.
+pub fn replace_for_pr_and_record_run(
+    conn: &mut Connection,
+    pr_number: i64,
+    findings: &[ReviewFinding],
+    run: &CollectionRun,
+) -> Result<()> {
+    if run.pr_number != pr_number {
+        return Err(crate::role_assignments::evidence_mismatch("collector PR"));
+    }
+    let now = clock::now();
+    let tx = begin_immediate(conn)?;
+    replace_for_pr_inner(&tx, pr_number, findings, now)?;
+    record_run_inner(&tx, run)?;
+    tx.commit()?;
     Ok(())
 }
 
 /// Read the run record for a PR (None if never collected).
 pub fn get_run(conn: &Connection, pr_number: i64) -> Result<Option<CollectionRun>> {
     let mut stmt = conn.prepare(
-        "SELECT pr_number, task_id, status, error, collector_model, collector_version,
-                findings_count, attempted_at, completed_at
-         FROM review_collection_runs WHERE pr_number = ?1",
+        "SELECT r.pr_number,r.task_id,r.status,r.error,r.collector_model,
+                r.collector_version,r.findings_count,r.attempted_at,r.completed_at,
+                r.role_assignment_id,a.provider,a.runner,a.effort
+         FROM review_collection_runs r
+         LEFT JOIN role_assignments a ON a.id=r.role_assignment_id
+         WHERE r.pr_number = ?1",
     )?;
     let mut rows = stmt.query(params![pr_number])?;
     if let Some(row) = rows.next()? {
@@ -248,10 +318,14 @@ pub fn get_run(conn: &Connection, pr_number: i64) -> Result<Option<CollectionRun
             status,
             error: row.get(3)?,
             collector_model: row.get(4)?,
+            collector_provider: row.get(10)?,
+            collector_runner: row.get(11)?,
+            collector_effort: row.get(12)?,
             collector_version: row.get(5)?,
             findings_count: row.get(6)?,
             attempted_at: row.get(7)?,
             completed_at: row.get(8)?,
+            role_assignment_id: row.get(9)?,
         }))
     } else {
         Ok(None)
@@ -268,6 +342,12 @@ pub struct CollectorInputs {
     pub reviews_json: String,
     pub review_comments_json: String,
     pub issue_comments_json: String,
+    /// Deterministic, record-count-bounded evidence index captured by streaming
+    /// the raw payloads before bounded prompt truncation.
+    /// `None` keeps hand-built/legacy inputs compatible with validation that
+    /// derives IDs directly from their JSON payloads.
+    #[serde(skip)]
+    pub fetched_evidence: Option<Vec<EvidenceId>>,
     pub commits_json: String,
     pub checks_summary: String,
     pub diff_stat: String,
@@ -368,10 +448,38 @@ Fields per finding:
      author replies "fixed in <sha>", or the reviewer confirms it resolved),
    - `"unaddressed"` if it merged without a fix and the author did not push back,
    - `"partial"` if some parts were fixed and others were left,
-   - `"unclear"` if the record does not let you tell.
+   - `"unclear"` if the record does not let you tell,
+   - `"withdrawn"` if the reviewer independently retracted the finding without
+     accepting author pushback.
 9. `evidence` — array of `{{"kind":"review"|"review_comment"|"issue_comment","id":<int>}}`
    objects. Include at least one; use the GitHub numeric `id` field from the raw
    comment/review JSON above. Threaded replies count as separate evidence rows.
+
+Also emit a `followup_artifacts` entry for each concrete, evidence-backed
+non-blocking concern that remains valid after merge. Every artifact must name
+exactly one source finding by its zero-based index in the `findings` array. That
+source must be a `suggestion`, must share at least one evidence row with the
+artifact, and must not be fixed, withdrawn, or accepted as invalid.
+
+Fields per follow-up artifact:
+
+1. `source_finding_index` — zero-based array index of the exact source finding.
+2. `technical_impact` — `"critical" | "major" | "minor" | "nit"`.
+3. `scope_relationship` — `"pre_existing" | "out_of_scope" |
+   "threat_model_expansion" | "defense_in_depth" | "future_requirement" |
+   "design_debt"`.
+4. `concern` — a closed object with both:
+   - `failure_mode` — the concrete failure (concise text such as "Requests deadlock" is valid),
+   - `trigger_or_assumption` — when or under which assumption the failure occurs.
+5. `non_blocking_reason` — why the merged PR did not need to resolve it.
+6. `affected_behavior` — the affected product behavior.
+7. `desired_outcome` — a closed object with both:
+   - `observable_behavior` — the behavior that can be observed (concise text such as
+     "Requests complete" is valid),
+   - `observation_condition` — when the behavior must be observed.
+8. `verification_expectations` — one through eight concrete checks.
+9. `evidence` — one or more unique GitHub evidence rows, all present above and
+   sharing at least one row with the selected source finding.
 
 ## Output
 
@@ -382,12 +490,23 @@ Respond with ONLY a JSON object:
    "severity":"major","text":"...","source_endpoint":"pulls",
    "addressed_status":"addressed",
    "evidence":[{{"kind":"review_comment","id":12345}}]}}
+],"followup_artifacts":[
+  {{"source_finding_index":0,"technical_impact":"major","scope_relationship":"out_of_scope",
+   "concern":{{"failure_mode":"Requests deadlock",
+              "trigger_or_assumption":"Concurrent shutdown overlaps request handling"}},
+   "non_blocking_reason":"Why the merged PR did not need to resolve it",
+   "affected_behavior":"Product behavior affected by the concern",
+   "desired_outcome":{{"observable_behavior":"Requests complete",
+                       "observation_condition":"The retry resumes after shutdown"}},
+   "verification_expectations":["Evidence that proves the outcome"],
+   "evidence":[{{"kind":"review_comment","id":12345}}]}}
 ]}}
 ```
 
 If the PR has no substantive reviewer findings (only bot noise, "LGTM", or merge
-notifications), return `{{"findings":[]}}`. Do NOT invent findings. Do NOT wrap the
-JSON in prose."#,
+notifications), return `{{"findings":[],"followup_artifacts":[]}}`. A PR may have
+findings and still have zero valid artifacts. Do NOT invent findings or artifacts.
+Do NOT wrap the JSON in prose."#,
         pr = inputs.pr_number,
         meta = inputs.pr_metadata_json,
         diff = inputs.diff_stat,
@@ -414,6 +533,7 @@ pub fn build_prompt(
         reviews_json: "[]".into(),
         review_comments_json: pulls_comments_json.to_string(),
         issue_comments_json: issues_comments_json.to_string(),
+        fetched_evidence: None,
         commits_json: "[]".into(),
         checks_summary: "unknown".into(),
         diff_stat: "unknown".into(),
@@ -648,22 +768,115 @@ mod tests {
     fn record_and_get_run_success() {
         let (conn, _dir) = test_conn();
         let now = clock::now();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (77,'collector:pr:500',80,500,'collector','collector-profile','claude',
+                     'claude','haiku','high','collector','g1',?1)",
+            [now],
+        )
+        .unwrap();
         let run = CollectionRun {
             pr_number: 500,
             task_id: Some(80),
             status: RunStatus::Success,
             error: None,
             collector_model: "haiku".into(),
+            collector_provider: Some("claude".into()),
+            collector_runner: Some("claude".into()),
+            collector_effort: Some("high".into()),
             collector_version: "v1".into(),
             findings_count: 3,
             attempted_at: now,
             completed_at: Some(now + 1),
+            role_assignment_id: Some(77),
         };
         record_run(&conn, &run).unwrap();
         let got = get_run(&conn, 500).unwrap().unwrap();
         assert_eq!(got.status, RunStatus::Success);
         assert_eq!(got.findings_count, 3);
         assert_eq!(got.error, None);
+        assert_eq!(got.role_assignment_id, Some(77));
+        assert_eq!(got.collector_provider.as_deref(), Some("claude"));
+        assert_eq!(got.collector_runner.as_deref(), Some("claude"));
+        assert_eq!(got.collector_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn mismatched_collector_assignment_rolls_back_findings_and_run_atomically() {
+        let (mut conn, _dir) = test_conn();
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+             VALUES (90,'merged','done','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let old = ReviewFinding {
+            pr_number: 700,
+            task_id: Some(90),
+            text: "old finding".into(),
+            ..mk("suggestion", "pulls")
+        };
+        replace_for_pr(&mut conn, 700, &[old]).unwrap();
+        let old_run = CollectionRun {
+            pr_number: 700,
+            task_id: Some(90),
+            status: RunStatus::Failed,
+            error: Some("old failure".into()),
+            collector_model: "haiku".into(),
+            collector_provider: None,
+            collector_runner: None,
+            collector_effort: None,
+            collector_version: "v1".into(),
+            findings_count: 0,
+            attempted_at: 1,
+            completed_at: Some(2),
+            role_assignment_id: None,
+        };
+        record_run(&conn, &old_run).unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (88,'collector:pr:700',90,700,'collector','profile','codex','claude',
+                     'haiku','high','collector','g1',1)",
+            [],
+        )
+        .unwrap();
+        let replacement = ReviewFinding {
+            pr_number: 700,
+            task_id: Some(90),
+            text: "replacement".into(),
+            ..mk("blocking", "pulls")
+        };
+        let routed_run = CollectionRun {
+            status: RunStatus::Success,
+            error: None,
+            findings_count: 1,
+            attempted_at: 3,
+            completed_at: Some(4),
+            role_assignment_id: Some(88),
+            collector_provider: Some("codex".into()),
+            collector_runner: Some("codex".into()),
+            collector_effort: Some("high".into()),
+            ..old_run
+        };
+
+        assert!(
+            replace_for_pr_and_record_run(&mut conn, 700, &[replacement], &routed_run).is_err()
+        );
+        let findings = list_for_pr(&conn, 700).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].text, "old finding");
+        let stored = get_run(&conn, 700).unwrap().unwrap();
+        assert_eq!(stored.status, RunStatus::Failed);
+        assert_eq!(stored.error.as_deref(), Some("old failure"));
+        assert_eq!(stored.role_assignment_id, None);
+        let task_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=90", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_status, "done");
     }
 
     #[test]
@@ -676,10 +889,14 @@ mod tests {
             status: RunStatus::Failed,
             error: Some("gh api rate-limited".into()),
             collector_model: "haiku".into(),
+            collector_provider: None,
+            collector_runner: None,
+            collector_effort: None,
             collector_version: "v1".into(),
             findings_count: 0,
             attempted_at: now,
             completed_at: None,
+            role_assignment_id: None,
         };
         record_run(&conn, &failed).unwrap();
         let got = get_run(&conn, 600).unwrap().unwrap();
@@ -720,6 +937,7 @@ mod tests {
             reviews_json: r#"[{"id":1,"state":"APPROVED"}]"#.into(),
             review_comments_json: r#"[{"id":10,"in_reply_to_id":null}]"#.into(),
             issue_comments_json: r#"[{"id":20,"body":"nit"}]"#.into(),
+            fetched_evidence: None,
             commits_json: r#"[{"sha":"deadbeef"}]"#.into(),
             checks_summary: "all-passed".into(),
             diff_stat: "3 files, 20 additions".into(),
@@ -760,6 +978,15 @@ mod tests {
         assert!(prompt.contains("deadbeef"));
         assert!(prompt.contains("Alpha"));
         assert!(prompt.contains("addressed_status"));
+        assert!(prompt.contains("withdrawn"));
         assert!(prompt.contains("evidence"));
+        assert!(prompt.contains("followup_artifacts"));
+        assert!(prompt.contains("source_finding_index"));
+        assert!(prompt.contains("technical_impact"));
+        assert!(prompt.contains("scope_relationship"));
+        assert!(prompt.contains("failure_mode"));
+        assert!(prompt.contains("trigger_or_assumption"));
+        assert!(prompt.contains("observable_behavior"));
+        assert!(prompt.contains("observation_condition"));
     }
 }

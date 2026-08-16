@@ -91,6 +91,116 @@ fn submit_with_verdict() {
 }
 
 #[test]
+fn submit_graph_blocker_writes_closed_capability_bound_payload() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "graph-run", 7, "BoundaryReviewer", "reviewer");
+    let feedback = r#"{"category":"boundary-violation","affected_task":7,"violated_assigned_boundary":"parser-only child","evidence":["diff changes sibling-owned schema.sql"]}"#;
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "graph-run")
+        .args([
+            "submit",
+            "--agent",
+            "BoundaryReviewer",
+            "--pr",
+            "71",
+            "--verdict",
+            "graph-blocker",
+            "--feedback-json",
+            feedback,
+        ])
+        .assert()
+        .success();
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let rows = quorum_core::mailbox::poll_unconsumed(&conn).unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0].1;
+    assert_eq!(row.task_id, Some(7));
+    assert_eq!(row.verdict.as_deref(), Some("graph-blocker"));
+    let payload: serde_json::Value = serde_json::from_str(row.payload.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["run_id"], "graph-run");
+    assert_eq!(payload["feedback"]["affected_task"], 7);
+    assert_eq!(payload["feedback"]["category"], "boundary-violation");
+}
+
+#[test]
+fn submit_graph_blocker_rejects_wrong_task_unknown_fields_and_wrong_role() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "graph-review", 7, "Reviewer", "reviewer");
+    issue_cap(home.path(), "graph-worker", 7, "Worker", "worker");
+    let valid = r#"{"category":"boundary-violation","affected_task":8,"violated_assigned_boundary":"parser-only child","evidence":["diff changes schema.sql"]}"#;
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "graph-review")
+        .args([
+            "submit",
+            "--agent",
+            "Reviewer",
+            "--pr",
+            "71",
+            "--verdict",
+            "graph-blocker",
+            "--feedback-json",
+            valid,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not match reviewer task"));
+
+    let unknown = valid.replace("}", ",\"unknown\":true}");
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "graph-review")
+        .args([
+            "submit",
+            "--agent",
+            "Reviewer",
+            "--pr",
+            "71",
+            "--verdict",
+            "graph-blocker",
+            "--feedback-json",
+            &unknown,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid --feedback-json"));
+
+    let worker_feedback = valid.replace(":8", ":7");
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "graph-worker")
+        .args([
+            "submit",
+            "--agent",
+            "Worker",
+            "--pr",
+            "71",
+            "--verdict",
+            "graph-blocker",
+            "--feedback-json",
+            &worker_feedback,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("role mismatch"));
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    assert!(quorum_core::mailbox::poll_unconsumed(&conn)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn submit_with_changes_and_feedback() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
@@ -114,6 +224,47 @@ fn submit_with_changes_and_feedback() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"ok\":true"));
+}
+
+#[test]
+fn submit_with_changes_and_feedback_file() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-r2-file", 1, "Reviewer-2", "reviewer");
+    let feedback = home.path().join("feedback.txt");
+    std::fs::write(
+        &feedback,
+        "Fix the quoted `$value` handling\nand its negative path.",
+    )
+    .unwrap();
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-r2-file")
+        .args([
+            "submit",
+            "--agent",
+            "Reviewer-2",
+            "--pr",
+            "60",
+            "--verdict",
+            "changes",
+            "--feedback-file",
+        ])
+        .arg(&feedback)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"ok\":true"));
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let rows = quorum_core::mailbox::poll_unconsumed(&conn).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1.feedback.as_deref(),
+        Some("Fix the quoted `$value` handling\nand its negative path."),
+        "feedback-file text must reach the mailbox unchanged"
+    );
 }
 
 #[test]
@@ -216,6 +367,53 @@ fn submit_changes_without_feedback_is_refused() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("--feedback"));
+}
+
+#[test]
+fn submit_feedback_file_requires_changes_verdict_before_file_io() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    let missing = home.path().join("missing-feedback.txt");
+
+    for verdict_args in [vec![], vec!["--verdict", "approved"]] {
+        let mut args = vec![
+            "submit",
+            "--agent",
+            "Reviewer-1",
+            "--feedback-file",
+            missing.to_str().unwrap(),
+        ];
+        args.extend(verdict_args);
+        quorum()
+            .env("QUORUM_HOME", home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "--feedback-file/--feedback requires --verdict changes",
+            ))
+            .stderr(predicate::str::contains("failed to read").not());
+    }
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "submit",
+            "--agent",
+            "Reviewer-1",
+            "--verdict",
+            "invalid",
+            "--feedback-file",
+            missing.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--verdict must be 'approved', 'changes', or 'graph-blocker'",
+        ))
+        .stderr(predicate::str::contains("failed to read").not());
 }
 
 // ---------------------------------------------------------------------------

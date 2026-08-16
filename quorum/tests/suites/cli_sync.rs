@@ -5,7 +5,7 @@
 //! shape, and the at-most-once cursor advance via the public `quorum read` path so a
 //! second `sync` invocation doesn't re-show the same direct messages.
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 
@@ -49,6 +49,7 @@ fn sync_returns_next_task_when_agent_idle() {
         ])
         .assert()
         .success();
+    common::classify_open_tasks(home.path());
     let out = quorum(home.path())
         .args(["sync", "--agent", "A"])
         .output()
@@ -125,6 +126,7 @@ fn sync_match_label_restricts_next_task() {
         ])
         .assert()
         .success();
+    common::classify_open_tasks(home.path());
     // Without filter: high-prio wins.
     let unfiltered = quorum(home.path())
         .args(["sync", "--agent", "A"])

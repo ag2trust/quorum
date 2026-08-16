@@ -2,33 +2,23 @@
 //! model/effort recommendations. Used by the classifier prompt, the
 //! cheatsheet, and regression tests.
 
-/// (level, short label, description, time estimate)
+/// (level, short label, description, reserved legacy field)
 pub const RUBRIC: [(u8, &str, &str, &str); 5] = [
     (1, "Trivial", "config tweak, typo fix, simple rename", ""),
-    (
-        2,
-        "Simple",
-        "single-file change, clear spec",
-        "< 15 min agent work",
-    ),
+    (2, "Simple", "single-file change, clear spec", ""),
     (
         3,
         "Moderate",
         "multi-file change, some design decisions",
-        "15-30 min",
+        "",
     ),
     (
         4,
         "Complex",
         "cross-cutting change, multiple components",
-        "30-60 min",
+        "",
     ),
-    (
-        5,
-        "Very complex",
-        "architectural change, new subsystem",
-        "> 60 min",
-    ),
+    (5, "Very complex", "architectural change, new subsystem", ""),
 ];
 
 /// Provider whose operational routing policy supplies recommendations.
@@ -51,10 +41,10 @@ pub const CLAUDE_RECOMMENDATIONS: [(u8, &str, &str); 5] = [
 /// Codex default (level, model_id, effort) recommendations.
 /// This is Quorum's operational routing policy, not a cross-vendor benchmark.
 pub const CODEX_RECOMMENDATIONS: [(u8, &str, &str); 5] = [
-    (1, "gpt-5.6-luna", "medium"),
-    (2, "gpt-5.6-terra", "medium"),
+    (1, "gpt-5.6-luna", "high"),
+    (2, "gpt-5.6-terra", "high"),
     (3, "gpt-5.6-terra", "high"),
-    (4, "gpt-5.6-sol", "medium"),
+    (4, "gpt-5.6-sol", "high"),
     (5, "gpt-5.6-sol", "high"),
 ];
 
@@ -145,10 +135,10 @@ mod tests {
         assert_eq!(
             CODEX_RECOMMENDATIONS,
             [
-                (1, "gpt-5.6-luna", "medium"),
-                (2, "gpt-5.6-terra", "medium"),
+                (1, "gpt-5.6-luna", "high"),
+                (2, "gpt-5.6-terra", "high"),
                 (3, "gpt-5.6-terra", "high"),
-                (4, "gpt-5.6-sol", "medium"),
+                (4, "gpt-5.6-sol", "high"),
                 (5, "gpt-5.6-sol", "high"),
             ]
         );

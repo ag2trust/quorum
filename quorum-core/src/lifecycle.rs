@@ -1,7 +1,8 @@
 //! Task lifecycle state machine — pure transition table, no DB, no I/O.
 //!
-//! Single-task model: one row walks `open → working → in-review → merging → done`
-//! with a rework loop (`in-review ⇄ rework`). Terminals: `done`, `failed`, `cancelled`.
+//! A directly executable task walks `open → working → in-review → merging → done`
+//! with a rework loop (`in-review ⇄ rework`). A decomposition source instead walks
+//! `open → planning → decomposed → done`. Terminals: `done`, `failed`, `cancelled`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -13,6 +14,8 @@ use std::str::FromStr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Status {
     Open,
+    Planning,
+    Decomposed,
     Working,
     InReview,
     Rework,
@@ -32,6 +35,8 @@ impl fmt::Display for Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Status::Open => "open",
+            Status::Planning => "planning",
+            Status::Decomposed => "decomposed",
             Status::Working => "working",
             Status::InReview => "in-review",
             Status::Rework => "rework",
@@ -48,6 +53,8 @@ impl FromStr for Status {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "open" => Ok(Status::Open),
+            "planning" => Ok(Status::Planning),
+            "decomposed" => Ok(Status::Decomposed),
             "working" => Ok(Status::Working),
             "in-review" => Ok(Status::InReview),
             "rework" => Ok(Status::Rework),
@@ -66,6 +73,16 @@ impl FromStr for Status {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// Daemon-only admission of an oversized implementation task into planning.
+    PlanningStarted,
+    /// Daemon-only commit of a fully validated and preclassified task graph.
+    PlanMaterialized,
+    /// Daemon-only durable hold for a planning blocker or exhausted bounded attempts.
+    PlanningBlocked {
+        reason: String,
+    },
+    /// Daemon-only completion after every generated child is durably done.
+    GraphCompleted,
     Claimed {
         agent: String,
     },
@@ -156,7 +173,7 @@ impl fmt::Display for InvalidTransition {
 
 impl std::error::Error for InvalidTransition {}
 
-pub const REWORK_CAP: u32 = 3;
+pub const REWORK_CAP: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // transition — the exhaustive match
@@ -173,6 +190,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
 
     match (&t.status, e) {
         // ---- Open ----
+        (Status::Open, Event::PlanningStarted) => Ok((Status::Planning, vec![])),
         (Status::Open, Event::Claimed { agent }) => Ok((
             Status::Working,
             vec![Effect::SetAuthor {
@@ -202,6 +220,45 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Open, Event::PrFoundClosed) => reject("no PR from open"),
         (Status::Open, Event::AgentFailed { .. }) => reject("no agent in open"),
         (Status::Open, Event::ControlledShutdown) => Ok((Status::Open, vec![])),
+
+        // ---- Planning (daemon-owned, never claimable) ----
+        (Status::Planning, Event::PlanMaterialized) => Ok((Status::Decomposed, vec![])),
+        (Status::Planning, Event::PlanningBlocked { reason }) => Ok((
+            Status::Failed,
+            vec![
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: reason.clone(),
+                },
+            ],
+        )),
+        (Status::Planning, Event::Cancelled { by }) => Ok((
+            Status::Cancelled,
+            vec![
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: format!("cancelled: {by}"),
+                },
+            ],
+        )),
+        (Status::Planning, Event::ControlledShutdown) => Ok((Status::Planning, vec![])),
+        (Status::Planning, _) => reject("planning is daemon-owned and unclaimable"),
+
+        // ---- Decomposed coordinator (daemon-owned, never claimable) ----
+        (Status::Decomposed, Event::GraphCompleted) => {
+            Ok((Status::Done, vec![Effect::ReleaseLease]))
+        }
+        (Status::Decomposed, Event::Cancelled { by }) => Ok((
+            Status::Cancelled,
+            vec![
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: format!("cancelled: {by}"),
+                },
+            ],
+        )),
+        (Status::Decomposed, Event::ControlledShutdown) => Ok((Status::Decomposed, vec![])),
+        (Status::Decomposed, _) => reject("decomposed coordinator is daemon-owned and unclaimable"),
 
         // ---- Working ----
         (Status::Working, Event::SignaledDone { .. }) => {
@@ -333,14 +390,22 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         }
         (Status::Rework, Event::AgentFailed { reason }) => {
             if t.review_only {
+                // A lost remediation worker must not hand the task back to
+                // review: the replacement reviewer re-judges the unchanged PR
+                // head and its changes verdict burns a rework round with zero
+                // remediation applied. Park instead (Failed + daemon_parked
+                // refs, written by the storage layer); only an explicit
+                // `task-retry` can restore it to rework.
                 Ok((
-                    Status::InReview,
+                    Status::Failed,
                     vec![
                         Effect::ReleaseLease,
                         Effect::NotifyOwner {
-                            reason: reason.clone(),
+                            reason: format!(
+                                "remediation worker lost ({reason}); parked — \
+                                 resume with `quorum task-retry`"
+                            ),
                         },
-                        Effect::SpawnReviewer,
                     ],
                 ))
             } else {
@@ -357,9 +422,17 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         }
         (Status::Rework, Event::LeaseExpired) => {
             if t.review_only {
+                // Same park-not-bounce contract as AgentFailed above.
                 Ok((
-                    Status::InReview,
-                    vec![Effect::ReleaseLease, Effect::SpawnReviewer],
+                    Status::Failed,
+                    vec![
+                        Effect::ReleaseLease,
+                        Effect::NotifyOwner {
+                            reason: "remediation lease expired; parked — \
+                                     resume with `quorum task-retry`"
+                                .into(),
+                        },
+                    ],
                 ))
             } else {
                 Ok((Status::Open, vec![Effect::ReleaseLease]))
@@ -449,6 +522,16 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Merging, Event::LeaseExpired) => reject("merging in progress"),
         (Status::Merging, Event::ControlledShutdown) => Ok((Status::Merging, vec![])),
 
+        // Decomposition events are daemon-only and valid solely on their
+        // documented source states above.
+        (
+            _,
+            Event::PlanningStarted
+            | Event::PlanMaterialized
+            | Event::PlanningBlocked { .. }
+            | Event::GraphCompleted,
+        ) => reject("decomposition event is invalid for this task state"),
+
         // ---- Done (terminal) ----
         (Status::Done, Event::ControlledShutdown) => reject("task is done"),
         (Status::Done, _) => reject("task is done"),
@@ -517,6 +600,8 @@ mod tests {
     fn status_display_roundtrip() {
         let all = [
             Status::Open,
+            Status::Planning,
+            Status::Decomposed,
             Status::Working,
             Status::InReview,
             Status::Rework,
@@ -540,6 +625,8 @@ mod tests {
     #[test]
     fn status_is_terminal() {
         assert!(!Status::Open.is_terminal());
+        assert!(!Status::Planning.is_terminal());
+        assert!(!Status::Decomposed.is_terminal());
         assert!(!Status::Working.is_terminal());
         assert!(!Status::InReview.is_terminal());
         assert!(!Status::Rework.is_terminal());
@@ -555,6 +642,8 @@ mod tests {
         // declaring its controlled-shutdown contract here before tests compile.
         let expected = |status| match status {
             Status::Open => Ok(Status::Open),
+            Status::Planning => Ok(Status::Planning),
+            Status::Decomposed => Ok(Status::Decomposed),
             Status::Working => Ok(Status::Working),
             Status::InReview => Ok(Status::InReview),
             Status::Rework => Ok(Status::Rework),
@@ -565,6 +654,8 @@ mod tests {
         };
         let all_statuses = [
             Status::Open,
+            Status::Planning,
+            Status::Decomposed,
             Status::Working,
             Status::InReview,
             Status::Rework,
@@ -588,6 +679,66 @@ mod tests {
                 Err(()) => assert_invalid(&view(status), &Event::ControlledShutdown),
             }
         }
+    }
+
+    #[test]
+    fn decomposition_source_happy_path_is_daemon_owned() {
+        let (status, effects) = transition(&view(Status::Open), &Event::PlanningStarted).unwrap();
+        assert_eq!(status, Status::Planning);
+        assert!(effects.is_empty());
+
+        let planning = view(status);
+        assert_invalid(
+            &planning,
+            &Event::Claimed {
+                agent: "worker".into(),
+            },
+        );
+        let (status, effects) = transition(&planning, &Event::PlanMaterialized).unwrap();
+        assert_eq!(status, Status::Decomposed);
+        assert!(effects.is_empty());
+
+        let decomposed = view(status);
+        assert_invalid(&decomposed, &Event::SignaledDone { pr: "42".into() });
+        assert_invalid(&decomposed, &Event::VerdictApprove);
+        let (status, effects) = transition(&decomposed, &Event::GraphCompleted).unwrap();
+        assert_eq!(status, Status::Done);
+        assert_eq!(effects, vec![Effect::ReleaseLease]);
+    }
+
+    #[test]
+    fn decomposition_events_reject_wrong_source_states() {
+        for (status, event) in [
+            (Status::Open, Event::PlanMaterialized),
+            (Status::Open, Event::GraphCompleted),
+            (Status::Planning, Event::PlanningStarted),
+            (Status::Planning, Event::GraphCompleted),
+            (Status::Decomposed, Event::PlanningStarted),
+            (Status::Decomposed, Event::PlanMaterialized),
+        ] {
+            assert_invalid(&view(status), &event);
+        }
+    }
+
+    #[test]
+    fn planning_blocker_is_a_durable_failed_hold() {
+        let (status, effects) = transition(
+            &view(Status::Planning),
+            &Event::PlanningBlocked {
+                reason: "scope is ambiguous".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(status, Status::Failed);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "scope is ambiguous".into()
+                }
+            ]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -847,20 +998,27 @@ mod tests {
     }
 
     #[test]
-    fn in_review_verdict_changes_rework_cap_exceeded() {
+    fn in_review_actionable_events_at_rework_cap_fail_without_incrementing() {
         let mut t = view_with_author(Status::InReview, "W1");
         t.rework_round = REWORK_CAP;
-        assert_ok(
-            &t,
-            &Event::VerdictChanges,
-            Status::Failed,
-            &[
-                Effect::NotifyOwner {
-                    reason: format!("rework cap ({REWORK_CAP}) exceeded"),
-                },
-                Effect::ReleaseLease,
-            ],
-        );
+        for event in [
+            Event::VerdictChanges,
+            Event::ChecksFailed {
+                checks: vec!["fmt".into()],
+            },
+        ] {
+            assert_ok(
+                &t,
+                &event,
+                Status::Failed,
+                &[
+                    Effect::NotifyOwner {
+                        reason: "rework cap (7) exceeded".into(),
+                    },
+                    Effect::ReleaseLease,
+                ],
+            );
+        }
     }
 
     #[test]
@@ -997,7 +1155,9 @@ mod tests {
     }
 
     // ── Review-only rework recovery (table-driven) ─────────────────
-    // review_only tasks must recover to InReview; implementation tasks to Open.
+    // Implementation tasks recover to Open (worker requeue). review_only
+    // tasks park (Failed + daemon_parked refs): bouncing to InReview would
+    // re-review the unchanged PR head and burn a rework round per bounce.
 
     #[test]
     fn rework_recovery_destinations_by_review_only() {
@@ -1017,8 +1177,8 @@ mod tests {
             Case {
                 review_only: true,
                 event: Event::AgentFailed { reason: "x".into() },
-                expected_status: Status::InReview,
-                label: "review_only+AgentFailed→InReview",
+                expected_status: Status::Failed,
+                label: "review_only+AgentFailed→Failed(park)",
             },
             Case {
                 review_only: false,
@@ -1029,8 +1189,8 @@ mod tests {
             Case {
                 review_only: true,
                 event: Event::LeaseExpired,
-                expected_status: Status::InReview,
-                label: "review_only+LeaseExpired→InReview",
+                expected_status: Status::Failed,
+                label: "review_only+LeaseExpired→Failed(park)",
             },
         ];
         for case in &cases {
@@ -1044,38 +1204,45 @@ mod tests {
     }
 
     #[test]
-    fn rework_agent_failed_review_only_spawns_reviewer() {
+    fn rework_agent_failed_review_only_parks_without_reviewer() {
         let mut t = view(Status::Rework);
         t.review_only = true;
         t.pr = Some("42".into());
         t.author = Some("W1".into());
-        assert_ok(
+        let (status, effects) = transition(
             &t,
             &Event::AgentFailed {
                 reason: "crash".into(),
             },
-            Status::InReview,
-            &[
-                Effect::ReleaseLease,
-                Effect::NotifyOwner {
-                    reason: "crash".into(),
-                },
-                Effect::SpawnReviewer,
-            ],
+        )
+        .unwrap();
+        // Park, never bounce: a replacement reviewer on the unchanged head
+        // would burn a rework round with zero remediation applied.
+        assert_eq!(status, Status::Failed);
+        assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(
+            !effects.contains(&Effect::SpawnReviewer),
+            "remediation death must not spawn a reviewer"
         );
+        assert!(
+            !effects.contains(&Effect::IncrementReworkRound),
+            "infra failure must not consume a rework round"
+        );
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyOwner { reason } if reason.contains("crash"))));
     }
 
     #[test]
-    fn rework_lease_expired_review_only_spawns_reviewer() {
+    fn rework_lease_expired_review_only_parks_without_reviewer() {
         let mut t = view(Status::Rework);
         t.review_only = true;
         t.pr = Some("42".into());
-        assert_ok(
-            &t,
-            &Event::LeaseExpired,
-            Status::InReview,
-            &[Effect::ReleaseLease, Effect::SpawnReviewer],
-        );
+        let (status, effects) = transition(&t, &Event::LeaseExpired).unwrap();
+        assert_eq!(status, Status::Failed);
+        assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(!effects.contains(&Effect::SpawnReviewer));
+        assert!(!effects.contains(&Effect::IncrementReworkRound));
     }
 
     #[test]
@@ -1206,7 +1373,7 @@ mod tests {
             Status::Failed,
             &[
                 Effect::NotifyOwner {
-                    reason: format!("rework cap ({REWORK_CAP}) exceeded"),
+                    reason: "rework cap (7) exceeded".into(),
                 },
                 Effect::ReleaseLease,
             ],
@@ -1330,11 +1497,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn rework_round_at_cap_minus_one_allowed() {
+    fn sixth_and_seventh_rework_rounds_are_accepted_before_cap_exhaustion() {
         let mut t = view_with_author(Status::InReview, "W1");
-        t.rework_round = REWORK_CAP - 1;
-        let (next, _) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(
+            REWORK_CAP, 7,
+            "managed rework policy must remain seven rounds"
+        );
+
+        // Round six begins with five completed rounds and increments to six.
+        t.rework_round = 5;
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
         assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+        t.rework_round += 1;
+        assert_eq!(t.rework_round, 6);
+
+        // Round seven begins at six and reaches the durable cap exactly once.
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+        t.rework_round += 1;
+        assert_eq!(t.rework_round, REWORK_CAP);
     }
 
     #[test]
@@ -1344,15 +1527,15 @@ mod tests {
         let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
         assert_eq!(next, Status::Failed);
         assert!(effects.contains(&Effect::ReleaseLease));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::NotifyOwner { reason } if reason == "rework cap (7) exceeded")
+        ));
     }
 
     #[test]
     fn rework_round_above_cap_also_fails() {
         let mut t = view_with_author(Status::InReview, "W1");
-        t.rework_round = REWORK_CAP + 5;
+        t.rework_round = REWORK_CAP + 1;
         let (next, _) = transition(&t, &Event::VerdictChanges).unwrap();
         assert_eq!(next, Status::Failed);
     }
@@ -2144,9 +2327,11 @@ mod proptests {
 
         /// Cancelled is reachable from every non-terminal state.
         #[test]
-        fn cancelled_reachable_from_all_non_terminals(status_idx in 0..5usize) {
+        fn cancelled_reachable_from_all_non_terminals(status_idx in 0..7usize) {
             let statuses = [
                 Status::Open,
+                Status::Planning,
+                Status::Decomposed,
                 Status::Working,
                 Status::InReview,
                 Status::Rework,

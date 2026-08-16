@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 32). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 53). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -35,6 +35,25 @@ CREATE TABLE IF NOT EXISTS cursors (
     topic       TEXT NOT NULL,
     last_seq    INTEGER NOT NULL,
     PRIMARY KEY (agent_id, topic)
+);
+
+-- v48: rotating cursors for bounded opportunistic sweep. Sweep-on-write pages
+-- over at most SWEEP_LIMIT raw task IDs before applying age/status/reference
+-- predicates, so retained history never inflates per-mutation candidate work.
+-- A short tail page resets the cursor to 0 so newly eligible lower task IDs are
+-- revisited fairly. Sweep-all does not consult the cursor.
+CREATE TABLE IF NOT EXISTS sweep_cursors (
+    name  TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+
+-- v51: durable, bounded reconciliation after a dependency is cancelled. Each
+-- sweep examines one primary-key page, so retained task history cannot enlarge
+-- a cancellation transaction or an opportunistic write sweep.
+CREATE TABLE IF NOT EXISTS cancelled_dependency_reconciliation (
+    cancelled_task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+    task_cursor       INTEGER NOT NULL DEFAULT 0,
+    updated_at        INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS claims (
@@ -81,9 +100,156 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- v29: durable crash-recovery budget. Incremented each time a managed worker
     -- dies and the task reopens; reset when the task reaches a meaningful lifecycle
     -- handoff (in-review via submit/rework-push). Cancels the task when exhausted.
-    recovery_attempts INTEGER NOT NULL DEFAULT 0
+    recovery_attempts INTEGER NOT NULL DEFAULT 0,
+    -- v35: optimistic concurrency authority for edits and planning input. The v38
+    -- repair migration adds these columns to split-lineage databases that missed them.
+    revision     INTEGER NOT NULL DEFAULT 1,
+    edit_count   INTEGER NOT NULL DEFAULT 0,
+    -- v35: authoritative existing-PR implementation intent. Unlike refs.pr, this field is
+    -- creator-selected only through --continue-pr and controls daemon provisioning.
+    continue_pr INTEGER CHECK (continue_pr IS NULL OR continue_pr > 0),
+    -- v47: daemon-owned terminal provenance. NULL deliberately preserves legacy/unknown
+    -- completions without guessing whether a retained refs.pr actually merged.
+    completion_provenance TEXT
+        CHECK (completion_provenance IS NULL OR completion_provenance IN ('merged','manual')),
+    -- v53: authoritative nullable target branch. Resolved to the daemon-configured
+    -- base before first execution; immutable once populated.
+    target_branch TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
+-- Bounded REVIEWING projection: each status is read newest-first, then at most two
+-- REVIEWING_TASK_LIMIT-sized candidate sets are merged for global ordering.
+CREATE INDEX IF NOT EXISTS tasks_reviewing_newest
+    ON tasks(status, updated_at DESC, id DESC);
+-- v36: durable candidate representation for corrupt terminal retry authority.
+-- These partial indexes contain only rows reconciliation/status need to inspect,
+-- so proving the healthy steady state does not scan the unbounded terminal task
+-- history. Separate orderings keep both LIMIT queries bounded without sorting
+-- the entire candidate set.
+CREATE INDEX IF NOT EXISTS tasks_terminal_retry_id
+    ON tasks(id)
+    WHERE status IN ('done','failed','cancelled')
+      AND json_valid(refs)
+      AND (
+          json_type(refs, '$.daemon_rework_retry_requested')='true'
+          OR json_type(refs, '$.daemon_parked_head_check')='true'
+          OR (
+              status IN ('done','cancelled')
+              AND (
+                  json_type(refs, '$.daemon_parked') IS NOT NULL
+                  OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
+              )
+          )
+          OR (
+              status='failed'
+              AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
+              AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
+          )
+      );
+CREATE INDEX IF NOT EXISTS tasks_terminal_retry_recent
+    ON tasks(updated_at DESC, id DESC)
+    WHERE status IN ('done','failed','cancelled')
+      AND json_valid(refs)
+      AND (
+          json_type(refs, '$.daemon_rework_retry_requested')='true'
+          OR json_type(refs, '$.daemon_parked_head_check')='true'
+          OR (
+              status IN ('done','cancelled')
+              AND (
+                  json_type(refs, '$.daemon_parked') IS NOT NULL
+                  OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
+              )
+          )
+          OR (
+              status='failed'
+              AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
+              AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
+          )
+      );
+
+-- v35: one bounded decomposition aggregate per source task. `active` and
+-- `freeze_active` are explicit partial-index sentinels, never inferred from
+-- text state, so racing writers lose at SQLite's uniqueness boundary.
+CREATE TABLE IF NOT EXISTS task_decompositions (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_task_id          INTEGER NOT NULL UNIQUE REFERENCES tasks(id),
+    state                   TEXT NOT NULL CHECK(state IN (
+                                'freeze-requested','draining','planning','validating',
+                                'preclassifying','provider-backoff','held','active',
+                                'blocked','completed','cancelled')),
+    active                  INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+    freeze_active           INTEGER NOT NULL DEFAULT 0 CHECK(freeze_active IN (0,1)),
+    planned_source_revision INTEGER NOT NULL,
+    plan_revision           INTEGER NOT NULL DEFAULT 1,
+    proposal_attempts       INTEGER NOT NULL DEFAULT 0,
+    provider_failures       INTEGER NOT NULL DEFAULT 0,
+    planner_provider        TEXT,
+    planner_model           TEXT,
+    planner_session_id      TEXT,
+    planner_assignment_id   INTEGER REFERENCES role_assignments(id),
+    frozen_base_sha         TEXT,
+    accepted_proposal_json  TEXT CHECK(accepted_proposal_json IS NULL OR length(CAST(accepted_proposal_json AS BLOB)) <= 65536),
+    accepted_plan_revision  INTEGER,
+    hold_code               TEXT,
+    hold_summary            TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_task_graph
+    ON task_decompositions(active) WHERE active = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS one_planning_freeze
+    ON task_decompositions(freeze_active) WHERE freeze_active = 1;
+
+-- v37: short-lived daemon reviewer reservations serialize external reviewer
+-- provisioning against acquisition of the repository planning freeze.
+CREATE TABLE IF NOT EXISTS reviewer_provision_reservations (
+    task_id       INTEGER PRIMARY KEY REFERENCES tasks(id),
+    token         TEXT NOT NULL UNIQUE,
+    role          TEXT NOT NULL CHECK(role IN ('r1','r2')),
+    created_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_graph_members (
+    graph_id      INTEGER NOT NULL REFERENCES task_decompositions(id),
+    task_id       INTEGER NOT NULL UNIQUE REFERENCES tasks(id),
+    local_key     TEXT NOT NULL,
+    plan_revision INTEGER NOT NULL,
+    active        INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    PRIMARY KEY (graph_id, plan_revision, local_key)
+);
+CREATE INDEX IF NOT EXISTS task_graph_members_graph_active
+    ON task_graph_members(graph_id, active);
+
+CREATE TABLE IF NOT EXISTS decomposition_attempts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    graph_id         INTEGER NOT NULL REFERENCES task_decompositions(id),
+    source_revision  INTEGER NOT NULL,
+    kind             TEXT NOT NULL CHECK(kind IN ('proposal','provider','blocker','recovery')),
+    ordinal          INTEGER NOT NULL,
+    reason_code      TEXT NOT NULL,
+    summary          TEXT NOT NULL,
+    created_at       INTEGER NOT NULL,
+    UNIQUE (graph_id, source_revision, kind, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS decomposition_cleanup (
+    graph_id       INTEGER NOT NULL REFERENCES task_decompositions(id),
+    task_id        INTEGER NOT NULL REFERENCES tasks(id),
+    artifact_kind  TEXT NOT NULL,
+    artifact_ref   TEXT NOT NULL,
+    state          TEXT NOT NULL DEFAULT 'pending'
+                       CHECK(state IN ('pending','running','done','exhausted')),
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (graph_id, task_id, artifact_kind, artifact_ref)
+);
+-- v48: bound sweep's durable-reference guard by task_id lookup. The composite
+-- PK's leading column is graph_id, so `WHERE task_id=?` falls back to a full
+-- scan of retained cleanup provenance. This lookup index keeps
+-- sweep_on_write's REFERENCES tasks(id) probe O(log n).
+CREATE INDEX IF NOT EXISTS decomposition_cleanup_task
+    ON decomposition_cleanup(task_id);
 
 CREATE TABLE IF NOT EXISTS errors (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,7 +327,10 @@ CREATE TABLE IF NOT EXISTS task_branches (
     branch       TEXT NOT NULL UNIQUE,
     worktree     TEXT NOT NULL,
     allocated_by TEXT NOT NULL,
-    allocated_at INTEGER NOT NULL
+    allocated_at INTEGER NOT NULL,
+    -- Immutable base/provenance commit captured before provisioning. It is
+    -- not necessarily the later deletion SHA after a worker commits.
+    provenance_sha TEXT
 );
 CREATE INDEX IF NOT EXISTS task_branches_task ON task_branches(task_id);
 
@@ -230,6 +399,12 @@ CREATE TABLE IF NOT EXISTS journal (
     pr              INTEGER,
     -- M7 crash recovery: rework round counter for limit enforcement across restarts.
     rework_count    INTEGER NOT NULL DEFAULT 0,
+    -- Restart-safe dormant turn identity. Nullable for ordinary running rows
+    -- and legacy journal history; awaiting-review dormant rows require all
+    -- three values and validate them before reconstruction.
+    provider        TEXT,
+    continuation_id TEXT,
+    local_branch    TEXT,
     updated_at      INTEGER NOT NULL
 );
 
@@ -276,6 +451,97 @@ CREATE TABLE IF NOT EXISTS daemon_lock (
     heartbeat_at  INTEGER NOT NULL
 );
 
+-- v42: one immutable executable routing decision per managed responsibility.
+-- Execution fields are snapshots, so later configuration changes or profile removal
+-- cannot reinterpret or strand an existing assignment.
+CREATE TABLE IF NOT EXISTS role_assignments (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    responsibility_key  TEXT NOT NULL UNIQUE,
+    task_id             INTEGER,
+    pr_number           INTEGER,
+    role                TEXT NOT NULL CHECK(role IN
+                            ('classifier','planner','worker','reviewer','collector')),
+    review_stage        TEXT CHECK(review_stage IN ('r1','r2')),
+    complexity          TEXT,
+    profile_id          TEXT NOT NULL,
+    provider            TEXT NOT NULL,
+    runner              TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    effort              TEXT NOT NULL,
+    pool_key            TEXT NOT NULL,
+    policy_generation   TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    CHECK((role = 'reviewer' AND review_stage IS NOT NULL) OR
+          (role != 'reviewer' AND review_stage IS NULL))
+);
+CREATE INDEX IF NOT EXISTS role_assignments_task ON role_assignments(task_id);
+CREATE INDEX IF NOT EXISTS role_assignments_pr ON role_assignments(pr_number);
+
+-- v49: immutable evidence for each distinct configured route attempted for one
+-- managed responsibility. The original role assignment remains the routing
+-- decision; these rows only record execution evidence and derive exclusions.
+CREATE TABLE IF NOT EXISTS routing_attempts (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    role_assignment_id    INTEGER NOT NULL REFERENCES role_assignments(id),
+    responsibility_key    TEXT NOT NULL,
+    profile_id            TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    runner                TEXT NOT NULL,
+    model                 TEXT NOT NULL,
+    effort                TEXT NOT NULL,
+    pool_key              TEXT NOT NULL,
+    policy_generation     TEXT NOT NULL,
+    failure_disposition   TEXT CHECK(failure_disposition IS NULL OR
+                              failure_disposition IN (
+                                  'provider-unavailable',
+                                  'profile-unavailable',
+                                  'retryable-same-route',
+                                  'non-failover',
+                                  'unclassified')),
+    recorded_at           INTEGER NOT NULL,
+    UNIQUE(role_assignment_id, profile_id)
+);
+CREATE INDEX IF NOT EXISTS routing_attempts_responsibility
+    ON routing_attempts(responsibility_key, id);
+
+CREATE TRIGGER IF NOT EXISTS routing_attempts_assignment_guard
+BEFORE INSERT ON routing_attempts
+WHEN NOT EXISTS (
+    SELECT 1 FROM role_assignments AS assignment
+    WHERE assignment.id=NEW.role_assignment_id
+      AND assignment.responsibility_key=NEW.responsibility_key
+      AND assignment.pool_key=NEW.pool_key
+      AND assignment.policy_generation=NEW.policy_generation
+)
+BEGIN
+    SELECT RAISE(ABORT, 'routing attempt does not match role assignment');
+END;
+
+CREATE TRIGGER IF NOT EXISTS routing_attempts_no_update
+BEFORE UPDATE ON routing_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'routing attempt evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS routing_attempts_no_delete
+BEFORE DELETE ON routing_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'routing attempt evidence is immutable');
+END;
+
+-- The exact shuffled 100-slot epoch is persisted. `next_slot` and assignment insertion
+-- advance in one BEGIN IMMEDIATE transaction, so restart never rerolls a pending turn.
+CREATE TABLE IF NOT EXISTS routing_cursors (
+    pool_key           TEXT NOT NULL,
+    policy_generation  TEXT NOT NULL,
+    epoch              INTEGER NOT NULL DEFAULT 0 CHECK(epoch >= 0),
+    bag_json           TEXT NOT NULL CHECK(json_valid(bag_json)
+                              AND length(CAST(bag_json AS BLOB)) <= 65536),
+    next_slot          INTEGER NOT NULL CHECK(next_slot BETWEEN 0 AND 100),
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY(pool_key, policy_generation)
+);
+
 -- Agent-performance capture: one row per daemon-spawned agent process (worker
 -- or reviewer). Records the RESOLVED model+effort (after label→model mapping +
 -- daemon defaults) so query surfaces can cut by what actually ran, not what was
@@ -296,7 +562,14 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     sub_role    TEXT,
     -- v31: resolved provider for this run ('claude' or 'codex'). NULL for
     -- pre-existing rows (implies Claude). Recovery must use this, not re-resolve.
-    provider    TEXT
+    provider    TEXT,
+    -- v41: immutable daemon-captured reviewer launch authority. All three are
+    -- NULL for workers and historical reviewer rows.
+    review_cap_run_id TEXT,
+    review_pr         INTEGER,
+    review_head_sha   TEXT,
+    -- v42: durable routing decision that caused this process run.
+    role_assignment_id INTEGER REFERENCES role_assignments(id)
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
 
@@ -408,10 +681,153 @@ CREATE TABLE IF NOT EXISTS review_collection_runs (
     collector_model     TEXT NOT NULL,
     collector_version   TEXT NOT NULL,
     findings_count      INTEGER NOT NULL DEFAULT 0,
+    followup_count      INTEGER NOT NULL DEFAULT 0,
     attempted_at        INTEGER NOT NULL,
-    completed_at        INTEGER
+    completed_at        INTEGER,
+    role_assignment_id  INTEGER REFERENCES role_assignments(id)
 );
 CREATE INDEX IF NOT EXISTS review_collection_runs_task ON review_collection_runs(task_id);
+
+-- v43: dormant durable review follow-up storage. A batch is the immutable first
+-- successful artifact snapshot for a merged PR. Later phases may advance its
+-- state, but re-interpretation never replaces the batch or its artifacts.
+CREATE TABLE IF NOT EXISTS review_followup_batches (
+    pr_number          INTEGER PRIMARY KEY,
+    task_id            INTEGER NOT NULL REFERENCES tasks(id),
+    graph_id           INTEGER REFERENCES task_decompositions(id),
+    source_task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    collector_version  TEXT NOT NULL,
+    artifact_count     INTEGER NOT NULL,
+    state              TEXT NOT NULL CHECK(state IN ('collected', 'assessing', 'resolved')),
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
+-- v48: index each REFERENCES tasks(id) column so sweep's durable-reference
+-- guard is bounded by index probe rather than a scan of every retained batch.
+CREATE INDEX IF NOT EXISTS review_followup_batches_task
+    ON review_followup_batches(task_id);
+CREATE INDEX IF NOT EXISTS review_followup_batches_source_task
+    ON review_followup_batches(source_task_id);
+
+CREATE TABLE IF NOT EXISTS review_followup_artifacts (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    pr_number                  INTEGER NOT NULL REFERENCES review_followup_batches(pr_number),
+    ordinal                    INTEGER NOT NULL,
+    technical_impact           TEXT NOT NULL CHECK(technical_impact IN ('critical', 'major', 'minor', 'nit')),
+    scope_relationship         TEXT NOT NULL CHECK(scope_relationship IN (
+                                   'pre_existing', 'out_of_scope', 'threat_model_expansion',
+                                   'defense_in_depth', 'future_requirement', 'design_debt')),
+    concern                    TEXT NOT NULL,
+    non_blocking_reason        TEXT NOT NULL,
+    affected_behavior          TEXT NOT NULL,
+    desired_outcome            TEXT NOT NULL,
+    verification_expectations  TEXT NOT NULL,
+    evidence_ids               TEXT NOT NULL,
+    disposition                TEXT CHECK(disposition IS NULL OR disposition IN (
+                                   'created', 'linked', 'dismissed', 'deferred')),
+    disposition_reason         TEXT,
+    linked_task_id             INTEGER REFERENCES tasks(id),
+    created_task_id            INTEGER REFERENCES tasks(id),
+    created_at                 INTEGER NOT NULL,
+    updated_at                 INTEGER NOT NULL,
+    UNIQUE(pr_number, ordinal),
+    CHECK(
+        CASE
+            WHEN disposition IS NULL
+                THEN linked_task_id IS NULL AND created_task_id IS NULL
+            WHEN disposition = 'linked'
+                THEN linked_task_id IS NOT NULL AND created_task_id IS NULL
+            WHEN disposition = 'created'
+                THEN linked_task_id IS NULL AND created_task_id IS NOT NULL
+            WHEN disposition IN ('dismissed', 'deferred')
+                THEN linked_task_id IS NULL AND created_task_id IS NULL
+            ELSE 0
+        END
+    )
+);
+-- v48: partial indexes (the CHECK above guarantees at most one of the two
+-- columns is non-NULL per row) so sweep's durable-reference guard is bounded
+-- by index probe over just the disposition='linked'/'created' subset.
+CREATE INDEX IF NOT EXISTS review_followup_artifacts_linked_task
+    ON review_followup_artifacts(linked_task_id) WHERE linked_task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS review_followup_artifacts_created_task
+    ON review_followup_artifacts(created_task_id) WHERE created_task_id IS NOT NULL;
+
+-- v44: dormant follow-up assessment storage. The aggregate is unique by
+-- semantic scope; `active` is an explicit per-target authority sentinel. No
+-- daemon or planner path consumes these rows until the final activation task.
+CREATE TABLE IF NOT EXISTS review_followup_assessments (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    target                TEXT NOT NULL,
+    scope_kind            TEXT NOT NULL CHECK(scope_kind IN ('task', 'graph')),
+    scope_id              INTEGER NOT NULL CHECK(scope_id > 0),
+    source_task_id        INTEGER NOT NULL REFERENCES tasks(id),
+    state                 TEXT NOT NULL CHECK(state IN (
+                              'pending', 'planning', 'provider-backoff', 'held', 'completed')),
+    active                INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+    membership_sealed     INTEGER NOT NULL DEFAULT 1 CHECK(membership_sealed IN (0, 1)),
+    proposal_attempts     INTEGER NOT NULL DEFAULT 0 CHECK(proposal_attempts BETWEEN 0 AND 3),
+    provider_failures     INTEGER NOT NULL DEFAULT 0 CHECK(provider_failures BETWEEN 0 AND 3),
+    planner_provider      TEXT,
+    planner_model         TEXT,
+    planner_assignment_id INTEGER REFERENCES role_assignments(id),
+    base_sha              TEXT,
+    hold_code             TEXT,
+    hold_summary          TEXT,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    UNIQUE(scope_kind, scope_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_followup_assessment
+    ON review_followup_assessments(target) WHERE active = 1;
+-- v48: index REFERENCES tasks(id) so sweep's durable-reference guard is
+-- bounded by index probe rather than a scan of every retained assessment.
+CREATE INDEX IF NOT EXISTS review_followup_assessments_source_task
+    ON review_followup_assessments(source_task_id);
+
+-- Membership is immutable once materialized. Fresh aggregate rows are sealed
+-- by default; the core materializer explicitly opens and irreversibly seals
+-- membership inside its BEGIN IMMEDIATE transaction. The artifact-level UNIQUE
+-- is separate from the composite primary key so one artifact cannot
+-- participate in two different assessments.
+CREATE TABLE IF NOT EXISTS review_followup_assessment_artifacts (
+    assessment_id INTEGER NOT NULL REFERENCES review_followup_assessments(id),
+    artifact_id   INTEGER NOT NULL UNIQUE REFERENCES review_followup_artifacts(id),
+    PRIMARY KEY (assessment_id, artifact_id)
+);
+
+-- v45: memberships are append-once at the storage boundary. These triggers
+-- also retrofit immutability onto v44 databases without recreating the table.
+CREATE TRIGGER IF NOT EXISTS review_followup_membership_no_update
+BEFORE UPDATE ON review_followup_assessment_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'follow-up assessment membership is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS review_followup_membership_no_delete
+BEFORE DELETE ON review_followup_assessment_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'follow-up assessment membership is immutable');
+END;
+
+-- v44 tables had non-negative counter checks but no upper storage check.
+-- Guard both insert and update so migrated and fresh databases share the
+-- three-attempt bound even for writes outside the core API.
+CREATE TRIGGER IF NOT EXISTS review_followup_assessment_counter_insert_bound
+BEFORE INSERT ON review_followup_assessments
+WHEN NEW.proposal_attempts NOT BETWEEN 0 AND 3
+  OR NEW.provider_failures NOT BETWEEN 0 AND 3
+BEGIN
+    SELECT RAISE(ABORT, 'follow-up assessment counter exceeds bound');
+END;
+
+CREATE TRIGGER IF NOT EXISTS review_followup_assessment_counter_update_bound
+BEFORE UPDATE OF proposal_attempts, provider_failures ON review_followup_assessments
+WHEN NEW.proposal_attempts NOT BETWEEN 0 AND 3
+  OR NEW.provider_failures NOT BETWEEN 0 AND 3
+BEGIN
+    SELECT RAISE(ABORT, 'follow-up assessment counter exceeds bound');
+END;
 
 -- v24 (#127): durable post-merge collector retry queue. Each row is a pending
 -- collector invocation — the daemon enqueues one at MergeSucceeded and drains
