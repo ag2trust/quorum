@@ -1183,6 +1183,33 @@ pub fn default_config_path(repo: &str) -> Result<std::path::PathBuf> {
         .join(format!("{slug}.toml")))
 }
 
+/// Resolve the base branch that a task created outside the daemon should store.
+///
+/// This intentionally reads only `base_branch`: task creation must not require the
+/// daemon's routing configuration, but it must use the same per-repository config
+/// location and built-in `main` fallback as `serve`.
+pub fn task_create_base_branch(repo: &str) -> Result<String> {
+    let path = default_config_path(repo)?;
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("main".into()),
+        Err(error) => {
+            return Err(QuorumError::Io(format!(
+                "cannot read serve config {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    #[derive(Deserialize)]
+    struct BaseBranchConfig {
+        base_branch: Option<String>,
+    }
+    let config: BaseBranchConfig = toml::from_str(&contents).map_err(|error| {
+        QuorumError::Usage(format!("bad serve config {}: {error}", path.display()))
+    })?;
+    Ok(config.base_branch.unwrap_or_else(|| "main".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

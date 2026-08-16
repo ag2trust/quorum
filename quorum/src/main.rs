@@ -471,6 +471,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             depends_on,
             review_pr,
             continue_pr,
+            base_branch,
             body_file,
             repo,
         } => {
@@ -478,8 +479,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             quorum_core::tasks::validate_creator_labels(labels.as_deref())?;
             quorum_core::tasks::validate_creator_refs(refs.as_deref())?;
             let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let target_branch =
+                base_branch.unwrap_or(serve_config::task_create_base_branch(&resolved_repo)?);
+            quorum_core::tasks::validate_target_branch(&target_branch)?;
             let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
-            let id = quorum_core::tasks::create_with_continue_pr(
+            let id = quorum_core::tasks::create_with_continue_pr_and_target_branch(
                 &mut conn,
                 &created_by,
                 &title,
@@ -490,6 +494,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 depends_on.as_deref(),
                 review_pr,
                 continue_pr,
+                Some(&target_branch),
                 now,
             )?;
             output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));

@@ -15,6 +15,7 @@ use crate::runner_state::{self, PendingTurn, ProviderBlock};
 use crate::sweep::SWEEP_LIMIT;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::Serialize;
+use std::process::Command;
 
 pub const STATUSES: &[&str] = &[
     "open",
@@ -673,6 +674,55 @@ pub fn active_pr_owner_in(
 
 // ── create ────────────────────────────────────────────────────────────────────
 
+/// Maximum byte length for a task target's local branch name.
+pub const MAX_TARGET_BRANCH_BYTES: usize = 255;
+
+/// Validate a bounded local branch name with Git's ref validator.
+///
+/// Process arguments are passed directly to Git; branch text is never interpreted
+/// by a shell. The pre-checks reject forms that Git accepts as shorthand or remote
+/// qualifications but which cannot be this task's local target branch.
+pub fn validate_target_branch(branch: &str) -> Result<()> {
+    if branch.is_empty() {
+        return Err(QuorumError::Usage("--base-branch must not be empty".into()));
+    }
+    if branch.len() > MAX_TARGET_BRANCH_BYTES {
+        return Err(QuorumError::Usage(format!(
+            "--base-branch must be at most {MAX_TARGET_BRANCH_BYTES} bytes"
+        )));
+    }
+    if branch.starts_with('-') {
+        return Err(QuorumError::Usage(
+            "--base-branch must not be option-like".into(),
+        ));
+    }
+    if branch == "@" || branch.chars().any(char::is_control) {
+        return Err(QuorumError::Usage(
+            "--base-branch must be a local branch name without control characters".into(),
+        ));
+    }
+    if branch.starts_with("refs/")
+        || branch.starts_with("remotes/")
+        || branch.starts_with("origin/")
+        || branch.starts_with("upstream/")
+    {
+        return Err(QuorumError::Usage(
+            "--base-branch must not be remote-qualified".into(),
+        ));
+    }
+
+    let output = Command::new("git")
+        .args(["check-ref-format", "--branch", branch])
+        .output()
+        .map_err(|error| QuorumError::Io(format!("run git check-ref-format: {error}")))?;
+    if !output.status.success() {
+        return Err(QuorumError::Usage(format!(
+            "invalid --base-branch {branch:?}"
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create(
     conn: &mut Connection,
@@ -705,6 +755,41 @@ pub fn create_with_continue_pr(
     continue_pr: Option<i64>,
     now: i64,
 ) -> Result<i64> {
+    create_with_continue_pr_and_target_branch(
+        conn,
+        created_by,
+        title,
+        body,
+        priority,
+        labels,
+        refs,
+        depends_on,
+        review_pr,
+        continue_pr,
+        None,
+        now,
+    )
+}
+
+/// Create a task with an optional, authoritative target branch.
+///
+/// A supplied branch is validated and inserted in the same transaction as the
+/// task, so a concurrent resolver cannot replace an explicit task-create target.
+#[allow(clippy::too_many_arguments)]
+pub fn create_with_continue_pr_and_target_branch(
+    conn: &mut Connection,
+    created_by: &str,
+    title: &str,
+    body: Option<&str>,
+    priority: i64,
+    labels: Option<&str>,
+    refs: Option<&str>,
+    depends_on: Option<&str>,
+    review_pr: Option<i64>,
+    continue_pr: Option<i64>,
+    target_branch: Option<&str>,
+    now: i64,
+) -> Result<i64> {
     if review_pr.is_some() && continue_pr.is_some() {
         return Err(QuorumError::Usage(
             "--review-pr and --continue-pr are mutually exclusive".into(),
@@ -715,6 +800,9 @@ pub fn create_with_continue_pr(
     }
     if continue_pr.is_some_and(|pr| pr <= 0) {
         return Err(QuorumError::Usage("--continue-pr must be positive".into()));
+    }
+    if let Some(branch) = target_branch {
+        validate_target_branch(branch)?;
     }
     if let Some(s) = depends_on {
         validate_depends_on(s)?;
@@ -750,8 +838,8 @@ pub fn create_with_continue_pr(
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     tx.execute(
         "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
-         created_at, updated_at, refs, depends_on, review_only, continue_pr) \
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?7, ?8, ?9, ?10, ?11)",
+         created_at, updated_at, refs, depends_on, review_only, continue_pr, target_branch) \
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             title,
             body,
@@ -763,7 +851,8 @@ pub fn create_with_continue_pr(
             final_refs.as_deref(),
             depends_on,
             review_only,
-            continue_pr
+            continue_pr,
+            target_branch,
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -11713,6 +11802,42 @@ mod tests {
         let id = create(&mut conn, "a", "t", None, 0, None, None, None, None, 1).unwrap();
         let task = get(&conn, id).unwrap().unwrap();
         assert!(task.target_branch.is_none());
+    }
+
+    #[test]
+    fn target_branch_validation_rejects_control_nul_and_oversized_inputs() {
+        for branch in ["main\0next", "main\u{1f}next", "@"] {
+            assert!(
+                validate_target_branch(branch).is_err(),
+                "must reject {branch:?}"
+            );
+        }
+        assert!(validate_target_branch(&"a".repeat(MAX_TARGET_BRANCH_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn create_with_target_branch_persists_it_atomically() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create_with_continue_pr_and_target_branch(
+            &mut conn,
+            "a",
+            "t",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("develop"),
+            1,
+        )
+        .unwrap();
+        assert!(!resolve_target_branch(&mut conn, id, "main", 2).unwrap());
+        assert_eq!(
+            get(&conn, id).unwrap().unwrap().target_branch.as_deref(),
+            Some("develop")
+        );
     }
 
     #[test]

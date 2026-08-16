@@ -140,6 +140,106 @@ fn create_claim_update_flow() {
 }
 
 #[test]
+fn task_create_persists_explicit_and_configured_base_branches() {
+    let explicit_home = tempfile::tempdir().unwrap();
+    quorum(explicit_home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "explicit target",
+            "--base-branch",
+            "develop",
+        ])
+        .assert()
+        .success();
+    quorum(explicit_home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"target_branch\":\"develop\""));
+
+    let db_path = explicit_home.path().join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db_path).unwrap();
+    assert!(
+        !quorum_core::tasks::resolve_target_branch(&mut conn, 1, "main", 99).unwrap(),
+        "task-create must persist an immutable target branch"
+    );
+
+    let default_home = tempfile::tempdir().unwrap();
+    quorum(default_home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "default target",
+        ])
+        .assert()
+        .success();
+    quorum(default_home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"target_branch\":\"main\""));
+
+    let configured_home = tempfile::tempdir().unwrap();
+    let serve_dir = configured_home.path().join("serve");
+    std::fs::create_dir_all(&serve_dir).unwrap();
+    std::fs::write(
+        serve_dir.join("test__repo.toml"),
+        "base_branch = \"release/2026\"\n",
+    )
+    .unwrap();
+    quorum(configured_home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "configured target",
+        ])
+        .assert()
+        .success();
+    quorum(configured_home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "\"target_branch\":\"release/2026\"",
+        ));
+}
+
+#[test]
+fn task_create_rejects_invalid_base_branch_inputs() {
+    let home = tempfile::tempdir().unwrap();
+    for branch in [
+        "",
+        "origin/main",
+        "refs/remotes/origin/main",
+        "--upload-pack=bad",
+        "main\nnext",
+        "bad..branch",
+        "bad branch",
+        "bad:branch",
+    ] {
+        quorum(home.path())
+            .args([
+                "task-create",
+                "--created-by",
+                "boss",
+                "--title",
+                "invalid target",
+                "--base-branch",
+                branch,
+            ])
+            .assert()
+            .code(2);
+    }
+}
+
+#[test]
 fn continue_pr_is_authoritative_and_exposed() {
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())
