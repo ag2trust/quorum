@@ -1390,7 +1390,9 @@ async fn publish_worker_completion(
     // None; only they may fall back to `config.base_branch`.
     let authoritative_task_target = task_target_branch(&config.db_path, task_id).await?;
     if let (Some(prior_target), Some(task_target)) = (
-        prior.as_ref().and_then(|prior| prior.target_branch.as_deref()),
+        prior
+            .as_ref()
+            .and_then(|prior| prior.target_branch.as_deref()),
         authoritative_task_target.as_deref(),
     ) {
         if prior_target != task_target {
