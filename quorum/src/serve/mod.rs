@@ -989,6 +989,25 @@ async fn create_initial_pr(
     task_id: i64,
     title: &str,
 ) -> std::result::Result<i64, String> {
+    let args = initial_pr_args(repo, base_branch, branch, task_id, title);
+    let output = run_publication_gh(&args, repo_dir, "gh pr create").await?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_created_pr_number(&output.stdout)
+        .ok_or_else(|| "gh pr create succeeded but did not return a pull-request URL".to_string())
+}
+
+fn initial_pr_args(
+    repo: &str,
+    base_branch: &str,
+    branch: &str,
+    task_id: i64,
+    title: &str,
+) -> Vec<String> {
     let mut args = vec![
         "pr".to_string(),
         "create".to_string(),
@@ -1005,15 +1024,7 @@ async fn create_initial_pr(
         args.push("--repo".to_string());
         args.push(repo.to_string());
     }
-    let output = run_publication_gh(&args, repo_dir, "gh pr create").await?;
-    if !output.status.success() {
-        return Err(format!(
-            "gh pr create failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    parse_created_pr_number(&output.stdout)
-        .ok_or_else(|| "gh pr create succeeded but did not return a pull-request URL".to_string())
+    args
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1022,6 +1033,10 @@ struct PublicationIntent {
     local_sha: String,
     pr: Option<i64>,
     stage: String,
+    /// The immutable task target used only for a fresh initial delivery.
+    /// Absent on historical and continuation intents.
+    #[serde(default)]
+    target_branch: Option<String>,
     #[serde(default)]
     expected_remote_sha: Option<String>,
 }
@@ -1072,6 +1087,47 @@ async fn load_publication_state(
     let intent = publication_intent_from_refs(refs.as_deref());
     let supersede_source = parked_rework_publication_intent(refs.as_deref())?.is_some();
     Ok((intent, supersede_source))
+}
+
+/// Return the authoritative target for a new initial delivery. Task creation
+/// persists this field before the daemon can claim the task. Legacy tasks that
+/// predate that contract return `None` and retain the configured-base path.
+async fn initial_task_target_branch(
+    db_path: &Path,
+    task_id: i64,
+) -> std::result::Result<Option<String>, String> {
+    let path = db_path.to_path_buf();
+    let branch = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let conn = quorum_core::db::open(&path)?;
+        Ok(tasks::get(&conn, task_id)?.and_then(|task| task.target_branch))
+    })
+    .await
+    .map_err(|error| format!("initial target branch read join failure: {error}"))?
+    .map_err(|error| format!("initial target branch read failed: {error}"))?;
+    match branch {
+        Some(branch) => {
+            tasks::validate_target_branch(&branch).map_err(|error| {
+                format!("task #{task_id} has invalid authoritative target branch: {error}")
+            })?;
+            Ok(Some(branch))
+        }
+        None => Ok(None),
+    }
+}
+
+fn publication_base_branch(
+    intent: &PublicationIntent,
+    configured_base_branch: &str,
+) -> std::result::Result<String, String> {
+    match intent.target_branch.as_deref() {
+        Some(branch) => {
+            tasks::validate_target_branch(branch).map_err(|error| {
+                format!("publication intent has invalid initial target branch: {error}")
+            })?;
+            Ok(branch.to_string())
+        }
+        None => Ok(configured_base_branch.to_string()),
+    }
 }
 
 fn publication_intent_from_refs(refs: Option<&str>) -> Option<PublicationIntent> {
@@ -1323,6 +1379,11 @@ async fn publish_worker_completion(
     known_pr: Option<i64>,
 ) -> std::result::Result<PublishedCompletion, String> {
     let (prior, supersede_source) = load_publication_state(&config.db_path, task_id).await?;
+    let initial_target_branch = if prior.is_none() && known_pr.is_none() {
+        initial_task_target_branch(&config.db_path, task_id).await?
+    } else {
+        None
+    };
     if let Some(prior) = &prior {
         if prior.branch != branch {
             return Err(format!(
@@ -1401,6 +1462,7 @@ async fn publish_worker_completion(
         local_sha: local_sha.clone(),
         pr: known_pr,
         stage: "intent".into(),
+        target_branch: initial_target_branch,
         expected_remote_sha: expected_remote_sha.clone(),
     });
     if supersede_source {
@@ -1409,6 +1471,7 @@ async fn publish_worker_completion(
     }
     intent.pr = known_pr;
     intent.expected_remote_sha = expected_remote_sha;
+    let publication_base_branch = publication_base_branch(&intent, &config.base_branch)?;
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
     if let Some(pr) = known_pr {
@@ -1418,13 +1481,13 @@ async fn publish_worker_completion(
         // have failed) after recording the PR but before verifying its target.
         // Re-run the complete initial branch/SHA/base check. Treating this as
         // an established PR would otherwise push before validating its base.
-        if validate_pr_created_retry_target(&intent, &target, &config.base_branch)? {
+        if validate_pr_created_retry_target(&intent, &target, &publication_base_branch)? {
             intent.stage = "verified".into();
             persist_publication_intent(&config.db_path, task_id, &intent).await?;
             return Ok(published_completion(intent, pr));
         }
         let Some(expected_remote_sha) =
-            existing_pr_lease_baseline(&intent, &target, &config.base_branch)?
+            existing_pr_lease_baseline(&intent, &target, &publication_base_branch)?
         else {
             intent.stage = "verified".into();
             persist_publication_intent(&config.db_path, task_id, &intent).await?;
@@ -1436,7 +1499,7 @@ async fn publish_worker_completion(
                 &target.head_ref,
                 expected_remote_sha,
                 &intent.local_sha,
-                &config.base_branch,
+                &publication_base_branch,
             )
             .await?;
         intent.stage = "verified".into();
@@ -1457,7 +1520,7 @@ async fn publish_worker_completion(
             create_initial_pr(
                 &config.repo_dir,
                 &config.repo,
-                &config.base_branch,
+                &publication_base_branch,
                 branch,
                 task_id,
                 &format!("task {task_id}"),
@@ -1470,7 +1533,7 @@ async fn publish_worker_completion(
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
     let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
-    validate_initial_pr_target(&target, branch, &pushed_sha, &config.base_branch)?;
+    validate_initial_pr_target(&target, branch, &pushed_sha, &publication_base_branch)?;
     intent.stage = "verified".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
     Ok(published_completion(intent, pr))
@@ -14573,6 +14636,30 @@ async fn spawn_worker(
     } else {
         0
     };
+    // Only a brand-new implementation is based on the task's authoritative
+    // target. Continuations and rework retain their existing provisioning
+    // rules in this slice.
+    let initial_target_branch = if continue_target.is_none() && task.rework_round == 0 {
+        match task.target_branch.as_deref() {
+            Some(target) => match tasks::validate_target_branch(target) {
+                Ok(()) => Some(target),
+                Err(error) => {
+                    let reason =
+                        format!("initial worker has invalid authoritative target branch: {error}");
+                    persist_provisioning_failure(&db_path, task.id, &reason).await;
+                    park_task(&db_path, task.id, &reason, "open").await;
+                    guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
+                    return Ok(false);
+                }
+            },
+            // Legacy tasks predate authoritative targets. They retain the
+            // configured-base provisioning behavior, including recovery.
+            None => None,
+        }
+    } else {
+        None
+    };
+    let initial_base_branch = initial_target_branch.unwrap_or(&config.base_branch);
 
     // Branch keyed to task + original author, not current assignee — a rework
     // re-claim by a different agent continues the original branch instead of
@@ -14621,7 +14708,7 @@ async fn spawn_worker(
     // Persist immutable allocation provenance before git creates anything.
     // Ref resolution is external I/O and completes before the short DB write.
     if continue_target.is_none() {
-        let base_ref = format!("origin/{}", config.base_branch);
+        let base_ref = format!("origin/{initial_base_branch}");
         let resolved_provenance = match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
             Ok(sha) => sha,
             Err(error) => {
@@ -14696,7 +14783,7 @@ async fn spawn_worker(
                 worker_repo_dir,
                 &branch,
                 &wt_path,
-                &format!("origin/{}", config.base_branch),
+                &format!("origin/{initial_base_branch}"),
             )
             .await
             .map(|path| (path, None))
@@ -22126,6 +22213,37 @@ mod tests {
     }
 
     #[test]
+    fn initial_pr_arguments_use_the_exact_task_target() {
+        for target in ["main", "develop"] {
+            let args = initial_pr_args("owner/repo", target, "daemon/worker-t1", 1, "work");
+            let base = args
+                .windows(2)
+                .find(|pair| pair[0] == "--base")
+                .map(|pair| pair[1].as_str());
+            assert_eq!(base, Some(target));
+        }
+    }
+
+    #[test]
+    fn initial_publication_target_is_durable_and_fails_closed_when_invalid() {
+        let intent = PublicationIntent {
+            branch: "daemon/worker-t1".into(),
+            local_sha: "abc123".into(),
+            pr: None,
+            stage: "intent".into(),
+            target_branch: Some("develop".into()),
+            expected_remote_sha: None,
+        };
+        assert_eq!(publication_base_branch(&intent, "main").unwrap(), "develop");
+
+        let mut invalid = intent;
+        invalid.target_branch = Some("origin/main".into());
+        assert!(publication_base_branch(&invalid, "main")
+            .expect_err("invalid durable target must reject publication")
+            .contains("invalid initial target"));
+    }
+
+    #[test]
     fn initial_pr_reconciliation_reuses_one_and_rejects_ambiguous_matches() {
         assert_eq!(
             parse_initial_pr_list(br#"[{"number":482,"state":"OPEN"}]"#, "daemon/worker-t1")
@@ -22163,6 +22281,14 @@ mod tests {
         let error = validate_initial_pr_target(&target, "daemon/worker-t1", "abc123", "main")
             .expect_err("wrong baseRefName must fail initial PR reconciliation");
         assert!(error.contains("base"));
+
+        let mut missing_base = target;
+        missing_base.base_ref = None;
+        assert!(
+            validate_initial_pr_target(&missing_base, "daemon/worker-t1", "abc123", "main")
+                .expect_err("a created PR without a base must fail closed")
+                .contains("base")
+        );
     }
 
     #[test]
@@ -22322,6 +22448,7 @@ mod tests {
             local_sha: "abc123".into(),
             pr: Some(482),
             stage: "pr_created".into(),
+            target_branch: Some("main".into()),
             expected_remote_sha: None,
         };
         let wrong_base = PrTarget {
@@ -22351,6 +22478,7 @@ mod tests {
             local_sha: "source-a".into(),
             pr: Some(482),
             stage: "intent".into(),
+            target_branch: None,
             expected_remote_sha: Some("spawn-x".into()),
         };
         let mut target = PrTarget {
@@ -22453,6 +22581,7 @@ mod tests {
             local_sha: "local-sha".into(),
             pr: Some(pr),
             stage: "verified".into(),
+            target_branch: None,
             expected_remote_sha: intent_baseline.map(str::to_string),
         };
         let json = serde_json::to_string(&intent).unwrap();
@@ -23238,6 +23367,7 @@ mod tests {
             local_sha: "abc123".into(),
             pr: Some(482),
             stage: "intent".into(),
+            target_branch: None,
             expected_remote_sha: Some("baseline".into()),
         };
         for id in &ids {
@@ -23347,6 +23477,7 @@ mod tests {
                 local_sha: "abc123".into(),
                 pr,
                 stage: stage.into(),
+                target_branch: Some("develop".into()),
                 expected_remote_sha: None,
             };
             let conn = quorum_core::db::open(&db_path).unwrap();
@@ -23365,6 +23496,10 @@ mod tests {
                 serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
             assert_eq!(refs["daemon_publication"]["stage"], stage);
             assert_eq!(refs["daemon_publication"]["pr"].as_i64(), pr);
+            assert_eq!(
+                refs["daemon_publication"]["target_branch"], "develop",
+                "each restart window must retain the initial task target"
+            );
         }
 
         let established = PublicationIntent {
@@ -23372,6 +23507,7 @@ mod tests {
             local_sha: "source-a".into(),
             pr: Some(482),
             stage: "intent".into(),
+            target_branch: None,
             expected_remote_sha: Some("spawn-x".into()),
         };
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -23456,6 +23592,7 @@ mod tests {
             local_sha: "sha-a".into(),
             pr: Some(482),
             stage: "verified".into(),
+            target_branch: None,
             expected_remote_sha: Some("sha-x".into()),
         };
         let mut conn = quorum_core::db::open(&db_path).unwrap();
@@ -23506,6 +23643,7 @@ mod tests {
             local_sha: "sha-a".into(),
             pr: Some(482),
             stage: "verified".into(),
+            target_branch: None,
             expected_remote_sha: Some("sha-x".into()),
         };
         let mut conn = quorum_core::db::open(&db_path).unwrap();
@@ -23549,6 +23687,7 @@ mod tests {
             local_sha: "sha-a".into(),
             pr: Some(482),
             stage: "verified".into(),
+            target_branch: None,
             expected_remote_sha: Some("sha-x".into()),
         };
         let mut conn = quorum_core::db::open(&db_path).unwrap();
