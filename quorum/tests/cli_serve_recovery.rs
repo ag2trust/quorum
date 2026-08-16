@@ -1,10 +1,10 @@
 //! Recovery acceptance tests: after a daemon restart, in-review tasks must
 //! get reviewers provisioned (via Phase 5b) without re-executing the worker.
 //!
-//! Stateless recovery (2026-07-09 refactor) kills stale processes, wipes the
-//! journal, GCs worktrees, and resets non-terminal tasks. In-review tasks are
-//! left as-is — the normal tick loop's Phase 5b queries the DB for in-review
-//! tasks with a PR but no live worker/reviewer and provisions a reviewer.
+//! Generic recovery kills stale processes, wipes their journal rows, GCs their
+//! worktrees, and resets non-terminal tasks. Explicit dormant awaiting-review
+//! workers are reconstructed separately. Other in-review tasks are left as-is
+//! so Phase 5b can provision a reviewer without re-executing the worker.
 
 use std::env;
 use std::io::{BufRead, BufReader, Write};
@@ -696,10 +696,11 @@ fn in_review_journal_row_survives_shutdown() {
     );
 }
 
-/// Exit-75 (self-update) recovery: journal row survives, task stays in-review,
-/// Phase 5b provisions a reviewer — no duplicate worker execution.
+/// Reviewer pre-spawn crash recovery: a PID-less reviewer journal is stale,
+/// so startup removes it and provisions one replacement reviewer without
+/// re-executing the worker.
 #[test]
-fn exit75_in_review_recovered_without_worker_respawn() {
+fn pidless_reviewer_provision_recovers_without_worker_respawn() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -758,12 +759,12 @@ fn exit75_in_review_recovered_without_worker_respawn() {
 
         let entry = quorum_core::journal::JournalEntry {
             agent: "Agent0".into(),
-            role: "worker".into(),
+            role: "reviewer".into(),
             task_id: Some(id),
             session_id: "sess-exit75".into(),
             worktree: Some(fake_wt.to_string_lossy().into()),
             branch: Some("feat/test-exit75".into()),
-            phase: "awaiting-review".into(),
+            phase: "reviewing".into(),
             cost_tokens: 500,
             agent_state: None,
             cost_usd: 0.01,
@@ -771,6 +772,9 @@ fn exit75_in_review_recovered_without_worker_respawn() {
             pid: None,
             pr: Some(99),
             rework_count: 0,
+            provider: None,
+            continuation_id: None,
+            local_branch: None,
         };
         quorum_core::journal::upsert(&mut conn, &entry).unwrap();
     }
@@ -784,6 +788,16 @@ fn exit75_in_review_recovered_without_worker_respawn() {
         handle.lines
     );
     handle.wait_for_completed_tick(home.path());
+
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    assert!(
+        quorum_core::journal::list_in_flight(&conn)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.session_id != "sess-exit75"),
+        "the PID-less pre-spawn reviewer row must be removed before replacement provisioning"
+    );
+    drop(conn);
 
     // Task stays in-review.
     let conn = quorum_core::db::open(&db_path).unwrap();
@@ -1030,16 +1044,21 @@ fn make_journal_entry(
         agent_state: None,
         cost_usd: 0.01,
         log_dir: None,
+        // Provisioners persist this row before child launch and add the PID
+        // afterward. Recovery must accept and clean that crash window.
         pid: None,
         pr,
         rework_count: 0,
+        provider: None,
+        continuation_id: None,
+        local_branch: None,
     }
 }
 
-/// Stateless recovery: working task with journal entry → AgentFailed → open,
-/// journal wiped, worktree GC'd, Phase 6 re-spawns a fresh worker.
+/// Worker pre-spawn crash recovery: the PID-less journal is removed, the task
+/// returns to open, and Phase 6 spawns exactly one replacement worker.
 #[test]
-fn recovery_working_task_reset_to_open_and_respawned() {
+fn pidless_worker_provision_resets_to_open_and_respawns() {
     let env = TestEnv::new();
     let id = env.seed_claimed_task("Working task with worktree", "Agent0");
 
@@ -1405,14 +1424,18 @@ fn recovery_journal_phase_irrelevant_db_status_drives_reset() {
     let wt = env.wt_base.path().join("Agent0");
     std::fs::create_dir_all(&wt).unwrap();
 
-    env.seed_journal(&make_journal_entry(
+    let mut entry = make_journal_entry(
         "Agent0",
         "worker",
         "awaiting-review",
         Some(id),
         Some(&wt.to_string_lossy()),
         None,
-    ));
+    );
+    // A PID-backed awaiting-review row predates the dormant handoff and is
+    // therefore ordinary stale state rather than an explicit dormant row.
+    entry.pid = Some(999_999);
+    env.seed_journal(&entry);
 
     let mut handle = env.start_serve();
 

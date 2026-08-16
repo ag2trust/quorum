@@ -2656,6 +2656,9 @@ fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry
         pid: slot.pid(),
         pr: slot.pr,
         rework_count: slot.rework_count as i32,
+        provider: Some(slot.process_kind().to_string()),
+        continuation_id: slot.continuation_id_for_launch().map(str::to_string),
+        local_branch: Some(slot.branch.clone()),
     }
 }
 
@@ -3159,7 +3162,7 @@ fn worker_done_event(rework_count: u32, pr: i64) -> Event {
 /// Start another turn on a live worker after the daemon has moved its task to
 /// rework.  The PR belongs to the daemon for the lifetime of this worker: a
 /// rework turn must retain it both in memory and in the crash-recovery journal.
-async fn begin_sticky_worker_rework(slot: &mut SlotState, db_path: &Path) {
+async fn begin_sticky_worker_rework(slot: &mut SlotState, db_path: &Path) -> Result<()> {
     debug_assert!(
         slot.pr.is_some(),
         "a sticky rework worker must retain its daemon-owned PR"
@@ -3172,14 +3175,43 @@ async fn begin_sticky_worker_rework(slot: &mut SlotState, db_path: &Path) {
     if let Some(ref mut session_log) = slot.session_log {
         session_log.log_rework(slot.rework_count);
     }
-    let p = db_path.to_path_buf();
-    let entry = slot_journal_entry(slot, "worker", "working");
+    // Respawn-per-turn workers cross the durable journal boundary inside
+    // `feed_worker_turn`, while the launched child is still locally owned and
+    // can be synchronously reaped on failure. Persistent-child workers retain
+    // the established post-feed journal update, but its result is no longer
+    // discarded.
+    if slot.process_kind().turn_mode() != runner::TurnMode::RespawnPerTurn {
+        persist_worker_journal(db_path, slot_journal_entry(slot, "worker", "working")).await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DurableWorkerJournalHandoffError(String);
+
+impl std::fmt::Display for DurableWorkerJournalHandoffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DurableWorkerJournalHandoffError {}
+
+fn durable_worker_journal_handoff_failed(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<DurableWorkerJournalHandoffError>())
+        .is_some()
+}
+
+async fn persist_worker_journal(db_path: &Path, entry: JournalEntry) -> Result<()> {
+    let path = db_path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = quorum_core::db::open(&p)?;
+        let mut conn = quorum_core::db::open(&path)?;
         journal::upsert(&mut conn, &entry)
     })
     .await
-    .ok();
+    .map_err(|error| QuorumError::Io(format!("worker journal handoff join failed: {error}")))?
 }
 
 /// Resolve a worker's publication target without granting the worker any PR
@@ -3460,6 +3492,17 @@ async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<LateRevi
             Some("changes") => tasks::LateReviewerVerdict::Changes,
             _ => continue,
         };
+        let remediation_feedback =
+            (verdict == tasks::LateReviewerVerdict::Changes).then(|| {
+                match (&gated.demotion_reason, &row.feedback) {
+                    (Some(reason), Some(feedback)) => {
+                        format!("{reason}\n\nReviewer feedback:\n{feedback}")
+                    }
+                    (Some(reason), None) => reason.clone(),
+                    (None, Some(feedback)) => feedback.clone(),
+                    (None, None) => "Changes requested.".to_string(),
+                }
+            });
         // A changed PR invalidates an approval, not a changes verdict. Changes
         // must still enter durable rework before stateless recovery discards
         // the reviewer journal identity; no approval is being stamped.
@@ -3522,6 +3565,7 @@ async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<LateRevi
                 verdict,
                 gated.blocking_count.unwrap_or(0) as i64,
                 &reviewed_sha,
+                remediation_feedback.as_deref(),
                 now_unix(),
             )
         })
@@ -4510,6 +4554,9 @@ async fn journal_decomposition_process(
         pid,
         pr: None,
         rework_count: 0,
+        provider: None,
+        continuation_id: None,
+        local_branch: None,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
@@ -5915,7 +5962,15 @@ async fn handle_pre_review_checks_failure(
                         }
                     } else {
                         let worker = &mut workers[worker_index];
-                        begin_sticky_worker_rework(worker, &config.db_path).await;
+                        if let Err(error) =
+                            begin_sticky_worker_rework(worker, &config.db_path).await
+                        {
+                            log(&format!(
+                                "FATAL: worker {} rework journal handoff failed: {error}",
+                                worker.agent_name
+                            ));
+                            return;
+                        }
                         log(&format!(
                             "worker {} rework #{} (pre-review CI failure)",
                             worker.agent_name, worker.rework_count
@@ -6468,11 +6523,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         // A frozen restart must first terminate stale managed processes and
         // empty the journal. Late completion and approval/network recovery are
         // deliberately deferred to later ticks after planning releases authority.
-        if let Err(e) = recovery::recover(config, &wt_mgr).await {
-            log(&format!(
-                "frozen decomposition recovery failed: {e} — starting fresh"
-            ));
-        }
+        recovery::recover(
+            config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut lifetime_roster,
+        )
+        .await?;
     }
 
     // Fold outcomes that were committed by a managed process just before the
@@ -6512,12 +6570,18 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
 
     reconcile_merged_continuations(&config.db_path, MergedContinuationTrigger::Startup).await?;
 
-    // M7: stateless crash recovery — kill stale processes, wipe journal,
-    // GC worktrees, and reset non-terminal tasks for the tick loop to handle.
+    // Crash recovery: reconstruct validated dormant workers, kill stale
+    // processes, wipe the remaining journal rows, GC orphaned worktrees, and
+    // reset non-terminal tasks for the tick loop to handle.
     if !recovered_frozen_decomposition {
-        if let Err(e) = recovery::recover(config, &wt_mgr).await {
-            log(&format!("recovery failed: {e} — starting fresh"));
-        }
+        recovery::recover(
+            config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut lifetime_roster,
+        )
+        .await?;
     }
     match reconcile_publication_source_refs(config, &wt_mgr, publication_ref_reconcile_cursor).await
     {
@@ -6528,6 +6592,30 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         Err(e) => log(&format!(
             "publication ref startup reconciliation failed: {e} — continuing"
         )),
+    }
+
+    // Recovered sticky rework is existing in-flight authority, not a new
+    // implementation start. Resume it exactly once during startup even when
+    // a decomposition freeze is draining: the freeze waits for this worker,
+    // its journal row, and its started task to settle. Deferring the resume to
+    // ordinary ticks would deadlock those two authorities against each other.
+    //
+    // This boundary is also intentionally outside the tick loop's retry
+    // policy. A failed durable disposition (including post-timeout BUSY) is an
+    // abnormal startup failure and must exit 3 instead of repeating baseline
+    // and provider subprocesses while starving mailbox processing.
+    if let Err(error) =
+        resume_recovered_dormant_reworks(config, &wt_mgr, &mut name_pool, &mut workers).await
+    {
+        log(&format!(
+            "FATAL: recovered dormant rework startup failed: {error}"
+        ));
+        for worker in workers.drain(..) {
+            let agent_name = worker.agent_name.clone();
+            let _terminal_output = worker.kill_and_reap().await;
+            name_pool.release(&agent_name);
+        }
+        return Err(error);
     }
 
     // #127/#157: report dead-lettered interpret jobs at startup. Historical
@@ -7793,22 +7881,23 @@ async fn tick(
                             log(&format!(
                                 "PR #{pr_num} is CONFLICTING — firing MergeConflict"
                             ));
-                            let mc = fire_event(
+                            let rework_msg = format!(
+                                "PR #{pr_num} has conflicts with {} \
+                                 (a sibling PR likely merged first).\n\n\
+                                 Preserve the published PR head, merge {} into the PR branch, \
+                                 resolve conflicts, commit, and submit without pushing. Never rebase.",
+                                config.base_branch, config.base_branch
+                            );
+                            let mc = fire_actionable_rework_event(
                                 &db_path,
                                 "system",
                                 reviewer_task_id,
                                 &Event::MergeConflict,
+                                &rework_msg,
                             )
                             .await;
                             match mc {
                                 Some(ref tr) if tr.task.status == "rework" => {
-                                    let rework_msg = format!(
-                                        "PR #{pr_num} has conflicts with {} \
-                                     (a sibling PR likely merged first).\n\n\
-                                     Preserve the published PR head, merge {} into the PR branch, \
-                                     resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                        config.base_branch, config.base_branch
-                                    );
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
@@ -7879,7 +7968,7 @@ async fn tick(
                                                 }
                                             } else {
                                                 let w = &mut workers[wi];
-                                                begin_sticky_worker_rework(w, &db_path).await;
+                                                begin_sticky_worker_rework(w, &db_path).await?;
                                                 log(&format!(
                                                     "worker {} rework #{} (pre-merge conflict)",
                                                     w.agent_name, w.rework_count
@@ -8086,19 +8175,20 @@ async fn tick(
                             .await;
                             // in-review → rework (lifecycle checks rework cap)
                             let reviewer_name = reviewers[ri].agent_name.clone();
-                            let vc = fire_event(
+                            let rework_msg = format!(
+                                "CI checks failed for PR #{pr_num}: {names}\n\n\
+                                 Fix the failing checks, commit, and submit again without pushing.",
+                            );
+                            let vc = fire_actionable_rework_event(
                                 &db_path,
                                 &reviewer_name,
                                 reviewer_task_id,
                                 &Event::VerdictChanges,
+                                &rework_msg,
                             )
                             .await;
                             match vc {
                                 Some(ref tr) if tr.task.status == "rework" => {
-                                    let rework_msg = format!(
-                                        "CI checks failed for PR #{pr_num}: {names}\n\n\
-                                         Fix the failing checks, commit, and submit again without pushing.",
-                                    );
                                     // Reviewer stays alive (sticky-agent).
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
@@ -8170,7 +8260,7 @@ async fn tick(
                                                 }
                                             } else {
                                                 let w = &mut workers[wi];
-                                                begin_sticky_worker_rework(w, &db_path).await;
+                                                begin_sticky_worker_rework(w, &db_path).await?;
                                                 log(&format!(
                                                     "worker {} rework #{} (checks failure)",
                                                     w.agent_name, w.rework_count
@@ -8303,22 +8393,23 @@ async fn tick(
                                     "PR #{pr_num} became CONFLICTING during checks \
                                      wait — firing MergeConflict"
                                 ));
-                                let mc = fire_event(
+                                let rework_msg = format!(
+                                    "PR #{pr_num} has conflicts with {} \
+                                     (detected after checks timeout).\n\n\
+                                     Preserve the published PR head, merge {} into the PR branch, \
+                                     resolve conflicts, commit, and submit without pushing. Never rebase.",
+                                    config.base_branch, config.base_branch
+                                );
+                                let mc = fire_actionable_rework_event(
                                     &db_path,
                                     "system",
                                     reviewer_task_id,
                                     &Event::MergeConflict,
+                                    &rework_msg,
                                 )
                                 .await;
                                 match mc {
                                     Some(ref tr) if tr.task.status == "rework" => {
-                                        let rework_msg = format!(
-                                            "PR #{pr_num} has conflicts with {} \
-                                             (detected after checks timeout).\n\n\
-                                             Preserve the published PR head, merge {} into the PR branch, \
-                                             resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                            config.base_branch, config.base_branch
-                                        );
                                         if let Some(wi) = workers
                                             .iter()
                                             .position(|w| w.task_id == reviewer_task_id)
@@ -8391,7 +8482,7 @@ async fn tick(
                                                     }
                                                 } else {
                                                     let w = &mut workers[wi];
-                                                    begin_sticky_worker_rework(w, &db_path).await;
+                                                    begin_sticky_worker_rework(w, &db_path).await?;
                                                     log(&format!(
                                                         "worker {} rework #{} \
                                                      (timeout + conflict)",
@@ -8654,22 +8745,23 @@ async fn tick(
                                 "PR #{pr_num} is CONFLICTING at merge time \
                                  — firing MergeConflict"
                             ));
-                            let mc = fire_event(
+                            let rework_msg = format!(
+                                "PR #{pr_num} has conflicts with {} \
+                                 (detected at merge time).\n\n\
+                                 Preserve the published PR head, merge {} into the PR branch, \
+                                 resolve conflicts, commit, and submit without pushing. Never rebase.",
+                                config.base_branch, config.base_branch
+                            );
+                            let mc = fire_actionable_rework_event(
                                 &db_path,
                                 "system",
                                 reviewer_task_id,
                                 &Event::MergeConflict,
+                                &rework_msg,
                             )
                             .await;
                             match mc {
                                 Some(ref tr) if tr.task.status == "rework" => {
-                                    let rework_msg = format!(
-                                        "PR #{pr_num} has conflicts with {} \
-                                         (detected at merge time).\n\n\
-                                         Preserve the published PR head, merge {} into the PR branch, \
-                                         resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                        config.base_branch, config.base_branch
-                                    );
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
@@ -8741,7 +8833,7 @@ async fn tick(
                                                 }
                                             } else {
                                                 let w = &mut workers[wi];
-                                                begin_sticky_worker_rework(w, &db_path).await;
+                                                begin_sticky_worker_rework(w, &db_path).await?;
                                                 log(&format!(
                                                     "worker {} rework #{} \
                                                  (pre-merge conflict recheck)",
@@ -9049,21 +9141,22 @@ async fn tick(
                                 } else {
                                     // in-review → rework
                                     let reviewer_name = reviewers[ri].agent_name.clone();
-                                    let vc = fire_event(
+                                    let rework_msg = format!(
+                                        "Merge of PR #{pr_num} failed: {}\n\n\
+                                         Preserve the published PR head, merge {} into the PR branch, \
+                                         resolve conflicts, commit, and submit without pushing. Never rebase.",
+                                        merge_result.message, config.base_branch
+                                    );
+                                    let vc = fire_actionable_rework_event(
                                         &db_path,
                                         &reviewer_name,
                                         reviewer_task_id,
                                         &Event::VerdictChanges,
+                                        &rework_msg,
                                     )
                                     .await;
                                     match vc {
                                         Some(ref tr) if tr.task.status == "rework" => {
-                                            let rework_msg = format!(
-                                                "Merge of PR #{pr_num} failed: {}\n\n\
-                                             Preserve the published PR head, merge {} into the PR branch, \
-                                             resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                                merge_result.message, config.base_branch
-                                            );
                                             // Reviewer stays alive (sticky-agent).
                                             if let Some(wi) = workers
                                                 .iter()
@@ -9139,7 +9232,7 @@ async fn tick(
                                                     } else {
                                                         let w = &mut workers[wi];
                                                         begin_sticky_worker_rework(w, &db_path)
-                                                            .await;
+                                                            .await?;
                                                         log(&format!(
                                                             "worker {} rework #{} (merge failure)",
                                                             w.agent_name, w.rework_count
@@ -9331,11 +9424,12 @@ async fn tick(
 
                     // Fire VerdictChanges lifecycle event (lifecycle enforces rework cap).
                     let reviewer_name = reviewers[ri].agent_name.clone();
-                    let vc = fire_event(
+                    let vc = fire_actionable_rework_event(
                         &db_path,
                         &reviewer_name,
                         reviewer_task_id,
                         &Event::VerdictChanges,
+                        feedback,
                     )
                     .await;
                     match vc {
@@ -9411,7 +9505,7 @@ async fn tick(
                                         }
                                     } else {
                                         let w = &mut workers[wi];
-                                        begin_sticky_worker_rework(w, &db_path).await;
+                                        begin_sticky_worker_rework(w, &db_path).await?;
                                         log(&format!(
                                             "worker {} rework #{} started",
                                             w.agent_name, w.rework_count
@@ -11792,7 +11886,8 @@ async fn feed_worker_turn(
     config: &ServeConfig,
 ) -> std::io::Result<()> {
     if slot.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
-        if should_replace_pending_prompt(raw_prompt) {
+        let recovered_startup = slot.pending_turn_kind == "recovered-rework";
+        if !recovered_startup && should_replace_pending_prompt(raw_prompt) {
             slot.pending_prompt = raw_prompt.to_string();
             slot.pending_turn_kind = if slot.pr.is_some() {
                 "rework".into()
@@ -11858,6 +11953,37 @@ async fn feed_worker_turn(
             slot.cap_run_id = Some(authority.cap_run_id);
             slot.live_stats = LiveStats::new();
             slot.turn_ended_at = None;
+        }
+
+        // A launched turn is not recoverably installed until its exact PID is
+        // in the journal. Keep ownership of the child until this write
+        // succeeds so a BUSY/IO/join failure can synchronously kill and reap
+        // it while the prior PID-less dormant row remains authoritative. A
+        // recovered startup turn uses an intermediate phase: if a later slot
+        // fails, restart can reconstruct this exact pending turn instead of
+        // treating it as generic stale `working` state.
+        let mut entry = slot_journal_entry(
+            slot,
+            "worker",
+            if recovered_startup {
+                "resuming-rework"
+            } else {
+                "working"
+            },
+        );
+        entry.pid = new_proc.pid();
+        if !recovered_startup && slot.pr.is_some() {
+            entry.rework_count = entry.rework_count.saturating_add(1);
+        }
+        if let Err(error) = persist_worker_journal(&config.db_path, entry).await {
+            let launched_pid = new_proc.pid();
+            let _terminal_output = new_proc.kill_and_reap().await;
+            return Err(std::io::Error::other(DurableWorkerJournalHandoffError(
+                format!(
+                    "{error}; launched pid {} was killed and reaped",
+                    launched_pid.unwrap_or_default()
+                ),
+            )));
         }
 
         if let Some(old) = slot.replace_with_launched_turn(new_proc)? {
@@ -12191,12 +12317,49 @@ async fn handle_dormant_worker_feed_failure(
     worker_index: usize,
     error: &std::io::Error,
 ) -> bool {
+    match settle_dormant_worker_feed_failure(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        worker_index,
+        error,
+    )
+    .await
+    {
+        Ok(DormantWorkerFeedFailureDisposition::LiveProcess) => false,
+        Ok(DormantWorkerFeedFailureDisposition::Settled)
+        | Ok(DormantWorkerFeedFailureDisposition::Retained)
+        | Err(_) => true,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DormantWorkerFeedFailureDisposition {
+    LiveProcess,
+    Settled,
+    Retained,
+}
+
+/// Classify and settle a failed dormant turn. Unlike the compatibility wrapper
+/// above, this returns durable-classification errors so startup recovery can
+/// fail the tick instead of repeatedly selecting an unchanged slot.
+async fn settle_dormant_worker_feed_failure(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    worker_index: usize,
+    error: &std::io::Error,
+) -> Result<DormantWorkerFeedFailureDisposition> {
     let (provider, continuation_id) = match &workers[worker_index].proc {
         SlotProcess::Dormant {
             kind,
             continuation_id,
         } => (kind.to_string(), continuation_id.clone()),
-        SlotProcess::Running(_) => return false,
+        SlotProcess::Running(_) => {
+            return Ok(DormantWorkerFeedFailureDisposition::LiveProcess);
+        }
     };
     let pending = PendingTurn {
         provider,
@@ -12222,6 +12385,7 @@ async fn handle_dormant_worker_feed_failure(
             )
             .await;
             cleanup_slot(config, wt_mgr, name_pool, worker, None, "provider_blocked").await;
+            Ok(DormantWorkerFeedFailureDisposition::Settled)
         }
         Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
             let worker = workers.remove(worker_index);
@@ -12241,20 +12405,22 @@ async fn handle_dormant_worker_feed_failure(
                 "ownership_transferred",
             )
             .await;
+            Ok(DormantWorkerFeedFailureDisposition::Settled)
         }
         Ok(tasks::DeadTurnRunnerDisposition::DonePending)
         | Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
             log(&format!(
                 "dormant worker {agent} feed failure raced a durable delivery for task #{task_id}; retaining slot"
             ));
+            Ok(DormantWorkerFeedFailureDisposition::Retained)
         }
         Err(classification_error) => {
             log(&format!(
                 "FATAL: dormant worker {agent} feed failed for task #{task_id} and exact turn could not be parked: {classification_error}; retaining slot"
             ));
+            Err(classification_error)
         }
     }
-    true
 }
 
 fn should_replace_pending_prompt(prompt: &str) -> bool {
@@ -13688,6 +13854,9 @@ async fn provision_reviewer_reserved(
         pid: None,
         pr: Some(pr),
         rework_count: 0,
+        provider: Some(reviewer_kind.to_string()),
+        continuation_id: reviewer_continuation_id.clone(),
+        local_branch: Some(branch.clone()),
     };
     let journal_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -13878,6 +14047,9 @@ async fn provision_reviewer_reserved(
                     pid: spawn_pid,
                     pr: Some(pr),
                     rework_count: 0,
+                    provider: Some(reviewer_kind.to_string()),
+                    continuation_id: reviewer_continuation_id.clone(),
+                    local_branch: Some(branch.clone()),
                 };
                 let pid_journal = tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -14621,6 +14793,9 @@ async fn spawn_worker(
         pid: None,
         pr: continuation_pr,
         rework_count: continuation_rework_count,
+        provider: None,
+        continuation_id: None,
+        local_branch: Some(branch.clone()),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -14796,6 +14971,11 @@ async fn spawn_worker(
                     pid: spawn_pid,
                     pr: continuation_pr,
                     rework_count: continuation_rework_count,
+                    provider: Some(resolved_kind.to_string()),
+                    continuation_id: retry_turn
+                        .as_ref()
+                        .and_then(|retry| retry.continuation_id.clone()),
+                    local_branch: Some(branch.clone()),
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -14977,7 +15157,7 @@ async fn fire_event_result(
     task_id: i64,
     event: &Event,
 ) -> std::result::Result<tasks::TransitionResult, String> {
-    fire_event_result_inner(db_path, agent, task_id, event, None).await
+    fire_event_result_inner(db_path, agent, task_id, event, None, None).await
 }
 
 async fn fire_published_event_result(
@@ -14987,7 +15167,15 @@ async fn fire_published_event_result(
     event: &Event,
     publication: &PublishedCompletion,
 ) -> std::result::Result<tasks::TransitionResult, String> {
-    fire_event_result_inner(db_path, agent, task_id, event, Some(publication.clone())).await
+    fire_event_result_inner(
+        db_path,
+        agent,
+        task_id,
+        event,
+        Some(publication.clone()),
+        None,
+    )
+    .await
 }
 
 async fn fire_event_result_inner(
@@ -14996,6 +15184,7 @@ async fn fire_event_result_inner(
     task_id: i64,
     event: &Event,
     publication: Option<PublishedCompletion>,
+    remediation_feedback: Option<String>,
 ) -> std::result::Result<tasks::TransitionResult, String> {
     let p = db_path.to_path_buf();
     let a = agent.to_string();
@@ -15006,6 +15195,8 @@ async fn fire_event_result_inner(
         let now = now_unix();
         if let Some(publication) = publication {
             tasks::apply_published_worker_event(&mut conn, &a, task_id, &ev, &publication, now)
+        } else if let Some(feedback) = remediation_feedback {
+            tasks::apply_actionable_rework_event(&mut conn, &a, task_id, &ev, &feedback, now)
         } else {
             tasks::apply_event(&mut conn, &a, task_id, &ev, now)
         }
@@ -15051,6 +15242,25 @@ async fn fire_event(
     event: &Event,
 ) -> Option<tasks::TransitionResult> {
     fire_event_result(db_path, agent, task_id, event).await.ok()
+}
+
+async fn fire_actionable_rework_event(
+    db_path: &std::path::Path,
+    agent: &str,
+    task_id: i64,
+    event: &Event,
+    feedback: &str,
+) -> Option<tasks::TransitionResult> {
+    fire_event_result_inner(
+        db_path,
+        agent,
+        task_id,
+        event,
+        None,
+        Some(feedback.to_string()),
+    )
+    .await
+    .ok()
 }
 
 /// Atomically fail a reviewer only if it still owns `in-review`.
@@ -15888,11 +16098,21 @@ async fn install_sticky_remediation_lease_and_baseline(
     if !install_live_worker_remediation_lease(config, agent.clone(), task_id, pr, feedback).await {
         return false;
     }
+    bind_claimed_sticky_remediation_baseline(config, &agent, task_id, pr, feedback).await
+}
+
+async fn bind_claimed_sticky_remediation_baseline(
+    config: &ServeConfig,
+    agent: &str,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) -> bool {
     if pr <= 0 {
         log(&format!(
             "sticky remediation: task #{task_id} has no PR to bind — releasing lease and parking"
         ));
-        release_sticky_remediation_lease(&config.db_path, &agent, task_id).await;
+        release_sticky_remediation_lease(&config.db_path, agent, task_id).await;
         let cause = classified_provisioning_cause(
             "sticky remediation baseline binding failed: no PR identity",
         );
@@ -15904,7 +16124,7 @@ async fn install_sticky_remediation_lease_and_baseline(
             "sticky remediation: baseline bind failed for task #{task_id} PR #{pr}: {error} \
              — releasing lease and parking"
         ));
-        release_sticky_remediation_lease(&config.db_path, &agent, task_id).await;
+        release_sticky_remediation_lease(&config.db_path, agent, task_id).await;
         let cause = classified_provisioning_cause(&format!(
             "sticky remediation baseline binding failed: {error}"
         ));
@@ -15912,6 +16132,163 @@ async fn install_sticky_remediation_lease_and_baseline(
         return false;
     }
     true
+}
+
+/// Commit every recovered startup launch as ordinary live work in one write
+/// transaction. Until this succeeds, each child remains journaled as
+/// `resuming-rework`, which recovery treats as an interrupted exact handoff.
+/// Atomic promotion prevents a later slot's DB failure from stranding an
+/// earlier slot as generic stale `working` state.
+async fn promote_recovered_rework_journals(db_path: &Path, workers: &[SlotState]) -> Result<()> {
+    let staged = workers
+        .iter()
+        .filter(|worker| {
+            worker.pending_turn_kind == "recovered-rework"
+                && matches!(worker.proc, SlotProcess::Running(_))
+        })
+        .map(|worker| {
+            (
+                worker.agent_name.clone(),
+                worker.task_id,
+                worker.pid(),
+                worker.pr,
+            )
+        })
+        .collect::<Vec<_>>();
+    if staged.is_empty() {
+        return Ok(());
+    }
+    let path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let now = now_unix();
+        for (agent, task_id, pid, pr) in staged {
+            let changed = tx.execute(
+                "UPDATE journal
+                    SET phase='working',rework_count=rework_count+1,updated_at=?5
+                  WHERE agent=?1 AND role='worker' AND task_id=?2
+                    AND phase='resuming-rework' AND pid=?3 AND pr=?4",
+                rusqlite::params![agent, task_id, pid, pr, now],
+            )?;
+            if changed != 1 {
+                return Err(QuorumError::Io(format!(
+                    "recovered worker {agent} lost its staged journal binding for task #{task_id}"
+                )));
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "recovered rework journal promotion join failed: {error}"
+        ))
+    })?
+}
+
+/// Finish a sticky dormant-worker handoff that was interrupted after the
+/// lifecycle entered rework. Generic recovery has already revalidated the
+/// exact continuation/worktree/run identity and re-installed any missing
+/// lease; bind the current daemon-owned PR baseline before launching that
+/// preserved continuation.
+async fn resume_recovered_dormant_reworks(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+) -> Result<()> {
+    // A delivery can race the failed launch, in which case disposition must
+    // retain the dormant slot for the mailbox phase later in this tick. Work
+    // from an attempted-identity set so that retained slot is attempted at
+    // most once instead of being immediately rediscovered forever.
+    let mut attempted = HashSet::new();
+    while let Some(worker_index) = next_recovered_dormant_rework(workers, &attempted) {
+        let task_id = workers[worker_index].task_id;
+        let agent = workers[worker_index].agent_name.clone();
+        attempted.insert((task_id, agent.clone()));
+        let pr = workers[worker_index].pr.unwrap_or_default();
+        let feedback = workers[worker_index].pending_prompt.clone();
+        if !bind_claimed_sticky_remediation_baseline(config, &agent, task_id, pr, &feedback).await {
+            let worker = workers.remove(worker_index);
+            cleanup_slot(
+                config,
+                wt_mgr,
+                name_pool,
+                worker,
+                None,
+                "remediation_lease_unavailable",
+            )
+            .await;
+            continue;
+        }
+
+        let prompt = reviewer::build_rework_prompt(
+            &agent,
+            task_id,
+            pr,
+            &feedback,
+            workers[worker_index].cost_usd,
+            config.limits.max_task_cost_usd,
+        );
+        if let Err(error) = feed_worker_turn(&mut workers[worker_index], &prompt, config).await {
+            log(&format!(
+                "recovered sticky remediation feed failed for task #{task_id}: {error}"
+            ));
+            if durable_worker_journal_handoff_failed(&error) {
+                return Err(QuorumError::Io(format!(
+                    "recovered worker {agent} post-launch journal handoff failed for task #{task_id}: {error}"
+                )));
+            }
+            if settle_dormant_worker_feed_failure(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                worker_index,
+                &error,
+            )
+            .await?
+                == DormantWorkerFeedFailureDisposition::LiveProcess
+            {
+                let worker = workers.remove(worker_index);
+                fire_event(
+                    &config.db_path,
+                    &worker.agent_name,
+                    worker.task_id,
+                    &Event::AgentFailed {
+                        reason: format!("recovered rework feed failed: {error}"),
+                    },
+                )
+                .await;
+                cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+            }
+        }
+    }
+    promote_recovered_rework_journals(&config.db_path, workers).await?;
+    for worker in workers.iter_mut().filter(|worker| {
+        worker.pending_turn_kind == "recovered-rework"
+            && matches!(worker.proc, SlotProcess::Running(_))
+    }) {
+        begin_sticky_worker_rework(worker, &config.db_path).await?;
+        log(&format!(
+            "worker {} resumed recovered rework #{} for task #{}",
+            worker.agent_name, worker.rework_count, worker.task_id
+        ));
+    }
+    Ok(())
+}
+
+fn next_recovered_dormant_rework(
+    workers: &[SlotState],
+    attempted: &HashSet<(i64, String)>,
+) -> Option<usize> {
+    workers.iter().position(|worker| {
+        worker.pending_turn_kind == "recovered-rework"
+            && matches!(worker.proc, SlotProcess::Dormant { .. })
+            && !attempted.contains(&(worker.task_id, worker.agent_name.clone()))
+    })
 }
 
 async fn release_sticky_remediation_lease(db_path: &Path, agent: &str, task_id: i64) {
@@ -16439,6 +16816,9 @@ async fn spawn_remediation_worker(
             pid: None,
             pr: Some(pr),
             rework_count: 0,
+            provider: None,
+            continuation_id: None,
+            local_branch: Some(branch.clone()),
         };
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&p)?;
@@ -17662,7 +18042,9 @@ mod tests {
         let mut worker = make_live_pre_review_ci_slot(414, dir.path().to_path_buf()).await;
         worker.pr = Some(571);
 
-        begin_sticky_worker_rework(&mut worker, &db_path).await;
+        begin_sticky_worker_rework(&mut worker, &db_path)
+            .await
+            .unwrap();
 
         assert!(worker.draining);
         assert_eq!(worker.pr, Some(571));
@@ -19222,8 +19604,11 @@ mod tests {
                 role: "worker".into(),
                 task_id: Some(task_id),
                 session_id: "logical-session".into(),
+                provider: Some("codex".into()),
+                continuation_id: persisted_continuation.map(str::to_owned),
                 worktree: Some(worktree.to_string_lossy().into_owned()),
                 branch: Some("daemon/dormant-t1".into()),
+                local_branch: Some("daemon/dormant-t1".into()),
                 phase: "awaiting-review".into(),
                 cost_tokens: 17,
                 agent_state: None,
@@ -19352,7 +19737,9 @@ mod tests {
         feed_worker_turn(&mut slot, prompt, &config)
             .await
             .expect("exact dormant continuation resumes");
-        begin_sticky_worker_rework(&mut slot, &db_path).await;
+        begin_sticky_worker_rework(&mut slot, &db_path)
+            .await
+            .unwrap();
 
         for _ in 0..1000 {
             if args_path.exists() && env_path.exists() && cwd_path.exists() {
@@ -19598,6 +19985,125 @@ mod tests {
         assert_eq!(requested.continuation_id.as_deref(), Some("thread-exact"));
     }
 
+    #[tokio::test]
+    async fn retained_recovered_rework_is_not_rediscovered_in_the_same_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retained-recovered-rework.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (mut slot, _old_run_id, _old_capability) =
+            dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
+        slot.pending_prompt = "exact recovered feedback".into();
+        slot.pending_turn_kind = "recovered-rework".into();
+        let config = dormant_codex_test_config(db_path.clone(), worktree, None);
+        assert!(
+            install_live_worker_remediation_lease(
+                &config,
+                slot.agent_name.clone(),
+                slot.task_id,
+                443,
+                "exact recovered feedback",
+            )
+            .await
+        );
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: slot.agent_name.clone(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(slot.task_id),
+                    pr: Some(443),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let mut workers = vec![slot];
+        let mut attempted = HashSet::new();
+        let worker_index = next_recovered_dormant_rework(&workers, &attempted)
+            .expect("recovered slot must be attempted once");
+        attempted.insert((
+            workers[worker_index].task_id,
+            workers[worker_index].agent_name.clone(),
+        ));
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Dormant").unwrap();
+        let disposition = settle_dormant_worker_feed_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            worker_index,
+            &std::io::Error::other("provider launch failed"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(disposition, DormantWorkerFeedFailureDisposition::Retained);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].pending_turn_kind, "recovered-rework");
+        assert!(
+            next_recovered_dormant_rework(&workers, &attempted).is_none(),
+            "the retained slot must not be selected again before mailbox processing"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(
+            mailbox::has_unconsumed(
+                &conn,
+                "Dormant",
+                mailbox::MailboxKind::Done,
+                workers[0].task_id,
+            )
+            .unwrap(),
+            "the later mailbox phase must retain authority over the delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_rework_disposition_error_is_propagated() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture_db = dir.path().join("fixture.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (mut slot, _old_run_id, _old_capability) = dormant_codex_rework_fixture(
+            &fixture_db,
+            &worktree,
+            Some("thread-exact"),
+            "thread-exact",
+        );
+        slot.pending_prompt = "exact recovered feedback".into();
+        slot.pending_turn_kind = "recovered-rework".into();
+        let unavailable_db = dir.path().join("missing-parent").join("classification.db");
+        let config = dormant_codex_test_config(unavailable_db, worktree, None);
+        let mut workers = vec![slot];
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Dormant").unwrap();
+
+        let error = settle_dormant_worker_feed_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            &std::io::Error::other("provider launch failed"),
+        )
+        .await
+        .expect_err("durable disposition failure must abort recovered startup");
+
+        assert!(error.to_string().contains("open database"), "{error}");
+        assert_eq!(workers.len(), 1, "failed classification retains the slot");
+        assert_eq!(workers[0].pending_turn_kind, "recovered-rework");
+    }
+
     #[test]
     fn dormant_slot_rejects_missing_continuation() {
         let Err(error) = SlotProcess::dormant(runner::AgentKind::Codex, None) else {
@@ -19674,6 +20180,12 @@ mod tests {
         assert_eq!(entries[0].phase, "awaiting-review");
         assert_eq!(entries[0].task_id, Some(4242));
         assert_eq!(entries[0].pr, Some(999));
+        assert_eq!(entries[0].provider.as_deref(), Some("codex"));
+        assert_eq!(
+            entries[0].continuation_id.as_deref(),
+            Some("provider-thread-777")
+        );
+        assert_eq!(entries[0].local_branch.as_deref(), Some("daemon/delivered"));
         assert!(
             entries[0].pid.is_none(),
             "dormant journal entry must not advertise a live pid"
@@ -24595,6 +25107,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -25618,6 +26133,9 @@ mod tests {
                     pid: Some(999_999),
                     pr: Some(1),
                     rework_count: 0,
+                    provider: None,
+                    continuation_id: None,
+                    local_branch: None,
                 },
             )
             .unwrap();
@@ -26126,6 +26644,9 @@ mod tests {
                         pid: Some(pid),
                         pr: None,
                         rework_count: 0,
+                        provider: None,
+                        continuation_id: None,
+                        local_branch: None,
                     },
                 )
                 .unwrap();
@@ -26266,14 +26787,17 @@ mod tests {
         let capture = tokio::spawn(async move {
             repository_head_sha_with_options(&repo_path, &git, Duration::from_secs(5), 4096).await
         });
+        let mut pid = None;
         for _ in 0..1_500 {
-            if pid_path.exists() {
+            pid = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|value| value.parse().ok());
+            if pid.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(pid_path.exists(), "frozen-base child did not start");
-        let pid: i32 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        let pid: i32 = pid.expect("frozen-base child did not publish its pid");
         capture.abort();
         let _ = capture.await;
         for _ in 0..500 {

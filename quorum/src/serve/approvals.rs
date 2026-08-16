@@ -493,6 +493,9 @@ mod tests {
                 pid: None,
                 pr: Some(pr),
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();

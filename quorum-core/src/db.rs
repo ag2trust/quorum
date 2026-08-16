@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 51;
+pub const SCHEMA_VERSION: i64 = 52;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -755,7 +755,10 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // operator symptom task #473 was opened to fix. Idempotent: the guard
         // requires the marker to be missing/false, so a re-run at v50 is a
         // no-op. Data-only backfill; no schema shape change.
-        if current < 50 && column_exists(conn, "tasks", "depends_on")? {
+        // Run through v51 as well: task #426 independently shipped v50 for
+        // dormant-worker journal identity, so that lineage has not applied
+        // main's v50 data migration. The UPDATE remains idempotent by marker.
+        if current < 52 && column_exists(conn, "tasks", "depends_on")? {
             conn.execute(
                 "UPDATE tasks
                  SET refs = json_set(
@@ -805,6 +808,21 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                      updated_at        INTEGER NOT NULL
                  );",
             )?;
+        }
+        // v52 converges main's v50/v51 migrations with task #426's
+        // independently shipped v50 dormant-worker journal identity. Fresh
+        // databases receive these nullable columns from SCHEMA_SQL; guarded
+        // ALTERs upgrade either published lineage without rewriting history.
+        if current < 52 {
+            if !column_exists(conn, "journal", "provider")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN provider TEXT", [])?;
+            }
+            if !column_exists(conn, "journal", "continuation_id")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN continuation_id TEXT", [])?;
+            }
+            if !column_exists(conn, "journal", "local_branch")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN local_branch TEXT", [])?;
+            }
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -900,9 +918,49 @@ mod tests {
     }
 
     #[test]
-    fn populated_v48_migration_adds_immutable_routing_attempts_idempotently() {
+    fn main_v49_migration_adds_dormant_journal_identity_without_backfill() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v48.db");
+        let path = dir.path().join("main-v49-dormant-journal.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO journal(agent,role,task_id,session_id,phase,updated_at)
+                 VALUES ('legacy','worker',7,'session','working',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE journal DROP COLUMN provider;
+                 ALTER TABLE journal DROP COLUMN continuation_id;
+                 ALTER TABLE journal DROP COLUMN local_branch;
+                 PRAGMA user_version=49;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        for column in ["provider", "continuation_id", "local_branch"] {
+            assert!(column_exists(&conn, "journal", column).unwrap());
+        }
+        let legacy: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT provider,continuation_id,local_branch FROM journal WHERE agent='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (None, None, None));
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn dormant_worker_v49_migration_adds_immutable_routing_attempts_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dormant-worker-v49.db");
         {
             let conn = Connection::open(&path).unwrap();
             apply_pragmas(&conn).unwrap();
@@ -929,7 +987,7 @@ mod tests {
                      runner,model,effort,pool_key,policy_generation,created_at)
                  VALUES (9,'worker:task:9',9,'worker','M','opus','claude','claude',
                          'claude-opus-4-8','high','worker.M','generation-1',10);
-                 PRAGMA user_version=48;",
+                 PRAGMA user_version=49;",
             )
             .unwrap();
         }
@@ -4063,13 +4121,22 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v50_to_v51_adds_cancelled_dependency_reconciliation_queue() {
+    fn migrates_colliding_v50_to_v52_with_backfill_queue_and_journal_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v50-cancelled-dependency-queue.db");
+        let path = dir.path().join("colliding-v50.db");
         {
             let conn = open(&path).unwrap();
             conn.execute_batch(
-                "DROP TABLE cancelled_dependency_reconciliation;
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                     VALUES
+                         (1,'cancelled','cancelled','owner',1,1),
+                         (2,'legacy park','failed','owner',1,1);
+                 UPDATE tasks SET depends_on='[1]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"dependency #1 is terminal-not-done\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=2;
+                 DROP TABLE cancelled_dependency_reconciliation;
                  PRAGMA user_version=50;",
             )
             .unwrap();
@@ -4081,12 +4148,14 @@ mod tests {
                 .unwrap(),
             SCHEMA_VERSION
         );
-        conn.execute(
-            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
-             VALUES (1,'cancelled','cancelled','owner',1,1)",
-            [],
-        )
-        .unwrap();
+        let refs: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=2", [], |row| row.get(0))
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["daemon_parked_unsatisfiable"], true);
+        for column in ["provider", "continuation_id", "local_branch"] {
+            assert!(column_exists(&conn, "journal", column).unwrap());
+        }
         conn.execute(
             "INSERT INTO cancelled_dependency_reconciliation(
                  cancelled_task_id,task_cursor,updated_at

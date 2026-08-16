@@ -1377,6 +1377,40 @@ pub fn apply_event(
     apply_event_tx(tx, agent, id, event, now, |_| Ok(()))
 }
 
+/// Apply an actionable rework transition and persist the exact pending turn
+/// in the same transaction. Sticky turn-oriented workers may be dormant when
+/// the daemon dies, so the lifecycle destination must never become visible
+/// without the prompt that restart will replay.
+pub fn apply_actionable_rework_event(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    event: &Event,
+    feedback: &str,
+    now: i64,
+) -> Result<TransitionResult> {
+    if feedback.trim().is_empty() || feedback.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "actionable rework feedback must be non-empty and contain no NUL".into(),
+        ));
+    }
+    if !matches!(event, Event::VerdictChanges | Event::MergeConflict) {
+        return Err(QuorumError::BadInput(
+            "actionable rework persistence requires VerdictChanges or MergeConflict".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    apply_event_tx(tx, agent, id, event, now, |tx| {
+        tx.execute(
+            "UPDATE tasks
+             SET refs=json_set(COALESCE(refs, '{}'), '$.remediation_feedback', ?2)
+             WHERE id=?1 AND status='rework'",
+            params![id, feedback],
+        )?;
+        Ok(())
+    })
+}
+
 /// Apply a daemon-verified worker publication and retire its durable intent in
 /// the same transaction as the lifecycle transition.
 pub fn apply_published_worker_event(
@@ -1699,8 +1733,8 @@ pub fn recover_late_worker_completion(
 }
 
 /// Fold a reviewer verdict that committed before a daemon restart. Validation,
-/// approval persistence/invalidation, transition, and mailbox consumption are
-/// deliberately one immediate transaction.
+/// approval persistence/invalidation, transition, remediation feedback, and
+/// mailbox consumption are deliberately one immediate transaction.
 #[allow(clippy::too_many_arguments)]
 pub fn recover_late_reviewer_verdict(
     conn: &mut Connection,
@@ -1711,12 +1745,14 @@ pub fn recover_late_reviewer_verdict(
     verdict: LateReviewerVerdict,
     blocking_count: i64,
     reviewed_head_sha: &str,
+    remediation_feedback: Option<&str>,
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
-    let role: Option<String> = tx
+    let reviewer_state: Option<(String, String)> = tx
         .query_row(
-            "SELECT CASE WHEN ar.sub_role='r2' THEN 'r2' WHEN ar.sub_role IS NULL THEN 'r1' END
+            "SELECT CASE WHEN ar.sub_role='r2' THEN 'r2' WHEN ar.sub_role IS NULL THEN 'r1' END,
+                    t.status
              FROM mailbox m
              JOIN tasks t ON t.id=m.task_id
              JOIN journal j ON j.agent=m.agent AND j.role='reviewer'
@@ -1728,7 +1764,8 @@ pub fn recover_late_reviewer_verdict(
              )
              WHERE m.id=?1 AND m.consumed_at IS NULL AND m.kind='done'
                AND m.agent=?2 AND m.task_id=?3 AND m.pr=?4
-               AND t.status='in-review' AND t.reviewer=m.agent
+               AND ((t.status='in-review' AND t.reviewer=m.agent)
+                    OR (?5='changes' AND t.status='rework'))
                AND (ar.sub_role IS NULL OR ar.sub_role='r2')
                AND ((?5='approved' AND m.verdict='approved')
                     OR (?5='changes' AND m.verdict='changes'))",
@@ -1742,10 +1779,10 @@ pub fn recover_late_reviewer_verdict(
                     LateReviewerVerdict::Changes => "changes",
                 }
             ],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(role) = role else {
+    let Some((role, task_status)) = reviewer_state else {
         tx.commit()?;
         return Ok(false);
     };
@@ -1810,6 +1847,31 @@ pub fn recover_late_reviewer_verdict(
             Ok(true)
         }
         LateReviewerVerdict::Changes => {
+            let remediation_feedback = remediation_feedback
+                .map(str::trim)
+                .filter(|feedback| !feedback.is_empty())
+                .unwrap_or("Changes requested.");
+            // The live path commits VerdictChanges before installing the
+            // sticky worker's replacement lease. A daemon death in that gap
+            // leaves this exact reviewer result unconsumed with the task
+            // already in rework. Preserve the feedback and consume the
+            // reviewer authority here; dormant recovery will re-install the
+            // exact worker lease and resume its continuation.
+            if task_status == "rework" {
+                tx.execute(
+                    "DELETE FROM approvals WHERE pr_number=?1 AND task_id=?2",
+                    params![pr, task_id],
+                )?;
+                tx.execute(
+                    "UPDATE tasks SET refs=json_set(COALESCE(refs, '{}'),
+                       '$.remediation_feedback', ?2)
+                     WHERE id=?1 AND status='rework'",
+                    params![task_id, remediation_feedback],
+                )?;
+                consume_late_mailbox(&tx, mailbox_id, now)?;
+                tx.commit()?;
+                return Ok(true);
+            }
             apply_event_tx(tx, agent, task_id, &Event::VerdictChanges, now, |tx| {
                 tx.execute(
                     "DELETE FROM approvals WHERE pr_number=?1 AND task_id=?2",
@@ -1818,9 +1880,10 @@ pub fn recover_late_reviewer_verdict(
                 tx.execute(
                     "UPDATE tasks SET assignee=NULL,
                      refs=json_set(COALESCE(refs, '{}'),
-                       '$.daemon_rework_retry_requested', json('true'))
+                       '$.daemon_rework_retry_requested', json('true'),
+                       '$.remediation_feedback', ?2)
                      WHERE id=?1 AND status='rework'",
-                    params![task_id],
+                    params![task_id, remediation_feedback],
                 )?;
                 consume_late_mailbox(tx, mailbox_id, now)
             })
@@ -4273,6 +4336,9 @@ mod tests {
                 pid: None,
                 pr,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -4321,6 +4387,9 @@ mod tests {
                 pid: None,
                 pr: Some(42),
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -4477,6 +4546,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003
         )
         .unwrap());
@@ -4513,6 +4583,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003
         )
         .unwrap());
@@ -4541,6 +4612,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003,
         )
         .unwrap());
@@ -4567,6 +4639,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003,
         )
         .unwrap());
@@ -4607,13 +4680,55 @@ mod tests {
                 LateReviewerVerdict::Changes,
                 1,
                 "",
+                Some("fix the blocking finding"),
                 1003,
             )
             .unwrap());
-            assert_eq!(get(&c, task_id).unwrap().unwrap().status, "rework");
+            let task = get(&c, task_id).unwrap().unwrap();
+            assert_eq!(task.status, "rework");
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(refs[PARKED_REWORK_RETRY_REF], true);
+            assert_eq!(refs["remediation_feedback"], "fix the blocking finding");
             assert!(crate::approvals::get_for_pr(&c, 42).unwrap().is_empty());
             assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 0);
         }
+    }
+
+    #[test]
+    fn late_changes_finishes_feedback_handoff_after_transition_already_committed() {
+        let (_d, mut c) = open_tmp();
+        let (task_id, mailbox_id) = late_reviewer_fixture(&mut c, false);
+        c.execute(
+            "UPDATE mailbox SET verdict='changes', payload='{\"blocking\":1}' WHERE id=?1",
+            [mailbox_id],
+        )
+        .unwrap();
+        apply_event(&mut c, "reviewer", task_id, &Event::VerdictChanges, 1002).unwrap();
+
+        assert!(recover_late_reviewer_verdict(
+            &mut c,
+            mailbox_id,
+            "reviewer",
+            task_id,
+            42,
+            LateReviewerVerdict::Changes,
+            1,
+            "",
+            Some("resume the exact sticky worker"),
+            1003,
+        )
+        .unwrap());
+
+        let task = get(&c, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs["remediation_feedback"],
+            "resume the exact sticky worker"
+        );
+        assert!(refs.get(PARKED_REWORK_RETRY_REF).is_none());
+        assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 0);
     }
 
     #[test]
@@ -4631,6 +4746,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003
         )
         .unwrap());
@@ -4645,6 +4761,7 @@ mod tests {
             LateReviewerVerdict::Approved,
             0,
             "head",
+            None,
             1003
         )
         .is_err());
@@ -4984,6 +5101,40 @@ mod tests {
         assert_eq!(r.task.rework_round, 1);
         assert!(r.effects.contains(&Effect::IncrementReworkRound));
         assert!(r.effects.contains(&Effect::ResumeWorker));
+    }
+
+    #[test]
+    fn actionable_rework_event_persists_exact_turn_atomically() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone { pr: "99".into() },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+        let feedback = "Preserve the published head; merge main and never rebase.";
+        let result =
+            apply_actionable_rework_event(&mut c, "R", id, &Event::VerdictChanges, feedback, 1003)
+                .unwrap();
+
+        assert_eq!(result.task.status, "rework");
+        let refs: serde_json::Value =
+            serde_json::from_str(result.task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["remediation_feedback"], feedback);
+        assert!(c
+            .query_row(
+                "SELECT 1 FROM claims WHERE target=?1 AND active=1",
+                [lease_target(id)],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_none());
     }
 
     #[test]
