@@ -35,6 +35,8 @@ enum Scenario {
     DarwinPartialFallback,
     #[cfg(target_os = "macos")]
     DarwinPartialChildList,
+    #[cfg(target_os = "macos")]
+    DarwinPidReuse,
     Interrupted,
     AbruptOwnerDeath,
 }
@@ -51,6 +53,8 @@ impl Scenario {
             Self::DarwinPartialFallback => "darwin-partial-fallback",
             #[cfg(target_os = "macos")]
             Self::DarwinPartialChildList => "darwin-partial-child-list",
+            #[cfg(target_os = "macos")]
+            Self::DarwinPidReuse => "darwin-pid-reuse",
             Self::Interrupted => "interrupted",
             Self::AbruptOwnerDeath => "abrupt-owner-death",
         }
@@ -126,9 +130,9 @@ impl Fixture {
                     | Scenario::Interrupted
                     | Scenario::AbruptOwnerDeath => self.repo.join("fixture-test-blocking"),
                     #[cfg(target_os = "macos")]
-                    Scenario::DarwinPartialFallback | Scenario::DarwinPartialChildList => {
-                        self.repo.join("fixture-test-blocking")
-                    }
+                    Scenario::DarwinPartialFallback
+                    | Scenario::DarwinPartialChildList
+                    | Scenario::DarwinPidReuse => self.repo.join("fixture-test-blocking"),
                     _ => self.repo.join("fixture-test-unused"),
                 },
             )
@@ -171,6 +175,13 @@ impl Fixture {
                     "PREFLIGHT_FIXTURE_PARTIAL_LIST_PID_FILE",
                     self.pid_file().with_extension("partial-list"),
                 );
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(scenario, Scenario::DarwinPidReuse) {
+            command.env("PREFLIGHT_TEST_TIMEOUT_SECS", "2").env(
+                "TIMING_TEST_DARWIN_REUSED_PID_FILE",
+                self.pid_file().with_extension("reused"),
+            );
         }
         command.output().expect("run preflight")
     }
@@ -326,6 +337,41 @@ fn assert_processes_gone(pids: &[i32]) {
         survivors.is_empty(),
         "fixture processes survived: {survivors:?}"
     );
+}
+
+#[cfg(target_os = "macos")]
+struct ChildGuard(Child);
+
+#[cfg(target_os = "macos")]
+impl ChildGuard {
+    fn unrelated_process() -> Self {
+        Self(
+            Command::new("python3")
+                .args(["-c", "import time; time.sleep(60)"])
+                .process_group(0)
+                .spawn()
+                .expect("spawn unrelated PID-reuse sentinel"),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn is_running(&mut self) -> bool {
+        self.0
+            .try_wait()
+            .expect("poll unrelated PID-reuse sentinel")
+            .is_none()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[test]
@@ -523,6 +569,39 @@ fn partial_darwin_child_list_is_loud_and_reaps_retained_descendants() {
     assert!(
         cleanup_error.contains("libproc child list incomplete for live PID"),
         "cleanup error={cleanup_error}"
+    );
+    fixture.assert_fixture_uses_separate_process_groups();
+    assert_processes_gone(&fixture.wait_for_fixture_pids());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn reused_darwin_pid_is_discarded_without_signaling_unrelated_process() {
+    let _guard = process_fixture_guard();
+    let fixture = Fixture::new();
+    let mut unrelated = ChildGuard::unrelated_process();
+    fs::write(
+        fixture.pid_file().with_extension("reused"),
+        unrelated.pid().to_string(),
+    )
+    .expect("publish synthetic reused PID");
+
+    let output = fixture.preflight(Scenario::DarwinPidReuse);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        unrelated.is_running(),
+        "cleanup signaled the unrelated process that reused a retained PID"
+    );
+    let timing = fixture.timing();
+    assert_branch_base(&timing);
+    assert_gate(&timing, "test_execute", 124);
+    let binary = &timing["test_binaries"][0];
+    assert_eq!(binary["execute_outcome"], "timed_out");
+    assert_eq!(
+        binary["cleanup"]["complete"], true,
+        "cleanup={}",
+        binary["cleanup"]
     );
     fixture.assert_fixture_uses_separate_process_groups();
     assert_processes_gone(&fixture.wait_for_fixture_pids());

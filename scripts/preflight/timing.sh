@@ -68,10 +68,14 @@ DARWIN_PARTIAL_PID_FILE_ENV = "TIMING_TEST_DARWIN_PARTIAL_PID_FILE"
 DARWIN_PARTIAL_CHILD_LIST_PID_FILE_ENV = (
     "TIMING_TEST_DARWIN_PARTIAL_CHILD_LIST_PID_FILE"
 )
+DARWIN_REUSED_PID_FILE_ENV = "TIMING_TEST_DARWIN_REUSED_PID_FILE"
 
 DEFAULT_TEST_TIMEOUT_SECS = 120.0
 DEFAULT_TERM_GRACE_SECS = 2.0
 TIMEOUT_EXIT_CODE = 124
+
+ProcessStart = tuple[int, int]
+RetainedProcesses = dict[int, ProcessStart | None]
 
 
 def now() -> float:
@@ -407,7 +411,7 @@ def _linux_process_table() -> dict[int, tuple[int, int]] | None:
 
 def _darwin_process_table(
     root_pid: int,
-    known: set[int],
+    known: RetainedProcesses,
 ) -> tuple[dict[int, tuple[int, int]] | None, str | None]:
     """Read the retained process tree without spawning under macOS."""
     if sys.platform != "darwin":
@@ -478,10 +482,12 @@ def _darwin_process_table(
 
         rows: dict[int, tuple[int, int]] = {}
         listed_children: dict[int, set[int]] = {}
-        pending = list({root_pid, *known})
+        pending = [(pid, None) for pid in known if pid != root_pid]
+        if root_pid in known:
+            pending.append((root_pid, None))
         visited: set[int] = set()
         while pending:
-            pid = pending.pop()
+            pid, discovered_parent = pending.pop()
             if pid <= 0 or pid in visited:
                 continue
             visited.add(pid)
@@ -496,13 +502,37 @@ def _darwin_process_table(
             if pid == partial_pid:
                 copied = 0
             if copied == ctypes.sizeof(info):
-                rows[pid] = (int(info.pbi_ppid), int(info.pbi_pgid))
+                start = (
+                    int(info.pbi_start_tvsec),
+                    int(info.pbi_start_tvusec),
+                )
+                parent_pid = int(info.pbi_ppid)
+                retained_start = known.get(pid)
+                if retained_start is not None and retained_start != start:
+                    # This PID now identifies another process. Do not traverse
+                    # it or trust its current process group during cleanup,
+                    # unless it was independently rediscovered as a current
+                    # child of the retained tree.
+                    known.pop(pid, None)
+                    if discovered_parent is None or parent_pid != discovered_parent:
+                        continue
+                elif (
+                    pid not in known
+                    and discovered_parent is not None
+                    and parent_pid != discovered_parent
+                ):
+                    # The listed child exited and its PID was reused before
+                    # its detail snapshot. The replacement is not ours.
+                    continue
+                known[pid] = start
+                rows[pid] = (parent_pid, int(info.pbi_pgid))
             else:
                 try:
                     os.kill(pid, 0)
                 except ProcessLookupError:
                     # The process exited between the retained PID and detail
                     # snapshots.
+                    known.pop(pid, None)
                     continue
                 except PermissionError:
                     pass
@@ -534,7 +564,7 @@ def _darwin_process_table(
                 if child_pid > 0
             }
             listed_children[pid] = children_found
-            pending.extend(children_found)
+            pending.extend((child_pid, pid) for child_pid in children_found)
 
         # A zero or shortened child-list result is only distinguishable from
         # a real leaf when it contradicts a retained live child's BSD info.
@@ -557,7 +587,7 @@ def _darwin_process_table(
 def _process_table_failure(
     error: str,
     root_pid: int,
-    known: set[int],
+    known: RetainedProcesses,
 ) -> tuple[dict[int, tuple[int, int]], str]:
     rows = _linux_process_table()
     if rows is not None:
@@ -572,7 +602,7 @@ def _process_table_failure(
 
 def _process_table(
     root_pid: int,
-    known: set[int],
+    known: RetainedProcesses,
 ) -> tuple[dict[int, tuple[int, int]], str | None]:
     """Return PID -> (PPID, PGID) from a bounded POSIX process snapshot."""
     try:
@@ -630,33 +660,42 @@ def _process_table(
                 rows[pid] = (ppid, pgid)
     except ValueError as exc:
         return {}, f"invalid process-tree snapshot: {exc}"
+    if sys.platform == "darwin":
+        # A ps row carries no stable process identity. Make libproc's start
+        # timestamp authoritative before retained PIDs can reach signaling.
+        darwin_rows, darwin_error = _darwin_process_table(root_pid, known)
+        if darwin_rows is None:
+            return {}, darwin_error or "libproc process snapshot failed"
+        return darwin_rows, None
     return rows, None
 
 
 def _extend_known_descendants(
     root_pid: int,
-    known: set[int],
+    known: RetainedProcesses,
     rows: dict[int, tuple[int, int]],
 ) -> None:
-    # Keep every PID ever observed: a descendant can be reparented after its
-    # parent is killed, or can move into a new process group. Linux subreaper
-    # adoptees appear as direct supervisor children. The original group is
-    # included even if its leader has already exited.
-    known.add(root_pid)
+    # Keep the stable identity of every live PID observed: a descendant can be
+    # reparented after its parent is killed, or can move into a new process
+    # group. Linux subreaper adoptees appear as direct supervisor children.
+    # Darwin's libproc traversal adds the root with its start time; do not
+    # recreate a root entry after an identity mismatch discarded it.
+    if sys.platform != "darwin":
+        known.setdefault(root_pid, None)
     for pid, (ppid, pgid) in rows.items():
         if ppid == os.getpid() or pgid == root_pid:
-            known.add(pid)
+            known.setdefault(pid, None)
     changed = True
     while changed:
         changed = False
         for pid, (ppid, _pgid) in rows.items():
             if pid not in known and ppid in known:
-                known.add(pid)
+                known[pid] = None
                 changed = True
 
 
 def _discover_descendants(
-    root_pid: int, known: set[int]
+    root_pid: int, known: RetainedProcesses
 ) -> tuple[dict[int, tuple[int, int]], str | None]:
     rows, error = _process_table(root_pid, known)
     _extend_known_descendants(root_pid, known, rows)
@@ -666,13 +705,15 @@ def _discover_descendants(
 def _cleanup_process_tree(
     proc: subprocess.Popen,
     grace_secs: float,
-    previously_known: set[int] | None = None,
+    previously_known: RetainedProcesses | None = None,
 ) -> dict:
     """Bounded TERM/KILL cleanup for every descendant of ``proc``."""
     root_pgid = proc.pid
     supervisor_pgid = os.getpgrp()
-    known = set(previously_known or ())
-    known.add(proc.pid)
+    known = dict(previously_known or {})
+    root_running = proc.poll() is None
+    if previously_known is None or root_running:
+        known.setdefault(proc.pid, None)
     discovery_error: str | None = None
     discovery_errors: list[str] = []
     signal_errors: list[str] = []
@@ -711,9 +752,21 @@ def _cleanup_process_tree(
             if pgid > 0 and pgid != supervisor_pgid
         }
         # Keep the original group as a fallback if discovery raced its leader
-        # or failed. Each known PID is also signaled in case it changes groups
-        # between the snapshot and killpg.
-        groups.add(root_pgid)
+        # or failed. On Darwin, require a retained process to remain in the
+        # isolated test session before trusting a group from a degraded
+        # snapshot; a reused PID cannot join that existing session.
+        def in_root_session(pid: int) -> bool:
+            try:
+                return os.getsid(pid) == root_pgid
+            except (OSError, ProcessLookupError):
+                return False
+
+        if (
+            sys.platform != "darwin"
+            or any(pgid == root_pgid for _ppid, pgid in live.values())
+            or any(in_root_session(pid) for pid in known)
+        ):
+            groups.add(root_pgid)
         sent = False
         for pgid in groups:
             try:
@@ -728,7 +781,10 @@ def _cleanup_process_tree(
             # A partial snapshot cannot prove whether a retained descendant is
             # still live. Signal its recorded PID so discovery failure cannot
             # orphan an escaped process group when the root group exits.
-            target_pids.update(known)
+            if sys.platform == "darwin":
+                target_pids.update(pid for pid in known if in_root_session(pid))
+            else:
+                target_pids.update(known)
         for pid in target_pids:
             try:
                 os.kill(pid, sig)
@@ -881,7 +937,7 @@ def _test_supervisor() -> int:
     started = now()
     proc: subprocess.Popen | None = None
     result: dict | None = None
-    known_descendants: set[int] = set()
+    known_descendants: RetainedProcesses = {}
 
     def interrupted(signum: int, _frame: object) -> None:
         raise SupervisorInterrupted(signum)
@@ -920,7 +976,19 @@ def _test_supervisor() -> int:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
         deadline = started + timeout_secs
-        known_descendants.add(proc.pid)
+        known_descendants[proc.pid] = None
+        if sys.platform == "darwin":
+            reused_pid_file = os.environ.get(DARWIN_REUSED_PID_FILE_ENV)
+            if reused_pid_file:
+                try:
+                    reused_pid = int(Path(reused_pid_file).read_text().strip())
+                    if reused_pid > 0:
+                        # Test-only stale identity: this models a retained PID
+                        # whose original process exited and whose number now
+                        # belongs to an unrelated live process.
+                        known_descendants[reused_pid] = (0, 0)
+                except (OSError, ValueError):
+                    pass
         next_darwin_snapshot = started
         outcome = "failed"
         rc = 1
