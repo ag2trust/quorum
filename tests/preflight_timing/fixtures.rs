@@ -37,6 +37,8 @@ enum Scenario {
     DarwinPartialChildList,
     #[cfg(target_os = "macos")]
     DarwinPidReuse,
+    #[cfg(target_os = "macos")]
+    DarwinFastExitRootReuse,
     Interrupted,
     AbruptOwnerDeath,
 }
@@ -55,6 +57,8 @@ impl Scenario {
             Self::DarwinPartialChildList => "darwin-partial-child-list",
             #[cfg(target_os = "macos")]
             Self::DarwinPidReuse => "darwin-pid-reuse",
+            #[cfg(target_os = "macos")]
+            Self::DarwinFastExitRootReuse => "darwin-fast-exit-root-reuse",
             Self::Interrupted => "interrupted",
             Self::AbruptOwnerDeath => "abrupt-owner-death",
         }
@@ -133,6 +137,8 @@ impl Fixture {
                     Scenario::DarwinPartialFallback
                     | Scenario::DarwinPartialChildList
                     | Scenario::DarwinPidReuse => self.repo.join("fixture-test-blocking"),
+                    #[cfg(target_os = "macos")]
+                    Scenario::DarwinFastExitRootReuse => self.repo.join("fixture-test-failure"),
                     _ => self.repo.join("fixture-test-unused"),
                 },
             )
@@ -181,6 +187,13 @@ impl Fixture {
             command.env("PREFLIGHT_TEST_TIMEOUT_SECS", "2").env(
                 "TIMING_TEST_DARWIN_REUSED_PID_FILE",
                 self.pid_file().with_extension("reused"),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(scenario, Scenario::DarwinFastExitRootReuse) {
+            command.env(
+                "TIMING_TEST_DARWIN_REUSED_ROOT_PID_FILE",
+                self.pid_file().with_extension("reused-root"),
             );
         }
         command.output().expect("run preflight")
@@ -605,6 +618,45 @@ fn reused_darwin_pid_is_discarded_without_signaling_unrelated_process() {
     );
     fixture.assert_fixture_uses_separate_process_groups();
     assert_processes_gone(&fixture.wait_for_fixture_pids());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn fast_exit_darwin_root_reuse_never_signals_the_replacement() {
+    let _guard = process_fixture_guard();
+    let fixture = Fixture::new();
+    let mut unrelated = ChildGuard::unrelated_process();
+    fs::write(
+        fixture.pid_file().with_extension("reused-root"),
+        unrelated.pid().to_string(),
+    )
+    .expect("publish synthetic reused root PID");
+
+    let started = Instant::now();
+    let output = fixture.preflight(Scenario::DarwinFastExitRootReuse);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "root PID reuse handling did not remain bounded"
+    );
+    assert!(
+        unrelated.is_running(),
+        "cleanup signaled the process that reused the reaped root PID"
+    );
+    let timing = fixture.timing();
+    assert_branch_base(&timing);
+    assert_gate(&timing, "test_execute", 42);
+    let binary = &timing["test_binaries"][0];
+    assert_eq!(binary["execute_outcome"], "failed");
+    assert_eq!(
+        binary["cleanup"]["complete"], false,
+        "a reused process group must not be certified as cleaned up"
+    );
+    assert!(binary["cleanup"]["error"]
+        .as_str()
+        .expect("reused process group is diagnosed")
+        .contains("still exists after SIGKILL"));
 }
 
 #[test]

@@ -69,6 +69,7 @@ DARWIN_PARTIAL_CHILD_LIST_PID_FILE_ENV = (
     "TIMING_TEST_DARWIN_PARTIAL_CHILD_LIST_PID_FILE"
 )
 DARWIN_REUSED_PID_FILE_ENV = "TIMING_TEST_DARWIN_REUSED_PID_FILE"
+DARWIN_REUSED_ROOT_PID_FILE_ENV = "TIMING_TEST_DARWIN_REUSED_ROOT_PID_FILE"
 
 DEFAULT_TEST_TIMEOUT_SECS = 120.0
 DEFAULT_TERM_GRACE_SECS = 2.0
@@ -712,6 +713,16 @@ def _cleanup_process_tree(
     supervisor_pgid = os.getpgrp()
     known = dict(previously_known or {})
     root_running = proc.poll() is None
+    if (
+        sys.platform == "darwin"
+        and not root_running
+        and proc.pid in known
+        and known[proc.pid] is None
+    ):
+        # Once waitpid has reaped an unidentified leader, its PID can identify
+        # an unrelated process. It is no longer safe to discover or signal by
+        # that bare number.
+        known.pop(proc.pid)
     if previously_known is None or root_running:
         known.setdefault(proc.pid, None)
     discovery_error: str | None = None
@@ -728,6 +739,13 @@ def _cleanup_process_tree(
     def snapshot() -> dict[int, tuple[int, int]]:
         nonlocal discovery_error
         proc.poll()
+        if (
+            sys.platform == "darwin"
+            and proc.returncode is not None
+            and proc.pid in known
+            and known[proc.pid] is None
+        ):
+            known.pop(proc.pid)
         _reap_children()
         live, error = _discover_descendants(proc.pid, known)
         if error is not None and error not in discovery_errors:
@@ -978,6 +996,10 @@ def _test_supervisor() -> int:
         deadline = started + timeout_secs
         known_descendants[proc.pid] = None
         if sys.platform == "darwin":
+            # Capture the leader's stable start identity before poll()/waitpid
+            # can reap it and make the PID reusable. A short-lived child is
+            # still owned here even if it has already become a zombie.
+            _darwin_process_table(proc.pid, known_descendants)
             reused_pid_file = os.environ.get(DARWIN_REUSED_PID_FILE_ENV)
             if reused_pid_file:
                 try:
@@ -1019,6 +1041,24 @@ def _test_supervisor() -> int:
                 rc = 1
                 outcome = "owner_lost"
                 break
+
+        if sys.platform == "darwin":
+            reused_root_pid_file = os.environ.get(
+                DARWIN_REUSED_ROOT_PID_FILE_ENV
+            )
+            if reused_root_pid_file:
+                try:
+                    reused_root_pid = int(
+                        Path(reused_root_pid_file).read_text().strip()
+                    )
+                    if reused_root_pid > 0 and proc.returncode is not None:
+                        # Test-only post-reap reuse: cleanup must reject this
+                        # unidentified replacement instead of signaling it.
+                        known_descendants.pop(proc.pid, None)
+                        proc.pid = reused_root_pid
+                        known_descendants[proc.pid] = None
+                except (OSError, ValueError):
+                    pass
 
         cleanup = _cleanup_process_tree(
             proc, grace_secs, known_descendants
