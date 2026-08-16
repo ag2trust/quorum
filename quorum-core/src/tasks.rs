@@ -173,6 +173,7 @@ pub struct Task {
     pub revision: i64,
     pub edit_count: i64,
     pub continue_pr: Option<i64>,
+    pub target_branch: Option<String>,
     pub ready: bool,
 }
 
@@ -191,6 +192,7 @@ pub struct TaskBrief {
     pub rework_round: i64,
     pub recovery_attempts: i64,
     pub continue_pr: Option<i64>,
+    pub target_branch: Option<String>,
 }
 
 impl From<&Task> for TaskBrief {
@@ -209,6 +211,7 @@ impl From<&Task> for TaskBrief {
             rework_round: t.rework_round,
             recovery_attempts: t.recovery_attempts,
             continue_pr: t.continue_pr,
+            target_branch: t.target_branch.clone(),
         }
     }
 }
@@ -306,7 +309,8 @@ pub fn effect_name(e: &Effect) -> String {
 
 const COLS: &str = "id, title, body, status, priority, labels, assignee, created_by, \
                     created_at, updated_at, refs, depends_on, author, reviewer, \
-                    rework_round, review_only, recovery_attempts, revision, edit_count, continue_pr";
+                    rework_round, review_only, recovery_attempts, revision, edit_count, \
+                    continue_pr, target_branch";
 
 const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
     SELECT 1 FROM json_each(depends_on) je
@@ -365,6 +369,7 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         revision: r.get(17)?,
         edit_count: r.get(18)?,
         continue_pr: r.get(19)?,
+        target_branch: r.get(20)?,
         ready: false,
     })
 }
@@ -3900,6 +3905,29 @@ pub fn retry_provider_blocked(
     task.ready = compute_ready(&tx, &task.depends_on)?;
     tx.commit()?;
     Ok(Some(task))
+}
+
+// ── target branch ────────────────────────────────────────────────────────────
+
+/// One-time resolution of a task's target branch. Succeeds only when the
+/// field is currently NULL; a populated value is immutable regardless of
+/// task status. Returns `true` if the value was set, `false` if already
+/// populated. Returns `Err` only on database errors — a missing task
+/// returns `Ok(false)`.
+pub fn resolve_target_branch(
+    conn: &mut Connection,
+    task_id: i64,
+    branch: &str,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let n = tx.execute(
+        "UPDATE tasks SET target_branch=?2, updated_at=?3 \
+         WHERE id=?1 AND target_branch IS NULL",
+        params![task_id, branch, now],
+    )?;
+    tx.commit()?;
+    Ok(n > 0)
 }
 
 // ── close_after_merge ─────────────────────────────────────────────────────────
@@ -11675,5 +11703,131 @@ mod tests {
             .unwrap();
         let ids = cancelled_dep_ids(&c, dependent).unwrap();
         assert_eq!(ids, vec![a]);
+    }
+
+    // ── target_branch ────────────────────────────────────────────────────────
+
+    #[test]
+    fn created_task_has_null_target_branch() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(&mut conn, "a", "t", None, 0, None, None, None, None, 1).unwrap();
+        let task = get(&conn, id).unwrap().unwrap();
+        assert!(task.target_branch.is_none());
+    }
+
+    #[test]
+    fn resolve_target_branch_sets_once() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(&mut conn, "a", "t", None, 0, None, None, None, None, 1).unwrap();
+        assert!(resolve_target_branch(&mut conn, id, "main", 2).unwrap());
+        let task = get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.target_branch.as_deref(), Some("main"));
+        assert_eq!(task.updated_at, 2);
+    }
+
+    #[test]
+    fn resolve_target_branch_immutable_once_populated() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(&mut conn, "a", "t", None, 0, None, None, None, None, 1).unwrap();
+        assert!(resolve_target_branch(&mut conn, id, "main", 2).unwrap());
+        assert!(!resolve_target_branch(&mut conn, id, "develop", 3).unwrap());
+        let task = get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.target_branch.as_deref(), Some("main"));
+        assert_eq!(task.updated_at, 2);
+    }
+
+    #[test]
+    fn resolve_target_branch_missing_task() {
+        let (_dir, mut conn) = open_tmp();
+        assert!(!resolve_target_branch(&mut conn, 999, "main", 1).unwrap());
+    }
+
+    #[test]
+    fn target_branch_survives_lifecycle() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(&mut conn, "a", "t", None, 0, None, None, None, None, 1).unwrap();
+        assert!(resolve_target_branch(&mut conn, id, "develop", 2).unwrap());
+        claim(&mut conn, "w", Some(id), &[], TTL, 3).unwrap();
+        let task = get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.target_branch.as_deref(), Some("develop"));
+        assert_eq!(task.status, "working");
+    }
+
+    #[test]
+    fn target_branch_in_brief() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(&mut conn, "a", "t", None, 0, None, None, None, None, 1).unwrap();
+        assert!(resolve_target_branch(&mut conn, id, "main", 2).unwrap());
+        let task = get(&conn, id).unwrap().unwrap();
+        let brief = TaskBrief::from(&task);
+        assert_eq!(brief.target_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn target_branch_concurrent_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let mut c1 = crate::db::open(&path).unwrap();
+        let id = create(&mut c1, "a", "t", None, 0, None, None, None, None, 1).unwrap();
+
+        let mut c2 = crate::db::open(&path).unwrap();
+        assert!(resolve_target_branch(&mut c1, id, "main", 2).unwrap());
+        assert!(!resolve_target_branch(&mut c2, id, "develop", 3).unwrap());
+
+        let task = get(&c1, id).unwrap().unwrap();
+        assert_eq!(task.target_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn legacy_migration_adds_target_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    body TEXT,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    labels TEXT,
+                    assignee TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    refs TEXT,
+                    depends_on TEXT,
+                    sticky_until INTEGER,
+                    orig TEXT,
+                    author TEXT,
+                    reviewer TEXT,
+                    rework_round INTEGER NOT NULL DEFAULT 0,
+                    review_only INTEGER NOT NULL DEFAULT 0,
+                    recovery_attempts INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    edit_count INTEGER NOT NULL DEFAULT 0,
+                    continue_pr INTEGER,
+                    completion_provenance TEXT
+                );
+                PRAGMA user_version = 52;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title, status, created_by, created_at, updated_at)
+                 VALUES ('old', 'open', 'x', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = crate::db::open(&path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, crate::db::SCHEMA_VERSION);
+        let task = get(&conn, 1).unwrap().unwrap();
+        assert!(task.target_branch.is_none());
+        assert_eq!(task.title, "old");
     }
 }

@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 51). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 53). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -111,7 +111,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- v47: daemon-owned terminal provenance. NULL deliberately preserves legacy/unknown
     -- completions without guessing whether a retained refs.pr actually merged.
     completion_provenance TEXT
-        CHECK (completion_provenance IS NULL OR completion_provenance IN ('merged','manual'))
+        CHECK (completion_provenance IS NULL OR completion_provenance IN ('merged','manual')),
+    -- v53: authoritative nullable target branch. Resolved to the daemon-configured
+    -- base before first execution; immutable once populated.
+    target_branch TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 -- Bounded REVIEWING projection: each status is read newest-first, then at most two

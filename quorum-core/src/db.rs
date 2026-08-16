@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 52;
+pub const SCHEMA_VERSION: i64 = 53;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -823,6 +823,12 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
             if !column_exists(conn, "journal", "local_branch")? {
                 conn.execute("ALTER TABLE journal ADD COLUMN local_branch TEXT", [])?;
             }
+        }
+        // v53 = authoritative nullable target-branch on tasks. Resolved to
+        // the daemon-configured base before first execution; immutable once
+        // populated. NULL preserves every historical task without reinterpreting.
+        if current < 53 && !column_exists(conn, "tasks", "target_branch")? {
+            conn.execute("ALTER TABLE tasks ADD COLUMN target_branch TEXT", [])?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
