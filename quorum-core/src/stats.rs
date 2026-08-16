@@ -791,11 +791,38 @@ fn queue_by_tier(conn: &Connection) -> Result<Vec<TierQueueCount>> {
         .collect())
 }
 
-/// Open tasks blocked by unmet dependencies (#86). Returns each blocked task with the
-/// list of dep ids it's waiting on (only deps that are NOT yet `closed`).
+/// Open tasks blocked by unmet dependencies (#86) plus daemon-parked
+/// (`status='failed'`) tasks whose `depends_on` currently contains any
+/// cancelled dep. The latter are the operator disposition queue — task-retry
+/// refuses until `depends_on` is edited or the dependent is closed.
+///
+/// Deliberately infers the unsatisfiable condition from the live dep graph
+/// instead of gating on the durable `daemon_parked_unsatisfiable` marker.
+/// Reason: cancellation writes commit before any subsequent sweep would set
+/// that marker (sweep_on_write runs before the mutator writes), so a purely
+/// marker-gated read would hide the row for an unbounded interval after
+/// cancellation. Inference is authoritative regardless of when refs get
+/// refreshed by `converge_parked_dependents_of_cancelled`. Also covers
+/// classifier-policy parks (their `daemon_parked_reason` stays "classifier
+/// declined" so refs never gain the marker, but the cancelled dep is still
+/// the operator disposition and must surface).
 fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, labels, depends_on FROM tasks WHERE status='open' AND depends_on IS NOT NULL",
+        "SELECT t.id, t.title, t.labels, t.depends_on, t.status FROM tasks t
+         WHERE t.depends_on IS NOT NULL
+           AND (
+               t.status='open'
+               OR (
+                   t.status='failed'
+                   AND json_valid(t.refs)
+                   AND json_extract(t.refs, '$.daemon_parked')=1
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(t.depends_on) j
+                       JOIN tasks d ON d.id = j.value
+                       WHERE d.status = 'cancelled'
+                   )
+               )
+           )",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -803,14 +830,19 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
             let title: String = r.get(1)?;
             let labels: Option<String> = r.get(2)?;
             let depends_on: Option<String> = r.get(3)?;
-            Ok((id, title, labels, depends_on))
+            let status: String = r.get(4)?;
+            Ok((id, title, labels, depends_on, status))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut blocked = Vec::new();
-    for (id, title, labels, depends_on) in rows {
-        let ready = crate::tasks::compute_ready(conn, &depends_on)?;
-        if ready {
-            continue;
+    for (id, title, labels, depends_on, status) in rows {
+        // Parked-unsatisfiable rows always render (they are the disposition
+        // queue). Open rows only render when they are actually blocked.
+        if status == "open" {
+            let ready = crate::tasks::compute_ready(conn, &depends_on)?;
+            if ready {
+                continue;
+            }
         }
         let waiting_on = unmet_deps(conn, &depends_on)?;
         let deadlocked_on = cancelled_deps(conn, &depends_on)?;
@@ -1847,6 +1879,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -2692,6 +2727,105 @@ mod tests {
         assert_eq!(b.deadlocked_on, vec![dep]);
     }
 
+    /// Task #473: a parked-unsatisfiable task (status='failed',
+    /// daemon_parked_unsatisfiable=1) surfaces in the BLOCKED section with
+    /// the cancelled dep id in `deadlocked_on`. Without this, the operator
+    /// has to spelunk the DB to find the disposition queue after the sweep
+    /// moves the task out of `status='open'`.
+    #[test]
+    fn blocked_section_surfaces_parked_unsatisfiable_tasks() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let parked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "parked-by-cancelled-dep",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![dep],
+        )
+        .unwrap();
+        // Simulate the sweep parking the dependent with unsatisfiable=true.
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_unsatisfiable', json('true'),
+                 'daemon_resume_status', 'open',
+                 'daemon_parked_reason', 'dependency #' || ?2 || ' is cancelled — unsatisfiable'
+             ) WHERE id=?1",
+            rusqlite::params![parked, dep],
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let b = s
+            .blocked
+            .iter()
+            .find(|task| task.id == parked)
+            .expect("parked-unsatisfiable task must render in the BLOCKED section");
+        assert_eq!(b.deadlocked_on, vec![dep]);
+    }
+
+    /// Task #473 R6 blocker 3: a classifier-policy park keeps its
+    /// authoritative "classifier declined" reason (retry is a
+    /// reclassification, not a dep restore), so the durable
+    /// `daemon_parked_unsatisfiable` marker is never set on it. BLOCKED
+    /// must still surface it when a dep is cancelled, otherwise the
+    /// operator disposition signal disappears after the generic alert
+    /// expires. Live dep-graph inference in `blocked_tasks` covers it.
+    #[test]
+    fn blocked_section_surfaces_policy_park_with_cancelled_dep() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let policy_parked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "policy-parked with cancelled dep",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![dep],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'classifier declined',
+                 'daemon_resume_status', 'open',
+                 'classifier_policy_parked', json('true')
+             ) WHERE id=?1",
+            rusqlite::params![policy_parked],
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let b = s
+            .blocked
+            .iter()
+            .find(|task| task.id == policy_parked)
+            .expect("policy park with cancelled dep must render in BLOCKED");
+        assert_eq!(b.deadlocked_on, vec![dep]);
+    }
+
     // -- Issue #97 scoreboard + retired list -----------------------------------
 
     #[test]
@@ -2773,6 +2907,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -2793,6 +2930,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -2843,6 +2983,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -3296,6 +3439,9 @@ mod tests {
                 pid: None,
                 pr: Some(102),
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();

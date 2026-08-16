@@ -261,6 +261,7 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
 /// review-follow-up history. Add here whenever a new durable FK to tasks(id) is
 /// introduced; the FK inventory test below fails when a new one is missed.
 const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
+    ("cancelled_dependency_reconciliation", "cancelled_task_id"),
     ("task_decompositions", "source_task_id"),
     ("task_graph_members", "task_id"),
     ("decomposition_cleanup", "task_id"),
@@ -429,10 +430,25 @@ pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<us
 }
 
 fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<usize> {
-    let doomed: Vec<(i64, i64, String)> = {
+    // Pick the failing dep to name in the park reason. A cancelled dep is
+    // terminal-terminal — the dependent can never dispatch without operator
+    // disposition — so it wins over a merely-failed dep, which may still be
+    // retried into `done`. Selecting a specific failed/cancelled dep also
+    // avoids the pre-existing hazard of naming a `done` sibling dep just
+    // because it happened to come first in the json_each iteration.
+    let doomed: Vec<(i64, Option<i64>, Option<i64>, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT t.id, je.value AS dep_id, t.status
-             FROM tasks t, json_each(t.depends_on) je
+            "SELECT t.id,
+                    (SELECT j.value FROM json_each(t.depends_on) j
+                     JOIN tasks d ON d.id = j.value
+                     WHERE d.status IN ('cancelled')
+                     ORDER BY j.value LIMIT 1) AS cancelled_dep,
+                    (SELECT j.value FROM json_each(t.depends_on) j
+                     JOIN tasks d ON d.id = j.value
+                     WHERE d.status IN ('failed')
+                     ORDER BY j.value LIMIT 1) AS failed_dep,
+                    t.status
+             FROM tasks t
              WHERE t.status IN ('open', 'rework')
                AND t.depends_on IS NOT NULL
                AND NOT EXISTS (
@@ -456,19 +472,25 @@ fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
         )?;
         let rows = stmt
             .query_map(params![now, limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
     let mut count = 0usize;
-    let mut seen = std::collections::HashSet::new();
-    for (task_id, failed_dep, resume_status) in &doomed {
-        if !seen.insert(*task_id) {
-            continue;
-        }
+    for (task_id, cancelled_dep, failed_dep, resume_status) in &doomed {
+        let (named_dep, unsatisfiable) = match (cancelled_dep, failed_dep) {
+            (Some(id), _) => (*id, true),
+            (None, Some(id)) => (*id, false),
+            // WHERE-clause already guarantees at least one failed/cancelled dep.
+            (None, None) => continue,
+        };
         let target = format!("task#{task_id}");
-        let reason = format!("dependency #{failed_dep} is terminal-not-done");
+        let reason = if unsatisfiable {
+            format!("dependency #{named_dep} is cancelled — unsatisfiable")
+        } else {
+            format!("dependency #{named_dep} is terminal-not-done")
+        };
         conn.execute(
             "UPDATE tasks
              SET status='failed',
@@ -477,11 +499,18 @@ fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                      COALESCE(refs, '{}'),
                      '$.daemon_parked', json('true'),
                      '$.daemon_parked_reason', ?1,
+                     '$.daemon_parked_unsatisfiable', json(?5),
                      '$.daemon_resume_status', ?2
                  ),
                  updated_at=?3
              WHERE id=?4",
-            params![reason, resume_status, now, task_id],
+            params![
+                reason,
+                resume_status,
+                now,
+                task_id,
+                if unsatisfiable { "true" } else { "false" },
+            ],
         )?;
         crate::decomposition::block_graph_if_child_failed(conn, *task_id, &reason, now)?;
         conn.execute(
@@ -507,6 +536,7 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // `claimed` task must become re-claimable on the next write).
     reap_lapsed_tasks(conn, now, limit)?;
     cascade_dead_deps(conn, now, limit)?;
+    crate::tasks::converge_cancelled_dependency_reconciliation(conn, now, limit)?;
     delete_bounded(conn, "messages", now, limit)?;
     delete_bounded(conn, "events", now, limit)?;
     delete_bounded(conn, "errors", now, limit)?;
@@ -535,6 +565,17 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     reap_lapsed_tasks(&tx, now, usize::MAX)?;
     cascade_dead_deps(&tx, now, usize::MAX)?;
+    while tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM cancelled_dependency_reconciliation)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        crate::tasks::converge_cancelled_dependency_reconciliation(
+            &tx,
+            now,
+            crate::tasks::CONVERGE_LIMIT,
+        )?;
+    }
     tx.execute("DELETE FROM messages WHERE expires_at <= ?1", params![now])?;
     tx.execute("DELETE FROM events WHERE expires_at <= ?1", params![now])?;
     tx.execute("DELETE FROM errors WHERE expires_at <= ?1", params![now])?;
@@ -1097,8 +1138,9 @@ mod tests {
         assert_eq!(alert.1, "alert");
         assert!(alert
             .2
-            .contains(&format!("dependency #{dep} is terminal-not-done")));
+            .contains(&format!("dependency #{dep} is cancelled — unsatisfiable")));
         assert!(alert.2.contains("quorum task-retry"));
+        assert_eq!(refs["daemon_parked_unsatisfiable"], true);
         assert_eq!(alert.3, format!("task:{child}"));
         assert_eq!(
             alert.4,
@@ -1108,6 +1150,106 @@ mod tests {
         assert_eq!(alert.5, "owner");
     }
 
+    /// Task #473: a merely-failed dep (recoverable) parks with the
+    /// terminal-not-done reason and daemon_parked_unsatisfiable=false; a
+    /// cancelled dep (unsatisfiable) uses the "cancelled — unsatisfiable"
+    /// reason and unsatisfiable=true. When both are present, cancelled wins
+    /// because it is terminal-terminal and drives the operator disposition.
+    #[test]
+    fn cascade_reason_distinguishes_cancelled_from_failed_deps() {
+        let (_d, mut c) = open_tmp();
+        let failed_dep = crate::tasks::create(
+            &mut c,
+            "boss",
+            "failed dep",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let cancelled_dep = crate::tasks::create(
+            &mut c,
+            "boss",
+            "cancelled dep",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let failed_only = crate::tasks::create(
+            &mut c,
+            "boss",
+            "child failed dep",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{failed_dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        let mixed = crate::tasks::create(
+            &mut c,
+            "boss",
+            "child mixed deps",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{failed_dep},{cancelled_dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', updated_at=200 WHERE id=?1",
+            params![failed_dep],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled', updated_at=200 WHERE id=?1",
+            params![cancelled_dep],
+        )
+        .unwrap();
+        assert_eq!(cascade_dead_deps(&c, 300, SWEEP_LIMIT).unwrap(), 2);
+
+        let f = crate::tasks::get(&c, failed_only).unwrap().unwrap();
+        let f_refs: serde_json::Value = serde_json::from_str(f.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(f_refs["daemon_parked"], true);
+        assert_eq!(f_refs["daemon_parked_unsatisfiable"], false);
+        assert_eq!(
+            f_refs["daemon_parked_reason"],
+            serde_json::Value::String(format!("dependency #{failed_dep} is terminal-not-done"))
+        );
+
+        let m = crate::tasks::get(&c, mixed).unwrap().unwrap();
+        let m_refs: serde_json::Value = serde_json::from_str(m.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(m_refs["daemon_parked_unsatisfiable"], true);
+        assert_eq!(
+            m_refs["daemon_parked_reason"],
+            serde_json::Value::String(format!(
+                "dependency #{cancelled_dep} is cancelled — unsatisfiable"
+            )),
+            "cancelled dep must be preferred over failed sibling in the reason"
+        );
+    }
+
+    /// Task #473 R6: the runtime convergence for
+    /// failed→open→cancelled deps is exercised by
+    /// `tasks::converge_parked_dependents_of_cancelled` — see
+    /// `converge_parked_dependents_of_cancelled_upgrades_stale_park` in
+    /// tasks.rs. The primary `cascade_dead_deps` no longer scans all failed
+    /// tasks per mutation (R6 blocker 2 removed that unbounded pass); this
+    /// module's remaining tests only cover the primary open/rework park.
     fn active_graph_with_dependency_park_child(
         c: &mut Connection,
         child_refs: Option<&str>,

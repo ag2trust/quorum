@@ -654,20 +654,67 @@ a durable parked state. Parking atomically:
 This applies to exhausted crash recovery, repeated instant worker death, merge-policy
 blocks, reviewer repository mismatch, reviewer provision exhaustion, and terminal
 not-done dependencies. The dependency cascade parks the dependent with resume status
-`open`; readiness remains false until all dependencies are `done`.
+`open`; readiness remains false until all dependencies are `done`. The cascade also
+distinguishes a merely-`failed` dependency (recoverable — the dep itself may still
+retry to `done`) from a `cancelled` dependency (terminal-terminal — no path exists
+back to `done` without a `depends_on` edit or closing the dependent). The park reason
+names the specific failing dep — a `cancelled` dep is preferred over a `failed`
+sibling because it drives the operator disposition — and the durable
+`daemon_parked_unsatisfiable=true` bit records the distinction in refs. Every other
+park path (`set_parked_refs`) clears any stale value so the marker is authoritative
+for the current park only. `quorum status` includes `daemon_parked_unsatisfiable=1`
+rows in the BLOCKED section with the cancelled dep in `deadlocked_on`, so the
+operator sees the disposition queue without DB inspection.
+
+Convergence when a dep transitions to `cancelled` runs in two coordinated
+layers:
+
+1. **Atomic at the cancellation:** `tasks::update` calls
+   `converge_parked_dependents_of_cancelled` inside the cancel transaction.
+   The transaction durably enqueues the cancelled task and examines one
+   primary-key-ordered page of raw task rows. Matching non-classifier-policy
+   daemon parks have their marker and reason upgraded before commit. The raw
+   page bound, rather than a post-filter result limit, bounds examined history.
+2. **Read-side inference in `stats::blocked_tasks`:** the BLOCKED section
+   surfaces every `status='failed'` daemon-parked task whose `depends_on`
+   currently contains any `cancelled` dep, regardless of the durable marker.
+   This covers cancellation paths that do not route through `tasks::update`
+   (decomposition-triggered cancels, direct test mutations, upgrade timing),
+   and covers queued rows awaiting durable reconciliation and
+   classifier-policy parks whose refs must not be overwritten
+   (their durable `daemon_parked_reason` stays "classifier declined").
+
+Bounded opportunistic write-sweeps advance one durable reconciliation cursor;
+explicit `sweep_all` drains the queue. Thus dependents beyond the cancellation-
+time page eventually receive durable refs through production paths. The v50
+migration performs the same durable repair at upgrade time on
+installed databases so pre-existing parks join the disposition queue
+immediately. Both the migration and the runtime convergence skip
+classifier-policy parks so the classifier cause is preserved; those rows
+still surface via the read-side inference. Convergence emits
+`task_parked_upgraded` and a task note; it does not duplicate the original
+owner alert. Each periodic pass examines at most one indexed raw-ID page, so
+mutation work is independent of retained failed-task history.
 
 `quorum task-retry --task-id N --by <operator>` is the sole resume operation for a
-daemon-parked task. It atomically validates the marker, clears it, resets only the crash
-recovery counter, and emits `task_retry`. `open`, `rework`, and `in-review` restore
-directly. A `rework` retry also records `daemon_rework_retry_requested=true`; startup
-recovery preserves it and the next daemon tick atomically claims and spawns a replacement
-worker on the same task and branch. A parked `merging` task restores to `in-review`
-because the original approval mailbox row and agents were consumed during teardown;
-the orphan-review reconciler obtains fresh R1/R2 approval before the next merge attempt.
-Retry does not change PR identity, approvals,
-dependencies, author/reviewer provenance, or rework count. An unparked or terminal task
-is a clean negative (exit 1). This explicit gate prevents hot respawn/provision loops:
-daemon ticks cannot retry a parked task until the operator requests it.
+daemon-parked task. It atomically validates the marker, clears it (including the
+unsatisfiable bit), resets only the crash recovery counter, and emits `task_retry`.
+`open`, `rework`, and `in-review` restore directly. A `rework` retry also records
+`daemon_rework_retry_requested=true`; startup recovery preserves it and the next
+daemon tick atomically claims and spawns a replacement worker on the same task and
+branch. A parked `merging` task restores to `in-review` because the original approval
+mailbox row and agents were consumed during teardown; the orphan-review reconciler
+obtains fresh R1/R2 approval before the next merge attempt. Retry does not change PR
+identity, approvals, dependencies, author/reviewer provenance, or rework count. An
+unparked or terminal task is a clean negative (exit 1). One additional clean negative
+(exit 1) fires when the parked task's `depends_on` still contains any `cancelled`
+task id: silently restoring the dependent would just have the sweep re-park it on
+the next tick while leaving the operator with no disposition signal. The CLI names
+the cancelled dep(s) in the JSON payload; the operator resolves it by editing
+`depends_on` (existing task-update guarded path) or closing the dependent. No
+automatic cancellation cascade is added. This explicit gate prevents hot
+respawn/provision loops: daemon ticks cannot retry a parked task until the operator
+requests it.
 
 Daemon startup also reconciles bounded batches of legacy/corrupt terminal rows carrying
 runnable remediation retry markers. `failed` parks retain their reason and explicit
@@ -699,7 +746,21 @@ conversation. Concretely:
   sibling paths, rather than only the most recent remediation commit. A new
   blocker in unchanged behavior must explain why it was not reasonably
   discoverable in the prior complete audit. Reviewers respond to author
-  pushback on the PR itself.
+  pushback on the PR itself. Each re-review publishes a cumulative disposition
+  section that lists prior BLOCKING findings, the author's claimed remedy or
+  response, and the current reviewer's independently determined disposition:
+  fixed, reaffirmed, downgraded/follow-up, overridden/accepted, or unresolved.
+  Findings first discovered in the current review are listed separately and
+  retain the late-blocker explanation requirement above. Because Quorum does
+  not currently have reliable structured extraction of PR review threads, the
+  daemon requires this standardized section rather than synthesizing finding
+  status. A daemon-provided ledger may later serve only as navigation context;
+  the PR discussion remains authoritative, and neither a pushed commit nor an
+  author's claim resolves a finding without the reviewer's current disposition.
+  Both prior and new sections have fixed entry limits, and each field has a
+  fixed Unicode-scalar limit. Explicit entry and field truncation directs the
+  reader to the PR for omitted authoritative history; omitted current blockers
+  still count in the verdict.
   Encouraged GitHub operations are normal comments, inline comments, and review
   summary comments. Formal APPROVE and REQUEST_CHANGES reviews remain daemon-owned
   because managed reviewers use the same GitHub account as PR authors.
@@ -1002,7 +1063,7 @@ The following must remain intact throughout the wait and across restarts:
 
 #### Restart reconciliation
 
-On daemon startup, before stateless recovery:
+On daemon startup, before generic crash recovery:
 
 1. **#228 approval recovery** runs first: scans `approvals` table, validates each role's
    verdict against the current PR head SHA via `next_missing_review_role(conn, pr, sha)`.
@@ -1014,6 +1075,14 @@ On daemon startup, before stateless recovery:
    `AgentFailed`, so the tick loop provisions the first missing role (#191).
 3. **Phase 5b** (orphan in-review tasks) checks for existing valid R1 approvals: if R1 is
    approved for the current PR SHA, it spawns R2 directly instead of re-running R1 (#191).
+
+A delivered respawn-per-turn worker is not an orphan while its review is pending. Its
+`awaiting-review` journal row has no PID and durably binds the agent/task, provider and exact
+continuation, worktree, local and publication branches, and PR. Startup preserves that row and
+worktree, verifies the live task claim plus task/run/capability/publication bindings, reserves the
+same name, and reconstructs a dormant capacity slot without launching a provider turn. Missing or
+mismatched identity is fatal recovery corruption; the row and name authority are not converted
+into a fresh worker assignment. Startup accepts PID omission only for this explicit dormant shape.
 
 Head-SHA invalidation on restart: the approval record stores `approved_head_sha`. On
 re-entry, `head_sha()` is queried and compared. If different, the approval is stale —
@@ -1429,8 +1498,9 @@ Do not mirror any CLI's complete schema. Preserve each raw JSON line in
 `stream.jsonl`, parse only fields Quorum consumes, render a compact normalized
 transcript, and ignore unknown events without advancing lifecycle state.
 
-`journal.session_id` becomes an opaque **runner continuation ID** while retaining its
-column name for schema compatibility:
+Task refs and dormant journal rows persist an opaque **runner continuation ID**. The journal's
+`session_id` remains the daemon session identity; a dormant row uses the provider-tagged
+`provider` and `continuation_id` fields so restart never infers one from the other:
 
 - Claude receives a Quorum-generated UUID before spawn.
 - Codex issues a thread ID in `thread.started`; Quorum persists it before relying on

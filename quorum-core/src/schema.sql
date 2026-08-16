@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 48). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 51). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS cursors (
 CREATE TABLE IF NOT EXISTS sweep_cursors (
     name  TEXT PRIMARY KEY,
     value INTEGER NOT NULL
+);
+
+-- v51: durable, bounded reconciliation after a dependency is cancelled. Each
+-- sweep examines one primary-key page, so retained task history cannot enlarge
+-- a cancellation transaction or an opportunistic write sweep.
+CREATE TABLE IF NOT EXISTS cancelled_dependency_reconciliation (
+    cancelled_task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+    task_cursor       INTEGER NOT NULL DEFAULT 0,
+    updated_at        INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS claims (
@@ -387,6 +396,12 @@ CREATE TABLE IF NOT EXISTS journal (
     pr              INTEGER,
     -- M7 crash recovery: rework round counter for limit enforcement across restarts.
     rework_count    INTEGER NOT NULL DEFAULT 0,
+    -- Restart-safe dormant turn identity. Nullable for ordinary running rows
+    -- and legacy journal history; awaiting-review dormant rows require all
+    -- three values and validate them before reconstruction.
+    provider        TEXT,
+    continuation_id TEXT,
+    local_branch    TEXT,
     updated_at      INTEGER NOT NULL
 );
 

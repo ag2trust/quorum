@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 49;
+pub const SCHEMA_VERSION: i64 = 52;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -745,6 +745,85 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // v49 adds immutable responsibility-scoped routing-attempt evidence.
         // The table, assignment guard, immutability triggers, and read index are
         // all additive and created idempotently by SCHEMA_SQL above.
+
+        // v50 backfills task #473's durable `daemon_parked_unsatisfiable` bit
+        // and the distinct "cancelled — unsatisfiable" reason onto rows already
+        // parked before this binary shipped. Without this, live examples
+        // (#308/#309, #313/#314, #318, #421/#422 in ag2trust/quorum on
+        // 2026-08-15) stay hidden from the BLOCKED disposition queue and
+        // indistinguishable from recoverable failed-dep parks — the exact
+        // operator symptom task #473 was opened to fix. Idempotent: the guard
+        // requires the marker to be missing/false, so a re-run at v50 is a
+        // no-op. Data-only backfill; no schema shape change.
+        // Run through v51 as well: task #426 independently shipped v50 for
+        // dormant-worker journal identity, so that lineage has not applied
+        // main's v50 data migration. The UPDATE remains idempotent by marker.
+        if current < 52 && column_exists(conn, "tasks", "depends_on")? {
+            conn.execute(
+                "UPDATE tasks
+                 SET refs = json_set(
+                         refs,
+                         '$.daemon_parked_unsatisfiable', json('true'),
+                         '$.daemon_parked_reason',
+                         'dependency #' ||
+                         (SELECT j.value FROM json_each(tasks.depends_on) j
+                          JOIN tasks d ON d.id = j.value
+                          WHERE d.status IN ('cancelled')
+                          ORDER BY j.value LIMIT 1)
+                         || ' is cancelled — unsatisfiable'
+                     )
+                 WHERE status='failed'
+                   AND depends_on IS NOT NULL
+                   AND json_valid(refs)
+                   AND json_extract(refs, '$.daemon_parked')=1
+                   -- Same rule as `upgrade_stale_recoverable_parks` in
+                   -- sweep.rs: classifier-policy parks own their own
+                   -- lifecycle (reason 'classifier declined', retry stays
+                   -- in `failed` as a reclassification request) and must
+                   -- not be relabeled as unsatisfiable-dep parks.
+                   -- Diverging here would make behavior depend on upgrade
+                   -- timing.
+                   AND COALESCE(
+                       json_extract(refs, '$.classifier_policy_parked'), 0
+                   ) != 1
+                   AND COALESCE(
+                       json_extract(refs, '$.daemon_parked_unsatisfiable'), 0
+                   ) != 1
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(tasks.depends_on) j
+                       JOIN tasks d ON d.id = j.value
+                       WHERE d.status IN ('cancelled')
+                   )",
+                [],
+            )?;
+        }
+        // v51 adds a durable cursor queue for bounded cancelled-dependency
+        // reconciliation. The idempotent table is declared in SCHEMA_SQL;
+        // repeat it here to make the versioned shape explicit.
+        if current < 51 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS cancelled_dependency_reconciliation (
+                     cancelled_task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+                     task_cursor       INTEGER NOT NULL DEFAULT 0,
+                     updated_at        INTEGER NOT NULL
+                 );",
+            )?;
+        }
+        // v52 converges main's v50/v51 migrations with task #426's
+        // independently shipped v50 dormant-worker journal identity. Fresh
+        // databases receive these nullable columns from SCHEMA_SQL; guarded
+        // ALTERs upgrade either published lineage without rewriting history.
+        if current < 52 {
+            if !column_exists(conn, "journal", "provider")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN provider TEXT", [])?;
+            }
+            if !column_exists(conn, "journal", "continuation_id")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN continuation_id TEXT", [])?;
+            }
+            if !column_exists(conn, "journal", "local_branch")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN local_branch TEXT", [])?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -839,9 +918,49 @@ mod tests {
     }
 
     #[test]
-    fn populated_v48_migration_adds_immutable_routing_attempts_idempotently() {
+    fn main_v49_migration_adds_dormant_journal_identity_without_backfill() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v48.db");
+        let path = dir.path().join("main-v49-dormant-journal.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO journal(agent,role,task_id,session_id,phase,updated_at)
+                 VALUES ('legacy','worker',7,'session','working',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE journal DROP COLUMN provider;
+                 ALTER TABLE journal DROP COLUMN continuation_id;
+                 ALTER TABLE journal DROP COLUMN local_branch;
+                 PRAGMA user_version=49;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        for column in ["provider", "continuation_id", "local_branch"] {
+            assert!(column_exists(&conn, "journal", column).unwrap());
+        }
+        let legacy: (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT provider,continuation_id,local_branch FROM journal WHERE agent='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy, (None, None, None));
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn dormant_worker_v49_migration_adds_immutable_routing_attempts_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dormant-worker-v49.db");
         {
             let conn = Connection::open(&path).unwrap();
             apply_pragmas(&conn).unwrap();
@@ -868,7 +987,7 @@ mod tests {
                      runner,model,effort,pool_key,policy_generation,created_at)
                  VALUES (9,'worker:task:9',9,'worker','M','opus','claude','claude',
                          'claude-opus-4-8','high','worker.M','generation-1',10);
-                 PRAGMA user_version=48;",
+                 PRAGMA user_version=49;",
             )
             .unwrap();
         }
@@ -3886,6 +4005,173 @@ mod tests {
                 .unwrap()
                 .pr,
             71
+        );
+    }
+
+    /// Task #473: rows parked before this binary shipped carry the legacy
+    /// `terminal-not-done` reason and lack the new `daemon_parked_unsatisfiable`
+    /// bit, so `stats::blocked_tasks` (which requires the bit) would hide the
+    /// exact operator disposition queue the task was opened to surface. The
+    /// v50 migration must backfill both refs onto the pre-existing rows,
+    /// leave recoverable failed-dep parks untouched, and be idempotent.
+    #[test]
+    fn migrates_v49_to_v50_backfills_cancelled_dependency_park_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v49-backfill.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                     VALUES
+                         (1,'cancelled-dep','cancelled','owner',1,1),
+                         (2,'failed-dep','failed','owner',1,1),
+                         (3,'legacy park cancelled','failed','owner',1,1),
+                         (4,'legacy park failed only','failed','owner',1,1),
+                         (5,'legacy park no deps','failed','owner',1,1),
+                         (6,'open with cancelled dep','open','owner',1,1),
+                         (7,'v49 policy park cancelled dep','failed','owner',1,1);
+                 UPDATE tasks SET depends_on='[1,2]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"dependency #1 is terminal-not-done\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=3;
+                 UPDATE tasks SET depends_on='[2]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"dependency #2 is terminal-not-done\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=4;
+                 UPDATE tasks SET refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"other reason\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=5;
+                 UPDATE tasks SET depends_on='[1]' WHERE id=6;
+                 UPDATE tasks SET depends_on='[1]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"classifier declined\",
+                             \"daemon_resume_status\": \"open\",
+                             \"classifier_policy_parked\": true}'
+                     WHERE id=7;
+                 PRAGMA user_version=49;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let refs3: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=3", [], |r| r.get(0))
+            .unwrap();
+        let v3: serde_json::Value = serde_json::from_str(&refs3).unwrap();
+        assert_eq!(v3["daemon_parked_unsatisfiable"], true);
+        assert_eq!(
+            v3["daemon_parked_reason"],
+            "dependency #1 is cancelled — unsatisfiable"
+        );
+
+        // Recoverable failed-only park stays untouched: no marker, original
+        // terminal-not-done reason preserved so operators still see the
+        // recoverable text.
+        let refs4: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=4", [], |r| r.get(0))
+            .unwrap();
+        let v4: serde_json::Value = serde_json::from_str(&refs4).unwrap();
+        assert!(v4.get("daemon_parked_unsatisfiable").is_none());
+        assert_eq!(
+            v4["daemon_parked_reason"],
+            "dependency #2 is terminal-not-done"
+        );
+
+        // Parks without any depends_on aren't touched.
+        let refs5: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=5", [], |r| r.get(0))
+            .unwrap();
+        let v5: serde_json::Value = serde_json::from_str(&refs5).unwrap();
+        assert!(v5.get("daemon_parked_unsatisfiable").is_none());
+        assert_eq!(v5["daemon_parked_reason"], "other reason");
+
+        // Open (non-failed) rows aren't touched by the parked-only backfill;
+        // the cascade will park them via the new production path.
+        let refs6: Option<String> = conn
+            .query_row("SELECT refs FROM tasks WHERE id=6", [], |r| r.get(0))
+            .unwrap();
+        assert!(refs6.is_none());
+
+        // Classifier-policy parks with a cancelled dep are NOT relabeled:
+        // the migration and the runtime convergence pass must apply one
+        // coherent rule, and policy parks own their own lifecycle.
+        let refs7: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=7", [], |r| r.get(0))
+            .unwrap();
+        let v7: serde_json::Value = serde_json::from_str(&refs7).unwrap();
+        assert!(v7.get("daemon_parked_unsatisfiable").is_none());
+        assert_eq!(v7["daemon_parked_reason"], "classifier declined");
+        assert_eq!(v7["classifier_policy_parked"], true);
+
+        // Idempotent: re-opening from the migrated DB does not double-write.
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        let refs3_again: String = reopened
+            .query_row("SELECT refs FROM tasks WHERE id=3", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(refs3_again, refs3);
+    }
+
+    #[test]
+    fn migrates_colliding_v50_to_v52_with_backfill_queue_and_journal_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("colliding-v50.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                     VALUES
+                         (1,'cancelled','cancelled','owner',1,1),
+                         (2,'legacy park','failed','owner',1,1);
+                 UPDATE tasks SET depends_on='[1]',
+                     refs='{\"daemon_parked\": true,
+                             \"daemon_parked_reason\": \"dependency #1 is terminal-not-done\",
+                             \"daemon_resume_status\": \"open\"}'
+                     WHERE id=2;
+                 DROP TABLE cancelled_dependency_reconciliation;
+                 PRAGMA user_version=50;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let refs: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=2", [], |row| row.get(0))
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["daemon_parked_unsatisfiable"], true);
+        for column in ["provider", "continuation_id", "local_branch"] {
+            assert!(column_exists(&conn, "journal", column).unwrap());
+        }
+        conn.execute(
+            "INSERT INTO cancelled_dependency_reconciliation(
+                 cancelled_task_id,task_cursor,updated_at
+             ) VALUES (1,64,2)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT task_cursor FROM cancelled_dependency_reconciliation
+                 WHERE cancelled_task_id=1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            64
         );
     }
 }

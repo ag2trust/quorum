@@ -520,6 +520,101 @@ fn policy_park_task_retry_succeeds_audits_and_resets_recovery_budget() {
     assert_eq!(retry_events, 1);
 }
 
+/// Task #473: `task-retry` on a dependent whose depends_on contains a
+/// cancelled task must exit 1 naming the cancelled dep and NOT restore the
+/// dependent (the sweep would just re-park it and give the operator no
+/// disposition signal). A merely-failed dep is still recoverable and must
+/// restore normally. After the operator edits depends_on to drop the
+/// cancelled id, the parked task retries clean.
+#[test]
+fn task_retry_refuses_when_a_dependency_is_cancelled() {
+    let home = tempfile::tempdir().unwrap();
+    // dep=1 (will be cancelled), dep=2 (will be failed → recoverable),
+    // parked=3 (depends on 1 + 2), parked_failed_only=4 (depends on 2).
+    for title in [
+        "cancelled dep",
+        "failed dep",
+        "parked dependent",
+        "recoverable dependent",
+    ] {
+        quorum(home.path())
+            .args(["task-create", "--created-by", "boss", "--title", title])
+            .assert()
+            .success();
+    }
+    let db = home.path().join("repos/test__repo/quorum.db");
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute("UPDATE tasks SET status='cancelled' WHERE id=1", [])
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=2", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET depends_on='[1,2]',
+                              status='failed',
+                              refs=json_object(
+                                  'daemon_parked', json('true'),
+                                  'daemon_parked_unsatisfiable', json('true'),
+                                  'daemon_resume_status', 'open',
+                                  'daemon_parked_reason', 'dependency #1 is cancelled — unsatisfiable'
+                              )
+             WHERE id=3",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET depends_on='[2]',
+                              status='failed',
+                              refs=json_object(
+                                  'daemon_parked', json('true'),
+                                  'daemon_parked_unsatisfiable', json('false'),
+                                  'daemon_resume_status', 'open',
+                                  'daemon_parked_reason', 'dependency #2 is terminal-not-done'
+                              )
+             WHERE id=4",
+            [],
+        )
+        .unwrap();
+    }
+
+    // Unsatisfiable dep → exit 1, JSON names the cancelled dep, no errors row.
+    quorum(home.path())
+        .args(["task-retry", "--task-id", "3", "--by", "operator"])
+        .assert()
+        .code(1)
+        .stdout(predicates::str::contains("\"ok\":false"))
+        .stdout(predicates::str::contains("cancelled — unsatisfiable"))
+        .stdout(predicates::str::contains("\"cancelled_deps\":[1]"));
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        let t3 = quorum_core::tasks::get(&conn, 3).unwrap().unwrap();
+        assert_eq!(t3.status, "failed", "must not silently restore #3");
+        let errs: i64 = conn
+            .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(errs, 0, "clean negative (exit 1) must not log errors");
+    }
+
+    // Recoverable failed-only dep → restores to the persisted resume status.
+    quorum(home.path())
+        .args(["task-retry", "--task-id", "4", "--by", "operator"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"open\""));
+
+    // Operator edits depends_on to drop the cancelled id → retry proceeds.
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute("UPDATE tasks SET depends_on='[2]' WHERE id=3", [])
+            .unwrap();
+    }
+    quorum(home.path())
+        .args(["task-retry", "--task-id", "3", "--by", "operator"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"open\""));
+}
+
 #[test]
 fn release_then_reclaim_hands_off_task() {
     // Hand-off under the lease model: the holder releases (→ open), then another agent claims.

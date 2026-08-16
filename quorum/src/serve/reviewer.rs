@@ -21,9 +21,14 @@
 //!   post findings as inline and summary comments; the daemon posts formal
 //!   approval or request-changes from the reviewer verdict as the merge account.
 
+use super::rereview_builder::review_round_contract;
 use super::review_cycle_context::ReviewCycleContext;
 use super::runner::AgentKind;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+pub use super::rereview_builder::build_rereview_turn;
+pub use super::rereview_builder::build_rereview_turn_with_context;
 
 pub struct ReviewerSpec {
     pub pr: i64,
@@ -66,7 +71,7 @@ pub fn task_review_contract(
 /// Reviewers must finish the planned audit for a SHA before their lifecycle
 /// verdict. This deliberately asks for coverage of related paths without
 /// demanding speculative findings or an audit of unrelated code.
-const COMPLETE_REVIEW_CONTRACT: &str = "\
+pub(super) const COMPLETE_REVIEW_CONTRACT: &str = "\
 ## Complete-review requirement\n\n\
 Complete the planned review before submitting a verdict. Coverage, not the number of \
 findings, determines when the review is complete: audit the full current diff, surrounding \
@@ -85,7 +90,7 @@ comments where needed, that reports the complete BLOCKING and FOLLOW-UP set disc
 
 /// Shared two-axis finding policy. Keeping this in one bounded block prevents
 /// R1, R2, generated-child, and re-review prompts from drifting apart.
-const REVIEW_FINDING_CONTRACT: &str = "\
+pub(super) const REVIEW_FINDING_CONTRACT: &str = "\
 ## Finding impact and merge disposition\n\n\
 Classify every substantive finding on two independent axes:\n\
 1. Technical impact: critical, major, minor, or nit — how serious the concrete failure is \
@@ -128,7 +133,7 @@ Managed Tasks for follow-ups.\n";
 
 /// CI and author-side verification are daemon concerns, never review findings.
 /// This wording is shared by every reviewer prompt.
-const REVIEWER_VERIFICATION_BOUNDARY: &str = "\
+pub(super) const REVIEWER_VERIFICATION_BOUNDARY: &str = "\
 Do NOT run tests, builds, formatters, or linters locally. Do not inspect, report, or block \
 on CI status or PR-body verification evidence, formatting, transcripts, links, headings, \
 tokens, or checklists. The daemon alone gates reviewer provisioning and merge on the \
@@ -233,7 +238,7 @@ pub fn build_review_prompt_for_kind_with_context_and_cycle(
     review_cycle: Option<ReviewCycleContext>,
 ) -> String {
     let review_cycle_contract = review_cycle
-        .map(ReviewCycleContext::prompt_contract)
+        .map(|context| review_round_contract(spec.pr, context))
         .unwrap_or_default();
     match kind {
         AgentKind::Claude => format!(
@@ -250,7 +255,7 @@ pub fn build_review_prompt_for_kind_with_context_and_cycle(
     }
 }
 
-fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&str>) -> String {
+pub(super) fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&str>) -> String {
     let Some(context) = context else {
         return String::new();
     };
@@ -369,7 +374,7 @@ pub fn build_r2_review_prompt_for_kind_with_context_and_cycle(
     review_cycle: Option<ReviewCycleContext>,
 ) -> String {
     let review_cycle_contract = review_cycle
-        .map(ReviewCycleContext::prompt_contract)
+        .map(|context| review_round_contract(spec.pr, context))
         .unwrap_or_default();
     match kind {
         AgentKind::Claude => format!(
@@ -611,82 +616,6 @@ pub fn build_worker_turn(
         title,
         body,
         max_task_cost_usd,
-    ))
-}
-
-#[cfg(test)]
-pub fn build_rereview_turn(
-    reviewer_name: &str,
-    pr: i64,
-    worker_agent: &str,
-    effort: &str,
-) -> String {
-    build_rereview_turn_with_context(
-        reviewer_name,
-        pr,
-        worker_agent,
-        effort,
-        None,
-        // This test-only compatibility helper builds a re-review, whose first
-        // possible persisted value is one completed transition.
-        ReviewCycleContext::from_persisted_rework_round(1),
-    )
-}
-
-pub fn build_rereview_turn_with_context(
-    reviewer_name: &str,
-    pr: i64,
-    worker_agent: &str,
-    effort: &str,
-    graph_context: Option<&str>,
-    review_cycle: ReviewCycleContext,
-) -> String {
-    super::agent::user_turn(&format!(
-        "The author ({worker}) pushed rework for PR #{pr}. Re-review the updated diff.\n\n\
-         Verify the branch actually advanced (new commits since prior review) — approving \
-         an unchanged diff over prior blocking findings is forbidden.\n\n\
-         Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
-         for the review methodology. If the builtin skill is unavailable, read the full \
-         PR diff and surrounding code and check the repo CLAUDE.md invariants.\n\n\
-         Verify prior fixes by reading the prior review thread on the PR. Then re-audit the \
-         full current diff and relevant sibling paths; do not narrowly inspect only the last \
-         remediation commit.\n\n\
-         {review_cycle_contract}\n\
-         {complete_review_contract}\n\
-         {finding_contract}\n\
-         The PR is the source of truth for this review:\n\
-         - Read the prior review thread on the PR. For each earlier finding, resolve it on \
-         the PR — mark it fixed, downgrade it, or reaffirm it — so a later reader can \
-         determine fixed / accepted / overridden / unaddressed outcomes. Do not silently \
-         drop a prior blocker.\n\
-         - Post new findings to the PR (inline where a specific file/line is involved, \
-         summary comment for cross-cutting findings) and reply to author pushback there.\n\
-         - Encouraged GitHub operations: normal PR comments, inline comments, and review summary \
-         comments.\n\
-         - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
-         --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
-         your verdict as the merge account and owns merge.\n\n\
-         {verification_boundary}\n\
-         Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
-         --verdict approved --blocking 0\n\
-         - One or more blocking findings: write a short blocker summary to a temp file, then \
-         run: quorum submit --agent {name} --pr {pr} --verdict changes --blocking <count> \
-         --feedback-file <path>\n\
-         - The feedback file is a lifecycle-signal summary; the authoritative \
-         findings must already be on the PR.\n\n\
-         Do NOT merge the PR yourself — the daemon handles merging.\n\
-         Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
-         approval as the merge account after your verdict.\n\
-         Do NOT mark the task done yourself — the daemon handles task lifecycle.{graph_contract}",
-        worker = worker_agent,
-        name = reviewer_name,
-        pr = pr,
-        complete_review_contract = COMPLETE_REVIEW_CONTRACT,
-        finding_contract = REVIEW_FINDING_CONTRACT,
-        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
-        graph_contract = graph_review_contract(reviewer_name, pr, graph_context),
-        review_cycle_contract = review_cycle.prompt_contract(),
     ))
 }
 
@@ -1508,9 +1437,11 @@ mod tests {
             r2_name: "Rev-2".into(),
         };
         for kind in [AgentKind::Claude, AgentKind::Codex] {
+            let initial = build_review_prompt_for_kind(kind, &spec, "high");
+            assert!(!initial.contains("Review-cycle context"));
             assert!(
-                !build_review_prompt_for_kind(kind, &spec, "high").contains("Review-cycle context"),
-                "the initial review is not a rework round"
+                !initial.contains("Required cumulative cross-round review ledger"),
+                "the initial review has no cross-round ledger"
             );
         }
 
@@ -1534,6 +1465,40 @@ mod tests {
             );
             assert!(r1.contains("final review opportunity"));
             assert!(r2.contains("final review opportunity"));
+            for (role, prompt) in [("R1", r1), ("R2", r2)] {
+                assert!(
+                    prompt.contains("Required cumulative cross-round review ledger")
+                        && prompt.contains("### Prior BLOCKING findings")
+                        && prompt.contains("### Newly discovered findings"),
+                    "{kind:?} recovered {role} must require the cumulative ledger"
+                );
+                assert!(
+                    prompt.contains(
+                        "TRUNCATED: additional ledger history omitted; read PR #42 discussion"
+                    ),
+                    "{kind:?} recovered {role} must carry explicit PR-directed truncation"
+                );
+                assert!(
+                    prompt.contains("daemon to fail the task because the rework cap is exhausted"),
+                    "{kind:?} {role} must state the lifecycle-owned final consequence"
+                );
+                assert!(
+                    prompt.contains(
+                        "Do not approve, downgrade, omit, or defer a valid BLOCKING finding"
+                    ),
+                    "{kind:?} {role} must resist final-round approval pressure"
+                );
+                assert!(
+                    prompt.contains(
+                        "Zero blockers is valid only after a complete independent review"
+                    ),
+                    "{kind:?} {role} must retain independent zero-blocker calibration"
+                );
+                assert!(
+                    !prompt.contains("approve because") && !prompt.contains("must approve"),
+                    "{kind:?} {role} must not pressure approval on the final opportunity"
+                );
+            }
         }
         let claude_turn =
             build_rereview_turn_with_context("Rev-1", 42, "Worker-1", "high", None, context);
@@ -1544,6 +1509,16 @@ mod tests {
             "the runner receives one neutral turn"
         );
         assert!(claude_turn.contains("final review opportunity"));
+        assert!(claude_turn.contains("Required cumulative cross-round review ledger"));
+        assert!(claude_turn.contains("### Prior BLOCKING findings"));
+        assert!(claude_turn.contains("### Newly discovered findings"));
+        assert!(claude_turn.contains("daemon to fail the task because the rework cap is exhausted"));
+        assert!(claude_turn
+            .contains("Do not approve, downgrade, omit, or defer a valid BLOCKING finding"));
+        assert!(
+            claude_turn.contains("Zero blockers is valid only after a complete independent review")
+        );
+        assert!(!claude_turn.contains("approve because") && !claude_turn.contains("must approve"));
         assert!(!claude_turn.contains("review round"));
     }
 
