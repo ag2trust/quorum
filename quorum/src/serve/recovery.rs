@@ -2,8 +2,8 @@
 //!
 //! On startup:
 //! 1. Kill all stale process groups (from journal PIDs)
-//! 2. Reconstruct validated dormant review/merge-wait Codex workers in place
-//!    and retire rows already transferred to authoritative rework/graph-block state
+//! 2. Reconstruct validated dormant review/merge-wait/rework Codex workers in place
+//!    and retire rows transferred to fresh-retry/graph-block authority
 //! 3. Delete stale/retired journal entries and GC only non-recovered worktrees
 //! 4. Scan non-terminal tasks and reset them to states the normal tick
 //!    loop can handle:
@@ -11,7 +11,8 @@
 //!    - `merging` → AgentFailed → in-review (Phase 5 spawns reviewer)
 //!    - `in-review` → left as-is (Phase 5 spawns reviewer)
 //!
-//! No provider turn is launched during dormant reconstruction.
+//! Reconstructed rework turns are marked for the startup coordinator to resume
+//! only after exact PR-baseline recovery.
 
 use super::worktree::WorktreeManager;
 use super::{log, LifetimeRoster, LiveStats, ServeConfig, SlotProcess, SlotState};
@@ -34,6 +35,8 @@ struct DormantRecovery {
     effort: String,
     agent_run_id: i64,
     cap_run_id: String,
+    rework_feedback: Option<String>,
+    needs_rework_claim: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +139,8 @@ fn validate_dormant_recovery(
     // worker only while review/merge authority still needs its exact slot;
     // accepted rework and graph-block transitions instead retire the stale
     // runtime row after every immutable binding below has been revalidated.
+    let mut rework_feedback = None;
+    let mut needs_rework_claim = false;
     let task_disposition = match task.status.as_str() {
         "in-review" | "merging" => {
             if claim_holder.as_deref() != Some(entry.agent.as_str()) {
@@ -150,21 +155,49 @@ fn validate_dormant_recovery(
                 .get(tasks::PARKED_REWORK_RETRY_REF)
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let feedback_present = refs
+            let feedback = refs
                 .get("remediation_feedback")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|feedback| !feedback.trim().is_empty());
-            if !retry_requested || !feedback_present {
-                return Err(invalid(format!(
-                    "stale journal: task #{task_id} entered rework without an authoritative retry"
-                )));
+                .or_else(|| {
+                    refs.get(tasks::CI_REMEDIATION_FEEDBACK_REF)
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(str::trim)
+                .filter(|feedback| !feedback.is_empty())
+                .map(str::to_string);
+            if retry_requested {
+                if feedback.is_none() {
+                    return Err(invalid(format!(
+                        "stale journal: task #{task_id} entered rework without an authoritative retry"
+                    )));
+                }
+                if task.assignee.is_some() || claim_holder.is_some() {
+                    return Err(invalid(format!(
+                        "claim mismatch: authoritative rework task #{task_id} retained runtime ownership"
+                    )));
+                }
+                Some("late reviewer changes verdict")
+            } else {
+                match (task.assignee.as_deref(), claim_holder.as_deref()) {
+                    (None, None) => needs_rework_claim = true,
+                    (Some(assignee), None) if assignee == entry.agent => needs_rework_claim = true,
+                    (Some(assignee), Some(holder))
+                        if assignee == entry.agent && holder == entry.agent => {}
+                    _ => {
+                        return Err(invalid(format!(
+                            "claim mismatch: sticky rework task #{task_id} is not owned wholly by this agent"
+                        )));
+                    }
+                }
+                rework_feedback = Some(feedback.unwrap_or_else(|| {
+                    format!(
+                        "Daemon restart interrupted the pending rework handoff for PR #{pr}. \
+                         Inspect the current review, CI, and merge state; resolve the actionable \
+                         blocker, commit, and submit the existing PR again without pushing."
+                    )
+                }));
+                None
             }
-            if task.assignee.is_some() || claim_holder.is_some() {
-                return Err(invalid(format!(
-                    "claim mismatch: authoritative rework task #{task_id} retained runtime ownership"
-                )));
-            }
-            Some("late reviewer changes verdict")
         }
         "failed" => {
             let graph_blocked: bool = conn.query_row(
@@ -284,6 +317,8 @@ fn validate_dormant_recovery(
         effort: run.effort.clone(),
         agent_run_id: run.id,
         cap_run_id: capability.run_id,
+        rework_feedback,
+        needs_rework_claim,
     };
     Ok(match task_disposition {
         Some(reason) => DormantRecoveryDisposition::Retire {
@@ -319,6 +354,39 @@ async fn verify_dormant_worktree(
         )
         .await
         .map_err(|error| invalid(format!("artifact mismatch: {error}")))?;
+    Ok(())
+}
+
+async fn install_recovered_rework_claim(db_path: &Path, recovery: &DormantRecovery) -> Result<()> {
+    if !recovery.needs_rework_claim {
+        return Ok(());
+    }
+    let path = db_path.to_path_buf();
+    let agent = recovery.entry.agent.clone();
+    let task_id = recovery.task_id;
+    let feedback = recovery
+        .rework_feedback
+        .clone()
+        .ok_or_else(|| dormant_recovery_error(&agent, "missing recovered rework feedback"))?;
+    let claimed = tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
+        let mut conn = quorum_core::db::open(&path)?;
+        tasks::claim_remediation_rework_with_feedback(
+            &mut conn,
+            &agent,
+            task_id,
+            tasks::DEFAULT_LEASE_TTL_SECS,
+            super::now_unix(),
+            Some(&feedback),
+        )
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("recovered rework claim join: {error}")))??;
+    if claimed.is_none() {
+        return Err(dormant_recovery_error(
+            &recovery.entry.agent,
+            format!("could not re-install sticky lease for task #{task_id}"),
+        ));
+    }
     Ok(())
 }
 
@@ -389,8 +457,12 @@ fn reconstruct_dormant_slots(
             r2_origin: false,
             reviewed_head_sha: None,
             continuation_id: Some(recovery.continuation_id.clone()),
-            pending_prompt: String::new(),
-            pending_turn_kind: "awaiting-review".into(),
+            pending_prompt: recovery.rework_feedback.clone().unwrap_or_default(),
+            pending_turn_kind: if recovery.rework_feedback.is_some() {
+                "recovered-rework".into()
+            } else {
+                "awaiting-review".into()
+            },
         });
         log(&format!(
             "recovery: reconstructed dormant worker {} for task #{} PR #{}",
@@ -571,6 +643,9 @@ pub(crate) async fn recover(
     for recovery in &recoveries {
         verify_dormant_worktree(config, wt_mgr, recovery).await?;
     }
+    for recovery in &recoveries {
+        install_recovered_rework_claim(&config.db_path, recovery).await?;
+    }
 
     // ── Phase 1b: Revoke run capabilities for stale agents (#130) ──────
     if !entries.is_empty() {
@@ -654,7 +729,14 @@ pub(crate) async fn recover(
     // merging → AgentFailed → in-review (Phase 5 spawns a reviewer)
     // in-review → left as-is (Phase 5 spawns a reviewer)
     //
-    // #130: no passive exemption — all working/rework tasks are reset.
+    // #130: ordinary working/rework tasks have no passive exemption. Exact
+    // validated dormant rework continuations are active recovered authority
+    // and must survive until the startup coordinator resumes their turn.
+    let recovered_rework_tasks = recoveries
+        .iter()
+        .filter(|recovery| recovery.rework_feedback.is_some())
+        .map(|recovery| recovery.task_id)
+        .collect::<std::collections::HashSet<_>>();
     for status in &["working", "rework"] {
         let p = db_path.clone();
         let s = status.to_string();
@@ -667,6 +749,13 @@ pub(crate) async fn recover(
         .unwrap_or_default();
 
         for task in tasks_in_state {
+            if recovered_rework_tasks.contains(&task.id) {
+                log(&format!(
+                    "recovery: preserving exact dormant rework continuation for task #{}",
+                    task.id
+                ));
+                continue;
+            }
             let retry_queued = task
                 .refs
                 .as_deref()
@@ -1097,6 +1186,149 @@ mod tests {
         }
     }
 
+    fn assert_recovered_sticky_rework(fixture: &DormantFixture, workers: &[SlotState]) {
+        assert_eq!(workers.len(), 1);
+        let worker = &workers[0];
+        assert_eq!(worker.agent_name, "Dormant");
+        assert_eq!(worker.pending_turn_kind, "recovered-rework");
+        assert!(!worker.pending_prompt.trim().is_empty());
+        assert!(matches!(worker.proc, SlotProcess::Dormant { .. }));
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.assignee.as_deref(), Some("Dormant"));
+        let holders: Vec<String> = conn
+            .prepare(
+                "SELECT holder FROM claims
+                 WHERE target=?1 AND active=1 AND expires_at>?2",
+            )
+            .unwrap()
+            .query_map(
+                rusqlite::params![
+                    tasks::lease_target(fixture.task_id),
+                    super::super::now_unix()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(holders, vec!["Dormant".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_sticky_rework_before_replacement_lease() {
+        let fixture = dormant_fixture();
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='rework',assignee='Dormant',
+                 refs=json_set(refs,'$.remediation_feedback','fix the reviewer blocker')
+             WHERE id=?1",
+            [fixture.task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE claims SET active=0 WHERE target=?1",
+            [tasks::lease_target(fixture.task_id)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+        assert_recovered_sticky_rework(&fixture, &workers);
+
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+        assert_recovered_sticky_rework(&fixture, &workers);
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_sticky_rework_after_replacement_lease() {
+        let fixture = dormant_fixture();
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='rework',assignee=NULL WHERE id=?1",
+            [fixture.task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE claims SET active=0 WHERE target=?1",
+            [tasks::lease_target(fixture.task_id)],
+        )
+        .unwrap();
+        tasks::claim_remediation_rework_with_feedback(
+            &mut conn,
+            "Dormant",
+            fixture.task_id,
+            tasks::DEFAULT_LEASE_TTL_SECS,
+            super::super::now_unix(),
+            Some("fix the reviewer blocker"),
+        )
+        .unwrap()
+        .unwrap();
+        drop(conn);
+
+        let mut workers = Vec::new();
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut super::super::names::Pool::new_generated(),
+            &mut workers,
+            &mut LifetimeRoster::new(),
+        )
+        .await
+        .unwrap();
+        assert_recovered_sticky_rework(&fixture, &workers);
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_sticky_pre_review_ci_rework() {
+        let fixture = dormant_fixture();
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        tasks::apply_checks_failed_with_remediation(
+            &mut conn,
+            fixture.task_id,
+            901,
+            "head-sha",
+            &["unit".into()],
+            "fix failing CI",
+            super::super::now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut workers = Vec::new();
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut super::super::names::Pool::new_generated(),
+            &mut workers,
+            &mut LifetimeRoster::new(),
+        )
+        .await
+        .unwrap();
+        assert_recovered_sticky_rework(&fixture, &workers);
+        assert_eq!(workers[0].pending_prompt, "fix failing CI");
+    }
+
     #[tokio::test]
     async fn late_changes_retires_dormant_runtime_into_authoritative_rework_retry() {
         let fixture = dormant_fixture();
@@ -1401,6 +1633,11 @@ mod tests {
                      '$.daemon_rework_retry_requested',json('true'),
                      '$.remediation_feedback','fix blocker')",
                 "retained runtime ownership",
+            ),
+            (
+                "UPDATE tasks SET status='rework',assignee='Other';
+                 UPDATE claims SET active=0 WHERE active=1",
+                "not owned wholly by this agent",
             ),
         ] {
             let fixture = dormant_fixture();

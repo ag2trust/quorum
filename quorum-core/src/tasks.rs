@@ -1711,9 +1711,10 @@ pub fn recover_late_reviewer_verdict(
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
-    let role: Option<String> = tx
+    let reviewer_state: Option<(String, String)> = tx
         .query_row(
-            "SELECT CASE WHEN ar.sub_role='r2' THEN 'r2' WHEN ar.sub_role IS NULL THEN 'r1' END
+            "SELECT CASE WHEN ar.sub_role='r2' THEN 'r2' WHEN ar.sub_role IS NULL THEN 'r1' END,
+                    t.status
              FROM mailbox m
              JOIN tasks t ON t.id=m.task_id
              JOIN journal j ON j.agent=m.agent AND j.role='reviewer'
@@ -1725,7 +1726,8 @@ pub fn recover_late_reviewer_verdict(
              )
              WHERE m.id=?1 AND m.consumed_at IS NULL AND m.kind='done'
                AND m.agent=?2 AND m.task_id=?3 AND m.pr=?4
-               AND t.status='in-review' AND t.reviewer=m.agent
+               AND ((t.status='in-review' AND t.reviewer=m.agent)
+                    OR (?5='changes' AND t.status='rework'))
                AND (ar.sub_role IS NULL OR ar.sub_role='r2')
                AND ((?5='approved' AND m.verdict='approved')
                     OR (?5='changes' AND m.verdict='changes'))",
@@ -1739,10 +1741,10 @@ pub fn recover_late_reviewer_verdict(
                     LateReviewerVerdict::Changes => "changes",
                 }
             ],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(role) = role else {
+    let Some((role, task_status)) = reviewer_state else {
         tx.commit()?;
         return Ok(false);
     };
@@ -1811,6 +1813,27 @@ pub fn recover_late_reviewer_verdict(
                 .map(str::trim)
                 .filter(|feedback| !feedback.is_empty())
                 .unwrap_or("Changes requested.");
+            // The live path commits VerdictChanges before installing the
+            // sticky worker's replacement lease. A daemon death in that gap
+            // leaves this exact reviewer result unconsumed with the task
+            // already in rework. Preserve the feedback and consume the
+            // reviewer authority here; dormant recovery will re-install the
+            // exact worker lease and resume its continuation.
+            if task_status == "rework" {
+                tx.execute(
+                    "DELETE FROM approvals WHERE pr_number=?1 AND task_id=?2",
+                    params![pr, task_id],
+                )?;
+                tx.execute(
+                    "UPDATE tasks SET refs=json_set(COALESCE(refs, '{}'),
+                       '$.remediation_feedback', ?2)
+                     WHERE id=?1 AND status='rework'",
+                    params![task_id, remediation_feedback],
+                )?;
+                consume_late_mailbox(&tx, mailbox_id, now)?;
+                tx.commit()?;
+                return Ok(true);
+            }
             apply_event_tx(tx, agent, task_id, &Event::VerdictChanges, now, |tx| {
                 tx.execute(
                     "DELETE FROM approvals WHERE pr_number=?1 AND task_id=?2",
@@ -4387,6 +4410,42 @@ mod tests {
             assert!(crate::approvals::get_for_pr(&c, 42).unwrap().is_empty());
             assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 0);
         }
+    }
+
+    #[test]
+    fn late_changes_finishes_feedback_handoff_after_transition_already_committed() {
+        let (_d, mut c) = open_tmp();
+        let (task_id, mailbox_id) = late_reviewer_fixture(&mut c, false);
+        c.execute(
+            "UPDATE mailbox SET verdict='changes', payload='{\"blocking\":1}' WHERE id=?1",
+            [mailbox_id],
+        )
+        .unwrap();
+        apply_event(&mut c, "reviewer", task_id, &Event::VerdictChanges, 1002).unwrap();
+
+        assert!(recover_late_reviewer_verdict(
+            &mut c,
+            mailbox_id,
+            "reviewer",
+            task_id,
+            42,
+            LateReviewerVerdict::Changes,
+            1,
+            "",
+            Some("resume the exact sticky worker"),
+            1003,
+        )
+        .unwrap());
+
+        let task = get(&c, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs["remediation_feedback"],
+            "resume the exact sticky worker"
+        );
+        assert!(refs.get(PARKED_REWORK_RETRY_REF).is_none());
+        assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 0);
     }
 
     #[test]

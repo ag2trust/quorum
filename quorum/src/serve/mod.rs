@@ -6975,6 +6975,10 @@ async fn tick(
     )
     .await?;
 
+    if !decomposition_freeze && !drain_state.draining {
+        resume_recovered_dormant_reworks(config, wt_mgr, name_pool, workers).await;
+    }
+
     // Graph consistency authority runs first. Exact merged-continuation
     // adoption is then settled before any ordinary recovery or provisioning
     // can observe the failed member.
@@ -15927,11 +15931,21 @@ async fn install_sticky_remediation_lease_and_baseline(
     if !install_live_worker_remediation_lease(config, agent.clone(), task_id, pr, feedback).await {
         return false;
     }
+    bind_claimed_sticky_remediation_baseline(config, &agent, task_id, pr, feedback).await
+}
+
+async fn bind_claimed_sticky_remediation_baseline(
+    config: &ServeConfig,
+    agent: &str,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) -> bool {
     if pr <= 0 {
         log(&format!(
             "sticky remediation: task #{task_id} has no PR to bind — releasing lease and parking"
         ));
-        release_sticky_remediation_lease(&config.db_path, &agent, task_id).await;
+        release_sticky_remediation_lease(&config.db_path, agent, task_id).await;
         let cause = classified_provisioning_cause(
             "sticky remediation baseline binding failed: no PR identity",
         );
@@ -15943,7 +15957,7 @@ async fn install_sticky_remediation_lease_and_baseline(
             "sticky remediation: baseline bind failed for task #{task_id} PR #{pr}: {error} \
              — releasing lease and parking"
         ));
-        release_sticky_remediation_lease(&config.db_path, &agent, task_id).await;
+        release_sticky_remediation_lease(&config.db_path, agent, task_id).await;
         let cause = classified_provisioning_cause(&format!(
             "sticky remediation baseline binding failed: {error}"
         ));
@@ -15951,6 +15965,83 @@ async fn install_sticky_remediation_lease_and_baseline(
         return false;
     }
     true
+}
+
+/// Finish a sticky dormant-worker handoff that was interrupted after the
+/// lifecycle entered rework. Generic recovery has already revalidated the
+/// exact continuation/worktree/run identity and re-installed any missing
+/// lease; bind the current daemon-owned PR baseline before launching that
+/// preserved continuation.
+async fn resume_recovered_dormant_reworks(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+) {
+    while let Some(worker_index) = workers.iter().position(|worker| {
+        worker.pending_turn_kind == "recovered-rework"
+            && matches!(worker.proc, SlotProcess::Dormant { .. })
+    }) {
+        let task_id = workers[worker_index].task_id;
+        let agent = workers[worker_index].agent_name.clone();
+        let pr = workers[worker_index].pr.unwrap_or_default();
+        let feedback = workers[worker_index].pending_prompt.clone();
+        if !bind_claimed_sticky_remediation_baseline(config, &agent, task_id, pr, &feedback).await {
+            let worker = workers.remove(worker_index);
+            cleanup_slot(
+                config,
+                wt_mgr,
+                name_pool,
+                worker,
+                None,
+                "remediation_lease_unavailable",
+            )
+            .await;
+            continue;
+        }
+
+        let prompt = reviewer::build_rework_prompt(
+            &agent,
+            task_id,
+            pr,
+            &feedback,
+            workers[worker_index].cost_usd,
+            config.limits.max_task_cost_usd,
+        );
+        if let Err(error) = feed_worker_turn(&mut workers[worker_index], &prompt, config).await {
+            log(&format!(
+                "recovered sticky remediation feed failed for task #{task_id}: {error}"
+            ));
+            if !handle_dormant_worker_feed_failure(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                worker_index,
+                &error,
+            )
+            .await
+            {
+                let worker = workers.remove(worker_index);
+                fire_event(
+                    &config.db_path,
+                    &worker.agent_name,
+                    worker.task_id,
+                    &Event::AgentFailed {
+                        reason: format!("recovered rework feed failed: {error}"),
+                    },
+                )
+                .await;
+                cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+            }
+        } else {
+            begin_sticky_worker_rework(&mut workers[worker_index], &config.db_path).await;
+            log(&format!(
+                "worker {agent} resumed recovered rework #{} for task #{task_id}",
+                workers[worker_index].rework_count
+            ));
+        }
+    }
 }
 
 async fn release_sticky_remediation_lease(db_path: &Path, agent: &str, task_id: i64) {
