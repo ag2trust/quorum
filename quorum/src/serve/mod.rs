@@ -6557,6 +6557,30 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         )),
     }
 
+    // Recovered sticky rework is existing in-flight authority, not a new
+    // implementation start. Resume it exactly once during startup even when
+    // a decomposition freeze is draining: the freeze waits for this worker,
+    // its journal row, and its started task to settle. Deferring the resume to
+    // ordinary ticks would deadlock those two authorities against each other.
+    //
+    // This boundary is also intentionally outside the tick loop's retry
+    // policy. A failed durable disposition (including post-timeout BUSY) is an
+    // abnormal startup failure and must exit 3 instead of repeating baseline
+    // and provider subprocesses while starving mailbox processing.
+    if let Err(error) =
+        resume_recovered_dormant_reworks(config, &wt_mgr, &mut name_pool, &mut workers).await
+    {
+        log(&format!(
+            "FATAL: recovered dormant rework startup failed: {error}"
+        ));
+        for worker in workers.drain(..) {
+            let agent_name = worker.agent_name.clone();
+            let _terminal_output = worker.kill_and_reap().await;
+            name_pool.release(&agent_name);
+        }
+        return Err(error);
+    }
+
     // #127/#157: report dead-lettered interpret jobs at startup. Historical
     // terminal tasks are NOT scanned — jobs come only from the MergeSucceeded
     // enqueue path. Already-enqueued rows (from prior merges) remain in the
@@ -6976,10 +7000,6 @@ async fn tick(
         },
     )
     .await?;
-
-    if !decomposition_freeze && !drain_state.draining {
-        resume_recovered_dormant_reworks(config, wt_mgr, name_pool, workers).await?;
-    }
 
     // Graph consistency authority runs first. Exact merged-continuation
     // adoption is then settled before any ordinary recovery or provisioning

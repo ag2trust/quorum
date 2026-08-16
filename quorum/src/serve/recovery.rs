@@ -1246,6 +1246,223 @@ mod tests {
         .unwrap();
     }
 
+    fn begin_unrelated_decomposition_freeze(
+        conn: &mut quorum_core::Connection,
+        frozen_base_sha: &str,
+    ) {
+        let source = tasks::create(
+            conn,
+            "owner",
+            "unrelated decomposition source",
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            super::super::now_unix(),
+        )
+        .unwrap();
+        quorum_core::decomposition::begin_planning(
+            conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "claude",
+                model: "planner",
+                frozen_base_sha,
+                now: super::super::now_unix() + 1,
+            },
+        )
+        .unwrap()
+        .expect("unrelated planning source acquires the freeze");
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frozen_restart_resumes_sticky_rework_before_and_after_replacement_lease() {
+        let mut retained_fixtures = Vec::new();
+        for lease_installed in [false, true] {
+            let mut fixture = dormant_fixture();
+            let feedback = "resume the exact frozen restart turn";
+            let head = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&fixture.config.repo_dir)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            assert!(head.status.success());
+            let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+            {
+                let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+                enter_merge_conflict_rework(&mut conn, fixture.task_id, feedback);
+                if lease_installed {
+                    tasks::claim_remediation_rework_with_feedback(
+                        &mut conn,
+                        "Dormant",
+                        fixture.task_id,
+                        tasks::DEFAULT_LEASE_TTL_SECS,
+                        super::super::now_unix(),
+                        Some(feedback),
+                    )
+                    .unwrap()
+                    .expect("replacement lease is installed before the crash");
+                }
+                begin_unrelated_decomposition_freeze(&mut conn, &head);
+            }
+
+            let args_path = fixture._dir.path().join(format!(
+                "codex-args-{}.txt",
+                if lease_installed { "after" } else { "before" }
+            ));
+            let codex = fixture._dir.path().join("fake-codex");
+            write_executable(
+                &codex,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec sleep 30\n",
+                    args_path.display(),
+                ),
+            );
+            let gh = fixture._dir.path().join("fake-gh");
+            write_executable(
+                &gh,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' '{{\"headRefName\":\"daemon/dormant-t1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"OPEN\"}}'\n"
+                ),
+            );
+            fixture.config.agent_bin = Some(codex.to_string_lossy().into_owned());
+            fixture.config.pr_target_program = Some(gh);
+            fixture.config.exit_when_gone =
+                Some(fixture._dir.path().join("absent-daemon-sentinel"));
+
+            let daemon_pid = std::process::id() as i64;
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            assert_eq!(
+                quorum_core::daemon_lock::try_acquire(
+                    &mut conn,
+                    daemon_pid,
+                    super::super::now_unix(),
+                    30,
+                    |_| false,
+                )
+                .unwrap(),
+                quorum_core::daemon_lock::AcquireResult::Acquired,
+            );
+            drop(conn);
+
+            let exit = super::super::tick_loop(&fixture.config, daemon_pid)
+                .await
+                .expect("frozen restart must converge through the startup coordinator");
+            assert_eq!(exit, 1, "missing sentinel terminates the test daemon");
+
+            let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            let freeze_active: bool = conn
+                .query_row("SELECT freeze_active FROM task_decompositions", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(
+                freeze_active,
+                "the existing worker continuation runs without stealing planning authority"
+            );
+            let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+            assert_eq!(task.status, "rework");
+            assert_eq!(task.assignee.as_deref(), Some("Dormant"));
+            assert_eq!(
+                journal::list_in_flight(&conn).unwrap()[0].phase,
+                "working",
+                "startup must advance the exact retained journal row"
+            );
+            drop(conn);
+            retained_fixtures.push(fixture);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovered_rework_disposition_error_exits_tick_loop_once() {
+        let mut fixture = dormant_fixture();
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.config.repo_dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        {
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            enter_merge_conflict_rework(
+                &mut conn,
+                fixture.task_id,
+                "resume the exact pending turn",
+            );
+            conn.execute(
+                "UPDATE agent_runs SET effort='' WHERE task_id=?1 AND role='worker'",
+                [fixture.task_id],
+            )
+            .unwrap();
+        }
+
+        let gh_calls = fixture._dir.path().join("gh-calls");
+        let gh = fixture._dir.path().join("fake-gh");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf x >> '{}'\nprintf '%s\\n' '{{\"headRefName\":\"daemon/dormant-t1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"OPEN\"}}'\n",
+                gh_calls.display(),
+            ),
+        );
+        fixture.config.pr_target_program = Some(gh);
+
+        let daemon_pid = std::process::id() as i64;
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        quorum_core::daemon_lock::try_acquire(
+            &mut conn,
+            daemon_pid,
+            super::super::now_unix(),
+            30,
+            |_| false,
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            super::super::tick_loop(&fixture.config, daemon_pid),
+        )
+        .await
+        .expect("persistent startup disposition error must not retry")
+        .expect_err("persistent startup disposition error must exit abnormally");
+        assert_eq!(error.exit_code(), 3);
+        assert!(
+            error.to_string().contains("complete pending turn"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&gh_calls).unwrap(),
+            "x",
+            "startup must perform the external baseline inspection only once"
+        );
+
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.assignee.as_deref(), Some("Dormant"));
+        assert_eq!(
+            journal::list_in_flight(&conn).unwrap()[0].phase,
+            "awaiting-review"
+        );
+    }
+
     #[tokio::test]
     async fn restart_recovers_sticky_rework_before_replacement_lease() {
         let fixture = dormant_fixture();
