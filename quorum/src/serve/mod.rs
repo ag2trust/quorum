@@ -1414,11 +1414,10 @@ fn backfill_intent_target_branch(
 /// publication I/O. Resolves the authoritative task target, rejects a
 /// durable prior intent whose target disagrees, and backfills a targetless
 /// prior intent so the intent handed to publication I/O binds to the exact
-/// task target on every restart. Extracted so DB-fixture tests can exercise
-/// the exact production path — removing this call from
-/// `publish_worker_completion` would leave a targetless prior intent
-/// falling through to `config.base_branch` and is directly covered by
-/// `reconcile_publication_intent_with_task_target_*` tests.
+/// task target on every restart. The caller-level restart fixtures exercise
+/// this invocation through `publish_worker_completion` and late-worker
+/// recovery: removing or moving it after live validation makes a targetless
+/// continuation either reject a matching target or publish a wrong-base PR.
 async fn reconcile_publication_intent_with_task_target(
     db_path: &Path,
     task_id: i64,
