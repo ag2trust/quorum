@@ -449,15 +449,20 @@ fn seed_review_only_task(home: &std::path::Path, repo: &std::path::Path, title: 
 
 fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     let db = home.join("repos").join("test__repo").join("quorum.db");
-    let mut conn = quorum_core::db::open(&db).unwrap();
-    match quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
-        Some(cap) => cap.run_id,
-        None => {
-            let rid = format!("test-{agent}-{}", std::process::id());
-            quorum_core::capabilities::issue(&mut conn, &rid, 0, agent, role, 1000).unwrap();
-            rid
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let conn = quorum_core::db::open(&db).unwrap();
+        if let Some(cap) = quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
+            if cap.task_id > 0 && cap.role == role {
+                return cap.run_id;
+            }
         }
+        std::thread::sleep(Duration::from_millis(10));
     }
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    let rid = format!("test-{agent}-{}", std::process::id());
+    quorum_core::capabilities::issue(&mut conn, &rid, 0, agent, role, 1000).unwrap();
+    rid
 }
 
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
@@ -686,6 +691,7 @@ fn worker_submission_before_terminal_overage_is_cleanup_only() {
         handle.lines
     );
     let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    let worker_run_id = resolve_run_id(home.path(), &worker_name, "worker");
     quorum_done(home.path(), &["--agent", &worker_name]);
     assert!(
         handle.wait_for("PR #1 ready for review", 15),
@@ -701,10 +707,39 @@ fn worker_submission_before_terminal_overage_is_cleanup_only() {
         .lines
         .iter()
         .any(|line| line.contains("WATCHDOG: worker"));
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let cap_error = {
+        let conn = quorum_core::db::open(&db).unwrap();
+        quorum_core::capabilities::validate(&conn, &worker_run_id, &worker_name, "worker", Some(1))
+            .unwrap_err()
+    };
+    assert!(
+        cap_error.to_string().contains("revoked"),
+        "cleanup did not atomically revoke the retiring capability: {cap_error}"
+    );
+    let late_submit = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "submit",
+            "--agent",
+            &worker_name,
+            "--run-id",
+            &worker_run_id,
+        ])
+        .output()
+        .unwrap();
     handle.stop();
 
     assert!(!false_alert, "recorded submission emitted a watchdog alert");
-    let db = home.path().join("repos/test__repo/quorum.db");
+    assert!(
+        !late_submit.status.success()
+            && String::from_utf8_lossy(&late_submit.stderr).contains("revoked"),
+        "retiring run remained able to submit after cleanup: status={}, stdout={}, stderr={}",
+        late_submit.status,
+        String::from_utf8_lossy(&late_submit.stdout),
+        String::from_utf8_lossy(&late_submit.stderr)
+    );
     let conn = quorum_core::db::open(&db).unwrap();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
     assert_eq!(task.status, "in-review");
@@ -738,6 +773,108 @@ fn worker_submission_before_terminal_overage_is_cleanup_only() {
     assert_eq!(worker_runs.len(), 1);
     assert!(matches!(
         worker_runs[0].end_reason.as_deref(),
+        Some("completed" | "ownership_transferred")
+    ));
+}
+
+#[test]
+fn pending_worker_overage_is_rechecked_after_mailbox_delivery() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    assert!(Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap()
+        .success());
+    seed_task(home.path(), "Pending worker terminal overage regression");
+
+    let gate = home.path().join("mailbox-snapshot-gate");
+    let gate_text = gate.to_string_lossy().into_owned();
+    let mut handle = ServeHandle::start_with_limits_and_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &["--max-task-tokens", "600"],
+        &[
+            ("FAKE_AGENT_DELAY_SECS", "3"),
+            ("QUORUM_TEST_MAILBOX_SNAPSHOT_GATE", &gate_text),
+        ],
+    );
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    std::fs::write(&gate, b"waiting").unwrap();
+    let gate_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::fs::read(&gate).unwrap_or_default() != b"captured"
+        && std::time::Instant::now() < gate_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(&gate).unwrap_or_default(),
+        b"captured",
+        "daemon did not pause after its mailbox snapshot"
+    );
+
+    // The snapshot does not contain this row, while the terminal usage event
+    // arrives during the held tick. Its first classification must therefore
+    // be OutcomePending; a later tick consumes the row and reclassifies it.
+    quorum_done(home.path(), &["--agent", &worker_name]);
+    std::thread::sleep(Duration::from_secs(4));
+    std::fs::remove_file(&gate).unwrap();
+    assert!(
+        handle.wait_for("submission pending", 15),
+        "terminal breach was not classified pending. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("PR #1 ready for review", 15),
+        "pending submission was not delivered. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("cleanup only", 15),
+        "pending breach was lost after mailbox consumption. Lines: {:?}",
+        handle.lines
+    );
+    let false_alert = handle
+        .lines
+        .iter()
+        .any(|line| line.contains("WATCHDOG: worker"));
+    handle.stop();
+
+    assert!(!false_alert, "pending submission emitted a watchdog alert");
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    assert_eq!(task.recovery_attempts, 0);
+    let review_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE subject='task#1' AND kind='task_in_review'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(review_events, 1, "watchdog duplicated task_in_review");
+    let worker_run = quorum_core::agent_runs::runs_for_task(&conn, 1)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.role == "worker")
+        .unwrap();
+    assert!(matches!(
+        worker_run.end_reason.as_deref(),
         Some("completed" | "ownership_transferred")
     ));
 }

@@ -514,6 +514,7 @@ fn reconstruct_dormant_slots(
             branch: recovery.local_branch.clone(),
             remote_branch: recovery.entry.branch.clone().unwrap_or_default(),
             draining: false,
+            pending_watchdog_breach: None,
             pr: Some(recovery.pr),
             rework_count: recovery.entry.rework_count.max(0) as u32,
             cost_tokens: recovery.entry.cost_tokens,
