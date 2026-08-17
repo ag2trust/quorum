@@ -680,6 +680,11 @@ pub struct CollectionOutcome {
     pub error: Option<String>,
 }
 
+struct ClassifierTurnOutcome {
+    response: Result<String>,
+    usage: super::runner::TokenUsage,
+}
+
 /// Full pipeline: fetch inputs, spawn classifier, parse + store. On any failure
 /// the run record is stamped `failed` with the error text — never returns without
 /// having written the run row.
@@ -708,8 +713,17 @@ pub async fn run_collection_with_inputs(
     attempted_at: i64,
 ) -> Result<CollectionOutcome> {
     // 2) Spawn classifier + await bounded turn.
-    let response_text = match spawn_and_run_classifier(request, &inputs).await {
-        Ok(t) => t,
+    let turn = match spawn_and_run_classifier(request, &inputs).await {
+        Ok(turn) => turn,
+        Err(e) => {
+            let err_text = format!("collector classifier failed: {e}");
+            record_failure(request, &err_text, attempted_at).await;
+            return Err(QuorumError::Io(err_text));
+        }
+    };
+    record_token_usage(request, turn.usage).await;
+    let response_text = match turn.response {
+        Ok(response) => response,
         Err(e) => {
             let err_text = format!("collector classifier failed: {e}");
             record_failure(request, &err_text, attempted_at).await;
@@ -840,6 +854,43 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
         record_result
     })
     .await;
+}
+
+/// Token telemetry is best-effort and intentionally independent from collector
+/// findings and lifecycle records.
+async fn record_token_usage(request: &CollectionRequest, usage: super::runner::TokenUsage) {
+    let db_path = request.db_path.clone();
+    let task_ids: Vec<i64> = request.task_id.into_iter().collect();
+    let pr_number = request.pr_number;
+    let provider = request.collector_provider.clone();
+    let model = request.collector_model.clone();
+    let effort = request.collector_effort.clone();
+    match tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        let usage = super::runner::try_durable_token_usage(usage)
+            .map_err(|error| QuorumError::Io(format!("invalid token telemetry: {error}")))?;
+        quorum_core::token_usage::record(
+            &mut conn,
+            None,
+            "collector",
+            &task_ids,
+            Some(pr_number),
+            &provider,
+            &model,
+            &effort,
+            usage,
+            clock::now(),
+        )?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("quorum collector: token usage write failed (ignored): {error}")
+        }
+        Err(error) => eprintln!("quorum collector: token usage join failed (ignored): {error}"),
+    }
 }
 
 /// Deterministically fetch every input the classifier will read. Failures at
@@ -1122,7 +1173,7 @@ async fn run_gh_raw(
 async fn spawn_and_run_classifier(
     request: &CollectionRequest,
     inputs: &CollectorInputs,
-) -> Result<String> {
+) -> Result<ClassifierTurnOutcome> {
     let prompt = review_findings::build_collector_prompt(inputs);
     let mut proc = RunnerProc::launch(
         &LaunchRequest {
@@ -1147,6 +1198,7 @@ async fn spawn_and_run_classifier(
 
     let deadline = tokio::time::Instant::now() + CLASSIFIER_TIMEOUT;
     let mut response_text = String::new();
+    let mut usage_total = super::runner::TokenUsage::default();
     let outcome: Result<String> = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -1165,10 +1217,16 @@ async fn spawn_and_run_classifier(
                 for event in line.events {
                     match event {
                         AgentEvent::AssistantText { text } => response_text.push_str(&text),
-                        AgentEvent::TurnCompleted { .. } => {
+                        AgentEvent::TurnCompleted { usage, .. } => {
+                            if let Some(usage) = usage {
+                                usage_total.saturating_add_assign(usage);
+                            }
                             terminal = Some(Ok(response_text.clone()))
                         }
-                        AgentEvent::TurnFailed { message, .. } => {
+                        AgentEvent::TurnFailed { message, usage, .. } => {
+                            if let Some(usage) = usage {
+                                usage_total.saturating_add_assign(usage);
+                            }
                             let message = line.terminal_text.as_deref().unwrap_or(&message);
                             terminal = Some(Err(QuorumError::Io(format!(
                                 "classifier returned an error: {message}"
@@ -1199,8 +1257,41 @@ async fn spawn_and_run_classifier(
         }
     };
 
-    proc.kill_and_reap().await;
-    outcome
+    // Reaping can drain a terminal event raced by the timeout. It remains
+    // lifecycle-inert, but its usage is still durable telemetry.
+    let kind = proc.kind();
+    let terminal = proc.kill_and_reap().await;
+    Ok(finalize_classifier_turn(
+        kind,
+        terminal,
+        outcome,
+        usage_total,
+    ))
+}
+
+fn finalize_classifier_turn(
+    kind: AgentKind,
+    terminal: Vec<super::runner::CapturedOutput>,
+    response: Result<String>,
+    mut usage: super::runner::TokenUsage,
+) -> ClassifierTurnOutcome {
+    for captured in terminal {
+        let super::runner::CapturedOutput::Stdout(raw_line) = captured else {
+            continue;
+        };
+        for event in super::runner::normalize_line(kind, &raw_line) {
+            match event {
+                AgentEvent::TurnCompleted {
+                    usage: Some(value), ..
+                }
+                | AgentEvent::TurnFailed {
+                    usage: Some(value), ..
+                } => usage.saturating_add_assign(value),
+                _ => {}
+            }
+        }
+    }
+    ClassifierTurnOutcome { response, usage }
 }
 
 /// Spawn a detached collection task from the daemon merge branch. Never awaits.
@@ -1290,6 +1381,76 @@ mod tests {
         s.push_str(&"b".repeat(100));
         let out = truncate(&s); // must not panic
         assert!(out.contains("truncated"));
+    }
+
+    #[test]
+    fn timeout_boundary_reap_retains_terminal_usage() {
+        let outcome = finalize_classifier_turn(
+            AgentKind::Claude,
+            vec![super::super::runner::CapturedOutput::Stdout(
+                r#"{"type":"result","result":"late","is_error":false,"usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":10,"output_tokens":5}}"#
+                    .into(),
+            )],
+            Err(QuorumError::Io("classifier timeout for PR #464".into())),
+            super::super::runner::TokenUsage::default(),
+        );
+
+        assert!(matches!(
+            outcome.response,
+            Err(QuorumError::Io(ref message)) if message.contains("timeout")
+        ));
+        assert_eq!(
+            outcome.usage,
+            super::super::runner::TokenUsage {
+                input_tokens: 100,
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 0,
+            },
+            "terminal usage raced by the timeout must survive final reap"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflowing_collector_usage_is_ignored_without_a_negative_row() {
+        let (_dir, db_path) = tmp_conn();
+        let request = CollectionRequest::new(
+            464,
+            None,
+            None,
+            db_path.clone(),
+            std::env::current_dir().unwrap(),
+            None,
+            true,
+        )
+        .with_collector(
+            "codex",
+            "codex",
+            "gpt-5.6-terra",
+            "medium",
+            "danger-full-access",
+        );
+
+        record_token_usage(
+            &request,
+            super::super::runner::TokenUsage {
+                output_tokens: u64::MAX,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let conn = db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_usage_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+            "collector overflow must fail inside the best-effort boundary"
+        );
     }
 
     #[tokio::test]

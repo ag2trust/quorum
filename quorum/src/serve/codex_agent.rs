@@ -645,7 +645,11 @@ fn normalize_event(event: Event) -> Vec<AgentEvent> {
         Event::TurnCompleted { usage } => vec![AgentEvent::TurnCompleted {
             usage: usage.map(|usage| TokenUsage {
                 input_tokens: usage.input_tokens,
+                uncached_input_tokens: usage.input_tokens.saturating_sub(usage.cached_input_tokens),
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_write_input_tokens: usage.cache_write_input_tokens,
                 output_tokens: usage.output_tokens,
+                reasoning_tokens: usage.reasoning_output_tokens,
             }),
             cost_usd: None,
         }],

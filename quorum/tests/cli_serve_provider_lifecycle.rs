@@ -305,6 +305,7 @@ enum ParkedRemoteState {
 struct ParkedPublicationFixture {
     pr: i64,
     remote_state: ParkedRemoteState,
+    target_branch: &'static str,
 }
 
 impl Case {
@@ -385,6 +386,24 @@ impl Case {
             Some(ParkedPublicationFixture {
                 pr: 10,
                 remote_state,
+                target_branch: "main",
+            }),
+            None,
+        )
+    }
+
+    fn start_targeted_parked_publication() -> Self {
+        Self::start_with_pr_assignment(
+            "codex",
+            "gpt-5.6-terra",
+            None,
+            None,
+            None,
+            None,
+            Some(ParkedPublicationFixture {
+                pr: 10,
+                remote_state: ParkedRemoteState::ExpectedHead,
+                target_branch: "develop",
             }),
             None,
         )
@@ -446,6 +465,9 @@ impl Case {
             let pr_string = pr.to_string();
             create.args(["--continue-pr", &pr_string]);
         }
+        if let Some(fixture) = parked_publication {
+            create.args(["--base-branch", fixture.target_branch]);
+        }
         assert!(create.status().unwrap().success());
         let db_path = home.path().join("repos/test__repo/quorum.db");
         let mut conn = quorum_core::db::open(&db_path).unwrap();
@@ -494,6 +516,23 @@ impl Case {
                 .status()
                 .unwrap()
                 .success());
+            if fixture.target_branch != "main" {
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "branch", fixture.target_branch])
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "fetch", "origin"])
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "checkout", fixture.target_branch])
+                    .status()
+                    .unwrap()
+                    .success());
+            }
             let head_ref = format!("parked-pr-{}", fixture.pr);
             assert!(Command::new("git")
                 .args(["-C", &repo_path, "checkout", "-b", &head_ref])
@@ -613,6 +652,7 @@ impl Case {
                     "local_sha": stale_delivery,
                     "pr": fixture.pr,
                     "stage": "intent",
+                    "target_branch": fixture.target_branch,
                     "expected_remote_sha": expected_sha,
                 }
             });
@@ -716,6 +756,11 @@ impl Case {
             std::fs::write(
                 gh_state.join(fixture.pr.to_string()),
                 format!("parked-pr-{}", fixture.pr),
+            )
+            .unwrap();
+            std::fs::write(
+                gh_state.join(format!("base-{}", fixture.pr)),
+                fixture.target_branch,
             )
             .unwrap();
         }
@@ -1266,6 +1311,37 @@ fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() 
 #[test]
 fn parked_rework_publication_retry_recovers_already_published_source() {
     assert_parked_rework_retry_publishes_from(ParkedRemoteState::PublishedSource);
+}
+
+#[cfg(unix)]
+#[test]
+fn targeted_parked_rework_retry_uses_task_target_before_worker_provisioning() {
+    let mut case = Case::start_targeted_parked_publication();
+    case.handle.wait_for("worktree provisioned");
+    case.handle.wait_for("turn");
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    assert_eq!(task.target_branch.as_deref(), Some("develop"));
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_rework_retry_requested"], true);
+    assert!(refs.get("daemon_parked").is_none());
+    let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+    assert_eq!(target.head_ref, "parked-pr-10");
+    let journal_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM journal WHERE task_id=1 AND role='worker'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        journal_rows, 1,
+        "targeted retry must reach worker provisioning"
+    );
+    drop(conn);
+    case.handle.stop_mut();
 }
 
 #[test]

@@ -221,6 +221,44 @@ Appended **only on genuinely abnormal failures** (DB error, post-timeout `BUSY`,
 migration refusal). **Normal lost-races / not-holder (exit 1) are NOT logged** — they are
 expected operation, and logging them would add hot-path write contention + noise.
 
+### `token_usage_runs` — durable per-invocation token telemetry
+
+One row per managed worker/reviewer run or daemon-internal classifier/collector
+invocation. The row preserves uncached input, cached input, cache-write input,
+output, and reasoning tokens separately, plus purpose, provider, model, effort,
+optional PR, and optional `agent_run_id`. `token_usage_run_tasks` maps one usage
+row to one or more tasks because the classifier handles batches.
+
+This is separate from `agent_runs`: classifier and collector invocations are not
+managed agents, and cost history must remain queryable after task/agent-run sweep.
+There are no foreign keys; numeric identities are historical attribution, not
+delete authority. Usage history has a 30-day retention window, deliberately
+longer than the 7-day completed-task window: sweep-on-write deletes at most 100
+expired usage runs (and their task mappings) per mutation, while explicit sweep
+deletes all expired usage. Cumulative snapshots for still-active managed runs
+are retained until run closure so dormant recovery cannot lose required state.
+Usage writes are instrumentation-only and best-effort.
+A failed usage write is logged and ignored after the lifecycle/run-close write,
+so it cannot fail a verdict, merge, collection result, or teardown.
+Provider-error collector turns retain and record any usage reported by the
+terminal event before the collection failure is persisted and returned.
+Managed teardown likewise normalizes usage from unread terminal provider output
+before snapshotting the durable row; terminal output remains lifecycle-inert.
+Each managed terminal turn also upserts the cumulative split against its
+`agent_run_id`, and dormant Codex/Grok recovery reloads that snapshot before
+continuing the same run identity. Ordinary and decomposition classifiers reap
+and record bounded terminal usage on normal completion, removal, and every
+daemon shutdown path; decomposition classifier rows are attributed to their
+source task. Open, write, and join failures on these best-effort paths are
+logged without changing lifecycle outcomes.
+
+Provider normalization keeps the source semantics explicit. Claude
+`input_tokens`, `cache_read_input_tokens`, and
+`cache_creation_input_tokens` remain separate. Codex `input_tokens` includes
+cached input, so durable uncached input is `input_tokens -
+cached_input_tokens` (saturating at zero); its cached, cache-write, output, and
+reasoning-output values are retained independently.
+
 ## TTL — self-expiring data (no manual pruning, ever)
 
 **Layer A — logical expiry (instant, free, the part that matters).** Write time:
@@ -241,6 +279,7 @@ command's txn pathologically long). `quorum sweep` does an unbounded sweep +
 | messages | 48h | no |
 | claims | 45 min lease | yes (`renew`, ~every 15 min) |
 | done tasks | swept 7d after `done` | n/a |
+| token usage history | swept 30d after recording | n/a |
 | errors | 7d | n/a |
 | presence (display) | `offline` once `last_seen` older than online window (default 5 min) | via any write (implicit `touch`) |
 
