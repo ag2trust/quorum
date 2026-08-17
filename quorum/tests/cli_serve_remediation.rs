@@ -640,6 +640,8 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
+    let global_git_config = home.path().join("gitconfig");
+    std::fs::write(&global_git_config, "[push]\n\tdefault = current\n").unwrap();
     // Outside wt_base so daemon GC never touches it.
     let external_wt = tempfile::tempdir().unwrap();
 
@@ -727,7 +729,7 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
     .trim()
     .to_string();
 
-    let mut handle = ServeHandle::start(
+    let mut handle = ServeHandle::start_with_env(
         home.path(),
         repo_dir.path(),
         wt_base.path(),
@@ -741,6 +743,10 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
             "--merge-checks-poll-secs",
             "1",
         ],
+        &[(
+            "GIT_CONFIG_GLOBAL".to_string(),
+            global_git_config.to_string_lossy().into_owned(),
+        )],
     );
 
     assert!(
@@ -782,10 +788,35 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
         let out = Command::new("git")
             .arg("-C")
             .arg(&wt_path)
+            .env("GIT_CONFIG_GLOBAL", &global_git_config)
             .args(args)
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let git_config = |key: &str| -> Vec<(String, String)> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&wt_path)
+            .env("GIT_CONFIG_GLOBAL", &global_git_config)
+            .args(["config", "--show-scope", "--get-all", key])
+            .output()
+            .unwrap();
+        assert!(
+            matches!(out.status.code(), Some(0 | 1)),
+            "git config failed for {key}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (scope, value) = line
+                    .split_once('\t')
+                    .unwrap_or_else(|| panic!("git config omitted scope for {key}: {line}"));
+                (scope.to_string(), value.to_string())
+            })
+            .collect()
     };
     let local_branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
     assert_eq!(
@@ -798,15 +829,25 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
         format!("refs/heads/{pr_branch}"),
         "plain `git push` must target the PR branch"
     );
-    assert_eq!(
-        git(&["config", "--get", "push.default"]),
-        "",
-        "remediation workers must not receive agent-side push defaults"
+    let push_defaults = git_config("push.default");
+    assert!(
+        push_defaults
+            .iter()
+            .any(|(scope, value)| scope == "global" && value == "current"),
+        "regression setup must expose the caller's global push default"
     );
-    assert_eq!(
-        git(&["config", "--get", "remote.origin.push"]),
-        "",
-        "remediation workers must not receive agent-side push refspecs"
+    assert!(
+        !push_defaults
+            .iter()
+            .any(|(scope, _)| scope == "local" || scope == "worktree"),
+        "remediation workers must not receive repository-local push defaults"
+    );
+    let push_refspecs = git_config("remote.origin.push");
+    assert!(
+        !push_refspecs
+            .iter()
+            .any(|(scope, _)| scope == "local" || scope == "worktree"),
+        "remediation workers must not receive repository-local push refspecs"
     );
     for ancestor in [&published_pr_head, &base_head] {
         assert!(
