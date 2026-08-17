@@ -2804,6 +2804,7 @@ fn classify_managed_exit_tx(
     role: ManagedRunRole,
     agent: &str,
     id: i64,
+    run_id: Option<&str>,
 ) -> Result<ManagedExitClassification> {
     let task = tx
         .query_row(
@@ -2822,12 +2823,26 @@ fn classify_managed_exit_tx(
         return Ok(ManagedExitClassification::OwnershipTransferred);
     };
 
+    let role_name = match role {
+        ManagedRunRole::Worker => "worker",
+        ManagedRunRole::Reviewer => "reviewer",
+    };
+    let exact_run_active = match run_id {
+        Some(run_id) => {
+            crate::capabilities::managed_run_is_active_tx(tx, run_id, agent, id, role_name)?
+        }
+        None => true,
+    };
     let (owns_phase, outcome_predicate) = match role {
         ManagedRunRole::Worker => {
-            let has_capability =
-                crate::capabilities::active_for_agent_task(tx, agent, id, "worker")?.is_some();
+            let has_capability = if run_id.is_some() {
+                exact_run_active
+            } else {
+                crate::capabilities::active_for_agent_task(tx, agent, id, "worker")?.is_some()
+            };
             (
                 matches!(status.as_str(), "working" | "rework")
+                    && exact_run_active
                     && (assignee.as_deref() == Some(agent) || has_capability),
                 // Initial daemon-owned publication deliberately submits without
                 // a PR; the daemon resolves/creates it after consuming the row.
@@ -2837,7 +2852,7 @@ fn classify_managed_exit_tx(
             )
         }
         ManagedRunRole::Reviewer => (
-            status == "in-review" && reviewer.as_deref() == Some(agent),
+            exact_run_active && status == "in-review" && reviewer.as_deref() == Some(agent),
             "verdict IS NOT NULL",
         ),
     };
@@ -2852,7 +2867,7 @@ fn classify_managed_exit_tx(
         params![agent, id],
         |row| row.get::<_, bool>(0),
     )?;
-    if has_pending_outcome {
+    if exact_run_active && has_pending_outcome {
         return Ok(ManagedExitClassification::OutcomePending);
     }
     if owns_phase {
@@ -2869,10 +2884,49 @@ fn classify_managed_exit_tx(
         params![agent, id],
         |row| row.get::<_, bool>(0),
     )?;
-    if has_recorded_outcome {
+    if exact_run_active && has_recorded_outcome {
         return Ok(ManagedExitClassification::OutcomeRecorded);
     }
     Ok(ManagedExitClassification::OwnershipTransferred)
+}
+
+/// Retire only this worker's task authority after its managed process can no
+/// longer serve a later rework turn. A successor may already own the task by
+/// the time a terminal provider event is drained, so the holder predicate is
+/// load-bearing: cleanup for the old process must never deactivate the new
+/// owner's lease.
+fn settle_retiring_worker_lease_tx(
+    tx: &Transaction<'_>,
+    agent: &str,
+    id: i64,
+    run_id: Option<&str>,
+) -> Result<()> {
+    if let Some(run_id) = run_id {
+        // The retiring capability has already been revoked in this
+        // transaction. A later active capability for the same reusable
+        // name/task identifies a successor, so its lease must survive; older
+        // leaked capabilities do not block retirement of this lease.
+        tx.execute(
+            "UPDATE claims SET active=0
+             WHERE target=?1 AND holder=?2 AND active=1
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM run_capabilities successor
+                   JOIN run_capabilities retiring ON retiring.run_id=?4
+                   WHERE successor.agent=?2 AND successor.task_id=?3
+                     AND successor.role='worker' AND successor.revoked_at IS NULL
+                     AND successor.rowid > retiring.rowid
+               )",
+            params![lease_target(id), agent, id, run_id],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE claims SET active=0
+             WHERE target=?1 AND holder=?2 AND active=1",
+            params![lease_target(id), agent],
+        )?;
+    }
+    Ok(())
 }
 
 /// Atomically classify a managed process exit and fail only a run that still
@@ -2882,7 +2936,8 @@ fn classify_managed_exit_tx(
 /// of completion only after the run no longer owns the active phase, so stale
 /// rows from earlier rework/review rounds cannot hide a current failure. The
 /// ownership check and `AgentFailed` transition share the same immediate
-/// transaction.
+/// transaction. Cleanup-only worker dispositions retire that worker's exact
+/// lease in the transaction as well, without deactivating a successor holder.
 pub fn dispose_managed_exit(
     conn: &mut Connection,
     role: ManagedRunRole,
@@ -2891,17 +2946,60 @@ pub fn dispose_managed_exit(
     reason: &str,
     now: i64,
 ) -> Result<ManagedExitDisposition> {
+    dispose_managed_exit_inner(conn, role, agent, id, None, reason, now)
+}
+
+/// Exact-run variant used by the daemon for all managed process teardown.
+/// Classification, capability revocation, and any lifecycle mutation share
+/// one immediate transaction.
+pub fn dispose_managed_run_exit(
+    conn: &mut Connection,
+    role: ManagedRunRole,
+    agent: &str,
+    id: i64,
+    run_id: &str,
+    reason: &str,
+    now: i64,
+) -> Result<ManagedExitDisposition> {
+    dispose_managed_exit_inner(conn, role, agent, id, Some(run_id), reason, now)
+}
+
+fn dispose_managed_exit_inner(
+    conn: &mut Connection,
+    role: ManagedRunRole,
+    agent: &str,
+    id: i64,
+    run_id: Option<&str>,
+    reason: &str,
+    now: i64,
+) -> Result<ManagedExitDisposition> {
     let tx = begin_immediate(conn)?;
-    match classify_managed_exit_tx(&tx, role, agent, id)? {
+    let role_name = match role {
+        ManagedRunRole::Worker => "worker",
+        ManagedRunRole::Reviewer => "reviewer",
+    };
+    match classify_managed_exit_tx(&tx, role, agent, id, run_id)? {
         ManagedExitClassification::OutcomePending => {
             tx.commit()?;
             return Ok(ManagedExitDisposition::OutcomePending);
         }
         ManagedExitClassification::OutcomeRecorded => {
+            if let Some(run_id) = run_id {
+                crate::capabilities::revoke_managed_run_tx(&tx, run_id, agent, id, role_name, now)?;
+            }
+            if role == ManagedRunRole::Worker {
+                settle_retiring_worker_lease_tx(&tx, agent, id, run_id)?;
+            }
             tx.commit()?;
             return Ok(ManagedExitDisposition::OutcomeRecorded);
         }
         ManagedExitClassification::OwnershipTransferred => {
+            if let Some(run_id) = run_id {
+                crate::capabilities::revoke_managed_run_tx(&tx, run_id, agent, id, role_name, now)?;
+            }
+            if role == ManagedRunRole::Worker {
+                settle_retiring_worker_lease_tx(&tx, agent, id, run_id)?;
+            }
             tx.commit()?;
             return Ok(ManagedExitDisposition::OwnershipTransferred);
         }
@@ -2916,7 +3014,12 @@ pub fn dispose_managed_exit(
             reason: reason.to_string(),
         },
         now,
-        |_| Ok(()),
+        |tx| {
+            if let Some(run_id) = run_id {
+                crate::capabilities::revoke_managed_run_tx(tx, run_id, agent, id, role_name, now)?;
+            }
+            Ok(())
+        },
     )
     .map(|transition| ManagedExitDisposition::AgentFailed(Box::new(transition)))
 }
@@ -2936,7 +3039,7 @@ pub fn dispose_dead_turn_runner(
     now: i64,
 ) -> Result<DeadTurnRunnerDisposition> {
     let tx = begin_immediate(conn)?;
-    match classify_managed_exit_tx(&tx, ManagedRunRole::Worker, agent, id)? {
+    match classify_managed_exit_tx(&tx, ManagedRunRole::Worker, agent, id, None)? {
         ManagedExitClassification::OutcomePending => {
             tx.commit()?;
             return Ok(DeadTurnRunnerDisposition::DonePending);
@@ -5674,6 +5777,7 @@ mod tests {
             .unwrap(),
             ManagedExitDisposition::OutcomePending
         ));
+        assert!(worker_lease_active_for(&mut c, "remediation", id, 1005).unwrap());
 
         apply_event(&mut c, "remediation", id, &Event::ReworkPushed, 1006).unwrap();
         crate::mailbox::mark_consumed(&mut c, row_id).unwrap();
@@ -5689,6 +5793,10 @@ mod tests {
             .unwrap(),
             ManagedExitDisposition::OutcomeRecorded
         ));
+        assert!(
+            !worker_lease_active_for(&mut c, "remediation", id, 1007).unwrap(),
+            "recorded worker cleanup must retire its lease"
+        );
         assert_eq!(get(&c, id).unwrap().unwrap().status, "in-review");
         let review_events: i64 = c
             .query_row(
@@ -5701,6 +5809,127 @@ mod tests {
             review_events, 2,
             "remediation exit must not add a third review transition"
         );
+    }
+
+    #[test]
+    fn transferred_worker_exit_preserves_successor_lease() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "retiring", Some(id), &[], TTL, 1000).unwrap();
+        crate::capabilities::issue(&mut c, "run-retiring", id, "retiring", "worker", 1000).unwrap();
+        apply_event(
+            &mut c,
+            "retiring",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND holder='retiring'",
+            [lease_target(id)],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+             VALUES (?1,'successor',1002,2002,1)",
+            [lease_target(id)],
+        )
+        .unwrap();
+        crate::capabilities::issue(&mut c, "run-successor", id, "successor", "worker", 1002)
+            .unwrap();
+
+        let disposition = dispose_managed_run_exit(
+            &mut c,
+            ManagedRunRole::Worker,
+            "retiring",
+            id,
+            "run-retiring",
+            "late terminal event",
+            1003,
+        )
+        .unwrap();
+        assert!(matches!(
+            disposition,
+            ManagedExitDisposition::OwnershipTransferred
+        ));
+        let successor: (String, i64) = c
+            .query_row(
+                "SELECT holder, expires_at FROM claims
+                 WHERE target=?1 AND active=1",
+                [lease_target(id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(successor, ("successor".into(), 2002));
+        assert!(
+            crate::capabilities::validate(&c, "run-retiring", "retiring", "worker", Some(id))
+                .is_err(),
+            "retiring capability must be revoked atomically"
+        );
+        assert!(
+            crate::capabilities::validate(&c, "run-successor", "successor", "worker", Some(id))
+                .is_ok(),
+            "successor capability must remain active"
+        );
+    }
+
+    #[test]
+    fn recycled_worker_name_cleanup_preserves_successor_authority() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "reused", Some(id), &[], TTL, 1000).unwrap();
+        crate::capabilities::issue(&mut c, "run-old", id, "reused", "worker", 1000).unwrap();
+        apply_event(
+            &mut c,
+            "reused",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND holder='reused'",
+            [lease_target(id)],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+             VALUES (?1,'reused',1002,2002,1)",
+            [lease_target(id)],
+        )
+        .unwrap();
+        crate::capabilities::issue(&mut c, "run-new", id, "reused", "worker", 1002).unwrap();
+
+        for reason in ["late terminal event", "duplicate cleanup"] {
+            assert!(matches!(
+                dispose_managed_run_exit(
+                    &mut c,
+                    ManagedRunRole::Worker,
+                    "reused",
+                    id,
+                    "run-old",
+                    reason,
+                    1003,
+                )
+                .unwrap(),
+                ManagedExitDisposition::OwnershipTransferred
+            ));
+        }
+
+        let successor_lease: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM claims
+                 WHERE target=?1 AND holder='reused' AND active=1",
+                [lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(successor_lease, 1);
+        assert!(
+            crate::capabilities::validate(&c, "run-old", "reused", "worker", Some(id)).is_err()
+        );
+        assert!(crate::capabilities::validate(&c, "run-new", "reused", "worker", Some(id)).is_ok());
     }
 
     #[test]

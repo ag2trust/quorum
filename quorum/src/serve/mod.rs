@@ -3330,6 +3330,10 @@ pub(crate) struct SlotState {
     /// head someone else already has checked out locally.
     remote_branch: String,
     draining: bool,
+    /// A terminal watchdog breach remains actionable after the provider marks
+    /// the turn complete. Pending mailbox delivery gets one chance to advance
+    /// lifecycle, then the next tick classifies cleanup against that outcome.
+    pending_watchdog_breach: Option<String>,
     pr: Option<i64>,
     rework_count: u32,
     cost_tokens: i64,
@@ -7363,6 +7367,42 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     }
 }
 
+/// Debug-build synchronization point for real subprocess mailbox-ordering
+/// tests. An existing gate file is rewritten to `captured` after Phase 1 and
+/// holds the tick until the test removes it. The wait is bounded so a failed
+/// test cannot wedge the daemon indefinitely.
+#[cfg(debug_assertions)]
+async fn pause_after_mailbox_snapshot_for_test() {
+    let Ok(gate) = std::env::var("QUORUM_TEST_MAILBOX_SNAPSHOT_GATE") else {
+        return;
+    };
+    let gate = PathBuf::from(gate);
+    if !gate.exists() || std::fs::write(&gate, b"captured").is_err() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while gate.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Debug-build synchronization point for inspecting state after Phase 4c
+/// without allowing the next tick to consume a newly authoritative outcome.
+#[cfg(debug_assertions)]
+async fn pause_after_message_delivery_for_test() {
+    let Ok(gate) = std::env::var("QUORUM_TEST_MESSAGE_DELIVERY_GATE") else {
+        return;
+    };
+    let gate = PathBuf::from(gate);
+    if !gate.exists() || std::fs::write(&gate, b"captured").is_err() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while gate.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn tick(
     config: &ServeConfig,
@@ -7433,6 +7473,9 @@ async fn tick(
         .await
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     }?;
+
+    #[cfg(debug_assertions)]
+    pause_after_mailbox_snapshot_for_test().await;
 
     // ── Phase 2: Process mailbox rows ─────────────────────────────────
     // Partition by kind: done rows process first (one-per-tick), task_update
@@ -10284,38 +10327,63 @@ async fn tick(
     }
 
     // ── Phase 3: Drain events from active reviewers ────────────────────
-    let mut reviewers_to_kill: Vec<usize> = Vec::new();
+    let mut reviewer_breaches: Vec<(usize, String)> = Vec::new();
     for (i, r) in reviewers.iter_mut().enumerate() {
-        if !r.draining {
-            continue;
-        }
         if let Some(breach) =
-            check_active_slot_limits(r, &db_path, "reviewer", &config.limits).await?
+            actionable_slot_breach(r, &db_path, "reviewer", &config.limits).await?
         {
-            log(&format!(
-                "WATCHDOG: reviewer {} killed — {}",
-                r.agent_name, breach
-            ));
-            reviewers_to_kill.push(i);
+            reviewer_breaches.push((i, breach));
         }
     }
-    for &i in reviewers_to_kill.iter().rev() {
-        let mutation = fail_reviewer_if_owner(
+    for (i, breach) in reviewer_breaches.into_iter().rev() {
+        let disposition = dispose_managed_process_exit(
             &db_path,
+            tasks::ManagedRunRole::Reviewer,
             &reviewers[i].agent_name,
             reviewers[i].task_id,
-            "reviewer killed by watchdog",
+            reviewers[i].cap_run_id.as_deref(),
+            &format!("reviewer watchdog breach: {breach}"),
         )
         .await;
-        if mutation.is_none() {
+        let Some(disposition) = disposition else {
             log(&format!(
-                "reviewer {} watchdog mutation failed — retaining slot for retry",
+                "reviewer {} watchdog classification failed — retaining slot for retry",
                 reviewers[i].agent_name
             ));
             continue;
+        };
+        match disposition {
+            tasks::ManagedExitDisposition::OutcomePending => {
+                log(&format!(
+                    "reviewer {} exceeded a limit ({breach}) with verdict pending — retaining slot for mailbox delivery",
+                    reviewers[i].agent_name
+                ));
+            }
+            tasks::ManagedExitDisposition::OutcomeRecorded => {
+                let dead = reviewers.remove(i);
+                log(&format!(
+                    "reviewer {} exceeded a limit ({breach}) after recorded verdict — cleanup only",
+                    dead.agent_name
+                ));
+                teardown_reviewer(config, wt_mgr, name_pool, dead, "completed").await;
+            }
+            tasks::ManagedExitDisposition::OwnershipTransferred => {
+                let dead = reviewers.remove(i);
+                log(&format!(
+                    "reviewer {} exceeded a limit ({breach}) after review ownership advanced — cleanup only",
+                    dead.agent_name
+                ));
+                teardown_reviewer(config, wt_mgr, name_pool, dead, "ownership_transferred").await;
+            }
+            tasks::ManagedExitDisposition::AgentFailed(_) => {
+                let dead = reviewers.remove(i);
+                log(&format!(
+                    "WATCHDOG: reviewer {} killed after classification proved active ownership without a verdict — {breach}",
+                    dead.agent_name
+                ));
+                teardown_reviewer(config, wt_mgr, name_pool, dead, "crashed").await;
+            }
         }
-        let dead = reviewers.remove(i);
-        teardown_reviewer(config, wt_mgr, name_pool, dead, "watchdog").await;
     }
 
     // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
@@ -10326,7 +10394,7 @@ async fn tick(
         .unwrap_or(900);
     let mut idle_reviewers: Vec<usize> = Vec::new();
     for (i, r) in reviewers.iter().enumerate() {
-        if r.draining {
+        if r.draining || slot_has_pending_watchdog_outcome(r) {
             continue;
         }
         if let Some(ended) = r.turn_ended_at {
@@ -10365,33 +10433,69 @@ async fn tick(
     }
 
     // ── Phase 4: Drain events from active workers ──────────────────────
-    let mut workers_to_kill: Vec<usize> = Vec::new();
+    let mut worker_breaches: Vec<(usize, String)> = Vec::new();
     for (i, w) in workers.iter_mut().enumerate() {
-        if !w.draining {
-            continue;
-        }
-        if let Some(breach) =
-            check_active_slot_limits(w, &db_path, "worker", &config.limits).await?
-        {
-            log(&format!(
-                "WATCHDOG: worker {} killed (task #{}) — {}",
-                w.agent_name, w.task_id, breach
-            ));
-            workers_to_kill.push(i);
+        if let Some(breach) = actionable_slot_breach(w, &db_path, "worker", &config.limits).await? {
+            worker_breaches.push((i, breach));
         }
     }
-    for &i in workers_to_kill.iter().rev() {
-        let dead = workers.remove(i);
-        fire_event(
+    for (i, breach) in worker_breaches.into_iter().rev() {
+        let disposition = dispose_managed_process_exit(
             &db_path,
-            &dead.agent_name,
-            dead.task_id,
-            &Event::AgentFailed {
-                reason: "worker killed by watchdog".into(),
-            },
+            tasks::ManagedRunRole::Worker,
+            &workers[i].agent_name,
+            workers[i].task_id,
+            workers[i].cap_run_id.as_deref(),
+            &format!("worker watchdog breach: {breach}"),
         )
         .await;
-        cleanup_slot(config, wt_mgr, name_pool, dead, None, "crashed").await;
+        let Some(disposition) = disposition else {
+            log(&format!(
+                "worker {} watchdog classification failed — retaining slot for retry",
+                workers[i].agent_name
+            ));
+            continue;
+        };
+        match disposition {
+            tasks::ManagedExitDisposition::OutcomePending => {
+                log(&format!(
+                    "worker {} exceeded a limit ({breach}) with submission pending — retaining slot for mailbox delivery",
+                    workers[i].agent_name
+                ));
+            }
+            tasks::ManagedExitDisposition::OutcomeRecorded => {
+                let dead = workers.remove(i);
+                log(&format!(
+                    "worker {} exceeded a limit ({breach}) after recorded submission — cleanup only",
+                    dead.agent_name
+                ));
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+            }
+            tasks::ManagedExitDisposition::OwnershipTransferred => {
+                let dead = workers.remove(i);
+                log(&format!(
+                    "worker {} exceeded a limit ({breach}) after task ownership advanced — cleanup only",
+                    dead.agent_name
+                ));
+                cleanup_slot(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    None,
+                    "ownership_transferred",
+                )
+                .await;
+            }
+            tasks::ManagedExitDisposition::AgentFailed(_) => {
+                let dead = workers.remove(i);
+                log(&format!(
+                    "WATCHDOG: worker {} killed (task #{}) after classification proved active ownership without a submission — {breach}",
+                    dead.agent_name, dead.task_id
+                ));
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "crashed").await;
+            }
+        }
     }
 
     // ── Phase 4-idle: Kill workers idle too long between turns ─────────
@@ -10470,7 +10574,7 @@ async fn tick(
     // After MAX_ERROR_RETRIES consecutive errors, fire AgentFailed.
     let mut error_failed: Vec<usize> = Vec::new();
     for (i, w) in workers.iter_mut().enumerate() {
-        if w.error_turn_count == 0 || w.draining {
+        if !slot_is_error_refeed_candidate(w) {
             continue;
         }
         if w.error_turn_count >= MAX_ERROR_RETRIES {
@@ -10597,7 +10701,7 @@ async fn tick(
     if drain_state.draining {
         let mut drain_workers: Vec<usize> = Vec::new();
         for (i, w) in workers.iter().enumerate() {
-            if !w.draining {
+            if slot_is_graceful_drain_candidate(w) {
                 drain_workers.push(i);
             }
         }
@@ -10621,7 +10725,7 @@ async fn tick(
 
         let mut drain_reviewers: Vec<usize> = Vec::new();
         for (i, r) in reviewers.iter().enumerate() {
-            if !r.draining {
+            if slot_is_graceful_drain_candidate(r) {
                 drain_reviewers.push(i);
             }
         }
@@ -10758,6 +10862,7 @@ async fn tick(
             tasks::ManagedRunRole::Worker,
             &dead.agent_name,
             dead.task_id,
+            dead.cap_run_id.as_deref(),
             "worker process died",
         )
         .await
@@ -10885,6 +10990,7 @@ async fn tick(
             tasks::ManagedRunRole::Reviewer,
             &reviewers[i].agent_name,
             reviewers[i].task_id,
+            reviewers[i].cap_run_id.as_deref(),
             "reviewer process died",
         )
         .await;
@@ -11034,6 +11140,15 @@ async fn tick(
             Some(wi) if workers[wi].draining => {
                 // Target is mid-turn — leave unconsumed, retry next tick.
             }
+            Some(wi) if slot_has_pending_watchdog_outcome(&workers[wi]) => {
+                // A durable outcome missed this tick's mailbox snapshot. Its
+                // watchdog disposition remains authoritative over sibling
+                // feeds until a later tick consumes and reclassifies it.
+                log(&format!(
+                    "deferring message from {} to {} while watchdog outcome is pending",
+                    msg_row.agent, target
+                ));
+            }
             Some(wi) => {
                 let payload = msg_row.payload.as_deref().unwrap_or("");
                 let raw_prompt = format!("MESSAGE from {}: {payload}", msg_row.agent);
@@ -11067,6 +11182,9 @@ async fn tick(
             }
         }
     }
+
+    #[cfg(debug_assertions)]
+    pause_after_message_delivery_for_test().await;
 
     // ── Phase 4d: Renew task leases for active workers (#130) ───────────
     // The daemon explicitly renews the exact lease for each active worker's
@@ -13293,7 +13411,7 @@ async fn renew_active_worker_task_leases(db_path: &Path, workers: &[SlotState]) 
 /// testable: a regression that lets the watchdog kill a dormant awaiting-
 /// review slot must break the same predicate the tick loop consults.
 fn slot_is_idle_zombie_candidate(slot: &SlotState, idle_timeout_secs: u64) -> bool {
-    if slot.draining || slot.error_turn_count > 0 {
+    if slot.draining || slot.error_turn_count > 0 || slot_has_pending_watchdog_outcome(slot) {
         return false;
     }
     // Dormant sticky slots have no live process to zombify; they exist to
@@ -13303,6 +13421,22 @@ fn slot_is_idle_zombie_candidate(slot: &SlotState, idle_timeout_secs: u64) -> bo
     }
     slot.turn_ended_at
         .is_some_and(|t| t.elapsed().as_secs() > idle_timeout_secs)
+}
+
+/// A terminal watchdog breach classified as OutcomePending preserves mailbox
+/// authority for the rest of the tick. No sibling idle path may refeed or
+/// tear down the slot before a later tick consumes and reclassifies the row.
+fn slot_has_pending_watchdog_outcome(slot: &SlotState) -> bool {
+    slot.pending_watchdog_breach.is_some()
+}
+
+fn slot_is_error_refeed_candidate(slot: &SlotState) -> bool {
+    slot.error_turn_count > 0 && !slot.draining && !slot_has_pending_watchdog_outcome(slot)
+}
+
+/// Shared by worker and reviewer graceful drain selection.
+fn slot_is_graceful_drain_candidate(slot: &SlotState) -> bool {
+    !slot.draining && !slot_has_pending_watchdog_outcome(slot)
 }
 
 async fn persist_runner_provider_block(
@@ -13693,6 +13827,31 @@ async fn check_active_slot_limits(
         return Ok(Some(breach));
     }
     Ok(check_wall_clock_limits(limits, slot))
+}
+
+/// Return a newly observed breach or retain an OutcomePending breach until a
+/// later mailbox tick can classify the durable outcome. Provider completion
+/// sets `draining=false`, so relying on active draining alone loses terminal
+/// token/cost breaches.
+async fn actionable_slot_breach(
+    slot: &mut SlotState,
+    db_path: &std::path::Path,
+    role: &str,
+    limits: &CostLimits,
+) -> Result<Option<String>> {
+    if let Some(breach) = &slot.pending_watchdog_breach {
+        return Ok(Some(breach.clone()));
+    }
+    if !slot.draining {
+        return Ok(None);
+    }
+    let breach = check_active_slot_limits(slot, db_path, role, limits)
+        .await?
+        .map(|breach| breach.to_string());
+    if let Some(breach) = &breach {
+        slot.pending_watchdog_breach = Some(breach.clone());
+    }
+    Ok(breach)
 }
 
 fn persist_diagnostics(slot: &mut SlotState) -> std::io::Result<()> {
@@ -14778,6 +14937,7 @@ async fn provision_reviewer_reserved(
                 remote_branch: branch.clone(),
                 branch,
                 draining: true,
+                pending_watchdog_breach: None,
                 pr: Some(pr),
                 rework_count: 0,
                 cost_tokens: 0,
@@ -15550,6 +15710,7 @@ async fn spawn_worker(
                 remote_branch: remote_branch.clone(),
                 branch,
                 draining: true,
+                pending_watchdog_breach: None,
                 pr: continuation_pr,
                 rework_count: retry_slot_rework_count(
                     task.rework_round,
@@ -15857,18 +16018,32 @@ async fn dispose_managed_process_exit(
     role: tasks::ManagedRunRole,
     agent: &str,
     task_id: i64,
+    run_id: Option<&str>,
     reason: &str,
 ) -> Option<tasks::ManagedExitDisposition> {
     let p = db_path.to_path_buf();
     let actor = agent.to_string();
+    let run_id = match run_id {
+        Some(run_id) => run_id.to_string(),
+        None => {
+            let message = "managed process has no run capability; refusing name-based teardown";
+            log(&format!(
+                "lifecycle: managed exit classification failed for task #{task_id}: {message}"
+            ));
+            persist_lifecycle_diagnostic(db_path, agent, task_id, "managed process exit", message)
+                .await;
+            return None;
+        }
+    };
     let failure_reason = reason.to_string();
     match tokio::task::spawn_blocking(move || {
         let mut conn = quorum_core::db::open(&p)?;
-        tasks::dispose_managed_exit(
+        tasks::dispose_managed_run_exit(
             &mut conn,
             role,
             &actor,
             task_id,
+            &run_id,
             &failure_reason,
             now_unix(),
         )
@@ -16133,10 +16308,9 @@ enum WorkerNameReleaseExpectation {
 }
 
 fn worker_name_release_expectation(end_reason: &str) -> WorkerNameReleaseExpectation {
-    if end_reason == "provider_blocked" {
-        WorkerNameReleaseExpectation::RetainedForProviderRetry
-    } else {
-        WorkerNameReleaseExpectation::Released
+    match end_reason {
+        "provider_blocked" => WorkerNameReleaseExpectation::RetainedForProviderRetry,
+        _ => WorkerNameReleaseExpectation::Released,
     }
 }
 
@@ -16149,10 +16323,11 @@ fn worker_name_release_expectation(end_reason: &str) -> WorkerNameReleaseExpecta
 /// unexpired lease on `task#<id>` is still held by this agent before the pool
 /// release. If the lease is still live, or the DB check itself fails, the name
 /// is retained in `in_use` — a leaked name is strictly safer than one recycled
-/// under an active claim. A retained lease is only expected for a
-/// provider-blocked retry; every other live lease and all DB/spawn failures are
-/// recorded as errors. Filesystem and process cleanup is done by the caller
-/// before invoking this guard so the DB check/settlement stays a short
+/// under an active claim. A retained lease is expected only for a provider
+/// retry; managed-exit classification settles a completed or transferred
+/// worker's exact lease before cleanup. Every other live lease and all DB/spawn
+/// failures are recorded as errors. Filesystem and process cleanup is done by
+/// the caller before invoking this guard so the DB check stays a short
 /// transaction.
 async fn guarded_worker_name_release(
     db_path: &Path,
@@ -17694,6 +17869,7 @@ async fn spawn_remediation_worker(
                 branch,
                 remote_branch,
                 draining: true,
+                pending_watchdog_breach: None,
                 pr: Some(pr),
                 rework_count: 1,
                 cost_tokens: 0,
@@ -19168,6 +19344,7 @@ mod tests {
             branch: "test-branch".into(),
             remote_branch: "test-branch".into(),
             draining: false,
+            pending_watchdog_breach: None,
             pr: None,
             rework_count: 0,
             cost_tokens: 500,
@@ -20237,6 +20414,7 @@ mod tests {
                 branch: "daemon/dormant-t1".into(),
                 remote_branch: "daemon/dormant-t1".into(),
                 draining: false,
+                pending_watchdog_breach: None,
                 pr: Some(443),
                 rework_count: 0,
                 cost_tokens: 17,
@@ -21397,6 +21575,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             branch: "test-branch".into(),
             remote_branch: "test-branch".into(),
             draining: false,
+            pending_watchdog_breach: None,
             pr: Some(553),
             rework_count: 0,
             cost_tokens: 0,
@@ -22200,6 +22379,26 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.draining = false;
         slot.error_turn_count = 1;
         assert!(!slot_is_idle_zombie_candidate(&slot, 300));
+    }
+
+    #[test]
+    fn pending_watchdog_outcome_blocks_sibling_idle_paths() {
+        let mut slot = make_dummy_slot();
+        slot.draining = false;
+        slot.error_turn_count = 0;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+        slot.pending_watchdog_breach = Some("task tokens exceeded".into());
+
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
+        slot.error_turn_count = 1;
+        assert!(!slot_is_error_refeed_candidate(&slot));
+        assert!(!slot_is_graceful_drain_candidate(&slot));
+
+        slot.pending_watchdog_breach = None;
+        assert!(slot_is_error_refeed_candidate(&slot));
+        assert!(slot_is_graceful_drain_candidate(&slot));
+        slot.error_turn_count = 0;
+        assert!(slot_is_idle_zombie_candidate(&slot, 300));
     }
 
     #[test]
@@ -26554,6 +26753,201 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
     }
 
+    fn issue_test_run(db_path: &Path, agent: &str, run_id: &str) {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        quorum_core::capabilities::issue(&mut conn, run_id, 1, agent, "worker", now_unix())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn watchdog_exit_with_pending_submission_retains_mailbox_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("watchdog-pending.db");
+        create_active_task(&db_path, "Spool", "working");
+        issue_test_run(&db_path, "Spool", "run-pending");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Spool".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(1),
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let disposition = dispose_managed_process_exit(
+            &db_path,
+            tasks::ManagedRunRole::Worker,
+            "Spool",
+            1,
+            Some("run-pending"),
+            "worker watchdog breach: task tokens exceeded",
+        )
+        .await
+        .expect("watchdog classification must succeed");
+        assert!(matches!(
+            disposition,
+            tasks::ManagedExitDisposition::OutcomePending
+        ));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        assert_eq!(task.recovery_attempts, 0);
+        assert!(mailbox::has_unconsumed(&conn, "Spool", mailbox::MailboxKind::Done, 1).unwrap());
+        let active_lease: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target='task#1' AND active=1 AND holder='Spool'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_lease, 1,
+            "pending delivery must retain its owner lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_exit_active_worker_without_submission_recovers_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("watchdog-active.db");
+        create_active_task(&db_path, "Spool", "working");
+        issue_test_run(&db_path, "Spool", "run-active");
+
+        let first = dispose_managed_process_exit(
+            &db_path,
+            tasks::ManagedRunRole::Worker,
+            "Spool",
+            1,
+            Some("run-active"),
+            "worker watchdog breach: task tokens exceeded",
+        )
+        .await
+        .expect("watchdog classification must succeed");
+        assert!(matches!(
+            first,
+            tasks::ManagedExitDisposition::AgentFailed(_)
+        ));
+
+        let duplicate = dispose_managed_process_exit(
+            &db_path,
+            tasks::ManagedRunRole::Worker,
+            "Spool",
+            1,
+            Some("run-active"),
+            "duplicate watchdog observation",
+        )
+        .await
+        .expect("repeat classification must succeed");
+        assert!(matches!(
+            duplicate,
+            tasks::ManagedExitDisposition::OwnershipTransferred
+        ));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 1);
+        let task_open_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject='task#1' AND kind='task_open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_open_events, 1, "watchdog must emit AgentFailed once");
+    }
+
+    #[tokio::test]
+    async fn recorded_watchdog_worker_settlement_allows_name_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("watchdog-recorded.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+        create_active_task(&db_path, &agent, "working");
+        issue_test_run(&db_path, &agent, "run-recorded");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let row_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: agent.clone(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(1),
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                &agent,
+                1,
+                &Event::SignaledDone { pr: "1".into() },
+                now_unix(),
+            )
+            .unwrap();
+            mailbox::mark_consumed(&mut conn, row_id).unwrap();
+        }
+
+        let disposition = dispose_managed_process_exit(
+            &db_path,
+            tasks::ManagedRunRole::Worker,
+            &agent,
+            1,
+            Some("run-recorded"),
+            "worker watchdog breach: task tokens exceeded",
+        )
+        .await
+        .expect("watchdog classification must succeed");
+        assert!(matches!(
+            disposition,
+            tasks::ManagedExitDisposition::OutcomeRecorded
+        ));
+        guarded_worker_name_release_with_expectation(
+            &db_path,
+            &mut pool,
+            &agent,
+            1,
+            worker_name_release_expectation("completed"),
+        )
+        .await;
+
+        assert_eq!(pool.in_use_count(), 0);
+        assert_eq!(pool.acquire_named(&agent), Some(agent.clone()));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let active_retiring_lease: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims
+                 WHERE target='task#1' AND holder=?1 AND active=1",
+                [&agent],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_retiring_lease, 0);
+        let retired =
+            quorum_core::capabilities::validate(&conn, "run-recorded", &agent, "worker", Some(1))
+                .unwrap_err();
+        assert!(
+            retired.to_string().contains("revoked"),
+            "late submit capability must be revoked before name reuse: {retired}"
+        );
+    }
+
     #[tokio::test]
     async fn dead_codex_with_pending_null_pr_done_is_retained_without_retry_staging() {
         let dir = tempfile::tempdir().unwrap();
@@ -29179,7 +29573,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             WorkerNameReleaseExpectation::RetainedForProviderRetry
         );
         assert_eq!(
-            worker_name_release_expectation("done"),
+            worker_name_release_expectation("completed"),
+            WorkerNameReleaseExpectation::Released
+        );
+        assert_eq!(
+            worker_name_release_expectation("ownership_transferred"),
             WorkerNameReleaseExpectation::Released
         );
     }

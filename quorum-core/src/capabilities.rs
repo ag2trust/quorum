@@ -157,6 +157,45 @@ pub(crate) fn revoke_for_agent_task_tx(
     revoke_tx(tx, run_id, now)
 }
 
+/// Check whether one exact managed-run capability is still active. Unknown or
+/// mismatched identities are rejected so a recycled agent name cannot make a
+/// retiring process appear to own a successor's authority.
+pub(crate) fn managed_run_is_active_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    agent: &str,
+    task_id: i64,
+    role: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT revoked_at IS NULL FROM run_capabilities
+         WHERE run_id=?1 AND agent=?2 AND task_id=?3 AND role=?4",
+        params![run_id, agent, task_id, role],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| {
+        QuorumError::Usage(format!(
+            "run_id '{run_id}' does not belong to {role} agent '{agent}' on task {task_id}"
+        ))
+    })
+}
+
+/// Revoke one exact managed-run capability within a caller-owned transaction.
+pub(crate) fn revoke_managed_run_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    agent: &str,
+    task_id: i64,
+    role: &str,
+    now: i64,
+) -> Result<bool> {
+    // Validate the immutable identity even when the capability was already
+    // revoked. Idempotent cleanup must not gain authority through a name match.
+    let _ = managed_run_is_active_tx(tx, run_id, agent, task_id, role)?;
+    revoke_tx(tx, run_id, now)
+}
+
 /// Revoke all active capabilities for an agent. Used on agent death/recovery.
 pub fn revoke_all_for_agent(conn: &mut Connection, agent: &str, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;
