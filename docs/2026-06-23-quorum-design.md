@@ -71,8 +71,17 @@ and verification evidence, not normative product language.
 DB path: `~/.quorum/repos/<owner>__<name>/quorum.db`. Repo identity is resolved from
 `QUORUM_REPO` env var (set by the daemon for workers) > cwd git detection (parse the
 `origin` remote URL) > loud error (exit 2). No daemon required for CLI commands. No
-server. No network. No MCP. Agents invoke `quorum <subcommand>` as ordinary shell
-commands (via the Bash tool), exactly as they already drive `gh`, `git`, and `rtk`.
+general network server. Agents invoke lifecycle-safe `quorum <subcommand>` operations as
+ordinary shell commands. Managed PR collaboration additionally uses a short-lived,
+credentialless `quorum agent-mcp` stdio process injected by the daemon; it writes bounded,
+run-authorized GitHub operation requests through a narrow local daemon endpoint, and the daemon
+alone writes SQLite and performs the remote operation. The MCP process never receives the Quorum
+database, GitHub credentials, or lifecycle authority.
+
+For contained runs, the same local endpoint carries the existing run-scoped `submit` and `react`
+signals, so those commands need neither a database mount nor a broader daemon API. They retain
+their current semantics and are not exposed as MCP tools. Public and admin CLI commands remain
+direct short-lived SQLite operations outside the contained managed runner.
 
 Each invocation is a **complete, self-contained, short-lived process**: open the DB,
 perform one atomic op, print JSON to stdout, exit with a meaningful code. There is **no
@@ -88,22 +97,23 @@ reads (re-read "last N comments" every poll), no atomic claim (the semaphore nee
 10s wait → full rescan → tiebreak-by-comment-id, and still races).
 
 Quorum replaces the *coordination* layer (chatter + claims + task queue). **PRs and code
-review stay on GitHub** — inherently tied to git/GitHub and out of scope.
+review stay authoritative on GitHub**; managed agents author that conversation through
+Quorum-mediated collaboration operations.
 
-## Why CLI-first over an HTTP/MCP daemon
+## CLI-first coordination plus managed-agent MCP
 
-| | CLI-first (chosen) | HTTP/MCP daemon (rejected for v1) |
-|---|---|---|
-| To build | binary + file | + transport + server + daemon lifecycle |
-| To operate | nothing | daemon, port, launchd, per-agent MCP config |
-| Atomicity | free (SQLite cross-process locking) | same, but mediated by the daemon |
-| Context cost | zero until invoked | ~all tool schemas loaded every turn |
-| Discovery | `--help` / `quorum help-agent` + CLAUDE.md | auto-listed typed tools |
-| Failure modes | fewer (no daemon to be down) | daemon down ⇒ agents blocked |
+General coordination stays CLI-first: each short-lived command opens SQLite, performs one
+atomic operation, emits JSON, and exits. Quorum does not add a general HTTP daemon, remote MCP
+listener, OAuth surface, port, or second source of coordination state.
 
-The only real loss is auto tool-discovery, mitigated by `quorum help-agent` + a CLAUDE.md
-snippet. **Not a one-way door:** an MCP shim over the same `quorum-core` lib can be added
-later if discovery ever proves worth the weight.
+Managed GitHub collaboration is the narrow exception because direct Repository Service
+credentials and shell-composed Markdown are the wrong boundary for an untrusted coding run. The
+daemon injects one tools-only stdio MCP whose inventory is derived from the exact live run role.
+The adapter remains short-lived and stateless; it forwards closed typed requests to a narrow local
+daemon endpoint, SQLite holds the durable operation request, and `quorum serve` executes remote
+GitHub work outside transactions. Restricted internal model roles receive no MCP. The separate
+outside/task-creator MCP requires its own authentication and remote-transport design and is not
+implied by this agent interface.
 
 ## Concurrency & atomicity (no daemon required)
 
@@ -379,7 +389,8 @@ for v1.)
 
 Single Cargo crate (workspace-ready) in `~/dev/quorum`:
 - `quorum-core` (lib): store + domain logic + PRAGMA setup + migrations; fully testable
-  without any I/O harness. A future MCP shim wraps this.
+  without any I/O harness. The credentialless agent MCP wraps its run-capability and durable
+  GitHub-operation boundaries.
 - `quorum` (bin): clap arg parsing, stdin/file input, JSON output, exit-code mapping,
   `status`/`watch`/`sweep`/`help-agent`.
 
@@ -722,13 +733,15 @@ owner-retry target but lose automatic retry/head-check authority; `done` and `ca
 rows lose all park/resume authority. The cleanup writes one audit note and is idempotent.
 Before reconciliation, `quorum status` surfaces these rows as critical health alerts.
 
-### Review responsibility boundary (agents own PR collaboration)
+### Review responsibility boundary (agents author; Quorum mediates)
 
 For PR-backed tasks, the GitHub PR is the source of truth for the review conversation:
 findings (BLOCKING and advisory), advisory suggestions, author responses/pushback,
 reviewer resolution of prior findings, and evidence. Quorum coordinates lifecycle,
-provisioning, the final formal APPROVE, and merge — it does **not** proxy the review
-conversation. Concretely:
+provisioning, validated publication, the final formal APPROVE, and merge. Agents author the
+conversation through the run-bound GitHub collaboration MCP; Quorum preserves their Markdown,
+anchors contributions to the authorized PR/revision, and never derives lifecycle transitions
+from comment text. Concretely:
 
 - **Reviewer agents** complete their planned audit for the reviewed SHA before
   submitting a verdict: discovering one blocker does not end exploration. They
@@ -761,8 +774,9 @@ conversation. Concretely:
   fixed Unicode-scalar limit. Explicit entry and field truncation directs the
   reader to the PR for omitted authoritative history; omitted current blockers
   still count in the verdict.
-  Encouraged GitHub operations are normal comments, inline comments, and review
-  summary comments. Formal APPROVE and REQUEST_CHANGES reviews remain daemon-owned
+  Encouraged GitHub operations are the injected MCP's normal comments, pending COMMENT review,
+  inline comments, review summary, thread replies, and reviewer-only thread resolution. Formal
+  APPROVE and REQUEST_CHANGES reviews remain daemon-owned
   because managed reviewers use the same GitHub account as PR authors.
   Reviewers classify technical impact independently from merge disposition. A
   concrete finding is BLOCKING only when merging the exact change would leave
@@ -784,7 +798,8 @@ conversation. Concretely:
 - **Author/rework agents** address findings on the PR. If disagreeing with a finding,
   the author replies to it on the PR with concrete evidence rather than silently
   ignoring it. The final PR history must let a later collector determine, for each
-  finding: fixed, accepted, overridden with evidence, or unaddressed.
+  finding: fixed, accepted, overridden with evidence, or unaddressed. Replies use the
+  referenced review thread rather than creating unrelated top-level comments.
 - **Lifecycle signal only:** reviewers signal state with
   `quorum submit --verdict approved|changes --blocking N [--feedback ...]`. The
   submit payload is a lifecycle signal, not a second review ledger — the ledger is
@@ -798,7 +813,12 @@ conversation. Concretely:
 
 This preserves #206 verdict attestation, reviewer separation, the rework cap, sticky
 reviewer, the stale-SHA gate, and R1/R2 lifecycle. It shifts only who writes to the PR:
-agents, directly.
+agents author the content and the daemon publishes it through run-scoped operations.
+
+Initial daemon-created PRs render stable Outcome, Changes, Verification, Task, and optional
+Notes sections. Task identity, accepted title, and accepted body come from daemon-owned task
+state. Bounded worker delivery evidence fills the other sections; absent evidence is stated
+explicitly. Existing-PR continuation and review-only entry do not overwrite an external body.
 
 ### R2 pre-merge review gate (#159, configurable sampling)
 
@@ -1821,11 +1841,12 @@ repeats the same authoritative
 branch/SHA/base validation before any push. Initial PR reconciliation
 also requires the PR base to equal the configured base branch. Rejected or ambiguous
 publication parks the task; persisted PR target data is never authority for a publish
-retry. This is protocol ownership plus a best-effort
-worktree `pushurl` lockout, not credential isolation: an agent holding the same GitHub
-credential can still bypass local Git configuration with an explicit URL or API.
-Enforcing physical write authority requires the separate D4 credential split and is not
-claimed here.
+retry. This is protocol ownership plus a best-effort worktree `pushurl` lockout. A local
+permissive run sharing the operator's OS identity still does not claim physical credential
+isolation: an agent that can reach the operator's independent GitHub credential may bypass local
+Git configuration. The isolated-runtime profile enforces the separate credential boundary by
+giving the runner no GitHub token, authenticated CLI configuration, SSH agent, credential helper,
+or credentialed Repository Service endpoint; only the daemon/broker performs remote writes.
 
 Reviewers must inspect the full diff and relevant surrounding behavior, follow
 repository instructions, classify BLOCKING and advisory findings, put authoritative
@@ -2636,7 +2657,7 @@ changes.
   Each request opens, reads, and closes SQLite before responding. Dashboard task and run
   pages are bounded, stream reads are byte-capped, and `--log-dir` selects the daemon's
   configured log root.
-- **Out of scope (YAGNI, v1):** auth · multi-machine · daemon/HTTP/MCP server ·
+- **Out of scope (YAGNI, v1):** general auth · multi-machine coordination · remote HTTP/MCP server ·
   message editing · threads beyond `topic` · PR/review mirroring · cross-repo bus ·
   presence-based claim eviction · arbitrary-byte (BLOB) payloads · **agent-name uniqueness
   enforcement** (v1 is caller-owned first-use-wins; same id silently merges — a v2 could
