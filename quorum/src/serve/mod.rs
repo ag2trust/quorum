@@ -12226,6 +12226,11 @@ async fn feed_worker_turn(
             };
             slot.agent_run_id = Some(new_run_id);
             slot.cap_run_id = Some(authority.cap_run_id);
+            // A respawned turn has a new durable agent_run identity. Keep the
+            // legacy task-level token scalar cumulative for live caps, but do
+            // not carry the preceding run's detailed telemetry into the new
+            // per-run snapshot.
+            slot.token_usage = runner::TokenUsage::default();
             slot.live_stats = LiveStats::new();
             slot.turn_ended_at = None;
         }
@@ -13617,6 +13622,36 @@ fn capture_terminal_usage(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn close_attachment_failed_reviewer_run(
+    db_path: &Path,
+    reviewer_run_id: i64,
+    task_id: i64,
+    pr: i64,
+    reviewer_kind: runner::AgentKind,
+    reviewer_model: &str,
+    reviewer_effort: &str,
+    terminal: &[runner::CapturedOutput],
+) {
+    let mut token_usage = runner::TokenUsage::default();
+    capture_terminal_usage(reviewer_kind, terminal, &mut token_usage);
+    close_agent_run_with_usage(
+        db_path,
+        Some(reviewer_run_id),
+        "attachment-failed",
+        Some(ManagedUsageRecord {
+            task_id,
+            purpose: "reviewer".into(),
+            pr_number: Some(pr),
+            provider: reviewer_kind.to_string(),
+            model: reviewer_model.to_string(),
+            effort: reviewer_effort.to_string(),
+            usage: durable_token_usage(token_usage),
+        }),
+    )
+    .await;
+}
+
 fn truncate_now_label(s: &str) -> String {
     if s.chars().count() <= 24 {
         s.to_string()
@@ -14149,7 +14184,7 @@ async fn provision_reviewer_reserved(
         wt_path.display()
     ));
 
-    let reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
+    let mut reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
             &reviewer_name,
@@ -14534,7 +14569,7 @@ async fn provision_reviewer_reserved(
                     "{}: ReviewerAttached was rejected after provisioning: {e}",
                     role.as_str().to_uppercase()
                 ));
-                let _terminal_output = proc.kill_and_reap().await;
+                let terminal_output = proc.kill_and_reap().await;
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
                 name_pool.release(&reviewer_name);
@@ -14549,16 +14584,22 @@ async fn provision_reviewer_reserved(
                             &failed_cap_run_id,
                             now_unix(),
                         );
-                        let _ = quorum_core::agent_runs::close(
-                            &conn,
-                            reviewer_run_id,
-                            now_unix(),
-                            "attachment-failed",
-                        );
                     }
                 })
                 .await
                 .ok();
+                close_attachment_failed_reviewer_run(
+                    &config.db_path,
+                    reviewer_run_id,
+                    worker.task_id,
+                    pr,
+                    reviewer_kind,
+                    &reviewer_model,
+                    &reviewer_effort,
+                    &terminal_output,
+                )
+                .await;
+                persist_terminal_output(&mut reviewer_session_log, terminal_output);
                 return Err(QuorumError::Io(format!(
                     "reviewer attachment failed after provisioning: {e}"
                 )));
@@ -20066,6 +20107,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn fake_codex_resume_with_usage_program(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join("fake-codex-resume-usage.sh");
+        std::fs::write(
+            &program,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input_tokens":20,"cache_write_input_tokens":3,"output_tokens":11,"reasoning_output_tokens":7}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn dormant_codex_rework_reacquires_lease_and_resumes_exact_turn_with_rotated_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -20196,6 +20253,106 @@ mod tests {
         assert_eq!(journal[0].phase, "working");
         assert_eq!(journal[0].pr, Some(443));
         assert!(journal[0].pid.is_some());
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dormant_codex_rework_records_each_agent_run_without_prior_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dormant-rework-usage.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let program = fake_codex_resume_with_usage_program(dir.path());
+        let (mut slot, old_run_id, _) =
+            dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
+        let config = dormant_codex_test_config(
+            db_path.clone(),
+            worktree,
+            Some(program.to_string_lossy().into_owned()),
+        );
+        let first_run_usage = runner::TokenUsage {
+            input_tokens: 100,
+            uncached_input_tokens: 60,
+            cached_input_tokens: 40,
+            cache_write_input_tokens: 5,
+            output_tokens: 20,
+            reasoning_tokens: 10,
+        };
+        slot.token_usage = first_run_usage;
+        record_managed_usage_snapshot(
+            &db_path,
+            slot.agent_run_id,
+            managed_usage_record(&slot, "worker"),
+        )
+        .await;
+        assert!(
+            install_live_worker_remediation_lease(
+                &config,
+                slot.agent_name.clone(),
+                slot.task_id,
+                443,
+                "exact reviewer finding",
+            )
+            .await
+        );
+
+        feed_worker_turn(&mut slot, "fix the reviewer finding", &config)
+            .await
+            .expect("new Codex rework run launches");
+        let new_run_id = slot.agent_run_id.expect("new run identity");
+        assert_ne!(new_run_id, old_run_id);
+        assert_eq!(
+            slot.token_usage,
+            runner::TokenUsage::default(),
+            "installing a new agent_run must reset only the detailed per-run accumulator"
+        );
+        assert_eq!(
+            slot.cost_tokens, 17,
+            "legacy task-level live accounting remains cumulative across run rotation"
+        );
+        begin_sticky_worker_rework(&mut slot, &db_path)
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                .await
+                .unwrap();
+            if !slot.draining {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let second_run_usage = runner::TokenUsage {
+            input_tokens: 70,
+            uncached_input_tokens: 50,
+            cached_input_tokens: 20,
+            cache_write_input_tokens: 3,
+            output_tokens: 11,
+            reasoning_tokens: 7,
+        };
+        assert_eq!(slot.token_usage, second_run_usage);
+        assert_eq!(
+            slot.cost_tokens, 98,
+            "new turn contributes raw input plus output to the legacy cumulative cap scalar"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, old_run_id)
+                .unwrap()
+                .unwrap(),
+            durable_token_usage(first_run_usage)
+        );
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, new_run_id)
+                .unwrap()
+                .unwrap(),
+            durable_token_usage(second_run_usage),
+            "the second run row must contain B, not A+B"
+        );
         drop(conn);
         slot.kill_and_reap().await;
     }
@@ -21505,6 +21662,99 @@ mod tests {
                 cache_write_input_tokens: 10,
                 output_tokens: 5,
                 reasoning_tokens: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_reviewer_attachment_closes_run_with_buffered_terminal_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("attachment-failed-usage.db");
+        let now = now_unix();
+        let (task_id, reviewer_run_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "reviewer attachment failure",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [task_id])
+                .unwrap();
+            let reviewer_run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "Rejected-reviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now,
+            )
+            .unwrap();
+            (task_id, reviewer_run_id)
+        };
+
+        let attachment_error = match fire_event_result(
+            &db_path,
+            "Rejected-reviewer",
+            task_id,
+            &Event::ReviewerAttached {
+                agent: "Rejected-reviewer".into(),
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("a terminal task must reject reviewer attachment"),
+            Err(error) => error,
+        };
+        assert!(attachment_error.to_string().contains("invalid transition"));
+
+        let terminal = vec![runner::CapturedOutput::Stdout(
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3}}"#
+                .into(),
+        )];
+        close_attachment_failed_reviewer_run(
+            &db_path,
+            reviewer_run_id,
+            task_id,
+            464,
+            runner::AgentKind::Codex,
+            "gpt-5.6-terra",
+            "high",
+            &terminal,
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "done",
+            "telemetry capture must not change the rejected lifecycle outcome"
+        );
+        let run = quorum_core::agent_runs::runs_for_task(&conn, task_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.id == reviewer_run_id)
+            .unwrap();
+        assert_eq!(run.end_reason.as_deref(), Some("attachment-failed"));
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, reviewer_run_id)
+                .unwrap()
+                .unwrap(),
+            quorum_core::token_usage::TokenUsage {
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 3,
             }
         );
     }
