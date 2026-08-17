@@ -2059,6 +2059,7 @@ async fn resolve_and_persist_parked_rework_target(
     config: &ServeConfig,
     task_id: i64,
     intent: &PublicationIntent,
+    base_branch: &str,
 ) -> std::result::Result<PrTarget, String> {
     let pr = intent
         .pr
@@ -2070,9 +2071,18 @@ async fn resolve_and_persist_parked_rework_target(
     // Resolve GitHub completely before opening the short persistence
     // transaction. The recorded lease is authoritative: a live target may
     // confirm it, never replace it.
-    let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
-    validate_continue_pr_target(&target, pr, &config.base_branch)?;
-    existing_pr_lease_baseline(intent, &target, &config.base_branch)?;
+    let target = resolve_publication_pr_target_with_program(
+        pr,
+        &config.repo_dir,
+        Some(&config.repo),
+        config
+            .pr_target_program
+            .as_deref()
+            .unwrap_or(Path::new("gh")),
+    )
+    .await?;
+    validate_continue_pr_target(&target, pr, base_branch)?;
+    existing_pr_lease_baseline(intent, &target, base_branch)?;
 
     let db_path = config.db_path.clone();
     let persisted = target.clone();
@@ -14712,7 +14722,14 @@ async fn spawn_worker(
         match recorded {
             Some(intent) => {
                 let pr = intent.pr.expect("validated parked publication PR");
-                match resolve_and_persist_parked_rework_target(config, task.id, &intent).await {
+                match resolve_and_persist_parked_rework_target(
+                    config,
+                    task.id,
+                    &intent,
+                    effective_base_branch,
+                )
+                .await
+                {
                     Ok(target) => (Some(target), true),
                     Err(error) => {
                         let reason = format!(
@@ -23246,6 +23263,132 @@ mod tests {
             "{{\"headRefName\":\"{head_ref}\",\"headRefOid\":\"{head_sha}\",\
              \"isCrossRepository\":false,\"baseRefName\":\"{base}\",\"state\":\"OPEN\"}}"
         )
+    }
+
+    fn seed_parked_rework_publication(
+        conn: &mut quorum_core::Connection,
+        pr: i64,
+        task_target: Option<&str>,
+        head_sha: &str,
+    ) -> (i64, PublicationIntent) {
+        let intent = PublicationIntent {
+            branch: format!("daemon/rework-t{pr}"),
+            local_sha: format!("source-{pr}"),
+            pr: Some(pr),
+            stage: "verified".into(),
+            target_branch: task_target.map(str::to_string),
+            expected_remote_sha: Some(head_sha.into()),
+        };
+        let refs = serde_json::json!({
+            "cx_est": 3,
+            "cx_size": "M",
+            "cx_ready": true,
+            "cx_not_ready_reason": null,
+            "cx_by": "test:v2",
+            "daemon_rework_retry_requested": true,
+            "pr": pr,
+            "daemon_publication": intent,
+        })
+        .to_string();
+        let task_id = tasks::create_with_continue_pr_and_target_branch(
+            conn,
+            "owner",
+            "parked rework publication",
+            None,
+            0,
+            None,
+            Some(&refs),
+            None,
+            None,
+            None,
+            task_target,
+            now_unix(),
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [task_id])
+            .unwrap();
+        (task_id, intent)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parked_rework_targeted_task_uses_immutable_target_not_configured_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("parked-targeted-rework.db");
+        let pr = 701;
+        let head_sha = "7017017017017017017017017017017017017017";
+        let (task_id, intent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_parked_rework_publication(&mut conn, pr, Some("develop"), head_sha)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-parked-targeted",
+            &open_pr_target_json(&intent.branch, head_sha, "develop"),
+        ));
+
+        let target = resolve_and_persist_parked_rework_target(&config, task_id, &intent, "develop")
+            .await
+            .expect("a develop-target parked rework must not fall back to configured main");
+        assert_eq!(target.base_ref.as_deref(), Some("develop"));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.target_branch.as_deref(), Some("develop"));
+        assert!(daemon_rework_retry_requested(task.refs.as_deref()));
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            head_sha,
+            "successful targeted validation must durably retain the exact rework lease"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parked_rework_targetless_legacy_task_uses_configured_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("parked-legacy-rework.db");
+        let pr = 702;
+        let head_sha = "7027027027027027027027027027027027027027";
+        let (task_id, intent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_parked_rework_publication(&mut conn, pr, None, head_sha)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-parked-legacy",
+            &open_pr_target_json(&intent.branch, head_sha, "main"),
+        ));
+
+        let target = resolve_and_persist_parked_rework_target(
+            &config,
+            task_id,
+            &intent,
+            &config.base_branch,
+        )
+        .await
+        .expect("a genuinely targetless parked rework must retain configured-base fallback");
+        assert_eq!(target.base_ref.as_deref(), Some("main"));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.target_branch, None);
+        assert!(daemon_rework_retry_requested(task.refs.as_deref()));
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            head_sha,
+            "legacy validation must durably retain the exact rework lease"
+        );
     }
 
     #[cfg(unix)]
