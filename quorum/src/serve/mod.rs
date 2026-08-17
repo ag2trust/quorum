@@ -13060,9 +13060,17 @@ async fn dispose_dead_turn_runner_worker(
 /// PID and a stale phase — restart recovery trusts that PID and would call
 /// `killpg` on whatever process group has since reused it.
 async fn park_worker_slot_dormant(db_path: &Path, slot: &mut SlotState) -> std::io::Result<()> {
+    let runner_kind = slot.process_kind();
     let old = slot.become_dormant()?;
     let captured = old.kill_and_reap().await;
+    capture_terminal_usage(runner_kind, &captured, &mut slot.token_usage);
     persist_terminal_output(&mut slot.session_log, captured);
+    record_managed_usage_snapshot(
+        db_path,
+        slot.agent_run_id,
+        managed_usage_record(slot, "worker"),
+    )
+    .await;
     slot.draining = false;
     slot.turn_ended_at = Some(std::time::Instant::now());
     slot.error_turn_count = 0;
@@ -20550,6 +20558,125 @@ mod tests {
             entries[0].pid.is_none(),
             "dormant journal entry must not advertise a live pid"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn park_delivered_codex_slot_persists_terminal_usage_beyond_drain_bound() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("park-terminal-usage.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        create_active_task(&db_path, "Delivered", "working");
+        let run_id = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            quorum_core::agent_runs::insert(
+                &conn,
+                1,
+                "Delivered",
+                "worker",
+                "gpt-5.6-terra",
+                "medium",
+                "codex",
+                now_unix(),
+            )
+            .unwrap()
+        };
+
+        let runner = dir.path().join("codex-terminal-usage.sh");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt {MAX_STREAM_LINES_PER_TICK} ]; do\n  printf '%s\\n' '{{}}'\n  i=$((i+1))\ndone\nprintf '%s\\n' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":100,\"cached_input_tokens\":40,\"cache_write_input_tokens\":6,\"output_tokens\":20,\"reasoning_output_tokens\":7}}}}'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let proc = runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "medium",
+                worktree: &worktree,
+                prompt: "test",
+                environment: &[],
+                mode: runner::LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &runner::AdapterConfig {
+                executable: runner.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut slot = slot_with_process(proc);
+        slot.agent_name = "Delivered".into();
+        slot.task_id = 1;
+        slot.model = "gpt-5.6-terra".into();
+        slot.effort = "medium".into();
+        slot.agent_run_id = Some(run_id);
+        slot.continuation_id = Some("provider-thread-terminal".into());
+        slot.draining = true;
+        slot.token_usage = runner::TokenUsage {
+            input_tokens: 30,
+            uncached_input_tokens: 10,
+            cached_input_tokens: 20,
+            cache_write_input_tokens: 3,
+            output_tokens: 4,
+            reasoning_tokens: 2,
+        };
+
+        assert!(
+            drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            slot.token_usage.input_tokens, 30,
+            "the terminal record must remain buffered beyond one drain tick"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if slot.try_wait().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scripted provider must exit after buffering its terminal record");
+
+        park_worker_slot_dormant(&db_path, &mut slot).await.unwrap();
+
+        let expected = runner::TokenUsage {
+            input_tokens: 130,
+            uncached_input_tokens: 70,
+            cached_input_tokens: 60,
+            cache_write_input_tokens: 9,
+            output_tokens: 24,
+            reasoning_tokens: 9,
+        };
+        assert_eq!(slot.token_usage, expected);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, run_id)
+                .unwrap()
+                .unwrap(),
+            durable_token_usage(expected),
+            "parking must persist the cumulative managed snapshot before the dormant handoff"
+        );
+        assert_eq!(
+            tasks::get(&conn, 1).unwrap().unwrap().status,
+            "working",
+            "best-effort usage persistence must not alter lifecycle state"
+        );
+        assert!(matches!(slot.proc, SlotProcess::Dormant { .. }));
     }
 
     #[tokio::test]
