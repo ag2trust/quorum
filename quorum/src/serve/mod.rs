@@ -10377,7 +10377,7 @@ async fn tick(
         .unwrap_or(900);
     let mut idle_reviewers: Vec<usize> = Vec::new();
     for (i, r) in reviewers.iter().enumerate() {
-        if r.draining {
+        if r.draining || slot_has_pending_watchdog_outcome(r) {
             continue;
         }
         if let Some(ended) = r.turn_ended_at {
@@ -10557,7 +10557,7 @@ async fn tick(
     // After MAX_ERROR_RETRIES consecutive errors, fire AgentFailed.
     let mut error_failed: Vec<usize> = Vec::new();
     for (i, w) in workers.iter_mut().enumerate() {
-        if w.error_turn_count == 0 || w.draining {
+        if !slot_is_error_refeed_candidate(w) {
             continue;
         }
         if w.error_turn_count >= MAX_ERROR_RETRIES {
@@ -10684,7 +10684,7 @@ async fn tick(
     if drain_state.draining {
         let mut drain_workers: Vec<usize> = Vec::new();
         for (i, w) in workers.iter().enumerate() {
-            if !w.draining {
+            if slot_is_graceful_drain_candidate(w) {
                 drain_workers.push(i);
             }
         }
@@ -10708,7 +10708,7 @@ async fn tick(
 
         let mut drain_reviewers: Vec<usize> = Vec::new();
         for (i, r) in reviewers.iter().enumerate() {
-            if !r.draining {
+            if slot_is_graceful_drain_candidate(r) {
                 drain_reviewers.push(i);
             }
         }
@@ -13382,7 +13382,7 @@ async fn renew_active_worker_task_leases(db_path: &Path, workers: &[SlotState]) 
 /// testable: a regression that lets the watchdog kill a dormant awaiting-
 /// review slot must break the same predicate the tick loop consults.
 fn slot_is_idle_zombie_candidate(slot: &SlotState, idle_timeout_secs: u64) -> bool {
-    if slot.draining || slot.error_turn_count > 0 {
+    if slot.draining || slot.error_turn_count > 0 || slot_has_pending_watchdog_outcome(slot) {
         return false;
     }
     // Dormant sticky slots have no live process to zombify; they exist to
@@ -13392,6 +13392,22 @@ fn slot_is_idle_zombie_candidate(slot: &SlotState, idle_timeout_secs: u64) -> bo
     }
     slot.turn_ended_at
         .is_some_and(|t| t.elapsed().as_secs() > idle_timeout_secs)
+}
+
+/// A terminal watchdog breach classified as OutcomePending preserves mailbox
+/// authority for the rest of the tick. No sibling idle path may refeed or
+/// tear down the slot before a later tick consumes and reclassifies the row.
+fn slot_has_pending_watchdog_outcome(slot: &SlotState) -> bool {
+    slot.pending_watchdog_breach.is_some()
+}
+
+fn slot_is_error_refeed_candidate(slot: &SlotState) -> bool {
+    slot.error_turn_count > 0 && !slot.draining && !slot_has_pending_watchdog_outcome(slot)
+}
+
+/// Shared by worker and reviewer graceful drain selection.
+fn slot_is_graceful_drain_candidate(slot: &SlotState) -> bool {
+    !slot.draining && !slot_has_pending_watchdog_outcome(slot)
 }
 
 async fn persist_runner_provider_block(
@@ -22334,6 +22350,26 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.draining = false;
         slot.error_turn_count = 1;
         assert!(!slot_is_idle_zombie_candidate(&slot, 300));
+    }
+
+    #[test]
+    fn pending_watchdog_outcome_blocks_sibling_idle_paths() {
+        let mut slot = make_dummy_slot();
+        slot.draining = false;
+        slot.error_turn_count = 0;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+        slot.pending_watchdog_breach = Some("task tokens exceeded".into());
+
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
+        slot.error_turn_count = 1;
+        assert!(!slot_is_error_refeed_candidate(&slot));
+        assert!(!slot_is_graceful_drain_candidate(&slot));
+
+        slot.pending_watchdog_breach = None;
+        assert!(slot_is_error_refeed_candidate(&slot));
+        assert!(slot_is_graceful_drain_candidate(&slot));
+        slot.error_turn_count = 0;
+        assert!(slot_is_idle_zombie_candidate(&slot, 300));
     }
 
     #[test]
