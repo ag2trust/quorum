@@ -1096,6 +1096,25 @@ impl TokenUsage {
     }
 }
 
+/// Convert provider counters at the durable signed-integer boundary without
+/// allowing malformed telemetry to wrap into negative SQLite values.
+pub fn try_durable_token_usage(
+    usage: TokenUsage,
+) -> std::result::Result<quorum_core::token_usage::TokenUsage, &'static str> {
+    Ok(quorum_core::token_usage::TokenUsage {
+        uncached_input_tokens: i64::try_from(usage.uncached_input_tokens)
+            .map_err(|_| "uncached_input_tokens exceeds i64::MAX")?,
+        cached_input_tokens: i64::try_from(usage.cached_input_tokens)
+            .map_err(|_| "cached_input_tokens exceeds i64::MAX")?,
+        cache_write_input_tokens: i64::try_from(usage.cache_write_input_tokens)
+            .map_err(|_| "cache_write_input_tokens exceeds i64::MAX")?,
+        output_tokens: i64::try_from(usage.output_tokens)
+            .map_err(|_| "output_tokens exceeds i64::MAX")?,
+        reasoning_tokens: i64::try_from(usage.reasoning_tokens)
+            .map_err(|_| "reasoning_tokens exceeds i64::MAX")?,
+    })
+}
+
 /// Compatibility entry point for sites that do not hold a process instance.
 /// Provider-specific raw parsing remains owned by the Claude adapter.
 pub fn normalize_claude_line(raw: &str) -> Vec<AgentEvent> {
@@ -1168,6 +1187,68 @@ fn truncate_label(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_token_conversion_rejects_every_overflowing_bucket() {
+        let maximum = TokenUsage {
+            input_tokens: u64::MAX,
+            uncached_input_tokens: i64::MAX as u64,
+            cached_input_tokens: i64::MAX as u64,
+            cache_write_input_tokens: i64::MAX as u64,
+            output_tokens: i64::MAX as u64,
+            reasoning_tokens: i64::MAX as u64,
+        };
+        assert_eq!(
+            try_durable_token_usage(maximum).unwrap(),
+            quorum_core::token_usage::TokenUsage {
+                uncached_input_tokens: i64::MAX,
+                cached_input_tokens: i64::MAX,
+                cache_write_input_tokens: i64::MAX,
+                output_tokens: i64::MAX,
+                reasoning_tokens: i64::MAX,
+            }
+        );
+
+        for (error, overflow) in [
+            (
+                "uncached_input_tokens exceeds i64::MAX",
+                TokenUsage {
+                    uncached_input_tokens: i64::MAX as u64 + 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "cached_input_tokens exceeds i64::MAX",
+                TokenUsage {
+                    cached_input_tokens: i64::MAX as u64 + 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "cache_write_input_tokens exceeds i64::MAX",
+                TokenUsage {
+                    cache_write_input_tokens: i64::MAX as u64 + 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "output_tokens exceeds i64::MAX",
+                TokenUsage {
+                    output_tokens: i64::MAX as u64 + 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "reasoning_tokens exceeds i64::MAX",
+                TokenUsage {
+                    reasoning_tokens: i64::MAX as u64 + 1,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert_eq!(try_durable_token_usage(overflow), Err(error));
+        }
+    }
 
     #[cfg(unix)]
     fn recording_runner(dir: &std::path::Path) -> std::path::PathBuf {

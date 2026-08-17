@@ -1305,6 +1305,90 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn rejected_overflow_snapshot_does_not_poison_dormant_recovery() {
+        let fixture = dormant_fixture();
+        let run_id = {
+            let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            let run_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_runs WHERE task_id=?1 AND ended_at IS NULL",
+                    [fixture.task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "DELETE FROM token_usage_run_tasks WHERE run_id IN
+                    (SELECT id FROM token_usage_runs WHERE agent_run_id=?1)",
+                [run_id],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM token_usage_runs WHERE agent_run_id=?1",
+                [run_id],
+            )
+            .unwrap();
+            run_id
+        };
+
+        super::super::record_managed_usage_snapshot(
+            &fixture.config.db_path,
+            Some(run_id),
+            super::super::ManagedUsageRecord {
+                task_id: fixture.task_id,
+                purpose: "worker".into(),
+                pr_number: Some(901),
+                provider: "codex".into(),
+                model: "gpt-5.6-terra".into(),
+                effort: "medium".into(),
+                usage: super::super::runner::TokenUsage {
+                    cached_input_tokens: u64::MAX,
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        assert!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, run_id)
+                .unwrap()
+                .is_none(),
+            "overflow must not leave a negative durable snapshot"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='token_usage'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "the ignored overflow must remain observable"
+        );
+        drop(conn);
+
+        let wt_mgr = WorktreeManager::new();
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .expect("best-effort telemetry overflow must not make recovery fatal");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(
+            workers[0].token_usage,
+            super::super::runner::TokenUsage::default(),
+            "a rejected snapshot recovers as empty usage, never wrapped negative usage"
+        );
+    }
+
     fn assert_recovered_sticky_rework(
         fixture: &DormantFixture,
         workers: &[SlotState],

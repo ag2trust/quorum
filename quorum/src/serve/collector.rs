@@ -865,15 +865,10 @@ async fn record_token_usage(request: &CollectionRequest, usage: super::runner::T
     let provider = request.collector_provider.clone();
     let model = request.collector_model.clone();
     let effort = request.collector_effort.clone();
-    let usage = quorum_core::token_usage::TokenUsage {
-        uncached_input_tokens: usage.uncached_input_tokens as i64,
-        cached_input_tokens: usage.cached_input_tokens as i64,
-        cache_write_input_tokens: usage.cache_write_input_tokens as i64,
-        output_tokens: usage.output_tokens as i64,
-        reasoning_tokens: usage.reasoning_tokens as i64,
-    };
     match tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
+        let usage = super::runner::try_durable_token_usage(usage)
+            .map_err(|error| QuorumError::Io(format!("invalid token telemetry: {error}")))?;
         quorum_core::token_usage::record(
             &mut conn,
             None,
@@ -1415,6 +1410,46 @@ mod tests {
                 reasoning_tokens: 0,
             },
             "terminal usage raced by the timeout must survive final reap"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflowing_collector_usage_is_ignored_without_a_negative_row() {
+        let (_dir, db_path) = tmp_conn();
+        let request = CollectionRequest::new(
+            464,
+            None,
+            None,
+            db_path.clone(),
+            std::env::current_dir().unwrap(),
+            None,
+            true,
+        )
+        .with_collector(
+            "codex",
+            "codex",
+            "gpt-5.6-terra",
+            "medium",
+            "danger-full-access",
+        );
+
+        record_token_usage(
+            &request,
+            super::super::runner::TokenUsage {
+                output_tokens: u64::MAX,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let conn = db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_usage_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+            "collector overflow must fail inside the best-effort boundary"
         );
     }
 

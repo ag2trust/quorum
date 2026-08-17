@@ -2698,7 +2698,7 @@ struct ManagedUsageRecord {
     provider: String,
     model: String,
     effort: String,
-    usage: quorum_core::token_usage::TokenUsage,
+    usage: runner::TokenUsage,
 }
 
 #[derive(Clone)]
@@ -2710,7 +2710,7 @@ struct UsageWriteRecord {
     provider: String,
     model: String,
     effort: String,
-    usage: quorum_core::token_usage::TokenUsage,
+    usage: runner::TokenUsage,
 }
 
 fn managed_usage_record(slot: &SlotState, purpose: &str) -> ManagedUsageRecord {
@@ -2721,35 +2721,29 @@ fn managed_usage_record(slot: &SlotState, purpose: &str) -> ManagedUsageRecord {
         provider: slot.process_kind().to_string(),
         model: slot.model.clone(),
         effort: slot.effort.clone(),
-        usage: durable_token_usage(slot.token_usage),
-    }
-}
-
-fn durable_token_usage(usage: runner::TokenUsage) -> quorum_core::token_usage::TokenUsage {
-    quorum_core::token_usage::TokenUsage {
-        uncached_input_tokens: usage.uncached_input_tokens as i64,
-        cached_input_tokens: usage.cached_input_tokens as i64,
-        cache_write_input_tokens: usage.cache_write_input_tokens as i64,
-        output_tokens: usage.output_tokens as i64,
-        reasoning_tokens: usage.reasoning_tokens as i64,
+        usage: slot.token_usage,
     }
 }
 
 fn write_usage_record(db_path: &Path, record: &UsageWriteRecord) -> Result<()> {
     let mut conn = quorum_core::db::open(db_path)?;
     let recorded_at = now_unix();
-    let result = quorum_core::token_usage::record(
-        &mut conn,
-        record.agent_run_id,
-        &record.purpose,
-        &record.task_ids,
-        record.pr_number,
-        &record.provider,
-        &record.model,
-        &record.effort,
-        record.usage,
-        recorded_at,
-    );
+    let result = (|| -> Result<i64> {
+        let usage = runner::try_durable_token_usage(record.usage)
+            .map_err(|error| QuorumError::Io(format!("invalid token telemetry: {error}")))?;
+        quorum_core::token_usage::record(
+            &mut conn,
+            record.agent_run_id,
+            &record.purpose,
+            &record.task_ids,
+            record.pr_number,
+            &record.provider,
+            &record.model,
+            &record.effort,
+            usage,
+            recorded_at,
+        )
+    })();
     if let Err(error) = &result {
         quorum_core::errlog::log_error(
             &conn,
@@ -2860,7 +2854,7 @@ async fn record_classifier_usage(
             provider: provider.to_string(),
             model: model.to_string(),
             effort: effort.to_string(),
-            usage: durable_token_usage(usage),
+            usage,
         },
     )
     .await;
@@ -3323,10 +3317,12 @@ impl SlotState {
     }
 
     async fn finalize_pre_authoritative_exit_evidence(&mut self) {
+        let runner_kind = self.process_kind();
         let output = match &mut self.proc {
             SlotProcess::Running(proc) => proc.finalize_pre_authoritative_evidence().await,
             SlotProcess::Dormant { .. } => Vec::new(),
         };
+        capture_terminal_usage(runner_kind, &output, &mut self.token_usage);
         persist_terminal_output(&mut self.session_log, output);
     }
 
@@ -13686,7 +13682,7 @@ async fn close_attachment_failed_reviewer_run(
             provider: reviewer_kind.to_string(),
             model: reviewer_model.to_string(),
             effort: reviewer_effort.to_string(),
-            usage: durable_token_usage(token_usage),
+            usage: token_usage,
         }),
     )
     .await;
@@ -16195,7 +16191,7 @@ async fn cleanup_slot_inner(
     let terminal = state.proc.kill_and_reap().await;
     capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
     persist_terminal_output(&mut state.session_log, terminal);
-    usage.usage = durable_token_usage(state.token_usage);
+    usage.usage = state.token_usage;
     if let Some(ref mut sl) = state.session_log {
         sl.finalize(finalize_verdict);
     }
@@ -16261,7 +16257,7 @@ async fn teardown_worker_with_body(
     let terminal = state.proc.kill_and_reap().await;
     capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
     persist_terminal_output(&mut state.session_log, terminal);
-    usage.usage = durable_token_usage(state.token_usage);
+    usage.usage = state.token_usage;
     if let Some(ref mut sl) = state.session_log {
         sl.finalize(verdict);
     }
@@ -16349,7 +16345,7 @@ async fn teardown_reviewer(
     let terminal = state.proc.kill_and_reap().await;
     capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
     persist_terminal_output(&mut state.session_log, terminal);
-    usage.usage = durable_token_usage(state.token_usage);
+    usage.usage = state.token_usage;
     if let Some(ref mut sl) = state.session_log {
         sl.finalize(None);
     }
@@ -19180,6 +19176,72 @@ mod tests {
         assert_eq!(slot.live_stats.tool_count, MAX_STREAM_LINES_PER_TICK as u32);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_authoritative_exit_finalization_folds_usage_beyond_drain_bound() {
+        use tokio::io::BufReader;
+
+        let command = format!(
+            "i=0; while [ \"$i\" -lt {MAX_STREAM_LINES_PER_TICK} ]; do printf '%s\\n' '{{}}'; i=$((i+1)); done; printf '%s\\n' '{{\"type\":\"result\",\"result\":\"failed before signal\",\"is_error\":true,\"usage\":{{\"input_tokens\":100,\"cache_read_input_tokens\":80,\"cache_creation_input_tokens\":10,\"output_tokens\":5}}}}'; exit 1"
+        );
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", &command])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+            child,
+            stdin,
+            BufReader::new(stdout),
+        ));
+        let mut slot = slot_with_process(proc);
+        let db_dir = tempfile::tempdir().unwrap();
+
+        assert!(drain_events(
+            &mut slot,
+            &db_dir.path().join("q.db"),
+            "worker",
+            &CostLimits::default(),
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(slot.token_usage, runner::TokenUsage::default());
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while slot.try_wait().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider must exit without a managed signal");
+
+        slot.finalize_pre_authoritative_exit_evidence().await;
+        assert_eq!(
+            slot.token_usage,
+            runner::TokenUsage {
+                input_tokens: 100,
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 0,
+            },
+            "the evidence finalizer must fold usage before teardown drains the remaining pipe"
+        );
+
+        let expected = slot.token_usage;
+        let terminal = slot.kill_and_reap().await;
+        let mut after_teardown = expected;
+        capture_terminal_usage(runner::AgentKind::Claude, &terminal, &mut after_teardown);
+        assert_eq!(
+            after_teardown, expected,
+            "the consumed terminal record must not be duplicated by final reap"
+        );
+    }
+
     async fn launch_test_codex(
         worktree: &Path,
         continuation_id: Option<&str>,
@@ -20384,13 +20446,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             quorum_core::token_usage::usage_for_agent_run(&conn, old_run_id)
                 .unwrap()
                 .unwrap(),
-            durable_token_usage(first_run_usage)
+            runner::try_durable_token_usage(first_run_usage).unwrap()
         );
         assert_eq!(
             quorum_core::token_usage::usage_for_agent_run(&conn, new_run_id)
                 .unwrap()
                 .unwrap(),
-            durable_token_usage(second_run_usage),
+            runner::try_durable_token_usage(second_run_usage).unwrap(),
             "the second run row must contain B, not A+B"
         );
         drop(conn);
@@ -20865,7 +20927,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             quorum_core::token_usage::usage_for_agent_run(&conn, run_id)
                 .unwrap()
                 .unwrap(),
-            durable_token_usage(expected),
+            runner::try_durable_token_usage(expected).unwrap(),
             "parking must persist the cumulative managed snapshot before the dormant handoff"
         );
         assert_eq!(
@@ -25590,7 +25652,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 provider: "codex".into(),
                 model: "gpt".into(),
                 effort: "high".into(),
-                usage: quorum_core::token_usage::TokenUsage {
+                usage: runner::TokenUsage {
+                    input_tokens: 12,
                     uncached_input_tokens: 10,
                     output_tokens: 2,
                     ..Default::default()
@@ -25641,6 +25704,83 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             2,
             "both ignored abnormal writes must remain observable"
         );
+    }
+
+    #[tokio::test]
+    async fn overflowing_managed_and_classifier_usage_is_logged_and_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("usage-overflow-isolation.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "overflow telemetry isolation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let run_id = quorum_core::agent_runs::insert(
+            &conn, task_id, "Worker", "worker", "gpt", "high", "codex", 2,
+        )
+        .unwrap();
+        drop(conn);
+
+        let overflow = runner::TokenUsage {
+            input_tokens: u64::MAX,
+            uncached_input_tokens: u64::MAX,
+            ..Default::default()
+        };
+        close_agent_run_with_usage(
+            &db_path,
+            Some(run_id),
+            "completed",
+            Some(ManagedUsageRecord {
+                task_id,
+                purpose: "worker".into(),
+                pr_number: Some(464),
+                provider: "codex".into(),
+                model: "gpt".into(),
+                effort: "high".into(),
+                usage: overflow,
+            }),
+        )
+        .await;
+        record_classifier_usage(&db_path, &[task_id], "codex", "gpt", "medium", overflow).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_usage_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+            "overflowing provider counters must never reach SQLite"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='token_usage'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2,
+            "both ignored overflow failures must remain observable"
+        );
+        let closed: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT ended_at,end_reason FROM agent_runs WHERE id=?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(closed.0.is_some());
+        assert_eq!(closed.1.as_deref(), Some("completed"));
+        assert_eq!(tasks::get(&conn, task_id).unwrap().unwrap().status, "open");
     }
 
     fn create_active_task(db_path: &Path, agent: &str, status: &str) {

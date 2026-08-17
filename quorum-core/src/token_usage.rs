@@ -49,6 +49,20 @@ pub fn record(
             "token usage attribution batch exceeds {TASK_ATTRIBUTION_BATCH_LIMIT} tasks"
         )));
     }
+    if [
+        usage.uncached_input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_write_input_tokens,
+        usage.output_tokens,
+        usage.reasoning_tokens,
+    ]
+    .into_iter()
+    .any(|tokens| tokens < 0)
+    {
+        return Err(crate::error::QuorumError::BadInput(
+            "token usage counters must be nonnegative".into(),
+        ));
+    }
     let tx = crate::db::begin_immediate(conn)?;
     // Token telemetry is also written by daemon-internal classifier and
     // collector turns, which do not pass through another command mutation.
@@ -177,6 +191,36 @@ pub fn usage_for_agent_run(conn: &Connection, agent_run_id: i64) -> Result<Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_rejects_negative_counters_without_persistent_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("q.db")).unwrap();
+        let error = record(
+            &mut conn,
+            None,
+            "classifier",
+            &[7],
+            None,
+            "codex",
+            "gpt",
+            "medium",
+            TokenUsage {
+                cached_input_tokens: -1,
+                ..Default::default()
+            },
+            1,
+        )
+        .expect_err("negative counters must be rejected before SQLite");
+        assert!(error.to_string().contains("must be nonnegative"));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_usage_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn managed_usage_survives_run_close_with_breakdown_intact() {
