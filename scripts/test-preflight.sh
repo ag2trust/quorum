@@ -569,6 +569,66 @@ assert second["cleanup"]["complete"] is True
 assert "execute_outcome" not in third
 PY
 
+# A test binary may orphan a process group and assert the group vanishes after
+# SIGKILL, as quorum's provider teardown tests do (for example the Grok
+# teardown_kills_stored_process_group_after_leader_is_reaped test). On Linux
+# the supervising subreaper adopts such orphans, so it must reap them promptly
+# while the test binary still runs: a zombie adoptee remains a process-group
+# member, keeps killpg(pgid, 0) succeeding, and times the test out.
+cat >"$TMP/orphan-group-test-binary" <<'EOF'
+#!/bin/sh
+exec python3 - <<'PYEOF'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+proc = subprocess.Popen(
+    ["/bin/sh", "-c", "trap '' HUP; (trap '' HUP; sleep 30) & exit 0"],
+    start_new_session=True,
+)
+pgid = proc.pid
+proc.wait()
+os.killpg(pgid, 0)  # an orphaned descendant must still hold the group
+try:
+    os.killpg(pgid, signal.SIGKILL)
+except ProcessLookupError:
+    pass
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        sys.exit(0)
+    time.sleep(0.01)
+print("orphaned process group was never reaped", file=sys.stderr)
+sys.exit(1)
+PYEOF
+EOF
+cat >"$TMP/orphan-group-noop-binary" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$TMP/orphan-group-test-binary" "$TMP/orphan-group-noop-binary"
+ORPHAN_OUT="$TMP/orphan-group-timing"
+PREFLIGHT_CARGO_TEST_BINARIES=1 \
+  PREFLIGHT_FIRST_TEST_BINARY="$TMP/orphan-group-test-binary" \
+  PREFLIGHT_SECOND_TEST_BINARY="$TMP/orphan-group-noop-binary" \
+  PATH="$BIN:$PATH" scripts/preflight/timing.sh \
+    --skip-fmt --skip-clippy --test-jobs 1 --test-timeout-secs 30 \
+    --out "$ORPHAN_OUT" >"$TMP/orphan-group.out" 2>&1
+python3 - "$ORPHAN_OUT/timing.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1]))
+first, second = data["test_binaries"]
+assert first["execute_outcome"] == "passed"
+assert first["cleanup"]["complete"] is True
+assert second["execute_outcome"] == "passed"
+PY
+
 # Signals that land while the collector is decoding a completed result or
 # reaping fail-fast peers must not remove those handles from cleanup tracking.
 # Import the collector directly so both narrow race windows are deterministic

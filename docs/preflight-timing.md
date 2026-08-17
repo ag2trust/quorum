@@ -72,6 +72,10 @@ the collector is abruptly killed, that supervisor observes owner loss and
 performs the same bounded TERM/KILL cleanup before exiting. Because an
 abruptly killed collector cannot finish writing JSON, that owner-loss cleanup
 does not itself promise a new timing artifact.
+On Linux the supervisor is a child subreaper and reaps adopted orphans while
+the test binary is still running, never only at cleanup. A test may kill a
+descendant process group of its own and poll for the group's disappearance; an
+unreaped zombie adoptee would keep that group visible and time the test out.
 
 ### Signal-safe supervisor handle lifecycle
 

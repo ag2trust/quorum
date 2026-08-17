@@ -363,6 +363,34 @@ def _reap_children() -> None:
             return
 
 
+def _reap_adoptees(leader_pid: int) -> None:
+    """Reap exited subreaper adoptees while the test binary still runs.
+
+    A zombie remains a member of its process group, so an unreaped adoptee
+    keeps ``killpg(pgid, 0)`` succeeding and a test polling for its own
+    descendant group's disappearance never observes it. Peek with ``WNOWAIT``
+    and skip the group leader so its exit status is never stolen from
+    ``Popen``; ``poll()`` maps a stolen status to a fabricated success.
+    """
+    if not sys.platform.startswith("linux"):
+        # Adoptees exist only under the Linux subreaper; elsewhere the sole
+        # supervisor child is the leader, which Popen owns.
+        return
+    while True:
+        try:
+            info = os.waitid(
+                os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT
+            )
+        except (ChildProcessError, OSError):
+            return
+        if info is None or info.si_pid == leader_pid:
+            return
+        try:
+            os.waitpid(info.si_pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return
+
+
 def _enable_child_subreaper() -> None:
     """Keep orphaned test descendants reparented here on Linux.
 
@@ -1025,6 +1053,7 @@ def _test_supervisor() -> int:
                 rc = polled
                 outcome = "passed" if rc == 0 else "failed"
                 break
+            _reap_adoptees(proc.pid)
             remaining = deadline - now()
             if remaining <= 0:
                 rc = TIMEOUT_EXIT_CODE
