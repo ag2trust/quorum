@@ -118,6 +118,10 @@ const MAX_POISON_STRIKES: u32 = 3;
 const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 const MAX_CI_REMEDIATION_PROVISION_STRIKES: i64 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
+// A post-launch journal failure can race a fast provider's terminal record.
+// Bound the pre-kill read so the failure stays prompt while teardown can
+// retain a record that the already-started turn is concurrently delivering.
+const FAILED_WORKER_HANDOFF_CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 /// Limit per-slot stream work so one noisy provider cannot starve other slots.
 const MAX_STREAM_LINES_PER_TICK: usize = 64;
@@ -12161,6 +12165,7 @@ async fn feed_worker_turn(
     config: &ServeConfig,
 ) -> std::io::Result<()> {
     if slot.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
+        let mut installed_run_id = None;
         let recovered_startup = slot.pending_turn_kind == "recovered-rework";
         if !recovered_startup && should_replace_pending_prompt(raw_prompt) {
             slot.pending_prompt = raw_prompt.to_string();
@@ -12205,7 +12210,7 @@ async fn feed_worker_turn(
             &runner_adapter_config(config, config.agent_bin.as_deref()),
         )
         .await;
-        let new_proc = match launch {
+        let mut new_proc = match launch {
             Ok(proc) => proc,
             Err(error) => {
                 if let Some(authority) = dormant_authority {
@@ -12225,6 +12230,7 @@ async fn feed_worker_turn(
                 }
             };
             slot.agent_run_id = Some(new_run_id);
+            installed_run_id = Some(new_run_id);
             slot.cap_run_id = Some(authority.cap_run_id);
             // A respawned turn has a new durable agent_run identity. Keep the
             // legacy task-level token scalar cumulative for live caps, but do
@@ -12257,7 +12263,33 @@ async fn feed_worker_turn(
         }
         if let Err(error) = persist_worker_journal(&config.db_path, entry).await {
             let launched_pid = new_proc.pid();
-            let _terminal_output = new_proc.kill_and_reap().await;
+            let mut terminal_output = Vec::new();
+            if installed_run_id.is_some() {
+                if let Ok(Some(raw_line)) = tokio::time::timeout(
+                    FAILED_WORKER_HANDOFF_CAPTURE_TIMEOUT,
+                    new_proc.next_raw_line(),
+                )
+                .await
+                {
+                    terminal_output.push(runner::CapturedOutput::Stdout(raw_line));
+                }
+            }
+            terminal_output.extend(new_proc.kill_and_reap().await);
+            if let Some(run_id) = installed_run_id {
+                capture_terminal_usage(
+                    slot.process_kind(),
+                    &terminal_output,
+                    &mut slot.token_usage,
+                );
+                close_agent_run_with_usage(
+                    &config.db_path,
+                    Some(run_id),
+                    "journal-handoff-failed",
+                    Some(managed_usage_record(slot, "worker")),
+                )
+                .await;
+            }
+            persist_terminal_output(&mut slot.session_log, terminal_output);
             return Err(std::io::Error::other(DurableWorkerJournalHandoffError(
                 format!(
                     "{error}; launched pid {} was killed and reaped",
@@ -12417,10 +12449,13 @@ async fn prepare_dormant_worker_turn(
                     "dormant worker {agent} references missing agent_run {old_run_id}"
                 ))
             })?;
+        let resumable_end_reason = matches!(
+            old_run.end_reason.as_deref(),
+            Some("turn-completed" | "journal-handoff-failed")
+        );
         if old_run.agent != agent
             || old_run.role != "worker"
-            || (old_run.ended_at.is_some()
-                && old_run.end_reason.as_deref() != Some("turn-completed"))
+            || (old_run.ended_at.is_some() && !resumable_end_reason)
             || old_run.model != model
             || old_run.effort != effort
             || old_run.provider.as_deref() != Some(provider.as_str())

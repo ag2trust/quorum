@@ -241,12 +241,22 @@ fn validate_dormant_recovery(
     let mut active_runs = runs
         .iter()
         .filter(|run| run.role == "worker" && run.agent == entry.agent && run.ended_at.is_none());
-    let run = active_runs
-        .next()
-        .ok_or_else(|| invalid("missing active worker run binding".into()))?;
-    if active_runs.next().is_some() {
+    let active_run = active_runs.next();
+    if active_run.is_some() && active_runs.next().is_some() {
         return Err(invalid("multiple active worker run bindings".into()));
     }
+    // A failed post-launch journal handoff has already killed and reaped its
+    // provider, so that run is truthfully closed. The unchanged PID-less
+    // awaiting-review journal and active capability still authorize one exact
+    // retry; recover the newest failed handoff as that dormant binding.
+    let run = active_run
+        .or_else(|| {
+            runs.iter()
+                .rev()
+                .find(|run| run.role == "worker" && run.agent == entry.agent)
+                .filter(|run| run.end_reason.as_deref() == Some("journal-handoff-failed"))
+        })
+        .ok_or_else(|| invalid("missing active or retryable worker run binding".into()))?;
     if run.provider.as_deref() != Some(provider_name) {
         return Err(invalid("worker run provider mismatch".into()));
     }
@@ -1836,7 +1846,13 @@ mod tests {
             .unwrap();
         }
         let codex = fixture._dir.path().join("fake-codex");
-        write_executable(&codex, "#!/bin/sh\nexec sleep 30\n");
+        write_executable(
+            &codex,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3}}'
+exec sleep 30
+"#,
+        );
         let gh = fixture._dir.path().join("fake-gh");
         write_executable(
             &gh,
@@ -1885,7 +1901,29 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(live_authority, (1, 1));
+        assert_eq!(
+            live_authority,
+            (0, 1),
+            "the reaped provider run is closed while its exact retry capability remains active"
+        );
+        let failed_run = quorum_core::agent_runs::runs_for_task(&conn, fixture.task_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.end_reason.as_deref() == Some("journal-handoff-failed"))
+            .expect("the post-insert run is truthfully settled");
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, failed_run.id)
+                .unwrap()
+                .unwrap(),
+            quorum_core::token_usage::TokenUsage {
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 3,
+            },
+            "the failed handoff run retains all terminal token buckets"
+        );
         conn.execute_batch("DROP TRIGGER reject_recovered_journal_handoff")
             .unwrap();
         drop(conn);
