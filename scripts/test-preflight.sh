@@ -30,6 +30,12 @@ fi
   printf 'forced cargo test diagnostic\n' >&2
   exit 17
 }
+if [ "${PREFLIGHT_CARGO_TEST_BINARIES:-0}" = 1 ] && [ "$1" = test ]; then
+  printf '{"reason":"compiler-artifact","package_id":"path+file:///fixture#fixture@0.1.0","manifest_path":"/fixture/Cargo.toml","target":{"name":"first_binary","kind":["test"]},"profile":{"test":true},"executable":"%s","fresh":false}\n' \
+    "$PREFLIGHT_FIRST_TEST_BINARY"
+  printf '{"reason":"compiler-artifact","package_id":"path+file:///fixture#fixture@0.1.0","manifest_path":"/fixture/Cargo.toml","target":{"name":"second_binary","kind":["test"]},"profile":{"test":true},"executable":"%s","fresh":false}\n' \
+    "$PREFLIGHT_SECOND_TEST_BINARY"
+fi
 exit 0
 EOF
 chmod +x "$BIN/cargo"
@@ -429,6 +435,60 @@ grep -q '^  branch_base .*  ok$' target/preflight-timing/summary.txt
 grep -q '"name": "branch_base"' target/preflight-timing/timing.json
 grep -q 'slowest test binaries (top 0 of 0):' \
   target/preflight-timing/summary.txt
+
+# Test execution stops at the first failed binary boundary. The failed binary
+# has already completed supervisor cleanup, the next binary never launches,
+# and both structured outputs remain valid and actionable.
+cat >"$TMP/first-test-binary" <<'EOF'
+#!/bin/sh
+printf 'first\n' >> "$PREFLIGHT_TEST_LAUNCH_LOG"
+exit 23
+EOF
+cat >"$TMP/second-test-binary" <<'EOF'
+#!/bin/sh
+printf 'second\n' >> "$PREFLIGHT_TEST_LAUNCH_LOG"
+exit 0
+EOF
+chmod +x "$TMP/first-test-binary" "$TMP/second-test-binary"
+FAIL_FAST_OUT="$TMP/fail-fast-timing"
+if PREFLIGHT_CARGO_TEST_BINARIES=1 \
+  PREFLIGHT_FIRST_TEST_BINARY="$TMP/first-test-binary" \
+  PREFLIGHT_SECOND_TEST_BINARY="$TMP/second-test-binary" \
+  PREFLIGHT_TEST_LAUNCH_LOG="$TMP/test-launches.log" \
+  PATH="$BIN:$PATH" scripts/preflight/timing.sh \
+    --skip-fmt --skip-clippy --out "$FAIL_FAST_OUT" \
+    >"$TMP/fail-fast.out" 2>&1; then
+  echo 'expected first test binary failure to reject timing run' >&2
+  exit 1
+fi
+printf 'first\n' >"$TMP/test-launches.expected"
+cmp "$TMP/test-launches.expected" "$TMP/test-launches.log"
+python3 - "$FAIL_FAST_OUT/timing.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1]))
+assert data["version"] == 3
+assert data["gates"][-1]["name"] == "test_execute"
+assert data["gates"][-1]["exit_code"] == 23
+assert data["first_failure"]["phase"] == "test_execute"
+assert data["first_failure"]["target_name"] == "first_binary"
+assert data["first_failure"]["exit_code"] == 23
+assert data["first_failure"]["cleanup_complete"] is True
+assert data["first_failure"]["rerun_command"] == (
+    "cargo test --manifest-path /fixture/Cargo.toml --all-features "
+    "--features quorum-core/test-support --test first_binary -- "
+    "--test-threads 4 --nocapture"
+)
+assert data["test_binaries"][0]["execute_outcome"] == "failed"
+assert "execute_outcome" not in data["test_binaries"][1]
+PY
+grep -q '^FIRST FAILURE:$' "$FAIL_FAST_OUT/summary.txt"
+grep -q '^  test_binary: first_binary$' "$FAIL_FAST_OUT/summary.txt"
+grep -Fq \
+  'rerun: cargo test --manifest-path /fixture/Cargo.toml --all-features --features quorum-core/test-support --test first_binary -- --test-threads 4 --nocapture' \
+  "$FAIL_FAST_OUT/summary.txt"
+grep -q 'preflight timing: FIRST FAILURE: test binary' "$TMP/fail-fast.out"
 
 # Cargo's compile/no-run diagnostics are captured by the structured collector,
 # then replayed by preflight before it returns the same failure status as the

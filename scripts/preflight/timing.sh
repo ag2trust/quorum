@@ -1267,6 +1267,59 @@ def slowest(binaries: list[dict], top_n: int) -> list[dict]:
     return sorted(binaries, key=key, reverse=True)[:top_n]
 
 
+def cargo_rerun_command(binary: dict, test_threads: int) -> str | None:
+    """Return a copy/pasteable Cargo command for one discovered executable.
+
+    Cargo's compiler-artifact message gives us the package manifest and target
+    kind directly. Prefer those stable fields over parsing the opaque
+    ``package_id`` string.
+    """
+    manifest_path = binary.get("manifest_path")
+    target_name = binary.get("target_name")
+    target_kinds = binary.get("target_kinds") or []
+    if not manifest_path or not target_name:
+        return None
+
+    selector: list[str]
+    if "test" in target_kinds:
+        selector = ["--test", target_name]
+    elif "bin" in target_kinds:
+        selector = ["--bin", target_name]
+    elif "example" in target_kinds:
+        selector = ["--example", target_name]
+    elif "bench" in target_kinds:
+        selector = ["--bench", target_name]
+    elif "lib" in target_kinds or "proc-macro" in target_kinds:
+        selector = ["--lib"]
+    else:
+        return None
+
+    argv = [
+        "cargo", "test", "--manifest-path", manifest_path,
+        *CARGO_FEATURES, *selector,
+        "--", "--test-threads", str(test_threads), "--nocapture",
+    ]
+    return shlex.join(argv)
+
+
+def test_binary_failure(
+    binary: dict, result: dict, test_threads: int
+) -> dict:
+    return {
+        "phase": "test_execute",
+        "target_name": (
+            binary.get("target_name") or Path(binary["executable"]).name
+        ),
+        "package_id": binary.get("package_id"),
+        "manifest_path": binary.get("manifest_path"),
+        "executable": binary["executable"],
+        "exit_code": result["exit_code"] or 1,
+        "outcome": result["outcome"],
+        "cleanup_complete": result["cleanup"]["complete"],
+        "rerun_command": cargo_rerun_command(binary, test_threads),
+    }
+
+
 def emit_artifact(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     json.loads(path.read_text())
@@ -1287,6 +1340,18 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
             f"{len(data.get('test_binaries') or [])} binaries "
             f"from {wrapper.get('log_entries', 0)} rustc invocations"
         )
+    first_failure = data.get("first_failure")
+    if first_failure:
+        lines.append("")
+        lines.append("FIRST FAILURE:")
+        lines.append(f"  phase: {first_failure['phase']}")
+        if first_failure.get("target_name"):
+            lines.append(f"  test_binary: {first_failure['target_name']}")
+        lines.append(f"  exit_code: {first_failure['exit_code']}")
+        if first_failure.get("outcome"):
+            lines.append(f"  outcome: {first_failure['outcome']}")
+        if first_failure.get("rerun_command"):
+            lines.append(f"  rerun: {first_failure['rerun_command']}")
     lines.append("")
     lines.append("gates:")
     for g in data["gates"]:
@@ -1334,9 +1399,10 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
     wrapper_stats: dict = {}
     status = 0
     interrupted_signal: int | None = None
+    first_failure: dict | None = None
 
     def add_gate(name: str, duration: float, rc: int) -> None:
-        nonlocal status
+        nonlocal first_failure, status
         gates.append({
             "name": name,
             "duration_secs": round(duration, 3),
@@ -1344,6 +1410,13 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
         })
         if rc != 0 and status == 0:
             status = 1
+            if first_failure is None:
+                first_failure = {
+                    "phase": name,
+                    "exit_code": rc,
+                    "outcome": "failed",
+                    "rerun_command": None,
+                }
 
     if not args.skip_fmt:
         print("=== timing 1/4: cargo fmt --all -- --check ===", flush=True)
@@ -1407,11 +1480,32 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
             b["execute_timed_out"] = result["timed_out"]
             b["execute_timeout_secs"] = result["timeout_secs"]
             b["cleanup"] = result["cleanup"]
-            if (
+            failed = (
                 result["exit_code"] != 0
                 or not result["cleanup"]["complete"]
-            ) and exec_rc == 0:
+            )
+            if failed and exec_rc == 0:
                 exec_rc = result["exit_code"] or 1
+                first_failure = test_binary_failure(
+                    b, result, args.test_threads
+                )
+                print(
+                    "preflight timing: FIRST FAILURE: test binary "
+                    f"{name!r} ({result['outcome']}, exit {exec_rc})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                rerun = first_failure.get("rerun_command")
+                if rerun:
+                    print(
+                        f"preflight timing: rerun: {rerun}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                # run_test_binary returns only after its supervisor completes
+                # bounded descendant cleanup. Stop at this binary boundary so
+                # no later executable starts after the first failure.
+                break
             if interrupted_signal is not None:
                 break
         add_gate("test_execute", now() - t0, exec_rc)
@@ -1426,6 +1520,7 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
         "test_timeout_secs": args.test_timeout_secs,
         "term_grace_secs": args.term_grace_secs,
         "interrupted_signal": interrupted_signal,
+        "first_failure": first_failure,
         "gates": gates,
         "test_binaries": binaries,
         "top_n_slowest": slowest(binaries, args.top_n),

@@ -34,6 +34,7 @@ the complete author-gate artifact is required.
 | `test_timeout_secs` | Per-test-executable deadline (default `120`). |
 | `term_grace_secs` | Bounded wait after TERM and again after KILL while cleaning a test process group (default `2`). |
 | `interrupted_signal` | Signal number that interrupted test execution, or JSON `null` when uninterrupted. |
+| `first_failure` | The first failed gate or test binary, including its exit/outcome details and a target-specific Cargo `rerun_command` when compiler-artifact identity is sufficient. JSON `null` on success. |
 | `gates` | Ordered objects with `name`, `duration_secs`, and `exit_code`. Full preflight prepends `branch_base`; the collector records `cargo_fmt`, `cargo_clippy`, `cargo_test_no_run`, and `test_execute` until a failure stops later gates. |
 | `test_binaries` | One object per Cargo test executable discovered during the compile/no-run gate. Its identity fields are `package_id`, `manifest_path`, `target_name`, `target_kinds`, `executable`, and `fresh`; execution fields are described below. It is empty when compilation was never reached. |
 | `top_n_slowest` | A bounded, descending copy of the slowest entries in `test_binaries`. |
@@ -54,6 +55,10 @@ including descendants that created separate process groups, no longer exist
 and the supervisor reaped the children it owns. `error` also retains a
 transient process-discovery diagnostic when fallback or a later snapshot still
 allowed cleanup to complete. A timeout uses exit code `124`.
+After the first nonzero exit or incomplete cleanup, the collector stops at that
+binary boundary. Later discovered entries remain in `test_binaries` without
+execution fields, while `timing.json` and `summary.txt` retain the completed
+partial run and identify the first failure prominently.
 Each test is owned by a supervisor outside the collector's process group; if
 the collector is abruptly killed, that supervisor observes owner loss and
 performs the same bounded TERM/KILL cleanup before exiting. Because an
