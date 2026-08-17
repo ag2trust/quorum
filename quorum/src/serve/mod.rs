@@ -943,16 +943,16 @@ async fn resolve_publication_pr_target(
     repo_dir: &Path,
     gh_repo: Option<&str>,
 ) -> std::result::Result<PrTarget, String> {
-    resolve_pr_target_with_timeout(pr, repo_dir, gh_repo, PUBLICATION_GH_TIMEOUT).await
+    resolve_publication_pr_target_with_program(pr, repo_dir, gh_repo, Path::new("gh")).await
 }
 
-async fn resolve_pr_target_with_timeout(
+async fn resolve_publication_pr_target_with_program(
     pr: i64,
     repo_dir: &Path,
     gh_repo: Option<&str>,
-    timeout: Duration,
+    program: &Path,
 ) -> std::result::Result<PrTarget, String> {
-    resolve_pr_target_with_program(pr, repo_dir, gh_repo, timeout, Path::new("gh")).await
+    resolve_pr_target_with_program(pr, repo_dir, gh_repo, PUBLICATION_GH_TIMEOUT, program).await
 }
 
 async fn resolve_pr_target_with_program(
@@ -1038,8 +1038,11 @@ struct PublicationIntent {
     local_sha: String,
     pr: Option<i64>,
     stage: String,
-    /// The immutable task target used only for a fresh initial delivery.
-    /// Absent on historical and continuation intents.
+    /// The immutable task target captured on the first publication for a
+    /// task (fresh initial delivery or first existing-PR continuation). It is
+    /// preserved across retry and reconciliation, and is the authoritative
+    /// base for validation and publication. Absent on historical intents and
+    /// on legacy tasks that predate authoritative targets.
     #[serde(default)]
     target_branch: Option<String>,
     #[serde(default)]
@@ -1094,10 +1097,10 @@ async fn load_publication_state(
     Ok((intent, supersede_source))
 }
 
-/// Return the authoritative target for a new initial delivery. Task creation
-/// persists this field before the daemon can claim the task. Legacy tasks that
-/// predate that contract return `None` and retain the configured-base path.
-async fn initial_task_target_branch(
+/// Return the authoritative target for a task. Task creation persists this
+/// field before the daemon can claim the task. Legacy tasks that predate that
+/// contract return `None` and retain the configured-base path.
+async fn task_target_branch(
     db_path: &Path,
     task_id: i64,
 ) -> std::result::Result<Option<String>, String> {
@@ -1127,7 +1130,7 @@ fn publication_base_branch(
     match intent.target_branch.as_deref() {
         Some(branch) => {
             tasks::validate_target_branch(branch).map_err(|error| {
-                format!("publication intent has invalid initial target branch: {error}")
+                format!("publication intent has invalid task target branch: {error}")
             })?;
             Ok(branch.to_string())
         }
@@ -1374,6 +1377,64 @@ fn existing_pr_lease_baseline<'a>(
     Ok(Some(expected))
 }
 
+/// Reject a durable prior intent whose recorded target branch conflicts with
+/// the authoritative task target. The task target is immutable; a mismatch
+/// indicates a durable corruption and must fail closed before any publication
+/// I/O runs. A prior intent with no recorded target is legal here — it will
+/// be backfilled after materialization by [`backfill_intent_target_branch`].
+fn reject_prior_target_conflict(
+    prior: Option<&PublicationIntent>,
+    authoritative_task_target: Option<&str>,
+) -> std::result::Result<(), String> {
+    let Some(prior_target) = prior.and_then(|intent| intent.target_branch.as_deref()) else {
+        return Ok(());
+    };
+    let Some(task_target) = authoritative_task_target else {
+        return Ok(());
+    };
+    if prior_target != task_target {
+        return Err(format!(
+            "durable publication target branch {prior_target} conflicts with task target {task_target}"
+        ));
+    }
+    Ok(())
+}
+
+/// Backfill a targetless prior publication intent (written by a preceding
+/// daemon version before the intent carried a target) from the authoritative
+/// task target so retry and reconciliation validate and publish against the
+/// exact task target rather than the configured base. Legacy tasks without
+/// an authoritative target remain None and retain the configured-base
+/// fallback. Intents that already carry a target are left untouched.
+fn backfill_intent_target_branch(
+    intent: &mut PublicationIntent,
+    authoritative_task_target: Option<String>,
+) {
+    if intent.target_branch.is_none() {
+        intent.target_branch = authoritative_task_target;
+    }
+}
+
+/// Single orchestrator called by [`publish_worker_completion`] before any
+/// publication I/O. Resolves the authoritative task target, rejects a
+/// durable prior intent whose target disagrees, and backfills a targetless
+/// prior intent so the intent handed to publication I/O binds to the exact
+/// task target on every restart. The caller-level restart fixtures exercise
+/// this invocation through `publish_worker_completion` and late-worker
+/// recovery: removing or moving it after live validation makes a targetless
+/// continuation either reject a matching target or publish a wrong-base PR.
+async fn reconcile_publication_intent_with_task_target(
+    db_path: &Path,
+    task_id: i64,
+    prior: Option<&PublicationIntent>,
+    intent: &mut PublicationIntent,
+) -> std::result::Result<(), String> {
+    let authoritative_task_target = task_target_branch(db_path, task_id).await?;
+    reject_prior_target_conflict(prior, authoritative_task_target.as_deref())?;
+    backfill_intent_target_branch(intent, authoritative_task_target);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_worker_completion(
     config: &ServeConfig,
@@ -1384,11 +1445,6 @@ async fn publish_worker_completion(
     known_pr: Option<i64>,
 ) -> std::result::Result<PublishedCompletion, String> {
     let (prior, supersede_source) = load_publication_state(&config.db_path, task_id).await?;
-    let initial_target_branch = if prior.is_none() && known_pr.is_none() {
-        initial_task_target_branch(&config.db_path, task_id).await?
-    } else {
-        None
-    };
     if let Some(prior) = &prior {
         if prior.branch != branch {
             return Err(format!(
@@ -1462,12 +1518,17 @@ async fn publish_worker_completion(
         }
         (None, None) => None,
     };
+    // Materialize with a null target — the single reconciliation call below
+    // resolves the authoritative task target, rejects a durable prior target
+    // conflict, and backfills for both the fresh and prior-intent paths. All
+    // publication I/O below sees the intent bound to the exact task target.
+    let prior_snapshot = prior.clone();
     let mut intent = prior.unwrap_or(PublicationIntent {
         branch: branch.to_string(),
         local_sha: local_sha.clone(),
         pr: known_pr,
         stage: "intent".into(),
-        target_branch: initial_target_branch,
+        target_branch: None,
         expected_remote_sha: expected_remote_sha.clone(),
     });
     if supersede_source {
@@ -1476,12 +1537,27 @@ async fn publish_worker_completion(
     }
     intent.pr = known_pr;
     intent.expected_remote_sha = expected_remote_sha;
+    reconcile_publication_intent_with_task_target(
+        &config.db_path,
+        task_id,
+        prior_snapshot.as_ref(),
+        &mut intent,
+    )
+    .await?;
     let publication_base_branch = publication_base_branch(&intent, &config.base_branch)?;
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
     if let Some(pr) = known_pr {
-        let target =
-            resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
+        let target = resolve_publication_pr_target_with_program(
+            pr,
+            &config.repo_dir,
+            Some(&config.repo),
+            config
+                .pr_target_program
+                .as_deref()
+                .unwrap_or(Path::new("gh")),
+        )
+        .await?;
         // `pr_created` means the daemon may have crashed (or validation may
         // have failed) after recording the PR but before verifying its target.
         // Re-run the complete initial branch/SHA/base check. Treating this as
@@ -1966,11 +2042,12 @@ async fn resolve_and_persist_continue_pr_target(
     config: &ServeConfig,
     task_id: i64,
     pr: i64,
+    base_branch: &str,
 ) -> std::result::Result<PrTarget, String> {
     // GitHub resolution is deliberately complete before opening the SQLite
     // write transaction below.
     let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
-    validate_continue_pr_target(&target, pr, &config.base_branch)?;
+    validate_continue_pr_target(&target, pr, base_branch)?;
     let db_path = config.db_path.clone();
     let persisted = target.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1987,6 +2064,7 @@ async fn resolve_and_persist_parked_rework_target(
     config: &ServeConfig,
     task_id: i64,
     intent: &PublicationIntent,
+    base_branch: &str,
 ) -> std::result::Result<PrTarget, String> {
     let pr = intent
         .pr
@@ -1998,9 +2076,18 @@ async fn resolve_and_persist_parked_rework_target(
     // Resolve GitHub completely before opening the short persistence
     // transaction. The recorded lease is authoritative: a live target may
     // confirm it, never replace it.
-    let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
-    validate_continue_pr_target(&target, pr, &config.base_branch)?;
-    existing_pr_lease_baseline(intent, &target, &config.base_branch)?;
+    let target = resolve_publication_pr_target_with_program(
+        pr,
+        &config.repo_dir,
+        Some(&config.repo),
+        config
+            .pr_target_program
+            .as_deref()
+            .unwrap_or(Path::new("gh")),
+    )
+    .await?;
+    validate_continue_pr_target(&target, pr, base_branch)?;
+    existing_pr_lease_baseline(intent, &target, base_branch)?;
 
     let db_path = config.db_path.clone();
     let persisted = target.clone();
@@ -2976,8 +3063,8 @@ pub struct ServeConfig {
     pub r2_steady_state_p: f64,
     /// Codex sandbox mode (default: "danger-full-access").
     pub codex_sandbox: String,
-    /// Test-only override for the `gh` binary used by sticky remediation
-    /// baseline resolution. None → look up "gh" on PATH.
+    /// Test-only override for the `gh` binary used by live PR target
+    /// resolution. None → look up "gh" on PATH.
     pub pr_target_program: Option<PathBuf>,
 }
 
@@ -14925,13 +15012,35 @@ async fn spawn_worker(
 
     let worker_repo_dir = &config.repo_dir;
 
+    // Task creation persists the authoritative target before the daemon can
+    // claim. Every provisioning path — fresh initial, continue-pr — uses this
+    // exact branch. Legacy tasks (target_branch absent) fall back to the
+    // configured base. An invalid persisted value fails closed here.
+    let task_target = match task.target_branch.as_deref() {
+        Some(target) => match tasks::validate_target_branch(target) {
+            Ok(()) => Some(target),
+            Err(error) => {
+                let reason =
+                    format!("worker has invalid authoritative task target branch: {error}");
+                persist_provisioning_failure(&db_path, task.id, &reason).await;
+                park_task(&db_path, task.id, &reason, "open").await;
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
+                return Ok(false);
+            }
+        },
+        None => None,
+    };
+    let effective_base_branch = task_target.unwrap_or(&config.base_branch);
+
     // A continuation assignment is bound to the live PR target resolved after
     // the atomic claim. Explicit --continue-pr remains authoritative. A
     // parked-rework retry may recover the same authority only from a complete
     // daemon publication lease; it must never adopt a mutable refs.pr value or
     // fall through to base-derived provisioning once that lease exists.
     let (continue_target, parked_rework_continuation) = if let Some(pr) = task.continue_pr {
-        match resolve_and_persist_continue_pr_target(config, task.id, pr).await {
+        match resolve_and_persist_continue_pr_target(config, task.id, pr, effective_base_branch)
+            .await
+        {
             Ok(target) => (Some(target), false),
             Err(error) => {
                 let reason = format!("continue PR #{pr} provisioning rejected: {error}");
@@ -14955,7 +15064,14 @@ async fn spawn_worker(
         match recorded {
             Some(intent) => {
                 let pr = intent.pr.expect("validated parked publication PR");
-                match resolve_and_persist_parked_rework_target(config, task.id, &intent).await {
+                match resolve_and_persist_parked_rework_target(
+                    config,
+                    task.id,
+                    &intent,
+                    effective_base_branch,
+                )
+                .await
+                {
                     Ok(target) => (Some(target), true),
                     Err(error) => {
                         let reason = format!(
@@ -14978,31 +15094,6 @@ async fn spawn_worker(
     } else {
         0
     };
-    // Only a brand-new implementation is based on the task's authoritative
-    // target. Continuations and rework retain their existing provisioning
-    // rules in this slice.
-    let initial_target_branch = if continue_target.is_none() && task.rework_round == 0 {
-        match task.target_branch.as_deref() {
-            Some(target) => match tasks::validate_target_branch(target) {
-                Ok(()) => Some(target),
-                Err(error) => {
-                    let reason =
-                        format!("initial worker has invalid authoritative target branch: {error}");
-                    persist_provisioning_failure(&db_path, task.id, &reason).await;
-                    park_task(&db_path, task.id, &reason, "open").await;
-                    guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
-                    return Ok(false);
-                }
-            },
-            // Legacy tasks predate authoritative targets. They retain the
-            // configured-base provisioning behavior, including recovery.
-            None => None,
-        }
-    } else {
-        None
-    };
-    let initial_base_branch = initial_target_branch.unwrap_or(&config.base_branch);
-
     // Branch keyed to task + original author, not current assignee — a rework
     // re-claim by a different agent continues the original branch instead of
     // forking a duplicate PR (#340).
@@ -15050,7 +15141,7 @@ async fn spawn_worker(
     // Persist immutable allocation provenance before git creates anything.
     // Ref resolution is external I/O and completes before the short DB write.
     if continue_target.is_none() {
-        let base_ref = format!("origin/{initial_base_branch}");
+        let base_ref = format!("origin/{effective_base_branch}");
         let resolved_provenance = match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
             Ok(sha) => sha,
             Err(error) => {
@@ -15112,11 +15203,11 @@ async fn spawn_worker(
             &branch,
             &wt_path,
             target,
-            &config.base_branch,
+            effective_base_branch,
         )
         .await
         .map(|(path, base_merge)| {
-            let context = continuation_worker_context(target, &config.base_branch, base_merge);
+            let context = continuation_worker_context(target, effective_base_branch, base_merge);
             (path, Some(context))
         })
     } else {
@@ -15125,7 +15216,7 @@ async fn spawn_worker(
                 worker_repo_dir,
                 &branch,
                 &wt_path,
-                &format!("origin/{initial_base_branch}"),
+                &format!("origin/{effective_base_branch}"),
             )
             .await
             .map(|path| (path, None))
@@ -23073,7 +23164,488 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         invalid.target_branch = Some("origin/main".into());
         assert!(publication_base_branch(&invalid, "main")
             .expect_err("invalid durable target must reject publication")
-            .contains("invalid initial target"));
+            .contains("invalid task target branch"));
+    }
+
+    #[test]
+    fn continuation_publication_intent_uses_task_target_over_configured_base() {
+        let mut intent = PublicationIntent {
+            branch: "external/pr-head".into(),
+            local_sha: "source-a".into(),
+            pr: Some(482),
+            stage: "intent".into(),
+            target_branch: Some("develop".into()),
+            expected_remote_sha: Some("spawn-x".into()),
+        };
+        assert_eq!(
+            publication_base_branch(&intent, "main").unwrap(),
+            "develop",
+            "a continuation intent must publish to the durable task target",
+        );
+
+        let live = PrTarget {
+            pr: 482,
+            head_ref: "external/pr-head".into(),
+            head_sha: "spawn-x".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let error = existing_pr_lease_baseline(&intent, &live, "develop").expect_err(
+            "a PR whose live base drifted from the task target must fail closed with no push",
+        );
+        assert!(
+            error.contains("targets base") && error.contains("expected develop"),
+            "unexpected error: {error}"
+        );
+
+        intent.target_branch = None;
+        assert_eq!(
+            publication_base_branch(&intent, "main").unwrap(),
+            "main",
+            "legacy tasks without an authoritative target fall back to the configured base",
+        );
+    }
+
+    fn targetless_prior_intent(pr: i64) -> PublicationIntent {
+        PublicationIntent {
+            branch: "daemon/worker-t1".into(),
+            local_sha: "source-a".into(),
+            pr: Some(pr),
+            stage: "pr_created".into(),
+            target_branch: None,
+            expected_remote_sha: Some("spawn-x".into()),
+        }
+    }
+
+    #[test]
+    fn backfill_intent_target_branch_binds_prior_targetless_intent_to_task_target() {
+        let mut intent = targetless_prior_intent(482);
+        backfill_intent_target_branch(&mut intent, Some("develop".into()));
+        assert_eq!(intent.target_branch.as_deref(), Some("develop"));
+        assert_eq!(
+            publication_base_branch(&intent, "main").unwrap(),
+            "develop",
+            "an in-flight prior intent from the preceding daemon version must publish to the task's authoritative target on restart",
+        );
+
+        let mut legacy = targetless_prior_intent(482);
+        backfill_intent_target_branch(&mut legacy, None);
+        assert_eq!(legacy.target_branch, None);
+        assert_eq!(
+            publication_base_branch(&legacy, "main").unwrap(),
+            "main",
+            "genuinely legacy tasks (no authoritative target) retain the configured-base fallback",
+        );
+
+        let mut already_targeted = PublicationIntent {
+            target_branch: Some("develop".into()),
+            ..targetless_prior_intent(482)
+        };
+        backfill_intent_target_branch(&mut already_targeted, Some("main".into()));
+        assert_eq!(
+            already_targeted.target_branch.as_deref(),
+            Some("develop"),
+            "an intent that already carries a target must not be overwritten",
+        );
+    }
+
+    #[test]
+    fn reject_prior_target_conflict_fails_closed_when_prior_disagrees_with_task_target() {
+        let prior = PublicationIntent {
+            target_branch: Some("develop".into()),
+            ..targetless_prior_intent(482)
+        };
+        reject_prior_target_conflict(Some(&prior), Some("develop")).unwrap();
+        let error = reject_prior_target_conflict(Some(&prior), Some("main")).expect_err(
+            "a durable prior target that disagrees with the task target must fail closed",
+        );
+        assert!(error.contains("conflicts with task target"));
+
+        let targetless = targetless_prior_intent(482);
+        reject_prior_target_conflict(Some(&targetless), Some("develop")).unwrap();
+        reject_prior_target_conflict(None, Some("develop")).unwrap();
+        reject_prior_target_conflict(Some(&targetless), None).unwrap();
+    }
+
+    #[cfg(unix)]
+    struct RestartPublicationFixture {
+        _dir: tempfile::TempDir,
+        config: ServeConfig,
+        wt_mgr: WorktreeManager,
+        task_id: i64,
+        mailbox_id: i64,
+        row: mailbox::MailboxRow,
+        remote_sha: String,
+        source_sha: String,
+        branch: String,
+    }
+
+    /// Build a preceding-version targetless continuation intent, a durable
+    /// continuation target, and a real Git remote. The wrong-base recovery
+    /// regression below includes `publish_worker_completion` and lifecycle
+    /// settlement.
+    #[cfg(unix)]
+    async fn restart_publication_fixture(live_base: &str) -> RestartPublicationFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["branch", "develop"]);
+        git(&["push", "-q", "origin", "main", "develop"]);
+
+        let branch = "daemon/restart-t482".to_string();
+        git(&["checkout", "-q", "-b", &branch]);
+        git(&["push", "-q", "-u", "origin", &branch]);
+        let remote_sha = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("state.txt"), "published source\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "worker completion"]);
+        let source_sha = git(&["rev-parse", "HEAD"]);
+
+        let db_path = dir.path().join("restart-publication.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create_with_continue_pr_and_target_branch(
+                &mut conn,
+                "owner",
+                "targeted continuation restart",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                Some(482),
+                Some("develop"),
+                now_unix(),
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                now_unix(),
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Restart", Some(task_id), &[], 3600, now_unix())
+                .unwrap()
+                .expect("restart worker claim");
+            quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "Restart",
+                "worker",
+                "model",
+                "high",
+                "codex",
+                now_unix(),
+            )
+            .unwrap();
+            pr_targets::upsert(&mut conn, task_id, 482, &branch, &remote_sha, false).unwrap();
+            journal::upsert(
+                &mut conn,
+                &JournalEntry {
+                    agent: "Restart".into(),
+                    role: "worker".into(),
+                    task_id: Some(task_id),
+                    session_id: "restart-worker".into(),
+                    worktree: Some(repo.to_string_lossy().into_owned()),
+                    branch: Some(branch.clone()),
+                    phase: "working".into(),
+                    cost_tokens: 0,
+                    agent_state: None,
+                    cost_usd: 0.0,
+                    log_dir: None,
+                    pid: None,
+                    pr: Some(482),
+                    rework_count: 0,
+                    provider: None,
+                    continuation_id: None,
+                    local_branch: Some(branch.clone()),
+                },
+            )
+            .unwrap();
+            task_id
+        };
+        let legacy_intent = PublicationIntent {
+            branch: branch.clone(),
+            local_sha: source_sha.clone(),
+            pr: Some(482),
+            stage: "intent".into(),
+            target_branch: None,
+            expected_remote_sha: Some(remote_sha.clone()),
+        };
+        persist_publication_intent(&db_path, task_id, &legacy_intent)
+            .await
+            .unwrap();
+
+        let row = done_row("Restart", Some(task_id), Some(482));
+        let mailbox_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(&mut conn, &row).unwrap()
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-restart-publication",
+            &open_pr_target_json(&branch, &remote_sha, live_base),
+        );
+        let mut config = pre_review_ci_test_config(db_path, repo);
+        config.pr_target_program = Some(gh);
+        RestartPublicationFixture {
+            _dir: dir,
+            config,
+            wt_mgr: WorktreeManager::new(),
+            task_id,
+            mailbox_id,
+            row,
+            remote_sha,
+            source_sha,
+            branch,
+        }
+    }
+
+    #[cfg(unix)]
+    fn remote_branch_sha(repo: &Path, branch: &str) -> String {
+        let output = std::process::Command::new("git")
+            .args(["ls-remote", "origin", &format!("refs/heads/{branch}")])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_targetless_intent_backfills_task_target_and_publishes_matching_live_base() {
+        let fixture = restart_publication_fixture("develop").await;
+        let published = publish_worker_completion(
+            &fixture.config,
+            &fixture.wt_mgr,
+            fixture.task_id,
+            &fixture.config.repo_dir,
+            &fixture.branch,
+            Some(482),
+        )
+        .await
+        .expect("the restart path must publish a matching targeted continuation");
+
+        assert_eq!(
+            remote_branch_sha(&fixture.config.repo_dir, &fixture.branch),
+            fixture.source_sha,
+            "publication must advance the daemon-owned remote ref"
+        );
+        assert_eq!(published.pr, 482);
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+        assert_eq!(
+            task.target_branch.as_deref(),
+            Some("develop"),
+            "the immutable continuation target remains durable on the task"
+        );
+        let intent = publication_intent_from_refs(task.refs.as_deref()).expect(
+            "successful restart publication must retain its durable intent until settlement",
+        );
+        assert_eq!(
+            intent.target_branch.as_deref(),
+            Some("develop"),
+            "the targetless preceding-version intent must be durably backfilled before publication"
+        );
+        assert!(
+            intent.stage == "verified",
+            "successful publication must verify the backfilled intent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_targetless_intent_wrong_live_base_does_not_push_or_settle_task() {
+        let fixture = restart_publication_fixture("main").await;
+        assert!(
+            !recover_late_worker_done_with_publication(
+                &fixture.config,
+                &fixture.wt_mgr,
+                fixture.mailbox_id,
+                &fixture.row,
+            )
+            .await
+            .unwrap(),
+            "a wrong-base continuation must not be recovered as published"
+        );
+
+        assert_eq!(
+            remote_branch_sha(&fixture.config.repo_dir, &fixture.branch),
+            fixture.remote_sha,
+            "wrong-base validation must reject before mutating the remote ref"
+        );
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "failed",
+            "failed publication must park, not settle"
+        );
+        assert!(
+            !task_event_kinds(&fixture.config.db_path, fixture.task_id)
+                .contains(&"task_in_review".to_string()),
+            "wrong-base publication must not emit a published lifecycle event"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_publication_intent_with_task_target_rejects_durable_target_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reconcile-conflict.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = tasks::create_with_continue_pr_and_target_branch(
+            &mut conn,
+            "owner",
+            "targeted continuation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("develop"),
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let conflicting_prior = PublicationIntent {
+            target_branch: Some("main".into()),
+            ..targetless_prior_intent(482)
+        };
+        let mut intent = conflicting_prior.clone();
+        let error = reconcile_publication_intent_with_task_target(
+            &db_path,
+            task_id,
+            Some(&conflicting_prior),
+            &mut intent,
+        )
+        .await
+        .expect_err("a durable prior target that disagrees with the task target must fail closed");
+        assert!(
+            error.contains("conflicts with task target develop"),
+            "unexpected error: {error}",
+        );
+        assert_eq!(
+            intent.target_branch.as_deref(),
+            Some("main"),
+            "a rejected reconciliation must not mutate the intent",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_publication_intent_with_task_target_preserves_legacy_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reconcile-legacy.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let legacy_task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "legacy",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let prior = targetless_prior_intent(482);
+        let mut intent = prior.clone();
+        reconcile_publication_intent_with_task_target(
+            &db_path,
+            legacy_task_id,
+            Some(&prior),
+            &mut intent,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            intent.target_branch, None,
+            "a legacy task without an authoritative target keeps the intent's None so downstream falls back to config.base_branch",
+        );
+        assert_eq!(publication_base_branch(&intent, "main").unwrap(), "main",);
+    }
+
+    #[tokio::test]
+    async fn task_target_branch_reads_persisted_task_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("task-target.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let legacy_id = tasks::create(
+            &mut conn,
+            "owner",
+            "legacy",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now_unix(),
+        )
+        .unwrap();
+        let develop_id = tasks::create_with_continue_pr_and_target_branch(
+            &mut conn,
+            "owner",
+            "targeted",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("develop"),
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(task_target_branch(&db_path, legacy_id).await.unwrap(), None);
+        assert_eq!(
+            task_target_branch(&db_path, develop_id).await.unwrap(),
+            Some("develop".to_string()),
+        );
     }
 
     #[test]
@@ -23182,6 +23754,31 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[test]
+    fn continue_pr_target_binds_to_the_exact_task_target_branch() {
+        for target_branch in ["main", "develop"] {
+            let target = PrTarget {
+                pr: 19,
+                head_ref: "feature/existing".into(),
+                head_sha: "abc123".into(),
+                is_fork: false,
+                base_ref: Some(target_branch.into()),
+                state: Some("OPEN".into()),
+            };
+            validate_continue_pr_target(&target, 19, target_branch).unwrap();
+
+            let other = if target_branch == "main" {
+                "develop"
+            } else {
+                "main"
+            };
+            let error = validate_continue_pr_target(&target, 19, other).expect_err(
+                "a continuation whose live PR base differs from the task target must fail closed",
+            );
+            assert!(error.contains(&format!("expected {other}")));
+        }
+    }
+
+    #[test]
     fn continue_pr_target_rejects_missing_live_state_and_wrong_identity() {
         let mut target = PrTarget {
             pr: 20,
@@ -23220,6 +23817,24 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(conflicted.contains("still in progress because of conflicts"));
         assert!(conflicted.contains("commit the merge before"));
         assert!(conflicted.contains("Do not abort the prepared merge"));
+    }
+
+    #[test]
+    fn continuation_worker_context_directs_merge_to_the_task_target_branch() {
+        let target = PrTarget {
+            pr: 601,
+            head_ref: "feature/existing".into(),
+            head_sha: "0eb645bb".into(),
+            is_fork: false,
+            base_ref: Some("develop".into()),
+            state: Some("OPEN".into()),
+        };
+        let clean = continuation_worker_context(&target, "develop", ContinuationBaseMerge::Clean);
+        assert!(clean.contains("git merge --ff --no-edit origin/develop"));
+        assert!(
+            !clean.contains("origin/main"),
+            "a develop-target continuation must not reference the configured base"
+        );
     }
 
     #[test]
@@ -23481,6 +24096,132 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "{{\"headRefName\":\"{head_ref}\",\"headRefOid\":\"{head_sha}\",\
              \"isCrossRepository\":false,\"baseRefName\":\"{base}\",\"state\":\"OPEN\"}}"
         )
+    }
+
+    fn seed_parked_rework_publication(
+        conn: &mut quorum_core::Connection,
+        pr: i64,
+        task_target: Option<&str>,
+        head_sha: &str,
+    ) -> (i64, PublicationIntent) {
+        let intent = PublicationIntent {
+            branch: format!("daemon/rework-t{pr}"),
+            local_sha: format!("source-{pr}"),
+            pr: Some(pr),
+            stage: "verified".into(),
+            target_branch: task_target.map(str::to_string),
+            expected_remote_sha: Some(head_sha.into()),
+        };
+        let refs = serde_json::json!({
+            "cx_est": 3,
+            "cx_size": "M",
+            "cx_ready": true,
+            "cx_not_ready_reason": null,
+            "cx_by": "test:v2",
+            "daemon_rework_retry_requested": true,
+            "pr": pr,
+            "daemon_publication": intent,
+        })
+        .to_string();
+        let task_id = tasks::create_with_continue_pr_and_target_branch(
+            conn,
+            "owner",
+            "parked rework publication",
+            None,
+            0,
+            None,
+            Some(&refs),
+            None,
+            None,
+            None,
+            task_target,
+            now_unix(),
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [task_id])
+            .unwrap();
+        (task_id, intent)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parked_rework_targeted_task_uses_immutable_target_not_configured_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("parked-targeted-rework.db");
+        let pr = 701;
+        let head_sha = "7017017017017017017017017017017017017017";
+        let (task_id, intent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_parked_rework_publication(&mut conn, pr, Some("develop"), head_sha)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-parked-targeted",
+            &open_pr_target_json(&intent.branch, head_sha, "develop"),
+        ));
+
+        let target = resolve_and_persist_parked_rework_target(&config, task_id, &intent, "develop")
+            .await
+            .expect("a develop-target parked rework must not fall back to configured main");
+        assert_eq!(target.base_ref.as_deref(), Some("develop"));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.target_branch.as_deref(), Some("develop"));
+        assert!(daemon_rework_retry_requested(task.refs.as_deref()));
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            head_sha,
+            "successful targeted validation must durably retain the exact rework lease"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parked_rework_targetless_legacy_task_uses_configured_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("parked-legacy-rework.db");
+        let pr = 702;
+        let head_sha = "7027027027027027027027027027027027027027";
+        let (task_id, intent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_parked_rework_publication(&mut conn, pr, None, head_sha)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-parked-legacy",
+            &open_pr_target_json(&intent.branch, head_sha, "main"),
+        ));
+
+        let target = resolve_and_persist_parked_rework_target(
+            &config,
+            task_id,
+            &intent,
+            &config.base_branch,
+        )
+        .await
+        .expect("a genuinely targetless parked rework must retain configured-base fallback");
+        assert_eq!(target.base_ref.as_deref(), Some("main"));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.target_branch, None);
+        assert!(daemon_rework_retry_requested(task.refs.as_deref()));
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            head_sha,
+            "legacy validation must durably retain the exact rework lease"
+        );
     }
 
     #[cfg(unix)]
