@@ -35,6 +35,10 @@ if [ "${PREFLIGHT_CARGO_TEST_BINARIES:-0}" = 1 ] && [ "$1" = test ]; then
     "$PREFLIGHT_FIRST_TEST_BINARY"
   printf '{"reason":"compiler-artifact","package_id":"path+file:///fixture#fixture@0.1.0","manifest_path":"/fixture/Cargo.toml","target":{"name":"second_binary","kind":["test"]},"profile":{"test":true},"executable":"%s","fresh":false}\n' \
     "$PREFLIGHT_SECOND_TEST_BINARY"
+  if [ -n "${PREFLIGHT_THIRD_TEST_BINARY:-}" ]; then
+    printf '{"reason":"compiler-artifact","package_id":"path+file:///fixture#fixture@0.1.0","manifest_path":"/fixture/Cargo.toml","target":{"name":"third_binary","kind":["test"]},"profile":{"test":true},"executable":"%s","fresh":false}\n' \
+      "$PREFLIGHT_THIRD_TEST_BINARY"
+  fi
 fi
 exit 0
 EOF
@@ -435,6 +439,27 @@ grep -q '^  branch_base .*  ok$' target/preflight-timing/summary.txt
 grep -q '"name": "branch_base"' target/preflight-timing/timing.json
 grep -q 'slowest test binaries (top 0 of 0):' \
   target/preflight-timing/summary.txt
+python3 - target/preflight-timing/timing.json <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1]))
+assert data["test_jobs"] == 2
+assert data["test_threads"] == 4
+PY
+
+if PATH="$BIN:$PATH" scripts/preflight/timing.sh --test-jobs 0 \
+  >"$TMP/invalid-test-jobs.out" 2>&1; then
+  echo 'expected zero test jobs to be rejected' >&2
+  exit 1
+fi
+grep -q -- '--test-jobs must be positive' "$TMP/invalid-test-jobs.out"
+if PREFLIGHT_TEST_JOBS=invalid PATH="$BIN:$PATH" \
+  scripts/preflight/timing.sh >"$TMP/invalid-test-jobs-env.out" 2>&1; then
+  echo 'expected invalid PREFLIGHT_TEST_JOBS to be rejected' >&2
+  exit 1
+fi
+grep -q 'invalid int value' "$TMP/invalid-test-jobs-env.out"
 
 # Test execution stops at the first failed binary boundary. The failed binary
 # has already completed supervisor cleanup, the next binary never launches,
@@ -456,7 +481,7 @@ if PREFLIGHT_CARGO_TEST_BINARIES=1 \
   PREFLIGHT_SECOND_TEST_BINARY="$TMP/second-test-binary" \
   PREFLIGHT_TEST_LAUNCH_LOG="$TMP/test-launches.log" \
   PATH="$BIN:$PATH" scripts/preflight/timing.sh \
-    --skip-fmt --skip-clippy --out "$FAIL_FAST_OUT" \
+    --skip-fmt --skip-clippy --test-jobs 1 --out "$FAIL_FAST_OUT" \
     >"$TMP/fail-fast.out" 2>&1; then
   echo 'expected first test binary failure to reject timing run' >&2
   exit 1
@@ -489,6 +514,60 @@ grep -Fq \
   'rerun: cargo test --manifest-path /fixture/Cargo.toml --all-features --features quorum-core/test-support --test first_binary -- --test-threads 4 --nocapture' \
   "$FAIL_FAST_OUT/summary.txt"
 grep -q 'preflight timing: FIRST FAILURE: test binary' "$TMP/fail-fast.out"
+
+# With two jobs, both initial binaries must run concurrently. The first waits
+# for the second to start before failing; fail-fast then cancels and reaps the
+# second supervisor tree, while the unscheduled third binary never launches.
+cat >"$TMP/concurrent-first-test-binary" <<'EOF'
+#!/bin/sh
+printf 'first\n' >> "$PREFLIGHT_TEST_LAUNCH_LOG"
+while [ ! -e "$PREFLIGHT_SECOND_READY" ]; do sleep 0.01; done
+exit 23
+EOF
+cat >"$TMP/concurrent-second-test-binary" <<'EOF'
+#!/bin/sh
+printf 'second\n' >> "$PREFLIGHT_TEST_LAUNCH_LOG"
+: > "$PREFLIGHT_SECOND_READY"
+sleep 30
+EOF
+cat >"$TMP/concurrent-third-test-binary" <<'EOF'
+#!/bin/sh
+printf 'third\n' >> "$PREFLIGHT_TEST_LAUNCH_LOG"
+exit 0
+EOF
+chmod +x "$TMP"/concurrent-*-test-binary
+CONCURRENT_OUT="$TMP/concurrent-fail-fast-timing"
+if PREFLIGHT_CARGO_TEST_BINARIES=1 \
+  PREFLIGHT_FIRST_TEST_BINARY="$TMP/concurrent-first-test-binary" \
+  PREFLIGHT_SECOND_TEST_BINARY="$TMP/concurrent-second-test-binary" \
+  PREFLIGHT_THIRD_TEST_BINARY="$TMP/concurrent-third-test-binary" \
+  PREFLIGHT_TEST_LAUNCH_LOG="$TMP/concurrent-test-launches.log" \
+  PREFLIGHT_SECOND_READY="$TMP/concurrent-second-ready" \
+  PATH="$BIN:$PATH" scripts/preflight/timing.sh \
+    --skip-fmt --skip-clippy --test-jobs 2 --test-timeout-secs 5 \
+    --term-grace-secs 0.1 --out "$CONCURRENT_OUT" \
+    >"$TMP/concurrent-fail-fast.out" 2>&1; then
+  echo 'expected concurrent first test binary failure to reject timing run' >&2
+  exit 1
+fi
+sort "$TMP/concurrent-test-launches.log" >"$TMP/concurrent-launches.sorted"
+printf 'first\nsecond\n' >"$TMP/concurrent-launches.expected"
+cmp "$TMP/concurrent-launches.expected" "$TMP/concurrent-launches.sorted"
+python3 - "$CONCURRENT_OUT/timing.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1]))
+assert data["test_jobs"] == 2
+assert data["first_failure"]["target_name"] == "first_binary"
+assert data["first_failure"]["exit_code"] == 23
+first, second, third = data["test_binaries"]
+assert first["execute_outcome"] == "failed"
+assert second["execute_outcome"] == "owner_lost"
+assert second["execute_cancelled_by_fail_fast"] is True
+assert second["cleanup"]["complete"] is True
+assert "execute_outcome" not in third
+PY
 
 # Cargo's compile/no-run diagnostics are captured by the structured collector,
 # then replayed by preflight before it returns the same failure status as the

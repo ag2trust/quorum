@@ -30,6 +30,7 @@ the complete author-gate artifact is required.
 | --- | --- |
 | `timestamp_utc` | UTC completion timestamp in RFC 3339 form. |
 | `top_n` | Requested list length (default `10`). |
+| `test_jobs` | Maximum test executables scheduled concurrently (`--test-jobs`; default `2`, or `PREFLIGHT_TEST_JOBS`). |
 | `test_threads` | `--test-threads` value used when executing each test binary. |
 | `test_timeout_secs` | Per-test-executable deadline (default `120`). |
 | `term_grace_secs` | Bounded wait after TERM and again after KILL while cleaning a test process group (default `2`). |
@@ -48,22 +49,38 @@ conditional, not an artifact validity check.
 
 After a binary is executed, its entry has `execute_secs`,
 `execute_exit_code`, `execute_outcome` (`passed`, `failed`, `timed_out`, or
-`interrupted`), `execute_timed_out`, and `execute_timeout_secs`. Its `cleanup`
+`interrupted`; fail-fast cancellation uses `owner_lost`),
+`execute_timed_out`, and `execute_timeout_secs`. An in-flight binary cancelled
+because another binary failed also has `execute_cancelled_by_fail_fast: true`.
+Its `cleanup`
 object records `attempted`, `term_sent`, `kill_sent`, `complete`, and `error`.
 `complete: true` means the isolated test and its tracked descendant tree,
 including descendants that created separate process groups, no longer exist
 and the supervisor reaped the children it owns. `error` also retains a
 transient process-discovery diagnostic when fallback or a later snapshot still
 allowed cleanup to complete. A timeout uses exit code `124`.
-After the first nonzero exit or incomplete cleanup, the collector stops at that
-binary boundary. Later discovered entries remain in `test_binaries` without
-execution fields, while `timing.json` and `summary.txt` retain the completed
-partial run and identify the first failure prominently.
+The collector compiles once and then runs at most `test_jobs` discovered
+executables concurrently. After the first observed nonzero exit or incomplete
+cleanup, it schedules no more binaries and closes every other active
+supervisor's owner pipe. Those supervisors perform bounded descendant cleanup
+and are reaped before the collector publishes its partial artifact. The
+completed result that caused cancellation remains the exact `first_failure`;
+cancelled peers cannot replace it. Later discovered entries remain in
+`test_binaries` without execution fields.
 Each test is owned by a supervisor outside the collector's process group; if
 the collector is abruptly killed, that supervisor observes owner loss and
 performs the same bounded TERM/KILL cleanup before exiting. Because an
 abruptly killed collector cannot finish writing JSON, that owner-loss cleanup
 does not itself promise a new timing artifact.
+
+The default of two jobs and four threads per binary is based on one warm
+full-suite comparison on the 10-core development host. Test-execution wall
+time was 336.572 seconds at `1 x 4`, 241.591 seconds at `2 x 2`, and 174.005
+seconds at `2 x 4`. The `4 x 1` profile was rejected: `cli_serve_merge_checks`
+exceeded the existing 120-second binary deadline and made the run fail. These
+measurements justify the conservative two-job default; they are not a portable
+performance guarantee. Override either dimension when diagnosing machine- or
+test-specific behavior.
 
 For a binary, `compile_no_run_secs` is the sum of wall-clock intervals for the
 matching test `rustc` invocations, and `compile_no_run_source` identifies the
