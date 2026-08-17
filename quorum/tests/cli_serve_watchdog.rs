@@ -710,6 +710,18 @@ fn worker_submission_before_terminal_overage_is_cleanup_only() {
     assert_eq!(task.status, "in-review");
     assert_eq!(task.recovery_attempts, 0);
     assert_eq!(quorum_core::tasks::extract_pr_number(&task.refs), Some(1));
+    let active_retiring_lease: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM claims
+             WHERE target='task#1' AND holder=?1 AND active=1",
+            [&worker_name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        active_retiring_lease, 0,
+        "cleanup-only watchdog teardown must settle the retiring worker lease"
+    );
     let review_events: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM events WHERE subject='task#1' AND kind='task_in_review'",

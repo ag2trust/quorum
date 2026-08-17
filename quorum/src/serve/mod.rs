@@ -16197,18 +16197,11 @@ enum WorkerNameReleaseExpectation {
     /// A provider-blocked retry deliberately preserves the worker lease and
     /// its daemon-issued name for the continuation.
     RetainedForProviderRetry,
-    /// A submitted/stale run may be reaped after the task phase advanced but
-    /// before the next lifecycle owner replaced its lease. Retain the name
-    /// without treating that safe handoff window as a cleanup failure.
-    RetainedForLifecycleHandoff,
 }
 
 fn worker_name_release_expectation(end_reason: &str) -> WorkerNameReleaseExpectation {
     match end_reason {
         "provider_blocked" => WorkerNameReleaseExpectation::RetainedForProviderRetry,
-        "completed" | "ownership_transferred" => {
-            WorkerNameReleaseExpectation::RetainedForLifecycleHandoff
-        }
         _ => WorkerNameReleaseExpectation::Released,
     }
 }
@@ -16222,11 +16215,12 @@ fn worker_name_release_expectation(end_reason: &str) -> WorkerNameReleaseExpecta
 /// unexpired lease on `task#<id>` is still held by this agent before the pool
 /// release. If the lease is still live, or the DB check itself fails, the name
 /// is retained in `in_use` — a leaked name is strictly safer than one recycled
-/// under an active claim. A retained lease is expected for a provider retry or
-/// an authoritative lifecycle handoff whose replacement owner has not claimed
-/// yet; every other live lease and all DB/spawn failures are recorded as
-/// errors. Filesystem and process cleanup is done by the caller before invoking
-/// this guard so the DB check/settlement stays a short transaction.
+/// under an active claim. A retained lease is expected only for a provider
+/// retry; managed-exit classification settles a completed or transferred
+/// worker's exact lease before cleanup. Every other live lease and all DB/spawn
+/// failures are recorded as errors. Filesystem and process cleanup is done by
+/// the caller before invoking this guard so the DB check stays a short
+/// transaction.
 async fn guarded_worker_name_release(
     db_path: &Path,
     name_pool: &mut Pool,
@@ -26732,6 +26726,77 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[tokio::test]
+    async fn recorded_watchdog_worker_settlement_allows_name_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("watchdog-recorded.db");
+        let mut pool = Pool::new_generated();
+        let agent = pool.acquire().into_name();
+        create_active_task(&db_path, &agent, "working");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let row_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: agent.clone(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(1),
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                &agent,
+                1,
+                &Event::SignaledDone { pr: "1".into() },
+                now_unix(),
+            )
+            .unwrap();
+            mailbox::mark_consumed(&mut conn, row_id).unwrap();
+        }
+
+        let disposition = dispose_managed_process_exit(
+            &db_path,
+            tasks::ManagedRunRole::Worker,
+            &agent,
+            1,
+            "worker watchdog breach: task tokens exceeded",
+        )
+        .await
+        .expect("watchdog classification must succeed");
+        assert!(matches!(
+            disposition,
+            tasks::ManagedExitDisposition::OutcomeRecorded
+        ));
+        guarded_worker_name_release_with_expectation(
+            &db_path,
+            &mut pool,
+            &agent,
+            1,
+            worker_name_release_expectation("completed"),
+        )
+        .await;
+
+        assert_eq!(pool.in_use_count(), 0);
+        assert_eq!(pool.acquire_named(&agent), Some(agent.clone()));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let active_retiring_lease: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims
+                 WHERE target='task#1' AND holder=?1 AND active=1",
+                [&agent],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_retiring_lease, 0);
+    }
+
+    #[tokio::test]
     async fn dead_codex_with_pending_null_pr_done_is_retained_without_retry_staging() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("done-pending.db");
@@ -29356,7 +29421,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             WorkerNameReleaseExpectation::RetainedForProviderRetry
         );
         assert_eq!(
-            worker_name_release_expectation("done"),
+            worker_name_release_expectation("completed"),
+            WorkerNameReleaseExpectation::Released
+        );
+        assert_eq!(
+            worker_name_release_expectation("ownership_transferred"),
             WorkerNameReleaseExpectation::Released
         );
     }

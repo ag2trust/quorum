@@ -2875,6 +2875,20 @@ fn classify_managed_exit_tx(
     Ok(ManagedExitClassification::OwnershipTransferred)
 }
 
+/// Retire only this worker's task authority after its managed process can no
+/// longer serve a later rework turn. A successor may already own the task by
+/// the time a terminal provider event is drained, so the holder predicate is
+/// load-bearing: cleanup for the old process must never deactivate the new
+/// owner's lease.
+fn settle_retiring_worker_lease_tx(tx: &Transaction<'_>, agent: &str, id: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE claims SET active=0
+         WHERE target=?1 AND holder=?2 AND active=1",
+        params![lease_target(id), agent],
+    )?;
+    Ok(())
+}
+
 /// Atomically classify a managed process exit and fail only a run that still
 /// owns its lifecycle phase and has produced no durable outcome.
 ///
@@ -2882,7 +2896,8 @@ fn classify_managed_exit_tx(
 /// of completion only after the run no longer owns the active phase, so stale
 /// rows from earlier rework/review rounds cannot hide a current failure. The
 /// ownership check and `AgentFailed` transition share the same immediate
-/// transaction.
+/// transaction. Cleanup-only worker dispositions retire that worker's exact
+/// lease in the transaction as well, without deactivating a successor holder.
 pub fn dispose_managed_exit(
     conn: &mut Connection,
     role: ManagedRunRole,
@@ -2898,10 +2913,16 @@ pub fn dispose_managed_exit(
             return Ok(ManagedExitDisposition::OutcomePending);
         }
         ManagedExitClassification::OutcomeRecorded => {
+            if role == ManagedRunRole::Worker {
+                settle_retiring_worker_lease_tx(&tx, agent, id)?;
+            }
             tx.commit()?;
             return Ok(ManagedExitDisposition::OutcomeRecorded);
         }
         ManagedExitClassification::OwnershipTransferred => {
+            if role == ManagedRunRole::Worker {
+                settle_retiring_worker_lease_tx(&tx, agent, id)?;
+            }
             tx.commit()?;
             return Ok(ManagedExitDisposition::OwnershipTransferred);
         }
@@ -5674,6 +5695,7 @@ mod tests {
             .unwrap(),
             ManagedExitDisposition::OutcomePending
         ));
+        assert!(worker_lease_active_for(&mut c, "remediation", id, 1005).unwrap());
 
         apply_event(&mut c, "remediation", id, &Event::ReworkPushed, 1006).unwrap();
         crate::mailbox::mark_consumed(&mut c, row_id).unwrap();
@@ -5689,6 +5711,10 @@ mod tests {
             .unwrap(),
             ManagedExitDisposition::OutcomeRecorded
         ));
+        assert!(
+            !worker_lease_active_for(&mut c, "remediation", id, 1007).unwrap(),
+            "recorded worker cleanup must retire its lease"
+        );
         assert_eq!(get(&c, id).unwrap().unwrap().status, "in-review");
         let review_events: i64 = c
             .query_row(
@@ -5701,6 +5727,55 @@ mod tests {
             review_events, 2,
             "remediation exit must not add a third review transition"
         );
+    }
+
+    #[test]
+    fn transferred_worker_exit_preserves_successor_lease() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "retiring", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "retiring",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND holder='retiring'",
+            [lease_target(id)],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+             VALUES (?1,'successor',1002,2002,1)",
+            [lease_target(id)],
+        )
+        .unwrap();
+
+        let disposition = dispose_managed_exit(
+            &mut c,
+            ManagedRunRole::Worker,
+            "retiring",
+            id,
+            "late terminal event",
+            1003,
+        )
+        .unwrap();
+        assert!(matches!(
+            disposition,
+            ManagedExitDisposition::OwnershipTransferred
+        ));
+        let successor: (String, i64) = c
+            .query_row(
+                "SELECT holder, expires_at FROM claims
+                 WHERE target=?1 AND active=1",
+                [lease_target(id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(successor, ("successor".into(), 2002));
     }
 
     #[test]
