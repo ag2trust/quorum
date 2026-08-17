@@ -82,7 +82,12 @@ elif [ "$cmd" = "pr list" ]; then
   pr="${head##*-t}"
   if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then printf '[{"number":%s,"state":"OPEN"}]\n' "$pr"; else printf '[]\n'; fi
 elif [ "$cmd" = "pr view" ]; then
-  pr="$3"; branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  pr="$3"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  else
+    branch="review-pr-$pr"
+  fi
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
@@ -385,6 +390,63 @@ fn seed_task(home: &std::path::Path, title: &str) {
     .unwrap();
 }
 
+fn seed_review_only_task(home: &std::path::Path, repo: &std::path::Path, title: &str) {
+    let out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "task-create",
+            "--title",
+            title,
+            "--created-by",
+            "TestCreator",
+            "--review-pr",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "task-create failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let db = home.join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id: 1,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: Vec::new(),
+        }],
+        "test-classifier:v1",
+        1,
+    )
+    .unwrap();
+    let head_sha = Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(head_sha.status.success());
+    assert!(Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "branch", "review-pr-1"])
+        .status()
+        .unwrap()
+        .success());
+    quorum_core::pr_targets::upsert(
+        &mut conn,
+        1,
+        1,
+        "review-pr-1",
+        String::from_utf8_lossy(&head_sha.stdout).trim(),
+        false,
+    )
+    .unwrap();
+}
+
 fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     let db = home.join("repos").join("test__repo").join("quorum.db");
     let mut conn = quorum_core::db::open(&db).unwrap();
@@ -591,6 +653,81 @@ fn task_token_limit_kills_worker_and_releases_task() {
         stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
         "task should be released to open after token limit, got: {stdout}"
     );
+}
+
+#[test]
+fn worker_submission_before_terminal_overage_is_cleanup_only() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    assert!(Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap()
+        .success());
+    seed_task(home.path(), "Submitted worker terminal overage regression");
+
+    let mut handle = ServeHandle::start_with_limits_and_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &["--max-task-tokens", "600"],
+        &[("FAKE_AGENT_DELAY_SECS", "3")],
+    );
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker_name]);
+    assert!(
+        handle.wait_for("PR #1 ready for review", 15),
+        "submission did not reach in-review before terminal usage. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("cleanup only", 15),
+        "recorded worker outcome was not cleanup-only. Lines: {:?}",
+        handle.lines
+    );
+    let false_alert = handle
+        .lines
+        .iter()
+        .any(|line| line.contains("WATCHDOG: worker"));
+    handle.stop();
+
+    assert!(!false_alert, "recorded submission emitted a watchdog alert");
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    assert_eq!(task.recovery_attempts, 0);
+    assert_eq!(quorum_core::tasks::extract_pr_number(&task.refs), Some(1));
+    let review_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE subject='task#1' AND kind='task_in_review'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(review_events, 1, "watchdog duplicated task_in_review");
+    let worker_runs = quorum_core::agent_runs::runs_for_task(&conn, 1)
+        .unwrap()
+        .into_iter()
+        .filter(|run| run.role == "worker")
+        .collect::<Vec<_>>();
+    assert_eq!(worker_runs.len(), 1);
+    assert!(matches!(
+        worker_runs[0].end_reason.as_deref(),
+        Some("completed" | "ownership_transferred")
+    ));
 }
 
 #[test]
@@ -1149,6 +1286,111 @@ fn reviewer_ceiling_kills_reviewer_and_respawns() {
         handle.lines
     );
 
+    handle.stop();
+}
+
+#[test]
+fn reviewer_verdict_before_terminal_overage_is_cleanup_only() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    assert!(Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap()
+        .success());
+    seed_review_only_task(
+        home.path(),
+        repo_dir.path(),
+        "Recorded reviewer terminal overage regression",
+    );
+
+    let mut handle = ServeHandle::start_with_limits_and_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &["--max-task-tokens", "600"],
+        &[("FAKE_AGENT_DELAY_SECS", "3")],
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(
+        handle.wait_for("R1: reviewer", 15),
+        "reviewer authority was not installed. Lines: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--feedback",
+            "Fix the regression",
+        ],
+    );
+    assert!(
+        handle.wait_for("-> rework", 15),
+        "verdict did not reach rework before terminal usage. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("cleanup only", 15),
+        "recorded reviewer outcome was not cleanup-only. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for(&format!("reviewer {reviewer_name} torn down"), 15),
+        "reviewer cleanup did not finish. Lines: {:?}",
+        handle.lines
+    );
+    let false_alert = handle
+        .lines
+        .iter()
+        .any(|line| line.contains("WATCHDOG: reviewer"));
+
+    assert!(!false_alert, "recorded verdict emitted a watchdog alert");
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    assert_eq!(task.recovery_attempts, 0);
+    assert_eq!(quorum_core::tasks::extract_pr_number(&task.refs), Some(1));
+    let rework_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE subject='task#1' AND kind='task_rework'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rework_events, 1, "watchdog duplicated task_rework");
+    let reviewer_runs = quorum_core::agent_runs::runs_for_task(&conn, 1)
+        .unwrap()
+        .into_iter()
+        .filter(|run| run.role == "reviewer")
+        .collect::<Vec<_>>();
+    assert_eq!(reviewer_runs.len(), 1);
+    assert!(
+        matches!(
+            reviewer_runs[0].end_reason.as_deref(),
+            Some("completed" | "ownership_transferred")
+        ),
+        "unexpected reviewer runs: {reviewer_runs:?}"
+    );
+    drop(conn);
     handle.stop();
 }
 

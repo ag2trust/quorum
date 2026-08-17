@@ -9984,7 +9984,7 @@ async fn tick(
     }
 
     // ── Phase 3: Drain events from active reviewers ────────────────────
-    let mut reviewers_to_kill: Vec<usize> = Vec::new();
+    let mut reviewer_breaches: Vec<(usize, String)> = Vec::new();
     for (i, r) in reviewers.iter_mut().enumerate() {
         if !r.draining {
             continue;
@@ -9992,30 +9992,57 @@ async fn tick(
         if let Some(breach) =
             check_active_slot_limits(r, &db_path, "reviewer", &config.limits).await?
         {
-            log(&format!(
-                "WATCHDOG: reviewer {} killed — {}",
-                r.agent_name, breach
-            ));
-            reviewers_to_kill.push(i);
+            reviewer_breaches.push((i, breach.to_string()));
         }
     }
-    for &i in reviewers_to_kill.iter().rev() {
-        let mutation = fail_reviewer_if_owner(
+    for (i, breach) in reviewer_breaches.into_iter().rev() {
+        let disposition = dispose_managed_process_exit(
             &db_path,
+            tasks::ManagedRunRole::Reviewer,
             &reviewers[i].agent_name,
             reviewers[i].task_id,
-            "reviewer killed by watchdog",
+            &format!("reviewer watchdog breach: {breach}"),
         )
         .await;
-        if mutation.is_none() {
+        let Some(disposition) = disposition else {
             log(&format!(
-                "reviewer {} watchdog mutation failed — retaining slot for retry",
+                "reviewer {} watchdog classification failed — retaining slot for retry",
                 reviewers[i].agent_name
             ));
             continue;
+        };
+        match disposition {
+            tasks::ManagedExitDisposition::OutcomePending => {
+                log(&format!(
+                    "reviewer {} exceeded a limit ({breach}) with verdict pending — retaining slot for mailbox delivery",
+                    reviewers[i].agent_name
+                ));
+            }
+            tasks::ManagedExitDisposition::OutcomeRecorded => {
+                let dead = reviewers.remove(i);
+                log(&format!(
+                    "reviewer {} exceeded a limit ({breach}) after recorded verdict — cleanup only",
+                    dead.agent_name
+                ));
+                teardown_reviewer(config, wt_mgr, name_pool, dead, "completed").await;
+            }
+            tasks::ManagedExitDisposition::OwnershipTransferred => {
+                let dead = reviewers.remove(i);
+                log(&format!(
+                    "reviewer {} exceeded a limit ({breach}) after review ownership advanced — cleanup only",
+                    dead.agent_name
+                ));
+                teardown_reviewer(config, wt_mgr, name_pool, dead, "ownership_transferred").await;
+            }
+            tasks::ManagedExitDisposition::AgentFailed(_) => {
+                let dead = reviewers.remove(i);
+                log(&format!(
+                    "WATCHDOG: reviewer {} killed after classification proved active ownership without a verdict — {breach}",
+                    dead.agent_name
+                ));
+                teardown_reviewer(config, wt_mgr, name_pool, dead, "crashed").await;
+            }
         }
-        let dead = reviewers.remove(i);
-        teardown_reviewer(config, wt_mgr, name_pool, dead, "watchdog").await;
     }
 
     // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
@@ -10065,7 +10092,7 @@ async fn tick(
     }
 
     // ── Phase 4: Drain events from active workers ──────────────────────
-    let mut workers_to_kill: Vec<usize> = Vec::new();
+    let mut worker_breaches: Vec<(usize, String)> = Vec::new();
     for (i, w) in workers.iter_mut().enumerate() {
         if !w.draining {
             continue;
@@ -10073,25 +10100,65 @@ async fn tick(
         if let Some(breach) =
             check_active_slot_limits(w, &db_path, "worker", &config.limits).await?
         {
-            log(&format!(
-                "WATCHDOG: worker {} killed (task #{}) — {}",
-                w.agent_name, w.task_id, breach
-            ));
-            workers_to_kill.push(i);
+            worker_breaches.push((i, breach.to_string()));
         }
     }
-    for &i in workers_to_kill.iter().rev() {
-        let dead = workers.remove(i);
-        fire_event(
+    for (i, breach) in worker_breaches.into_iter().rev() {
+        let disposition = dispose_managed_process_exit(
             &db_path,
-            &dead.agent_name,
-            dead.task_id,
-            &Event::AgentFailed {
-                reason: "worker killed by watchdog".into(),
-            },
+            tasks::ManagedRunRole::Worker,
+            &workers[i].agent_name,
+            workers[i].task_id,
+            &format!("worker watchdog breach: {breach}"),
         )
         .await;
-        cleanup_slot(config, wt_mgr, name_pool, dead, None, "crashed").await;
+        let Some(disposition) = disposition else {
+            log(&format!(
+                "worker {} watchdog classification failed — retaining slot for retry",
+                workers[i].agent_name
+            ));
+            continue;
+        };
+        match disposition {
+            tasks::ManagedExitDisposition::OutcomePending => {
+                log(&format!(
+                    "worker {} exceeded a limit ({breach}) with submission pending — retaining slot for mailbox delivery",
+                    workers[i].agent_name
+                ));
+            }
+            tasks::ManagedExitDisposition::OutcomeRecorded => {
+                let dead = workers.remove(i);
+                log(&format!(
+                    "worker {} exceeded a limit ({breach}) after recorded submission — cleanup only",
+                    dead.agent_name
+                ));
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+            }
+            tasks::ManagedExitDisposition::OwnershipTransferred => {
+                let dead = workers.remove(i);
+                log(&format!(
+                    "worker {} exceeded a limit ({breach}) after task ownership advanced — cleanup only",
+                    dead.agent_name
+                ));
+                cleanup_slot(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    None,
+                    "ownership_transferred",
+                )
+                .await;
+            }
+            tasks::ManagedExitDisposition::AgentFailed(_) => {
+                let dead = workers.remove(i);
+                log(&format!(
+                    "WATCHDOG: worker {} killed (task #{}) after classification proved active ownership without a submission — {breach}",
+                    dead.agent_name, dead.task_id
+                ));
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "crashed").await;
+            }
+        }
     }
 
     // ── Phase 4-idle: Kill workers idle too long between turns ─────────
@@ -15696,13 +15763,19 @@ enum WorkerNameReleaseExpectation {
     /// A provider-blocked retry deliberately preserves the worker lease and
     /// its daemon-issued name for the continuation.
     RetainedForProviderRetry,
+    /// A submitted/stale run may be reaped after the task phase advanced but
+    /// before the next lifecycle owner replaced its lease. Retain the name
+    /// without treating that safe handoff window as a cleanup failure.
+    RetainedForLifecycleHandoff,
 }
 
 fn worker_name_release_expectation(end_reason: &str) -> WorkerNameReleaseExpectation {
-    if end_reason == "provider_blocked" {
-        WorkerNameReleaseExpectation::RetainedForProviderRetry
-    } else {
-        WorkerNameReleaseExpectation::Released
+    match end_reason {
+        "provider_blocked" => WorkerNameReleaseExpectation::RetainedForProviderRetry,
+        "completed" | "ownership_transferred" => {
+            WorkerNameReleaseExpectation::RetainedForLifecycleHandoff
+        }
+        _ => WorkerNameReleaseExpectation::Released,
     }
 }
 
@@ -15715,11 +15788,11 @@ fn worker_name_release_expectation(end_reason: &str) -> WorkerNameReleaseExpecta
 /// unexpired lease on `task#<id>` is still held by this agent before the pool
 /// release. If the lease is still live, or the DB check itself fails, the name
 /// is retained in `in_use` — a leaked name is strictly safer than one recycled
-/// under an active claim. A retained lease is only expected for a
-/// provider-blocked retry; every other live lease and all DB/spawn failures are
-/// recorded as errors. Filesystem and process cleanup is done by the caller
-/// before invoking this guard so the DB check/settlement stays a short
-/// transaction.
+/// under an active claim. A retained lease is expected for a provider retry or
+/// an authoritative lifecycle handoff whose replacement owner has not claimed
+/// yet; every other live lease and all DB/spawn failures are recorded as
+/// errors. Filesystem and process cleanup is done by the caller before invoking
+/// this guard so the DB check/settlement stays a short transaction.
 async fn guarded_worker_name_release(
     db_path: &Path,
     name_pool: &mut Pool,
@@ -24806,6 +24879,110 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn watchdog_exit_with_pending_submission_retains_mailbox_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("watchdog-pending.db");
+        create_active_task(&db_path, "Spool", "working");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Spool".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(1),
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let disposition = dispose_managed_process_exit(
+            &db_path,
+            tasks::ManagedRunRole::Worker,
+            "Spool",
+            1,
+            "worker watchdog breach: task tokens exceeded",
+        )
+        .await
+        .expect("watchdog classification must succeed");
+        assert!(matches!(
+            disposition,
+            tasks::ManagedExitDisposition::OutcomePending
+        ));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        assert_eq!(task.recovery_attempts, 0);
+        assert!(mailbox::has_unconsumed(&conn, "Spool", mailbox::MailboxKind::Done, 1).unwrap());
+        let active_lease: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target='task#1' AND active=1 AND holder='Spool'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_lease, 1,
+            "pending delivery must retain its owner lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_exit_active_worker_without_submission_recovers_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("watchdog-active.db");
+        create_active_task(&db_path, "Spool", "working");
+
+        let first = dispose_managed_process_exit(
+            &db_path,
+            tasks::ManagedRunRole::Worker,
+            "Spool",
+            1,
+            "worker watchdog breach: task tokens exceeded",
+        )
+        .await
+        .expect("watchdog classification must succeed");
+        assert!(matches!(
+            first,
+            tasks::ManagedExitDisposition::AgentFailed(_)
+        ));
+
+        let duplicate = dispose_managed_process_exit(
+            &db_path,
+            tasks::ManagedRunRole::Worker,
+            "Spool",
+            1,
+            "duplicate watchdog observation",
+        )
+        .await
+        .expect("repeat classification must succeed");
+        assert!(matches!(
+            duplicate,
+            tasks::ManagedExitDisposition::OwnershipTransferred
+        ));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 1);
+        let task_open_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject='task#1' AND kind='task_open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(task_open_events, 1, "watchdog must emit AgentFailed once");
     }
 
     #[tokio::test]
