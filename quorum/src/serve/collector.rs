@@ -1388,6 +1388,36 @@ mod tests {
         assert!(out.contains("truncated"));
     }
 
+    #[test]
+    fn timeout_boundary_reap_retains_terminal_usage() {
+        let outcome = finalize_classifier_turn(
+            AgentKind::Claude,
+            vec![super::super::runner::CapturedOutput::Stdout(
+                r#"{"type":"result","result":"late","is_error":false,"usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":10,"output_tokens":5}}"#
+                    .into(),
+            )],
+            Err(QuorumError::Io("classifier timeout for PR #464".into())),
+            super::super::runner::TokenUsage::default(),
+        );
+
+        assert!(matches!(
+            outcome.response,
+            Err(QuorumError::Io(ref message)) if message.contains("timeout")
+        ));
+        assert_eq!(
+            outcome.usage,
+            super::super::runner::TokenUsage {
+                input_tokens: 100,
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 0,
+            },
+            "terminal usage raced by the timeout must survive final reap"
+        );
+    }
+
     #[tokio::test]
     async fn record_failure_writes_run_and_error_rows() {
         let (_dir, db_path) = tmp_conn();

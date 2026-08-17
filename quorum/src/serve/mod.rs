@@ -2696,6 +2696,18 @@ struct ManagedUsageRecord {
     usage: quorum_core::token_usage::TokenUsage,
 }
 
+#[derive(Clone)]
+struct UsageWriteRecord {
+    agent_run_id: Option<i64>,
+    purpose: String,
+    task_ids: Vec<i64>,
+    pr_number: Option<i64>,
+    provider: String,
+    model: String,
+    effort: String,
+    usage: quorum_core::token_usage::TokenUsage,
+}
+
 fn managed_usage_record(slot: &SlotState, purpose: &str) -> ManagedUsageRecord {
     ManagedUsageRecord {
         task_id: slot.task_id,
@@ -2718,6 +2730,79 @@ fn durable_token_usage(usage: runner::TokenUsage) -> quorum_core::token_usage::T
     }
 }
 
+fn write_usage_record(db_path: &Path, record: &UsageWriteRecord) -> Result<()> {
+    let mut conn = quorum_core::db::open(db_path)?;
+    let recorded_at = now_unix();
+    let result = quorum_core::token_usage::record(
+        &mut conn,
+        record.agent_run_id,
+        &record.purpose,
+        &record.task_ids,
+        record.pr_number,
+        &record.provider,
+        &record.model,
+        &record.effort,
+        record.usage,
+        recorded_at,
+    );
+    if let Err(error) = &result {
+        quorum_core::errlog::log_error(
+            &conn,
+            recorded_at,
+            "token_usage",
+            &format!(
+                "{} telemetry write failed for agent_run_id={:?}: {error}",
+                record.purpose, record.agent_run_id
+            ),
+        );
+    }
+    result.map(|_| ())
+}
+
+/// Telemetry is lifecycle-inert, but ignored abnormal failures remain loud.
+/// A usable connection records the failure in `errors`; open and join failures
+/// are still emitted to the daemon log when no DB write is possible.
+async fn record_usage_best_effort(db_path: &Path, record: UsageWriteRecord) {
+    let path = db_path.to_path_buf();
+    let context = format!(
+        "{} agent_run_id={:?} task_ids={:?}",
+        record.purpose, record.agent_run_id, record.task_ids
+    );
+    match tokio::task::spawn_blocking(move || write_usage_record(&path, &record)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!(
+            "token usage write failed (ignored) for {context}: {error}"
+        )),
+        Err(error) => log(&format!(
+            "token usage join failed (ignored) for {context}: {error}"
+        )),
+    }
+}
+
+async fn record_managed_usage_snapshot(
+    db_path: &Path,
+    agent_run_id: Option<i64>,
+    usage: ManagedUsageRecord,
+) {
+    let Some(agent_run_id) = agent_run_id else {
+        return;
+    };
+    record_usage_best_effort(
+        db_path,
+        UsageWriteRecord {
+            agent_run_id: Some(agent_run_id),
+            purpose: usage.purpose,
+            task_ids: vec![usage.task_id],
+            pr_number: usage.pr_number,
+            provider: usage.provider,
+            model: usage.model,
+            effort: usage.effort,
+            usage: usage.usage,
+        },
+    )
+    .await;
+}
+
 #[cfg(test)]
 async fn close_agent_run(db_path: &std::path::Path, run_id: Option<i64>, end_reason: &str) {
     close_agent_run_with_usage(db_path, run_id, end_reason, None).await;
@@ -2732,31 +2817,23 @@ async fn close_agent_run_with_usage(
     if let Some(rid) = run_id {
         let p = db_path.to_path_buf();
         let reason = end_reason.to_string();
-        tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = quorum_core::db::open(&p) {
-                let _ = quorum_core::agent_runs::close(&conn, rid, now_unix(), &reason);
-            }
-            // Telemetry is independent best-effort instrumentation; its
-            // failure must never undo lifecycle or run closure.
-            if let Some(usage) = usage {
-                if let Ok(mut conn) = quorum_core::db::open(&p) {
-                    let _ = quorum_core::token_usage::record(
-                        &mut conn,
-                        Some(rid),
-                        &usage.purpose,
-                        &[usage.task_id],
-                        usage.pr_number,
-                        &usage.provider,
-                        &usage.model,
-                        &usage.effort,
-                        usage.usage,
-                        now_unix(),
-                    );
-                }
-            }
+        match tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = quorum_core::db::open(&p)?;
+            quorum_core::agent_runs::close(&conn, rid, now_unix(), &reason)
         })
         .await
-        .ok();
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log(&format!("agent run close failed for run #{rid}: {error}")),
+            Err(error) => log(&format!(
+                "agent run close join failed for run #{rid}: {error}"
+            )),
+        }
+        // Telemetry runs only after the lifecycle/run-close write and cannot
+        // change its result.
+        if let Some(usage) = usage {
+            record_managed_usage_snapshot(db_path, Some(rid), usage).await;
+        }
     }
 }
 
@@ -2768,29 +2845,33 @@ async fn record_classifier_usage(
     effort: &str,
     usage: runner::TokenUsage,
 ) {
-    let path = db_path.to_path_buf();
-    let task_ids = task_ids.to_vec();
-    let provider = provider.to_string();
-    let model = model.to_string();
-    let effort = effort.to_string();
-    let usage = durable_token_usage(usage);
-    let _ = tokio::task::spawn_blocking(move || {
-        if let Ok(mut conn) = quorum_core::db::open(&path) {
-            let _ = quorum_core::token_usage::record(
-                &mut conn,
-                None,
-                "classifier",
-                &task_ids,
-                None,
-                &provider,
-                &model,
-                &effort,
-                usage,
-                now_unix(),
-            );
-        }
-    })
+    record_usage_best_effort(
+        db_path,
+        UsageWriteRecord {
+            agent_run_id: None,
+            purpose: "classifier".into(),
+            task_ids: task_ids.to_vec(),
+            pr_number: None,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            effort: effort.to_string(),
+            usage: durable_token_usage(usage),
+        },
+    )
     .await;
+}
+
+async fn reap_classifier_with_usage(
+    db_path: &Path,
+    slot: classifier::ClassifierSlot,
+    attribution_override: Option<Vec<i64>>,
+) {
+    let task_ids = attribution_override.unwrap_or_else(|| slot.pending_task_ids.clone());
+    let provider = slot.provider.clone();
+    let model = slot.model.clone();
+    let effort = slot.effort.clone();
+    let usage = slot.kill_and_reap().await;
+    record_classifier_usage(db_path, &task_ids, &provider, &model, &effort, usage).await;
 }
 
 fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry {
@@ -3999,11 +4080,25 @@ struct DrainState {
 #[derive(Default)]
 struct DecompositionCoordinator {
     graph_id: Option<i64>,
+    classifier_source_task_id: Option<i64>,
     proposal: Option<Vec<planner::ProposedTask>>,
     planner_slot: Option<planner::PlannerSlot>,
     classifier_slot: Option<classifier::ClassifierSlot>,
     planner_view: Option<tempfile::TempDir>,
     writable_path_resolver: planner::WritablePathResolver,
+}
+
+async fn reap_decomposition_classifier_with_usage(
+    db_path: &Path,
+    coordinator: &mut DecompositionCoordinator,
+) {
+    let source_task_id = coordinator.classifier_source_task_id.take();
+    if let Some(slot) = coordinator.classifier_slot.take() {
+        if source_task_id.is_none() {
+            log("decomposition classifier usage has no source-task attribution");
+        }
+        reap_classifier_with_usage(db_path, slot, Some(source_task_id.into_iter().collect())).await;
+    }
 }
 
 #[derive(Clone)]
@@ -4258,6 +4353,7 @@ async fn reconcile_decomposition_startup(
     .map_err(|error| QuorumError::Io(format!("decomposition startup join: {error}")))??;
     if let Some(snapshot) = snapshot {
         coordinator.graph_id = Some(snapshot.graph_id);
+        coordinator.classifier_source_task_id = Some(snapshot.source_task_id);
         coordinator.proposal = snapshot.accepted_proposal;
     }
     Ok(state)
@@ -4765,9 +4861,7 @@ async fn discard_removed_decomposition(
     if let Some(slot) = coordinator.planner_slot.take() {
         slot.kill_and_reap().await;
     }
-    if let Some(slot) = coordinator.classifier_slot.take() {
-        slot.kill_and_reap().await;
-    }
+    reap_decomposition_classifier_with_usage(db_path, coordinator).await;
     coordinator.planner_view = None;
     coordinator.proposal = None;
     if let Some(graph_id) = graph_id {
@@ -5188,7 +5282,12 @@ async fn tick_decomposition(
                 .take()
                 .expect("classifier slot exists");
             let expected = slot.pending_task_ids.clone();
-            slot.kill_and_reap().await;
+            let source_task_ids: Vec<i64> = coordinator
+                .classifier_source_task_id
+                .take()
+                .into_iter()
+                .collect();
+            reap_classifier_with_usage(&config.db_path, slot, Some(source_task_ids)).await;
             let graph_id = coordinator
                 .graph_id
                 .ok_or_else(|| QuorumError::Io("classifier lost graph identity".into()))?;
@@ -5322,6 +5421,7 @@ async fn tick_decomposition(
         return Ok(false);
     };
     coordinator.graph_id = Some(snapshot.graph_id);
+    coordinator.classifier_source_task_id = Some(snapshot.source_task_id);
     if coordinator.proposal.is_none() {
         coordinator.proposal = snapshot.accepted_proposal.clone();
     }
@@ -5617,7 +5717,12 @@ async fn tick_decomposition(
                 )
                 .await
                 {
-                    slot.kill_and_reap().await;
+                    reap_classifier_with_usage(
+                        &config.db_path,
+                        slot,
+                        Some(vec![snapshot.source_task_id]),
+                    )
+                    .await;
                     return Err(error);
                 }
                 coordinator.classifier_slot = Some(slot);
@@ -6853,14 +6958,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         if lock_stolen.load(std::sync::atomic::Ordering::SeqCst) {
             log("daemon lock stolen — tearing down and exiting");
             if let Some(slot) = classifier_slot.take() {
-                let _terminal_output = slot.proc.kill_and_reap().await;
+                reap_classifier_with_usage(&config.db_path, slot, None).await;
             }
             if let Some(slot) = decomposition_coordinator.planner_slot.take() {
                 slot.kill_and_reap().await;
             }
-            if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
-                slot.kill_and_reap().await;
-            }
+            reap_decomposition_classifier_with_usage(
+                &config.db_path,
+                &mut decomposition_coordinator,
+            )
+            .await;
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
@@ -6882,14 +6989,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log("shutting down (signal, no in-flight agents)");
             }
             if let Some(slot) = classifier_slot.take() {
-                let _terminal_output = slot.proc.kill_and_reap().await;
+                reap_classifier_with_usage(&config.db_path, slot, None).await;
             }
             if let Some(slot) = decomposition_coordinator.planner_slot.take() {
                 slot.kill_and_reap().await;
             }
-            if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
-                slot.kill_and_reap().await;
-            }
+            reap_decomposition_classifier_with_usage(
+                &config.db_path,
+                &mut decomposition_coordinator,
+            )
+            .await;
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
@@ -6913,14 +7022,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if !sentinel.exists() {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
                 if let Some(slot) = classifier_slot.take() {
-                    let _terminal_output = slot.proc.kill_and_reap().await;
+                    reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
                 if let Some(slot) = decomposition_coordinator.planner_slot.take() {
                     slot.kill_and_reap().await;
                 }
-                if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
-                    slot.kill_and_reap().await;
-                }
+                reap_decomposition_classifier_with_usage(
+                    &config.db_path,
+                    &mut decomposition_coordinator,
+                )
+                .await;
                 for r in reviewers.drain(..) {
                     let agent_name = r.agent_name.clone();
                     let _terminal_output = r.kill_and_reap().await;
@@ -6997,14 +7108,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                      exit_code={exit} supervisor={supervisor_action}"
                 ));
                 if let Some(slot) = classifier_slot.take() {
-                    let _terminal_output = slot.proc.kill_and_reap().await;
+                    reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
                 if let Some(slot) = decomposition_coordinator.planner_slot.take() {
                     slot.kill_and_reap().await;
                 }
-                if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
-                    slot.kill_and_reap().await;
-                }
+                reap_decomposition_classifier_with_usage(
+                    &config.db_path,
+                    &mut decomposition_coordinator,
+                )
+                .await;
                 return Ok(exit);
             }
 
@@ -7018,14 +7131,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     reviewers.len(),
                 ));
                 if let Some(slot) = classifier_slot.take() {
-                    let _terminal_output = slot.proc.kill_and_reap().await;
+                    reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
                 if let Some(slot) = decomposition_coordinator.planner_slot.take() {
                     slot.kill_and_reap().await;
                 }
-                if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
-                    slot.kill_and_reap().await;
-                }
+                reap_decomposition_classifier_with_usage(
+                    &config.db_path,
+                    &mut decomposition_coordinator,
+                )
+                .await;
                 for r in reviewers.drain(..) {
                     teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "drain").await;
                 }
@@ -7130,14 +7245,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     // against a too-new schema); just reap the processes and release their
                     // names. Journal recovery reclaims the tasks on restart.
                     if let Some(slot) = classifier_slot.take() {
-                        let _terminal_output = slot.proc.kill_and_reap().await;
+                        reap_classifier_with_usage(&config.db_path, slot, None).await;
                     }
                     if let Some(slot) = decomposition_coordinator.planner_slot.take() {
                         slot.kill_and_reap().await;
                     }
-                    if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
-                        slot.kill_and_reap().await;
-                    }
+                    reap_decomposition_classifier_with_usage(
+                        &config.db_path,
+                        &mut decomposition_coordinator,
+                    )
+                    .await;
                     for r in reviewers.drain(..) {
                         let agent_name = r.agent_name.clone();
                         let _terminal_output = r.kill_and_reap().await;
@@ -11519,19 +11636,8 @@ async fn tick(
             .expect("terminal classifier result requires an active slot");
         let pending_task_ids = slot.pending_task_ids.clone();
         let pending_inputs = slot.pending_inputs.clone();
-        let classifier_provider = slot.provider.clone();
         let classifier_model = slot.model.clone();
-        let classifier_effort = slot.effort.clone();
-        let usage = slot.kill_and_reap().await;
-        record_classifier_usage(
-            &db_path,
-            &pending_task_ids,
-            &classifier_provider,
-            &classifier_model,
-            &classifier_effort,
-            usage,
-        )
-        .await;
+        reap_classifier_with_usage(&db_path, slot, None).await;
 
         match result {
             classifier::ClassifierResult::Done(text) => {
@@ -13315,6 +13421,13 @@ async fn drain_events(
                         sl.set_phase(phase);
                     }
 
+                    record_managed_usage_snapshot(
+                        db_path,
+                        slot.agent_run_id,
+                        managed_usage_record(slot, role),
+                    )
+                    .await;
+
                     let p = db_path.to_path_buf();
                     let entry = slot_journal_entry(slot, role, phase);
                     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -13368,6 +13481,13 @@ async fn drain_events(
                         sl.update_cost(slot.cost_tokens, slot.cost_usd);
                         sl.set_phase("working");
                     }
+
+                    record_managed_usage_snapshot(
+                        db_path,
+                        slot.agent_run_id,
+                        managed_usage_record(slot, role),
+                    )
+                    .await;
 
                     let p = db_path.to_path_buf();
                     let entry = slot_journal_entry(slot, role, "working");
@@ -21183,6 +21303,86 @@ mod tests {
     }
 
     #[test]
+    fn codex_cached_input_fixture_preserves_live_turn_and_task_caps() {
+        let event = runner::normalize_codex_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":900,"cache_write_input_tokens":40,"output_tokens":25,"reasoning_output_tokens":10}}"#,
+        )
+        .into_iter()
+        .next()
+        .expect("Codex terminal fixture");
+        let runner::AgentEvent::TurnCompleted {
+            usage: Some(usage), ..
+        } = event
+        else {
+            panic!("fixture did not normalize to terminal usage");
+        };
+        assert_eq!(usage.uncached_input_tokens, 100);
+        assert_eq!(usage.cached_input_tokens, 900);
+        assert_eq!(usage.cache_write_input_tokens, 40);
+        assert_eq!(usage.live_total_tokens(), 1_025);
+
+        let slot = make_dummy_slot();
+        let turn_limits = CostLimits {
+            max_turn_tokens: Some(500),
+            ..Default::default()
+        };
+        assert!(matches!(
+            check_post_result_limits(
+                &turn_limits,
+                usage.live_total_tokens() as i64,
+                usage.live_total_tokens() as i64,
+                None,
+                0.0,
+                &slot,
+            ),
+            Some(LimitBreached::TurnTokens {
+                turn: 1_025,
+                max: 500
+            })
+        ));
+
+        let task_limits = CostLimits {
+            max_task_tokens: Some(1_500),
+            ..Default::default()
+        };
+        assert!(matches!(
+            check_post_result_limits(
+                &task_limits,
+                usage.live_total_tokens() as i64,
+                1_600,
+                None,
+                0.0,
+                &slot,
+            ),
+            Some(LimitBreached::TaskTokens {
+                total: 1_600,
+                max: 1_500
+            })
+        ));
+    }
+
+    #[test]
+    fn managed_teardown_captures_unread_failed_terminal_usage() {
+        let output = vec![runner::CapturedOutput::Stdout(
+            r#"{"type":"result","result":"provider failed","is_error":true,"usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":10,"output_tokens":5}}"#
+                .into(),
+        )];
+        let mut usage = runner::TokenUsage::default();
+        capture_terminal_usage(runner::AgentKind::Claude, &output, &mut usage);
+        assert_eq!(
+            usage,
+            runner::TokenUsage {
+                input_tokens: 100,
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 0,
+            }
+        );
+    }
+
+    #[test]
     fn check_limits_task_tokens_exceeded() {
         let limits = CostLimits {
             max_task_tokens: Some(400),
@@ -24932,6 +25132,100 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn telemetry_write_failures_are_logged_without_changing_lifecycle_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("usage-failure-isolation.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "telemetry isolation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let run_id = quorum_core::agent_runs::insert(
+            &conn, task_id, "Worker", "worker", "gpt", "high", "codex", 2,
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_usage_insert
+             BEFORE INSERT ON token_usage_runs
+             BEGIN SELECT RAISE(ABORT, 'injected usage failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        close_agent_run_with_usage(
+            &db_path,
+            Some(run_id),
+            "completed",
+            Some(ManagedUsageRecord {
+                task_id,
+                purpose: "worker".into(),
+                pr_number: Some(464),
+                provider: "codex".into(),
+                model: "gpt".into(),
+                effort: "high".into(),
+                usage: quorum_core::token_usage::TokenUsage {
+                    uncached_input_tokens: 10,
+                    output_tokens: 2,
+                    ..Default::default()
+                },
+            }),
+        )
+        .await;
+        record_classifier_usage(
+            &db_path,
+            &[task_id],
+            "codex",
+            "gpt",
+            "medium",
+            runner::TokenUsage {
+                input_tokens: 5,
+                uncached_input_tokens: 5,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let closed: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT ended_at,end_reason FROM agent_runs WHERE id=?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            closed.0.is_some(),
+            "run closure must survive telemetry failure"
+        );
+        assert_eq!(closed.1.as_deref(), Some("completed"));
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "open",
+            "classifier telemetry must not mutate task lifecycle"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='token_usage'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2,
+            "both ignored abnormal writes must remain observable"
+        );
+    }
+
     fn create_active_task(db_path: &Path, agent: &str, status: &str) {
         let mut conn = quorum_core::db::open(db_path).unwrap();
         let now = now_unix();
@@ -26947,6 +27241,7 @@ mod tests {
         }
         let mut coordinator = DecompositionCoordinator {
             graph_id: Some(graph_id),
+            classifier_source_task_id: Some(1),
             proposal: Some(vec![]),
             planner_slot: Some(planner_slot),
             classifier_slot: Some(classifier_slot),
@@ -26972,6 +27267,74 @@ mod tests {
         for pid in [planner_pid, classifier_pid] {
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "provider {pid} survived");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decomposition_shutdown_persists_buffered_classifier_terminal_usage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("decomposition-usage.db");
+        let emitted = dir.path().join("emitted");
+        let runner = dir.path().join("claude");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\n\
+                 IFS= read -r _turn\n\
+                 printf '%s\\n' '{{\"type\":\"result\",\"result\":\"done\",\"is_error\":false,\"usage\":{{\"input_tokens\":100,\"cache_read_input_tokens\":80,\"cache_creation_input_tokens\":10,\"output_tokens\":5}}}}'\n\
+                 touch '{}'\n\
+                 sleep 30\n",
+                emitted.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tasks = vec![quorum_core::classify::TaskForClassification {
+            id: -1,
+            revision: 1,
+            title: "planned child".into(),
+            body: None,
+            dependencies: vec![],
+            recovery_notes: vec![],
+        }];
+        let slot = classifier::spawn_classifier_configured(
+            &tasks,
+            &[],
+            runner.to_str(),
+            false,
+            classifier::CLASSIFIER_MODEL,
+            classifier::CLASSIFIER_EFFORT,
+            "read-only",
+            "",
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !emitted.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("classifier fixture did not emit terminal usage");
+
+        let mut coordinator = DecompositionCoordinator {
+            classifier_source_task_id: Some(42),
+            classifier_slot: Some(slot),
+            ..Default::default()
+        };
+        reap_decomposition_classifier_with_usage(&db_path, &mut coordinator).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let runs = quorum_core::token_usage::for_task(&conn, 42).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].purpose, "classifier");
+        assert_eq!(runs[0].task_ids, vec![42]);
+        assert_eq!(runs[0].usage.uncached_input_tokens, 20);
+        assert_eq!(runs[0].usage.cached_input_tokens, 80);
+        assert_eq!(runs[0].usage.cache_write_input_tokens, 10);
+        assert_eq!(runs[0].usage.output_tokens, 5);
     }
 
     #[tokio::test]

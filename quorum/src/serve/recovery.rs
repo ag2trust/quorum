@@ -34,6 +34,7 @@ struct DormantRecovery {
     model: String,
     effort: String,
     agent_run_id: i64,
+    token_usage: super::runner::TokenUsage,
     cap_run_id: String,
     rework_feedback: Option<String>,
     needs_rework_claim: bool,
@@ -41,9 +42,9 @@ struct DormantRecovery {
 
 #[derive(Debug, Clone)]
 enum DormantRecoveryDisposition {
-    Reconstruct(DormantRecovery),
+    Reconstruct(Box<DormantRecovery>),
     Retire {
-        entry: JournalEntry,
+        entry: Box<JournalEntry>,
         reason: &'static str,
     },
 }
@@ -254,6 +255,27 @@ fn validate_dormant_recovery(
     if model_provider != provider {
         return Err(invalid("worker run model/provider mismatch".into()));
     }
+    let token_usage = quorum_core::token_usage::usage_for_agent_run(conn, run.id)?
+        .map(|usage| -> Result<super::runner::TokenUsage> {
+            Ok(super::runner::TokenUsage {
+                // The legacy live total is recovered independently from the
+                // journal's scalar `cost_tokens`; only durable split buckets
+                // are restored here.
+                input_tokens: 0,
+                uncached_input_tokens: u64::try_from(usage.uncached_input_tokens)
+                    .map_err(|_| invalid("negative uncached token snapshot".into()))?,
+                cached_input_tokens: u64::try_from(usage.cached_input_tokens)
+                    .map_err(|_| invalid("negative cached token snapshot".into()))?,
+                cache_write_input_tokens: u64::try_from(usage.cache_write_input_tokens)
+                    .map_err(|_| invalid("negative cache-write token snapshot".into()))?,
+                output_tokens: u64::try_from(usage.output_tokens)
+                    .map_err(|_| invalid("negative output token snapshot".into()))?,
+                reasoning_tokens: u64::try_from(usage.reasoning_tokens)
+                    .map_err(|_| invalid("negative reasoning token snapshot".into()))?,
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
     let capability =
         quorum_core::capabilities::active_for_agent_task(conn, &entry.agent, task_id, "worker")?
             .ok_or_else(|| invalid("missing active run capability binding".into()))?;
@@ -321,6 +343,7 @@ fn validate_dormant_recovery(
         model: run.model.clone(),
         effort: run.effort.clone(),
         agent_run_id: run.id,
+        token_usage,
         cap_run_id: capability.run_id,
         rework_feedback,
         needs_rework_claim,
@@ -332,10 +355,10 @@ fn validate_dormant_recovery(
     }
     Ok(match task_disposition {
         Some(reason) => DormantRecoveryDisposition::Retire {
-            entry: entry.clone(),
+            entry: Box::new(entry.clone()),
             reason,
         },
-        None => DormantRecoveryDisposition::Reconstruct(recovery),
+        None => DormantRecoveryDisposition::Reconstruct(Box::new(recovery)),
     })
 }
 
@@ -484,7 +507,7 @@ fn reconstruct_dormant_slots(
             pr: Some(recovery.pr),
             rework_count: recovery.entry.rework_count.max(0) as u32,
             cost_tokens: recovery.entry.cost_tokens,
-            token_usage: super::runner::TokenUsage::default(),
+            token_usage: recovery.token_usage,
             cost_usd: recovery.entry.cost_usd,
             task_started_at: now,
             turn_started_at: now,
@@ -671,9 +694,9 @@ pub(crate) async fn recover(
     let mut retired = Vec::new();
     for disposition in dispositions {
         match disposition {
-            DormantRecoveryDisposition::Reconstruct(recovery) => recoveries.push(recovery),
+            DormantRecoveryDisposition::Reconstruct(recovery) => recoveries.push(*recovery),
             DormantRecoveryDisposition::Retire { entry, reason } => {
-                retired.push((entry, reason));
+                retired.push((*entry, reason));
             }
         }
     }
@@ -1139,6 +1162,25 @@ mod tests {
         )
         .unwrap();
         assert!(run_id > 0);
+        quorum_core::token_usage::record(
+            &mut conn,
+            Some(run_id),
+            "worker",
+            &[task_id],
+            Some(901),
+            "codex",
+            "gpt-5.6-terra",
+            "medium",
+            quorum_core::token_usage::TokenUsage {
+                uncached_input_tokens: 80,
+                cached_input_tokens: 900,
+                cache_write_input_tokens: 10,
+                output_tokens: 20,
+                reasoning_tokens: 5,
+            },
+            now + 2,
+        )
+        .unwrap();
         quorum_core::capabilities::issue(
             &mut conn,
             "cap-dormant",
@@ -1206,6 +1248,18 @@ mod tests {
         assert_eq!(worker.worktree_path, fixture.worktree);
         assert_eq!(worker.continuation_id_for_launch(), Some("thread-dormant"));
         assert!(matches!(worker.proc, SlotProcess::Dormant { .. }));
+        assert_eq!(
+            worker.token_usage,
+            super::super::runner::TokenUsage {
+                input_tokens: 0,
+                uncached_input_tokens: 80,
+                cached_input_tokens: 900,
+                cache_write_input_tokens: 10,
+                output_tokens: 20,
+                reasoning_tokens: 5,
+            },
+            "dormant recovery must restore the cumulative detailed snapshot"
+        );
         assert!(roster.owns("Dormant"));
         assert!(names.acquire_named("Dormant").is_none());
 

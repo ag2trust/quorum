@@ -929,6 +929,73 @@ mod tests {
     }
 
     #[test]
+    fn populated_v53_to_v54_preserves_history_and_adds_empty_usage_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("populated-v53.db");
+        {
+            let mut conn = open(&path).unwrap();
+            let task_id = crate::tasks::create(
+                &mut conn,
+                "owner",
+                "historic task",
+                Some("historic body"),
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            let run_id = crate::agent_runs::insert(
+                &conn, task_id, "Historic", "worker", "gpt", "high", "codex", 11,
+            )
+            .unwrap();
+            crate::agent_runs::close(&conn, run_id, 12, "done").unwrap();
+            conn.execute_batch(
+                "DROP TABLE token_usage_run_tasks;
+                 DROP TABLE token_usage_runs;
+                 PRAGMA user_version=53;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT title || ':' || body FROM tasks WHERE id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "historic task:historic body"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT end_reason FROM agent_runs WHERE task_id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "done"
+        );
+        for table in ["token_usage_runs", "token_usage_run_tasks"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0),)
+                    .unwrap(),
+                0,
+                "migration must not fabricate historical usage in {table}"
+            );
+        }
+    }
+
+    #[test]
     fn main_v49_migration_adds_dormant_journal_identity_without_backfill() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("main-v49-dormant-journal.db");

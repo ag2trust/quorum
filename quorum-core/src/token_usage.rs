@@ -1,7 +1,7 @@
 //! Durable token accounting for managed and daemon-internal model invocations.
 
 use crate::error::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 /// Attributions are inserted while holding SQLite's global writer lock.
@@ -149,6 +149,31 @@ pub fn for_task(conn: &Connection, task_id: i64) -> Result<Vec<UsageRun>> {
     Ok(result)
 }
 
+/// Load the last durable cumulative snapshot for a managed agent run.
+///
+/// Managed rows are upserted as turns finish, then overwritten once more at
+/// teardown. Dormant recovery uses this snapshot to retain the detailed token
+/// buckets while continuing the same `agent_run_id` after a daemon restart.
+pub fn usage_for_agent_run(conn: &Connection, agent_run_id: i64) -> Result<Option<TokenUsage>> {
+    Ok(conn
+        .query_row(
+            "SELECT uncached_input_tokens, cached_input_tokens,
+                    cache_write_input_tokens, output_tokens, reasoning_tokens
+             FROM token_usage_runs WHERE agent_run_id=?1",
+            [agent_run_id],
+            |row| {
+                Ok(TokenUsage {
+                    uncached_input_tokens: row.get(0)?,
+                    cached_input_tokens: row.get(1)?,
+                    cache_write_input_tokens: row.get(2)?,
+                    output_tokens: row.get(3)?,
+                    reasoning_tokens: row.get(4)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +219,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ended_at, 2);
+    }
+
+    #[test]
+    fn managed_usage_snapshot_is_reloadable_and_upserts_cumulatively() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("q.db")).unwrap();
+        let run_id =
+            crate::agent_runs::insert(&conn, 7, "A", "worker", "gpt", "high", "codex", 1).unwrap();
+        let before_restart = TokenUsage {
+            uncached_input_tokens: 80,
+            cached_input_tokens: 900,
+            cache_write_input_tokens: 10,
+            output_tokens: 20,
+            reasoning_tokens: 5,
+        };
+        record(
+            &mut conn,
+            Some(run_id),
+            "worker",
+            &[7],
+            Some(464),
+            "codex",
+            "gpt",
+            "high",
+            before_restart,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            usage_for_agent_run(&conn, run_id).unwrap(),
+            Some(before_restart)
+        );
+
+        let after_restart = TokenUsage {
+            uncached_input_tokens: 100,
+            cached_input_tokens: 1_000,
+            cache_write_input_tokens: 15,
+            output_tokens: 30,
+            reasoning_tokens: 8,
+        };
+        record(
+            &mut conn,
+            Some(run_id),
+            "worker",
+            &[7],
+            Some(464),
+            "codex",
+            "gpt",
+            "high",
+            after_restart,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            usage_for_agent_run(&conn, run_id).unwrap(),
+            Some(after_restart)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM token_usage_runs WHERE agent_run_id=?1",
+                [run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]

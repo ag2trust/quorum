@@ -235,13 +235,22 @@ There are no foreign keys; numeric identities are historical attribution, not
 delete authority. Usage history has a 30-day retention window, deliberately
 longer than the 7-day completed-task window: sweep-on-write deletes at most 100
 expired usage runs (and their task mappings) per mutation, while explicit sweep
-deletes all expired usage. Usage writes are instrumentation-only and best-effort.
+deletes all expired usage. Cumulative snapshots for still-active managed runs
+are retained until run closure so dormant recovery cannot lose required state.
+Usage writes are instrumentation-only and best-effort.
 A failed usage write is logged and ignored after the lifecycle/run-close write,
 so it cannot fail a verdict, merge, collection result, or teardown.
 Provider-error collector turns retain and record any usage reported by the
 terminal event before the collection failure is persisted and returned.
 Managed teardown likewise normalizes usage from unread terminal provider output
 before snapshotting the durable row; terminal output remains lifecycle-inert.
+Each managed terminal turn also upserts the cumulative split against its
+`agent_run_id`, and dormant Codex/Grok recovery reloads that snapshot before
+continuing the same run identity. Ordinary and decomposition classifiers reap
+and record bounded terminal usage on normal completion, removal, and every
+daemon shutdown path; decomposition classifier rows are attributed to their
+source task. Open, write, and join failures on these best-effort paths are
+logged without changing lifecycle outcomes.
 
 Provider normalization keeps the source semantics explicit. Claude
 `input_tokens`, `cache_read_input_tokens`, and
