@@ -24,12 +24,14 @@ Outputs (under ``target/preflight-timing/`` by default):
   rustc-invocations.jsonl      — per-rustc-invocation timing log
 
 Usage:
-    scripts/preflight/timing.sh [--top-n N] [--out DIR] [--test-threads N]
+    scripts/preflight/timing.sh [--top-n N] [--out DIR] [--test-jobs N]
+                                [--test-threads N]
                                 [--test-timeout-secs N]
                                 [--term-grace-secs N]
                                 [--skip-fmt] [--skip-clippy] [--self-test]
 
 Defaults: --top-n 10, --out target/preflight-timing,
+          --test-jobs $PREFLIGHT_TEST_JOBS or 2,
           --test-threads $RUST_TEST_THREADS or 4,
           --test-timeout-secs $PREFLIGHT_TEST_TIMEOUT_SECS or 120,
           --term-grace-secs $PREFLIGHT_TERM_GRACE_SECS or 2.
@@ -358,6 +360,34 @@ def _reap_children() -> None:
         except ChildProcessError:
             return
         if pid == 0:
+            return
+
+
+def _reap_adoptees(leader_pid: int) -> None:
+    """Reap exited subreaper adoptees while the test binary still runs.
+
+    A zombie remains a member of its process group, so an unreaped adoptee
+    keeps ``killpg(pgid, 0)`` succeeding and a test polling for its own
+    descendant group's disappearance never observes it. Peek with ``WNOWAIT``
+    and skip the group leader so its exit status is never stolen from
+    ``Popen``; ``poll()`` maps a stolen status to a fabricated success.
+    """
+    if not sys.platform.startswith("linux"):
+        # Adoptees exist only under the Linux subreaper; elsewhere the sole
+        # supervisor child is the leader, which Popen owns.
+        return
+    while True:
+        try:
+            info = os.waitid(
+                os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT
+            )
+        except (ChildProcessError, OSError):
+            return
+        if info is None or info.si_pid == leader_pid:
+            return
+        try:
+            os.waitpid(info.si_pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
             return
 
 
@@ -968,9 +998,12 @@ def _test_supervisor() -> int:
         old_mask = signal.pthread_sigmask(
             signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
         )
+        child_mask = set(old_mask) - {signal.SIGINT, signal.SIGTERM}
 
         def restore_child_signal_mask() -> None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+            # A supervisor can inherit the scheduler's temporary mask. Its
+            # test child should retain the ordinary unblocked signal state.
+            signal.pthread_sigmask(signal.SIG_SETMASK, child_mask)
 
         test_env = os.environ.copy()
         for key in (
@@ -1020,6 +1053,7 @@ def _test_supervisor() -> int:
                 rc = polled
                 outcome = "passed" if rc == 0 else "failed"
                 break
+            _reap_adoptees(proc.pid)
             remaining = deadline - now()
             if remaining <= 0:
                 rc = TIMEOUT_EXIT_CODE
@@ -1134,25 +1168,101 @@ def _read_supervisor_result(fd: int) -> dict:
     return json.loads(payload)
 
 
-def run_test_binary(
+class TestBinaryHandle:
+    """Collector-owned connection to one independently safe supervisor."""
+
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        owner_write: int,
+        result_read: int,
+        display_name: str,
+    ):
+        self.proc = proc
+        self.owner_write = owner_write
+        self.result_read = result_read
+        self.display_name = display_name
+        self._result: dict | None = None
+
+    def poll(self) -> int | None:
+        return self.proc.poll()
+
+    def cancel(self) -> None:
+        """Report owner loss so the supervisor cleans its whole test tree."""
+        self._close_descriptors(("owner_write",))
+
+    def interrupt(self, signum: int) -> None:
+        """Ask the supervisor to report interruption after bounded cleanup."""
+        if self.proc.poll() is None:
+            try:
+                os.kill(self.proc.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    def finish(self) -> dict:
+        if self._result is not None:
+            return self._result
+
+        # A terminal signal must not strand this handle between process reap
+        # and result decoding. Cache the complete result and close both pipes
+        # before restoring the collector's signal mask. If a pending signal
+        # then raises CollectorInterrupted, the scheduler still tracks this
+        # handle and a second finish() returns the cached result.
+        old_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+        try:
+            self.proc.wait()
+            self._result = _read_supervisor_result(self.result_read)
+            return self._result
+        finally:
+            try:
+                self.close()
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+    def close(self) -> None:
+        self._close_descriptors(("owner_write", "result_read"))
+
+    def _close_descriptors(self, attrs: tuple[str, ...]) -> None:
+        """Transfer descriptor ownership before an interruption can raise.
+
+        Blocking terminal signals across the field update and close syscall
+        prevents either unsafe half-state: an open descriptor marked closed,
+        or a closed descriptor still marked live and closed again on retry.
+        """
+        old_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+        close_error: OSError | None = None
+        try:
+            for attr in attrs:
+                fd = getattr(self, attr)
+                if fd < 0:
+                    continue
+                setattr(self, attr, -1)
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    if close_error is None:
+                        close_error = exc
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        if close_error is not None:
+            raise close_error
+
+
+def start_test_binary(
     exe: str,
     threads: int,
     timeout_secs: float,
     term_grace_secs: float,
     display_name: str,
-) -> dict:
+) -> TestBinaryHandle:
     argv = [exe, "--test-threads", str(threads)]
-    t0 = now()
     proc: subprocess.Popen | None = None
     owner_read, owner_write = os.pipe()
     result_read, result_write = os.pipe()
-    previous_handlers: dict[signal.Signals, object] = {}
-
-    def interrupted(signum: int, _frame: object) -> None:
-        raise CollectorInterrupted(signum)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        previous_handlers[sig] = signal.signal(sig, interrupted)
 
     try:
         env = os.environ.copy()
@@ -1172,9 +1282,12 @@ def run_test_binary(
         old_mask = signal.pthread_sigmask(
             signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
         )
+        supervisor_mask = set(old_mask) - {
+            signal.SIGINT, signal.SIGTERM
+        }
 
         def restore_child_signal_mask() -> None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+            signal.pthread_sigmask(signal.SIG_SETMASK, supervisor_mask)
 
         try:
             proc = subprocess.Popen(
@@ -1190,51 +1303,10 @@ def run_test_binary(
         owner_read = -1
         os.close(result_write)
         result_write = -1
-        proc.wait()
-        return _read_supervisor_result(result_read)
-    except CollectorInterrupted as exc:
-        for sig in previous_handlers:
-            signal.signal(sig, signal.SIG_IGN)
-        if owner_read >= 0:
-            os.close(owner_read)
-            owner_read = -1
-        if result_write >= 0:
-            os.close(result_write)
-            result_write = -1
-        os.close(owner_write)
-        owner_write = -1
-        if proc is not None:
-            proc.wait(timeout=(2 * term_grace_secs) + 2)
-            result = _read_supervisor_result(result_read)
-        else:
-            result = _run_result(
-                t0,
-                128 + exc.signum,
-                "interrupted",
-                timeout_secs,
-                {
-                    "attempted": False,
-                    "term_sent": False,
-                    "kill_sent": False,
-                    "complete": True,
-                    "error": None,
-                },
-            )
-        result["exit_code"] = 128 + exc.signum
-        result["outcome"] = "interrupted"
-        result["timed_out"] = False
-        exc.result = result
-        print(
-            f"preflight timing: interrupted while running test binary "
-            f"{display_name!r} after {exc.result['duration_secs']:.2f}s; "
-            f"{_cleanup_diagnostic(result['cleanup'])}",
-            file=sys.stderr,
-            flush=True,
+        return TestBinaryHandle(
+            proc, owner_write, result_read, display_name
         )
-        raise
     except BaseException:
-        for sig in previous_handlers:
-            signal.signal(sig, signal.SIG_IGN)
         if owner_write >= 0:
             os.close(owner_write)
             owner_write = -1
@@ -1243,13 +1315,14 @@ def run_test_binary(
                 proc.wait(timeout=(2 * term_grace_secs) + 2)
             except subprocess.TimeoutExpired:
                 pass
+        if result_read >= 0:
+            os.close(result_read)
+            result_read = -1
         raise
     finally:
-        for fd in (owner_read, owner_write, result_read, result_write):
+        for fd in (owner_read, result_write):
             if fd >= 0:
                 os.close(fd)
-        for sig, handler in previous_handlers.items():
-            signal.signal(sig, handler)
 
 
 # ---------------------------------------------------------------------------
@@ -1267,6 +1340,251 @@ def slowest(binaries: list[dict], top_n: int) -> list[dict]:
     return sorted(binaries, key=key, reverse=True)[:top_n]
 
 
+def cargo_rerun_command(binary: dict, test_threads: int) -> str | None:
+    """Return a copy/pasteable Cargo command for one discovered executable.
+
+    Cargo's compiler-artifact message gives us the package manifest and target
+    kind directly. Prefer those stable fields over parsing the opaque
+    ``package_id`` string.
+    """
+    manifest_path = binary.get("manifest_path")
+    target_name = binary.get("target_name")
+    target_kinds = binary.get("target_kinds") or []
+    if not manifest_path or not target_name:
+        return None
+
+    selector: list[str]
+    if "test" in target_kinds:
+        selector = ["--test", target_name]
+    elif "bin" in target_kinds:
+        selector = ["--bin", target_name]
+    elif "example" in target_kinds:
+        selector = ["--example", target_name]
+    elif "bench" in target_kinds:
+        selector = ["--bench", target_name]
+    elif "lib" in target_kinds or "proc-macro" in target_kinds:
+        selector = ["--lib"]
+    else:
+        return None
+
+    argv = [
+        "cargo", "test", "--manifest-path", manifest_path,
+        *CARGO_FEATURES, *selector,
+        "--", "--test-threads", str(test_threads), "--nocapture",
+    ]
+    return shlex.join(argv)
+
+
+def test_binary_failure(
+    binary: dict, result: dict, test_threads: int
+) -> dict:
+    return {
+        "phase": "test_execute",
+        "target_name": (
+            binary.get("target_name") or Path(binary["executable"]).name
+        ),
+        "package_id": binary.get("package_id"),
+        "manifest_path": binary.get("manifest_path"),
+        "executable": binary["executable"],
+        "exit_code": result["exit_code"] or 1,
+        "outcome": result["outcome"],
+        "cleanup_complete": result["cleanup"]["complete"],
+        "rerun_command": cargo_rerun_command(binary, test_threads),
+    }
+
+
+def record_test_result(
+    binary: dict, result: dict, *, cancelled_by_fail_fast: bool = False
+) -> None:
+    binary["execute_secs"] = round(result["duration_secs"], 3)
+    binary["execute_exit_code"] = result["exit_code"]
+    binary["execute_outcome"] = result["outcome"]
+    binary["execute_timed_out"] = result["timed_out"]
+    binary["execute_timeout_secs"] = result["timeout_secs"]
+    binary["cleanup"] = result["cleanup"]
+    if cancelled_by_fail_fast:
+        binary["execute_cancelled_by_fail_fast"] = True
+
+
+def execute_test_binaries(
+    binaries: list[dict],
+    jobs: int,
+    threads: int,
+    timeout_secs: float,
+    term_grace_secs: float,
+) -> tuple[int, int | None, dict | None]:
+    """Run compiled executables with bounded concurrency and safe fail-fast.
+
+    The collector only schedules supervisors. Each supervisor remains the
+    exclusive owner of its test process tree and its timeout/cleanup policy.
+    """
+    active: list[tuple[dict, TestBinaryHandle]] = []
+    next_index = 0
+    exec_rc = 0
+    interrupted_signal: int | None = None
+    first_failure: dict | None = None
+    previous_handlers: dict[signal.Signals, object] = {}
+
+    def interrupted(signum: int, _frame: object) -> None:
+        raise CollectorInterrupted(signum)
+
+    def start(binary: dict) -> None:
+        # Do not let a pending signal land between Popen returning and the
+        # handle becoming visible to the cleanup path.
+        old_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+        try:
+            name = binary.get("target_name") or Path(
+                binary["executable"]
+            ).name
+            handle = start_test_binary(
+                binary["executable"], threads, timeout_secs,
+                term_grace_secs, name,
+            )
+            active.append((binary, handle))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sig] = signal.signal(sig, interrupted)
+
+    try:
+        while next_index < len(binaries) or active:
+            while next_index < len(binaries) and len(active) < jobs:
+                start(binaries[next_index])
+                next_index += 1
+
+            completed = [
+                entry for entry in active if entry[1].poll() is not None
+            ]
+            if not completed:
+                time.sleep(0.02)
+                continue
+
+            for binary, handle in completed:
+                result = handle.finish()
+                record_test_result(binary, result)
+                failed = (
+                    result["exit_code"] != 0
+                    or not result["cleanup"]["complete"]
+                )
+                if not failed or first_failure is not None:
+                    active.remove((binary, handle))
+                    continue
+
+                exec_rc = result["exit_code"] or 1
+                first_failure = test_binary_failure(
+                    binary, result, threads
+                )
+                name = first_failure["target_name"]
+                print(
+                    "preflight timing: FIRST FAILURE: test binary "
+                    f"{name!r} ({result['outcome']}, exit {exec_rc})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                rerun = first_failure.get("rerun_command")
+                if rerun:
+                    print(
+                        f"preflight timing: rerun: {rerun}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+                # The causal result is now recorded. Remove only this settled
+                # handle; every peer remains tracked until its cancellation
+                # result has been collected below.
+                active.remove((binary, handle))
+
+                # Stop scheduling at the first observed failure. Closing the
+                # owner pipe makes each still-running supervisor perform the
+                # same bounded descendant cleanup as abrupt owner loss.
+                cancellation: list[
+                    tuple[dict, TestBinaryHandle, bool]
+                ] = []
+                for other_binary, other_handle in active:
+                    was_running = other_handle.poll() is None
+                    if was_running:
+                        # Treat the artifact marker and owner-pipe close as one
+                        # signal-safe state transition. A pending terminal
+                        # signal may raise as soon as the mask is restored,
+                        # but the interruption path will then see both facts.
+                        old_mask = signal.pthread_sigmask(
+                            signal.SIG_BLOCK,
+                            {signal.SIGINT, signal.SIGTERM},
+                        )
+                        try:
+                            other_binary[
+                                "execute_cancelled_by_fail_fast"
+                            ] = True
+                            other_handle.cancel()
+                        finally:
+                            signal.pthread_sigmask(
+                                signal.SIG_SETMASK, old_mask
+                            )
+                    cancellation.append(
+                        (other_binary, other_handle, was_running)
+                    )
+                for other_binary, other_handle, was_running in cancellation:
+                    other_result = other_handle.finish()
+                    record_test_result(
+                        other_binary,
+                        other_result,
+                        cancelled_by_fail_fast=was_running,
+                    )
+                    active.remove((other_binary, other_handle))
+                return exec_rc, None, first_failure
+    except CollectorInterrupted as exc:
+        interrupted_signal = exc.signum
+        # Ignore a repeated terminal signal while every active supervisor
+        # performs its own bounded cleanup and reports a final result.
+        for sig in previous_handlers:
+            signal.signal(sig, signal.SIG_IGN)
+        for _binary, handle in active:
+            handle.interrupt(exc.signum)
+        for binary, handle in active:
+            result = handle.finish()
+            record_test_result(binary, result)
+            failed = (
+                result["exit_code"] != 0
+                or not result["cleanup"]["complete"]
+            )
+            if first_failure is None and failed:
+                first_failure = test_binary_failure(binary, result, threads)
+            print(
+                "preflight timing: interrupted while running test binary "
+                f"{handle.display_name!r} after "
+                f"{result['duration_secs']:.2f}s; "
+                f"{_cleanup_diagnostic(result['cleanup'])}",
+                file=sys.stderr,
+                flush=True,
+            )
+        active.clear()
+        exec_rc = 128 + exc.signum
+        if first_failure is None:
+            first_failure = {
+                "phase": "test_execute",
+                "exit_code": exec_rc,
+                "outcome": "interrupted",
+                "rerun_command": None,
+            }
+    finally:
+        # This also closes owner pipes if an unexpected collector exception
+        # escapes, retaining owner-loss cleanup rather than orphaning tests.
+        for _binary, handle in active:
+            handle.cancel()
+        for _binary, handle in active:
+            try:
+                handle.finish()
+            except BaseException:
+                handle.close()
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+
+    return exec_rc, interrupted_signal, first_failure
+
+
 def emit_artifact(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     json.loads(path.read_text())
@@ -1276,6 +1594,8 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
     lines: list[str] = []
     lines.append("=== preflight timing summary ===")
     lines.append(f"timestamp_utc: {data['timestamp_utc']}")
+    lines.append(f"test_jobs: {data.get('test_jobs', 2)}")
+    lines.append(f"test_threads: {data.get('test_threads', 'n/a')}")
     lines.append(
         f"test_timeout_secs: {data.get('test_timeout_secs', 'n/a')}"
     )
@@ -1287,6 +1607,18 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
             f"{len(data.get('test_binaries') or [])} binaries "
             f"from {wrapper.get('log_entries', 0)} rustc invocations"
         )
+    first_failure = data.get("first_failure")
+    if first_failure:
+        lines.append("")
+        lines.append("FIRST FAILURE:")
+        lines.append(f"  phase: {first_failure['phase']}")
+        if first_failure.get("target_name"):
+            lines.append(f"  test_binary: {first_failure['target_name']}")
+        lines.append(f"  exit_code: {first_failure['exit_code']}")
+        if first_failure.get("outcome"):
+            lines.append(f"  outcome: {first_failure['outcome']}")
+        if first_failure.get("rerun_command"):
+            lines.append(f"  rerun: {first_failure['rerun_command']}")
     lines.append("")
     lines.append("gates:")
     for g in data["gates"]:
@@ -1334,9 +1666,10 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
     wrapper_stats: dict = {}
     status = 0
     interrupted_signal: int | None = None
+    first_failure: dict | None = None
 
     def add_gate(name: str, duration: float, rc: int) -> None:
-        nonlocal status
+        nonlocal first_failure, status
         gates.append({
             "name": name,
             "duration_secs": round(duration, 3),
@@ -1344,6 +1677,13 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
         })
         if rc != 0 and status == 0:
             status = 1
+            if first_failure is None:
+                first_failure = {
+                    "phase": name,
+                    "exit_code": rc,
+                    "outcome": "failed",
+                    "rerun_command": None,
+                }
 
     if not args.skip_fmt:
         print("=== timing 1/4: cargo fmt --all -- --check ===", flush=True)
@@ -1381,39 +1721,21 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
     if status == 0:
         print(
             f"=== timing 4/4: run {len(binaries)} test binaries "
-            f"(--test-threads {args.test_threads}, "
+            f"(--test-jobs {args.test_jobs}, "
+            f"--test-threads {args.test_threads}, "
             f"{args.test_timeout_secs:g}s deadline each) ===",
             flush=True,
         )
         t0 = now()
-        exec_rc = 0
-        for b in binaries:
-            name = b.get("target_name") or Path(b["executable"]).name
-            try:
-                result = run_test_binary(
-                    b["executable"],
-                    args.test_threads,
-                    args.test_timeout_secs,
-                    args.term_grace_secs,
-                    name,
-                )
-            except CollectorInterrupted as exc:
-                assert exc.result is not None
-                result = exc.result
-                interrupted_signal = exc.signum
-            b["execute_secs"] = round(result["duration_secs"], 3)
-            b["execute_exit_code"] = result["exit_code"]
-            b["execute_outcome"] = result["outcome"]
-            b["execute_timed_out"] = result["timed_out"]
-            b["execute_timeout_secs"] = result["timeout_secs"]
-            b["cleanup"] = result["cleanup"]
-            if (
-                result["exit_code"] != 0
-                or not result["cleanup"]["complete"]
-            ) and exec_rc == 0:
-                exec_rc = result["exit_code"] or 1
-            if interrupted_signal is not None:
-                break
+        exec_rc, interrupted_signal, test_failure = execute_test_binaries(
+            binaries,
+            args.test_jobs,
+            args.test_threads,
+            args.test_timeout_secs,
+            args.term_grace_secs,
+        )
+        if test_failure is not None:
+            first_failure = test_failure
         add_gate("test_execute", now() - t0, exec_rc)
         if interrupted_signal is not None:
             status = 128 + interrupted_signal
@@ -1422,10 +1744,12 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
         "version": 3,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "top_n": args.top_n,
+        "test_jobs": args.test_jobs,
         "test_threads": args.test_threads,
         "test_timeout_secs": args.test_timeout_secs,
         "term_grace_secs": args.term_grace_secs,
         "interrupted_signal": interrupted_signal,
+        "first_failure": first_failure,
         "gates": gates,
         "test_binaries": binaries,
         "top_n_slowest": slowest(binaries, args.top_n),
@@ -1620,6 +1944,7 @@ def self_test() -> int:
             "version": 3,
             "timestamp_utc": "2026-08-14T00:00:00Z",
             "top_n": 5,
+            "test_jobs": 1,
             "test_threads": 4,
             "test_timeout_secs": 120.0,
             "term_grace_secs": 2.0,
@@ -1687,6 +2012,12 @@ def main() -> int:
     p.add_argument("--top-n", type=int, default=10)
     p.add_argument("--out", default="target/preflight-timing")
     p.add_argument(
+        "--test-jobs",
+        type=int,
+        default=os.environ.get("PREFLIGHT_TEST_JOBS", "2"),
+        help="maximum test executables run concurrently (default: 2)",
+    )
+    p.add_argument(
         "--test-threads",
         type=int,
         default=int(os.environ.get("RUST_TEST_THREADS", "4")),
@@ -1716,6 +2047,8 @@ def main() -> int:
 
     if args.top_n <= 0:
         p.error("--top-n must be positive")
+    if args.test_jobs <= 0:
+        p.error("--test-jobs must be positive")
     if args.test_threads <= 0:
         p.error("--test-threads must be positive")
     if args.test_timeout_secs <= 0:

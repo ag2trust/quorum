@@ -300,6 +300,7 @@ fi
 
 # --- Gates 2-4: timing collector ---------------------------------------------
 TEST_THREADS="${RUST_TEST_THREADS:-4}"
+TEST_JOBS="${PREFLIGHT_TEST_JOBS:-2}"
 BRANCH_BASE_DURATION=$(python3 - "$BRANCH_BASE_STARTED" <<'PY'
 import sys
 import time
@@ -308,7 +309,8 @@ PY
 ) || fail "finish branch-base timer"
 
 printf '=== preflight 2-4: timing collector (fmt, clippy, compile/no-run, test execution) ===\n'
-if scripts/preflight/timing.sh --test-threads "$TEST_THREADS"; then
+if scripts/preflight/timing.sh \
+  --test-jobs "$TEST_JOBS" --test-threads "$TEST_THREADS"; then
   record_branch_base_timing "$BRANCH_BASE_DURATION" \
     || fail "publish branch-base timing"
 else

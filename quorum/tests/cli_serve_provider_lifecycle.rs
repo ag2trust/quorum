@@ -179,6 +179,37 @@ fn runner_hold_pipe() -> (File, File) {
     unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
 }
 
+fn linux_proc_stat_state(stat: &str) -> Option<u8> {
+    // The command name is parenthesized and may itself contain `)`, so parse
+    // from the final delimiter before the one-byte process state.
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.as_bytes().first().copied())
+}
+
+fn process_has_finished_execution(pid: libc::pid_t) -> bool {
+    if unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                // The preflight test supervisor is a child subreaper. An
+                // exited provider can therefore remain here as its zombie
+                // until the test binary exits and the supervisor reaps it.
+                return matches!(linux_proc_stat_state(&stat), Some(b'Z' | b'X'));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => {}
+        }
+    }
+
+    false
+}
+
 struct ServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
@@ -1445,14 +1476,20 @@ fn dropping_serve_handle_releases_sticky_codex_runner() {
         "sticky Codex runner cleanup after ServeHandle drop",
         Duration::from_secs(5),
         || {
-            if unsafe { libc::kill(runner_pid, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
+            if process_has_finished_execution(runner_pid) {
                 WaitState::Ready(())
             } else {
-                WaitState::Pending(format!("runner PID {runner_pid} is still alive"))
+                WaitState::Pending(format!("runner PID {runner_pid} is still executing"))
             }
         },
+    );
+}
+
+#[test]
+fn linux_proc_stat_state_uses_the_final_command_delimiter() {
+    assert_eq!(
+        linux_proc_stat_state("12477 (fake) runner) Z 1 2 3"),
+        Some(b'Z')
     );
 }
 

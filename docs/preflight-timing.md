@@ -30,10 +30,12 @@ the complete author-gate artifact is required.
 | --- | --- |
 | `timestamp_utc` | UTC completion timestamp in RFC 3339 form. |
 | `top_n` | Requested list length (default `10`). |
+| `test_jobs` | Maximum test executables scheduled concurrently (`--test-jobs`; default `2`, or `PREFLIGHT_TEST_JOBS`). |
 | `test_threads` | `--test-threads` value used when executing each test binary. |
 | `test_timeout_secs` | Per-test-executable deadline (default `120`). |
 | `term_grace_secs` | Bounded wait after TERM and again after KILL while cleaning a test process group (default `2`). |
 | `interrupted_signal` | Signal number that interrupted test execution, or JSON `null` when uninterrupted. |
+| `first_failure` | The first failed gate or test binary, including its exit/outcome details and a target-specific Cargo `rerun_command` when compiler-artifact identity is sufficient. JSON `null` on success. |
 | `gates` | Ordered objects with `name`, `duration_secs`, and `exit_code`. Full preflight prepends `branch_base`; the collector records `cargo_fmt`, `cargo_clippy`, `cargo_test_no_run`, and `test_execute` until a failure stops later gates. |
 | `test_binaries` | One object per Cargo test executable discovered during the compile/no-run gate. Its identity fields are `package_id`, `manifest_path`, `target_name`, `target_kinds`, `executable`, and `fresh`; execution fields are described below. It is empty when compilation was never reached. |
 | `top_n_slowest` | A bounded, descending copy of the slowest entries in `test_binaries`. |
@@ -47,18 +49,80 @@ conditional, not an artifact validity check.
 
 After a binary is executed, its entry has `execute_secs`,
 `execute_exit_code`, `execute_outcome` (`passed`, `failed`, `timed_out`, or
-`interrupted`), `execute_timed_out`, and `execute_timeout_secs`. Its `cleanup`
+`interrupted`; fail-fast cancellation uses `owner_lost`),
+`execute_timed_out`, and `execute_timeout_secs`. An in-flight binary cancelled
+because another binary failed also has `execute_cancelled_by_fail_fast: true`.
+Its `cleanup`
 object records `attempted`, `term_sent`, `kill_sent`, `complete`, and `error`.
 `complete: true` means the isolated test and its tracked descendant tree,
 including descendants that created separate process groups, no longer exist
 and the supervisor reaped the children it owns. `error` also retains a
 transient process-discovery diagnostic when fallback or a later snapshot still
 allowed cleanup to complete. A timeout uses exit code `124`.
+The collector compiles once and then runs at most `test_jobs` discovered
+executables concurrently. After the first observed nonzero exit or incomplete
+cleanup, it schedules no more binaries and closes every other active
+supervisor's owner pipe. Those supervisors perform bounded descendant cleanup
+and are reaped before the collector publishes its partial artifact. The
+completed result that caused cancellation remains the exact `first_failure`;
+cancelled peers cannot replace it. Later discovered entries remain in
+`test_binaries` without execution fields.
 Each test is owned by a supervisor outside the collector's process group; if
 the collector is abruptly killed, that supervisor observes owner loss and
 performs the same bounded TERM/KILL cleanup before exiting. Because an
 abruptly killed collector cannot finish writing JSON, that owner-loss cleanup
 does not itself promise a new timing artifact.
+On Linux the supervisor is a child subreaper and reaps adopted orphans while
+the test binary is still running, never only at cleanup. A test may kill a
+descendant process group of its own and poll for the group's disappearance; an
+unreaped zombie adoptee would keep that group visible and time the test out.
+
+### Signal-safe supervisor handle lifecycle
+
+The collector's Python signal handlers raise immediately, so supervisor-handle
+bookkeeping must remain correct at every bytecode boundary, not only around
+blocking syscalls. Keep these rules together when changing scheduling or
+cleanup:
+
+- A handle remains in the collector's tracked active set until its supervisor
+  result is decoded and the corresponding binary fields, including
+  `first_failure`, are recorded.
+- `finish()` blocks terminal signals while it reaps the supervisor, decodes and
+  caches the result, and closes descriptors. It restores the prior mask only
+  after the cached result is retryable and both descriptor fields are retired.
+- Descriptor closure transfers ownership first: while terminal signals are
+  blocked, set the field to `-1` before calling `close(2)`. This prevents both
+  a leaked open descriptor marked closed and a closed descriptor retried as
+  live after an interrupt.
+- Fail-fast cancellation records `execute_cancelled_by_fail_fast` and closes
+  the peer's owner pipe under one signal mask. An interrupt may be delivered
+  afterward, but the interruption path must observe both facts and finish
+  reaping the peer before artifact publication.
+
+The shell regressions inject SIGTERM at completed-result collection,
+fail-fast peer settlement, and immediately after the real owner-pipe close.
+Retain those deterministic seams; ordinary process timing is too imprecise to
+reliably exercise these boundaries.
+
+### Nested collector fixture launch
+
+The Rust supervisor fixtures copy `timing.sh` into a fresh temporary repository
+and invoke it through `python3`, rather than asking the kernel to execute that
+newly materialized script directly. Linux CI has returned `ETXTBSY` from the
+direct spawn even after the fixture copy call completed. Explicit interpreter
+launch still leaves the Python child as the signal target and process-group owner,
+while avoiding an executable-inode race that is unrelated to the supervisor
+behavior under test. Keep copied fixture paths per-instance and use this launch
+pattern for new nested collector fixtures.
+
+The default of two jobs and four threads per binary is based on one warm
+full-suite comparison on the 10-core development host. Test-execution wall
+time was 336.572 seconds at `1 x 4`, 241.591 seconds at `2 x 2`, and 174.005
+seconds at `2 x 4`. The `4 x 1` profile was rejected: `cli_serve_merge_checks`
+exceeded the existing 120-second binary deadline and made the run fail. These
+measurements justify the conservative two-job default; they are not a portable
+performance guarantee. Override either dimension when diagnosing machine- or
+test-specific behavior.
 
 For a binary, `compile_no_run_secs` is the sum of wall-clock intervals for the
 matching test `rustc` invocations, and `compile_no_run_source` identifies the
