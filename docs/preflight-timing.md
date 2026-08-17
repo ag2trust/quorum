@@ -100,6 +100,17 @@ fail-fast peer settlement, and immediately after the real owner-pipe close.
 Retain those deterministic seams; ordinary process timing is too imprecise to
 reliably exercise these boundaries.
 
+### Nested collector fixture launch
+
+The Rust supervisor fixtures copy `timing.sh` into a fresh temporary repository
+and invoke it through `python3`, rather than asking the kernel to execute that
+newly materialized script directly. Linux CI has returned `ETXTBSY` from the
+direct spawn even after the fixture copy call completed. Explicit interpreter
+launch still leaves the Python child as the signal target and process-group owner,
+while avoiding an executable-inode race that is unrelated to the supervisor
+behavior under test. Keep copied fixture paths per-instance and use this launch
+pattern for new nested collector fixtures.
+
 The default of two jobs and four threads per binary is based on one warm
 full-suite comparison on the 10-core development host. Test-execution wall
 time was 336.572 seconds at `1 x 4`, 241.591 seconds at `2 x 2`, and 174.005

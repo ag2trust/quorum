@@ -167,8 +167,14 @@ impl Fixture {
             env::var("PATH").expect("PATH is set")
         );
         let timeout_secs = timeout_secs.to_string();
-        let mut command = Command::new("scripts/preflight/timing.sh");
+        // These fixtures copy the collector immediately before launching it.
+        // Invoke Python explicitly so Linux does not need to exec the
+        // freshly materialized script inode, which can transiently fail with
+        // ETXTBSY on CI filesystems. The child remains the signal target and
+        // process-group owner exercised by the interruption fixtures.
+        let mut command = Command::new("python3");
         command
+            .arg("scripts/preflight/timing.sh")
             .current_dir(&self.repo)
             .args([
                 "--skip-fmt",
