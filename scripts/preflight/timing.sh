@@ -11,10 +11,12 @@ Cargo's stable ``compiler-artifact`` JSON message identifies a test binary and
 its executable path but carries neither a start time nor a duration; naive
 inter-artifact-arrival gaps misattribute concurrent and shared work. This
 script therefore points ``RUSTC_WRAPPER`` at itself (dispatching via the
-``TIMING_RUSTC_WRAPPER_ACTIVE`` env var) so it fork/execs rustc while wall-
-clocking each invocation, then correlates each entry to a compiler-artifact
-message by ``(--crate-name, --test)``. Execution time is measured by invoking
-each test executable directly and wall-clocking its run.
+``TIMING_RUSTC_WRAPPER_ACTIVE`` env var) so it wall-clocks each invocation.
+When Cargo already has a wrapper such as ``sccache``, the timing wrapper chains
+it as the inner command instead of replacing it. The collector then correlates
+each entry to a compiler-artifact message by ``(--crate-name, --test)``.
+Execution time is measured by invoking each test executable directly and
+wall-clocking its run.
 
 Outputs (under ``target/preflight-timing/`` by default):
   timing.json                  — machine-readable artifact
@@ -47,6 +49,7 @@ import json
 import os
 import select
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -58,6 +61,7 @@ CARGO_FEATURES = ["--all-features", "--features", "quorum-core/test-support"]
 
 WRAPPER_ACTIVE_ENV = "TIMING_RUSTC_WRAPPER_ACTIVE"
 WRAPPER_LOG_ENV = "TIMING_RUSTC_LOG"
+WRAPPER_CHAIN_ENV = "TIMING_RUSTC_INNER_WRAPPER"
 SUPERVISOR_ACTIVE_ENV = "TIMING_TEST_SUPERVISOR_ACTIVE"
 SUPERVISOR_OWNER_FD_ENV = "TIMING_TEST_SUPERVISOR_OWNER_FD"
 SUPERVISOR_RESULT_FD_ENV = "TIMING_TEST_SUPERVISOR_RESULT_FD"
@@ -115,15 +119,47 @@ def _parse_rustc_argv(argv: list[str]) -> tuple[str | None, bool, list[str]]:
     return crate_name, is_test, crate_types
 
 
+def _same_executable(left: str, right: str) -> bool:
+    """Best-effort recursion guard for two executable path spellings."""
+    left_path = shutil.which(left) or left
+    right_path = shutil.which(right) or right
+    return os.path.realpath(left_path) == os.path.realpath(right_path)
+
+
+def _install_timing_wrapper(env: dict[str, str], wrapper_path: str) -> str | None:
+    """Install the timing wrapper without discarding Cargo's cache wrapper.
+
+    ``RUSTC_WRAPPER`` takes precedence over ``CARGO_BUILD_RUSTC_WRAPPER``.
+    Preserve that ordering, including the documented empty-string reset, and
+    pass the inherited wrapper to timing-wrapper mode as its inner command.
+    """
+    if "RUSTC_WRAPPER" in env:
+        inherited = env["RUSTC_WRAPPER"]
+    else:
+        inherited = env.get("CARGO_BUILD_RUSTC_WRAPPER", "")
+
+    env.pop(WRAPPER_CHAIN_ENV, None)
+    chained = inherited or None
+    if chained and not _same_executable(chained, wrapper_path):
+        env[WRAPPER_CHAIN_ENV] = chained
+    else:
+        chained = None
+    env["RUSTC_WRAPPER"] = wrapper_path
+    return chained
+
+
 def _rustc_wrapper() -> int:
-    """Fork/exec rustc, wall-clock the invocation, append a JSON line to the
-    log named by ``TIMING_RUSTC_LOG``. Single ``f.write()`` on an <PIPE_BUF
-    payload is atomic on POSIX, so concurrent wrappers may safely share the
-    log file."""
-    argv = sys.argv[1:]
-    if not argv:
+    """Fork/exec the inherited wrapper (or rustc), and time the invocation.
+
+    Single ``f.write()`` on an <PIPE_BUF payload is atomic on POSIX, so
+    concurrent wrappers may safely share the log file.
+    """
+    rustc_argv = sys.argv[1:]
+    if not rustc_argv:
         return 2
-    crate_name, is_test, crate_types = _parse_rustc_argv(argv)
+    crate_name, is_test, crate_types = _parse_rustc_argv(rustc_argv)
+    inherited = os.environ.get(WRAPPER_CHAIN_ENV)
+    argv = [inherited, *rustc_argv] if inherited else rustc_argv
 
     start = time.monotonic()
     try:
@@ -280,14 +316,14 @@ def compile_tests(
     stderr_log: Path,
     rustc_log: Path,
     wrapper_path: str,
-) -> tuple[float, int, list[dict], int, int]:
+) -> tuple[float, int, list[dict], int, int, str | None]:
     """Run ``cargo test --no-run --message-format=json`` with the RUSTC_WRAPPER
     active. Enumerate test binaries from ``compiler-artifact`` messages, then
     correlate exact compile intervals from the wrapper log.
     """
     rustc_log.write_text("")
     env = os.environ.copy()
-    env["RUSTC_WRAPPER"] = wrapper_path
+    chained_wrapper = _install_timing_wrapper(env, wrapper_path)
     env[WRAPPER_ACTIVE_ENV] = "1"
     env[WRAPPER_LOG_ENV] = str(rustc_log)
 
@@ -332,7 +368,14 @@ def compile_tests(
             })
         proc.wait()
     matched, log_entries = correlate_compile_times(rustc_log, binaries)
-    return now() - t0, proc.returncode, binaries, matched, log_entries
+    return (
+        now() - t0,
+        proc.returncode,
+        binaries,
+        matched,
+        log_entries,
+        chained_wrapper,
+    )
 
 
 class CollectorInterrupted(BaseException):
@@ -1607,6 +1650,11 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
             f"{len(data.get('test_binaries') or [])} binaries "
             f"from {wrapper.get('log_entries', 0)} rustc invocations"
         )
+        if wrapper.get("chained_wrapper"):
+            lines.append(
+                "rustc_wrapper_chain: timing -> "
+                f"{wrapper['chained_wrapper']} -> rustc"
+            )
     first_failure = data.get("first_failure")
     if first_failure:
         lines.append("")
@@ -1708,7 +1756,14 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
             "--workspace (RUSTC_WRAPPER active) ===",
             flush=True,
         )
-        dur, rc, binaries, matched, log_entries = compile_tests(
+        (
+            dur,
+            rc,
+            binaries,
+            matched,
+            log_entries,
+            chained_wrapper,
+        ) = compile_tests(
             compile_log, stderr_log, rustc_log, wrapper_path
         )
         add_gate("cargo_test_no_run", dur, rc)
@@ -1716,6 +1771,7 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
             "matched": matched,
             "log_entries": log_entries,
             "log_path": str(rustc_log),
+            "chained_wrapper": chained_wrapper,
         }
 
     if status == 0:
@@ -1774,6 +1830,7 @@ def self_test() -> int:
       2. Rustc-argv parser extracts crate_name/--test/--crate-type correctly.
       3. Correlation attaches exact per-binary durations from a synthetic
          wrapper log and leaves unmatched binaries as null.
+      4. The timing wrapper preserves and invokes an inherited cache wrapper.
     """
     # ---- (2) rustc-argv parser ----
     name, is_test, kinds = _parse_rustc_argv([
@@ -1794,6 +1851,73 @@ def self_test() -> int:
     # wins deterministically.
     assert name == "serde_json", name
     assert is_test is False
+
+    # ---- (4) inherited wrapper composition ----
+    wrapper_path = os.path.abspath(__file__)
+    env = {"RUSTC_WRAPPER": "sccache"}
+    assert _install_timing_wrapper(env, wrapper_path) == "sccache"
+    assert env["RUSTC_WRAPPER"] == wrapper_path
+    assert env[WRAPPER_CHAIN_ENV] == "sccache"
+
+    # An explicitly empty RUSTC_WRAPPER disables the config-derived wrapper;
+    # do not resurrect CARGO_BUILD_RUSTC_WRAPPER behind Cargo's back.
+    env = {
+        "RUSTC_WRAPPER": "",
+        "CARGO_BUILD_RUSTC_WRAPPER": "config-cache",
+    }
+    assert _install_timing_wrapper(env, wrapper_path) is None
+    assert WRAPPER_CHAIN_ENV not in env
+
+    # When only Cargo's config environment override is present, preserve it.
+    env = {"CARGO_BUILD_RUSTC_WRAPPER": "config-cache"}
+    assert _install_timing_wrapper(env, wrapper_path) == "config-cache"
+    assert env[WRAPPER_CHAIN_ENV] == "config-cache"
+
+    # Never chain the collector into itself.
+    env = {"RUSTC_WRAPPER": wrapper_path}
+    assert _install_timing_wrapper(env, wrapper_path) is None
+    assert WRAPPER_CHAIN_ENV not in env
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        compiler = out / "fake-rustc"
+        cache = out / "fake-cache"
+        capture = out / "cache-argv"
+        log = out / "rustc.jsonl"
+        compiler.write_text("#!/bin/sh\nexit 0\n")
+        cache.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$TIMING_CHAIN_CAPTURE\"\n"
+            "exec \"$@\"\n"
+        )
+        compiler.chmod(0o755)
+        cache.chmod(0o755)
+        child_env = os.environ.copy()
+        child_env[WRAPPER_ACTIVE_ENV] = "1"
+        child_env[WRAPPER_LOG_ENV] = str(log)
+        child_env[WRAPPER_CHAIN_ENV] = str(cache)
+        child_env["TIMING_CHAIN_CAPTURE"] = str(capture)
+        subprocess.run(
+            [
+                wrapper_path,
+                str(compiler),
+                "--crate-name",
+                "cache_probe",
+                "--test",
+            ],
+            env=child_env,
+            check=True,
+        )
+        captured = capture.read_text().splitlines()
+        assert captured == [
+            str(compiler),
+            "--crate-name",
+            "cache_probe",
+            "--test",
+        ], captured
+        record = json.loads(log.read_text())
+        assert record["crate_name"] == "cache_probe", record
+        assert record["is_test"] is True, record
+        assert record["exit_code"] == 0, record
 
     # ---- (3) correlation fixture ----
     with tempfile.TemporaryDirectory() as tmp:
