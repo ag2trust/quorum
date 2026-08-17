@@ -119,9 +119,10 @@ const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 const MAX_CI_REMEDIATION_PROVISION_STRIKES: i64 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
 // A post-launch journal failure can race a fast provider's terminal record.
-// Bound the pre-kill read so the failure stays prompt while teardown can
-// retain a record that the already-started turn is concurrently delivering.
+// Bound both time and allocation so a malformed provider cannot prevent the
+// original fatal handoff outcome or synchronous reap.
 const FAILED_WORKER_HANDOFF_CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
+const FAILED_WORKER_HANDOFF_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 /// Limit per-slot stream work so one noisy provider cannot starve other slots.
 const MAX_STREAM_LINES_PER_TICK: usize = 64;
@@ -12264,10 +12265,14 @@ async fn feed_worker_turn(
         if let Err(error) = persist_worker_journal(&config.db_path, entry).await {
             let launched_pid = new_proc.pid();
             let mut terminal_output = Vec::new();
-            if installed_run_id.is_some() {
-                if let Ok(Some(raw_line)) = tokio::time::timeout(
+            // Claude/Codex keep partial records in a persistent buffer, so
+            // cancelling this explicitly byte-bounded read cannot lose bytes.
+            // Grok's shared bounded role read is intentionally unavailable;
+            // kill it first and rely on its bounded teardown reader instead.
+            if installed_run_id.is_some() && new_proc.kind() != runner::AgentKind::Grok {
+                if let Ok(Ok(Some(raw_line))) = tokio::time::timeout(
                     FAILED_WORKER_HANDOFF_CAPTURE_TIMEOUT,
-                    new_proc.next_raw_line(),
+                    new_proc.next_raw_line_bounded(FAILED_WORKER_HANDOFF_CAPTURE_BYTES),
                 )
                 .await
                 {

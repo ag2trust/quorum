@@ -1487,6 +1487,46 @@ mod tests {
             .expect("journal handoff error records the synchronously reaped PID")
     }
 
+    #[cfg(unix)]
+    fn configure_recovered_journal_handoff_failure(fixture: &mut DormantFixture, codex_body: &str) {
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.config.repo_dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        {
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            enter_merge_conflict_rework(
+                &mut conn,
+                fixture.task_id,
+                "retry the exact turn after journal handoff failure",
+            );
+            conn.execute_batch(
+                "CREATE TRIGGER reject_recovered_journal_handoff
+                   BEFORE UPDATE ON journal
+                   WHEN NEW.phase='resuming-rework'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected recovered journal failure');
+                 END;",
+            )
+            .unwrap();
+        }
+        let codex = fixture._dir.path().join("fake-codex");
+        write_executable(&codex, codex_body);
+        let gh = fixture._dir.path().join("fake-gh");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"headRefName\":\"daemon/dormant-t1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"OPEN\"}}'\n"
+            ),
+        );
+        fixture.config.agent_bin = Some(codex.to_string_lossy().into_owned());
+        fixture.config.pr_target_program = Some(gh);
+    }
+
     fn begin_unrelated_decomposition_freeze(
         conn: &mut quorum_core::Connection,
         frozen_base_sha: &str,
@@ -1823,45 +1863,13 @@ mod tests {
     #[tokio::test]
     async fn post_launch_journal_failure_is_loud_reaped_and_retryable_once() {
         let mut fixture = dormant_fixture();
-        let feedback = "retry the exact turn after journal handoff failure";
-        let head = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&fixture.config.repo_dir)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        assert!(head.status.success());
-        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
-        {
-            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
-            enter_merge_conflict_rework(&mut conn, fixture.task_id, feedback);
-            conn.execute_batch(
-                "CREATE TRIGGER reject_recovered_journal_handoff
-                   BEFORE UPDATE ON journal
-                   WHEN NEW.phase='resuming-rework'
-                 BEGIN
-                   SELECT RAISE(ABORT, 'injected recovered journal failure');
-                 END;",
-            )
-            .unwrap();
-        }
-        let codex = fixture._dir.path().join("fake-codex");
-        write_executable(
-            &codex,
+        configure_recovered_journal_handoff_failure(
+            &mut fixture,
             r#"#!/bin/sh
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3}}'
 exec sleep 30
 "#,
         );
-        let gh = fixture._dir.path().join("fake-gh");
-        write_executable(
-            &gh,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' '{{\"headRefName\":\"daemon/dormant-t1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"OPEN\"}}'\n"
-            ),
-        );
-        fixture.config.agent_bin = Some(codex.to_string_lossy().into_owned());
-        fixture.config.pr_target_program = Some(gh);
 
         let daemon_pid = std::process::id() as i64;
         let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
@@ -1963,6 +1971,60 @@ exec sleep 30
         assert_eq!(authority, (3, 1), "restart launches one replacement run");
         drop(conn);
         workers.remove(0).kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_launch_journal_failure_bounds_unterminated_stdout_before_reap() {
+        let mut fixture = dormant_fixture();
+        let chunk = "x".repeat(4096);
+        configure_recovered_journal_handoff_failure(
+            &mut fixture,
+            &format!("#!/bin/sh\nwhile :; do printf '%s' '{chunk}'; done\n"),
+        );
+
+        let daemon_pid = std::process::id() as i64;
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        quorum_core::daemon_lock::try_acquire(
+            &mut conn,
+            daemon_pid,
+            super::super::now_unix(),
+            30,
+            |_| false,
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::super::tick_loop(&fixture.config, daemon_pid),
+        )
+        .await
+        .expect("unterminated provider output must not prevent fatal handoff settlement")
+        .expect_err("injected journal handoff failure must remain fatal");
+        assert_eq!(error.exit_code(), 3);
+        assert!(
+            error.to_string().contains("journal handoff failed"),
+            "{error}"
+        );
+        let pid = reaped_pid_from_error(&error.to_string());
+        assert!(!process_is_alive(pid), "failed provider must be reaped");
+
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let failed_run = quorum_core::agent_runs::runs_for_task(&conn, fixture.task_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.end_reason.as_deref() == Some("journal-handoff-failed"))
+            .expect("the bounded failure path settles the inserted run");
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, failed_run.id)
+                .unwrap()
+                .unwrap(),
+            quorum_core::token_usage::TokenUsage::default(),
+            "malformed non-terminal output cannot fabricate token usage"
+        );
+        let entry = journal::list_in_flight(&conn).unwrap().remove(0);
+        assert_eq!((entry.phase.as_str(), entry.pid), ("awaiting-review", None));
     }
 
     #[tokio::test]
