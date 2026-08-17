@@ -73,29 +73,42 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::build(true)
+    }
+
+    fn timing_only() -> Self {
+        Self::build(false)
+    }
+
+    fn build(with_repository: bool) -> Self {
         let temp = tempfile::tempdir().expect("create fixture directory");
         let root = temp.path();
-        let remote = root.join("origin.git");
         let repo = root.join("repo");
         let bin = root.join("bin");
+        fs::create_dir(&repo).expect("create fixture repository directory");
         fs::create_dir(&bin).expect("create fake binary directory");
 
-        git(root, ["init", "--bare", "-q", remote.to_str().unwrap()]);
-        git(root, ["init", "-q", repo.to_str().unwrap()]);
-        git(&repo, ["config", "user.name", "Fixture"]);
-        git(&repo, ["config", "user.email", "fixture@example.invalid"]);
-        git(&repo, ["remote", "add", "origin", remote.to_str().unwrap()]);
-        fs::write(repo.join("state"), "base\n").expect("write fixture state");
-        git(&repo, ["add", "state"]);
-        git(&repo, ["commit", "-qm", "fixture base"]);
-        git(&repo, ["branch", "-M", "main"]);
-        git(&repo, ["push", "-q", "origin", "main"]);
+        if with_repository {
+            git(&repo, ["init", "-q", "-b", "main"]);
+            git(&repo, ["config", "user.name", "Fixture"]);
+            git(&repo, ["config", "user.email", "fixture@example.invalid"]);
+            fs::write(repo.join("state"), "base\n").expect("write fixture state");
+            git(&repo, ["add", "state"]);
+            git(&repo, ["commit", "-qm", "fixture base"]);
+            // The branch-base gate only needs a freshly fetchable origin/main.
+            // Pointing origin at the fixture itself avoids creating and
+            // pushing to a second repository while exercising the same fetch
+            // and remote-tracking-ref behavior.
+            git(&repo, ["remote", "add", "origin", "."]);
+        }
 
         let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        copy_executable(
-            &source_root.join("preflight.sh"),
-            &repo.join("preflight.sh"),
-        );
+        if with_repository {
+            copy_executable(
+                &source_root.join("preflight.sh"),
+                &repo.join("preflight.sh"),
+            );
+        }
         let timing_dir = repo.join("scripts/preflight");
         fs::create_dir_all(&timing_dir).expect("create timing script directory");
         copy_executable(
@@ -144,67 +157,16 @@ impl Fixture {
             )
             .env("PREFLIGHT_TERM_GRACE_SECS", "0.2")
             .env("PREFLIGHT_FIXTURE_PID_FILE", self.pid_file());
-        if matches!(scenario, Scenario::Timeout) {
-            command.env("PREFLIGHT_TEST_TIMEOUT_SECS", "5");
-        }
-        if matches!(scenario, Scenario::DiscoverySpawnFailure) {
-            command
-                .env("PREFLIGHT_TEST_TIMEOUT_SECS", "2")
-                // Keep external discovery unavailable throughout both cleanup
-                // stages so the platform's spawn-free fallback owns teardown.
-                .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000");
-        }
-        #[cfg(target_os = "macos")]
-        if matches!(scenario, Scenario::DarwinPartialFallback) {
-            command
-                .env("PREFLIGHT_TEST_TIMEOUT_SECS", "2")
-                .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000")
-                .env(
-                    "TIMING_TEST_DARWIN_PARTIAL_PID_FILE",
-                    self.pid_file().with_extension("partial"),
-                )
-                .env(
-                    "PREFLIGHT_FIXTURE_PARTIAL_PID_FILE",
-                    self.pid_file().with_extension("partial"),
-                );
-        }
-        #[cfg(target_os = "macos")]
-        if matches!(scenario, Scenario::DarwinPartialChildList) {
-            command
-                .env("PREFLIGHT_TEST_TIMEOUT_SECS", "2")
-                .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000")
-                .env(
-                    "TIMING_TEST_DARWIN_PARTIAL_CHILD_LIST_PID_FILE",
-                    self.pid_file().with_extension("partial-list"),
-                )
-                .env(
-                    "PREFLIGHT_FIXTURE_PARTIAL_LIST_PID_FILE",
-                    self.pid_file().with_extension("partial-list"),
-                );
-        }
-        #[cfg(target_os = "macos")]
-        if matches!(scenario, Scenario::DarwinPidReuse) {
-            command.env("PREFLIGHT_TEST_TIMEOUT_SECS", "2").env(
-                "TIMING_TEST_DARWIN_REUSED_PID_FILE",
-                self.pid_file().with_extension("reused"),
-            );
-        }
-        #[cfg(target_os = "macos")]
-        if matches!(scenario, Scenario::DarwinFastExitRootReuse) {
-            command.env(
-                "TIMING_TEST_DARWIN_REUSED_ROOT_PID_FILE",
-                self.pid_file().with_extension("reused-root"),
-            );
-        }
         command.output().expect("run preflight")
     }
 
-    fn timing_collector(&self, scenario: Scenario) -> Command {
+    fn timing_collector(&self, scenario: Scenario, timeout_secs: f64) -> Command {
         let path = format!(
             "{}:{}",
             self.bin.display(),
             env::var("PATH").expect("PATH is set")
         );
+        let timeout_secs = timeout_secs.to_string();
         let mut command = Command::new("scripts/preflight/timing.sh");
         command
             .current_dir(&self.repo)
@@ -212,7 +174,7 @@ impl Fixture {
                 "--skip-fmt",
                 "--skip-clippy",
                 "--test-timeout-secs",
-                "30",
+                &timeout_secs,
                 "--term-grace-secs",
                 "0.2",
             ])
@@ -220,22 +182,75 @@ impl Fixture {
             .env("PREFLIGHT_TIMING_SCENARIO", scenario.env_value())
             .env(
                 "PREFLIGHT_TEST_EXECUTABLE",
-                self.repo.join("fixture-test-blocking"),
+                match scenario {
+                    #[cfg(target_os = "macos")]
+                    Scenario::DarwinFastExitRootReuse => self.repo.join("fixture-test-failure"),
+                    _ => self.repo.join("fixture-test-blocking"),
+                },
             )
             .env("PREFLIGHT_FIXTURE_PID_FILE", self.pid_file())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if matches!(scenario, Scenario::DiscoverySpawnFailure) {
+            command.env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000");
+        }
+        #[cfg(target_os = "macos")]
+        match scenario {
+            Scenario::DarwinPartialFallback => {
+                command
+                    .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000")
+                    .env(
+                        "TIMING_TEST_DARWIN_PARTIAL_PID_FILE",
+                        self.pid_file().with_extension("partial"),
+                    )
+                    .env(
+                        "PREFLIGHT_FIXTURE_PARTIAL_PID_FILE",
+                        self.pid_file().with_extension("partial"),
+                    );
+            }
+            Scenario::DarwinPartialChildList => {
+                command
+                    .env("TIMING_TEST_PROCESS_TABLE_SPAWN_FAILURES", "1000000")
+                    .env(
+                        "TIMING_TEST_DARWIN_PARTIAL_CHILD_LIST_PID_FILE",
+                        self.pid_file().with_extension("partial-list"),
+                    )
+                    .env(
+                        "PREFLIGHT_FIXTURE_PARTIAL_LIST_PID_FILE",
+                        self.pid_file().with_extension("partial-list"),
+                    );
+            }
+            Scenario::DarwinPidReuse => {
+                command.env(
+                    "TIMING_TEST_DARWIN_REUSED_PID_FILE",
+                    self.pid_file().with_extension("reused"),
+                );
+            }
+            Scenario::DarwinFastExitRootReuse => {
+                command.env(
+                    "TIMING_TEST_DARWIN_REUSED_ROOT_PID_FILE",
+                    self.pid_file().with_extension("reused-root"),
+                );
+            }
+            _ => {}
+        }
         command
     }
 
+    fn run_timing_collector(&self, scenario: Scenario, timeout_secs: f64) -> Output {
+        self.timing_collector(scenario, timeout_secs)
+            .output()
+            .expect("run timing collector")
+    }
+
     fn interrupted_timing(&self) -> Child {
-        self.timing_collector(Scenario::Interrupted)
+        self.timing_collector(Scenario::Interrupted, 30.0)
             .spawn()
             .expect("spawn interruptible timing collector")
     }
 
     fn abruptly_owned_timing(&self) -> Child {
-        self.timing_collector(Scenario::AbruptOwnerDeath)
+        self.timing_collector(Scenario::AbruptOwnerDeath, 30.0)
             .process_group(0)
             .spawn()
             .expect("spawn abruptly killable timing collector")
@@ -449,8 +464,8 @@ fn compilation_failure_preserves_diagnostics_and_timing() {
 #[test]
 fn timeout_reaps_descendants_in_separate_process_groups() {
     let _guard = process_fixture_guard();
-    let fixture = Fixture::new();
-    let output = fixture.preflight(Scenario::Timeout);
+    let fixture = Fixture::timing_only();
+    let output = fixture.run_timing_collector(Scenario::Timeout, 1.0);
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -458,7 +473,7 @@ fn timeout_reaps_descendants_in_separate_process_groups() {
     assert!(stderr.contains("timed out after"));
     assert!(stderr.contains("--nocapture to diagnose"));
     let timing = fixture.timing();
-    assert_branch_base(&timing);
+    assert_eq!(timing["version"].as_i64(), Some(3));
     assert_gate(&timing, "test_execute", 124);
     let binary = &timing["test_binaries"][0];
     assert_eq!(binary["execute_outcome"], "timed_out");
@@ -477,9 +492,9 @@ fn timeout_reaps_descendants_in_separate_process_groups() {
 #[test]
 fn sustained_process_discovery_failure_is_bounded_and_reaps_descendants() {
     let _guard = process_fixture_guard();
-    let fixture = Fixture::new();
+    let fixture = Fixture::timing_only();
     let started = Instant::now();
-    let output = fixture.preflight(Scenario::DiscoverySpawnFailure);
+    let output = fixture.run_timing_collector(Scenario::DiscoverySpawnFailure, 1.0);
 
     assert_eq!(output.status.code(), Some(1));
     let elapsed = started.elapsed();
@@ -494,7 +509,7 @@ fn sustained_process_discovery_failure_is_bounded_and_reaps_descendants() {
         "missing bounded discovery diagnostic: {stderr}"
     );
     let timing = fixture.timing();
-    assert_branch_base(&timing);
+    assert_eq!(timing["version"].as_i64(), Some(3));
     assert_gate(&timing, "test_execute", 124);
     let binary = &timing["test_binaries"][0];
     assert_eq!(binary["execute_outcome"], "timed_out");
@@ -527,9 +542,9 @@ fn sustained_process_discovery_failure_is_bounded_and_reaps_descendants() {
 #[test]
 fn partial_darwin_fallback_is_loud_and_reaps_retained_descendants() {
     let _guard = process_fixture_guard();
-    let fixture = Fixture::new();
+    let fixture = Fixture::timing_only();
     let started = Instant::now();
-    let output = fixture.preflight(Scenario::DarwinPartialFallback);
+    let output = fixture.run_timing_collector(Scenario::DarwinPartialFallback, 1.5);
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
@@ -537,7 +552,7 @@ fn partial_darwin_fallback_is_loud_and_reaps_retained_descendants() {
         "partial Darwin fallback did not terminate promptly"
     );
     let timing = fixture.timing();
-    assert_branch_base(&timing);
+    assert_eq!(timing["version"].as_i64(), Some(3));
     assert_gate(&timing, "test_execute", 124);
     let binary = &timing["test_binaries"][0];
     assert_eq!(binary["execute_outcome"], "timed_out");
@@ -560,12 +575,12 @@ fn partial_darwin_fallback_is_loud_and_reaps_retained_descendants() {
 #[test]
 fn partial_darwin_child_list_is_loud_and_reaps_retained_descendants() {
     let _guard = process_fixture_guard();
-    let fixture = Fixture::new();
-    let output = fixture.preflight(Scenario::DarwinPartialChildList);
+    let fixture = Fixture::timing_only();
+    let output = fixture.run_timing_collector(Scenario::DarwinPartialChildList, 1.5);
 
     assert_eq!(output.status.code(), Some(1));
     let timing = fixture.timing();
-    assert_branch_base(&timing);
+    assert_eq!(timing["version"].as_i64(), Some(3));
     assert_gate(&timing, "test_execute", 124);
     let binary = &timing["test_binaries"][0];
     assert_eq!(binary["execute_outcome"], "timed_out");
@@ -591,7 +606,7 @@ fn partial_darwin_child_list_is_loud_and_reaps_retained_descendants() {
 #[test]
 fn reused_darwin_pid_is_discarded_without_signaling_unrelated_process() {
     let _guard = process_fixture_guard();
-    let fixture = Fixture::new();
+    let fixture = Fixture::timing_only();
     let mut unrelated = ChildGuard::unrelated_process();
     fs::write(
         fixture.pid_file().with_extension("reused"),
@@ -599,7 +614,7 @@ fn reused_darwin_pid_is_discarded_without_signaling_unrelated_process() {
     )
     .expect("publish synthetic reused PID");
 
-    let output = fixture.preflight(Scenario::DarwinPidReuse);
+    let output = fixture.run_timing_collector(Scenario::DarwinPidReuse, 1.0);
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
@@ -607,7 +622,7 @@ fn reused_darwin_pid_is_discarded_without_signaling_unrelated_process() {
         "cleanup signaled the unrelated process that reused a retained PID"
     );
     let timing = fixture.timing();
-    assert_branch_base(&timing);
+    assert_eq!(timing["version"].as_i64(), Some(3));
     assert_gate(&timing, "test_execute", 124);
     let binary = &timing["test_binaries"][0];
     assert_eq!(binary["execute_outcome"], "timed_out");
@@ -624,7 +639,7 @@ fn reused_darwin_pid_is_discarded_without_signaling_unrelated_process() {
 #[test]
 fn fast_exit_darwin_root_reuse_never_signals_the_replacement() {
     let _guard = process_fixture_guard();
-    let fixture = Fixture::new();
+    let fixture = Fixture::timing_only();
     let mut unrelated = ChildGuard::unrelated_process();
     fs::write(
         fixture.pid_file().with_extension("reused-root"),
@@ -633,7 +648,7 @@ fn fast_exit_darwin_root_reuse_never_signals_the_replacement() {
     .expect("publish synthetic reused root PID");
 
     let started = Instant::now();
-    let output = fixture.preflight(Scenario::DarwinFastExitRootReuse);
+    let output = fixture.run_timing_collector(Scenario::DarwinFastExitRootReuse, 2.0);
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
@@ -645,7 +660,7 @@ fn fast_exit_darwin_root_reuse_never_signals_the_replacement() {
         "cleanup signaled the process that reused the reaped root PID"
     );
     let timing = fixture.timing();
-    assert_branch_base(&timing);
+    assert_eq!(timing["version"].as_i64(), Some(3));
     assert_gate(&timing, "test_execute", 42);
     let binary = &timing["test_binaries"][0];
     assert_eq!(binary["execute_outcome"], "failed");
@@ -662,7 +677,7 @@ fn fast_exit_darwin_root_reuse_never_signals_the_replacement() {
 #[test]
 fn interruption_reaps_the_complete_descendant_tree() {
     let _guard = process_fixture_guard();
-    let fixture = Fixture::new();
+    let fixture = Fixture::timing_only();
     let mut collector = fixture.interrupted_timing();
     let pid_deadline = Instant::now() + Duration::from_secs(10);
     while !fixture.pid_file().exists() {
@@ -728,7 +743,7 @@ fn interruption_reaps_the_complete_descendant_tree() {
 #[test]
 fn abrupt_owner_group_death_reaps_separate_descendant_groups() {
     let _guard = process_fixture_guard();
-    let fixture = Fixture::new();
+    let fixture = Fixture::timing_only();
     let collector = fixture.abruptly_owned_timing();
     let fixture_pids = fixture.wait_for_fixture_pids();
     fixture.assert_fixture_uses_separate_process_groups();
@@ -795,6 +810,8 @@ groups_file.write_text(f"{os.getpgrp()} {os.getpgid(child.pid)}\n")
 pid_file.write_text(f"{os.getpid()} {child.pid}\n")
 partial_file = os.environ.get("PREFLIGHT_FIXTURE_PARTIAL_PID_FILE")
 if partial_file:
+    # Let the supervisor retain the escaped child before injecting a partial
+    # later snapshot; that retained identity is what this scenario exercises.
     time.sleep(0.75)
     Path(partial_file).write_text(str(child.pid))
 partial_list_file = os.environ.get("PREFLIGHT_FIXTURE_PARTIAL_LIST_PID_FILE")
