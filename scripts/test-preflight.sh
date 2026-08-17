@@ -580,10 +580,14 @@ fi
 grep -q 'forced cargo test diagnostic' "$TMP/full-compile-failure.out"
 grep -q 'PREFLIGHT: FAIL (cargo test)' "$TMP/full-compile-failure.out"
 
-# CI must preserve the same explicit feature at the test boundary. Its test
-# command is what builds the real helper binary in a clean installed toolchain.
-grep -Fqx \
-  '      - run: cargo test --workspace --all-features --features quorum-core/test-support' \
+# CI uses the same collector so it compiles once with the explicit test-support
+# feature, waits for cheap mechanical jobs, and preserves a four-thread total
+# budget while exercising binary-level concurrency.
+grep -Fqx '    needs: [fmt, clippy, shell-tests]' \
+  "$ROOT/.github/workflows/ci.yml"
+grep -Fqx '          --test-jobs 2' "$ROOT/.github/workflows/ci.yml"
+grep -Fqx '          --test-threads 2' "$ROOT/.github/workflows/ci.yml"
+grep -Fqx '          --out target/ci-test-timing' \
   "$ROOT/.github/workflows/ci.yml"
 
 echo 'test-preflight: PASS'
