@@ -7386,6 +7386,23 @@ async fn pause_after_mailbox_snapshot_for_test() {
     }
 }
 
+/// Debug-build synchronization point for inspecting state after Phase 4c
+/// without allowing the next tick to consume a newly authoritative outcome.
+#[cfg(debug_assertions)]
+async fn pause_after_message_delivery_for_test() {
+    let Ok(gate) = std::env::var("QUORUM_TEST_MESSAGE_DELIVERY_GATE") else {
+        return;
+    };
+    let gate = PathBuf::from(gate);
+    if !gate.exists() || std::fs::write(&gate, b"captured").is_err() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while gate.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn tick(
     config: &ServeConfig,
@@ -11123,6 +11140,15 @@ async fn tick(
             Some(wi) if workers[wi].draining => {
                 // Target is mid-turn — leave unconsumed, retry next tick.
             }
+            Some(wi) if slot_has_pending_watchdog_outcome(&workers[wi]) => {
+                // A durable outcome missed this tick's mailbox snapshot. Its
+                // watchdog disposition remains authoritative over sibling
+                // feeds until a later tick consumes and reclassifies it.
+                log(&format!(
+                    "deferring message from {} to {} while watchdog outcome is pending",
+                    msg_row.agent, target
+                ));
+            }
             Some(wi) => {
                 let payload = msg_row.payload.as_deref().unwrap_or("");
                 let raw_prompt = format!("MESSAGE from {}: {payload}", msg_row.agent);
@@ -11156,6 +11182,9 @@ async fn tick(
             }
         }
     }
+
+    #[cfg(debug_assertions)]
+    pause_after_message_delivery_for_test().await;
 
     // ── Phase 4d: Renew task leases for active workers (#130) ───────────
     // The daemon explicitly renews the exact lease for each active worker's

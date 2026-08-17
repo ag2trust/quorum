@@ -346,12 +346,109 @@ fi
         None
     }
 
+    fn suspend(&mut self) {
+        let pid = self.child.id() as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGSTOP) },
+            0,
+            "failed to suspend daemon process {pid}"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .starts_with('T')
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("daemon process {pid} did not suspend");
+    }
+
+    fn resume(&mut self) {
+        let pid = self.child.id() as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGCONT) },
+            0,
+            "failed to resume daemon process {pid}"
+        );
+    }
+
     fn stop(mut self) {
         unsafe {
             libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
         }
         let _ = self.child.wait();
     }
+}
+
+fn managed_pid(home: &std::path::Path, role: &str) -> i32 {
+    let db = home.join("repos/test__repo/quorum.db");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let conn = quorum_core::db::open(&db).unwrap();
+        if let Ok(pid) = conn.query_row(
+            "SELECT pid FROM journal WHERE role=?1 AND pid IS NOT NULL",
+            [role],
+            |row| row.get(0),
+        ) {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("managed {role} pid was not persisted")
+}
+
+fn wait_for_process_terminated(pid: i32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() || state.trim().is_empty() || state.trim().starts_with('Z') {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("managed process {pid} did not terminate");
+}
+
+fn append_worker_message(home: &std::path::Path, target: &str) -> i64 {
+    let db = home.join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    quorum_core::mailbox::append(
+        &mut conn,
+        &quorum_core::mailbox::MailboxRow {
+            agent: "MessageSender".into(),
+            kind: quorum_core::mailbox::MailboxKind::Message,
+            task_id: None,
+            pr: None,
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: Some(target.into()),
+            payload: Some("queued while completion is pending".into()),
+        },
+    )
+    .unwrap()
+}
+
+fn mailbox_row_is_consumed(home: &std::path::Path, id: i64) -> bool {
+    let db = home.join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    conn.query_row(
+        "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+        [id],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 fn seed_task(home: &std::path::Path, title: &str) {
@@ -868,6 +965,170 @@ fn pending_worker_overage_is_rechecked_after_mailbox_delivery() {
         )
         .unwrap();
     assert_eq!(review_events, 1, "watchdog duplicated task_in_review");
+    let worker_run = quorum_core::agent_runs::runs_for_task(&conn, 1)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.role == "worker")
+        .unwrap();
+    assert!(matches!(
+        worker_run.end_reason.as_deref(),
+        Some("completed" | "ownership_transferred")
+    ));
+}
+
+#[test]
+fn pending_worker_overage_defers_snapshotted_message_after_feed_becomes_broken() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    assert!(Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap()
+        .success());
+    seed_task(home.path(), "Pending worker message delivery regression");
+
+    let snapshot_gate = home.path().join("message-mailbox-snapshot-gate");
+    let message_gate = home.path().join("message-delivery-gate");
+    let snapshot_gate_text = snapshot_gate.to_string_lossy().into_owned();
+    let message_gate_text = message_gate.to_string_lossy().into_owned();
+    let mut handle = ServeHandle::start_with_limits_and_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &["--max-task-tokens", "600"],
+        &[
+            ("FAKE_AGENT_DELAY_SECS", "3"),
+            ("QUORUM_TEST_MAILBOX_SNAPSHOT_GATE", &snapshot_gate_text),
+            ("QUORUM_TEST_MESSAGE_DELIVERY_GATE", &message_gate_text),
+        ],
+    );
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    let worker_pid = managed_pid(home.path(), "worker");
+
+    // Freeze the daemon so the message and both synchronization gates are
+    // installed before one tick snapshots the message row.
+    handle.suspend();
+    let message_id = append_worker_message(home.path(), &worker_name);
+    std::fs::write(&snapshot_gate, b"waiting").unwrap();
+    std::fs::write(&message_gate, b"waiting").unwrap();
+    handle.resume();
+
+    let snapshot_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::fs::read(&snapshot_gate).unwrap_or_default() != b"captured"
+        && std::time::Instant::now() < snapshot_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(&snapshot_gate).unwrap_or_default(),
+        b"captured",
+        "daemon did not snapshot the queued message"
+    );
+
+    // Done misses this snapshot. The terminal overage and dead stdin then
+    // make the snapshotted Phase 4c feed fail if it is attempted.
+    quorum_done(home.path(), &["--agent", &worker_name]);
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
+    wait_for_process_terminated(worker_pid);
+    std::fs::remove_file(&snapshot_gate).unwrap();
+
+    assert!(
+        handle.wait_for("submission pending", 15),
+        "terminal breach was not classified pending. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("deferring message", 15),
+        "snapshotted message was not deferred. Lines: {:?}",
+        handle.lines
+    );
+    let message_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::fs::read(&message_gate).unwrap_or_default() != b"captured"
+        && std::time::Instant::now() < message_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(&message_gate).unwrap_or_default(),
+        b"captured",
+        "daemon did not pause after Phase 4c"
+    );
+
+    assert!(
+        !mailbox_row_is_consumed(home.path(), message_id),
+        "pending watchdog outcome lost the queued message"
+    );
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let pending_task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(pending_task.status, "working");
+    assert_eq!(pending_task.recovery_attempts, 0);
+    drop(conn);
+    assert!(
+        !handle.lines.iter().any(|line| {
+            line.contains("message delivery") && line.contains("failed")
+                || line.contains("WATCHDOG: worker")
+        }),
+        "pending message path emitted a failure teardown: {:?}",
+        handle.lines
+    );
+
+    // The next tick consumes Done first, records the submission, performs
+    // cleanup-only watchdog teardown, then consumes the now-unowned message.
+    std::fs::remove_file(&message_gate).unwrap();
+    assert!(
+        handle.wait_for("PR #1 ready for review", 15),
+        "pending submission was not delivered. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("cleanup only", 15),
+        "pending breach was not reclassified after delivery. Lines: {:?}",
+        handle.lines
+    );
+    let consumed_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !mailbox_row_is_consumed(home.path(), message_id)
+        && std::time::Instant::now() < consumed_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        mailbox_row_is_consumed(home.path(), message_id),
+        "deferred message was not settled on the later tick"
+    );
+    let false_alert = handle
+        .lines
+        .iter()
+        .any(|line| line.contains("WATCHDOG: worker"));
+    handle.stop();
+
+    assert!(!false_alert, "pending submission emitted a watchdog alert");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    assert_eq!(task.recovery_attempts, 0);
+    assert_eq!(quorum_core::tasks::extract_pr_number(&task.refs), Some(1));
+    let review_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE subject='task#1' AND kind='task_in_review'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(review_events, 1, "message path duplicated task_in_review");
     let worker_run = quorum_core::agent_runs::runs_for_task(&conn, 1)
         .unwrap()
         .into_iter()
