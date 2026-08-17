@@ -1153,15 +1153,14 @@ class TestBinaryHandle:
         self.owner_write = owner_write
         self.result_read = result_read
         self.display_name = display_name
+        self._result: dict | None = None
 
     def poll(self) -> int | None:
         return self.proc.poll()
 
     def cancel(self) -> None:
         """Report owner loss so the supervisor cleans its whole test tree."""
-        if self.owner_write >= 0:
-            os.close(self.owner_write)
-            self.owner_write = -1
+        self._close_descriptors(("owner_write",))
 
     def interrupt(self, signum: int) -> None:
         """Ask the supervisor to report interruption after bounded cleanup."""
@@ -1172,18 +1171,56 @@ class TestBinaryHandle:
                 pass
 
     def finish(self) -> dict:
-        self.proc.wait()
+        if self._result is not None:
+            return self._result
+
+        # A terminal signal must not strand this handle between process reap
+        # and result decoding. Cache the complete result and close both pipes
+        # before restoring the collector's signal mask. If a pending signal
+        # then raises CollectorInterrupted, the scheduler still tracks this
+        # handle and a second finish() returns the cached result.
+        old_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
         try:
-            return _read_supervisor_result(self.result_read)
+            self.proc.wait()
+            self._result = _read_supervisor_result(self.result_read)
+            return self._result
         finally:
-            self.close()
+            try:
+                self.close()
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
     def close(self) -> None:
-        for attr in ("owner_write", "result_read"):
-            fd = getattr(self, attr)
-            if fd >= 0:
-                os.close(fd)
+        self._close_descriptors(("owner_write", "result_read"))
+
+    def _close_descriptors(self, attrs: tuple[str, ...]) -> None:
+        """Transfer descriptor ownership before an interruption can raise.
+
+        Blocking terminal signals across the field update and close syscall
+        prevents either unsafe half-state: an open descriptor marked closed,
+        or a closed descriptor still marked live and closed again on retry.
+        """
+        old_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+        )
+        close_error: OSError | None = None
+        try:
+            for attr in attrs:
+                fd = getattr(self, attr)
+                if fd < 0:
+                    continue
                 setattr(self, attr, -1)
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    if close_error is None:
+                        close_error = exc
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        if close_error is not None:
+            raise close_error
 
 
 def start_test_binary(
@@ -1397,7 +1434,6 @@ def execute_test_binaries(
                 continue
 
             for binary, handle in completed:
-                active.remove((binary, handle))
                 result = handle.finish()
                 record_test_result(binary, result)
                 failed = (
@@ -1405,6 +1441,7 @@ def execute_test_binaries(
                     or not result["cleanup"]["complete"]
                 )
                 if not failed or first_failure is not None:
+                    active.remove((binary, handle))
                     continue
 
                 exec_rc = result["exit_code"] or 1
@@ -1426,6 +1463,11 @@ def execute_test_binaries(
                         flush=True,
                     )
 
+                # The causal result is now recorded. Remove only this settled
+                # handle; every peer remains tracked until its cancellation
+                # result has been collected below.
+                active.remove((binary, handle))
+
                 # Stop scheduling at the first observed failure. Closing the
                 # owner pipe makes each still-running supervisor perform the
                 # same bounded descendant cleanup as abrupt owner loss.
@@ -1435,11 +1477,26 @@ def execute_test_binaries(
                 for other_binary, other_handle in active:
                     was_running = other_handle.poll() is None
                     if was_running:
-                        other_handle.cancel()
+                        # Treat the artifact marker and owner-pipe close as one
+                        # signal-safe state transition. A pending terminal
+                        # signal may raise as soon as the mask is restored,
+                        # but the interruption path will then see both facts.
+                        old_mask = signal.pthread_sigmask(
+                            signal.SIG_BLOCK,
+                            {signal.SIGINT, signal.SIGTERM},
+                        )
+                        try:
+                            other_binary[
+                                "execute_cancelled_by_fail_fast"
+                            ] = True
+                            other_handle.cancel()
+                        finally:
+                            signal.pthread_sigmask(
+                                signal.SIG_SETMASK, old_mask
+                            )
                     cancellation.append(
                         (other_binary, other_handle, was_running)
                     )
-                active.clear()
                 for other_binary, other_handle, was_running in cancellation:
                     other_result = other_handle.finish()
                     record_test_result(
@@ -1447,6 +1504,7 @@ def execute_test_binaries(
                         other_result,
                         cancelled_by_fail_fast=was_running,
                     )
+                    active.remove((other_binary, other_handle))
                 return exec_rc, None, first_failure
     except CollectorInterrupted as exc:
         interrupted_signal = exc.signum
@@ -1459,7 +1517,11 @@ def execute_test_binaries(
         for binary, handle in active:
             result = handle.finish()
             record_test_result(binary, result)
-            if first_failure is None and result["outcome"] == "interrupted":
+            failed = (
+                result["exit_code"] != 0
+                or not result["cleanup"]["complete"]
+            )
+            if first_failure is None and failed:
                 first_failure = test_binary_failure(binary, result, threads)
             print(
                 "preflight timing: interrupted while running test binary "

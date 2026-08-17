@@ -569,6 +569,282 @@ assert second["cleanup"]["complete"] is True
 assert "execute_outcome" not in third
 PY
 
+# Signals that land while the collector is decoding a completed result or
+# reaping fail-fast peers must not remove those handles from cleanup tracking.
+# Import the collector directly so both narrow race windows are deterministic
+# rather than dependent on process scheduling.
+PYTHONDONTWRITEBYTECODE=1 python3 - \
+  "$ROOT/scripts/preflight/timing.sh" <<'PY'
+import importlib.machinery
+import importlib.util
+import json
+import os
+import signal
+import sys
+
+path = sys.argv[1]
+loader = importlib.machinery.SourceFileLoader("timing_interrupt_test", path)
+spec = importlib.util.spec_from_loader("timing_interrupt_test", loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+
+
+def result(outcome, exit_code):
+    return {
+        "duration_secs": 0.01,
+        "exit_code": exit_code,
+        "outcome": outcome,
+        "timed_out": False,
+        "timeout_secs": 1.0,
+        "cleanup": {
+            "attempted": outcome != "passed",
+            "term_sent": outcome != "passed",
+            "kill_sent": False,
+            "complete": True,
+            "error": None,
+        },
+    }
+
+
+class FakeHandle:
+    def __init__(self, name, final_result, *, complete, interrupt_finish=False):
+        self.display_name = name
+        self.final_result = final_result
+        self.complete = complete
+        self.interrupt_finish = interrupt_finish
+        self.cancelled = False
+        self.closed = False
+        self.interrupts = []
+
+    def poll(self):
+        return 0 if self.complete else None
+
+    def finish(self):
+        if self.interrupt_finish:
+            self.interrupt_finish = False
+            os.kill(os.getpid(), signal.SIGTERM)
+            raise AssertionError("SIGTERM handler did not interrupt finish")
+        self.closed = True
+        self.complete = True
+        return self.final_result
+
+    def cancel(self):
+        self.cancelled = True
+
+    def interrupt(self, signum):
+        self.interrupts.append(signum)
+
+    def close(self):
+        self.closed = True
+
+
+def run_with(handles, binaries, jobs):
+    pending = list(handles)
+    original = module.start_test_binary
+    module.start_test_binary = lambda *_args: pending.pop(0)
+    try:
+        return module.execute_test_binaries(
+            binaries,
+            jobs=jobs,
+            threads=1,
+            timeout_secs=1.0,
+            term_grace_secs=0.1,
+        )
+    finally:
+        module.start_test_binary = original
+
+
+# Reproduce the review finding: a completed handle raises while finish() is
+# collecting its result. It must remain tracked, be interrupted/retried, and
+# contribute its final result to the artifact model.
+completed = FakeHandle(
+    "completed",
+    result("interrupted", 128 + signal.SIGTERM),
+    complete=True,
+    interrupt_finish=True,
+)
+completed_binary = {"executable": "/fake/completed", "target_name": "completed"}
+rc, signum, failure = run_with([completed], [completed_binary], jobs=1)
+assert rc == 128 + signal.SIGTERM
+assert signum == signal.SIGTERM
+assert failure["target_name"] == "completed"
+assert completed.interrupts == [signal.SIGTERM]
+assert completed.closed is True
+assert completed_binary["execute_outcome"] == "interrupted"
+assert completed_binary["cleanup"]["complete"] is True
+
+
+# If the signal lands while a fail-fast peer is settling, preserve the causal
+# failure, finish/reap the peer, and retain its cancellation classification.
+causal = FakeHandle(
+    "causal", result("failed", 23), complete=True
+)
+peer = FakeHandle(
+    "peer",
+    result("owner_lost", 1),
+    complete=False,
+    interrupt_finish=True,
+)
+binaries = [
+    {"executable": "/fake/causal", "target_name": "causal"},
+    {"executable": "/fake/peer", "target_name": "peer"},
+]
+rc, signum, failure = run_with([causal, peer], binaries, jobs=2)
+assert rc == 128 + signal.SIGTERM
+assert signum == signal.SIGTERM
+assert failure["target_name"] == "causal"
+assert failure["exit_code"] == 23
+assert peer.cancelled is True
+assert peer.interrupts == [signal.SIGTERM]
+assert peer.closed is True
+assert binaries[1]["execute_outcome"] == "owner_lost"
+assert binaries[1]["execute_cancelled_by_fail_fast"] is True
+assert binaries[1]["cleanup"]["complete"] is True
+
+
+# TestBinaryHandle.finish itself caches and closes a complete supervisor result
+# before unmasking a pending terminal signal, so retry after interruption is
+# descriptor-safe and lossless.
+owner_read, owner_write = os.pipe()
+os.close(owner_read)
+result_read, result_write = os.pipe()
+expected = result("passed", 0)
+os.write(result_write, json.dumps(expected).encode())
+os.close(result_write)
+
+
+class SignalOnWaitProc:
+    pid = os.getpid()
+
+    def poll(self):
+        return 0
+
+    def wait(self):
+        os.kill(os.getpid(), signal.SIGTERM)
+        return 0
+
+
+handle = module.TestBinaryHandle(
+    SignalOnWaitProc(), owner_write, result_read, "cached"
+)
+
+
+def interrupt(signum, _frame):
+    raise module.CollectorInterrupted(signum)
+
+
+old_handler = signal.signal(signal.SIGTERM, interrupt)
+try:
+    try:
+        handle.finish()
+        raise AssertionError("pending SIGTERM did not interrupt finish")
+    except module.CollectorInterrupted as exc:
+        assert exc.signum == signal.SIGTERM
+finally:
+    signal.signal(signal.SIGTERM, old_handler)
+
+assert handle.owner_write == -1
+assert handle.result_read == -1
+assert handle.finish() == expected
+
+
+# Reproduce the follow-up review finding at the narrower point immediately
+# after the real close syscall. The descriptor field must already be retired,
+# and retrying close must not raise EBADF or leak the other descriptor.
+owner_read, owner_write = os.pipe()
+os.close(owner_read)
+result_read, result_write = os.pipe()
+os.close(result_write)
+
+
+class FinishedProc:
+    pid = os.getpid()
+
+    def poll(self):
+        return 0
+
+
+handle = module.TestBinaryHandle(
+    FinishedProc(), owner_write, result_read, "close-race"
+)
+real_close = module.os.close
+
+
+def close_then_signal(fd):
+    real_close(fd)
+    if fd == owner_write:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
+old_handler = signal.signal(signal.SIGTERM, interrupt)
+module.os.close = close_then_signal
+try:
+    try:
+        handle.cancel()
+        raise AssertionError("pending SIGTERM did not interrupt cancel")
+    except module.CollectorInterrupted as exc:
+        assert exc.signum == signal.SIGTERM
+finally:
+    module.os.close = real_close
+    signal.signal(signal.SIGTERM, old_handler)
+
+assert handle.owner_write == -1
+handle.close()
+assert handle.result_read == -1
+
+
+# Exercise that same close-then-signal point through the scheduler. The peer
+# must be reaped and recorded as both owner_lost and fail-fast-cancelled while
+# the already observed causal failure remains first_failure.
+owner_read, owner_write = os.pipe()
+os.close(owner_read)
+result_read, result_write = os.pipe()
+peer_result = result("owner_lost", 1)
+os.write(result_write, json.dumps(peer_result).encode())
+os.close(result_write)
+
+
+class RunningThenFinishedProc:
+    pid = os.getpid()
+
+    def __init__(self):
+        self.polls = 0
+
+    def poll(self):
+        self.polls += 1
+        return None if self.polls <= 2 else 0
+
+    def wait(self):
+        return 0
+
+
+peer = module.TestBinaryHandle(
+    RunningThenFinishedProc(), owner_write, result_read, "close-race-peer"
+)
+causal = FakeHandle(
+    "causal-close-race", result("failed", 23), complete=True
+)
+binaries = [
+    {"executable": "/fake/causal", "target_name": "causal-close-race"},
+    {"executable": "/fake/peer", "target_name": "close-race-peer"},
+]
+module.os.close = close_then_signal
+try:
+    rc, signum, failure = run_with([causal, peer], binaries, jobs=2)
+finally:
+    module.os.close = real_close
+
+assert rc == 128 + signal.SIGTERM
+assert signum == signal.SIGTERM
+assert failure["target_name"] == "causal-close-race"
+assert failure["exit_code"] == 23
+assert peer.owner_write == -1
+assert peer.result_read == -1
+assert binaries[1]["execute_outcome"] == "owner_lost"
+assert binaries[1]["execute_cancelled_by_fail_fast"] is True
+assert binaries[1]["cleanup"]["complete"] is True
+PY
+
 # Cargo's compile/no-run diagnostics are captured by the structured collector,
 # then replayed by preflight before it returns the same failure status as the
 # former direct `cargo test` gate.

@@ -73,6 +73,33 @@ performs the same bounded TERM/KILL cleanup before exiting. Because an
 abruptly killed collector cannot finish writing JSON, that owner-loss cleanup
 does not itself promise a new timing artifact.
 
+### Signal-safe supervisor handle lifecycle
+
+The collector's Python signal handlers raise immediately, so supervisor-handle
+bookkeeping must remain correct at every bytecode boundary, not only around
+blocking syscalls. Keep these rules together when changing scheduling or
+cleanup:
+
+- A handle remains in the collector's tracked active set until its supervisor
+  result is decoded and the corresponding binary fields, including
+  `first_failure`, are recorded.
+- `finish()` blocks terminal signals while it reaps the supervisor, decodes and
+  caches the result, and closes descriptors. It restores the prior mask only
+  after the cached result is retryable and both descriptor fields are retired.
+- Descriptor closure transfers ownership first: while terminal signals are
+  blocked, set the field to `-1` before calling `close(2)`. This prevents both
+  a leaked open descriptor marked closed and a closed descriptor retried as
+  live after an interrupt.
+- Fail-fast cancellation records `execute_cancelled_by_fail_fast` and closes
+  the peer's owner pipe under one signal mask. An interrupt may be delivered
+  afterward, but the interruption path must observe both facts and finish
+  reaping the peer before artifact publication.
+
+The shell regressions inject SIGTERM at completed-result collection,
+fail-fast peer settlement, and immediately after the real owner-pipe close.
+Retain those deterministic seams; ordinary process timing is too imprecise to
+reliably exercise these boundaries.
+
 The default of two jobs and four threads per binary is based on one warm
 full-suite comparison on the 10-core development host. Test-execution wall
 time was 336.572 seconds at `1 x 4`, 241.591 seconds at `2 x 2`, and 174.005
