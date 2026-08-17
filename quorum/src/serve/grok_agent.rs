@@ -812,7 +812,14 @@ fn terminal_usage(value: &serde_json::Value) -> Option<TokenUsage> {
         .unwrap_or(0);
     Some(TokenUsage {
         input_tokens: input.saturating_add(cache_read).saturating_add(cache_write),
+        uncached_input_tokens: input,
+        cached_input_tokens: cache_read,
+        cache_write_input_tokens: cache_write,
         output_tokens: usage.get("output_tokens")?.as_u64()?,
+        reasoning_tokens: usage
+            .get("reasoning_output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
@@ -950,7 +957,11 @@ mod tests {
             AgentEvent::TurnCompleted {
                 usage: Some(TokenUsage {
                     input_tokens: 33,
-                    output_tokens: 4
+                    uncached_input_tokens: 10,
+                    cached_input_tokens: 20,
+                    cache_write_input_tokens: 3,
+                    output_tokens: 4,
+                    ..Default::default()
                 }),
                 cost_usd: Some(0.0125),
             }
@@ -995,7 +1006,10 @@ mod tests {
             AgentEvent::TurnCompleted {
                 usage: Some(TokenUsage {
                     input_tokens: 12,
+                    uncached_input_tokens: 8,
+                    cached_input_tokens: 4,
                     output_tokens: 2,
+                    ..Default::default()
                 }),
                 cost_usd: None,
             }

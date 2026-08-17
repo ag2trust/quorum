@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 53;
+pub const SCHEMA_VERSION: i64 = 54;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -830,6 +830,9 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         if current < 53 && !column_exists(conn, "tasks", "target_branch")? {
             conn.execute("ALTER TABLE tasks ADD COLUMN target_branch TEXT", [])?;
         }
+        // v54 = durable, per-invocation token usage. Both new tables are
+        // created idempotently by SCHEMA_SQL; historic agent runs remain
+        // untouched and no usage is fabricated during migration.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -893,6 +896,8 @@ mod tests {
             "journal",
             "daemon_lock",
             "agent_runs",
+            "token_usage_runs",
+            "token_usage_run_tasks",
             "role_assignments",
             "routing_cursors",
             "routing_attempts",
@@ -921,6 +926,73 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn populated_v53_to_v54_preserves_history_and_adds_empty_usage_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("populated-v53.db");
+        {
+            let mut conn = open(&path).unwrap();
+            let task_id = crate::tasks::create(
+                &mut conn,
+                "owner",
+                "historic task",
+                Some("historic body"),
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            let run_id = crate::agent_runs::insert(
+                &conn, task_id, "Historic", "worker", "gpt", "high", "codex", 11,
+            )
+            .unwrap();
+            crate::agent_runs::close(&conn, run_id, 12, "done").unwrap();
+            conn.execute_batch(
+                "DROP TABLE token_usage_run_tasks;
+                 DROP TABLE token_usage_runs;
+                 PRAGMA user_version=53;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT title || ':' || body FROM tasks WHERE id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "historic task:historic body"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT end_reason FROM agent_runs WHERE task_id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "done"
+        );
+        for table in ["token_usage_runs", "token_usage_run_tasks"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0),)
+                    .unwrap(),
+                0,
+                "migration must not fabricate historical usage in {table}"
+            );
+        }
     }
 
     #[test]

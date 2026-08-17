@@ -1335,7 +1335,14 @@ fn recovery_respawned_agent_dies_detected_by_tick_loop() {
     ));
 
     let bad_agent = env.home.path().join("exit-agent.sh");
-    std::fs::write(&bad_agent, "#!/bin/sh\nexit 0\n").unwrap();
+    // Consume the initial stream-json turn before exiting. Exiting before the
+    // daemon finishes that write races provisioning on fast Linux runners and
+    // tests the spawn-failure poison budget instead of post-spawn death.
+    std::fs::write(
+        &bad_agent,
+        "#!/bin/sh\nIFS= read -r _turn\nsleep 1\nexit 0\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

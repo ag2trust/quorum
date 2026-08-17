@@ -34,6 +34,7 @@ struct DormantRecovery {
     model: String,
     effort: String,
     agent_run_id: i64,
+    token_usage: super::runner::TokenUsage,
     cap_run_id: String,
     rework_feedback: Option<String>,
     needs_rework_claim: bool,
@@ -41,9 +42,9 @@ struct DormantRecovery {
 
 #[derive(Debug, Clone)]
 enum DormantRecoveryDisposition {
-    Reconstruct(DormantRecovery),
+    Reconstruct(Box<DormantRecovery>),
     Retire {
-        entry: JournalEntry,
+        entry: Box<JournalEntry>,
         reason: &'static str,
     },
 }
@@ -240,12 +241,22 @@ fn validate_dormant_recovery(
     let mut active_runs = runs
         .iter()
         .filter(|run| run.role == "worker" && run.agent == entry.agent && run.ended_at.is_none());
-    let run = active_runs
-        .next()
-        .ok_or_else(|| invalid("missing active worker run binding".into()))?;
-    if active_runs.next().is_some() {
+    let active_run = active_runs.next();
+    if active_run.is_some() && active_runs.next().is_some() {
         return Err(invalid("multiple active worker run bindings".into()));
     }
+    // A failed post-launch journal handoff has already killed and reaped its
+    // provider, so that run is truthfully closed. The unchanged PID-less
+    // awaiting-review journal and active capability still authorize one exact
+    // retry; recover the newest failed handoff as that dormant binding.
+    let run = active_run
+        .or_else(|| {
+            runs.iter()
+                .rev()
+                .find(|run| run.role == "worker" && run.agent == entry.agent)
+                .filter(|run| run.end_reason.as_deref() == Some("journal-handoff-failed"))
+        })
+        .ok_or_else(|| invalid("missing active or retryable worker run binding".into()))?;
     if run.provider.as_deref() != Some(provider_name) {
         return Err(invalid("worker run provider mismatch".into()));
     }
@@ -254,6 +265,27 @@ fn validate_dormant_recovery(
     if model_provider != provider {
         return Err(invalid("worker run model/provider mismatch".into()));
     }
+    let token_usage = quorum_core::token_usage::usage_for_agent_run(conn, run.id)?
+        .map(|usage| -> Result<super::runner::TokenUsage> {
+            Ok(super::runner::TokenUsage {
+                // The legacy live total is recovered independently from the
+                // journal's scalar `cost_tokens`; only durable split buckets
+                // are restored here.
+                input_tokens: 0,
+                uncached_input_tokens: u64::try_from(usage.uncached_input_tokens)
+                    .map_err(|_| invalid("negative uncached token snapshot".into()))?,
+                cached_input_tokens: u64::try_from(usage.cached_input_tokens)
+                    .map_err(|_| invalid("negative cached token snapshot".into()))?,
+                cache_write_input_tokens: u64::try_from(usage.cache_write_input_tokens)
+                    .map_err(|_| invalid("negative cache-write token snapshot".into()))?,
+                output_tokens: u64::try_from(usage.output_tokens)
+                    .map_err(|_| invalid("negative output token snapshot".into()))?,
+                reasoning_tokens: u64::try_from(usage.reasoning_tokens)
+                    .map_err(|_| invalid("negative reasoning token snapshot".into()))?,
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
     let capability =
         quorum_core::capabilities::active_for_agent_task(conn, &entry.agent, task_id, "worker")?
             .ok_or_else(|| invalid("missing active run capability binding".into()))?;
@@ -321,6 +353,7 @@ fn validate_dormant_recovery(
         model: run.model.clone(),
         effort: run.effort.clone(),
         agent_run_id: run.id,
+        token_usage,
         cap_run_id: capability.run_id,
         rework_feedback,
         needs_rework_claim,
@@ -332,10 +365,10 @@ fn validate_dormant_recovery(
     }
     Ok(match task_disposition {
         Some(reason) => DormantRecoveryDisposition::Retire {
-            entry: entry.clone(),
+            entry: Box::new(entry.clone()),
             reason,
         },
-        None => DormantRecoveryDisposition::Reconstruct(recovery),
+        None => DormantRecoveryDisposition::Reconstruct(Box::new(recovery)),
     })
 }
 
@@ -484,6 +517,7 @@ fn reconstruct_dormant_slots(
             pr: Some(recovery.pr),
             rework_count: recovery.entry.rework_count.max(0) as u32,
             cost_tokens: recovery.entry.cost_tokens,
+            token_usage: recovery.token_usage,
             cost_usd: recovery.entry.cost_usd,
             task_started_at: now,
             turn_started_at: now,
@@ -670,9 +704,9 @@ pub(crate) async fn recover(
     let mut retired = Vec::new();
     for disposition in dispositions {
         match disposition {
-            DormantRecoveryDisposition::Reconstruct(recovery) => recoveries.push(recovery),
+            DormantRecoveryDisposition::Reconstruct(recovery) => recoveries.push(*recovery),
             DormantRecoveryDisposition::Retire { entry, reason } => {
-                retired.push((entry, reason));
+                retired.push((*entry, reason));
             }
         }
     }
@@ -1138,6 +1172,25 @@ mod tests {
         )
         .unwrap();
         assert!(run_id > 0);
+        quorum_core::token_usage::record(
+            &mut conn,
+            Some(run_id),
+            "worker",
+            &[task_id],
+            Some(901),
+            "codex",
+            "gpt-5.6-terra",
+            "medium",
+            quorum_core::token_usage::TokenUsage {
+                uncached_input_tokens: 80,
+                cached_input_tokens: 900,
+                cache_write_input_tokens: 10,
+                output_tokens: 20,
+                reasoning_tokens: 5,
+            },
+            now + 2,
+        )
+        .unwrap();
         quorum_core::capabilities::issue(
             &mut conn,
             "cap-dormant",
@@ -1205,6 +1258,18 @@ mod tests {
         assert_eq!(worker.worktree_path, fixture.worktree);
         assert_eq!(worker.continuation_id_for_launch(), Some("thread-dormant"));
         assert!(matches!(worker.proc, SlotProcess::Dormant { .. }));
+        assert_eq!(
+            worker.token_usage,
+            super::super::runner::TokenUsage {
+                input_tokens: 0,
+                uncached_input_tokens: 80,
+                cached_input_tokens: 900,
+                cache_write_input_tokens: 10,
+                output_tokens: 20,
+                reasoning_tokens: 5,
+            },
+            "dormant recovery must restore the cumulative detailed snapshot"
+        );
         assert!(roster.owns("Dormant"));
         assert!(names.acquire_named("Dormant").is_none());
 
@@ -1238,6 +1303,90 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "recovery duplicated {table}");
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_overflow_snapshot_does_not_poison_dormant_recovery() {
+        let fixture = dormant_fixture();
+        let run_id = {
+            let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            let run_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_runs WHERE task_id=?1 AND ended_at IS NULL",
+                    [fixture.task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "DELETE FROM token_usage_run_tasks WHERE run_id IN
+                    (SELECT id FROM token_usage_runs WHERE agent_run_id=?1)",
+                [run_id],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM token_usage_runs WHERE agent_run_id=?1",
+                [run_id],
+            )
+            .unwrap();
+            run_id
+        };
+
+        super::super::record_managed_usage_snapshot(
+            &fixture.config.db_path,
+            Some(run_id),
+            super::super::ManagedUsageRecord {
+                task_id: fixture.task_id,
+                purpose: "worker".into(),
+                pr_number: Some(901),
+                provider: "codex".into(),
+                model: "gpt-5.6-terra".into(),
+                effort: "medium".into(),
+                usage: super::super::runner::TokenUsage {
+                    cached_input_tokens: u64::MAX,
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        assert!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, run_id)
+                .unwrap()
+                .is_none(),
+            "overflow must not leave a negative durable snapshot"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='token_usage'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "the ignored overflow must remain observable"
+        );
+        drop(conn);
+
+        let wt_mgr = WorktreeManager::new();
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .expect("best-effort telemetry overflow must not make recovery fatal");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(
+            workers[0].token_usage,
+            super::super::runner::TokenUsage::default(),
+            "a rejected snapshot recovers as empty usage, never wrapped negative usage"
+        );
     }
 
     fn assert_recovered_sticky_rework(
@@ -1420,6 +1569,46 @@ mod tests {
             .and_then(|tail| tail.split_whitespace().next())
             .and_then(|pid| pid.parse().ok())
             .expect("journal handoff error records the synchronously reaped PID")
+    }
+
+    #[cfg(unix)]
+    fn configure_recovered_journal_handoff_failure(fixture: &mut DormantFixture, codex_body: &str) {
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.config.repo_dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        {
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            enter_merge_conflict_rework(
+                &mut conn,
+                fixture.task_id,
+                "retry the exact turn after journal handoff failure",
+            );
+            conn.execute_batch(
+                "CREATE TRIGGER reject_recovered_journal_handoff
+                   BEFORE UPDATE ON journal
+                   WHEN NEW.phase='resuming-rework'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected recovered journal failure');
+                 END;",
+            )
+            .unwrap();
+        }
+        let codex = fixture._dir.path().join("fake-codex");
+        write_executable(&codex, codex_body);
+        let gh = fixture._dir.path().join("fake-gh");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"headRefName\":\"daemon/dormant-t1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"OPEN\"}}'\n"
+            ),
+        );
+        fixture.config.agent_bin = Some(codex.to_string_lossy().into_owned());
+        fixture.config.pr_target_program = Some(gh);
     }
 
     fn begin_unrelated_decomposition_freeze(
@@ -1758,39 +1947,13 @@ mod tests {
     #[tokio::test]
     async fn post_launch_journal_failure_is_loud_reaped_and_retryable_once() {
         let mut fixture = dormant_fixture();
-        let feedback = "retry the exact turn after journal handoff failure";
-        let head = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&fixture.config.repo_dir)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
-        assert!(head.status.success());
-        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
-        {
-            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
-            enter_merge_conflict_rework(&mut conn, fixture.task_id, feedback);
-            conn.execute_batch(
-                "CREATE TRIGGER reject_recovered_journal_handoff
-                   BEFORE UPDATE ON journal
-                   WHEN NEW.phase='resuming-rework'
-                 BEGIN
-                   SELECT RAISE(ABORT, 'injected recovered journal failure');
-                 END;",
-            )
-            .unwrap();
-        }
-        let codex = fixture._dir.path().join("fake-codex");
-        write_executable(&codex, "#!/bin/sh\nexec sleep 30\n");
-        let gh = fixture._dir.path().join("fake-gh");
-        write_executable(
-            &gh,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' '{{\"headRefName\":\"daemon/dormant-t1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"OPEN\"}}'\n"
-            ),
+        configure_recovered_journal_handoff_failure(
+            &mut fixture,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3}}'
+exec sleep 30
+"#,
         );
-        fixture.config.agent_bin = Some(codex.to_string_lossy().into_owned());
-        fixture.config.pr_target_program = Some(gh);
 
         let daemon_pid = std::process::id() as i64;
         let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
@@ -1830,7 +1993,29 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(live_authority, (1, 1));
+        assert_eq!(
+            live_authority,
+            (0, 1),
+            "the reaped provider run is closed while its exact retry capability remains active"
+        );
+        let failed_run = quorum_core::agent_runs::runs_for_task(&conn, fixture.task_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.end_reason.as_deref() == Some("journal-handoff-failed"))
+            .expect("the post-insert run is truthfully settled");
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, failed_run.id)
+                .unwrap()
+                .unwrap(),
+            quorum_core::token_usage::TokenUsage {
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 3,
+            },
+            "the failed handoff run retains all terminal token buckets"
+        );
         conn.execute_batch("DROP TRIGGER reject_recovered_journal_handoff")
             .unwrap();
         drop(conn);
@@ -1870,6 +2055,60 @@ mod tests {
         assert_eq!(authority, (3, 1), "restart launches one replacement run");
         drop(conn);
         workers.remove(0).kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_launch_journal_failure_bounds_unterminated_stdout_before_reap() {
+        let mut fixture = dormant_fixture();
+        let chunk = "x".repeat(4096);
+        configure_recovered_journal_handoff_failure(
+            &mut fixture,
+            &format!("#!/bin/sh\nwhile :; do printf '%s' '{chunk}'; done\n"),
+        );
+
+        let daemon_pid = std::process::id() as i64;
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        quorum_core::daemon_lock::try_acquire(
+            &mut conn,
+            daemon_pid,
+            super::super::now_unix(),
+            30,
+            |_| false,
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::super::tick_loop(&fixture.config, daemon_pid),
+        )
+        .await
+        .expect("unterminated provider output must not prevent fatal handoff settlement")
+        .expect_err("injected journal handoff failure must remain fatal");
+        assert_eq!(error.exit_code(), 3);
+        assert!(
+            error.to_string().contains("journal handoff failed"),
+            "{error}"
+        );
+        let pid = reaped_pid_from_error(&error.to_string());
+        assert!(!process_is_alive(pid), "failed provider must be reaped");
+
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let failed_run = quorum_core::agent_runs::runs_for_task(&conn, fixture.task_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.end_reason.as_deref() == Some("journal-handoff-failed"))
+            .expect("the bounded failure path settles the inserted run");
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, failed_run.id)
+                .unwrap()
+                .unwrap(),
+            quorum_core::token_usage::TokenUsage::default(),
+            "malformed non-terminal output cannot fabricate token usage"
+        );
+        let entry = journal::list_in_flight(&conn).unwrap().remove(0);
+        assert_eq!((entry.phase.as_str(), entry.pid), ("awaiting-review", None));
     }
 
     #[tokio::test]

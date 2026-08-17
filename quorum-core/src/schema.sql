@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 53). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 54). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -572,6 +572,39 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     role_assignment_id INTEGER REFERENCES role_assignments(id)
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
+
+-- Durable token telemetry for every model invocation. Managed worker/reviewer
+-- rows point at agent_runs; daemon classifier and post-merge collector rows do
+-- not need a synthetic agent identity. Task attribution is many-to-many because
+-- one classifier invocation may classify a batch of tasks. Sweep retains these
+-- rows for 30 days, including after their task row is reclaimed, then deletes
+-- mappings before runs because v1 intentionally has no foreign keys.
+CREATE TABLE IF NOT EXISTS token_usage_runs (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_run_id             INTEGER UNIQUE,
+    purpose                  TEXT NOT NULL CHECK(purpose IN ('worker','reviewer','classifier','collector')),
+    pr_number                INTEGER,
+    provider                 TEXT NOT NULL,
+    model                    TEXT NOT NULL,
+    effort                   TEXT NOT NULL,
+    uncached_input_tokens    INTEGER NOT NULL DEFAULT 0,
+    cached_input_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens            INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens         INTEGER NOT NULL DEFAULT 0,
+    recorded_at              INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS token_usage_runs_pr ON token_usage_runs(pr_number);
+CREATE INDEX IF NOT EXISTS token_usage_runs_recorded
+    ON token_usage_runs(recorded_at);
+
+CREATE TABLE IF NOT EXISTS token_usage_run_tasks (
+    run_id  INTEGER NOT NULL,
+    task_id INTEGER NOT NULL,
+    PRIMARY KEY (run_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS token_usage_run_tasks_task
+    ON token_usage_run_tasks(task_id);
 
 -- `activity_events`: one row per Claude PostToolUse hook firing. `agent_name`
 -- is resolved at insert time (NULL if the session isn't registered).

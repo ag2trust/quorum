@@ -36,12 +36,24 @@ pub enum Event {
     Other,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
     pub output_tokens: u64,
+}
+
+impl Usage {
+    /// Legacy live display/cap measurement. Cache activity remains available
+    /// in the stream breakdown but does not change the established gauge.
+    pub fn live_total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
 }
 
 pub fn parse_line(line: &str) -> Option<Event> {
