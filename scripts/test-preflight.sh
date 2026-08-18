@@ -139,8 +139,10 @@ EOF
 mkdir "$INERT_REPO/docs"
 printf 'docs only\n' > "$INERT_REPO/docs/x.md"
 : >"$TMP/inert-cargo.log"
-PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" \
-  "$INERT_REPO/preflight.sh" >"$TMP/inert-docs.out"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-docs.out"
 grep -q 'PREFLIGHT: skipping clippy + test — diff is docs/config-only (1 files)' \
   "$TMP/inert-docs.out"
 cmp "$TMP/inert-fmt.expected" "$TMP/inert-cargo.log"
@@ -148,8 +150,10 @@ cmp "$TMP/inert-fmt.expected" "$TMP/inert-cargo.log"
 git -C "$INERT_REPO" add docs/x.md
 git -C "$INERT_REPO" commit -qm 'docs-only committed change'
 : >"$TMP/inert-cargo.log"
-PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" \
-  "$INERT_REPO/preflight.sh" >"$TMP/inert-committed-docs.out"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-committed-docs.out"
 grep -q 'PREFLIGHT: skipping clippy + test — diff is docs/config-only (1 files)' \
   "$TMP/inert-committed-docs.out"
 cmp "$TMP/inert-fmt.expected" "$TMP/inert-cargo.log"
@@ -157,16 +161,20 @@ cmp "$TMP/inert-fmt.expected" "$TMP/inert-cargo.log"
 mkdir -p "$INERT_REPO/.claude/skills/quorum"
 printf 'compiled skill input\n' > "$INERT_REPO/.claude/skills/quorum/SKILL.md"
 : >"$TMP/inert-cargo.log"
-PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" \
-  "$INERT_REPO/preflight.sh" >"$TMP/inert-skill.out"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-skill.out"
 ! grep -q 'skipping clippy + test' "$TMP/inert-skill.out"
 cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
 
 git -C "$INERT_REPO" clean -fd
 printf 'pub fn compiled() {}\n' > "$INERT_REPO/compiled.rs"
 : >"$TMP/inert-cargo.log"
-PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" \
-  "$INERT_REPO/preflight.sh" >"$TMP/inert-rust.out"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-rust.out"
 ! grep -q 'skipping clippy + test' "$TMP/inert-rust.out"
 cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
 
@@ -175,8 +183,10 @@ mkdir -p "$INERT_REPO/docs" "$INERT_REPO/quorum-core/src"
 printf 'mixed docs\n' > "$INERT_REPO/docs/x.md"
 printf 'compiled schema input\n' > "$INERT_REPO/quorum-core/src/schema.sql"
 : >"$TMP/inert-cargo.log"
-PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" \
-  "$INERT_REPO/preflight.sh" >"$TMP/inert-mixed-schema.out"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-mixed-schema.out"
 ! grep -q 'skipping clippy + test' "$TMP/inert-mixed-schema.out"
 cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
 
