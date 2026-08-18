@@ -21,6 +21,7 @@ use quorum_core::lifecycle::Event;
 use quorum_core::runner_state::{self, ContinuationSlot};
 use quorum_core::{approvals, error::QuorumError, error::Result, tasks};
 use rusqlite::OptionalExtension;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -35,6 +36,7 @@ struct DormantRecovery {
     effort: String,
     agent_run_id: i64,
     token_usage: super::runner::TokenUsage,
+    limit_tokens: i64,
     cap_run_id: String,
     rework_feedback: Option<String>,
     needs_rework_claim: bool,
@@ -65,6 +67,7 @@ fn validate_dormant_recovery(
     conn: &rusqlite::Connection,
     entry: &JournalEntry,
     now: i64,
+    token_limit_basis: crate::serve_config::TokenLimitBasis,
 ) -> Result<DormantRecoveryDisposition> {
     let invalid = |detail: String| dormant_recovery_error(&entry.agent, detail);
     if !is_explicit_dormant_recovery_entry(entry) {
@@ -286,6 +289,8 @@ fn validate_dormant_recovery(
         })
         .transpose()?
         .unwrap_or_default();
+    let limit_tokens =
+        recovered_limit_tokens(conn, &runs, task_id, &entry.agent, token_limit_basis)?;
     let capability =
         quorum_core::capabilities::active_for_agent_task(conn, &entry.agent, task_id, "worker")?
             .ok_or_else(|| invalid("missing active run capability binding".into()))?;
@@ -354,6 +359,7 @@ fn validate_dormant_recovery(
         effort: run.effort.clone(),
         agent_run_id: run.id,
         token_usage,
+        limit_tokens,
         cap_run_id: capability.run_id,
         rework_feedback,
         needs_rework_claim,
@@ -370,6 +376,59 @@ fn validate_dormant_recovery(
         },
         None => DormantRecoveryDisposition::Reconstruct(Box::new(recovery)),
     })
+}
+
+/// Rebuild an active watchdog total from durable split buckets. The journal's
+/// `cost_tokens` remains the historical raw inspection scalar and cannot be
+/// reused after a repository changes its token-limit basis.
+fn recovered_limit_tokens(
+    conn: &rusqlite::Connection,
+    runs: &[quorum_core::agent_runs::AgentRun],
+    task_id: i64,
+    agent: &str,
+    basis: crate::serve_config::TokenLimitBasis,
+) -> Result<i64> {
+    let matching_runs: HashSet<i64> = runs
+        .iter()
+        .filter(|run| run.role == "worker" && run.agent == agent)
+        .map(|run| run.id)
+        .collect();
+    let mut total = 0_i64;
+    for usage_run in quorum_core::token_usage::for_task(conn, task_id)? {
+        let Some(agent_run_id) = usage_run.agent_run_id else {
+            continue;
+        };
+        if !matching_runs.contains(&agent_run_id) {
+            continue;
+        }
+        let usage = usage_run.usage;
+        let uncached = u64::try_from(usage.uncached_input_tokens)
+            .map_err(|_| dormant_recovery_error(agent, "negative uncached token snapshot"))?;
+        let cached = u64::try_from(usage.cached_input_tokens)
+            .map_err(|_| dormant_recovery_error(agent, "negative cached token snapshot"))?;
+        let cache_write = u64::try_from(usage.cache_write_input_tokens)
+            .map_err(|_| dormant_recovery_error(agent, "negative cache-write token snapshot"))?;
+        let output = u64::try_from(usage.output_tokens)
+            .map_err(|_| dormant_recovery_error(agent, "negative output token snapshot"))?;
+        let input = match usage_run.provider.as_str() {
+            // Claude and Codex report cache writes outside input_tokens.
+            "claude" | "codex" => uncached.saturating_add(cached),
+            // Grok's normalized raw input includes cache creation tokens.
+            "grok" => uncached.saturating_add(cached).saturating_add(cache_write),
+            provider => {
+                return Err(dormant_recovery_error(
+                    agent,
+                    format!("unknown token-usage provider '{provider}'"),
+                ));
+            }
+        };
+        let turn = match basis {
+            crate::serve_config::TokenLimitBasis::Raw => input.saturating_add(output),
+            crate::serve_config::TokenLimitBasis::Uncached => uncached.saturating_add(output),
+        };
+        total = total.saturating_add(i64::try_from(turn).unwrap_or(i64::MAX));
+    }
+    Ok(total)
 }
 
 fn normalize_interrupted_rework_journals(
@@ -518,6 +577,7 @@ fn reconstruct_dormant_slots(
             pr: Some(recovery.pr),
             rework_count: recovery.entry.rework_count.max(0) as u32,
             cost_tokens: recovery.entry.cost_tokens,
+            limit_tokens: recovery.limit_tokens,
             token_usage: recovery.token_usage,
             cost_usd: recovery.entry.cost_usd,
             task_started_at: now,
@@ -688,12 +748,15 @@ pub(crate) async fn recover(
 
     let dispositions = {
         let p = db_path.clone();
+        let token_limit_basis = config.limits.token_limit_basis;
         tokio::task::spawn_blocking(move || -> Result<Vec<DormantRecoveryDisposition>> {
             let mut conn = quorum_core::db::open(&p)?;
             let tx = quorum_core::db::begin_immediate(&mut conn)?;
             let dispositions = dormant_entries
                 .iter()
-                .map(|entry| validate_dormant_recovery(&tx, entry, super::now_unix()))
+                .map(|entry| {
+                    validate_dormant_recovery(&tx, entry, super::now_unix(), token_limit_basis)
+                })
                 .collect::<Result<Vec<_>>>()?;
             tx.commit()?;
             Ok(dispositions)
@@ -1303,6 +1366,87 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 1, "recovery duplicated {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_task_token_ceiling_in_the_current_basis() {
+        for (basis, prior_journal_total, expected_total, max, breaches) in [
+            (
+                crate::serve_config::TokenLimitBasis::Uncached,
+                6_590_100,
+                281_761,
+                500_000,
+                false,
+            ),
+            (
+                crate::serve_config::TokenLimitBasis::Raw,
+                281_761,
+                6_590_100,
+                500_000,
+                true,
+            ),
+        ] {
+            let mut fixture = dormant_fixture();
+            fixture.config.limits.token_limit_basis = basis;
+            fixture.config.limits.max_task_tokens = Some(max);
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            let run_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_runs WHERE task_id=?1 AND ended_at IS NULL",
+                    [fixture.task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            quorum_core::token_usage::record(
+                &mut conn,
+                Some(run_id),
+                "worker",
+                &[fixture.task_id],
+                Some(901),
+                "codex",
+                "gpt-5.6-terra",
+                "medium",
+                quorum_core::token_usage::TokenUsage {
+                    uncached_input_tokens: 281_661,
+                    cached_input_tokens: 6_308_339,
+                    cache_write_input_tokens: 40,
+                    output_tokens: 100,
+                    reasoning_tokens: 10,
+                },
+                super::super::now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE journal SET cost_tokens=?1 WHERE agent='Dormant'",
+                [prior_journal_total],
+            )
+            .unwrap();
+            drop(conn);
+
+            let mut names = super::super::names::Pool::new_generated();
+            let mut workers = Vec::new();
+            recover(
+                &fixture.config,
+                &WorktreeManager::new(),
+                &mut names,
+                &mut workers,
+                &mut LifetimeRoster::new(),
+            )
+            .await
+            .unwrap();
+            let worker = workers.first().expect("recovered dormant worker");
+            assert_eq!(worker.limit_tokens, expected_total);
+            assert_eq!(worker.cost_tokens, prior_journal_total);
+            let breach = super::super::check_post_result_limits(
+                &fixture.config.limits,
+                0,
+                worker.limit_tokens,
+                Some(0.0),
+                0.0,
+                worker,
+            );
+            assert_eq!(breach.is_some(), breaches, "basis {basis}");
         }
     }
 

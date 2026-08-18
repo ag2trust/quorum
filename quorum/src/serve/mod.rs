@@ -3379,7 +3379,11 @@ pub(crate) struct SlotState {
     pending_watchdog_breach: Option<String>,
     pr: Option<i64>,
     rework_count: u32,
+    /// Legacy raw input + output accounting kept in the journal and live
+    /// inspection surfaces for compatibility.
     cost_tokens: i64,
+    /// Selected token-limit-basis cumulative accounting for watchdog ceilings.
+    limit_tokens: i64,
     token_usage: runner::TokenUsage,
     cost_usd: f64,
     task_started_at: std::time::Instant,
@@ -13791,10 +13795,14 @@ async fn drain_events(
                 runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
                     let turn_tokens =
                         usage.map_or(0, |u| token_limit_total(u, limits.token_limit_basis));
+                    let raw_turn_tokens = usage.map_or(0, |u| {
+                        token_limit_total(u, crate::serve_config::TokenLimitBasis::Raw)
+                    });
                     if let Some(usage) = usage {
                         slot.token_usage.saturating_add_assign(*usage);
                     }
-                    slot.cost_tokens = slot.cost_tokens.saturating_add(turn_tokens);
+                    slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
+                    slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
                     // cost_usd is session-cumulative (running total), not per-turn.
                     let prev_cost = slot.cost_usd;
                     if let Some(cost) = cost_usd {
@@ -13803,7 +13811,7 @@ async fn drain_events(
                     let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
                     log(&format!(
                         "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4})",
-                        slot.agent_name, turn_tokens, slot.cost_tokens, slot.cost_usd,
+                        slot.agent_name, turn_tokens, slot.limit_tokens, slot.cost_usd,
                     ));
 
                     let phase = if role == "worker" {
@@ -13845,7 +13853,7 @@ async fn drain_events(
                     let breach = check_post_result_limits(
                         limits,
                         turn_tokens,
-                        slot.cost_tokens,
+                        slot.limit_tokens,
                         turn_cost_usd,
                         slot.cost_usd,
                         slot,
@@ -13860,10 +13868,14 @@ async fn drain_events(
                 } => {
                     let turn_tokens =
                         usage.map_or(0, |u| token_limit_total(u, limits.token_limit_basis));
+                    let raw_turn_tokens = usage.map_or(0, |u| {
+                        token_limit_total(u, crate::serve_config::TokenLimitBasis::Raw)
+                    });
                     if let Some(usage) = usage {
                         slot.token_usage.saturating_add_assign(*usage);
                     }
-                    slot.cost_tokens = slot.cost_tokens.saturating_add(turn_tokens);
+                    slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
+                    slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
                     let prev_cost = slot.cost_usd;
                     if let Some(cost) = cost_usd {
                         slot.cost_usd = *cost;
@@ -13871,7 +13883,7 @@ async fn drain_events(
                     let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
                     log(&format!(
                         "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4}, ERROR)",
-                        slot.agent_name, turn_tokens, slot.cost_tokens, slot.cost_usd,
+                        slot.agent_name, turn_tokens, slot.limit_tokens, slot.cost_usd,
                     ));
 
                     if let Some(ref mut sl) = slot.session_log {
@@ -13908,7 +13920,7 @@ async fn drain_events(
                     let breach = check_post_result_limits(
                         limits,
                         turn_tokens,
-                        slot.cost_tokens,
+                        slot.limit_tokens,
                         turn_cost_usd,
                         slot.cost_usd,
                         slot,
@@ -15075,6 +15087,7 @@ async fn provision_reviewer_reserved(
                 pr: Some(pr),
                 rework_count: 0,
                 cost_tokens: 0,
+                limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -15852,6 +15865,7 @@ async fn spawn_worker(
                     daemon_rework_retry_requested(task.refs.as_deref()),
                 ),
                 cost_tokens: 0,
+                limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -18026,6 +18040,7 @@ async fn spawn_remediation_worker(
                 pr: Some(pr),
                 rework_count: 1,
                 cost_tokens: 0,
+                limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -19502,6 +19517,7 @@ mod tests {
             pr: None,
             rework_count: 0,
             cost_tokens: 500,
+            limit_tokens: 500,
             token_usage: runner::TokenUsage::default(),
             cost_usd: 0.01,
             task_started_at: now,
@@ -20572,6 +20588,7 @@ mod tests {
                 pr: Some(443),
                 rework_count: 0,
                 cost_tokens: 17,
+                limit_tokens: 17,
                 token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -21733,6 +21750,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             pr: Some(553),
             rework_count: 0,
             cost_tokens: 0,
+            limit_tokens: 0,
             token_usage: runner::TokenUsage::default(),
             cost_usd: 0.0,
             task_started_at: now,
