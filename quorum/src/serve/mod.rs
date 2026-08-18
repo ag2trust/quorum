@@ -6888,7 +6888,42 @@ struct MergeRetryAuthority {
 #[derive(Debug)]
 struct InvalidMergeRetryAuthority {
     stale_roles: Vec<&'static str>,
+    stale_sampling_head: Option<String>,
+    repair_and_continue: bool,
     reason: String,
+}
+
+impl InvalidMergeRetryAuthority {
+    fn return_to_review(stale_roles: Vec<&'static str>, reason: String) -> Self {
+        Self {
+            stale_roles,
+            stale_sampling_head: None,
+            repair_and_continue: false,
+            reason,
+        }
+    }
+
+    fn return_to_review_with_stale_sampling(
+        stale_roles: Vec<&'static str>,
+        stale_sampling_head: String,
+        reason: String,
+    ) -> Self {
+        Self {
+            stale_roles,
+            stale_sampling_head: Some(stale_sampling_head),
+            repair_and_continue: false,
+            reason,
+        }
+    }
+
+    fn repair_and_continue(stale_roles: Vec<&'static str>, reason: String) -> Self {
+        Self {
+            stale_roles,
+            stale_sampling_head: None,
+            repair_and_continue: true,
+            reason,
+        }
+    }
 }
 
 /// Validate the complete durable half of an explicit merge replay against a
@@ -6902,10 +6937,10 @@ fn validate_merge_retry_authority(
     live: &ResolvedReviewerPrTarget,
 ) -> Result<std::result::Result<MergeRetryAuthority, InvalidMergeRetryAuthority>> {
     let invalid_all = |reason: String| {
-        Ok(Err(InvalidMergeRetryAuthority {
-            stale_roles: vec!["r1", "r2"],
+        Ok(Err(InvalidMergeRetryAuthority::return_to_review(
+            vec!["r1", "r2"],
             reason,
-        }))
+        )))
     };
     let Some(task) = tasks::get(conn, task_id)? else {
         return invalid_all(format!("merge retry task #{task_id} disappeared"));
@@ -6960,14 +6995,13 @@ fn validate_merge_retry_authority(
             })
     };
     if !role_valid("r1") {
-        return Ok(Err(InvalidMergeRetryAuthority {
-            stale_roles: rows
-                .iter()
+        return Ok(Err(InvalidMergeRetryAuthority::return_to_review(
+            rows.iter()
                 .filter(|row| row.review_role == "r1")
                 .map(|_| "r1")
                 .collect(),
-            reason: format!("PR #{pr} is missing a valid exact-head R1 approval"),
-        }));
+            format!("PR #{pr} is missing a valid exact-head R1 approval"),
+        )));
     }
 
     let r2_required = match quorum_core::review_audits::r2_requirement(
@@ -6977,18 +7011,39 @@ fn validate_merge_retry_authority(
         &live.target.head_sha,
     ) {
         Ok(Some(required)) => required,
-        // Missing/corrupt sampled-R2 evidence fails closed to a fresh R2.
-        Ok(None) | Err(_) => true,
+        // The sampling row is authority in its own right. An R2 approval
+        // cannot substitute for a missing or differently-task-bound decision.
+        // Re-run R1 so the daemon recreates the decision, while retaining an
+        // exact R2 that a newly-required decision may safely reuse.
+        Ok(None) => {
+            return Ok(Err(
+                InvalidMergeRetryAuthority::return_to_review_with_stale_sampling(
+                    vec!["r1"],
+                    live.target.head_sha.clone(),
+                    format!("PR #{pr} has no durable sampled-R2 decision for task #{task_id}"),
+                ),
+            ));
+        }
+        Err(error) => {
+            return Ok(Err(
+                InvalidMergeRetryAuthority::return_to_review_with_stale_sampling(
+                    vec!["r1"],
+                    live.target.head_sha.clone(),
+                    format!(
+                        "PR #{pr} has non-authoritative sampled-R2 evidence for task #{task_id}: {error}"
+                    ),
+                ),
+            ));
+        }
     };
     if r2_required && !role_valid("r2") {
-        return Ok(Err(InvalidMergeRetryAuthority {
-            stale_roles: rows
-                .iter()
+        return Ok(Err(InvalidMergeRetryAuthority::return_to_review(
+            rows.iter()
                 .filter(|row| row.review_role == "r2")
                 .map(|_| "r2")
                 .collect(),
-            reason: format!("PR #{pr} is missing a valid exact-head R2 approval"),
-        }));
+            format!("PR #{pr} is missing a valid exact-head R2 approval"),
+        )));
     }
 
     // A rejected/blocking/misattributed extra row is never ignored merely
@@ -7007,13 +7062,20 @@ fn validate_merge_retry_authority(
             "r2" => vec!["r2"],
             _ => vec!["r1", "r2"],
         };
-        return Ok(Err(InvalidMergeRetryAuthority {
+        let reason = format!(
+            "PR #{pr} has non-authoritative durable {} evidence",
+            invalid.review_role
+        );
+        if !r2_required && invalid.review_role == "r2" {
+            return Ok(Err(InvalidMergeRetryAuthority::repair_and_continue(
+                stale_roles,
+                reason,
+            )));
+        }
+        return Ok(Err(InvalidMergeRetryAuthority::return_to_review(
             stale_roles,
-            reason: format!(
-                "PR #{pr} has non-authoritative durable {} evidence",
-                invalid.review_role
-            ),
-        }));
+            reason,
+        )));
     }
 
     let reviewer = if r2_required {
@@ -7038,6 +7100,12 @@ async fn invalidate_explicit_merge_retry(
     pr: i64,
     invalid: InvalidMergeRetryAuthority,
 ) -> Result<()> {
+    let InvalidMergeRetryAuthority {
+        stale_roles,
+        stale_sampling_head,
+        reason,
+        ..
+    } = invalid;
     let p = db_path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -7045,8 +7113,11 @@ async fn invalidate_explicit_merge_retry(
             &mut conn,
             task_id,
             pr,
-            &invalid.stale_roles,
-            &invalid.reason,
+            tasks::StaleMergeRetryEvidence {
+                roles: &stale_roles,
+                sampling_head: stale_sampling_head.as_deref(),
+            },
+            &reason,
             now_unix(),
         )?;
         Ok(())
@@ -7054,6 +7125,75 @@ async fn invalidate_explicit_merge_retry(
     .await
     .map_err(|error| QuorumError::Io(format!("merge retry invalidation join: {error}")))??;
     Ok(())
+}
+
+async fn read_merge_retry_authority(
+    db_path: &Path,
+    task_id: i64,
+    pr: i64,
+    live: &ResolvedReviewerPrTarget,
+) -> Result<std::result::Result<MergeRetryAuthority, InvalidMergeRetryAuthority>> {
+    let p = db_path.to_path_buf();
+    let live = live.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&p)?;
+        validate_merge_retry_authority(&conn, task_id, pr, &live)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("merge retry authority join: {error}")))?
+}
+
+/// Read the complete authority and permit one bounded cleanup pass for stale
+/// evidence belonging to a role that the durable sampling decision made
+/// optional. No network call has happened yet, the `attempting` marker remains
+/// held throughout, and the second read must be fully authoritative.
+async fn reconcile_merge_retry_authority(
+    db_path: &Path,
+    task_id: i64,
+    pr: i64,
+    live: &ResolvedReviewerPrTarget,
+) -> Result<Option<MergeRetryAuthority>> {
+    let authority = read_merge_retry_authority(db_path, task_id, pr, live).await?;
+    match authority {
+        Ok(authority) => Ok(Some(authority)),
+        Err(invalid) if invalid.repair_and_continue => {
+            let stale_roles = invalid.stale_roles.clone();
+            let reason = invalid.reason.clone();
+            let p = db_path.to_path_buf();
+            let repaired = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let mut conn = quorum_core::db::open(&p)?;
+                tasks::repair_merge_retry_evidence(
+                    &mut conn,
+                    task_id,
+                    pr,
+                    &stale_roles,
+                    &reason,
+                    now_unix(),
+                )
+            })
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!("merge retry authority repair join: {error}"))
+            })??;
+            if !repaired {
+                return Err(QuorumError::Io(format!(
+                    "task #{task_id} lost merge retry authority before evidence repair"
+                )));
+            }
+
+            match read_merge_retry_authority(db_path, task_id, pr, live).await? {
+                Ok(authority) => Ok(Some(authority)),
+                Err(invalid) => {
+                    invalidate_explicit_merge_retry(db_path, task_id, pr, invalid).await?;
+                    Ok(None)
+                }
+            }
+        }
+        Err(invalid) => {
+            invalidate_explicit_merge_retry(db_path, task_id, pr, invalid).await?;
+            Ok(None)
+        }
+    }
 }
 
 async fn rework_explicit_merge_retry(
@@ -7067,10 +7207,7 @@ async fn rework_explicit_merge_retry(
         &config.db_path,
         task_id,
         pr,
-        InvalidMergeRetryAuthority {
-            stale_roles: vec!["r1", "r2"],
-            reason: reason.to_string(),
-        },
+        InvalidMergeRetryAuthority::return_to_review(vec!["r1", "r2"], reason.to_string()),
     )
     .await?;
     let task = {
@@ -7123,10 +7260,10 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
             &config.db_path,
             task_id,
             0,
-            InvalidMergeRetryAuthority {
-                stale_roles: vec!["r1", "r2"],
-                reason: format!("task #{task_id} merge retry lost its PR association"),
-            },
+            InvalidMergeRetryAuthority::return_to_review(
+                vec!["r1", "r2"],
+                format!("task #{task_id} merge retry lost its PR association"),
+            ),
         )
         .await?;
         return Ok(());
@@ -7167,12 +7304,12 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
             &config.db_path,
             task_id,
             pr,
-            InvalidMergeRetryAuthority {
-                stale_roles: vec!["r1", "r2"],
-                reason: format!(
+            InvalidMergeRetryAuthority::return_to_review(
+                vec!["r1", "r2"],
+                format!(
                     "task #{task_id} has no immutable target branch; legacy merge approval cannot be replayed"
                 ),
-            },
+            ),
         )
         .await?;
         return Ok(());
@@ -7184,30 +7321,15 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
             &config.db_path,
             task_id,
             pr,
-            InvalidMergeRetryAuthority {
-                stale_roles: vec!["r1", "r2"],
-                reason,
-            },
+            InvalidMergeRetryAuthority::return_to_review(vec!["r1", "r2"], reason),
         )
         .await?;
         return Ok(());
     }
-    let authority = {
-        let p = config.db_path.clone();
-        let live = live.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = quorum_core::db::open(&p)?;
-            validate_merge_retry_authority(&conn, task_id, pr, &live)
-        })
-        .await
-        .map_err(|error| QuorumError::Io(format!("merge retry authority join: {error}")))??
-    };
-    let authority = match authority {
-        Ok(authority) => authority,
-        Err(invalid) => {
-            invalidate_explicit_merge_retry(&config.db_path, task_id, pr, invalid).await?;
-            return Ok(());
-        }
+    let Some(authority) =
+        reconcile_merge_retry_authority(&config.db_path, task_id, pr, &live).await?
+    else {
+        return Ok(());
     };
 
     let mergeability = {
@@ -7245,10 +7367,10 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
                 &config.db_path,
                 task_id,
                 pr,
-                InvalidMergeRetryAuthority {
-                    stale_roles: vec!["r1", "r2"],
-                    reason: format!("PR #{pr} is closed without merge"),
-                },
+                InvalidMergeRetryAuthority::return_to_review(
+                    vec!["r1", "r2"],
+                    format!("PR #{pr} is closed without merge"),
+                ),
             )
             .await?;
             return Ok(());
@@ -7346,30 +7468,15 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
             &config.db_path,
             task_id,
             pr,
-            InvalidMergeRetryAuthority {
-                stale_roles: vec!["r1", "r2"],
-                reason,
-            },
+            InvalidMergeRetryAuthority::return_to_review(vec!["r1", "r2"], reason),
         )
         .await?;
         return Ok(());
     }
-    let final_authority = {
-        let p = config.db_path.clone();
-        let live = live.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = quorum_core::db::open(&p)?;
-            validate_merge_retry_authority(&conn, task_id, pr, &live)
-        })
-        .await
-        .map_err(|error| QuorumError::Io(format!("final merge retry authority join: {error}")))??
-    };
-    let final_authority = match final_authority {
-        Ok(authority) => authority,
-        Err(invalid) => {
-            invalidate_explicit_merge_retry(&config.db_path, task_id, pr, invalid).await?;
-            return Ok(());
-        }
+    let Some(final_authority) =
+        reconcile_merge_retry_authority(&config.db_path, task_id, pr, &live).await?
+    else {
+        return Ok(());
     };
 
     let final_mergeability = {
@@ -7410,10 +7517,10 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
                 &config.db_path,
                 task_id,
                 pr,
-                InvalidMergeRetryAuthority {
-                    stale_roles: vec!["r1", "r2"],
-                    reason: format!("PR #{pr} is closed without merge"),
-                },
+                InvalidMergeRetryAuthority::return_to_review(
+                    vec!["r1", "r2"],
+                    format!("PR #{pr} is closed without merge"),
+                ),
             )
             .await?;
             return Ok(());
@@ -10366,7 +10473,10 @@ async fn tick(
                                             &mut conn,
                                             reviewer_task_id,
                                             pr_num,
-                                            &["r1", "r2"],
+                                            tasks::StaleMergeRetryEvidence {
+                                                roles: &["r1", "r2"],
+                                                sampling_head: None,
+                                            },
                                             &reason,
                                             now_unix(),
                                         )
@@ -23790,6 +23900,152 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
     }
 
+    struct SuccessfulMergeCounter {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl merge::MergeExecutor for SuccessfulMergeCounter {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            merge::MergeResult {
+                success: true,
+                message: "merged".into(),
+                failure_kind: None,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_sampling_with_both_approvals_never_calls_merge_and_requests_r1() {
+        let (dir, conn, task_id, live) = seeded_merge_retry_authority();
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(refs, '$.daemon_merge_retry', 'requested') WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM r2_sampling_decisions WHERE task_id=?1",
+            [task_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let repo = tempfile::tempdir().unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("q.db"), repo.path().into());
+        config.repo = "test/repo".into();
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-missing-sampling",
+            &open_pr_target_json(
+                &live.target.head_ref,
+                &live.target.head_sha,
+                live.target.base_ref.as_deref().unwrap(),
+            ),
+        ));
+        let executor = Arc::new(PolicyBlockedMergeCounter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        config.merge_executor = executor.clone();
+
+        reconcile_merge_retries(&config, false).await.unwrap();
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+        assert!(quorum_core::approvals::get(&conn, 42, "r1")
+            .unwrap()
+            .is_none());
+        assert!(quorum_core::approvals::get(&conn, 42, "r2")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            next_needed_role(&conn, 42, &live.target.head_sha).unwrap(),
+            Some("r1")
+        );
+        assert_eq!(
+            quorum_core::review_audits::r2_requirement(&conn, task_id, 42, &live.target.head_sha,)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_optional_r2_is_cleaned_and_one_merge_call_completes() {
+        let (dir, conn, task_id, live) = seeded_merge_retry_authority();
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(refs, '$.daemon_merge_retry', 'requested') WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE r2_sampling_decisions SET required=0
+             WHERE task_id=?1 AND pr_number=42 AND head_sha='abc123'",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE approvals SET verdict='changes', blocking_count=1
+             WHERE pr_number=42 AND review_role='r2'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let repo = tempfile::tempdir().unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("q.db"), repo.path().into());
+        config.repo = "test/repo".into();
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-optional-r2-repair",
+            &open_pr_target_json(
+                &live.target.head_ref,
+                &live.target.head_sha,
+                live.target.base_ref.as_deref().unwrap(),
+            ),
+        ));
+        let executor = Arc::new(SuccessfulMergeCounter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        config.merge_executor = executor.clone();
+
+        reconcile_merge_retries(&config, false).await.unwrap();
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(tasks::get(&conn, task_id).unwrap().unwrap().status, "done");
+        assert!(quorum_core::approvals::get_for_pr(&conn, 42)
+            .unwrap()
+            .is_empty());
+        let repairs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE subject=?1 AND kind='merge_retry_authority_repaired'",
+                [tasks::lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repairs, 1);
+        let starts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE subject=?1 AND kind='merge_retry_started'",
+                [tasks::lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(starts, 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn repeated_policy_failure_requires_one_owner_retry_per_merge_call() {
@@ -24003,7 +24259,18 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     fn repaired_r1_recognizes_retained_exact_task_r2_without_duplicate_review() {
         let (_dir, mut conn, task_id, live) = seeded_merge_retry_authority();
         quorum_core::approvals::delete_role(&mut conn, 42, "r1").unwrap();
-        tasks::invalidate_merge_retry(&mut conn, task_id, 42, &[], "R1 missing", 102).unwrap();
+        tasks::invalidate_merge_retry(
+            &mut conn,
+            task_id,
+            42,
+            tasks::StaleMergeRetryEvidence {
+                roles: &[],
+                sampling_head: None,
+            },
+            "R1 missing",
+            102,
+        )
+        .unwrap();
         quorum_core::approvals::record(
             &mut conn,
             &quorum_core::approvals::Approval {
@@ -24051,11 +24318,151 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             [task_id],
         )
         .unwrap();
-        quorum_core::approvals::delete_role(&mut conn, 42, "r2").unwrap();
         let invalid = validate_merge_retry_authority(&conn, task_id, 42, &live)
             .unwrap()
             .unwrap_err();
-        assert!(invalid.reason.contains("R2"));
+        assert_eq!(invalid.stale_roles, vec!["r1"]);
+        assert_eq!(
+            invalid.stale_sampling_head.as_deref(),
+            Some(live.target.head_sha.as_str())
+        );
+        assert!(!invalid.repair_and_continue);
+        assert!(invalid.reason.contains("sampled-R2 decision"));
+
+        tasks::invalidate_merge_retry(
+            &mut conn,
+            task_id,
+            42,
+            tasks::StaleMergeRetryEvidence {
+                roles: &invalid.stale_roles,
+                sampling_head: invalid.stale_sampling_head.as_deref(),
+            },
+            &invalid.reason,
+            102,
+        )
+        .unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+        assert!(quorum_core::approvals::get(&conn, 42, "r1")
+            .unwrap()
+            .is_none());
+        assert!(quorum_core::approvals::get(&conn, 42, "r2")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            next_needed_role(&conn, 42, &live.target.head_sha).unwrap(),
+            Some("r1")
+        );
+    }
+
+    #[test]
+    fn merge_retry_authority_task_mismatched_sampling_rebuilds_from_r1() {
+        let (_dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        let other_task_id = tasks::create(
+            &mut conn,
+            "creator",
+            "other sampling owner",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            101,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE r2_sampling_decisions SET task_id=?1
+             WHERE pr_number=42 AND head_sha='abc123'",
+            [other_task_id],
+        )
+        .unwrap();
+
+        let invalid = validate_merge_retry_authority(&conn, task_id, 42, &live)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(invalid.stale_roles, vec!["r1"]);
+        assert_eq!(
+            invalid.stale_sampling_head.as_deref(),
+            Some(live.target.head_sha.as_str())
+        );
+        assert!(!invalid.repair_and_continue);
+
+        tasks::invalidate_merge_retry(
+            &mut conn,
+            task_id,
+            42,
+            tasks::StaleMergeRetryEvidence {
+                roles: &invalid.stale_roles,
+                sampling_head: invalid.stale_sampling_head.as_deref(),
+            },
+            &invalid.reason,
+            102,
+        )
+        .unwrap();
+        assert_eq!(
+            quorum_core::review_audits::r2_requirement(&conn, task_id, 42, &live.target.head_sha,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            next_needed_role(&conn, 42, &live.target.head_sha).unwrap(),
+            Some("r1")
+        );
+        assert!(quorum_core::approvals::get(&conn, 42, "r2")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn optional_invalid_r2_is_repaired_then_authority_revalidates() {
+        let (_dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        conn.execute(
+            "UPDATE r2_sampling_decisions SET required=0
+             WHERE task_id=?1 AND pr_number=42 AND head_sha='abc123'",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE approvals SET verdict='changes', blocking_count=1
+             WHERE pr_number=42 AND review_role='r2'",
+            [],
+        )
+        .unwrap();
+
+        let invalid = validate_merge_retry_authority(&conn, task_id, 42, &live)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(invalid.stale_roles, vec!["r2"]);
+        assert!(invalid.repair_and_continue);
+        assert!(tasks::repair_merge_retry_evidence(
+            &mut conn,
+            task_id,
+            42,
+            &invalid.stale_roles,
+            &invalid.reason,
+            102,
+        )
+        .unwrap());
+
+        let authority = validate_merge_retry_authority(&conn, task_id, 42, &live)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.reviewer, "rev-r1");
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "merging"
+        );
+        assert_eq!(
+            quorum_core::approvals::get_for_pr(&conn, 42)
+                .unwrap()
+                .iter()
+                .map(|row| row.review_role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r1"]
+        );
     }
 
     #[test]

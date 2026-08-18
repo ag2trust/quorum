@@ -380,7 +380,11 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   parking. A parked merge restores `merging` with one durable daemon-owned replay intent;
   the daemon revalidates the exact persisted PR target, base, head, required role approvals,
   sampled-R2 decision, and CI before making at most one approval/merge call. Invalid or
-  incomplete authority returns to `in-review` for the first missing role.
+  incomplete authority returns to `in-review` for the first missing role. A missing or
+  differently-task-bound sampling decision invalidates the R1 sampling anchor and decision
+  together, preserving an exact R2 while a fresh R1 recreates the decision. An invalid extra
+  R2 row for a durable sampled skip is removed under the existing one-shot attempt and the
+  complete authority is reread once before any merge call.
   Provider/auth/quota/protocol parks atomically require and clear their provider-block marker.
   A provider-parked
   `working` task returns to `open`; a true `rework` task remains unassigned in
@@ -769,7 +773,12 @@ branch. A parked `merging` task restores to `merging` and records
 persisted target tuple, expected base, live head, exact task/role/SHA approvals, durable R2
 sampling decision, and CI. Valid authority performs one merge replay without allocating a
 reviewer; missing or stale authority is invalidated narrowly and returns to `in-review` for
-the first missing role. Legacy tasks without an immutable `target_branch` cannot directly
+the first missing role. Missing or task-mismatched sampling evidence cannot be replaced by
+otherwise-valid R1/R2 rows: the daemon atomically removes that decision and R1, then normal
+review recreates the decision from a fresh R1 while retaining an exact R2. If a durable skip
+makes R2 optional but a stale extra R2 row exists, the daemon atomically removes only that row
+and rereads the complete authority once under the same `attempting` marker; it never issues
+more than the one merge call authorized by the owner retry. Legacy tasks without an immutable `target_branch` cannot directly
 replay approval; their approvals are invalidated and review is rebuilt against a persisted
 base. A repeated policy/infrastructure failure parks again with approvals intact. The ordinary
 live reviewed path also writes `attempting` immediately before its first remote merge call, and
