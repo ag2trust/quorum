@@ -7693,6 +7693,15 @@ async fn tick(
             continue;
         }
 
+        // A review draft is intentionally non-authoritative continuation context.
+        // Consume it without entering any verdict, teardown, or lifecycle path.
+        if row.kind == mailbox::MailboxKind::ReviewDraft {
+            if !consume_review_draft(&db_path, *id, row).await {
+                break;
+            }
+            continue;
+        }
+
         // kind=done — existing lifecycle processing below.
         let note_suffix = row
             .note
@@ -12345,6 +12354,19 @@ async fn tick(
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     Ok(())
+}
+
+/// Consume a non-authoritative reviewer draft without changing lifecycle state.
+async fn consume_review_draft(
+    db_path: &std::path::Path,
+    id: i64,
+    row: &mailbox::MailboxRow,
+) -> bool {
+    log(&format!(
+        "review-draft from {} (task {:?}, pr {:?}, blocking={:?}) consumed without lifecycle action",
+        row.agent, row.task_id, row.pr, row.payload
+    ));
+    consume_mailbox_row(db_path, id).await
 }
 
 /// Consume a mailbox row. Returns false on failure (caller should break and retry next tick).
@@ -18562,6 +18584,131 @@ mod tests {
     use super::*;
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[tokio::test]
+    async fn review_draft_consumption_is_lifecycle_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("review-draft.db");
+        let (task_id, mailbox_id, row) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "review draft fixture",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='in-review', assignee='Worker', reviewer='R1', rework_round=2 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO claims(target,holder,ts,expires_at,active) VALUES (?1,'R1',1,?2,1)",
+                rusqlite::params![format!("task#{task_id}"), now_unix() + 60],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO journal(agent,role,task_id,session_id,phase,pr,updated_at)
+                 VALUES ('R1','reviewer',?1,'session-r1','reviewing',77,1)",
+                [task_id],
+            )
+            .unwrap();
+            let row = mailbox::MailboxRow {
+                agent: "R1".into(),
+                kind: mailbox::MailboxKind::ReviewDraft,
+                task_id: Some(task_id),
+                pr: Some(77),
+                verdict: None,
+                feedback: Some("Need a second analysis turn for cancellation.".into()),
+                note: None,
+                to_agent: None,
+                payload: Some("{\"blocking\":1}".into()),
+            };
+            let mailbox_id = mailbox::append(&mut conn, &row).unwrap();
+            (task_id, mailbox_id, row)
+        };
+
+        let snapshot = |conn: &quorum_core::Connection,
+                        task_id|
+         -> (
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) {
+            let task = conn
+                .query_row(
+                    "SELECT status,assignee,reviewer,rework_round FROM tasks WHERE id=?1",
+                    [task_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            let approvals = conn
+                .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0))
+                .unwrap();
+            let active_claims = conn
+                .query_row("SELECT COUNT(*) FROM claims WHERE active=1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let reviewer_slots = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM journal WHERE agent='R1' AND role='reviewer'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let worker_notifications = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM messages WHERE recipient='Worker'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (
+                task.0,
+                task.1,
+                task.2,
+                task.3,
+                approvals,
+                active_claims,
+                reviewer_slots,
+                worker_notifications,
+            )
+        };
+        let before = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            snapshot(&conn, task_id)
+        };
+
+        assert!(consume_review_draft(&db_path, mailbox_id, &row).await);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            snapshot(&conn, task_id),
+            before,
+            "draft must not mutate lifecycle authority"
+        );
+        let consumed: bool = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(consumed, "draft must be safely consumed");
+    }
 
     #[test]
     fn review_cycle_context_reloads_persisted_rework_round_after_restart() {
