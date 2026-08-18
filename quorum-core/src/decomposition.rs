@@ -386,6 +386,178 @@ fn is_unique_constraint(error: &rusqlite::Error) -> bool {
     matches!(error, rusqlite::Error::SqliteFailure(f, _) if f.code == ErrorCode::ConstraintViolation)
 }
 
+#[derive(Debug)]
+struct PlanningRetryCandidate {
+    graph_id: i64,
+    hold_code: String,
+    retry_count: i64,
+}
+
+fn planning_attempt_history_is_consistent(
+    conn: &Connection,
+    graph_id: i64,
+    source_revision: i64,
+    retry_count: i64,
+    proposal_attempts: i64,
+    provider_failures: i64,
+    hold_code: &str,
+) -> Result<bool> {
+    let generation_count = (retry_count + 1) as usize;
+    let mut attempts_by_generation = vec![[0_i64; 2]; generation_count];
+    let mut expected_ordinal = [1_i64; 2];
+    let mut last_generation = [-1_i64; 2];
+    let mut stmt = conn.prepare(
+        "SELECT source_revision,kind,ordinal,retry_generation
+         FROM decomposition_attempts WHERE graph_id=?1 ORDER BY kind,ordinal",
+    )?;
+    let mut rows = stmt.query([graph_id])?;
+    while let Some(row) = rows.next()? {
+        let attempt_source_revision: i64 = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let ordinal: i64 = row.get(2)?;
+        let generation: i64 = row.get(3)?;
+        let kind_index = match kind.as_str() {
+            "proposal" => 0,
+            "provider" => 1,
+            _ => return Ok(false),
+        };
+        if attempt_source_revision != source_revision
+            || ordinal != expected_ordinal[kind_index]
+            || generation < last_generation[kind_index]
+            || generation < 0
+            || generation > retry_count
+        {
+            return Ok(false);
+        }
+        let count = &mut attempts_by_generation[generation as usize][kind_index];
+        *count += 1;
+        if *count > 3 {
+            return Ok(false);
+        }
+        expected_ordinal[kind_index] += 1;
+        last_generation[kind_index] = generation;
+    }
+
+    let mut replayed = [0_i64; 2];
+    for (generation, attempts) in attempts_by_generation.into_iter().enumerate() {
+        replayed[0] += attempts[0];
+        replayed[1] += attempts[1];
+        if replayed[0] > MAX_PROPOSAL_ATTEMPTS || replayed[1] > MAX_PROVIDER_FAILURES {
+            return Ok(false);
+        }
+        if generation + 1 < generation_count {
+            match (
+                replayed[0] == MAX_PROPOSAL_ATTEMPTS,
+                replayed[1] == MAX_PROVIDER_FAILURES,
+            ) {
+                (true, false) => replayed[0] = 0,
+                (false, true) => replayed[1] = 0,
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    Ok(replayed == [proposal_attempts, provider_failures]
+        && match hold_code {
+            "proposal-attempts-exhausted" => {
+                replayed[0] == MAX_PROPOSAL_ATTEMPTS && replayed[1] < MAX_PROVIDER_FAILURES
+            }
+            "provider-attempts-exhausted" => {
+                replayed[1] == MAX_PROVIDER_FAILURES && replayed[0] < MAX_PROPOSAL_ATTEMPTS
+            }
+            _ => false,
+        })
+}
+
+fn planning_retry_candidate(
+    conn: &Connection,
+    source_task_id: i64,
+    now: i64,
+) -> Result<Option<PlanningRetryCandidate>> {
+    let candidate: Option<(i64, String, i64, i64, i64, i64)> = conn
+        .query_row(
+            "SELECT d.id,d.hold_code,d.operator_retry_count,d.planned_source_revision,
+                    d.proposal_attempts,d.provider_failures
+             FROM task_decompositions d
+             JOIN tasks t ON t.id=d.source_task_id
+             WHERE d.source_task_id=?1
+               AND d.state='held' AND d.active=0 AND d.freeze_active=0
+               AND d.hold_code IN ('provider-attempts-exhausted',
+                                   'proposal-attempts-exhausted')
+               AND d.operator_retry_count BETWEEN 0 AND ?2
+               AND d.accepted_proposal_json IS NULL
+               AND d.accepted_plan_revision IS NULL
+               AND t.status='failed' AND t.assignee IS NULL AND t.reviewer IS NULL
+               AND t.revision=d.planned_source_revision
+               AND t.review_only=0 AND t.continue_pr IS NULL
+               AND t.completion_provenance IS NULL
+               AND (t.refs IS NULL OR (
+                    json_valid(t.refs)
+                    AND json_type(t.refs,'$.pr') IS NULL
+                    AND json_type(t.refs,'$.recovery_delivery') IS NULL))
+               AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.graph_id=d.id)
+               AND NOT EXISTS (SELECT 1 FROM decomposition_cleanup c WHERE c.graph_id=d.id)
+               AND NOT EXISTS (SELECT 1 FROM agent_runs r WHERE r.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM journal j WHERE j.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM task_branches b WHERE b.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM pr_targets p WHERE p.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM approvals a WHERE a.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations r
+                               WHERE r.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM claims c
+                               WHERE c.target=('task#' || t.id)
+                                 AND c.active=1 AND c.expires_at>?3)",
+            params![source_task_id, MAX_OPERATOR_RETRIES, now],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        graph_id,
+        hold_code,
+        retry_count,
+        source_revision,
+        proposal_attempts,
+        provider_failures,
+    )) = candidate
+    else {
+        return Ok(None);
+    };
+    if !planning_attempt_history_is_consistent(
+        conn,
+        graph_id,
+        source_revision,
+        retry_count,
+        proposal_attempts,
+        provider_failures,
+        &hold_code,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(PlanningRetryCandidate {
+        graph_id,
+        hold_code,
+        retry_count,
+    }))
+}
+
+pub(crate) fn exhausted_planning_retry_is_eligible(
+    conn: &Connection,
+    source_task_id: i64,
+    now: i64,
+) -> Result<bool> {
+    Ok(planning_retry_candidate(conn, source_task_id, now)?
+        .is_some_and(|candidate| candidate.retry_count < MAX_OPERATOR_RETRIES))
+}
+
 /// Explicitly resume an exhausted, pre-materialization planning aggregate.
 ///
 /// Every eligibility and negative-evidence check is made under one immediate
@@ -398,85 +570,15 @@ pub fn retry_exhausted_planning(
     now: i64,
 ) -> Result<PlanningRetryOutcome> {
     let tx = begin_immediate(conn)?;
-
-    let candidate: Option<(i64, String, i64)> = tx
-        .query_row(
-            "SELECT d.id,d.hold_code,d.operator_retry_count
-             FROM task_decompositions d
-             JOIN tasks t ON t.id=d.source_task_id
-             WHERE d.source_task_id=?1
-               AND d.state='held' AND d.active=0 AND d.freeze_active=0
-               AND d.hold_code IN ('provider-attempts-exhausted',
-                                   'proposal-attempts-exhausted')
-               AND d.operator_retry_count BETWEEN 0 AND ?5
-               AND d.accepted_proposal_json IS NULL
-               AND d.accepted_plan_revision IS NULL
-               AND t.status='failed' AND t.assignee IS NULL AND t.reviewer IS NULL
-               AND t.revision=d.planned_source_revision
-               AND t.review_only=0 AND t.continue_pr IS NULL
-               AND t.completion_provenance IS NULL
-               AND (t.refs IS NULL OR (
-                    json_valid(t.refs)
-                    AND json_type(t.refs,'$.pr') IS NULL
-                    AND json_type(t.refs,'$.recovery_delivery') IS NULL))
-               AND ((d.hold_code='provider-attempts-exhausted'
-                     AND d.provider_failures=?2)
-                 OR (d.hold_code='proposal-attempts-exhausted'
-                     AND d.proposal_attempts=?3))
-               AND (SELECT count(*) FROM decomposition_attempts a
-                    WHERE a.graph_id=d.id
-                      AND a.retry_generation=d.operator_retry_count
-                      AND a.kind=CASE d.hold_code
-                          WHEN 'provider-attempts-exhausted' THEN 'provider'
-                          ELSE 'proposal' END)=3
-               AND (d.operator_retry_count<1 OR
-                    EXISTS (SELECT 1 FROM decomposition_attempts prior
-                            WHERE prior.graph_id=d.id AND prior.retry_generation=0
-                              AND prior.kind IN ('provider','proposal')
-                            GROUP BY prior.kind HAVING count(*)=3))
-               AND (d.operator_retry_count<2 OR
-                    EXISTS (SELECT 1 FROM decomposition_attempts prior
-                            WHERE prior.graph_id=d.id AND prior.retry_generation=1
-                              AND prior.kind IN ('provider','proposal')
-                            GROUP BY prior.kind HAVING count(*)=3))
-               AND NOT EXISTS (
-                    SELECT 1 FROM decomposition_attempts invalid
-                    WHERE invalid.graph_id=d.id AND (
-                         invalid.retry_generation<0
-                         OR invalid.retry_generation>d.operator_retry_count
-                         OR invalid.kind IN ('blocker','recovery')))
-               AND NOT EXISTS (
-                    SELECT 1 FROM decomposition_attempts excessive
-                    WHERE excessive.graph_id=d.id
-                      AND excessive.kind IN ('provider','proposal')
-                    GROUP BY excessive.retry_generation,excessive.kind
-                    HAVING count(*)>3)
-               AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.graph_id=d.id)
-               AND NOT EXISTS (SELECT 1 FROM decomposition_cleanup c WHERE c.graph_id=d.id)
-               AND NOT EXISTS (SELECT 1 FROM agent_runs r WHERE r.task_id=t.id)
-               AND NOT EXISTS (SELECT 1 FROM journal j WHERE j.task_id=t.id)
-               AND NOT EXISTS (SELECT 1 FROM task_branches b WHERE b.task_id=t.id)
-               AND NOT EXISTS (SELECT 1 FROM pr_targets p WHERE p.task_id=t.id)
-               AND NOT EXISTS (SELECT 1 FROM approvals a WHERE a.task_id=t.id)
-               AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations r
-                               WHERE r.task_id=t.id)
-               AND NOT EXISTS (SELECT 1 FROM claims c
-                               WHERE c.target=('task#' || t.id)
-                                 AND c.active=1 AND c.expires_at>?4)",
-            params![
-                source_task_id,
-                MAX_PROVIDER_FAILURES,
-                MAX_PROPOSAL_ATTEMPTS,
-                now,
-                MAX_OPERATOR_RETRIES
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let Some((graph_id, hold_code, retry_count)) = candidate else {
+    let Some(candidate) = planning_retry_candidate(&tx, source_task_id, now)? else {
         tx.commit().map_err(map_sql_err)?;
         return Ok(PlanningRetryOutcome::NotEligible);
     };
+    let PlanningRetryCandidate {
+        graph_id,
+        hold_code,
+        retry_count,
+    } = candidate;
     if retry_count >= MAX_OPERATOR_RETRIES {
         tx.commit().map_err(map_sql_err)?;
         return Ok(PlanningRetryOutcome::RetryCapExhausted { retry_count });
@@ -3917,11 +4019,26 @@ mod tests {
     fn exhausted_proposal_retry_resets_only_proposal_budget_and_resumes_freeze() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        conn.execute(
-            "UPDATE task_decompositions SET provider_failures=1 WHERE id=?1",
-            [graph],
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "timeout",
+            "preserved provider failure",
+            3,
         )
-        .unwrap();
+        .unwrap()
+        .is_some());
+        assert!(reacquire_freeze(&mut conn, graph, 4).unwrap());
+        assert!(set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            5,
+        )
+        .unwrap());
         for ordinal in 1..=MAX_PROPOSAL_ATTEMPTS {
             if ordinal > 1 {
                 assert!(set_frozen_phase(
@@ -3995,6 +4112,181 @@ mod tests {
             )
             .unwrap();
         assert_eq!(latest, (4, 1));
+    }
+
+    #[test]
+    fn exhausted_carried_proposal_budget_remains_operator_retryable() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        for attempt in 0..2 {
+            let phase = if attempt == 0 {
+                "preclassifying"
+            } else {
+                assert!(
+                    set_frozen_phase(&mut conn, graph, "planning", "validating", None, 10,)
+                        .unwrap()
+                );
+                "validating"
+            };
+            conn.execute(
+                "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                [graph],
+            )
+            .unwrap();
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "semantic",
+                "carried proposal rejection",
+                11 + attempt,
+            )
+            .unwrap());
+        }
+        exhaust_planning(&mut conn, graph, "provider", 20);
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 40).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 1, .. }
+        ));
+
+        assert!(reacquire_freeze(&mut conn, graph, 41).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "validating", None, 42,)
+                .unwrap()
+        );
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "validating",
+            "semantic",
+            "exhaust carried proposal budget",
+            43,
+        )
+        .unwrap());
+        let held: (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT hold_code,proposal_attempts,provider_failures,
+                        (SELECT count(*) FROM decomposition_attempts
+                         WHERE graph_id=?1 AND kind='proposal' AND retry_generation=1)
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(held, ("proposal-attempts-exhausted".into(), 3, 0, 1));
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 44).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn exhausted_carried_provider_budget_remains_operator_retryable() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "timeout",
+            "first carried provider failure",
+            10,
+        )
+        .unwrap()
+        .is_some());
+        assert!(reacquire_freeze(&mut conn, graph, 11).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 12,).unwrap()
+        );
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "timeout",
+            "second carried provider failure",
+            13,
+        )
+        .unwrap()
+        .is_some());
+        assert!(reacquire_freeze(&mut conn, graph, 14).unwrap());
+        assert!(set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            15,
+        )
+        .unwrap());
+        for attempt in 0..MAX_PROPOSAL_ATTEMPTS {
+            let phase = if attempt == 0 {
+                "preclassifying"
+            } else {
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "planning",
+                    "validating",
+                    None,
+                    20 + attempt,
+                )
+                .unwrap());
+                "validating"
+            };
+            conn.execute(
+                "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                [graph],
+            )
+            .unwrap();
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "semantic",
+                "proposal rejection before carried provider exhaustion",
+                30 + attempt,
+            )
+            .unwrap());
+        }
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 40).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 1, .. }
+        ));
+
+        assert!(reacquire_freeze(&mut conn, graph, 41).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 42,).unwrap()
+        );
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "timeout",
+            "exhaust carried provider budget",
+            43,
+        )
+        .unwrap()
+        .is_some());
+        let held: (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT hold_code,proposal_attempts,provider_failures,
+                        (SELECT count(*) FROM decomposition_attempts
+                         WHERE graph_id=?1 AND kind='provider' AND retry_generation=1)
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(held, ("provider-attempts-exhausted".into(), 0, 3, 1));
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 44).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 2, .. }
+        ));
     }
 
     #[test]
