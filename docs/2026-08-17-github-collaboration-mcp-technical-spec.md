@@ -444,14 +444,25 @@ authored summary. A successful or reconciled create persists the remote review I
 publication slot. If the create response is lost, the marker, publisher scope, PR, and immutable
 launch SHA are the recovery identity; the daemon never guesses from review position or body text.
 
-The create claim transaction changes its slot's `create_send_state` from `not_started` to
-`ambiguous` before committing and before Repository Service I/O. A successful response or exact
-marker reconciliation changes it to `confirmed`. It may change to `definitely_unsent` only when
-the same live Repository Service invocation returns a closed transport result proving that it
-failed before handing any request to GitHub; timeout, cancellation, process death, lost response,
-daemon crash, or an unrecognized result is always `ambiguous`. After a crash, startup therefore
-defaults conservatively from the persisted pre-I/O state without inferring non-delivery from a
-dead child.
+Every create claim, including a retry after `definitely_unsent`, atomically changes its slot's
+`create_send_state` from either `not_started` or `definitely_unsent` to `ambiguous` in the same
+guarded transaction that changes the operation from `queued` to `running`. The transaction also
+requires that the slot is still `owned` by that operation's attempt; only after it commits may the
+daemon begin Repository Service I/O. A cleanup transition that wins the transaction race prevents
+the claim and therefore the send; a claim that wins leaves persisted ambiguity before cleanup can
+observe it. Sending a create while the slot is `not_started` or `definitely_unsent`, or claiming
+one from `ambiguous` or `confirmed`, is forbidden.
+
+A successful response or exact marker reconciliation changes the send state to `confirmed`. The
+same live Repository Service invocation may change it from `ambiguous` to `definitely_unsent` only
+when a closed transport result proves that it failed before handing any request to GitHub; this
+completed invocation may schedule the same durable operation for a bounded retry. Before that
+retry performs any I/O, its next claim must atomically change `definitely_unsent` back to
+`ambiguous` under the rule above. Timeout, cancellation, process death, lost response, daemon
+crash, or an unrecognized result leaves the state `ambiguous`. Thus `not_started` and
+`definitely_unsent` are true only while no create invocation is in flight or can still land from a
+prior invocation. After a crash, startup defaults conservatively from the persisted pre-I/O state
+without inferring non-delivery from a dead child.
 
 Before provisioning the first reviewer or any distinct re-review/R1/R2 attempt, the daemon
 atomically inserts the unique `(publisher_scope, pr_number)` slot in `probing` state. It commits,
@@ -484,14 +495,16 @@ review ID and leaves the slot cleanup-required; it never replaces a newer owner.
 The daemon claims cleanup with a guarded `cleanup_required -> cleanup_running` update under
 `BEGIN IMMEDIATE`, commits, and performs no more than a bounded read/delete/re-read sequence
 through the Repository Service. It deletes only the current pending review with the exact stored
-owner marker, PR, publisher scope, launch SHA, and remote ID when known. For `not_started` or
-`definitely_unsent`, no pending review is idempotent cleanup success because no create can still
-land. A `confirmed` create has a persisted remote ID; cleanup addresses that exact ID instead of
-trusting an empty pending-review listing. An exact delete success, authoritative exact-ID lookup
-showing it is no longer pending, or 404 after the exact delete is success because the one create
-has already reached a terminal remote disposition. A timeout or crash after delete is reconciled
-through that exact ID: confirmed non-pending state completes cleanup, while the same exact marker
-may be retried. A foreign or ambiguous review is never deleted and makes the slot `blocked`.
+owner marker, PR, publisher scope, launch SHA, and remote ID when known. After the guarded
+transition away from `owned` has made every queued create permanently unclaimable, no pending
+review is idempotent cleanup success for `not_started` or `definitely_unsent` because no invocation
+is in flight and no prior invocation can still land. A `confirmed` create has a persisted remote
+ID; cleanup addresses that exact ID instead of trusting an empty pending-review listing. An exact
+delete success, authoritative exact-ID lookup showing it is no longer pending, or 404 after the
+exact delete is success because the one create has already reached a terminal remote disposition.
+A timeout or crash after delete is reconciled through that exact ID: confirmed non-pending state
+completes cleanup, while the same exact marker may be retried. A foreign or ambiguous review is
+never deleted and makes the slot `blocked`.
 
 For `ambiguous`, an empty read is only one negative observation. It leaves the slot
 `cleanup_required`, increments the bounded reconciliation count, and schedules another read after
@@ -656,6 +669,11 @@ Required tests include:
 - cleanup cannot claim until every old review network child has completed or been killed, reaped,
   and locally reconciled; killing a post-send create then returning one or more empty reads never
   permits resend or slot release;
+- a first create call that proves `definitely_unsent` remains retryable, but the retry claim
+  atomically persists `ambiguous` before Repository Service I/O; if that retry is handed off and
+  then times out, is cancelled, or loses its response, an empty cleanup read neither releases the
+  slot nor authorizes another create until exact marker/ID reconciliation or the specified remote
+  fence completes;
 - the fake Repository Service accepts a create, returns the first cleanup read as empty, and makes
   the marked draft visible only on a later read; the slot remains unavailable until the draft is
   found, exactly deleted, and proven non-pending by exact ID;
