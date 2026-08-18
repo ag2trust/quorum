@@ -1109,6 +1109,17 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
         let status = status?;
         let evidence = slot.proc.finalize_pre_authoritative_evidence().await;
         if !status.success() {
+            if let Some(failure) = slot.proc.observed_strict_pre_authoritative_failure() {
+                return Some(provider_failure(
+                    slot,
+                    &format!(
+                        "planner provider exited unsuccessfully after terminal response ({}) at {status}: {}",
+                        failure.disposition(),
+                        failure.detail()
+                    ),
+                    "exact",
+                ));
+            }
             return Some(provider_failure(
                 slot,
                 &format!(
@@ -1829,6 +1840,10 @@ mod tests {
         let cases = [
             ("nonzero-exit", "exit 7"),
             (
+                "nonzero-exit-with-informational-stderr",
+                "printf '%s\\n' 'Codex changed its informational input notice.' >&2; exit 7",
+            ),
+            (
                 "trailing-stdout",
                 "printf '%s\\n' '{\"type\":\"error\",\"message\":\"fatal trailing error\"}'",
             ),
@@ -1868,6 +1883,16 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("non-failover"));
+            }
+            if name == "nonzero-exit-with-informational-stderr" {
+                let diagnostic = failure_json(&outcome);
+                let failure = diagnostic["failure"].as_str().unwrap();
+                assert!(failure.contains("unclassified"));
+                assert!(failure.contains("Codex stderr did not match a bounded provider signal"));
+                assert!(
+                    !failure.contains("Codex changed its informational input notice."),
+                    "durable failure retained raw provider stderr"
+                );
             }
             slot.kill_and_reap().await;
         }

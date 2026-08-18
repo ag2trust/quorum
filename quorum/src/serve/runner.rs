@@ -899,6 +899,14 @@ impl RunnerProc {
         self.failure_tracker().observed_planner_terminal_failure()
     }
 
+    /// Return any bounded failure evidence even after a syntactic terminal
+    /// record. A caller that has separately established a nonzero exit must
+    /// use this strict view so deferred stderr remains available for its
+    /// durable failure summary.
+    pub fn observed_strict_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
+        self.failure_tracker().observed_strict_failure()
+    }
+
     pub async fn next_raw_line(&mut self) -> Option<String> {
         match self {
             Self::Claude(proc) => proc.next_raw_line().await,
