@@ -7203,13 +7203,6 @@ async fn rework_explicit_merge_retry(
     reviewer: &str,
     reason: &str,
 ) -> Result<()> {
-    invalidate_explicit_merge_retry(
-        &config.db_path,
-        task_id,
-        pr,
-        InvalidMergeRetryAuthority::return_to_review(vec!["r1", "r2"], reason.to_string()),
-    )
-    .await?;
     let task = {
         let p = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
@@ -7220,20 +7213,30 @@ async fn rework_explicit_merge_retry(
         .map_err(|error| QuorumError::Io(format!("merge retry task reload join: {error}")))??
     };
     if task.as_ref().is_some_and(|task| task.review_only) {
+        invalidate_explicit_merge_retry(
+            &config.db_path,
+            task_id,
+            pr,
+            InvalidMergeRetryAuthority::return_to_review(vec!["r1", "r2"], reason.to_string()),
+        )
+        .await?;
         set_task_body(&config.db_path, task_id, tasks::MERGE_BLOCKED_BODY).await;
         return Ok(());
     }
     let effective_base =
         effective_task_base_branch(&config.db_path, task_id, &config.base_branch).await?;
     let feedback = merge_base_remediation_message(reason, &effective_base);
-    fire_actionable_rework_event(
-        &config.db_path,
-        reviewer,
-        task_id,
-        &Event::VerdictChanges,
-        &feedback,
-    )
-    .await;
+    let p = config.db_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::rework_approved_merge(&mut conn, task_id, pr, &feedback, now_unix())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("merge retry rework join: {error}")))??;
+    log(&format!(
+        "task #{task_id} merge replay assigned actionable rework by {reviewer}"
+    ));
     Ok(())
 }
 
@@ -7534,6 +7537,7 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
             reviewer_name: final_authority.reviewer.clone(),
             review_task_id: task_id,
             expected_base_branch: effective_base,
+            expected_head_sha: live.target.head_sha.clone(),
         };
         tokio::task::spawn_blocking(move || executor.merge(pr, &repo, &ctx))
             .await
@@ -7562,6 +7566,21 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
                     task_id,
                     &format!("merge retry policy blocked PR #{pr}: {}", result.message),
                     "merging",
+                )
+                .await?;
+            }
+            merge::MergeFailureKind::StaleAuthority => {
+                invalidate_explicit_merge_retry(
+                    &config.db_path,
+                    task_id,
+                    pr,
+                    InvalidMergeRetryAuthority::return_to_review(
+                        vec!["r1", "r2"],
+                        format!(
+                            "merge retry authority became stale for PR #{pr}: {}",
+                            result.message
+                        ),
+                    ),
                 )
                 .await?;
             }
@@ -10296,6 +10315,9 @@ async fn tick(
                                 reviewer_name: reviewers[ri].agent_name.clone(),
                                 review_task_id: reviewer_task_id,
                                 expected_base_branch: effective_base_branch.clone(),
+                                expected_head_sha: current_sha
+                                    .clone()
+                                    .expect("validated current review head"),
                             };
                             tokio::task::spawn_blocking(move || {
                                 executor.merge(pr_num, &repo, &merge_ctx)
@@ -10422,6 +10444,34 @@ async fn tick(
                             .unwrap_or(merge::MergeFailureKind::PolicyBlocked);
 
                         match failure_kind {
+                            merge::MergeFailureKind::StaleAuthority => {
+                                let p = db_path.clone();
+                                let reason = format!(
+                                    "PR #{pr_num} head moved after managed approval: {}",
+                                    merge_result.message
+                                );
+                                tokio::task::spawn_blocking(move || -> Result<()> {
+                                    let mut conn = quorum_core::db::open(&p)?;
+                                    tasks::invalidate_merge_retry(
+                                        &mut conn,
+                                        reviewer_task_id,
+                                        pr_num,
+                                        tasks::StaleMergeRetryEvidence {
+                                            roles: &["r1", "r2"],
+                                            sampling_head: None,
+                                        },
+                                        &reason,
+                                        now_unix(),
+                                    )?;
+                                    Ok(())
+                                })
+                                .await
+                                .map_err(|error| {
+                                    QuorumError::Io(format!(
+                                        "stale merge authority disposition join: {error}"
+                                    ))
+                                })??;
+                            }
                             merge::MergeFailureKind::PolicyBlocked
                             | merge::MergeFailureKind::PolicyPending => {
                                 log(&format!(
@@ -10457,17 +10507,36 @@ async fn tick(
                                 // consumed atomically before remediation.
                                 log(&format!(
                                     "PR #{pr_num} merge failed (retryable): {} \
-                                     — firing MergeFailed",
+                                     — entering actionable rework",
                                     merge_result.message
                                 ));
-                                // merging → in-review (NotifyOwner alert posted by lifecycle)
-                                let p = db_path.clone();
-                                let reason = format!(
-                                    "Merge of PR #{pr_num} failed: {}",
-                                    merge_result.message
-                                );
-                                let mf = Some(
-                                    tokio::task::spawn_blocking(move || {
+                                let is_review_only = {
+                                    let p = db_path.clone();
+                                    tokio::task::spawn_blocking(move || -> Result<bool> {
+                                        let conn = quorum_core::db::open(&p)?;
+                                        tasks::get(&conn, reviewer_task_id)?
+                                            .map(|task| task.review_only)
+                                            .ok_or_else(|| {
+                                                QuorumError::Io(format!(
+                                                    "task #{reviewer_task_id} disappeared during retryable merge disposition"
+                                                ))
+                                            })
+                                    })
+                                    .await
+                                    .map_err(|error| {
+                                        QuorumError::Io(format!(
+                                            "retryable merge task lookup join: {error}"
+                                        ))
+                                    })??
+                                };
+
+                                if is_review_only {
+                                    let p = db_path.clone();
+                                    let reason = format!(
+                                        "Merge of PR #{pr_num} failed: {}",
+                                        merge_result.message
+                                    );
+                                    tokio::task::spawn_blocking(move || -> Result<()> {
                                         let mut conn = quorum_core::db::open(&p)?;
                                         tasks::invalidate_merge_retry(
                                             &mut conn,
@@ -10479,20 +10548,15 @@ async fn tick(
                                             },
                                             &reason,
                                             now_unix(),
-                                        )
+                                        )?;
+                                        Ok(())
                                     })
                                     .await
                                     .map_err(|error| {
                                         QuorumError::Io(format!(
-                                            "merge retryable disposition join: {error}"
+                                            "review-only retryable disposition join: {error}"
                                         ))
-                                    })??,
-                                );
-
-                                let is_review_only =
-                                    mf.as_ref().is_some_and(|tr| tr.task.review_only);
-
-                                if is_review_only {
+                                    })??;
                                     log(&format!(
                                         "review-only task #{reviewer_task_id}: \
                                          merge blocked (retryable) — parking, not failing"
@@ -10513,8 +10577,8 @@ async fn tick(
                                     )
                                     .await;
                                 } else {
-                                    // in-review → rework
-                                    let reviewer_name = reviewers[ri].agent_name.clone();
+                                    // merging → rework with authority consumption
+                                    // and actionable feedback in one transaction.
                                     let rework_msg = merge_base_remediation_message(
                                         &format!(
                                             "Merge of PR #{pr_num} failed: {}",
@@ -10522,14 +10586,28 @@ async fn tick(
                                         ),
                                         &effective_base_branch,
                                     );
-                                    let vc = fire_actionable_rework_event(
-                                        &db_path,
-                                        &reviewer_name,
-                                        reviewer_task_id,
-                                        &Event::VerdictChanges,
-                                        &rework_msg,
-                                    )
-                                    .await;
+                                    let vc = {
+                                        let p = db_path.clone();
+                                        let feedback = rework_msg.clone();
+                                        Some(
+                                            tokio::task::spawn_blocking(move || {
+                                                let mut conn = quorum_core::db::open(&p)?;
+                                                tasks::rework_approved_merge(
+                                                    &mut conn,
+                                                    reviewer_task_id,
+                                                    pr_num,
+                                                    &feedback,
+                                                    now_unix(),
+                                                )
+                                            })
+                                            .await
+                                            .map_err(|error| {
+                                                QuorumError::Io(format!(
+                                                    "retryable merge rework join: {error}"
+                                                ))
+                                            })??,
+                                        )
+                                    };
                                     match vc {
                                         Some(ref tr) if tr.task.status == "rework" => {
                                             // Reviewer stays alive (sticky-agent).
@@ -23920,6 +23998,48 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
     }
 
+    struct RetryableMergeCounter {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl merge::MergeExecutor for RetryableMergeCounter {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            merge::MergeResult {
+                success: false,
+                message: "branch is behind target".into(),
+                failure_kind: Some(merge::MergeFailureKind::Retryable),
+            }
+        }
+    }
+
+    struct StaleAuthorityMergeProbe {
+        calls: std::sync::atomic::AtomicUsize,
+        expected_head: std::sync::Mutex<Option<String>>,
+    }
+
+    impl merge::MergeExecutor for StaleAuthorityMergeProbe {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.expected_head.lock().unwrap() = Some(ctx.expected_head_sha.clone());
+            merge::MergeResult {
+                success: false,
+                message: "head SHA does not match expected head commit".into(),
+                failure_kind: Some(merge::MergeFailureKind::StaleAuthority),
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn missing_sampling_with_both_approvals_never_calls_merge_and_requests_r1() {
@@ -24044,6 +24164,111 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
         assert_eq!(starts, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_fixable_explicit_retry_enters_rework_without_review_gap() {
+        let (dir, conn, task_id, live) = seeded_merge_retry_authority();
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(refs, '$.daemon_merge_retry', 'requested') WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let repo = tempfile::tempdir().unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("q.db"), repo.path().into());
+        config.repo = "test/repo".into();
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-retryable-replay",
+            &open_pr_target_json(
+                &live.target.head_ref,
+                &live.target.head_sha,
+                live.target.base_ref.as_deref().unwrap(),
+            ),
+        ));
+        let executor = Arc::new(RetryableMergeCounter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        config.merge_executor = executor.clone();
+
+        reconcile_merge_retries(&config, false).await.unwrap();
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+        assert!(quorum_core::approvals::get_for_pr(&conn, 42)
+            .unwrap()
+            .is_empty());
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(tasks::MERGE_RETRY_REF).is_none());
+        assert!(refs["remediation_feedback"]
+            .as_str()
+            .unwrap()
+            .contains("branch is behind target"));
+        let (rework_events, review_events): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                   SUM(kind='task_rework'),
+                   SUM(kind='task_in_review')
+                 FROM events WHERE subject=?1",
+                [tasks::lease_target(task_id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rework_events, 1);
+        assert_eq!(review_events, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_push_at_merge_boundary_invalidates_exact_head_authority() {
+        let (dir, conn, task_id, live) = seeded_merge_retry_authority();
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(refs, '$.daemon_merge_retry', 'requested') WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let repo = tempfile::tempdir().unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("q.db"), repo.path().into());
+        config.repo = "test/repo".into();
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-final-force-push",
+            &open_pr_target_json(
+                &live.target.head_ref,
+                &live.target.head_sha,
+                live.target.base_ref.as_deref().unwrap(),
+            ),
+        ));
+        let executor = Arc::new(StaleAuthorityMergeProbe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            expected_head: std::sync::Mutex::new(None),
+        });
+        config.merge_executor = executor.clone();
+
+        reconcile_merge_retries(&config, false).await.unwrap();
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            executor.expected_head.lock().unwrap().as_deref(),
+            Some(live.target.head_sha.as_str())
+        );
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.rework_round, 0);
+        assert!(quorum_core::approvals::get_for_pr(&conn, 42)
+            .unwrap()
+            .is_empty());
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(tasks::MERGE_RETRY_REF).is_none());
     }
 
     #[cfg(unix)]

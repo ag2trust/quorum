@@ -1587,6 +1587,52 @@ pub fn invalidate_merge_retry(
     })
 }
 
+/// Atomically consume an admitted merge attempt into actionable remediation.
+///
+/// Worker-fixable merge outcomes must never expose an intermediate
+/// `in-review` task after deleting approval authority: that state could
+/// provision a fresh reviewer instead of the worker who must change the code.
+/// The direct daemon-owned `MergeConflict` transition preserves the lifecycle
+/// rework budget while approval invalidation, attempt consumption, and the
+/// restart-replayable feedback commit in the same transaction.
+pub fn rework_approved_merge(
+    conn: &mut Connection,
+    id: i64,
+    pr_number: i64,
+    feedback: &str,
+    now: i64,
+) -> Result<TransitionResult> {
+    if feedback.trim().is_empty() || feedback.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "approved merge rework feedback must be non-empty and contain no NUL".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    apply_event_tx(tx, "daemon", id, &Event::MergeConflict, now, |tx| {
+        let changed = tx.execute(
+            "UPDATE tasks
+             SET refs=json_set(
+                 json_remove(refs, '$.daemon_merge_retry'),
+                 '$.remediation_feedback', ?3
+             )
+             WHERE id=?1 AND status IN ('rework','failed') AND json_valid(refs)
+               AND json_extract(refs, '$.pr')=?2
+               AND json_extract(refs, '$.daemon_merge_retry')='attempting'",
+            params![id, pr_number, feedback],
+        )?;
+        if changed != 1 {
+            return Err(QuorumError::Io(format!(
+                "task #{id} lost admitted merge authority before rework disposition"
+            )));
+        }
+        tx.execute(
+            "DELETE FROM approvals WHERE pr_number=?1",
+            params![pr_number],
+        )?;
+        Ok(())
+    })
+}
+
 /// Remove non-authoritative optional-role evidence without consuming the
 /// owner-authorized merge attempt.
 ///
@@ -10024,6 +10070,121 @@ mod tests {
         let refs: serde_json::Value =
             serde_json::from_str(invalidated.task.refs.as_deref().unwrap()).unwrap();
         assert!(refs.get(MERGE_RETRY_REF).is_none());
+    }
+
+    #[test]
+    fn worker_fixable_merge_retry_atomically_enters_actionable_rework() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":419,"daemon_merge_retry":"attempting"}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging',author='worker',reviewer='r2' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        for role in ["r1", "r2"] {
+            crate::approvals::record(
+                &mut conn,
+                &crate::approvals::Approval {
+                    pr_number: 419,
+                    review_role: role.into(),
+                    task_id,
+                    author: "worker".into(),
+                    reviewer: role.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "head".into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let feedback = "merge conflict\n\nMerge main into the PR branch.";
+        let transition = rework_approved_merge(&mut conn, task_id, 419, feedback, 11).unwrap();
+        assert_eq!(transition.task.status, "rework");
+        assert_eq!(transition.task.rework_round, 1);
+        assert_eq!(transition.task.assignee.as_deref(), Some("worker"));
+        assert!(crate::approvals::get_for_pr(&conn, 419).unwrap().is_empty());
+        let refs: serde_json::Value =
+            serde_json::from_str(transition.task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(MERGE_RETRY_REF).is_none());
+        assert_eq!(refs["remediation_feedback"], feedback);
+        let (rework_events, review_events): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                   SUM(kind='task_rework'),
+                   SUM(kind='task_in_review')
+                 FROM events WHERE subject=?1",
+                [lease_target(task_id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rework_events, 1);
+        assert_eq!(review_events, 0);
+    }
+
+    #[test]
+    fn worker_fixable_merge_retry_rolls_back_when_attempt_marker_is_missing() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":419}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging',author='worker',reviewer='r2' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        crate::approvals::record(
+            &mut conn,
+            &crate::approvals::Approval {
+                pr_number: 419,
+                review_role: "r1".into(),
+                task_id,
+                author: "worker".into(),
+                reviewer: "r1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "head".into(),
+            },
+        )
+        .unwrap();
+
+        let error = match rework_approved_merge(&mut conn, task_id, 419, "fix merge", 11) {
+            Ok(_) => panic!("missing attempt marker must reject rework disposition"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("lost admitted merge authority"));
+        assert_eq!(get(&conn, task_id).unwrap().unwrap().status, "merging");
+        assert!(crate::approvals::get(&conn, 419, "r1").unwrap().is_some());
+        let rework_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_rework'",
+                [lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rework_events, 0);
     }
 
     #[test]

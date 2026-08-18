@@ -788,14 +788,21 @@ otherwise-valid R1/R2 rows: the daemon atomically removes that decision and R1, 
 review recreates the decision from a fresh R1 while retaining an exact R2. If a durable skip
 makes R2 optional but a stale extra R2 row exists, the daemon atomically removes only that row
 and rereads the complete authority once under the same `attempting` marker; it never issues
-more than the one merge call authorized by the owner retry. Legacy tasks without an immutable `target_branch` cannot directly
-replay approval; their approvals are invalidated and review is rebuilt against a persisted
-base. A repeated policy/infrastructure failure parks again with approvals intact. The ordinary
-live reviewed path also writes `attempting` immediately before its first remote merge call, and
-must durably park a policy outcome before tearing down its worker/reviewer. Startup never
-auto-replays a parked task; any interrupted `attempting` marker is parked for another owner
-retry rather than issuing an uncertain duplicate call. Retry does not change PR identity,
-approvals, dependencies, author/reviewer provenance, or rework count. An
+more than the one merge call authorized by the owner retry. The exact approved head is carried
+through the merge-executor boundary: the production executor rechecks it immediately before
+formal approval and again afterward, then invokes GitHub merge with that SHA as the required
+head. A force-push in the remaining call window is therefore rejected and returns to review
+with stale approvals invalidated. Legacy tasks without an immutable `target_branch` cannot
+directly replay approval; their approvals are invalidated and review is rebuilt against a
+persisted base. A repeated policy/infrastructure failure parks again with approvals intact. A
+worker-fixable replay result atomically consumes the `attempting` marker, invalidates approval
+rows, records bounded remediation feedback, and transitions directly from `merging` to
+`rework`; no intermediate `in-review` state can allocate a replacement reviewer or lose the
+actionable turn. The ordinary live reviewed path also writes `attempting` immediately before
+its first remote merge call, and must durably park a policy outcome before tearing down its
+worker/reviewer. Startup never auto-replays a parked task; any interrupted `attempting` marker
+is parked for another owner retry rather than issuing an uncertain duplicate call. Retry does
+not change PR identity, approvals, dependencies, author/reviewer provenance, or rework count. An
 unparked or terminal task is a clean negative (exit 1). One additional clean negative
 (exit 1) fires when the parked task's `depends_on` still contains any `cancelled`
 task id: silently restoring the dependent would just have the sweep re-park it on
@@ -1247,7 +1254,7 @@ fail-closed and leaves the parked task for explicit operator action.
 | Concept | Location |
 |---|---|
 | `ChecksOutcome` enum (Ready/Failed/TimedOut) | `quorum/src/serve/merge.rs:67-74` |
-| `MergeFailureKind` enum (Retryable/PolicyPending/PolicyBlocked) | `quorum/src/serve/merge.rs:16-24` |
+| `MergeFailureKind` enum (StaleAuthority/Retryable/PolicyPending/PolicyBlocked) | `quorum/src/serve/merge.rs` |
 | Checks-wait timeout handling (current: fires rework) | `quorum/src/serve/mod.rs:2073` |
 | Failed-checks rework path | `quorum/src/serve/mod.rs:1932` |
 | PolicyPending retry loop | `quorum/src/serve/mod.rs:2638` |
@@ -1342,7 +1349,9 @@ Each invariant below requires both a positive and a negative test. Tests marked
     the published PR head, and the worker resolves it without rebasing.
 
 12. `retryable_merge_failure_triggers_rework` — merge attempt fails with
-    `MergeFailureKind::Retryable`. Assert: `MergeFailed` + `VerdictChanges` → Rework.
+    `MergeFailureKind::Retryable`. Assert: one atomic `merging` → `rework` transition
+    consumes the attempt marker and approvals while persisting actionable feedback; no
+    intermediate `in-review` event is visible.
 
 13. `rework_no_worker_spawns_remediation` — actionable rework fires but no live worker.
     Assert: remediation worker spawned on existing PR branch. If spawn fails,

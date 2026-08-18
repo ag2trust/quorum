@@ -402,12 +402,22 @@ async fn merge_approved(
         reviewer_name: appr.reviewer.clone(),
         review_task_id: appr.task_id,
         expected_base_branch: effective_base_branch,
+        expected_head_sha: appr.approved_head_sha.clone(),
     };
     let result = tokio::task::spawn_blocking(move || exec.merge(pr, &repo, &ctx))
         .await
         .map_err(|e| QuorumError::Io(format!("merge spawn_blocking join: {e}")))?;
 
     if !result.success {
+        if result.failure_kind == Some(merge::MergeFailureKind::StaleAuthority) {
+            log(&format!(
+                "approval-recovery: PR #{pr} head moved during final merge boundary \
+                 (task #{}) — dropping stale approval",
+                appr.task_id
+            ));
+            drop_approval(db_path, pr).await?;
+            return Ok(false);
+        }
         log(&format!(
             "approval-recovery: PR #{pr} merge failed (task #{}) — leaving approval \
              for a later startup: {}",
