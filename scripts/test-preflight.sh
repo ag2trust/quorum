@@ -44,16 +44,26 @@ exit 0
 EOF
 chmod +x "$BIN/cargo"
 
+cat >"$BIN/constant-textconv" <<'EOF'
+#!/bin/sh
+printf 'constant textconv output\n'
+EOF
+chmod +x "$BIN/constant-textconv"
+
 cd "$REPO"
 git config user.name CI
 git config user.email ci@example.invalid
 git remote add origin "$REMOTE"
 
 printf 'base\n' > state
-git add state
+printf 'pub fn tracked_fixture() {}\n' > tracked.rs
+printf 'tracked.rs diff=constant\n' > .gitattributes
+printf '/target\n' > .gitignore
+git add .gitattributes .gitignore state tracked.rs
 git commit -qm 'base'
 git branch -M main
 git push -q origin main
+git config diff.constant.textconv "$BIN/constant-textconv"
 
 git switch -qc develop
 printf 'develop\n' >> state
@@ -447,6 +457,83 @@ data = json.load(open(sys.argv[1]))
 assert data["test_jobs"] == 2
 assert data["test_threads"] == 4
 PY
+python3 - target/preflight-timing/last-green.json <<'PY'
+import json
+import re
+import sys
+
+data = json.load(open(sys.argv[1]))
+assert data["exit"] == 0
+assert re.fullmatch(r"[0-9a-f]{64}", data["fingerprint"])
+PY
+
+# A green full run records the complete working-tree fingerprint. Repeating it
+# without a source change still checks branch base, but does not invoke Cargo.
+: >"$TMP/full-cargo.log"
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/cached.out"
+grep -q 'PREFLIGHT: PASS (cached — tree unchanged since last green run)' \
+  "$TMP/cached.out"
+[ ! -s "$TMP/full-cargo.log" ]
+
+# Fingerprint reads must not refresh a stale index. A content-identical touch
+# keeps the cache valid while forcing Git to observe outdated stat data.
+cp .git/index "$TMP/index-before-cache-lookup"
+sleep 1
+touch tracked.rs
+: >"$TMP/full-cargo.log"
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/index-preserving-cache.out"
+cmp "$TMP/index-before-cache-lookup" .git/index
+grep -q 'PREFLIGHT: PASS (cached — tree unchanged since last green run)' \
+  "$TMP/index-preserving-cache.out"
+[ ! -s "$TMP/full-cargo.log" ]
+
+# A tracked Rust source edit must invalidate the green result and re-run every
+# collector gate. The configured textconv deliberately erases the diff's
+# contents, so a second dirty edit proves the fingerprint uses raw diff bytes.
+printf '// tracked change\n' >> tracked.rs
+: >"$TMP/full-cargo.log"
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/tracked-cache-miss.out"
+cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/tracked-cache-miss.out"
+
+printf '// second tracked change\n' >> tracked.rs
+: >"$TMP/full-cargo.log"
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/textconv-cache-miss.out"
+cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/textconv-cache-miss.out"
+
+printf 'pub fn untracked_fixture() {}\n' > untracked.rs
+: >"$TMP/full-cargo.log"
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/untracked-cache-miss.out"
+cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/untracked-cache-miss.out"
+
+# The cache file is ignored and excluded from its own fingerprint, so malformed
+# JSON records must be rejected rather than relying on Python's numeric equality
+# (`false == 0` and `0.0 == 0`).
+for INVALID_EXIT in false 0.0; do
+  python3 - target/preflight-timing/last-green.json "$INVALID_EXIT" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+data = json.load(open(path))
+data["exit"] = json.loads(sys.argv[2])
+with open(path, "w") as output:
+    json.dump(data, output)
+PY
+  : >"$TMP/full-cargo.log"
+  PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+    ./preflight.sh >"$TMP/malformed-cache-miss-$INVALID_EXIT.out"
+  cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
+  grep -q 'PREFLIGHT: PASS (all 4 gates green)' \
+    "$TMP/malformed-cache-miss-$INVALID_EXIT.out"
+done
 
 if PATH="$BIN:$PATH" scripts/preflight/timing.sh --test-jobs 0 \
   >"$TMP/invalid-test-jobs.out" 2>&1; then
@@ -908,6 +995,7 @@ PY
 # Cargo's compile/no-run diagnostics are captured by the structured collector,
 # then replayed by preflight before it returns the same failure status as the
 # former direct `cargo test` gate.
+rm -f target/preflight-timing/last-green.json
 if PREFLIGHT_CARGO_FAIL=compile PATH="$BIN:$PATH" ./preflight.sh \
   >"$TMP/full-compile-failure.out" 2>&1; then
   echo 'expected compile/no-run failure to reject full preflight' >&2

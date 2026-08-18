@@ -636,6 +636,16 @@ only through an explicit outside request)
 
 - **Author/reviewer separation:** ReviewerAttached is rejected if the agent is the author.
   The daemon enforces #206: the deliverer (who signaled `submit`) cannot review.
+- **Author-side preflight cache:** A full `preflight.sh` invocation always runs the
+  branch-base gate, because it fetches and checks the moving `origin/main` reference.
+  Gates 2–4 may instead use a task-local green cache at
+  `target/preflight-timing/last-green.json`. Its deterministic fingerprint covers HEAD,
+  porcelain status, the binary diff from HEAD, and the paths, modes, and contents of
+  untracked inputs (including ignored inputs outside generated `target/`). Only an exact
+  `{ fingerprint, exit: 0 }` record written after a green, unchanged gates-2–4 run may
+  skip those gates. Missing, malformed, or unreadable cache entries and every fingerprint
+  error are cache misses. Fingerprinting never writes the index or uses the network; the
+  daemon does not use this optimization and merge CI remains the full backstop.
 - **Rework cap:** `REWORK_CAP = 7`. When `rework_round >= 7` and an actionable rework
   event (VerdictChanges, ChecksFailed, or MergeConflict) fires,
   the task goes to Failed (not Rework). Rounds are consumed only by review verdicts,
