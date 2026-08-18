@@ -7898,7 +7898,7 @@ async fn tick(
                             .await
                             .unwrap_or(false)
                         };
-                        if already_merging {
+                        let merge_failed_recorded = if already_merging {
                             fire_event(
                                 &db_path,
                                 "system",
@@ -7912,10 +7912,24 @@ async fn tick(
                                     ),
                                 },
                             )
-                            .await;
-                        }
+                            .await
+                            .is_some()
+                        } else {
+                            false
+                        };
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r, "stale-sha").await;
+                        if merge_failed_recorded {
+                            teardown_reviewer_after_recorded_outcome(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                "stale-sha",
+                            )
+                            .await;
+                        } else {
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "stale-sha").await;
+                        }
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -23467,6 +23481,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         task_id: i64,
         reviewer_run_id: i64,
         agent: String,
+        reviewed_head_sha: Option<String>,
     ) -> (Pool, Vec<SlotState>) {
         std::thread::Builder::new()
             .name("phase2-reviewer-fixture".into())
@@ -23487,6 +23502,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         )
                         .await,
                     ];
+                    reviewers[0].reviewed_head_sha = reviewed_head_sha;
                     let wt_mgr = WorktreeManager::new();
                     let mut workers = Vec::new();
                     let mut pre_review_checks = HashMap::new();
@@ -23635,6 +23651,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             task_id,
             reviewer_run_id,
             "Phase2Reviewer".into(),
+            None,
         );
 
         assert!(
@@ -23793,6 +23810,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             task_id,
             reviewer_run_id,
             "UnrecordedReviewer".into(),
+            None,
         );
 
         assert!(
@@ -23831,6 +23849,204 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
         assert!(consumed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase2_merge_wait_stale_sha_reaps_buffered_terminal_after_merge_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("phase2-merge-wait-terminal.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id, mailbox_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "phase 2 merge-wait stale terminal",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::claim(
+                &mut conn,
+                "MergeWaitReviewer",
+                Some(task_id),
+                &[],
+                3600,
+                now + 2,
+            )
+            .unwrap()
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "system",
+                task_id,
+                &Event::ReviewerAttached {
+                    agent: "MergeWaitReviewer".into(),
+                },
+                now + 2,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "MergeWaitReviewer",
+                task_id,
+                &Event::VerdictApprove,
+                now + 3,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "MergeWaitReviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now + 2,
+            )
+            .unwrap();
+            let mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "MergeWaitReviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(464),
+                    verdict: Some("approved".into()),
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: Some(r#"{"blocking":0}"#.into()),
+                },
+            )
+            .unwrap();
+            (task_id, run_id, mailbox_id)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir.clone());
+        config.limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("MergeWaitReviewer").unwrap();
+        assert!(take_terminal_usage_diagnostics_for_test("MergeWaitReviewer").is_empty());
+
+        let (_name_pool, reviewers) = tick_phase2_reviewer_fixture(
+            config,
+            name_pool,
+            dir.path().to_path_buf(),
+            repo_dir,
+            task_id,
+            reviewer_run_id,
+            "MergeWaitReviewer".into(),
+            Some("reviewed-head".into()),
+        );
+
+        assert!(reviewers.is_empty(), "merge-wait reviewer must be reaped");
+        let diagnostics = take_terminal_usage_diagnostics_for_test("MergeWaitReviewer");
+        assert_eq!(diagnostics.len(), 1, "one recorded merge-wait cleanup");
+        assert_eq!(
+            diagnostics[0],
+            serde_json::json!({
+                "event": "terminal_usage",
+                "action": "recorded_outcome_cleanup",
+                "agent": "MergeWaitReviewer",
+                "role": "reviewer",
+                "provider": "codex",
+                "task_id": task_id,
+                "raw_input_tokens": 100,
+                "cached_input_tokens": 80,
+                "cache_write_input_tokens": 10,
+                "uncached_input_tokens": 20,
+                "output_tokens": 5,
+                "reasoning_tokens": 3,
+                "raw_total_tokens": 105,
+                "uncached_total_tokens": 25,
+                "configured_max_turn_tokens": null,
+                "configured_max_task_tokens": 100,
+                "configured_max_turn_cost_usd": null,
+                "configured_max_task_cost_usd": null,
+                "configured_limit_basis": "raw",
+                "cumulative_raw_total_tokens": 105,
+                "cumulative_uncached_total_tokens": 25,
+                "cumulative_limit_tokens": 105,
+                "cost_usd": null,
+                "breach": true,
+                "breach_reason": "task tokens (raw) 105 exceeded limit 100",
+            })
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let subject = format!("task#{task_id}");
+        let merging_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_merging'",
+                [&subject],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let in_review_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_in_review'",
+                [&subject],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(merging_events, 1, "mailbox retry must not replay approval");
+        assert_eq!(
+            in_review_events, 3,
+            "exactly one MergeFailed must return to review"
+        );
+        let consumed: bool = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed, "merge-wait retry mailbox must be consumed");
+        let terminal_alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind='alert' AND body LIKE '%terminal%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_alerts, 0, "recorded cleanup must not alert");
     }
 
     #[cfg(unix)]
