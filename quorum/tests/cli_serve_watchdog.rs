@@ -346,13 +346,20 @@ fi
         None
     }
 
-    fn suspend(&mut self) {
+    /// Stop the daemon only after this process holds the SQLite write lock.
+    /// Otherwise SIGSTOP can freeze the daemon inside a write transaction and
+    /// make the test's subsequent mailbox append fail with SQLITE_BUSY.
+    fn suspend_after_db_quiescent(&mut self, home: &std::path::Path) {
+        let db = home.join("repos/test__repo/quorum.db");
+        let mut conn = quorum_core::db::open(&db).unwrap();
+        let tx = quorum_core::db::begin_immediate(&mut conn).unwrap();
         let pid = self.child.id() as libc::pid_t;
         assert_eq!(
             unsafe { libc::kill(pid, libc::SIGSTOP) },
             0,
             "failed to suspend daemon process {pid}"
         );
+        tx.commit().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             let output = Command::new("ps")
@@ -1019,7 +1026,7 @@ fn pending_worker_overage_defers_snapshotted_message_after_feed_becomes_broken()
 
     // Freeze the daemon so the message and both synchronization gates are
     // installed before one tick snapshots the message row.
-    handle.suspend();
+    handle.suspend_after_db_quiescent(home.path());
     let message_id = append_worker_message(home.path(), &worker_name);
     std::fs::write(&snapshot_gate, b"waiting").unwrap();
     std::fs::write(&message_gate, b"waiting").unwrap();
