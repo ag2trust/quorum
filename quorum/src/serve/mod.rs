@@ -14365,15 +14365,40 @@ fn record_captured_terminal_usage(
 async fn close_attachment_failed_reviewer_run(
     db_path: &Path,
     reviewer_run_id: i64,
+    reviewer_name: &str,
     task_id: i64,
     pr: i64,
     reviewer_kind: runner::AgentKind,
     reviewer_model: &str,
     reviewer_effort: &str,
+    limits: &CostLimits,
     terminal: &[runner::CapturedOutput],
-) {
+) -> Option<serde_json::Value> {
     let mut token_usage = runner::TokenUsage::default();
-    capture_terminal_usage(reviewer_kind, terminal, &mut token_usage);
+    let mut last_terminal_usage = runner::TokenUsage::default();
+    let mut last_terminal_cost_usd = None;
+    let mut cost_tokens = 0;
+    let mut limit_tokens = 0;
+    let mut cost_usd = 0.0;
+    let mut session_log = None;
+    let diagnostic = record_captured_terminal_usage_fields(
+        "reviewer",
+        limits,
+        reviewer_kind,
+        terminal,
+        TerminalUsageAction::RecordedOutcomeCleanup,
+        reviewer_name,
+        task_id,
+        &mut token_usage,
+        &mut last_terminal_usage,
+        &mut last_terminal_cost_usd,
+        &mut cost_tokens,
+        &mut limit_tokens,
+        &mut cost_usd,
+        std::time::Instant::now(),
+        std::time::Instant::now(),
+        &mut session_log,
+    );
     close_agent_run_with_usage(
         db_path,
         Some(reviewer_run_id),
@@ -14389,6 +14414,7 @@ async fn close_attachment_failed_reviewer_run(
         }),
     )
     .await;
+    diagnostic
 }
 
 fn truncate_now_label(s: &str) -> String {
@@ -15337,11 +15363,13 @@ async fn provision_reviewer_reserved(
                 close_attachment_failed_reviewer_run(
                     &config.db_path,
                     reviewer_run_id,
+                    &reviewer_name,
                     worker.task_id,
                     pr,
                     reviewer_kind,
                     &reviewer_model,
                     &reviewer_effort,
+                    &config.limits,
                     &terminal_output,
                 )
                 .await;
@@ -22943,17 +22971,45 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3}}"#
                 .into(),
         )];
-        close_attachment_failed_reviewer_run(
+        let limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
+        let diagnostic = close_attachment_failed_reviewer_run(
             &db_path,
             reviewer_run_id,
+            "Rejected-reviewer",
             task_id,
             464,
             runner::AgentKind::Codex,
             "gpt-5.6-terra",
             "high",
+            &limits,
             &terminal,
         )
-        .await;
+        .await
+        .expect("terminal output must produce an attachment cleanup diagnostic");
+
+        assert_eq!(diagnostic["role"], "reviewer");
+        assert_eq!(diagnostic["agent"], "Rejected-reviewer");
+        assert_eq!(diagnostic["task_id"], task_id);
+        assert_eq!(diagnostic["provider"], "codex");
+        assert_eq!(diagnostic["raw_input_tokens"], 100);
+        assert_eq!(diagnostic["uncached_input_tokens"], 20);
+        assert_eq!(diagnostic["cached_input_tokens"], 80);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 10);
+        assert_eq!(diagnostic["output_tokens"], 5);
+        assert_eq!(diagnostic["reasoning_tokens"], 3);
+        assert_eq!(diagnostic["raw_total_tokens"], 105);
+        assert_eq!(diagnostic["uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 105);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_limit_tokens"], 105);
+        assert_eq!(diagnostic["configured_limit_basis"], "raw");
+        assert_eq!(diagnostic["configured_max_task_tokens"], 100);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["breach"], true);
+        assert_eq!(diagnostic["action"], "recorded_outcome_cleanup");
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, task_id).unwrap().unwrap();
@@ -22961,8 +23017,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             task.status, "done",
             "telemetry capture must not change the rejected lifecycle outcome"
         );
-        let run = quorum_core::agent_runs::runs_for_task(&conn, task_id)
-            .unwrap()
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, task_id).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "diagnostics must not duplicate lifecycle runs"
+        );
+        let run = runs
             .into_iter()
             .find(|run| run.id == reviewer_run_id)
             .unwrap();
