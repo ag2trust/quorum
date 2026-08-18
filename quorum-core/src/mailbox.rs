@@ -6,7 +6,7 @@
 use crate::clock;
 use crate::db::begin_immediate;
 use crate::error::Result;
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, types::Type, Connection, Row};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +15,7 @@ pub enum MailboxKind {
     Message,
     TaskUpdate,
     Kill,
+    ReviewDraft,
 }
 
 impl MailboxKind {
@@ -24,6 +25,7 @@ impl MailboxKind {
             Self::Message => "message",
             Self::TaskUpdate => "task_update",
             Self::Kill => "kill",
+            Self::ReviewDraft => "review_draft",
         }
     }
 
@@ -33,6 +35,7 @@ impl MailboxKind {
             "message" => Some(Self::Message),
             "task_update" => Some(Self::TaskUpdate),
             "kill" => Some(Self::Kill),
+            "review_draft" => Some(Self::ReviewDraft),
             _ => None,
         }
     }
@@ -53,7 +56,16 @@ pub struct MailboxRow {
 
 fn row_from_sql(r: &Row<'_>) -> rusqlite::Result<(i64, MailboxRow)> {
     let kind_str: String = r.get(2)?;
-    let kind = MailboxKind::from_str(&kind_str).unwrap_or(MailboxKind::Done);
+    let kind = MailboxKind::from_str(&kind_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown mailbox kind {kind_str:?}"),
+            )),
+        )
+    })?;
     Ok((
         r.get(0)?,
         MailboxRow {
@@ -329,6 +341,41 @@ mod tests {
         assert_eq!(unconsumed[0].1.agent, "Worker1");
         assert_eq!(unconsumed[0].1.task_id, Some(42));
         assert_eq!(unconsumed[0].1.note.as_deref(), Some("blocked"));
+    }
+
+    #[test]
+    fn review_draft_kind_round_trips_without_becoming_done() {
+        let (mut conn, _dir) = test_conn();
+        let row = MailboxRow {
+            agent: "Reviewer1".into(),
+            kind: MailboxKind::ReviewDraft,
+            task_id: Some(42),
+            pr: Some(77),
+            verdict: None,
+            feedback: Some("Need another analysis turn for the blocking path.".into()),
+            note: None,
+            to_agent: None,
+            payload: Some("{\"blocking\":1}".into()),
+        };
+        append(&mut conn, &row).unwrap();
+
+        let unconsumed = poll_unconsumed(&conn).unwrap();
+        assert_eq!(unconsumed.len(), 1);
+        assert_eq!(unconsumed[0].1.kind, MailboxKind::ReviewDraft);
+        assert_ne!(unconsumed[0].1.kind, MailboxKind::Done);
+    }
+
+    #[test]
+    fn unknown_mailbox_kind_fails_closed_instead_of_decoding_as_done() {
+        let (conn, _dir) = test_conn();
+        conn.execute(
+            "INSERT INTO mailbox(agent,kind,created_at) VALUES ('legacy','unknown_kind',1)",
+            [],
+        )
+        .unwrap();
+
+        let err = poll_unconsumed(&conn).unwrap_err();
+        assert!(err.to_string().contains("unknown mailbox kind"), "{err}");
     }
 
     #[test]

@@ -384,6 +384,25 @@ pub enum Command {
         #[arg(long = "run-id")]
         run_id: Option<String>,
     },
+    /// Send a non-authoritative blocking-review draft to the daemon. This is
+    /// continuation context only: it never records a verdict or changes task lifecycle.
+    ///
+    /// Requires daemon reviewer run identity: `--run-id` flag or `QUORUM_RUN_ID` env var.
+    ReviewDraft {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        pr: i64,
+        /// Positive count of BLOCKING findings in the draft.
+        #[arg(long)]
+        blocking: u32,
+        /// Read the bounded continuation summary from a text file.
+        #[arg(long = "feedback-file")]
+        feedback_file: PathBuf,
+        /// Daemon-issued reviewer run capability token. Falls back to QUORUM_RUN_ID env var.
+        #[arg(long = "run-id")]
+        run_id: Option<String>,
+    },
     /// Launch the agent-manager daemon. Spawns and drives Claude or Codex agents,
     /// polls their lifecycle signals, and shuts down on Ctrl-C.
     Serve {
