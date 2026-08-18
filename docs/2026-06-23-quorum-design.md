@@ -812,9 +812,14 @@ rows, records bounded remediation feedback, and transitions directly from `mergi
 `rework`; no intermediate `in-review` state can allocate a replacement reviewer or lose the
 actionable turn. The ordinary live reviewed path also writes `attempting` immediately before
 its first remote merge call, and must durably park a policy outcome before tearing down its
-worker/reviewer. Startup never auto-replays a parked task; any interrupted `attempting` marker
-is parked for another owner retry rather than issuing an uncertain duplicate call. Retry does
-not change PR identity, approvals, dependencies, author/reviewer provenance, or rework count. An
+worker/reviewer. Final-role verdict persistence uses the head already validated against the
+reviewer's launch SHA; it never refetches and binds the verdict to a later force-pushed head.
+Startup never auto-replays a parked task; any interrupted `attempting` marker is parked for
+another owner retry rather than issuing an uncertain duplicate call. A policy failure during
+startup approval replay is likewise parked with exact-head approvals retained before generic
+recovery, while a worker-fixable result invalidates those approvals and returns to rework.
+Retry does not change PR identity, approvals, dependencies, author/reviewer provenance, or
+rework count. An
 unparked or terminal task is a clean negative (exit 1). One additional clean negative
 (exit 1) fires when the parked task's `depends_on` still contains any `cancelled`
 task id: silently restoring the dependent would just have the sweep re-park it on
@@ -1165,12 +1170,13 @@ The following must remain intact throughout the wait and across restarts:
 | State | Location | Why |
 |---|---|---|
 | PR number | `tasks.pr` column | Identifies the merge target |
-| Both durable approvals (R1 + R2) | `approvals` table | Restart recovery reconstructs "merge this PR" |
+| Required durable role approvals | `approvals` table | Restart recovery reconstructs exact-head review authority |
+| Durable sampled-R2 decision | `r2_sampling_decisions` table | Proves whether R2 is required for this task/PR/head |
 | Reviewed head SHA | `approvals.approved_head_sha` | Head-change detection (step 4b above) |
 | Branch provenance | `tasks.branch`, journal row | Worker/remediation needs the branch |
 | Dependency blocking | `tasks.depends_on` | Already-done deps stay done; blocked deps stay blocked |
 | Task status = `merging` | `tasks.status` column | Restart recovery recognizes this as merge-pending |
-| Mailbox row (unconsumed) | `mailbox` table | Restart re-enters merge flow from unconsumed approval |
+| Mailbox row (if still unconsumed) | `mailbox` table | Recoverable delivery signal only; durable approvals remain authoritative without it |
 | Explicit retry intent | `tasks.refs.daemon_merge_retry` | Bounds an owner retry to one daemon attempt |
 
 #### Restart reconciliation
@@ -1184,16 +1190,23 @@ On daemon startup, before generic crash recovery:
    Before any network call the complete PR-wide row set must name one exact task and immutable
    author; mixed-task or mixed-author evidence is deferred fail-closed. Parked tasks and tasks
    carrying a merge-attempt marker are excluded: the former require owner authority, while the
-   latter are handled by the bounded live retry reconciler or uncertain-attempt park.
+   latter are handled by the bounded live retry reconciler or uncertain-attempt park. A policy
+   failure from an unmarked startup replay is durably parked before recovery can run again;
+   repeated starts therefore cannot create a merge loop. A worker-fixable replay result consumes
+   its admitted boundary, invalidates approvals, and enters actionable rework.
 2. **Generic recovery** handles `merging` tasks: stays in `merging` only when
    `dual_approved()` confirms all required roles are approved for the same head SHA.
    Incomplete approval (e.g. R1 approved, R2 missing) resets the task to `in-review` via
-   `AgentFailed`, so the tick loop provisions the first missing role (#191).
+   `AgentFailed`, so the tick loop provisions the first missing role (#191). The exception is a
+   durable `daemon_merge_retry=requested`: generic recovery preserves `merging` even with
+   incomplete evidence so the live reconciler can atomically consume the request, invalidate
+   only stale evidence, and return to the first missing role without stranding the marker.
 3. **Phase 5b** (orphan in-review tasks) checks for existing valid R1 approvals: if R1 is
    approved for the current PR SHA, it spawns R2 directly instead of re-running R1 (#191).
    Reviewer verdict persistence uses the task's durable author when no worker is live. When a
    repaired R1 returns and an exact task/author/head-bound R2 row was retained, that R2 is reused
-   rather than provisioned again.
+   rather than provisioned again. Every persisted role remains bound to the launch-validated
+   head even if the PR moves between that validation and the persistence write.
 4. **Explicit merge replay** atomically claims at most one `requested` marker per tick. A
    valid replay needs no live reviewer, mailbox row, or roster entry. Graceful shutdown lets
    an admitted call settle; startup parks an uncertain `attempting` marker without a second

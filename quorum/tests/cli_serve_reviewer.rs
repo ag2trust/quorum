@@ -281,6 +281,14 @@ elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  force_after_view="$QUORUM_TEST_GH_STATE/force-head-after-next-view-$pr"
+  if [ -f "$force_after_view" ]; then
+    next_sha="$(cat "$force_after_view")"
+    rm "$force_after_view"
+    printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+    git -C "$QUORUM_TEST_REPO" update-ref "refs/heads/$branch" "$next_sha"
+    exit 0
+  fi
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
@@ -1244,6 +1252,148 @@ fn final_boundary_head_drift_promptly_provisions_fresh_r1() {
         "head drift must cause exactly one merge invocation"
     );
 
+    handle.stop();
+}
+
+#[test]
+fn r2_force_push_window_never_stamps_the_unreviewed_head() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "R2 force-push persistence window");
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    assert!(handle.wait_for("spawning agent", 15));
+    assert!(handle.wait_for("result", 15));
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+    assert!(handle.wait_for("spawning reviewer", 15));
+    assert!(handle.wait_for("result", 15));
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(handle.wait_for("R2: pre-merge reviewer", 15));
+    assert!(handle.wait_for("result", 15));
+    let r2 = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("R2 reviewer name");
+
+    let branch = format!("daemon/{}-t1", worker.to_lowercase());
+    let old_head = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                &branch,
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "force-pushed head",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let new_head = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "main",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(old_head, new_head);
+    std::fs::write(
+        handle
+            ._gh_shim
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("state/force-head-after-next-view-1"),
+        &new_head,
+    )
+    .unwrap();
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r2,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(
+        handle.wait_for("STALE SHA", 15),
+        "force-pushed R2 verdict was not rejected: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("R1: reviewer", 15),
+        "fresh R1 was not provisioned for the moved head: {:?}",
+        handle.lines
+    );
+
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let approvals = quorum_core::approvals::get_for_pr(&conn, 1).unwrap();
+    assert!(
+        !approvals.is_empty(),
+        "valid old-head evidence may be retained"
+    );
+    assert!(approvals
+        .iter()
+        .all(|approval| approval.approved_head_sha == old_head));
+    assert!(approvals
+        .iter()
+        .all(|approval| approval.approved_head_sha != new_head));
+    assert_eq!(
+        quorum_core::tasks::get(&conn, 1).unwrap().unwrap().status,
+        "in-review"
+    );
     handle.stop();
 }
 

@@ -1009,6 +1009,30 @@ pub(crate) async fn recover(
             let p = db_path.clone();
             let tid = task.id;
 
+            // An owner retry is durable daemon work, even when its retained
+            // role evidence is incomplete or stale. Approval recovery defers
+            // every marked task, and the live retry reconciler must consume
+            // `requested` exactly once so it can validate that evidence and
+            // return to the first missing role. Demoting here would strand the
+            // marker on an in-review task that neither reconciler can claim.
+            let merge_retry_requested = task
+                .refs
+                .as_deref()
+                .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                .and_then(|refs| {
+                    refs.get(tasks::MERGE_RETRY_REF)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some(tasks::MERGE_RETRY_REQUESTED);
+            if merge_retry_requested {
+                log(&format!(
+                    "recovery: preserving owner-requested merge replay for task #{tid}"
+                ));
+                continue;
+            }
+
             // #191: stay in merging only when ALL required review roles are
             // approved for the same SHA (genuine merge-wait). Incomplete
             // approval (e.g. R1 only with R2 still required) resets to
@@ -1366,6 +1390,90 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 1, "recovery duplicated {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_requested_merge_retry_with_missing_role_evidence() {
+        for retain_r1 in [false, true] {
+            let fixture = dormant_fixture();
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            let now = super::super::now_unix();
+            let retry_task = tasks::create(
+                &mut conn,
+                "owner",
+                "requested merge retry",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":902,"daemon_merge_retry":"requested"}"#),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET status='merging', author='Worker-Retry', target_branch='main'
+                 WHERE id=?1",
+                [retry_task],
+            )
+            .unwrap();
+            if retain_r1 {
+                approvals::record(
+                    &mut conn,
+                    &approvals::Approval {
+                        pr_number: 902,
+                        review_role: "r1".into(),
+                        task_id: retry_task,
+                        author: "Worker-Retry".into(),
+                        reviewer: "Reviewer-R1".into(),
+                        verdict: "approved".into(),
+                        blocking_count: 0,
+                        approved_head_sha: "head-a".into(),
+                    },
+                )
+                .unwrap();
+            }
+            drop(conn);
+
+            let mut names = super::super::names::Pool::new_generated();
+            let mut workers = Vec::new();
+            let mut roster = LifetimeRoster::new();
+            let wt_mgr = WorktreeManager::new();
+            recover(
+                &fixture.config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut roster,
+            )
+            .await
+            .unwrap();
+
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            let task = tasks::get(&conn, retry_task).unwrap().unwrap();
+            assert_eq!(task.status, "merging");
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                refs[tasks::MERGE_RETRY_REF],
+                tasks::MERGE_RETRY_REQUESTED,
+                "restart must not strand requested authority on an in-review task"
+            );
+            let failed_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE subject=?1 AND kind='agent_failed'",
+                    [tasks::lease_target(retry_task)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(failed_events, 0);
+            let claimed = tasks::claim_merge_retry(&mut conn, now + 1)
+                .unwrap()
+                .expect("the live reconciler must still be able to consume the retry");
+            assert_eq!(claimed.id, retry_task);
         }
     }
 

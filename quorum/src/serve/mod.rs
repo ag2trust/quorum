@@ -9015,9 +9015,11 @@ async fn tick(
                             }
                             continue;
                         }
-                        // #174: persist R2 approval NOW (before merge gate)
-                        // so it survives a restart during merge-wait. Uses
-                        // the current head SHA which is the diff R2 reviewed.
+                        // #174: persist the final role NOW (before merge gate)
+                        // so it survives a restart during merge-wait. Bind it
+                        // to the launch-validated SHA above: another live head
+                        // lookup here could stamp a force-pushed head that this
+                        // reviewer never saw.
                         // Only runs once — merge-wait retries take the
                         // already_merging branch above and skip this.
                         {
@@ -9031,38 +9033,28 @@ async fn tick(
                                 None => durable_task_author(&db_path, reviewer_task_id).await?,
                             };
                             if let Some(author) = author {
-                                let repo = config.repo_dir.clone();
-                                let executor = Arc::clone(&config.merge_executor);
-                                let head = tokio::task::spawn_blocking(move || {
-                                    executor.head_sha(pr_num, &repo)
+                                let p = db_path.clone();
+                                let role = if reviewers[ri].r2_origin { "r2" } else { "r1" };
+                                let record = quorum_core::approvals::Approval {
+                                    pr_number: pr_num,
+                                    review_role: role.to_string(),
+                                    task_id: reviewer_task_id,
+                                    author,
+                                    reviewer: reviewer_name,
+                                    verdict: "approved".to_string(),
+                                    blocking_count: gated.blocking_count.unwrap_or(0) as i64,
+                                    approved_head_sha: head_sha.clone(),
+                                };
+                                tokio::task::spawn_blocking(move || -> Result<()> {
+                                    let mut conn = quorum_core::db::open(&p)?;
+                                    quorum_core::approvals::record(&mut conn, &record)
                                 })
                                 .await
-                                .ok()
-                                .flatten();
-                                if let Some(head) = head {
-                                    let p = db_path.clone();
-                                    let role = if reviewers[ri].r2_origin { "r2" } else { "r1" };
-                                    let record = quorum_core::approvals::Approval {
-                                        pr_number: pr_num,
-                                        review_role: role.to_string(),
-                                        task_id: reviewer_task_id,
-                                        author,
-                                        reviewer: reviewer_name,
-                                        verdict: "approved".to_string(),
-                                        blocking_count: gated.blocking_count.unwrap_or(0) as i64,
-                                        approved_head_sha: head,
-                                    };
-                                    tokio::task::spawn_blocking(move || -> Result<()> {
-                                        let mut conn = quorum_core::db::open(&p)?;
-                                        quorum_core::approvals::record(&mut conn, &record)
-                                    })
-                                    .await
-                                    .map_err(|error| {
-                                        QuorumError::Io(format!(
-                                            "final approval persistence join: {error}"
-                                        ))
-                                    })??;
-                                }
+                                .map_err(|error| {
+                                    QuorumError::Io(format!(
+                                        "final approval persistence join: {error}"
+                                    ))
+                                })??;
                             } else {
                                 return Err(QuorumError::Io(format!(
                                     "task #{reviewer_task_id} has no durable author for final approval"
