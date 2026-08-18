@@ -28,7 +28,9 @@ struct SessionMeta {
     start_time: i64,
     end_time: Option<i64>,
     cost_tokens: i64,
-    cost_usd: f64,
+    /// Provider cost is optional. In particular, Codex's runner protocol does
+    /// not supply USD, so serializing zero here would fabricate a measurement.
+    cost_usd: Option<f64>,
     final_phase: String,
     verdict: Option<String>,
     rework_count: u32,
@@ -73,7 +75,7 @@ impl SessionLog {
             start_time,
             end_time: None,
             cost_tokens: 0,
-            cost_usd: 0.0,
+            cost_usd: None,
             final_phase: "working".to_string(),
             verdict: None,
             rework_count: 0,
@@ -123,7 +125,7 @@ impl SessionLog {
         self.meta.final_phase = phase.to_string();
     }
 
-    pub fn update_cost(&mut self, tokens: i64, cost_usd: f64) {
+    pub fn update_cost(&mut self, tokens: i64, cost_usd: Option<f64>) {
         self.meta.cost_tokens = tokens;
         self.meta.cost_usd = cost_usd;
     }
@@ -224,7 +226,7 @@ mod tests {
         };
         log.log_event(&tool_event);
 
-        log.update_cost(500, 0.05);
+        log.update_cost(500, Some(0.05));
         log.set_phase("awaiting-review");
         log.finalize(Some("approved"));
 
@@ -237,6 +239,7 @@ mod tests {
         assert_eq!(meta["role"], "worker");
         assert_eq!(meta["task_id"], 42);
         assert_eq!(meta["cost_tokens"], 500);
+        assert_eq!(meta["cost_usd"], 0.05);
         assert_eq!(meta["final_phase"], "awaiting-review");
         assert_eq!(meta["verdict"], "approved");
 
@@ -247,6 +250,30 @@ mod tests {
         let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
         assert!(transcript.contains("Hello world"));
         assert!(transcript.contains("> Bash:"));
+    }
+
+    #[test]
+    fn session_meta_keeps_unreported_cost_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(
+            dir.path(),
+            "CodexAgent",
+            "worker",
+            Some(7),
+            "sess-codex",
+            "feat/cost",
+            1000,
+        )
+        .unwrap();
+
+        log.update_cost(123, None);
+        log.finalize(None);
+
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(log.dir().join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["cost_tokens"], 123);
+        assert_eq!(meta["cost_usd"], serde_json::Value::Null);
     }
 
     #[test]

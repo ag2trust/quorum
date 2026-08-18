@@ -3385,6 +3385,10 @@ pub(crate) struct SlotState {
     /// Selected token-limit-basis cumulative accounting for watchdog ceilings.
     limit_tokens: i64,
     token_usage: runner::TokenUsage,
+    /// The latest provider terminal usage keeps watchdog diagnostics tied to
+    /// the terminal turn while cumulative values remain in `token_usage`.
+    last_terminal_usage: runner::TokenUsage,
+    last_terminal_cost_usd: Option<f64>,
     cost_usd: f64,
     task_started_at: std::time::Instant,
     turn_started_at: std::time::Instant,
@@ -10443,6 +10447,13 @@ async fn tick(
             ));
             continue;
         };
+        log_terminal_usage_diagnostic(
+            &reviewers[i],
+            "reviewer",
+            &config.limits,
+            Some(&breach),
+            terminal_usage_action(&disposition),
+        );
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -10547,6 +10558,13 @@ async fn tick(
             ));
             continue;
         };
+        log_terminal_usage_diagnostic(
+            &workers[i],
+            "worker",
+            &config.limits,
+            Some(&breach),
+            terminal_usage_action(&disposition),
+        );
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -12461,6 +12479,103 @@ fn token_limit_total(
     i64::try_from(total).unwrap_or(i64::MAX)
 }
 
+/// The lifecycle classifier is authoritative for watchdog action. This is
+/// deliberately diagnostic-only: it neither reads nor writes the database.
+#[derive(Clone, Copy)]
+enum TerminalUsageAction {
+    NoTeardown,
+    ActiveOwnerWatchdogTermination,
+    PendingOutcomeRetention,
+    RecordedOutcomeCleanup,
+    TransferredOwnershipCleanup,
+}
+
+impl TerminalUsageAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoTeardown => "no_teardown",
+            Self::ActiveOwnerWatchdogTermination => "active_owner_watchdog_termination",
+            Self::PendingOutcomeRetention => "pending_outcome_retention",
+            Self::RecordedOutcomeCleanup => "recorded_outcome_cleanup",
+            Self::TransferredOwnershipCleanup => "transferred_ownership_cleanup",
+        }
+    }
+}
+
+fn terminal_usage_action(disposition: &tasks::ManagedExitDisposition) -> TerminalUsageAction {
+    match disposition {
+        tasks::ManagedExitDisposition::OutcomePending => {
+            TerminalUsageAction::PendingOutcomeRetention
+        }
+        tasks::ManagedExitDisposition::OutcomeRecorded => {
+            TerminalUsageAction::RecordedOutcomeCleanup
+        }
+        tasks::ManagedExitDisposition::OwnershipTransferred => {
+            TerminalUsageAction::TransferredOwnershipCleanup
+        }
+        tasks::ManagedExitDisposition::AgentFailed(_) => {
+            TerminalUsageAction::ActiveOwnerWatchdogTermination
+        }
+    }
+}
+
+/// Render only normalized scalar telemetry. It contains no provider payload,
+/// prompt, tool input, or credentials, and serde escapes every text field.
+fn terminal_usage_diagnostic(
+    slot: &SlotState,
+    role: &str,
+    limits: &CostLimits,
+    breach: Option<&str>,
+    action: TerminalUsageAction,
+) -> serde_json::Value {
+    let usage = slot.last_terminal_usage;
+    let breach_reason = breach.map(|reason| {
+        let mut bounded: String = reason.chars().take(512).collect();
+        if reason.chars().count() > 512 {
+            bounded.push('…');
+        }
+        bounded
+    });
+    serde_json::json!({
+        "event": "terminal_usage",
+        "role": role,
+        "agent": slot.agent_name,
+        "task_id": slot.task_id,
+        "provider": slot.process_kind().to_string(),
+        "raw_input_tokens": usage.input_tokens,
+        "uncached_input_tokens": usage.uncached_input_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "cache_write_input_tokens": usage.cache_write_input_tokens,
+        "output_tokens": usage.output_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "raw_total_tokens": usage.live_total_tokens(),
+        "uncached_total_tokens": usage.uncached_total_tokens(),
+        "cumulative_raw_total_tokens": slot.token_usage.live_total_tokens(),
+        "cumulative_uncached_total_tokens": slot.token_usage.uncached_total_tokens(),
+        "cumulative_limit_tokens": slot.limit_tokens,
+        "cost_usd": slot.last_terminal_cost_usd,
+        "configured_limit_basis": limits.token_limit_basis.to_string(),
+        "configured_max_turn_tokens": limits.max_turn_tokens,
+        "configured_max_task_tokens": limits.max_task_tokens,
+        "configured_max_turn_cost_usd": limits.max_turn_cost_usd,
+        "configured_max_task_cost_usd": limits.max_task_cost_usd,
+        "breach": breach_reason.is_some(),
+        "breach_reason": breach_reason,
+        "action": action.as_str(),
+    })
+}
+
+fn log_terminal_usage_diagnostic(
+    slot: &SlotState,
+    role: &str,
+    limits: &CostLimits,
+    breach: Option<&str>,
+    action: TerminalUsageAction,
+) {
+    let diagnostic = terminal_usage_diagnostic(slot, role, limits, breach, action);
+    log(&format!("terminal usage diagnostic: {diagnostic}"));
+}
+
 /// Check wall-clock limits only (called each tick for slots still draining).
 fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<LimitBreached> {
     let max_idle_secs = max_idle_secs(limits);
@@ -13801,6 +13916,8 @@ async fn drain_events(
                     if let Some(usage) = usage {
                         slot.token_usage.saturating_add_assign(*usage);
                     }
+                    slot.last_terminal_usage = usage.unwrap_or_default();
+                    slot.last_terminal_cost_usd = *cost_usd;
                     slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
                     slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
                     // cost_usd is session-cumulative (running total), not per-turn.
@@ -13809,11 +13926,6 @@ async fn drain_events(
                         slot.cost_usd = *cost;
                     }
                     let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
-                    log(&format!(
-                        "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4})",
-                        slot.agent_name, turn_tokens, slot.limit_tokens, slot.cost_usd,
-                    ));
-
                     let phase = if role == "worker" {
                         "awaiting-review"
                     } else {
@@ -13821,7 +13933,7 @@ async fn drain_events(
                     };
 
                     if let Some(ref mut sl) = slot.session_log {
-                        sl.update_cost(slot.cost_tokens, slot.cost_usd);
+                        sl.update_cost(slot.cost_tokens, *cost_usd);
                         sl.set_phase(phase);
                     }
 
@@ -13858,6 +13970,15 @@ async fn drain_events(
                         slot.cost_usd,
                         slot,
                     );
+                    if breach.is_none() {
+                        log_terminal_usage_diagnostic(
+                            slot,
+                            role,
+                            limits,
+                            None,
+                            TerminalUsageAction::NoTeardown,
+                        );
+                    }
                     return Ok(breach);
                 }
 
@@ -13874,6 +13995,8 @@ async fn drain_events(
                     if let Some(usage) = usage {
                         slot.token_usage.saturating_add_assign(*usage);
                     }
+                    slot.last_terminal_usage = usage.unwrap_or_default();
+                    slot.last_terminal_cost_usd = *cost_usd;
                     slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
                     slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
                     let prev_cost = slot.cost_usd;
@@ -13881,13 +14004,8 @@ async fn drain_events(
                         slot.cost_usd = *cost;
                     }
                     let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
-                    log(&format!(
-                        "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4}, ERROR)",
-                        slot.agent_name, turn_tokens, slot.limit_tokens, slot.cost_usd,
-                    ));
-
                     if let Some(ref mut sl) = slot.session_log {
-                        sl.update_cost(slot.cost_tokens, slot.cost_usd);
+                        sl.update_cost(slot.cost_tokens, *cost_usd);
                         sl.set_phase("working");
                     }
 
@@ -13925,6 +14043,15 @@ async fn drain_events(
                         slot.cost_usd,
                         slot,
                     );
+                    if breach.is_none() {
+                        log_terminal_usage_diagnostic(
+                            slot,
+                            role,
+                            limits,
+                            None,
+                            TerminalUsageAction::NoTeardown,
+                        );
+                    }
                     return Ok(breach);
                 }
 
@@ -15089,6 +15216,8 @@ async fn provision_reviewer_reserved(
                 cost_tokens: 0,
                 limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
+                last_terminal_usage: runner::TokenUsage::default(),
+                last_terminal_cost_usd: None,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -15867,6 +15996,8 @@ async fn spawn_worker(
                 cost_tokens: 0,
                 limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
+                last_terminal_usage: runner::TokenUsage::default(),
+                last_terminal_cost_usd: None,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -18042,6 +18173,8 @@ async fn spawn_remediation_worker(
                 cost_tokens: 0,
                 limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
+                last_terminal_usage: runner::TokenUsage::default(),
+                last_terminal_cost_usd: None,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -19519,6 +19652,8 @@ mod tests {
             cost_tokens: 500,
             limit_tokens: 500,
             token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
             cost_usd: 0.01,
             task_started_at: now,
             turn_started_at: now,
@@ -20590,6 +20725,8 @@ mod tests {
                 cost_tokens: 17,
                 limit_tokens: 17,
                 token_usage: runner::TokenUsage::default(),
+                last_terminal_usage: runner::TokenUsage::default(),
+                last_terminal_cost_usd: None,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -21752,6 +21889,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             cost_tokens: 0,
             limit_tokens: 0,
             token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
             cost_usd: 0.0,
             task_started_at: now,
             turn_started_at: now,
@@ -22106,6 +22245,90 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let limits = CostLimits::default();
         let slot = make_dummy_slot();
         assert!(check_post_result_limits(&limits, 100, 500, Some(0.01), 0.05, &slot).is_none());
+    }
+
+    #[test]
+    fn cached_heavy_codex_terminal_usage_diagnostic_explains_cleanup() {
+        let mut slot = make_dummy_slot();
+        slot.proc = SlotProcess::dormant(runner::AgentKind::Codex, Some("test-thread")).unwrap();
+        slot.last_terminal_usage = runner::TokenUsage {
+            input_tokens: 2_000_000,
+            uncached_input_tokens: 40_000,
+            cached_input_tokens: 1_950_000,
+            cache_write_input_tokens: 10_000,
+            output_tokens: 2_000,
+            reasoning_tokens: 700,
+        };
+        slot.token_usage = slot.last_terminal_usage;
+        slot.limit_tokens = 42_000;
+        let limits = CostLimits {
+            token_limit_basis: crate::serve_config::TokenLimitBasis::Uncached,
+            max_task_tokens: Some(40_000),
+            ..Default::default()
+        };
+
+        let diagnostic = terminal_usage_diagnostic(
+            &slot,
+            "worker",
+            &limits,
+            Some("task tokens (uncached) 42000 exceeded limit 40000"),
+            TerminalUsageAction::RecordedOutcomeCleanup,
+        );
+
+        assert_eq!(diagnostic["role"], "worker");
+        assert_eq!(diagnostic["agent"], "Test-1");
+        assert_eq!(diagnostic["task_id"], 1);
+        assert_eq!(diagnostic["provider"], "codex");
+        assert_eq!(diagnostic["raw_input_tokens"], 2_000_000);
+        assert_eq!(diagnostic["uncached_input_tokens"], 40_000);
+        assert_eq!(diagnostic["cached_input_tokens"], 1_950_000);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 10_000);
+        assert_eq!(diagnostic["output_tokens"], 2_000);
+        assert_eq!(diagnostic["reasoning_tokens"], 700);
+        assert_eq!(diagnostic["raw_total_tokens"], 2_002_000);
+        assert_eq!(diagnostic["uncached_total_tokens"], 42_000);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 2_002_000);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 42_000);
+        assert_eq!(diagnostic["cumulative_limit_tokens"], 42_000);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["configured_limit_basis"], "uncached");
+        assert_eq!(diagnostic["configured_max_task_tokens"], 40_000);
+        assert_eq!(diagnostic["breach"], true);
+        assert_eq!(diagnostic["action"], "recorded_outcome_cleanup");
+    }
+
+    #[test]
+    fn terminal_usage_diagnostic_is_bounded_and_json_safe() {
+        let mut slot = make_dummy_slot();
+        slot.last_terminal_usage = runner::TokenUsage {
+            input_tokens: u64::MAX,
+            uncached_input_tokens: u64::MAX,
+            cached_input_tokens: u64::MAX,
+            cache_write_input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            reasoning_tokens: u64::MAX,
+        };
+        let oversized = format!("bad\n{}", "x".repeat(4_096));
+        let diagnostic = terminal_usage_diagnostic(
+            &slot,
+            "worker",
+            &CostLimits::default(),
+            Some(&oversized),
+            TerminalUsageAction::ActiveOwnerWatchdogTermination,
+        );
+        let rendered = serde_json::to_string(&diagnostic).unwrap();
+
+        assert!(
+            diagnostic["breach_reason"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                <= 513
+        );
+        assert!(rendered.len() < 2_000);
+        assert!(!rendered.contains('\n'));
+        assert_eq!(diagnostic["action"], "active_owner_watchdog_termination");
     }
 
     #[test]
