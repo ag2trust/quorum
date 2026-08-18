@@ -87,7 +87,11 @@ Agents communicate with the daemon exclusively through the SQLite database:
   recovery), `worktree`, `branch`, `phase`, and `cost_tokens`. Entries are deleted
   on terminal transitions (teardown).
 
-No sockets, no pipes beyond the stream-json stdin/stdout of each agent process.
+This implemented baseline originally used no sockets and no pipes beyond each agent's stream-JSON
+stdin/stdout. The proposed credentialless GitHub collaboration MCP supersedes that constraint with
+one narrow, local, run-capability-authorized agent endpoint; see
+`2026-08-17-github-collaboration-mcp-technical-spec.md`. It does not add a remote or general daemon
+API.
 
 ## Lifecycle
 
