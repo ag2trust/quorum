@@ -610,7 +610,7 @@ pub enum Command {
         #[arg(long = "reason-file")]
         reason_file: Option<PathBuf>,
     },
-    /// Explicitly retry a task parked by the daemon after a bounded failure.
+    /// Explicitly retry a daemon park, provider block, or eligible exhausted decomposition plan.
     TaskRetry {
         #[arg(long = "task-id")]
         task_id: i64,
