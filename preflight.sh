@@ -288,7 +288,7 @@ try:
         stderr=subprocess.DEVNULL,
     ).split(b"\0")[:-1]
     status = subprocess.check_output(
-        ["git", "status", "--porcelain=v1", "-z"],
+        ["git", "status", "--porcelain=v1", "--untracked-files=all", "-z"],
         stderr=subprocess.DEVNULL,
     ).split(b"\0")
 except BaseException:

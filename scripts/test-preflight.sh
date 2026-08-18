@@ -169,6 +169,17 @@ printf 'root Rust source\n' > "$INERT_REPO/LICENSE.rs"
 cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
 
 git -C "$INERT_REPO" clean -fd
+mkdir -p "$INERT_REPO/docs"
+printf 'nested Rust source\n' > "$INERT_REPO/docs/generated.rs"
+: >"$TMP/inert-cargo.log"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-nested-rust.out"
+! grep -q 'skipping clippy + test' "$TMP/inert-nested-rust.out"
+cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
+
+git -C "$INERT_REPO" clean -fd
 mkdir -p "$INERT_REPO/.claude/skills/quorum"
 printf 'compiled skill input\n' > "$INERT_REPO/.claude/skills/quorum/SKILL.md"
 : >"$TMP/inert-cargo.log"
