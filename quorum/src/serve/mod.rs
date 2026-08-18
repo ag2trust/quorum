@@ -23473,15 +23473,19 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         reviewer
     }
 
-    fn tick_phase2_reviewer_fixture(
-        config: ServeConfig,
-        mut name_pool: Pool,
-        fixture_dir: std::path::PathBuf,
+    struct Phase2ReviewerFixture {
+        dir: std::path::PathBuf,
         repo_dir: std::path::PathBuf,
         task_id: i64,
         reviewer_run_id: i64,
         agent: String,
         reviewed_head_sha: Option<String>,
+    }
+
+    fn tick_phase2_reviewer_fixture(
+        config: ServeConfig,
+        mut name_pool: Pool,
+        fixture: Phase2ReviewerFixture,
     ) -> (Pool, Vec<SlotState>) {
         std::thread::Builder::new()
             .name("phase2-reviewer-fixture".into())
@@ -23494,15 +23498,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 runtime.block_on(async {
                     let mut reviewers = vec![
                         buffered_codex_reviewer_slot_for_phase2_test(
-                            &fixture_dir,
-                            &repo_dir,
-                            task_id,
-                            reviewer_run_id,
-                            &agent,
+                            &fixture.dir,
+                            &fixture.repo_dir,
+                            fixture.task_id,
+                            fixture.reviewer_run_id,
+                            &fixture.agent,
                         )
                         .await,
                     ];
-                    reviewers[0].reviewed_head_sha = reviewed_head_sha;
+                    reviewers[0].reviewed_head_sha = fixture.reviewed_head_sha;
                     let wt_mgr = WorktreeManager::new();
                     let mut workers = Vec::new();
                     let mut pre_review_checks = HashMap::new();
@@ -23646,12 +23650,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let (_name_pool, reviewers) = tick_phase2_reviewer_fixture(
             config,
             name_pool,
-            dir.path().to_path_buf(),
-            repo_dir,
-            task_id,
-            reviewer_run_id,
-            "Phase2Reviewer".into(),
-            None,
+            Phase2ReviewerFixture {
+                dir: dir.path().to_path_buf(),
+                repo_dir,
+                task_id,
+                reviewer_run_id,
+                agent: "Phase2Reviewer".into(),
+                reviewed_head_sha: None,
+            },
         );
 
         assert!(
@@ -23805,12 +23811,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let (_name_pool, reviewers) = tick_phase2_reviewer_fixture(
             config,
             name_pool,
-            dir.path().to_path_buf(),
-            repo_dir,
-            task_id,
-            reviewer_run_id,
-            "UnrecordedReviewer".into(),
-            None,
+            Phase2ReviewerFixture {
+                dir: dir.path().to_path_buf(),
+                repo_dir,
+                task_id,
+                reviewer_run_id,
+                agent: "UnrecordedReviewer".into(),
+                reviewed_head_sha: None,
+            },
         );
 
         assert!(
@@ -23959,12 +23967,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let (_name_pool, reviewers) = tick_phase2_reviewer_fixture(
             config,
             name_pool,
-            dir.path().to_path_buf(),
-            repo_dir,
-            task_id,
-            reviewer_run_id,
-            "MergeWaitReviewer".into(),
-            Some("reviewed-head".into()),
+            Phase2ReviewerFixture {
+                dir: dir.path().to_path_buf(),
+                repo_dir,
+                task_id,
+                reviewer_run_id,
+                agent: "MergeWaitReviewer".into(),
+                reviewed_head_sha: Some("reviewed-head".into()),
+            },
         );
 
         assert!(reviewers.is_empty(), "merge-wait reviewer must be reaped");
