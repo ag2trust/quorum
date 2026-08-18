@@ -1128,7 +1128,8 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
     /// Current Codex releases can write an informational notice about that
     /// stdin shape before the first JSONL event. Keep this a real-binary
     /// boundary check without requiring a network-authenticated turn: the
-    /// captured notice must not suppress a later structured auth failure.
+    /// spawned no-auth process must eventually report its structured failure
+    /// despite the captured notice.
     #[tokio::test]
     async fn real_cli_planner_stderr_notice_does_not_mask_structured_auth_failure() {
         if !codex_available() {
@@ -1169,8 +1170,24 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
             .iter()
             .any(|line| matches!(line, CapturedOutput::Stderr(text) if !text.is_empty())));
 
-        proc.failures.observe_stdout(
-            r#"{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"}}"#,
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let raw = proc
+                    .next_raw_line()
+                    .await
+                    .expect("planner Codex ended before a structured auth/provider failure");
+                if matches!(
+                    codex_stream::parse_line(&raw),
+                    Some(Event::TurnFailed { .. } | Event::Error { .. })
+                ) {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            terminal.is_ok(),
+            "planner Codex did not report a structured auth/provider failure within 60s"
         );
         assert_eq!(
             proc.observed_planner_live_failure()
