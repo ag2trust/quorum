@@ -65,6 +65,18 @@ git branch -M main
 git push -q origin main
 git config diff.constant.textconv "$BIN/constant-textconv"
 
+# Keep the preflight sources tracked so the integration check below has only
+# its docs change. (The scripts are production inputs in this fixture, not the
+# subject of the inert-diff test.)
+cp "$ROOT/preflight.sh" ./preflight.sh
+chmod +x ./preflight.sh
+mkdir -p scripts/preflight
+cp "$ROOT/scripts/preflight/timing.sh" scripts/preflight/timing.sh
+chmod +x scripts/preflight/timing.sh
+git add preflight.sh scripts/preflight/timing.sh
+git commit -qm 'add preflight fixture support'
+git push -q origin main
+
 git switch -qc develop
 printf 'develop\n' >> state
 git commit -qam 'develop work' -m 'Co-Authored-By: Develop-agent <develop@example.invalid>'
@@ -88,6 +100,130 @@ cp "$ROOT/scripts/preflight/timing.sh" scripts/preflight/timing.sh
 chmod +x scripts/preflight/timing.sh
 PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/integration.out"
 grep -q 'PREFLIGHT: PASS (quick' "$TMP/integration.out"
+
+# An integration's branch-base comparison is intentionally compound. Even a
+# docs-only working-tree change must keep the full Cargo suite on that path.
+mkdir -p docs
+printf 'integration docs\n' > docs/integration.md
+PREFLIGHT_CARGO_LOG="$TMP/integration-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/integration-full.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/integration-full.out"
+! grep -q 'skipping clippy + test' "$TMP/integration-full.out"
+grep -q '^clippy ' "$TMP/integration-cargo.log"
+rm -rf docs
+
+# Exercise the inert-diff decision in a clean real repository so a previous
+# green-cache result cannot mask either the skip or its fail-safe fallbacks.
+INERT_REPO="$TMP/inert-repo"
+mkdir "$INERT_REPO"
+git -C "$INERT_REPO" init -q -b main
+git -C "$INERT_REPO" config user.name CI
+git -C "$INERT_REPO" config user.email ci@example.invalid
+cp "$ROOT/preflight.sh" "$INERT_REPO/preflight.sh"
+chmod +x "$INERT_REPO/preflight.sh"
+mkdir -p "$INERT_REPO/scripts/preflight"
+cp "$ROOT/scripts/preflight/timing.sh" "$INERT_REPO/scripts/preflight/timing.sh"
+chmod +x "$INERT_REPO/scripts/preflight/timing.sh"
+printf '/target\n' > "$INERT_REPO/.gitignore"
+git -C "$INERT_REPO" add .gitignore preflight.sh scripts/preflight/timing.sh
+git -C "$INERT_REPO" commit -qm 'inert diff fixture base'
+git -C "$INERT_REPO" remote add origin .
+git -C "$INERT_REPO" switch -qc daemon/inert-diff-t10
+printf 'fmt --all -- --check\n' > "$TMP/inert-fmt.expected"
+cat >"$TMP/inert-full.expected" <<'EOF'
+fmt --all -- --check
+clippy --all-targets --all-features --features quorum-core/test-support -- -D warnings
+test --no-run --message-format=json --workspace --all-features --features quorum-core/test-support
+EOF
+
+mkdir "$INERT_REPO/docs"
+printf 'docs only\n' > "$INERT_REPO/docs/x.md"
+: >"$TMP/inert-cargo.log"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-docs.out"
+grep -q 'PREFLIGHT: skipping clippy + test — diff is docs/config-only (1 files)' \
+  "$TMP/inert-docs.out"
+cmp "$TMP/inert-fmt.expected" "$TMP/inert-cargo.log"
+
+git -C "$INERT_REPO" add docs/x.md
+git -C "$INERT_REPO" commit -qm 'docs-only committed change'
+: >"$TMP/inert-cargo.log"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-committed-docs.out"
+grep -q 'PREFLIGHT: skipping clippy + test — diff is docs/config-only (1 files)' \
+  "$TMP/inert-committed-docs.out"
+cmp "$TMP/inert-fmt.expected" "$TMP/inert-cargo.log"
+
+printf 'root Rust source\n' > "$INERT_REPO/README.rs"
+printf 'root Rust source\n' > "$INERT_REPO/LICENSE.rs"
+: >"$TMP/inert-cargo.log"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-root-rust.out"
+! grep -q 'skipping clippy + test' "$TMP/inert-root-rust.out"
+cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
+
+git -C "$INERT_REPO" clean -fd
+mkdir -p "$INERT_REPO/docs"
+printf 'nested Rust source\n' > "$INERT_REPO/docs/generated.rs"
+: >"$TMP/inert-cargo.log"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-nested-rust.out"
+! grep -q 'skipping clippy + test' "$TMP/inert-nested-rust.out"
+cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
+
+git -C "$INERT_REPO" clean -fd
+mkdir -p "$INERT_REPO/docs" "$INERT_REPO/.github"
+printf '[package]\nname = "nested-fixture"\nversion = "0.0.0"\n' \
+  > "$INERT_REPO/docs/Cargo.toml"
+printf 'nested lockfile\n' > "$INERT_REPO/.github/Cargo.lock"
+: >"$TMP/inert-cargo.log"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-nested-manifest.out"
+! grep -q 'skipping clippy + test' "$TMP/inert-nested-manifest.out"
+cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
+
+git -C "$INERT_REPO" clean -fd
+mkdir -p "$INERT_REPO/.claude/skills/quorum"
+printf 'compiled skill input\n' > "$INERT_REPO/.claude/skills/quorum/SKILL.md"
+: >"$TMP/inert-cargo.log"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-skill.out"
+! grep -q 'skipping clippy + test' "$TMP/inert-skill.out"
+cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
+
+git -C "$INERT_REPO" clean -fd
+printf 'pub fn compiled() {}\n' > "$INERT_REPO/compiled.rs"
+: >"$TMP/inert-cargo.log"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-rust.out"
+! grep -q 'skipping clippy + test' "$TMP/inert-rust.out"
+cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
+
+git -C "$INERT_REPO" clean -fd
+mkdir -p "$INERT_REPO/docs" "$INERT_REPO/quorum-core/src"
+printf 'mixed docs\n' > "$INERT_REPO/docs/x.md"
+printf 'compiled schema input\n' > "$INERT_REPO/quorum-core/src/schema.sql"
+: >"$TMP/inert-cargo.log"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-mixed-schema.out"
+! grep -q 'skipping clippy + test' "$TMP/inert-mixed-schema.out"
+cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
 
 # Merely branching from develop is not integration: the branch omits current
 # main and must remain subject to the normal branch-base rejection.
