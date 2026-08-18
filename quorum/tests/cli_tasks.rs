@@ -649,6 +649,167 @@ fn policy_park_task_retry_succeeds_audits_and_resets_recovery_budget() {
     assert_eq!(retry_events, 1);
 }
 
+#[test]
+fn concurrent_exhausted_decomposition_retry_has_one_atomic_winner() {
+    for round in 0..8 {
+        let home = tempfile::tempdir().unwrap();
+        quorum(home.path())
+            .args([
+                "task-create",
+                "--created-by",
+                "boss",
+                "--title",
+                "retry exhausted plan",
+            ])
+            .assert()
+            .success();
+        let db = home.path().join("repos/test__repo/quorum.db");
+        {
+            let conn = quorum_core::db::open(&db).unwrap();
+            conn.execute("UPDATE tasks SET status='failed' WHERE id=1", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 provider_failures,hold_code,hold_summary,created_at,updated_at)
+             VALUES (1,'held',0,0,1,3,'provider-attempts-exhausted',
+                     'planner transport failed',1,1)",
+                [],
+            )
+            .unwrap();
+            for ordinal in 1..=3 {
+                conn.execute(
+                    "INSERT INTO decomposition_attempts(
+                     graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+                 VALUES (1,1,'provider',?1,'provider','failed',1)",
+                    [ordinal],
+                )
+                .unwrap();
+            }
+        }
+
+        let binary = assert_cmd::cargo::cargo_bin("quorum");
+        let mut commands = ["first", "second"].map(|operator| {
+            let mut command = std::process::Command::new(&binary);
+            command
+                .env("QUORUM_HOME", home.path())
+                .env("QUORUM_REPO", "test/repo")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .args(["task-retry", "--task-id", "1", "--by", operator]);
+            command
+        });
+        let first = commands[0].spawn().unwrap();
+        let second = commands[1].spawn().unwrap();
+        let first = first.wait_with_output().unwrap();
+        let second = second.wait_with_output().unwrap();
+        let winners = usize::from(first.status.success()) + usize::from(second.status.success());
+        assert_eq!(winners, 1, "round {round}");
+        let winner = if first.status.success() {
+            &first
+        } else {
+            &second
+        };
+        let loser = if first.status.success() {
+            &second
+        } else {
+            &first
+        };
+        assert!(String::from_utf8_lossy(&winner.stdout)
+            .contains("\"outcome\":\"decomposition-planning-retried\""));
+        assert_eq!(loser.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&loser.stdout).contains("\"outcome\":\"task-retry-rejected\"")
+        );
+
+        let conn = quorum_core::db::open(&db).unwrap();
+        let state: (String, String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT d.state,t.status,d.operator_retry_count,
+                    (SELECT count(*) FROM events
+                     WHERE kind='decomposition_planning_retry'),
+                    (SELECT count(*) FROM errors)
+             FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("provider-backoff".into(), "planning".into(), 1, 1, 0)
+        );
+    }
+}
+
+#[test]
+fn task_retry_help_names_exhausted_decomposition_planning() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-retry", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("exhausted decomposition plan"));
+}
+
+#[test]
+fn exhausted_decomposition_retry_cap_has_actionable_json() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "capped plan",
+        ])
+        .assert()
+        .success();
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    conn.execute("UPDATE tasks SET status='failed' WHERE id=1", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO task_decompositions(
+             source_task_id,state,planned_source_revision,provider_failures,
+             operator_retry_count,hold_code,created_at,updated_at)
+         VALUES (1,'held',1,3,2,'provider-attempts-exhausted',1,1)",
+        [],
+    )
+    .unwrap();
+    for generation in 0..=2 {
+        for offset in 1..=3 {
+            conn.execute(
+                "INSERT INTO decomposition_attempts(
+                     graph_id,source_revision,kind,ordinal,retry_generation,
+                     reason_code,summary,created_at)
+                 VALUES (1,1,'provider',?1,?2,'provider','failed',1)",
+                rusqlite::params![generation * 3 + offset, generation],
+            )
+            .unwrap();
+        }
+    }
+    drop(conn);
+
+    quorum(home.path())
+        .args(["task-retry", "--task-id", "1", "--by", "operator"])
+        .assert()
+        .code(1)
+        .stdout(predicates::str::contains(
+            "\"outcome\":\"decomposition-planning-retry-rejected\"",
+        ))
+        .stdout(predicates::str::contains("operator retry cap exhausted"))
+        .stdout(predicates::str::contains("\"retry_count\":2"))
+        .stdout(predicates::str::contains("\"retry_cap\":2"));
+}
+
 /// Task #473: `task-retry` on a dependent whose depends_on contains a
 /// cancelled task must exit 1 naming the cancelled dep and NOT restore the
 /// dependent (the sweep would just re-park it and give the operator no

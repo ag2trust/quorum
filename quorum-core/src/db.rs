@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 54;
+pub const SCHEMA_VERSION: i64 = 55;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -833,6 +833,24 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // v54 = durable, per-invocation token usage. Both new tables are
         // created idempotently by SCHEMA_SQL; historic agent runs remain
         // untouched and no usage is fabricated during migration.
+        // v55 makes exhausted decomposition planning explicitly and boundedly
+        // operator-retryable. Existing attempts belong to generation zero.
+        if current < 55 {
+            if !column_exists(conn, "task_decompositions", "operator_retry_count")? {
+                conn.execute(
+                    "ALTER TABLE task_decompositions
+                     ADD COLUMN operator_retry_count INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "decomposition_attempts", "retry_generation")? {
+                conn.execute(
+                    "ALTER TABLE decomposition_attempts
+                     ADD COLUMN retry_generation INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -926,6 +944,56 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrates_v54_adds_decomposition_retry_generations_without_rewriting_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v54.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('source','failed','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                     source_task_id,state,planned_source_revision,provider_failures,
+                     hold_code,created_at,updated_at)
+                 VALUES (1,'held',1,3,'provider-attempts-exhausted',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO decomposition_attempts(
+                     graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+                 VALUES (1,1,'provider',1,'provider','preserved',1)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE task_decompositions DROP COLUMN operator_retry_count;
+                 ALTER TABLE decomposition_attempts DROP COLUMN retry_generation;
+                 PRAGMA user_version=54;",
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let values: (i64, i64, String) = conn
+            .query_row(
+                "SELECT d.operator_retry_count,a.retry_generation,a.summary
+                 FROM task_decompositions d
+                 JOIN decomposition_attempts a ON a.graph_id=d.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (0, 0, "preserved".into()));
     }
 
     #[test]

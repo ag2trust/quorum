@@ -778,7 +778,9 @@ owner alert. Each periodic pass examines at most one indexed raw-ID page, so
 mutation work is independent of retained failed-task history.
 
 `quorum task-retry --task-id N --by <operator>` is the sole resume operation for a
-daemon-parked task. It atomically validates the marker, clears it (including the
+daemon-parked task, a worker provider block, or the narrowly eligible exhausted
+decomposition-planning state described below. For a daemon park it atomically validates
+the marker, clears it (including the
 unsatisfiable bit), resets only the crash recovery counter, and emits `task_retry`.
 `open`, `rework`, and `in-review` restore directly. A `rework` retry also records
 `daemon_rework_retry_requested=true`; startup recovery preserves it and the next
@@ -2060,6 +2062,32 @@ the freeze during backoff, and retry drains again. Full prompts and transcripts 
 only bounded structured attempts, the accepted closed proposal needed to resume validation or
 preclassification, and final reasons are durable. Restart inspection never consumes a semantic
 proposal attempt.
+
+Exhausting either three-attempt planning budget holds the graph and fails the source; it never
+retries automatically. `task-retry` may explicitly resume that same aggregate only while a single
+`BEGIN IMMEDIATE` transaction proves the source revision is unchanged and unassigned, the graph
+is held without active/freeze authority, the hold code and exhausted counter agree, the source is
+neither review-only nor a continuation, and no accepted plan, member/child, process, run, PR, or
+delivery/merge evidence exists. The winner restores the source to `planning`, clears only the
+retryable hold/session/base fields, resets the exhausted current-generation counter, and places the
+graph in provider backoff so the coordinator must reacquire `one_planning_freeze` through the
+ordinary guarded path. Semantic blockers, inconsistent holds, stale authority, materialization,
+delivery evidence, and racing callers are clean negatives.
+
+Coordinator snapshot selection always prioritizes the unique `freeze_active=1` aggregate before
+older provider-backoff aggregates. An explicitly retried graph therefore cannot shadow, stall, or
+consume output from a later graph that already owns the planning freeze; backoff graphs resume in
+ID order only when no freeze owner remains. A live planner or classifier slot also pins its
+in-memory graph identity: any mismatch with the durable selected graph is a loud internal failure,
+never permission to consume that process result for a different aggregate.
+
+Each graph permits at most two operator planning retries. Attempts remain append-only: their
+ordinals increase monotonically across the unchanged source revision and each row records the
+operator retry generation (historical rows are generation zero). Thus each proposal/provider
+ledger is bounded at nine rows per graph. A successful retry emits one durable
+`decomposition_planning_retry` event naming the operator and generation; cap exhaustion is an
+actionable clean negative. Status exposes the hold code, whether it is currently retryable, and the
+retry count/cap without exposing planner transcripts.
 
 Reviewer provisioning reserves task authority in `BEGIN IMMEDIATE` before external resolution or
 process creation. The same transaction checks task phase, classification, and planning freeze;
