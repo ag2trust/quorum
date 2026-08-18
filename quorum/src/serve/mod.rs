@@ -385,6 +385,51 @@ enum ProvisionDecision {
     Exhausted,
 }
 
+/// Result of a reviewer provisioning attempt after its reservation has been
+/// released. `Unavailable` is an expected no-op: the caller no longer had
+/// authority, or another guard made the reviewer ineligible to attach.
+/// Errors remain `Err` so callers that need to report them never mistake them
+/// for this retriable outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewerProvisionOutcome {
+    Attached,
+    Unavailable,
+}
+
+/// The R1 terminal telemetry for an attempted mandatory-R2 handoff. These
+/// labels intentionally separate an expected reservation/eligibility miss
+/// from a provisioning error so the latter is actionable in run history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum R2ProvisionDisposition {
+    Attached,
+    Unavailable,
+    Error,
+}
+
+impl R2ProvisionDisposition {
+    fn end_reason(self) -> &'static str {
+        match self {
+            Self::Attached => "r2-pending",
+            Self::Unavailable => "r2-provision-unavailable",
+            Self::Error => "r2-spawn-error",
+        }
+    }
+}
+
+fn r2_provision_disposition(
+    reviewer_added: bool,
+    result: &Result<ReviewerProvisionOutcome>,
+) -> R2ProvisionDisposition {
+    if reviewer_added {
+        return R2ProvisionDisposition::Attached;
+    }
+    match result {
+        Ok(ReviewerProvisionOutcome::Attached) => R2ProvisionDisposition::Attached,
+        Ok(ReviewerProvisionOutcome::Unavailable) => R2ProvisionDisposition::Unavailable,
+        Err(_) => R2ProvisionDisposition::Error,
+    }
+}
+
 /// Decide whether a reviewer slot is needed for `head_sha`, distinguishing
 /// "every required role already approved" from "provisioning is exhausted".
 fn decide_provision(
@@ -8100,47 +8145,92 @@ async fn tick(
                                     &head_sha,
                                 )
                                 .await?;
-                                let pre_count = reviewers.len();
-                                if ci_gate == PreReviewChecksGate::Ready {
-                                    provision_reviewer(
-                                        config,
-                                        wt_mgr,
-                                        name_pool,
-                                        reviewers,
-                                        lifetime_roster,
-                                        pr_num,
-                                        worker_cp,
-                                        &role,
-                                        &head_sha,
-                                        false,
+                                let reviewer_count_before = reviewers.len();
+                                let r2_provision = if ci_gate == PreReviewChecksGate::Ready {
+                                    Some(
+                                        provision_reviewer(
+                                            config,
+                                            wt_mgr,
+                                            name_pool,
+                                            reviewers,
+                                            lifetime_roster,
+                                            pr_num,
+                                            worker_cp,
+                                            &role,
+                                            &head_sha,
+                                            false,
+                                        )
+                                        .await,
                                     )
-                                    .await
-                                    .ok();
+                                } else {
+                                    None
+                                };
+                                if ci_gate == PreReviewChecksGate::Ready {
                                     pre_review_checks.remove(&reviewer_task_id);
                                 }
-                                let r2_added = reviewers.len() > pre_count;
-
-                                match &ci_gate {
-                                    PreReviewChecksGate::Ready if r2_added => log(&format!(
-                                        "R2 GATE: PR #{pr_num} — mandatory R2 review spawned, \
-                                         tearing down R1 reviewer {}",
-                                        r1_reviewer
-                                    )),
-                                    PreReviewChecksGate::Ready => log(&format!(
-                                        "R2 GATE: R2 spawn failed for PR #{pr_num} \
-                                         — R1 approval stored, Phase 5 will retry"
-                                    )),
-                                    PreReviewChecksGate::Waiting => log(&format!(
-                                        "R2 GATE: PR #{pr_num} — CI pending for current head; \
-                                         R1 approval stored and Phase 5 will retry without a reviewer"
-                                    )),
+                                let r2_added = reviewers.len() > reviewer_count_before;
+                                let (r2_added, r1_end_reason) = match &ci_gate {
+                                    PreReviewChecksGate::Ready => {
+                                        let result = r2_provision.as_ref().expect(
+                                            "ready R2 CI gate always attempts provisioning",
+                                        );
+                                        match r2_provision_disposition(r2_added, result) {
+                                            R2ProvisionDisposition::Attached => {
+                                                if let Err(error) = result {
+                                                    log(&format!(
+                                                        "R2 GATE: PR #{pr_num} — R2 attached but \
+                                                         provisioning finalization errored: {error}"
+                                                    ));
+                                                }
+                                                log(&format!(
+                                                    "R2 GATE: PR #{pr_num} — mandatory R2 review spawned, \
+                                                     tearing down R1 reviewer {}",
+                                                    r1_reviewer
+                                                ));
+                                                (
+                                                    true,
+                                                    R2ProvisionDisposition::Attached.end_reason(),
+                                                )
+                                            }
+                                            R2ProvisionDisposition::Unavailable => {
+                                                log(&format!(
+                                                    "R2 GATE: PR #{pr_num} — R2 provisioning unavailable \
+                                                     (no provisioning authority or reviewer eligibility); \
+                                                     R1 approval stored, Phase 5 will retry"
+                                                ));
+                                                (
+                                                    false,
+                                                    R2ProvisionDisposition::Unavailable
+                                                        .end_reason(),
+                                                )
+                                            }
+                                            R2ProvisionDisposition::Error => {
+                                                let Err(error) = result else {
+                                                    unreachable!("error disposition requires provisioning error")
+                                                };
+                                                log(&format!(
+                                                    "R2 GATE: PR #{pr_num} — R2 provisioning error: {error}; \
+                                                     R1 approval stored, Phase 5 will retry"
+                                                ));
+                                                (false, R2ProvisionDisposition::Error.end_reason())
+                                            }
+                                        }
+                                    }
+                                    PreReviewChecksGate::Waiting => {
+                                        log(&format!(
+                                            "R2 GATE: PR #{pr_num} — CI pending for current head; \
+                                             R1 approval stored and Phase 5 will retry without a reviewer"
+                                        ));
+                                        (false, "r2-ci-pending")
+                                    }
                                     PreReviewChecksGate::Failed { failing_checks } => {
                                         log(&format!(
                                             "R2 GATE: PR #{pr_num} — CI failed before R2: {}",
                                             failing_checks.join(", ")
-                                        ))
+                                        ));
+                                        (false, "r2-ci-failed")
                                     }
-                                }
+                                };
                                 let r = reviewers.remove(ri);
                                 if r2_added {
                                     teardown_reviewer_after_authority_transfer(
@@ -8148,7 +8238,7 @@ async fn tick(
                                         wt_mgr,
                                         name_pool,
                                         r,
-                                        "r2-pending",
+                                        r1_end_reason,
                                     )
                                     .await;
                                 } else {
@@ -8157,7 +8247,7 @@ async fn tick(
                                         wt_mgr,
                                         name_pool,
                                         r,
-                                        "r2-spawn-failed",
+                                        r1_end_reason,
                                     )
                                     .await;
                                 }
@@ -14714,7 +14804,8 @@ async fn provision_reviewer(
     role: &ReviewRole,
     head_sha: &str,
     recover_interrupted: bool,
-) -> Result<()> {
+) -> Result<ReviewerProvisionOutcome> {
+    let reviewer_count_before = reviewers.len();
     let reservation = uuid::Uuid::new_v4().to_string();
     let reserved = {
         let path = config.db_path.clone();
@@ -14740,7 +14831,7 @@ async fn provision_reviewer(
             role.as_str().to_uppercase(),
             worker.task_id
         ));
-        return Ok(());
+        return Ok(ReviewerProvisionOutcome::Unavailable);
     }
     let task_id = worker.task_id;
     let result = provision_reviewer_reserved(
@@ -14769,7 +14860,12 @@ async fn provision_reviewer(
             "reviewer reservation release lost token authority for task #{task_id}"
         )));
     }
-    result
+    result?;
+    Ok(if reviewers.len() > reviewer_count_before {
+        ReviewerProvisionOutcome::Attached
+    } else {
+        ReviewerProvisionOutcome::Unavailable
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -25062,6 +25158,55 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(
             all_required_roles_approved(&conn, 77, "head-x").unwrap(),
             "merge-wait recovery must treat a sampled skip as fully approved"
+        );
+    }
+
+    #[test]
+    fn r2_handoff_provision_outcomes_keep_reservation_misses_and_errors_distinct() {
+        let attached: Result<ReviewerProvisionOutcome> = Ok(ReviewerProvisionOutcome::Attached);
+        assert_eq!(
+            r2_provision_disposition(true, &attached),
+            R2ProvisionDisposition::Attached,
+            "an attached reviewer transfers R2 authority"
+        );
+        assert_eq!(
+            r2_provision_disposition(true, &attached).end_reason(),
+            "r2-pending"
+        );
+
+        let reservation_miss: Result<ReviewerProvisionOutcome> =
+            Ok(ReviewerProvisionOutcome::Unavailable);
+        assert_eq!(
+            r2_provision_disposition(false, &reservation_miss),
+            R2ProvisionDisposition::Unavailable,
+            "a reservation miss attaches no reviewer but remains retriable"
+        );
+        assert_eq!(
+            r2_provision_disposition(false, &reservation_miss).end_reason(),
+            "r2-provision-unavailable"
+        );
+
+        let provision_error: Result<ReviewerProvisionOutcome> = Err(QuorumError::Io(
+            "provider launch authentication failed".into(),
+        ));
+        assert_eq!(
+            r2_provision_disposition(false, &provision_error),
+            R2ProvisionDisposition::Error,
+            "a provisioning error must not be mistaken for a reservation miss"
+        );
+        assert_eq!(
+            r2_provision_disposition(false, &provision_error).end_reason(),
+            "r2-spawn-error"
+        );
+        assert_eq!(
+            provision_error.as_ref().unwrap_err().to_string(),
+            "io: provider launch authentication failed",
+            "the handoff logs this unmodified provisioning error"
+        );
+        assert_eq!(
+            r2_provision_disposition(true, &provision_error),
+            R2ProvisionDisposition::Attached,
+            "a live R2 keeps transferred-review authority even if reservation release errors"
         );
     }
 
