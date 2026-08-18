@@ -6016,23 +6016,21 @@ async fn store_classifier_response(
     let results = classifier::parse_validated_response(text, pending_task_ids)?;
     let path = db_path.to_path_buf();
     let pending_inputs = pending_inputs.to_vec();
-    let pending_task_ids = pending_task_ids.to_vec();
     let version = quorum_core::classify::classifier_provenance(classifier_model);
     let stored = tokio::task::spawn_blocking(move || -> Result<usize> {
         let mut conn = quorum_core::db::open(&path)?;
-        let stored = quorum_core::classify::store_classifications_for_inputs(
+        // Atomic: classification acceptance and the immutable adoption-time
+        // rework ceiling land in one write transaction, so a crash between them
+        // cannot leave the task dispatchable at the compiled default despite a
+        // configured `max_rework`.
+        quorum_core::classify::store_classifications_and_stamp_rework_cap(
             &mut conn,
             &results,
             &pending_inputs,
             &version,
             now_unix(),
-        )?;
-        // Classification is the earliest per-task daemon adoption point: stamp
-        // the configured rework ceiling here, immutable once populated.
-        for id in &pending_task_ids {
-            quorum_core::tasks::stamp_rework_cap(&mut conn, *id, max_rework, now_unix())?;
-        }
-        Ok(stored)
+            max_rework,
+        )
     })
     .await
     .map_err(|error| format!("classifier storage join failed: {error}"))?
