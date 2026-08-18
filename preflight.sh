@@ -272,6 +272,62 @@ for gate in json.load(open(sys.argv[1])).get("gates", []):
 PY
 }
 
+# Print the number of changed files only when every change is inert.  This is
+# intentionally byte-oriented: Git paths need not be valid UTF-8, and a
+# malformed status or diff query must leave the caller on the full-gate path.
+inert_diff_file_count() {
+  python3 - "$1" <<'PY'
+import subprocess
+import sys
+
+base = sys.argv[1]
+
+try:
+    committed = subprocess.check_output(
+        ["git", "-c", "diff.renames=false", "diff", "--name-only", "-z", f"{base}...HEAD"],
+        stderr=subprocess.DEVNULL,
+    ).split(b"\0")[:-1]
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain=v1", "-z"],
+        stderr=subprocess.DEVNULL,
+    ).split(b"\0")
+except BaseException:
+    sys.exit(1)
+
+paths = set(committed)
+index = 0
+try:
+    while index < len(status) - 1:
+        record = status[index]
+        index += 1
+        if len(record) < 4 or record[2:3] != b" ":
+            raise ValueError("malformed porcelain record")
+        paths.add(record[3:])
+        # In -z porcelain output, a rename/copy's source path is the next
+        # record. Both sides must be inert before the Cargo gates may skip.
+        if record[:1] in (b"R", b"C") or record[1:2] in (b"R", b"C"):
+            paths.add(status[index])
+            index += 1
+except (IndexError, ValueError):
+    sys.exit(1)
+
+def inert(path):
+    return (
+        path.startswith(b"docs/")
+        or path.startswith(b".github/")
+        or (b"/" not in path and (
+            path.endswith(b".md")
+            or path.startswith(b"LICENSE")
+            or path.startswith(b"README")
+        ))
+    )
+
+if not paths or not all(inert(path) for path in paths):
+    sys.exit(1)
+print(len(paths))
+PY
+}
+
 # --- Gate 1: branch base ------------------------------------------------------
 printf '=== preflight 1/4: branch base ===\n'
 if [ "$QUICK" -eq 0 ]; then
@@ -287,6 +343,7 @@ git rev-parse --verify --quiet origin/main >/dev/null \
   || fail "origin/main not found — missing remote-tracking ref; gate cannot run"
 BASE_REF=origin/main
 INTEGRATION=0
+INERT_DIFF_BASE=
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 TIP=HEAD
 if [ "$PROPOSED_SET" -eq 1 ]; then
@@ -399,6 +456,12 @@ else
   fi
   printf 'branch base OK (%s session(s) ahead of %s)\n' "$N_SESSIONS" "$BASE_REF"
 fi
+if [ "$INTEGRATION" -eq 0 ] && [ -z "$CONTINUATION_FROM" ] \
+  && [ -z "$CONFIGURED_CONTINUATION_FROM" ]; then
+  # Continuations and integrations compare compound histories; keep their
+  # existing full-suite behavior rather than trying to infer a safe diff base.
+  INERT_DIFF_BASE=$BASE_REF
+fi
 fi
 
 # --- Gate 2: cargo fmt --------------------------------------------------------
@@ -428,6 +491,16 @@ if FULL_GATE_FINGERPRINT=$(working_tree_fingerprint); then
   fi
 else
   printf 'preflight.sh: fingerprint unavailable; running full gates\n' >&2
+fi
+
+if [ -n "$INERT_DIFF_BASE" ] \
+  && INERT_DIFF_FILE_COUNT=$(inert_diff_file_count "$INERT_DIFF_BASE"); then
+  printf '=== preflight 2/4: cargo fmt --all -- --check ===\n'
+  cargo fmt --all -- --check || fail "cargo fmt"
+  printf 'PREFLIGHT: skipping clippy + test — diff is docs/config-only (%s files)\n' \
+    "$INERT_DIFF_FILE_COUNT"
+  printf '\nPREFLIGHT: PASS (fmt green; clippy + test skipped)\n'
+  exit 0
 fi
 
 printf '=== preflight 2-4: timing collector (fmt, clippy, compile/no-run, test execution) ===\n'

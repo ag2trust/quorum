@@ -646,6 +646,16 @@ only through an explicit outside request)
   skip those gates. Missing, malformed, or unreadable cache entries and every fingerprint
   error are cache misses. Fingerprinting never writes the index or uses the network; the
   daemon does not use this optimization and merge CI remains the full backstop.
+- **Author-side inert diffs:** After a cache miss, the ordinary single-base author path
+  still runs `cargo fmt`, but skips clippy and tests only when the union of
+  `BASE_REF...HEAD` changed paths and porcelain working-tree paths is non-empty and every
+  path is `docs/**`, a root-level `*.md`, `LICENSE*`, `README*`, or `.github/**`.
+  Continuation and integration bases are deliberately ineligible because they compare
+  compound histories. Any unresolved base, Git error, malformed path listing, or path
+  outside that allowlist runs the full suite. In particular, this is not a broad
+  `**/*.md` or `.claude/**` rule: `.claude/skills/quorum/SKILL.md`, `schema.sql`, and the
+  served web assets are `include_str!` build inputs. The daemon's CI remains the
+  unconditional full-suite backstop.
 - **Rework cap:** `REWORK_CAP = 7`. When `rework_round >= 7` and an actionable rework
   event (VerdictChanges, ChecksFailed, or MergeConflict) fires,
   the task goes to Failed (not Rework). Rounds are consumed only by review verdicts,
