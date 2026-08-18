@@ -3391,6 +3391,10 @@ pub(crate) struct SlotState {
     /// Selected token-limit-basis cumulative accounting for watchdog ceilings.
     limit_tokens: i64,
     token_usage: runner::TokenUsage,
+    /// The latest provider terminal usage keeps watchdog diagnostics tied to
+    /// the terminal turn while cumulative values remain in `token_usage`.
+    last_terminal_usage: runner::TokenUsage,
+    last_terminal_cost_usd: Option<f64>,
     cost_usd: f64,
     task_started_at: std::time::Instant,
     turn_started_at: std::time::Instant,
@@ -3460,14 +3464,26 @@ impl SlotState {
         }
     }
 
-    async fn finalize_pre_authoritative_exit_evidence(&mut self) {
+    async fn finalize_pre_authoritative_exit_evidence(
+        &mut self,
+        role: &str,
+        limits: &CostLimits,
+    ) -> Option<serde_json::Value> {
         let runner_kind = self.process_kind();
         let output = match &mut self.proc {
             SlotProcess::Running(proc) => proc.finalize_pre_authoritative_evidence().await,
             SlotProcess::Dormant { .. } => Vec::new(),
         };
-        capture_terminal_usage(runner_kind, &output, &mut self.token_usage);
+        let diagnostic = record_captured_terminal_usage(
+            self,
+            role,
+            limits,
+            runner_kind,
+            &output,
+            TerminalUsageAction::ActiveOwnerWatchdogTermination,
+        );
         persist_terminal_output(&mut self.session_log, output);
+        diagnostic
     }
 
     fn live_process_mut(&mut self) -> std::io::Result<&mut runner::RunnerProc> {
@@ -7779,7 +7795,14 @@ async fn tick(
                         row.agent, reviewer_task_id
                     ));
                     let reviewer = reviewers.remove(ri);
-                    teardown_reviewer(config, wt_mgr, name_pool, reviewer, "graph-blocker").await;
+                    teardown_reviewer_after_recorded_outcome(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        reviewer,
+                        "graph-blocker",
+                    )
+                    .await;
                     if let Some(wi) = workers
                         .iter()
                         .position(|worker| worker.task_id == reviewer_task_id)
@@ -7793,6 +7816,7 @@ async fn tick(
                             None,
                             false,
                             "graph-blocker",
+                            None,
                         )
                         .await;
                     }
@@ -7888,7 +7912,7 @@ async fn tick(
                             .await
                             .unwrap_or(false)
                         };
-                        if already_merging {
+                        let merge_failed_recorded = if already_merging {
                             fire_event(
                                 &db_path,
                                 "system",
@@ -7902,10 +7926,24 @@ async fn tick(
                                     ),
                                 },
                             )
-                            .await;
-                        }
+                            .await
+                            .is_some()
+                        } else {
+                            false
+                        };
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r, "stale-sha").await;
+                        if merge_failed_recorded {
+                            teardown_reviewer_after_recorded_outcome(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                "stale-sha",
+                            )
+                            .await;
+                        } else {
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "stale-sha").await;
+                        }
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -8104,18 +8142,25 @@ async fn tick(
                                     }
                                 }
                                 let r = reviewers.remove(ri);
-                                teardown_reviewer(
-                                    config,
-                                    wt_mgr,
-                                    name_pool,
-                                    r,
-                                    if r2_added {
-                                        "r2-pending"
-                                    } else {
-                                        "r2-spawn-failed"
-                                    },
-                                )
-                                .await;
+                                if r2_added {
+                                    teardown_reviewer_after_authority_transfer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "r2-pending",
+                                    )
+                                    .await;
+                                } else {
+                                    teardown_reviewer_after_recorded_outcome(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "r2-spawn-failed",
+                                    )
+                                    .await;
+                                }
                                 if let PreReviewChecksGate::Failed { failing_checks } = ci_gate {
                                     pre_review_checks.remove(&reviewer_task_id);
                                     handle_pre_review_checks_failure(
@@ -8141,8 +8186,14 @@ async fn tick(
                                  counterpart, R1 approval stored, Phase 5 will retry"
                                 ));
                                 let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r, "r2-no-branch")
-                                    .await;
+                                teardown_reviewer_after_recorded_outcome(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    r,
+                                    "r2-no-branch",
+                                )
+                                .await;
                                 if !consume_mailbox_row(&db_path, *id).await {
                                     break;
                                 }
@@ -8291,7 +8342,14 @@ async fn tick(
                         )
                         .await;
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r, "stale-sha").await;
+                        teardown_reviewer_after_recorded_outcome(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            r,
+                            "stale-sha",
+                        )
+                        .await;
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -8332,7 +8390,14 @@ async fn tick(
                             cleanup_slot(config, wt_mgr, name_pool, w, None, "merged").await;
                         }
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
+                        teardown_reviewer_after_recorded_outcome(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            r,
+                            "verdict:approved",
+                        )
+                        .await;
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -8391,8 +8456,14 @@ async fn tick(
                             set_task_body(&db_path, reviewer_task_id, tasks::MERGE_BLOCKED_BODY)
                                 .await;
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
-                                .await;
+                            teardown_reviewer_after_recorded_outcome(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                "verdict:approved",
+                            )
+                            .await;
                         } else {
                             // Non-review-only: fire MergeConflict (merging → rework
                             // directly, skipping the reviewer hop).
@@ -8542,7 +8613,7 @@ async fn tick(
                                 Some(_) => {
                                     // Rework cap exceeded → failed. Clean up.
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -8568,7 +8639,7 @@ async fn tick(
                                 None => {
                                     // MergeConflict event failed — clean up.
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -8834,7 +8905,7 @@ async fn tick(
                                 Some(_) => {
                                     // Rework cap exceeded → failed. Clean up.
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -8859,7 +8930,7 @@ async fn tick(
                                 }
                                 None => {
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -9058,7 +9129,7 @@ async fn tick(
                                     }
                                     Some(_) => {
                                         let r = reviewers.remove(ri);
-                                        teardown_reviewer(
+                                        teardown_reviewer_after_recorded_outcome(
                                             config,
                                             wt_mgr,
                                             name_pool,
@@ -9084,7 +9155,7 @@ async fn tick(
                                     }
                                     None => {
                                         let r = reviewers.remove(ri);
-                                        teardown_reviewer(
+                                        teardown_reviewer_after_recorded_outcome(
                                             config,
                                             wt_mgr,
                                             name_pool,
@@ -9407,7 +9478,7 @@ async fn tick(
                                 }
                                 Some(_) => {
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -9432,7 +9503,7 @@ async fn tick(
                                 }
                                 None => {
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -9561,7 +9632,14 @@ async fn tick(
                         }
 
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
+                        teardown_reviewer_after_recorded_outcome(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            r,
+                            "verdict:approved",
+                        )
+                        .await;
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
                         {
                             let w = workers.remove(wi);
@@ -9604,8 +9682,14 @@ async fn tick(
                                 )
                                 .await;
                                 let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
-                                    .await;
+                                teardown_reviewer_after_recorded_outcome(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    r,
+                                    "verdict:approved",
+                                )
+                                .await;
                                 if let Some(wi) =
                                     workers.iter().position(|w| w.task_id == reviewer_task_id)
                                 {
@@ -9649,7 +9733,7 @@ async fn tick(
                                     )
                                     .await;
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -9811,7 +9895,7 @@ async fn tick(
                                         Some(_) => {
                                             // Rework cap exceeded → failed. Clean up.
                                             let r = reviewers.remove(ri);
-                                            teardown_reviewer(
+                                            teardown_reviewer_after_recorded_outcome(
                                                 config,
                                                 wt_mgr,
                                                 name_pool,
@@ -9837,7 +9921,7 @@ async fn tick(
                                         }
                                         None => {
                                             let r = reviewers.remove(ri);
-                                            teardown_reviewer(
+                                            teardown_reviewer_after_recorded_outcome(
                                                 config,
                                                 wt_mgr,
                                                 name_pool,
@@ -10083,8 +10167,14 @@ async fn tick(
                         Some(_) => {
                             // Rework cap exceeded → failed. Clean up both.
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:changes")
-                                .await;
+                            teardown_reviewer_after_recorded_outcome(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                "verdict:changes",
+                            )
+                            .await;
                             if let Some(wi) =
                                 workers.iter().position(|w| w.task_id == reviewer_task_id)
                             {
@@ -10380,6 +10470,7 @@ async fn tick(
                             None,
                             false,
                             "agent_failed",
+                            None,
                         )
                         .await;
                     }
@@ -10466,6 +10557,13 @@ async fn tick(
             ));
             continue;
         };
+        log_terminal_usage_diagnostic(
+            &reviewers[i],
+            "reviewer",
+            &config.limits,
+            Some(&breach),
+            terminal_usage_action(&disposition),
+        );
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -10570,6 +10668,13 @@ async fn tick(
             ));
             continue;
         };
+        log_terminal_usage_diagnostic(
+            &workers[i],
+            "worker",
+            &config.limits,
+            Some(&breach),
+            terminal_usage_action(&disposition),
+        );
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -10765,13 +10870,14 @@ async fn tick(
                     .await;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
-                    cleanup_slot(
+                    cleanup_slot_with_terminal_action(
                         config,
                         wt_mgr,
                         name_pool,
                         dead,
                         None,
                         "ownership_transferred",
+                        TerminalUsageAction::TransferredOwnershipCleanup,
                     )
                     .await;
                 }
@@ -10939,19 +11045,21 @@ async fn tick(
                         "worker {} exit ignored after task #{} ownership/state advanced — cleaning up",
                         dead.agent_name, dead.task_id
                     ));
-                    cleanup_slot(
+                    cleanup_slot_with_terminal_action(
                         config,
                         wt_mgr,
                         name_pool,
                         dead,
                         None,
                         "ownership_transferred",
+                        TerminalUsageAction::TransferredOwnershipCleanup,
                     )
                     .await;
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
-                    dead.finalize_pre_authoritative_exit_evidence().await;
+                    dead.finalize_pre_authoritative_exit_evidence("worker", &config.limits)
+                        .await;
                     if let Some(failure) = dead.classify_pre_authoritative_exit(status) {
                         log(&format!(
                             "worker {} pre-authoritative runner failure classified as {failure}",
@@ -10985,8 +11093,15 @@ async fn tick(
             continue;
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
-        let runner_failure =
-            classify_managed_pre_authoritative_exit(&mut dead, status, &disposition).await;
+        let terminal_action = terminal_usage_action(&disposition);
+        let runner_failure = classify_managed_pre_authoritative_exit(
+            &mut dead,
+            status,
+            &disposition,
+            "worker",
+            &config.limits,
+        )
+        .await;
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -11001,13 +11116,14 @@ async fn tick(
                     "worker {} exited after recorded submission — cleaning up completed run",
                     dead.agent_name
                 ));
-                cleanup_slot(
+                cleanup_slot_with_terminal_action(
                     config,
                     wt_mgr,
                     name_pool,
                     dead,
                     None,
                     cleanup_reason.expect("recorded outcome has cleanup reason"),
+                    terminal_action,
                 )
                 .await;
                 continue;
@@ -11017,13 +11133,14 @@ async fn tick(
                     "worker {} exit ignored after task ownership/state advanced — cleaning up",
                     dead.agent_name
                 ));
-                cleanup_slot(
+                cleanup_slot_with_terminal_action(
                     config,
                     wt_mgr,
                     name_pool,
                     dead,
                     None,
                     cleanup_reason.expect("transferred outcome has cleanup reason"),
+                    terminal_action,
                 )
                 .await;
                 continue;
@@ -11116,8 +11233,15 @@ async fn tick(
             continue;
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
-        let runner_failure =
-            classify_managed_pre_authoritative_exit(&mut reviewers[i], status, &disposition).await;
+        let terminal_action = terminal_usage_action(&disposition);
+        let runner_failure = classify_managed_pre_authoritative_exit(
+            &mut reviewers[i],
+            status,
+            &disposition,
+            "reviewer",
+            &config.limits,
+        )
+        .await;
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -11131,12 +11255,13 @@ async fn tick(
                     "reviewer {} exited after recorded verdict — cleaning up completed run",
                     dead.agent_name
                 ));
-                teardown_reviewer(
+                teardown_reviewer_with_terminal_action(
                     config,
                     wt_mgr,
                     name_pool,
                     dead,
                     cleanup_reason.expect("recorded outcome has cleanup reason"),
+                    Some(terminal_action),
                 )
                 .await;
             }
@@ -11146,12 +11271,13 @@ async fn tick(
                     "reviewer {} exit ignored after review ownership/state advanced — cleaning up",
                     dead.agent_name
                 ));
-                teardown_reviewer(
+                teardown_reviewer_with_terminal_action(
                     config,
                     wt_mgr,
                     name_pool,
                     dead,
                     cleanup_reason.expect("transferred outcome has cleanup reason"),
+                    Some(terminal_action),
                 )
                 .await;
             }
@@ -12427,6 +12553,26 @@ fn check_post_result_limits(
     cumulative_cost_usd: f64,
     slot: &SlotState,
 ) -> Option<LimitBreached> {
+    check_post_result_limits_at(
+        limits,
+        turn_tokens,
+        cumulative_tokens,
+        turn_cost_usd,
+        cumulative_cost_usd,
+        slot.last_event_at,
+        slot.task_started_at,
+    )
+}
+
+fn check_post_result_limits_at(
+    limits: &CostLimits,
+    turn_tokens: i64,
+    cumulative_tokens: i64,
+    turn_cost_usd: Option<f64>,
+    cumulative_cost_usd: f64,
+    last_event_at: std::time::Instant,
+    task_started_at: std::time::Instant,
+) -> Option<LimitBreached> {
     if let Some(max) = limits.max_turn_tokens {
         if turn_tokens > max {
             return Some(LimitBreached::TurnTokens {
@@ -12468,7 +12614,7 @@ fn check_post_result_limits(
         }
     }
     let max_idle_secs = max_idle_secs(limits);
-    let elapsed = slot.last_event_at.elapsed().as_secs();
+    let elapsed = last_event_at.elapsed().as_secs();
     if elapsed > max_idle_secs {
         return Some(LimitBreached::IdleSecs {
             elapsed,
@@ -12476,7 +12622,7 @@ fn check_post_result_limits(
         });
     }
     if let Some(max) = limits.max_task_wall_secs {
-        let elapsed = slot.task_started_at.elapsed().as_secs();
+        let elapsed = task_started_at.elapsed().as_secs();
         if elapsed > max {
             return Some(LimitBreached::TaskWallSecs { elapsed, max });
         }
@@ -12496,6 +12642,226 @@ fn token_limit_total(
         crate::serve_config::TokenLimitBasis::Uncached => usage.uncached_total_tokens(),
     };
     i64::try_from(total).unwrap_or(i64::MAX)
+}
+
+/// The lifecycle classifier is authoritative for watchdog action. This is
+/// deliberately diagnostic-only: it neither reads nor writes the database.
+#[derive(Clone, Copy)]
+enum TerminalUsageAction {
+    NoTeardown,
+    ActiveOwnerWatchdogTermination,
+    PendingOutcomeRetention,
+    RecordedOutcomeCleanup,
+    TransferredOwnershipCleanup,
+}
+
+impl TerminalUsageAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoTeardown => "no_teardown",
+            Self::ActiveOwnerWatchdogTermination => "active_owner_watchdog_termination",
+            Self::PendingOutcomeRetention => "pending_outcome_retention",
+            Self::RecordedOutcomeCleanup => "recorded_outcome_cleanup",
+            Self::TransferredOwnershipCleanup => "transferred_ownership_cleanup",
+        }
+    }
+}
+
+fn terminal_usage_action(disposition: &tasks::ManagedExitDisposition) -> TerminalUsageAction {
+    match disposition {
+        tasks::ManagedExitDisposition::OutcomePending => {
+            TerminalUsageAction::PendingOutcomeRetention
+        }
+        tasks::ManagedExitDisposition::OutcomeRecorded => {
+            TerminalUsageAction::RecordedOutcomeCleanup
+        }
+        tasks::ManagedExitDisposition::OwnershipTransferred => {
+            TerminalUsageAction::TransferredOwnershipCleanup
+        }
+        tasks::ManagedExitDisposition::AgentFailed(_) => {
+            TerminalUsageAction::ActiveOwnerWatchdogTermination
+        }
+    }
+}
+
+/// Render only normalized scalar telemetry. It contains no provider payload,
+/// prompt, tool input, or credentials, and serde escapes every text field.
+fn terminal_usage_diagnostic(
+    slot: &SlotState,
+    role: &str,
+    limits: &CostLimits,
+    breach: Option<&str>,
+    action: TerminalUsageAction,
+) -> serde_json::Value {
+    terminal_usage_diagnostic_fields(
+        role,
+        &slot.agent_name,
+        slot.task_id,
+        slot.process_kind(),
+        slot.last_terminal_usage,
+        slot.token_usage,
+        slot.limit_tokens,
+        slot.last_terminal_cost_usd,
+        limits,
+        breach,
+        action,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_usage_diagnostic_fields(
+    role: &str,
+    agent_name: &str,
+    task_id: i64,
+    provider: runner::AgentKind,
+    usage: runner::TokenUsage,
+    cumulative_usage: runner::TokenUsage,
+    cumulative_limit_tokens: i64,
+    terminal_cost_usd: Option<f64>,
+    limits: &CostLimits,
+    breach: Option<&str>,
+    action: TerminalUsageAction,
+) -> serde_json::Value {
+    let breach_reason = breach.map(|reason| {
+        let mut bounded: String = reason.chars().take(512).collect();
+        if reason.chars().count() > 512 {
+            bounded.push('…');
+        }
+        bounded
+    });
+    serde_json::json!({
+        "event": "terminal_usage",
+        "role": role,
+        "agent": agent_name,
+        "task_id": task_id,
+        "provider": provider.to_string(),
+        "raw_input_tokens": usage.input_tokens,
+        "uncached_input_tokens": usage.uncached_input_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "cache_write_input_tokens": usage.cache_write_input_tokens,
+        "output_tokens": usage.output_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "raw_total_tokens": usage.live_total_tokens(),
+        "uncached_total_tokens": usage.uncached_total_tokens(),
+        "cumulative_raw_total_tokens": cumulative_usage.live_total_tokens(),
+        "cumulative_uncached_total_tokens": cumulative_usage.uncached_total_tokens(),
+        "cumulative_limit_tokens": cumulative_limit_tokens,
+        "cost_usd": terminal_cost_usd,
+        "configured_limit_basis": limits.token_limit_basis.to_string(),
+        "configured_max_turn_tokens": limits.max_turn_tokens,
+        "configured_max_task_tokens": limits.max_task_tokens,
+        "configured_max_turn_cost_usd": limits.max_turn_cost_usd,
+        "configured_max_task_cost_usd": limits.max_task_cost_usd,
+        "breach": breach_reason.is_some(),
+        "breach_reason": breach_reason,
+        "action": action.as_str(),
+    })
+}
+
+fn log_terminal_usage_diagnostic(
+    slot: &SlotState,
+    role: &str,
+    limits: &CostLimits,
+    breach: Option<&str>,
+    action: TerminalUsageAction,
+) -> serde_json::Value {
+    let diagnostic = terminal_usage_diagnostic(slot, role, limits, breach, action);
+    log(&format!(
+        "{role} {} result terminal usage diagnostic: {diagnostic}",
+        slot.agent_name
+    ));
+    diagnostic
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_captured_terminal_usage_fields(
+    role: &str,
+    limits: &CostLimits,
+    kind: runner::AgentKind,
+    output: &[runner::CapturedOutput],
+    action: TerminalUsageAction,
+    agent_name: &str,
+    task_id: i64,
+    token_usage: &mut runner::TokenUsage,
+    last_terminal_usage: &mut runner::TokenUsage,
+    last_terminal_cost_usd: &mut Option<f64>,
+    cost_tokens: &mut i64,
+    limit_tokens: &mut i64,
+    cost_usd: &mut f64,
+    last_event_at: std::time::Instant,
+    task_started_at: std::time::Instant,
+    session_log: &mut Option<session_log::SessionLog>,
+) -> Option<serde_json::Value> {
+    let terminal = capture_terminal_usage(kind, output, token_usage)?;
+    *last_terminal_usage = terminal.usage;
+    *last_terminal_cost_usd = terminal.cost_usd;
+    let turn_tokens = token_limit_total(terminal.usage, limits.token_limit_basis);
+    let raw_turn_tokens =
+        token_limit_total(terminal.usage, crate::serve_config::TokenLimitBasis::Raw);
+    *cost_tokens = cost_tokens.saturating_add(raw_turn_tokens);
+    *limit_tokens = limit_tokens.saturating_add(turn_tokens);
+    let previous_cost = *cost_usd;
+    if let Some(cost) = terminal.cost_usd {
+        *cost_usd = cost;
+    }
+    let turn_cost_usd = terminal
+        .cost_usd
+        .map(|cost| (cost - previous_cost).max(0.0));
+    let breach = check_post_result_limits_at(
+        limits,
+        turn_tokens,
+        *limit_tokens,
+        turn_cost_usd,
+        *cost_usd,
+        last_event_at,
+        task_started_at,
+    )
+    .map(|breach| breach.to_string());
+    let diagnostic = terminal_usage_diagnostic_fields(
+        role,
+        agent_name,
+        task_id,
+        kind,
+        *last_terminal_usage,
+        *token_usage,
+        *limit_tokens,
+        *last_terminal_cost_usd,
+        limits,
+        breach.as_deref(),
+        action,
+    );
+    log(&format!(
+        "{role} {agent_name} result terminal usage diagnostic: {diagnostic}"
+    ));
+    #[cfg(test)]
+    TEST_TERMINAL_USAGE_DIAGNOSTICS
+        .lock()
+        .unwrap()
+        .push(diagnostic.clone());
+    if let Some(session_log) = session_log {
+        session_log.update_cost(*cost_tokens, terminal.cost_usd);
+    }
+    Some(diagnostic)
+}
+
+#[cfg(test)]
+static TEST_TERMINAL_USAGE_DIAGNOSTICS: std::sync::LazyLock<
+    std::sync::Mutex<Vec<serde_json::Value>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
+fn take_terminal_usage_diagnostics_for_test(agent: &str) -> Vec<serde_json::Value> {
+    let mut diagnostics = TEST_TERMINAL_USAGE_DIAGNOSTICS.lock().unwrap();
+    let mut matching = Vec::new();
+    diagnostics.retain(|diagnostic| {
+        if diagnostic["agent"] == agent {
+            matching.push(diagnostic.clone());
+            false
+        } else {
+            true
+        }
+    });
+    matching
 }
 
 /// Check wall-clock limits only (called each tick for slots still draining).
@@ -12605,6 +12971,8 @@ async fn feed_worker_turn(
             // not carry the preceding run's detailed telemetry into the new
             // per-run snapshot.
             slot.token_usage = runner::TokenUsage::default();
+            slot.last_terminal_usage = runner::TokenUsage::default();
+            slot.last_terminal_cost_usd = None;
             slot.live_stats = LiveStats::new();
             slot.turn_ended_at = None;
         }
@@ -13083,13 +13451,14 @@ async fn settle_dormant_worker_feed_failure(
                 "ownership_transferred",
             )
             .await;
-            cleanup_slot(
+            cleanup_slot_with_terminal_action(
                 config,
                 wt_mgr,
                 name_pool,
                 worker,
                 None,
                 "ownership_transferred",
+                TerminalUsageAction::TransferredOwnershipCleanup,
             )
             .await;
             Ok(DormantWorkerFeedFailureDisposition::Settled)
@@ -13471,11 +13840,28 @@ async fn dispose_dead_turn_runner_worker(
 /// dormant worker whose crash-recovery row still advertises the reaped process
 /// PID and a stale phase — restart recovery trusts that PID and would call
 /// `killpg` on whatever process group has since reused it.
-async fn park_worker_slot_dormant(db_path: &Path, slot: &mut SlotState) -> std::io::Result<()> {
+async fn park_worker_slot_dormant(
+    db_path: &Path,
+    slot: &mut SlotState,
+    limits: &CostLimits,
+) -> std::io::Result<()> {
     let runner_kind = slot.process_kind();
     let old = slot.become_dormant()?;
     let captured = old.kill_and_reap().await;
-    capture_terminal_usage(runner_kind, &captured, &mut slot.token_usage);
+    if record_captured_terminal_usage(
+        slot,
+        "worker",
+        limits,
+        runner_kind,
+        &captured,
+        TerminalUsageAction::RecordedOutcomeCleanup,
+    )
+    .is_some()
+    {
+        if let Some(session_log) = &mut slot.session_log {
+            session_log.set_phase("awaiting-review");
+        }
+    }
     persist_terminal_output(&mut slot.session_log, captured);
     record_managed_usage_snapshot(
         db_path,
@@ -13530,7 +13916,7 @@ async fn park_or_cleanup_delivered_worker_slot(
     mut dead: SlotState,
 ) {
     let db_path = config.db_path.clone();
-    match park_worker_slot_dormant(&db_path, &mut dead).await {
+    match park_worker_slot_dormant(&db_path, &mut dead, &config.limits).await {
         Ok(()) => {
             log(&format!(
                 "worker {} parked dormant after delivering task #{} — awaiting reviewer",
@@ -13838,6 +14224,8 @@ async fn drain_events(
                     if let Some(usage) = usage {
                         slot.token_usage.saturating_add_assign(*usage);
                     }
+                    slot.last_terminal_usage = usage.unwrap_or_default();
+                    slot.last_terminal_cost_usd = *cost_usd;
                     slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
                     slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
                     // cost_usd is session-cumulative (running total), not per-turn.
@@ -13846,11 +14234,6 @@ async fn drain_events(
                         slot.cost_usd = *cost;
                     }
                     let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
-                    log(&format!(
-                        "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4})",
-                        slot.agent_name, turn_tokens, slot.limit_tokens, slot.cost_usd,
-                    ));
-
                     let phase = if role == "worker" {
                         "awaiting-review"
                     } else {
@@ -13858,7 +14241,7 @@ async fn drain_events(
                     };
 
                     if let Some(ref mut sl) = slot.session_log {
-                        sl.update_cost(slot.cost_tokens, slot.cost_usd);
+                        sl.update_cost(slot.cost_tokens, *cost_usd);
                         sl.set_phase(phase);
                     }
 
@@ -13895,6 +14278,15 @@ async fn drain_events(
                         slot.cost_usd,
                         slot,
                     );
+                    if breach.is_none() {
+                        log_terminal_usage_diagnostic(
+                            slot,
+                            role,
+                            limits,
+                            None,
+                            TerminalUsageAction::NoTeardown,
+                        );
+                    }
                     return Ok(breach);
                 }
 
@@ -13911,6 +14303,8 @@ async fn drain_events(
                     if let Some(usage) = usage {
                         slot.token_usage.saturating_add_assign(*usage);
                     }
+                    slot.last_terminal_usage = usage.unwrap_or_default();
+                    slot.last_terminal_cost_usd = *cost_usd;
                     slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
                     slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
                     let prev_cost = slot.cost_usd;
@@ -13918,13 +14312,8 @@ async fn drain_events(
                         slot.cost_usd = *cost;
                     }
                     let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
-                    log(&format!(
-                        "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4}, ERROR)",
-                        slot.agent_name, turn_tokens, slot.limit_tokens, slot.cost_usd,
-                    ));
-
                     if let Some(ref mut sl) = slot.session_log {
-                        sl.update_cost(slot.cost_tokens, slot.cost_usd);
+                        sl.update_cost(slot.cost_tokens, *cost_usd);
                         sl.set_phase("working");
                     }
 
@@ -13962,6 +14351,15 @@ async fn drain_events(
                         slot.cost_usd,
                         slot,
                     );
+                    if breach.is_none() {
+                        log_terminal_usage_diagnostic(
+                            slot,
+                            role,
+                            limits,
+                            None,
+                            TerminalUsageAction::NoTeardown,
+                        );
+                    }
                     return Ok(breach);
                 }
 
@@ -14057,11 +14455,18 @@ fn persist_terminal_output(
 /// Teardown output is lifecycle-inert, but it can contain the terminal usage
 /// line that arrived after the daemon consumed a mailbox verdict. Retain that
 /// telemetry before closing the managed run without replaying the event.
+#[derive(Clone, Copy)]
+struct CapturedTerminalUsage {
+    usage: runner::TokenUsage,
+    cost_usd: Option<f64>,
+}
+
 fn capture_terminal_usage(
     kind: runner::AgentKind,
     output: &[runner::CapturedOutput],
     usage_total: &mut runner::TokenUsage,
-) {
+) -> Option<CapturedTerminalUsage> {
+    let mut terminal = None;
     for captured in output {
         let runner::CapturedOutput::Stdout(raw_line) = captured else {
             continue;
@@ -14069,30 +14474,93 @@ fn capture_terminal_usage(
         for event in runner::normalize_line(kind, raw_line) {
             match event {
                 runner::AgentEvent::TurnCompleted {
-                    usage: Some(usage), ..
+                    usage: Some(usage),
+                    cost_usd,
                 }
                 | runner::AgentEvent::TurnFailed {
-                    usage: Some(usage), ..
-                } => usage_total.saturating_add_assign(usage),
+                    usage: Some(usage),
+                    cost_usd,
+                    ..
+                } => {
+                    usage_total.saturating_add_assign(usage);
+                    terminal = Some(CapturedTerminalUsage { usage, cost_usd });
+                }
                 _ => {}
             }
         }
     }
+    terminal
+}
+
+/// Fold one late terminal record into the existing normalized counters and
+/// emit its lifecycle-inert diagnostic. Callers supply the already-authoritative
+/// action; this helper never reads or writes lifecycle state.
+fn record_captured_terminal_usage(
+    slot: &mut SlotState,
+    role: &str,
+    limits: &CostLimits,
+    kind: runner::AgentKind,
+    output: &[runner::CapturedOutput],
+    action: TerminalUsageAction,
+) -> Option<serde_json::Value> {
+    record_captured_terminal_usage_fields(
+        role,
+        limits,
+        kind,
+        output,
+        action,
+        &slot.agent_name,
+        slot.task_id,
+        &mut slot.token_usage,
+        &mut slot.last_terminal_usage,
+        &mut slot.last_terminal_cost_usd,
+        &mut slot.cost_tokens,
+        &mut slot.limit_tokens,
+        &mut slot.cost_usd,
+        slot.last_event_at,
+        slot.task_started_at,
+        &mut slot.session_log,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn close_attachment_failed_reviewer_run(
     db_path: &Path,
     reviewer_run_id: i64,
+    reviewer_name: &str,
     task_id: i64,
     pr: i64,
     reviewer_kind: runner::AgentKind,
     reviewer_model: &str,
     reviewer_effort: &str,
+    limits: &CostLimits,
     terminal: &[runner::CapturedOutput],
-) {
+) -> Option<serde_json::Value> {
     let mut token_usage = runner::TokenUsage::default();
-    capture_terminal_usage(reviewer_kind, terminal, &mut token_usage);
+    let mut last_terminal_usage = runner::TokenUsage::default();
+    let mut last_terminal_cost_usd = None;
+    let mut cost_tokens = 0;
+    let mut limit_tokens = 0;
+    let mut cost_usd = 0.0;
+    let mut session_log = None;
+    let diagnostic = record_captured_terminal_usage_fields(
+        "reviewer",
+        limits,
+        reviewer_kind,
+        terminal,
+        TerminalUsageAction::RecordedOutcomeCleanup,
+        reviewer_name,
+        task_id,
+        &mut token_usage,
+        &mut last_terminal_usage,
+        &mut last_terminal_cost_usd,
+        &mut cost_tokens,
+        &mut limit_tokens,
+        &mut cost_usd,
+        std::time::Instant::now(),
+        std::time::Instant::now(),
+        &mut session_log,
+    );
     close_agent_run_with_usage(
         db_path,
         Some(reviewer_run_id),
@@ -14108,6 +14576,7 @@ async fn close_attachment_failed_reviewer_run(
         }),
     )
     .await;
+    diagnostic
 }
 
 fn truncate_now_label(s: &str) -> String {
@@ -15056,11 +15525,13 @@ async fn provision_reviewer_reserved(
                 close_attachment_failed_reviewer_run(
                     &config.db_path,
                     reviewer_run_id,
+                    &reviewer_name,
                     worker.task_id,
                     pr,
                     reviewer_kind,
                     &reviewer_model,
                     &reviewer_effort,
+                    &config.limits,
                     &terminal_output,
                 )
                 .await;
@@ -15126,6 +15597,8 @@ async fn provision_reviewer_reserved(
                 cost_tokens: 0,
                 limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
+                last_terminal_usage: runner::TokenUsage::default(),
+                last_terminal_cost_usd: None,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -15904,6 +16377,8 @@ async fn spawn_worker(
                 cost_tokens: 0,
                 limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
+                last_terminal_usage: runner::TokenUsage::default(),
+                last_terminal_cost_usd: None,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -16284,11 +16759,14 @@ async fn classify_managed_pre_authoritative_exit(
     slot: &mut SlotState,
     status: std::process::ExitStatus,
     disposition: &tasks::ManagedExitDisposition,
+    role: &str,
+    limits: &CostLimits,
 ) -> Option<runner::RunnerFailure> {
     if !managed_exit_permits_runner_failure(disposition) {
         return None;
     }
-    slot.finalize_pre_authoritative_exit_evidence().await;
+    slot.finalize_pre_authoritative_exit_evidence(role, limits)
+        .await;
     slot.classify_pre_authoritative_exit(status)
 }
 
@@ -16613,10 +17091,37 @@ async fn cleanup_slot(
         finalize_verdict,
         true,
         end_reason,
+        None,
     )
     .await;
 }
 
+/// Cleanup after the managed-exit classifier has already decided that this
+/// process no longer owns lifecycle. Late terminal telemetry is diagnostic
+/// only and cannot replay that disposition.
+async fn cleanup_slot_with_terminal_action(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    state: SlotState,
+    finalize_verdict: Option<&str>,
+    end_reason: &str,
+    action: TerminalUsageAction,
+) {
+    cleanup_slot_inner(
+        config,
+        wt_mgr,
+        name_pool,
+        state,
+        finalize_verdict,
+        true,
+        end_reason,
+        Some(action),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn cleanup_slot_inner(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -16625,6 +17130,7 @@ async fn cleanup_slot_inner(
     finalize_verdict: Option<&str>,
     delete_branch: bool,
     end_reason: &str,
+    terminal_action: Option<TerminalUsageAction>,
 ) {
     let mut usage = managed_usage_record(&state, "worker");
     log(&format!(
@@ -16640,7 +17146,28 @@ async fn cleanup_slot_inner(
 
     let runner_kind = state.proc.kind();
     let terminal = state.proc.kill_and_reap().await;
-    capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
+    if let Some(action) = terminal_action {
+        record_captured_terminal_usage_fields(
+            "worker",
+            &config.limits,
+            runner_kind,
+            &terminal,
+            action,
+            &state.agent_name,
+            state.task_id,
+            &mut state.token_usage,
+            &mut state.last_terminal_usage,
+            &mut state.last_terminal_cost_usd,
+            &mut state.cost_tokens,
+            &mut state.limit_tokens,
+            &mut state.cost_usd,
+            state.last_event_at,
+            state.task_started_at,
+            &mut state.session_log,
+        );
+    } else {
+        capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
+    }
     persist_terminal_output(&mut state.session_log, terminal);
     usage.usage = state.token_usage;
     if let Some(ref mut sl) = state.session_log {
@@ -16786,15 +17313,89 @@ async fn teardown_reviewer(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
-    mut state: SlotState,
+    state: SlotState,
     end_reason: &str,
 ) {
+    teardown_reviewer_with_terminal_action(config, wt_mgr, name_pool, state, end_reason, None)
+        .await;
+}
+
+/// A Phase 2 mailbox verdict has already been made durable. Any provider
+/// terminal record recovered during cleanup is observational only.
+async fn teardown_reviewer_after_recorded_outcome(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    state: SlotState,
+    end_reason: &str,
+) {
+    teardown_reviewer_with_terminal_action(
+        config,
+        wt_mgr,
+        name_pool,
+        state,
+        end_reason,
+        Some(TerminalUsageAction::RecordedOutcomeCleanup),
+    )
+    .await;
+}
+
+/// A Phase 2 verdict handed review authority to another reviewer. Late
+/// provider telemetry remains cleanup-only for the retired reviewer.
+async fn teardown_reviewer_after_authority_transfer(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    state: SlotState,
+    end_reason: &str,
+) {
+    teardown_reviewer_with_terminal_action(
+        config,
+        wt_mgr,
+        name_pool,
+        state,
+        end_reason,
+        Some(TerminalUsageAction::TransferredOwnershipCleanup),
+    )
+    .await;
+}
+
+async fn teardown_reviewer_with_terminal_action(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    mut state: SlotState,
+    end_reason: &str,
+    terminal_action: Option<TerminalUsageAction>,
+) -> Option<serde_json::Value> {
     let mut usage = managed_usage_record(&state, "reviewer");
     log(&format!("tearing down reviewer {}", state.agent_name));
 
     let runner_kind = state.proc.kind();
     let terminal = state.proc.kill_and_reap().await;
-    capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
+    let diagnostic = if let Some(action) = terminal_action {
+        record_captured_terminal_usage_fields(
+            "reviewer",
+            &config.limits,
+            runner_kind,
+            &terminal,
+            action,
+            &state.agent_name,
+            state.task_id,
+            &mut state.token_usage,
+            &mut state.last_terminal_usage,
+            &mut state.last_terminal_cost_usd,
+            &mut state.cost_tokens,
+            &mut state.limit_tokens,
+            &mut state.cost_usd,
+            state.last_event_at,
+            state.task_started_at,
+            &mut state.session_log,
+        )
+    } else {
+        capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
+        None
+    };
     persist_terminal_output(&mut state.session_log, terminal);
     usage.usage = state.token_usage;
     if let Some(ref mut sl) = state.session_log {
@@ -16831,6 +17432,7 @@ async fn teardown_reviewer(
 
     name_pool.release(&state.agent_name);
     log(&format!("reviewer {} torn down", state.agent_name));
+    diagnostic
 }
 
 /// Record an R2 audit row from stashed metadata (best-effort).
@@ -18079,6 +18681,8 @@ async fn spawn_remediation_worker(
                 cost_tokens: 0,
                 limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
+                last_terminal_usage: runner::TokenUsage::default(),
+                last_terminal_cost_usd: None,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -19682,6 +20286,8 @@ mod tests {
             cost_tokens: 500,
             limit_tokens: 500,
             token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
             cost_usd: 0.01,
             task_started_at: now,
             turn_started_at: now,
@@ -19799,7 +20405,14 @@ mod tests {
             BufReader::new(stdout),
         ));
         let mut slot = slot_with_process(proc);
+        slot.cost_tokens = 0;
+        slot.limit_tokens = 0;
+        slot.cost_usd = 0.0;
         let db_dir = tempfile::tempdir().unwrap();
+        let limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
 
         assert!(drain_events(
             &mut slot,
@@ -19819,7 +20432,10 @@ mod tests {
         .await
         .expect("provider must exit without a managed signal");
 
-        slot.finalize_pre_authoritative_exit_evidence().await;
+        let diagnostic = slot
+            .finalize_pre_authoritative_exit_evidence("worker", &limits)
+            .await
+            .expect("late active-owner terminal must emit a diagnostic");
         assert_eq!(
             slot.token_usage,
             runner::TokenUsage {
@@ -19832,6 +20448,23 @@ mod tests {
             },
             "the evidence finalizer must fold usage before teardown drains the remaining pipe"
         );
+        assert_eq!(diagnostic["role"], "worker");
+        assert_eq!(diagnostic["raw_input_tokens"], 100);
+        assert_eq!(diagnostic["uncached_input_tokens"], 20);
+        assert_eq!(diagnostic["cached_input_tokens"], 80);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 10);
+        assert_eq!(diagnostic["output_tokens"], 5);
+        assert_eq!(diagnostic["reasoning_tokens"], 0);
+        assert_eq!(diagnostic["raw_total_tokens"], 105);
+        assert_eq!(diagnostic["uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 105);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_limit_tokens"], 105);
+        assert_eq!(diagnostic["configured_limit_basis"], "raw");
+        assert_eq!(diagnostic["configured_max_task_tokens"], 100);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["breach"], true);
+        assert_eq!(diagnostic["action"], "active_owner_watchdog_termination");
 
         let expected = slot.token_usage;
         let terminal = slot.kill_and_reap().await;
@@ -20753,6 +21386,8 @@ mod tests {
                 cost_tokens: 17,
                 limit_tokens: 17,
                 token_usage: runner::TokenUsage::default(),
+                last_terminal_usage: runner::TokenUsage::default(),
+                last_terminal_cost_usd: None,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -20986,6 +21621,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             reasoning_tokens: 10,
         };
         slot.token_usage = first_run_usage;
+        slot.last_terminal_usage = first_run_usage;
+        slot.last_terminal_cost_usd = Some(1.25);
         record_managed_usage_snapshot(
             &db_path,
             slot.agent_run_id,
@@ -21013,6 +21650,32 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             runner::TokenUsage::default(),
             "installing a new agent_run must reset only the detailed per-run accumulator"
         );
+        assert_eq!(
+            slot.last_terminal_usage,
+            runner::TokenUsage::default(),
+            "a fresh Codex rework turn must not retain the preceding terminal breakdown"
+        );
+        assert_eq!(slot.last_terminal_cost_usd, None);
+        slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        let watchdog_limits = CostLimits {
+            max_idle_secs: Some(60),
+            ..Default::default()
+        };
+        let breach = check_wall_clock_limits(&watchdog_limits, &slot)
+            .expect("fresh rework turn must be eligible for an idle watchdog breach")
+            .to_string();
+        let diagnostic = terminal_usage_diagnostic(
+            &slot,
+            "worker",
+            &watchdog_limits,
+            Some(&breach),
+            TerminalUsageAction::ActiveOwnerWatchdogTermination,
+        );
+        assert_eq!(diagnostic["raw_input_tokens"], 0);
+        assert_eq!(diagnostic["cached_input_tokens"], 0);
+        assert_eq!(diagnostic["output_tokens"], 0);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["action"], "active_owner_watchdog_termination");
         assert_eq!(
             slot.cost_tokens, 17,
             "legacy task-level live accounting remains cumulative across run rotation"
@@ -21371,7 +22034,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.error_turn_count = 3;
         slot.last_error_text = Some("prior transient failure".into());
 
-        park_worker_slot_dormant(&db_path, &mut slot).await.unwrap();
+        park_worker_slot_dormant(&db_path, &mut slot, &CostLimits::default())
+            .await
+            .unwrap();
 
         // Live process torn down, logical slot preserved.
         assert!(matches!(
@@ -21492,6 +22157,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             output_tokens: 4,
             reasoning_tokens: 2,
         };
+        slot.cost_tokens = 34;
+        slot.limit_tokens = 14;
+        let limits = CostLimits {
+            token_limit_basis: crate::serve_config::TokenLimitBasis::Uncached,
+            max_task_tokens: Some(50),
+            ..Default::default()
+        };
 
         assert!(
             drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
@@ -21514,7 +22186,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .await
         .expect("scripted provider must exit after buffering its terminal record");
 
-        park_worker_slot_dormant(&db_path, &mut slot).await.unwrap();
+        park_worker_slot_dormant(&db_path, &mut slot, &limits)
+            .await
+            .unwrap();
 
         let expected = runner::TokenUsage {
             input_tokens: 130,
@@ -21525,6 +22199,29 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             reasoning_tokens: 9,
         };
         assert_eq!(slot.token_usage, expected);
+        assert_eq!(slot.last_terminal_usage.input_tokens, 100);
+        assert_eq!(slot.last_terminal_usage.uncached_input_tokens, 60);
+        assert_eq!(slot.last_terminal_cost_usd, None);
+        assert_eq!(slot.cost_tokens, 154);
+        assert_eq!(slot.limit_tokens, 94);
+        let diagnostic = terminal_usage_diagnostic(
+            &slot,
+            "worker",
+            &limits,
+            Some("task tokens (uncached) 94 exceeded limit 50"),
+            TerminalUsageAction::RecordedOutcomeCleanup,
+        );
+        assert_eq!(diagnostic["raw_input_tokens"], 100);
+        assert_eq!(diagnostic["uncached_input_tokens"], 60);
+        assert_eq!(diagnostic["cached_input_tokens"], 40);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 6);
+        assert_eq!(diagnostic["output_tokens"], 20);
+        assert_eq!(diagnostic["reasoning_tokens"], 7);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 154);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 94);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["breach"], true);
+        assert_eq!(diagnostic["action"], "recorded_outcome_cleanup");
         let conn = quorum_core::db::open(&db_path).unwrap();
         assert_eq!(
             quorum_core::token_usage::usage_for_agent_run(&conn, run_id)
@@ -21552,7 +22249,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.continuation_id = None;
         slot.pr = Some(1);
 
-        let err = park_worker_slot_dormant(&db_path, &mut slot)
+        let err = park_worker_slot_dormant(&db_path, &mut slot, &CostLimits::default())
             .await
             .expect_err("park must refuse a Codex slot without its provider-issued thread id");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -21578,7 +22275,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.continuation_id = Some("provider-thread-42".into());
         slot.pr = Some(1);
 
-        let err = park_worker_slot_dormant(&unwritable_db, &mut slot)
+        let err = park_worker_slot_dormant(&unwritable_db, &mut slot, &CostLimits::default())
             .await
             .expect_err("an unwritable journal DB must not be reported as a successful park");
         assert!(
@@ -21916,6 +22613,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             cost_tokens: 0,
             limit_tokens: 0,
             token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
             cost_usd: 0.0,
             task_started_at: now,
             turn_started_at: now,
@@ -22273,6 +22972,90 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[test]
+    fn cached_heavy_codex_terminal_usage_diagnostic_explains_cleanup() {
+        let mut slot = make_dummy_slot();
+        slot.proc = SlotProcess::dormant(runner::AgentKind::Codex, Some("test-thread")).unwrap();
+        slot.last_terminal_usage = runner::TokenUsage {
+            input_tokens: 2_000_000,
+            uncached_input_tokens: 40_000,
+            cached_input_tokens: 1_950_000,
+            cache_write_input_tokens: 10_000,
+            output_tokens: 2_000,
+            reasoning_tokens: 700,
+        };
+        slot.token_usage = slot.last_terminal_usage;
+        slot.limit_tokens = 42_000;
+        let limits = CostLimits {
+            token_limit_basis: crate::serve_config::TokenLimitBasis::Uncached,
+            max_task_tokens: Some(40_000),
+            ..Default::default()
+        };
+
+        let diagnostic = terminal_usage_diagnostic(
+            &slot,
+            "worker",
+            &limits,
+            Some("task tokens (uncached) 42000 exceeded limit 40000"),
+            TerminalUsageAction::RecordedOutcomeCleanup,
+        );
+
+        assert_eq!(diagnostic["role"], "worker");
+        assert_eq!(diagnostic["agent"], "Test-1");
+        assert_eq!(diagnostic["task_id"], 1);
+        assert_eq!(diagnostic["provider"], "codex");
+        assert_eq!(diagnostic["raw_input_tokens"], 2_000_000);
+        assert_eq!(diagnostic["uncached_input_tokens"], 40_000);
+        assert_eq!(diagnostic["cached_input_tokens"], 1_950_000);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 10_000);
+        assert_eq!(diagnostic["output_tokens"], 2_000);
+        assert_eq!(diagnostic["reasoning_tokens"], 700);
+        assert_eq!(diagnostic["raw_total_tokens"], 2_002_000);
+        assert_eq!(diagnostic["uncached_total_tokens"], 42_000);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 2_002_000);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 42_000);
+        assert_eq!(diagnostic["cumulative_limit_tokens"], 42_000);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["configured_limit_basis"], "uncached");
+        assert_eq!(diagnostic["configured_max_task_tokens"], 40_000);
+        assert_eq!(diagnostic["breach"], true);
+        assert_eq!(diagnostic["action"], "recorded_outcome_cleanup");
+    }
+
+    #[test]
+    fn terminal_usage_diagnostic_is_bounded_and_json_safe() {
+        let mut slot = make_dummy_slot();
+        slot.last_terminal_usage = runner::TokenUsage {
+            input_tokens: u64::MAX,
+            uncached_input_tokens: u64::MAX,
+            cached_input_tokens: u64::MAX,
+            cache_write_input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            reasoning_tokens: u64::MAX,
+        };
+        let oversized = format!("bad\n{}", "x".repeat(4_096));
+        let diagnostic = terminal_usage_diagnostic(
+            &slot,
+            "worker",
+            &CostLimits::default(),
+            Some(&oversized),
+            TerminalUsageAction::ActiveOwnerWatchdogTermination,
+        );
+        let rendered = serde_json::to_string(&diagnostic).unwrap();
+
+        assert!(
+            diagnostic["breach_reason"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                <= 513
+        );
+        assert!(rendered.len() < 2_000);
+        assert!(!rendered.contains('\n'));
+        assert_eq!(diagnostic["action"], "active_owner_watchdog_termination");
+    }
+
+    #[test]
     fn check_limits_turn_tokens_exceeded() {
         let limits = CostLimits {
             max_turn_tokens: Some(100),
@@ -22454,6 +23237,74 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
     }
 
+    #[test]
+    fn persistent_cleanup_capture_emits_classified_terminal_diagnostic() {
+        let output = vec![runner::CapturedOutput::Stdout(
+            r#"{"type":"result","result":"done","is_error":false,"usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":10,"output_tokens":5}}"#
+                .into(),
+        )];
+        let limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
+
+        for (role, action) in [
+            ("worker", TerminalUsageAction::RecordedOutcomeCleanup),
+            ("reviewer", TerminalUsageAction::TransferredOwnershipCleanup),
+        ] {
+            let mut token_usage = runner::TokenUsage::default();
+            let mut last_terminal_usage = runner::TokenUsage::default();
+            let mut last_terminal_cost_usd = None;
+            let mut cost_tokens = 0;
+            let mut limit_tokens = 0;
+            let mut cost_usd = 0.0;
+            let mut session_log = None;
+            let diagnostic = record_captured_terminal_usage_fields(
+                role,
+                &limits,
+                runner::AgentKind::Claude,
+                &output,
+                action,
+                "Test-1",
+                1,
+                &mut token_usage,
+                &mut last_terminal_usage,
+                &mut last_terminal_cost_usd,
+                &mut cost_tokens,
+                &mut limit_tokens,
+                &mut cost_usd,
+                std::time::Instant::now(),
+                std::time::Instant::now(),
+                &mut session_log,
+            )
+            .expect("late persistent terminal record must produce a diagnostic");
+
+            assert_eq!(diagnostic["role"], role);
+            assert_eq!(diagnostic["raw_input_tokens"], 100);
+            assert_eq!(diagnostic["uncached_input_tokens"], 20);
+            assert_eq!(diagnostic["cached_input_tokens"], 80);
+            assert_eq!(diagnostic["cache_write_input_tokens"], 10);
+            assert_eq!(diagnostic["output_tokens"], 5);
+            assert_eq!(diagnostic["raw_total_tokens"], 105);
+            assert_eq!(diagnostic["uncached_total_tokens"], 25);
+            assert_eq!(diagnostic["cumulative_raw_total_tokens"], 105);
+            assert_eq!(diagnostic["cumulative_limit_tokens"], 105);
+            assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+            assert_eq!(diagnostic["breach"], true);
+            assert_eq!(
+                diagnostic["action"],
+                match action {
+                    TerminalUsageAction::RecordedOutcomeCleanup => "recorded_outcome_cleanup",
+                    TerminalUsageAction::TransferredOwnershipCleanup => {
+                        "transferred_ownership_cleanup"
+                    }
+                    _ => unreachable!("fixture uses only cleanup actions"),
+                }
+            );
+            assert_eq!(token_usage.live_total_tokens(), 105);
+        }
+    }
+
     #[tokio::test]
     async fn rejected_reviewer_attachment_closes_run_with_buffered_terminal_usage() {
         let dir = tempfile::tempdir().unwrap();
@@ -22509,17 +23360,45 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3}}"#
                 .into(),
         )];
-        close_attachment_failed_reviewer_run(
+        let limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
+        let diagnostic = close_attachment_failed_reviewer_run(
             &db_path,
             reviewer_run_id,
+            "Rejected-reviewer",
             task_id,
             464,
             runner::AgentKind::Codex,
             "gpt-5.6-terra",
             "high",
+            &limits,
             &terminal,
         )
-        .await;
+        .await
+        .expect("terminal output must produce an attachment cleanup diagnostic");
+
+        assert_eq!(diagnostic["role"], "reviewer");
+        assert_eq!(diagnostic["agent"], "Rejected-reviewer");
+        assert_eq!(diagnostic["task_id"], task_id);
+        assert_eq!(diagnostic["provider"], "codex");
+        assert_eq!(diagnostic["raw_input_tokens"], 100);
+        assert_eq!(diagnostic["uncached_input_tokens"], 20);
+        assert_eq!(diagnostic["cached_input_tokens"], 80);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 10);
+        assert_eq!(diagnostic["output_tokens"], 5);
+        assert_eq!(diagnostic["reasoning_tokens"], 3);
+        assert_eq!(diagnostic["raw_total_tokens"], 105);
+        assert_eq!(diagnostic["uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 105);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_limit_tokens"], 105);
+        assert_eq!(diagnostic["configured_limit_basis"], "raw");
+        assert_eq!(diagnostic["configured_max_task_tokens"], 100);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["breach"], true);
+        assert_eq!(diagnostic["action"], "recorded_outcome_cleanup");
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, task_id).unwrap().unwrap();
@@ -22527,12 +23406,881 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             task.status, "done",
             "telemetry capture must not change the rejected lifecycle outcome"
         );
-        let run = quorum_core::agent_runs::runs_for_task(&conn, task_id)
-            .unwrap()
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, task_id).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "diagnostics must not duplicate lifecycle runs"
+        );
+        let run = runs
             .into_iter()
             .find(|run| run.id == reviewer_run_id)
             .unwrap();
         assert_eq!(run.end_reason.as_deref(), Some("attachment-failed"));
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, reviewer_run_id)
+                .unwrap()
+                .unwrap(),
+            quorum_core::token_usage::TokenUsage {
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 3,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    async fn buffered_codex_reviewer_slot_for_phase2_test(
+        dir: &Path,
+        repo_dir: &Path,
+        task_id: i64,
+        reviewer_run_id: i64,
+        agent: &str,
+    ) -> SlotState {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = dir.join(format!("{agent}-terminal.sh"));
+        std::fs::write(
+            &fixture,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":80,\"cache_write_input_tokens\":10,\"output_tokens\":5,\"reasoning_output_tokens\":3}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let proc = runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: repo_dir,
+                prompt: "review",
+                environment: &[],
+                mode: runner::LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &runner::AdapterConfig {
+                executable: fixture.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut reviewer = slot_with_process(proc);
+        reviewer.agent_name = agent.into();
+        reviewer.task_id = task_id;
+        reviewer.agent_run_id = Some(reviewer_run_id);
+        reviewer.worktree_path = dir.join(format!("{agent}-worktree"));
+        reviewer.branch = format!("{agent}-terminal-fixture");
+        reviewer.cost_tokens = 0;
+        reviewer.limit_tokens = 0;
+        reviewer.cost_usd = 0.0;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if reviewer.try_wait().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture provider must buffer its terminal record before teardown");
+        reviewer
+    }
+
+    struct Phase2ReviewerFixture {
+        dir: std::path::PathBuf,
+        repo_dir: std::path::PathBuf,
+        task_id: i64,
+        reviewer_run_id: i64,
+        agent: String,
+        reviewed_head_sha: Option<String>,
+    }
+
+    fn tick_phase2_reviewer_fixture(
+        config: ServeConfig,
+        mut name_pool: Pool,
+        fixture: Phase2ReviewerFixture,
+    ) -> (Pool, Vec<SlotState>) {
+        std::thread::Builder::new()
+            .name("phase2-reviewer-fixture".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let mut reviewers = vec![
+                        buffered_codex_reviewer_slot_for_phase2_test(
+                            &fixture.dir,
+                            &fixture.repo_dir,
+                            fixture.task_id,
+                            fixture.reviewer_run_id,
+                            &fixture.agent,
+                        )
+                        .await,
+                    ];
+                    reviewers[0].reviewed_head_sha = fixture.reviewed_head_sha;
+                    let wt_mgr = WorktreeManager::new();
+                    let mut workers = Vec::new();
+                    let mut pre_review_checks = HashMap::new();
+                    let mut pending_reviewer_resumes = HashMap::new();
+                    let mut poison_tracker = PoisonTracker::new();
+                    let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+                    let mut drain_state = DrainState::new();
+                    let mut lifetime_roster = LifetimeRoster::new();
+                    for reviewer in &reviewers {
+                        lifetime_roster.register(&reviewer.agent_name);
+                    }
+                    let mut classifier_slot = None;
+                    let mut decomposition_coordinator = DecompositionCoordinator::default();
+                    let mut classifier_consec_errors = 0;
+                    let mut classifier_backoff_until = None;
+                    let mut doctor_slot = None;
+                    let mut doctored_tasks = std::collections::HashSet::new();
+                    let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+                    tick(
+                        &config,
+                        &wt_mgr,
+                        &mut name_pool,
+                        &mut workers,
+                        &mut reviewers,
+                        &mut pre_review_checks,
+                        &mut pending_reviewer_resumes,
+                        &mut poison_tracker,
+                        &mut claim_skip_logs,
+                        &mut drain_state,
+                        &mut lifetime_roster,
+                        &mut classifier_slot,
+                        &mut decomposition_coordinator,
+                        &mut classifier_consec_errors,
+                        &mut classifier_backoff_until,
+                        &mut doctor_slot,
+                        &mut doctored_tasks,
+                        &signal_count,
+                    )
+                    .await
+                    .unwrap();
+                    (name_pool, reviewers)
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase2_mailbox_verdict_reaps_buffered_terminal_with_recorded_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("phase2-reviewer-terminal.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id, mailbox_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "phase 2 reviewer terminal cleanup",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::claim(
+                &mut conn,
+                "Phase2Reviewer",
+                Some(task_id),
+                &[],
+                3600,
+                now + 2,
+            )
+            .unwrap()
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET rework_round=?1 WHERE id=?2",
+                rusqlite::params![quorum_core::lifecycle::REWORK_CAP, task_id],
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "Phase2Reviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now + 2,
+            )
+            .unwrap();
+            let mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Phase2Reviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(464),
+                    verdict: Some("changes".into()),
+                    feedback: Some("fix the blocker".into()),
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            (task_id, run_id, mailbox_id)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir.clone());
+        config.limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Phase2Reviewer").unwrap();
+        assert!(take_terminal_usage_diagnostics_for_test("Phase2Reviewer").is_empty());
+
+        let (_name_pool, reviewers) = tick_phase2_reviewer_fixture(
+            config,
+            name_pool,
+            Phase2ReviewerFixture {
+                dir: dir.path().to_path_buf(),
+                repo_dir,
+                task_id,
+                reviewer_run_id,
+                agent: "Phase2Reviewer".into(),
+                reviewed_head_sha: None,
+            },
+        );
+
+        assert!(
+            reviewers.is_empty(),
+            "Phase 2 must reap the accepted reviewer"
+        );
+        let diagnostics = take_terminal_usage_diagnostics_for_test("Phase2Reviewer");
+        assert_eq!(diagnostics.len(), 1, "one late terminal diagnostic");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic["event"], "terminal_usage");
+        assert_eq!(diagnostic["role"], "reviewer");
+        assert_eq!(diagnostic["provider"], "codex");
+        assert_eq!(diagnostic["raw_input_tokens"], 100);
+        assert_eq!(diagnostic["uncached_input_tokens"], 20);
+        assert_eq!(diagnostic["cached_input_tokens"], 80);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 10);
+        assert_eq!(diagnostic["output_tokens"], 5);
+        assert_eq!(diagnostic["reasoning_tokens"], 3);
+        assert_eq!(diagnostic["raw_total_tokens"], 105);
+        assert_eq!(diagnostic["uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 105);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_limit_tokens"], 105);
+        assert_eq!(diagnostic["configured_limit_basis"], "raw");
+        assert_eq!(diagnostic["configured_max_task_tokens"], 100);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["breach"], true);
+        assert_eq!(diagnostic["action"], "recorded_outcome_cleanup");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "failed"
+        );
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1,
+            "cleanup must not duplicate the reviewer run"
+        );
+        let verdict_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_failed'",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict_events, 1, "cleanup must not replay the verdict");
+        let consumed: bool = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed, "Phase 2 must consume the accepted verdict");
+        let terminal_alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind='alert' AND body LIKE '%terminal%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_alerts, 0, "late telemetry must not raise an alert");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase2_unrecorded_verdict_teardown_keeps_buffered_terminal_unclassified() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("phase2-unrecorded-terminal.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id, mailbox_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "phase 2 unrecorded reviewer terminal",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::claim(
+                &mut conn,
+                "UnrecordedReviewer",
+                Some(task_id),
+                &[],
+                3600,
+                now + 2,
+            )
+            .unwrap()
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "UnrecordedReviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now + 2,
+            )
+            .unwrap();
+            let mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "UnrecordedReviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: None,
+                    verdict: Some("approved".into()),
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: Some(r#"{"blocking":0}"#.into()),
+                },
+            )
+            .unwrap();
+            (task_id, run_id, mailbox_id)
+        };
+        let config = pre_review_ci_test_config(db_path.clone(), repo_dir.clone());
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("UnrecordedReviewer").unwrap();
+        assert!(take_terminal_usage_diagnostics_for_test("UnrecordedReviewer").is_empty());
+
+        let (_name_pool, reviewers) = tick_phase2_reviewer_fixture(
+            config,
+            name_pool,
+            Phase2ReviewerFixture {
+                dir: dir.path().to_path_buf(),
+                repo_dir,
+                task_id,
+                reviewer_run_id,
+                agent: "UnrecordedReviewer".into(),
+                reviewed_head_sha: None,
+            },
+        );
+
+        assert!(
+            reviewers.is_empty(),
+            "invalid verdict branch must reap reviewer"
+        );
+        assert!(
+            take_terminal_usage_diagnostics_for_test("UnrecordedReviewer").is_empty(),
+            "unrecorded verdict cleanup must not claim a recorded terminal action"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let verdict_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE subject=?1 AND kind IN ('task_merging','task_rework','task_failed')",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict_events, 0, "unrecorded verdict must stay inert");
+        let consumed: bool = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase2_merge_wait_stale_sha_reaps_buffered_terminal_after_merge_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("phase2-merge-wait-terminal.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id, mailbox_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "phase 2 merge-wait stale terminal",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::claim(
+                &mut conn,
+                "MergeWaitReviewer",
+                Some(task_id),
+                &[],
+                3600,
+                now + 2,
+            )
+            .unwrap()
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "system",
+                task_id,
+                &Event::ReviewerAttached {
+                    agent: "MergeWaitReviewer".into(),
+                },
+                now + 2,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "MergeWaitReviewer",
+                task_id,
+                &Event::VerdictApprove,
+                now + 3,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "MergeWaitReviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now + 2,
+            )
+            .unwrap();
+            let mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "MergeWaitReviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(464),
+                    verdict: Some("approved".into()),
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: Some(r#"{"blocking":0}"#.into()),
+                },
+            )
+            .unwrap();
+            (task_id, run_id, mailbox_id)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir.clone());
+        config.limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("MergeWaitReviewer").unwrap();
+        assert!(take_terminal_usage_diagnostics_for_test("MergeWaitReviewer").is_empty());
+
+        let (_name_pool, reviewers) = tick_phase2_reviewer_fixture(
+            config,
+            name_pool,
+            Phase2ReviewerFixture {
+                dir: dir.path().to_path_buf(),
+                repo_dir,
+                task_id,
+                reviewer_run_id,
+                agent: "MergeWaitReviewer".into(),
+                reviewed_head_sha: Some("reviewed-head".into()),
+            },
+        );
+
+        assert!(reviewers.is_empty(), "merge-wait reviewer must be reaped");
+        let diagnostics = take_terminal_usage_diagnostics_for_test("MergeWaitReviewer");
+        assert_eq!(diagnostics.len(), 1, "one recorded merge-wait cleanup");
+        assert_eq!(
+            diagnostics[0],
+            serde_json::json!({
+                "event": "terminal_usage",
+                "action": "recorded_outcome_cleanup",
+                "agent": "MergeWaitReviewer",
+                "role": "reviewer",
+                "provider": "codex",
+                "task_id": task_id,
+                "raw_input_tokens": 100,
+                "cached_input_tokens": 80,
+                "cache_write_input_tokens": 10,
+                "uncached_input_tokens": 20,
+                "output_tokens": 5,
+                "reasoning_tokens": 3,
+                "raw_total_tokens": 105,
+                "uncached_total_tokens": 25,
+                "configured_max_turn_tokens": null,
+                "configured_max_task_tokens": 100,
+                "configured_max_turn_cost_usd": null,
+                "configured_max_task_cost_usd": null,
+                "configured_limit_basis": "raw",
+                "cumulative_raw_total_tokens": 105,
+                "cumulative_uncached_total_tokens": 25,
+                "cumulative_limit_tokens": 105,
+                "cost_usd": null,
+                "breach": true,
+                "breach_reason": "task tokens (raw) 105 exceeded limit 100",
+            })
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let subject = format!("task#{task_id}");
+        let merging_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_merging'",
+                [&subject],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let in_review_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_in_review'",
+                [&subject],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(merging_events, 1, "mailbox retry must not replay approval");
+        assert_eq!(
+            in_review_events, 3,
+            "exactly one MergeFailed must return to review"
+        );
+        let consumed: bool = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed, "merge-wait retry mailbox must be consumed");
+        let terminal_alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind='alert' AND body LIKE '%terminal%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_alerts, 0, "recorded cleanup must not alert");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mailbox_verdict_before_buffered_reviewer_terminal_emits_recorded_cleanup_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviewer-verdict-terminal.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id, mailbox_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "reviewer terminal cleanup",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("author must claim fixture task");
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Reviewer", Some(task_id), &[], 3600, now + 2)
+                .unwrap()
+                .expect("reviewer must claim fixture task");
+            let reviewer_run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "Reviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now + 2,
+            )
+            .unwrap();
+            let mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Reviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(464),
+                    verdict: Some("changes".into()),
+                    feedback: Some("fix the blocker".into()),
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Reviewer",
+                task_id,
+                &Event::VerdictChanges,
+                now + 3,
+            )
+            .unwrap();
+            (task_id, reviewer_run_id, mailbox_id)
+        };
+
+        let fixture = dir.path().join("reviewer-terminal.sh");
+        std::fs::write(
+            &fixture,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":80,\"cache_write_input_tokens\":10,\"output_tokens\":5,\"reasoning_output_tokens\":3}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let proc = runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: &repo_dir,
+                prompt: "review",
+                environment: &[],
+                mode: runner::LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &runner::AdapterConfig {
+                executable: fixture.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut reviewer = slot_with_process(proc);
+        reviewer.agent_name = "Reviewer".into();
+        reviewer.task_id = task_id;
+        reviewer.agent_run_id = Some(reviewer_run_id);
+        reviewer.worktree_path = dir.path().join("review-worktree");
+        reviewer.branch = "reviewer-terminal-fixture".into();
+        reviewer.cost_tokens = 0;
+        reviewer.limit_tokens = 0;
+        reviewer.cost_usd = 0.0;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if reviewer.try_wait().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture provider must buffer its terminal record before teardown");
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir);
+        config.limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Reviewer").unwrap();
+        let diagnostic = teardown_reviewer_with_terminal_action(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            reviewer,
+            "verdict:changes",
+            Some(TerminalUsageAction::RecordedOutcomeCleanup),
+        )
+        .await
+        .expect("buffered terminal record must emit a diagnostic");
+
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::mark_consumed(&mut conn, mailbox_id).unwrap();
+        }
+        assert_eq!(diagnostic["event"], "terminal_usage");
+        assert_eq!(diagnostic["role"], "reviewer");
+        assert_eq!(diagnostic["agent"], "Reviewer");
+        assert_eq!(diagnostic["task_id"], task_id);
+        assert_eq!(diagnostic["provider"], "codex");
+        assert_eq!(diagnostic["raw_input_tokens"], 100);
+        assert_eq!(diagnostic["uncached_input_tokens"], 20);
+        assert_eq!(diagnostic["cached_input_tokens"], 80);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 10);
+        assert_eq!(diagnostic["output_tokens"], 5);
+        assert_eq!(diagnostic["reasoning_tokens"], 3);
+        assert_eq!(diagnostic["raw_total_tokens"], 105);
+        assert_eq!(diagnostic["uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 105);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_limit_tokens"], 105);
+        assert_eq!(diagnostic["configured_limit_basis"], "raw");
+        assert_eq!(diagnostic["configured_max_task_tokens"], 100);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["breach"], true);
+        assert!(diagnostic["breach_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("task tokens (raw) 105 exceeded limit 100")));
+        assert_eq!(diagnostic["action"], "recorded_outcome_cleanup");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "rework"
+        );
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1,
+            "cleanup must not duplicate the reviewer run"
+        );
+        let rework_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_rework'",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rework_events, 1, "cleanup must not replay the verdict");
+        let alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind='alert'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alerts, 0, "recorded cleanup must not raise an alert");
         assert_eq!(
             quorum_core::token_usage::usage_for_agent_run(&conn, reviewer_run_id)
                 .unwrap()
@@ -27063,6 +28811,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 "authoritative outcome entered runner failure taxonomy"
             );
         }
+        assert_eq!(
+            terminal_usage_action(&tasks::ManagedExitDisposition::OutcomeRecorded).as_str(),
+            "recorded_outcome_cleanup"
+        );
+        assert_eq!(
+            terminal_usage_action(&tasks::ManagedExitDisposition::OwnershipTransferred).as_str(),
+            "transferred_ownership_cleanup"
+        );
     }
 
     #[tokio::test]
@@ -27108,6 +28864,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+        assert_eq!(runs.len(), 2, "cleanup must not duplicate lifecycle runs");
         assert_eq!(runs[0].end_reason.as_deref(), Some("completed"));
         assert_eq!(runs[1].end_reason.as_deref(), Some("ownership_transferred"));
         assert!(
