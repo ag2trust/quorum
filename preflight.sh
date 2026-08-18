@@ -120,7 +120,11 @@ import subprocess
 import sys
 
 def git(*args):
-    return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL)
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    return subprocess.check_output(
+        ["git", *args], stderr=subprocess.DEVNULL, env=environment
+    )
 
 def add(hasher, label, value):
     hasher.update(label)
@@ -130,7 +134,11 @@ def add(hasher, label, value):
 try:
     head = git("rev-parse", "--verify", "HEAD^{commit}")
     status = git("status", "--porcelain=v1", "-z", "--untracked-files=all")
-    diff = git("-c", "core.quotepath=false", "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD")
+    diff = git(
+        "-c", "core.quotepath=false",
+        "-c", "diff.autoRefreshIndex=false",
+        "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD",
+    )
     untracked = git("ls-files", "--others", "--exclude-standard", "-z")
     ignored = git("ls-files", "--others", "--ignored", "--exclude-standard", "-z")
 

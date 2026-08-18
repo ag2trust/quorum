@@ -476,6 +476,19 @@ grep -q 'PREFLIGHT: PASS (cached — tree unchanged since last green run)' \
   "$TMP/cached.out"
 [ ! -s "$TMP/full-cargo.log" ]
 
+# Fingerprint reads must not refresh a stale index. A content-identical touch
+# keeps the cache valid while forcing Git to observe outdated stat data.
+cp .git/index "$TMP/index-before-cache-lookup"
+sleep 1
+touch tracked.rs
+: >"$TMP/full-cargo.log"
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/index-preserving-cache.out"
+cmp "$TMP/index-before-cache-lookup" .git/index
+grep -q 'PREFLIGHT: PASS (cached — tree unchanged since last green run)' \
+  "$TMP/index-preserving-cache.out"
+[ ! -s "$TMP/full-cargo.log" ]
+
 # A tracked Rust source edit must invalidate the green result and re-run every
 # collector gate. The configured textconv deliberately erases the diff's
 # contents, so a second dirty edit proves the fingerprint uses raw diff bytes.
