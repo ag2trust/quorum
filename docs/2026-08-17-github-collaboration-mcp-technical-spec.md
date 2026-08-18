@@ -28,7 +28,8 @@ credentials or allowing comment text to transition lifecycle.
 - Preserve ordinary local `git` work for status, diff, commits, and history.
 - Give managed agents familiar GitHub-shaped MCP tools for PR reads, general comments, pending
   reviews, inline comments, review-thread replies, and reviewer-owned thread resolution.
-- Bind every operation to the live run's repository, task, role, PR, and applicable revision.
+- Bind every enqueue, read, and execution claim to the live run's repository, task, role, PR, and
+  applicable revision.
 - Preserve authored GitHub-flavored Markdown structure without shell quoting or argument
   interpolation.
 - Keep GitHub credentials, formal APPROVE/REQUEST_CHANGES, publication, and merge outside managed
@@ -83,7 +84,10 @@ control-plane state.
 
 `QUORUM_RUN_ID` already names a daemon-issued row in `run_capabilities`. The MCP adapter reuses
 that capability. It is not GitHub authority: compromise grants only the same bounded operations
-already available to that exact managed run and stops working when the daemon revokes the run.
+already available to that exact managed run. Revocation immediately prevents that capability
+from enqueueing, reading, or adopting work. A durable operation may survive only through the
+daemon-owned exact-continuation handoff defined below; possession of an old capability never
+performs that handoff.
 
 The MCP adapter reads `QUORUM_REPO`, `QUORUM_AGENT`, `QUORUM_RUN_ID`, and
 `QUORUM_AGENT_ENDPOINT` from its inherited environment. The daemon derives task and role from
@@ -101,6 +105,23 @@ the Quorum database. Capability validation and durable request creation occur in
 `BEGIN IMMEDIATE` transaction in the daemon.
 Revoked, ended, wrong-role, wrong-task, wrong-PR, or wrong-revision calls are clean authorization
 failures and enqueue nothing. GitHub calls never occur while a database transaction is open.
+
+Each new logical managed turn receives a daemon-generated `collaboration_attempt_id` bound to its
+exact task, agent, role, PR, lifecycle generation, and reviewer launch SHA when applicable. The ID
+is persisted with the daemon's pending-turn/recovery state; it is not accepted from an MCP
+argument or inferred from the provider's prose. A process restart or provider retry that resumes
+that exact pending turn retains the collaboration attempt even though it receives a fresh
+`agent_runs` row and run capability. A new rework round, re-review launch, role, PR, launch SHA, or
+provider turn receives a new attempt.
+
+Only the daemon provisioning path may adopt an interrupted attempt. In the same transaction that
+issues the replacement capability, it must prove the persisted pending-turn identity, task,
+agent, role, PR, lifecycle generation, launch SHA, and provider continuation all still match,
+that no other live capability owns the attempt, and that the task still permits the turn. It then
+replaces the attempt's `active_run_id`. The old run remains revoked. A mismatch revokes the
+attempt and cancels its unclaimed writes; it never falls back to a new attempt or copies rows.
+This is the durable handoff for Codex thread continuation and daemon restart, not a general
+cross-run lookup facility.
 
 The initial endpoint is a local framed-JSON IPC channel, implemented as an owner-only Unix-domain
 socket on supported runtimes. It does not listen on TCP. Each bounded request carries the run
@@ -168,14 +189,15 @@ standalone issue in the first increment.
 Only `method=create` and `method=submit_pending` are accepted.
 
 - `create` requires `commitID` equal to the immutable reviewer launch SHA and creates or resumes
-  the exact run's pending review.
+  the exact collaboration attempt's pending review.
 - `submit_pending` requires `event=COMMENT`. `APPROVE`, `REQUEST_CHANGES`, dismissal, deletion,
   and arbitrary review IDs are rejected.
 - The submitted `body` is the authored complete-review summary. Publication does not transition
   the Managed Task; the existing explicit `quorum submit` verdict remains separate.
 
-At most one live pending review belongs to one reviewer run. A restarted adapter resumes the
-durable request/review identity rather than creating a second review.
+At most one live pending review belongs to one reviewer collaboration attempt. A fresh-capability
+resume of the exact pending reviewer turn adopts the attempt's durable request/review identity
+rather than creating a second review. A different launch SHA or re-review cannot adopt it.
 
 ### `add_comment_to_pending_review`
 
@@ -241,15 +263,35 @@ still-open blockers. Cross-cutting responses may use a general PR comment.
 
 ## Durable GitHub-operation outbox
 
-A forward-only migration adds a bounded repository-local outbox. Names below are normative; exact
-column order is not.
+A forward-only migration adds bounded repository-local collaboration attempts and an outbox.
+Names below are normative; exact column order is not.
 
 ```sql
+CREATE TABLE github_collaboration_attempts (
+  attempt_id           TEXT PRIMARY KEY,
+  task_id              INTEGER NOT NULL REFERENCES tasks(id),
+  agent                 TEXT NOT NULL,
+  role                  TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+  pr_number             INTEGER NOT NULL,
+  head_sha              TEXT,
+  lifecycle_generation  INTEGER NOT NULL,
+  active_run_id         TEXT REFERENCES run_capabilities(run_id),
+  state                 TEXT NOT NULL
+                        CHECK(state IN ('active','awaiting_resume','completed','revoked')),
+  review_sealed         INTEGER NOT NULL DEFAULT 0 CHECK(review_sealed IN (0,1)),
+  next_review_sequence  INTEGER NOT NULL DEFAULT 0,
+  created_at            INTEGER NOT NULL,
+  updated_at            INTEGER NOT NULL,
+  expires_at            INTEGER NOT NULL,
+  UNIQUE(active_run_id)
+);
+
 CREATE TABLE github_agent_operations (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
   operation_id       TEXT NOT NULL UNIQUE,
   client_request_id  TEXT NOT NULL,
-  run_id             TEXT NOT NULL REFERENCES run_capabilities(run_id),
+  attempt_id          TEXT NOT NULL REFERENCES github_collaboration_attempts(attempt_id),
+  created_by_run_id   TEXT NOT NULL REFERENCES run_capabilities(run_id),
   task_id            INTEGER NOT NULL REFERENCES tasks(id),
   agent               TEXT NOT NULL,
   role                TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
@@ -257,42 +299,122 @@ CREATE TABLE github_agent_operations (
   head_sha            TEXT,
   kind                TEXT NOT NULL,
   request_json        TEXT NOT NULL,
-  state               TEXT NOT NULL,
+  state               TEXT NOT NULL
+                      CHECK(state IN ('queued','running','succeeded','failed','cancelled')),
   attempts            INTEGER NOT NULL DEFAULT 0,
   next_attempt_at     INTEGER,
+  deadline_at         INTEGER NOT NULL,
+  review_sequence     INTEGER,
   github_marker       TEXT,
   response_json       TEXT,
   error_kind          TEXT,
   error_summary       TEXT,
+  completed_after_revocation INTEGER NOT NULL DEFAULT 0
+                                     CHECK(completed_after_revocation IN (0,1)),
   created_at          INTEGER NOT NULL,
   updated_at          INTEGER NOT NULL,
   expires_at          INTEGER NOT NULL,
-  UNIQUE(run_id, client_request_id)
+  UNIQUE(attempt_id, client_request_id),
+  UNIQUE(attempt_id, review_sequence)
 );
 ```
 
-States are `queued`, `running`, `succeeded`, and `failed`. Requests are immutable after enqueue;
+Attempt states are `active`, `awaiting_resume`, `completed`, and `revoked`. Operation states are
+`queued`, `running`, `succeeded`, `failed`, and `cancelled`. Requests are immutable after enqueue;
 only execution state/result fields change. `request_json` and `response_json` use closed,
-kind-specific schemas and fixed aggregate limits. Terminal rows expire after a bounded retention
-window; live rows do not become logically dead while queued or running.
+kind-specific schemas and fixed aggregate limits. Terminal rows expire after a seven-day
+retention window. Nonterminal rows have a one-hour execution deadline and therefore cannot remain
+live indefinitely. An attempt becomes terminal with its exact lifecycle turn and expires only
+after all of its rows are terminal; `active` and `awaiting_resume` attempts remain tied to the
+persisted exact pending turn rather than becoming reusable identities.
 
 Every mutation accepts an optional `clientRequestId`, matching the role of an idempotency key. If
-it is absent, the adapter derives it from the run, operation kind, target, and canonical closed-
-schema request. Identical retries in one run therefore return the original durable `operation_id`
-without relying on agent discipline; a caller supplies a distinct ID only when intentionally
-repeating identical content. Every write body receives a hidden operation marker where GitHub
-permits one. After a crash in the ambiguous post-request/pre-commit window, the daemon queries the
-exact PR/review/thread for that marker before retrying.
+it is absent, the adapter derives it from the collaboration attempt, operation kind, target, and
+canonical closed-schema request. The `operation_id` and hidden marker are deterministic from the
+attempt and client request ID. Identical retries across fresh-capability resumes of the exact turn
+therefore return the original durable operation without relying on agent discipline; a caller
+supplies a distinct ID only when intentionally repeating identical content. Every write body
+receives the marker where GitHub permits one. Before a row's first send, after a crash in the
+ambiguous post-request/pre-commit window, and before any resend, the daemon queries the exact
+PR/review/thread for that marker or an operation-specific idempotent state predicate. Expiry or
+re-creation of a row does not change its marker.
+
+Admission is checked in the enqueue transaction after logically expired terminal rows are swept.
+The fixed initial limits are 64 nonexpired operations created by one run, 128 per collaboration
+attempt, 512 per task, and 4,096 in the repository database. All four counts include terminal
+retention rows so persistent storage, not only active work, is bounded. A request that would
+exceed any limit returns a typed `capacity_exceeded` result and creates no row. Limits are closed
+daemon constants, not agent input or configuration that a managed run can raise.
+
+Attempt creation is separately capped at 16 nonexpired attempts per task and 1,024 in the
+repository database, including terminal-retention rows. It returns the same fail-closed capacity
+outcome before provisioning if either cap is reached. Thus the identity table cannot become an
+unbounded side channel around the operation-row limits.
 
 The single daemon claims one queued operation with a guarded `UPDATE ... RETURNING` inside
-`BEGIN IMMEDIATE`, commits, performs the network call, then records the bounded result in a new
-transaction. Startup converts orphaned `running` rows back to reconciliation-required queued
-work. Network calls, sleeps, and response parsing never hold a DB transaction.
+`BEGIN IMMEDIATE`. Claim eligibility atomically revalidates that the attempt is active, its
+`active_run_id` names a live capability, and the capability, task phase, agent, role, PR,
+lifecycle generation, and reviewer launch SHA still match. A queued row that fails revalidation
+becomes `cancelled`; it is never sent. Task cancellation, authoritative phase exit, launch-head
+invalidation, or non-resumable teardown revokes affected attempts and cancels all their queued
+rows in the same lifecycle transaction. A resumable process interruption instead changes the
+attempt to `awaiting_resume`; no row is claimable until the exact-continuation adoption transaction
+reactivates it.
 
-`github_operation_read` returns `queued`, `running`, `succeeded`, or `failed` for an operation
-belonging to the caller's run. A tool call waits at most the existing 30-second publication bound;
-if unfinished it returns the operation ID and a pending result rather than blocking the agent or
-creating a second request.
+After claim commits, the daemon performs the network call and records the bounded result in a new
+transaction. The claim commit is the local point of no return: cancellation or revocation racing
+after it cannot recall a request already handed to GitHub. Such a call may produce one remote
+write, but its row is marked `completed_after_revocation=1`, it cannot satisfy a lifecycle guard,
+and no later operation in that attempt is sent. For a reviewer mutation, the executor first fetches
+the current remote PR head without a transaction, then the claim transaction requires that
+observation to equal the launch SHA and that the local authority generation has not changed. A
+head move discovered there revokes the attempt. GitHub cannot participate in the SQLite
+transaction: the unavoidable remote head-move race after that final observation may produce one
+stale write, but a later mismatch has the same completed-after-revocation disposition and can
+never authorize a verdict.
+
+On graceful shutdown the daemon stops claiming new rows and gives a claimed Repository Service
+call only its existing 30-second kill/reap bound. Startup treats every orphaned `running` row as
+reconciliation-required. If its attempt is active or later exactly adopted, the executor checks
+the marker before resend. If the attempt is revoked, startup may perform the read-only marker
+check to record whether the already-authorized call landed, but it never resends; absent evidence
+becomes `cancelled`. Network calls, sleeps, and response parsing never hold a DB transaction.
+
+Each operation permits at most eight claim/reconciliation cycles and at most one hour from
+`created_at`; the earlier limit wins. Backoff is exponential with jitter and a fixed maximum.
+Crossing either bound atomically changes the row to `failed` with `retry_exhausted`, and no
+automatic path sends it again. Saturation and exhaustion are infrastructure outcomes: they create
+no `errors` row and consume no rework, reviewer-provision, or provider-retry budget. The caller
+receives the terminal result. If an exhausted operation is required by a pending lifecycle submit,
+the daemon uses the existing durable parking path and preserves the exact attempt and marker for
+operator recovery; recovery reconciles and requeues that same operation rather than minting a new
+ID.
+
+`github_operation_read` returns `queued`, `running`, `succeeded`, `failed`, or `cancelled` only
+when the caller is the live `active_run_id` of the operation's attempt. A freshly provisioned exact
+continuation can therefore observe adopted operations; a revoked prior run cannot. A tool call
+waits at most the existing 30-second publication bound; if unfinished it returns the operation ID
+and a pending result rather than blocking the agent or creating a second request.
+
+### Pending-review ordering
+
+Review publication is one durable sequence within the reviewer collaboration attempt. `create`
+atomically receives sequence zero. Each accepted inline finding receives the next sequence. An
+accepted `submit_pending` receives the final sequence and sets `review_sealed=1` in the same
+transaction; after sealing, new inline findings and a second submit are rejected. The executor may
+claim a review-sequence row only after every lower sequence has `succeeded` without
+`completed_after_revocation`. A queued, running, or backing-off predecessor blocks later rows; a
+failed or cancelled predecessor terminally fails its dependents without sending them to GitHub.
+
+This serializes create, all accepted inline findings in enqueue order, and final COMMENT
+submission even when later rows are otherwise due first. The reviewer lifecycle submit guard
+requires the exact current attempt to be sealed, every sequence through the final submit to have
+succeeded without post-revocation completion, the final operation to be `submit_pending`, and the
+immutable launch SHA still to equal a freshly fetched remote PR head. After that bounded fetch,
+the database proof and unchanged-authority check occur in one `BEGIN IMMEDIATE` transaction; the
+same unavoidable post-fetch remote race as the existing launch-SHA attestation remains. A pending
+summary alone, or a succeeded submit with any missing/queued/running/failed/cancelled predecessor,
+cannot authorize the verdict.
 
 ## Repository Service execution
 
@@ -321,16 +443,19 @@ components are infrastructure outcomes. They MUST NOT:
 - consume rework or reviewer-provision budgets; or
 - duplicate a comment, inline finding, reply, or submitted review.
 
-Retryable operations remain queued with bounded exponential backoff and jitter. Permanent closed-
-schema input errors fail the operation and return actionable tool feedback. Authorization loss,
-repository deselection, credential failure, or an invalid current PR target fails closed and is
-surfaced as an infrastructure/authority condition for operator recovery; it is never rewritten as
-code rework.
+Retryable operations remain queued only within the fixed attempt and wall-clock bounds above,
+using bounded exponential backoff and jitter. Permanent closed-schema input errors fail the
+operation and return actionable tool feedback. Authorization loss, repository deselection,
+credential failure, or an invalid current PR target fails closed and is surfaced as an
+infrastructure/authority condition for operator recovery; it is never rewritten as code rework.
 
-A reviewer lifecycle submit is atomically rejected unless that run's pending review operation is
-already `succeeded` for the immutable launch SHA. This is a core submit guard, not a prompt rule.
-If the coding-runner turn ends while GitHub publication remains pending, the daemon retains the
-operation for reconciliation and does not infer a verdict from the model's text.
+A reviewer lifecycle submit is atomically rejected unless the sealed review sequence satisfies
+the complete predecessor and immutable-SHA guard above. This is a core submit guard, not a prompt
+rule. Every worker or reviewer lifecycle submit is also rejected while its collaboration attempt
+has any accepted mutation queued, running, failed, cancelled, or succeeded only after revocation.
+If the coding-runner turn ends while GitHub publication remains pending, the daemon preserves the
+exact attempt as `awaiting_resume` for bounded reconciliation and does not infer completion or a
+verdict from the model's text.
 
 ## Initial PR description
 
@@ -375,6 +500,13 @@ Required tests include:
 - run A cannot address task, PR, revision, operation, comment, or thread belonging to run B;
 - the local agent endpoint rejects public/admin CLI commands, raw SQL, and unknown operations;
 - revoked and ended capabilities enqueue nothing;
+- queued writes are cancelled on task cancellation, phase exit, non-resumable revocation, and
+  reviewer head movement; a running write in each race is reconciled at most once and never
+  authorizes lifecycle after revocation;
+- graceful and forced shutdown with queued/running writes preserves the point-of-no-return and
+  reconciliation rules without inferring a lifecycle outcome;
+- a fresh capability for the exact persisted Claude/Codex continuation adopts the same attempt,
+  operation IDs, markers, and pending review, while a changed task/role/PR/SHA/turn cannot adopt;
 - moved heads reject new inline review work and cannot authorize a verdict;
 - invalid path/line/side/range and foreign/outdated thread anchors fail visibly;
 - authored Markdown with lists, tables, fences, suggestions, Unicode, quotes, and newlines reaches
@@ -382,6 +514,11 @@ Required tests include:
 - NUL, invalid schema, oversized bodies/results, excessive pages/comments, and unknown fields fail;
 - crash-after-GitHub-success reconciliation produces exactly one visible contribution;
 - concurrent duplicate requests produce exactly one outbox row and GitHub write;
+- distinct-ID saturation at the run, attempt, task, and repository caps rejects admission without
+  a row, attempt-table saturation rejects provisioning without a row, and prolonged outage
+  reaches the retry-count/age bound with no further retries or lifecycle budget consumption;
+- a delayed or backing-off first inline finding prevents every later inline finding and pending-
+  review submit from being claimed, and the lifecycle verdict remains rejected;
 - repeated real-process races against one DB preserve SQLite invariants;
 - GitHub timeout/5xx leaves lifecycle and rework counters unchanged;
 - normal Claude and Codex launches receive the scoped MCP, while restricted roles do not;
@@ -395,16 +532,18 @@ Required tests include:
 Every implementation task is deliberately small or medium and independently reviewable.
 
 1. **M — Agent endpoint, MCP shell, and capability-derived inventory.** Add the narrow daemon
-   endpoint, route managed `submit`/`react` without semantic changes, add the stdio server and
-   closed schemas, derive role/target in the daemon, and prove the adapter has no direct database
-   or GitHub execution access.
+   endpoint, stable collaboration-attempt issuance and exact-continuation adoption, route managed
+   `submit`/`react` without semantic changes, add the stdio server and closed schemas, derive
+   role/target in the daemon, and prove the adapter has no direct database or GitHub execution
+   access.
 2. **M — Durable operation outbox and daemon executor skeleton.** Add the migration, atomic
-   enqueue/claim/result/recovery paths, bounds, retention, and fake Repository Service.
+   enqueue/claim/revalidation/revocation/result/recovery paths, fixed admission and retry bounds,
+   retention, shutdown reconciliation, and fake Repository Service.
 3. **M — PR read and general-comment operations.** Add bounded reads, exact target checks,
    Markdown-safe general comments, markers, and outage classification.
 4. **M — Pending reviews and inline findings.** Add create/resume/submit COMMENT review,
-   validated single/multiline anchors for the launch SHA, and the core publication-before-verdict
-   submit guard.
+   validated single/multiline anchors for the launch SHA, durable sequence/seal dependencies, and
+   the complete-publication-before-verdict submit guard.
 5. **S — Thread replies and reviewer resolution.** Add exact-PR comment lookup, true threaded
    replies, outdated context, and reviewer-only resolution.
 6. **S — Claude per-run MCP injection.** Add explicit strict config for initial/resumed managed
