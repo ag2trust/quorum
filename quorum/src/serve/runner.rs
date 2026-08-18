@@ -1289,6 +1289,28 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn launch_recording_runner(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> RunnerProc {
+        const EXECUTABLE_BUSY_RETRIES: u8 = 3;
+
+        for attempt in 0..=EXECUTABLE_BUSY_RETRIES {
+            match RunnerProc::launch(request, config).await {
+                Ok(proc) => return proc,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && attempt < EXECUTABLE_BUSY_RETRIES =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("recording runner launch failed: {error}"),
+            }
+        }
+        unreachable!("bounded retry either launches the runner or returns its error")
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn normal_launch_dispatches_to_each_explicit_adapter() {
         let claude_dir = tempfile::tempdir().unwrap();
@@ -1431,7 +1453,7 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let executable = recording_runner(dir.path());
-            let mut proc = RunnerProc::launch(
+            let mut proc = launch_recording_runner(
                 &LaunchRequest {
                     model,
                     effort: "low",
@@ -1449,8 +1471,7 @@ mod tests {
                     grok: Default::default(),
                 },
             )
-            .await
-            .unwrap();
+            .await;
             assert_eq!(proc.kind(), expected_kind);
             while proc.next_raw_line().await.is_some() {}
             proc.kill_and_reap().await;
