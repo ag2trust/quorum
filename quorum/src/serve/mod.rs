@@ -12573,7 +12573,10 @@ fn log_terminal_usage_diagnostic(
     action: TerminalUsageAction,
 ) {
     let diagnostic = terminal_usage_diagnostic(slot, role, limits, breach, action);
-    log(&format!("terminal usage diagnostic: {diagnostic}"));
+    log(&format!(
+        "{role} {} result terminal usage diagnostic: {diagnostic}",
+        slot.agent_name
+    ));
 }
 
 /// Check wall-clock limits only (called each tick for slots still draining).
