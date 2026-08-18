@@ -817,7 +817,10 @@ reviewer's launch SHA; it never refetches and binds the verdict to a later force
 Startup never auto-replays a parked task; any interrupted `attempting` marker is parked for
 another owner retry rather than issuing an uncertain duplicate call. A policy failure during
 startup approval replay is likewise parked with exact-head approvals retained before generic
-recovery, while a worker-fixable result invalidates those approvals and returns to rework.
+recovery, while a worker-fixable result invalidates those approvals, records
+`daemon_rework_retry_requested=true`, and returns to rework. This marker survives the immediately
+following generic recovery even when no worker journal or continuation exists, so the daemon
+provisions the actionable remediation turn rather than resetting the task to `open`.
 Retry does not change PR identity, approvals, dependencies, author/reviewer provenance, or
 rework count. An
 unparked or terminal task is a clean negative (exit 1). One additional clean negative
@@ -1184,7 +1187,8 @@ The following must remain intact throughout the wait and across restarts:
 On daemon startup, before generic crash recovery:
 
 1. **#228 approval recovery** runs first: scans `approvals` table, validates each role's
-   verdict against the current PR head SHA via `next_missing_review_role(conn, pr, sha)`.
+   verdict against the current PR head SHA via `next_missing_review_role(conn, pr, sha)`, and
+   requires an exact task/PR/head row in `r2_sampling_decisions` before merge admission.
    If all roles approved for the current SHA → merge. If any role is missing or stale →
    defer to generic recovery (the approval is preserved or dropped per disposition).
    Before any network call the complete PR-wide row set must name one exact task and immutable
@@ -1193,7 +1197,10 @@ On daemon startup, before generic crash recovery:
    latter are handled by the bounded live retry reconciler or uncertain-attempt park. A policy
    failure from an unmarked startup replay is durably parked before recovery can run again;
    repeated starts therefore cannot create a merge loop. A worker-fixable replay result consumes
-   its admitted boundary, invalidates approvals, and enters actionable rework.
+   its admitted boundary, invalidates approvals, and enters actionable rework with the durable
+   remediation-retry marker that generic recovery preserves. Missing or differently-task-bound
+   sampling evidence cannot be replaced by R1+R2 rows: startup atomically removes R1 plus the
+   stale sampling row and returns a `merging` task to `in-review` for a fresh R1.
 2. **Generic recovery** handles `merging` tasks: stays in `merging` only when
    `dual_approved()` confirms all required roles are approved for the same head SHA.
    Incomplete approval (e.g. R1 approved, R2 missing) resets the task to `in-review` via
@@ -1206,7 +1213,10 @@ On daemon startup, before generic crash recovery:
    Reviewer verdict persistence uses the task's durable author when no worker is live. When a
    repaired R1 returns and an exact task/author/head-bound R2 row was retained, that R2 is reused
    rather than provisioned again. Every persisted role remains bound to the launch-validated
-   head even if the PR moves between that validation and the persistence write.
+   head even if the PR moves between that validation and the persistence write. Adoption of a
+   stranded mailbox verdict likewise requires one unambiguous daemon-written `agent_runs`
+   launch for the exact reviewer/task/PR and binds only to its immutable launch head; the current
+   PR head is comparison input, never the SHA assigned to the approval.
 4. **Explicit merge replay** atomically claims at most one `requested` marker per tick. A
    valid replay needs no live reviewer, mailbox row, or roster entry. Graceful shutdown lets
    an admitted call settle; startup parks an uncertain `attempting` marker without a second

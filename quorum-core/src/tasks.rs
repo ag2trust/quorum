@@ -1613,7 +1613,8 @@ pub fn rework_approved_merge(
             "UPDATE tasks
              SET refs=json_set(
                  json_remove(refs, '$.daemon_merge_retry'),
-                 '$.remediation_feedback', ?3
+                 '$.remediation_feedback', ?3,
+                 '$.daemon_rework_retry_requested', json('true')
              )
              WHERE id=?1 AND status IN ('rework','failed') AND json_valid(refs)
                AND json_extract(refs, '$.pr')=?2
@@ -1631,6 +1632,62 @@ pub fn rework_approved_merge(
         )?;
         Ok(())
     })
+}
+
+/// Atomically invalidate startup merge authority when the independent
+/// sampled-R2 decision is missing or belongs to another task. R1 is the role
+/// that creates that decision, so an exact-head R2 approval remains reusable.
+/// A task already at `merging` returns directly to review; older recovered
+/// lifecycle shapes retain their status for generic recovery.
+pub fn invalidate_recovered_sampling_authority(
+    conn: &mut Connection,
+    id: i64,
+    pr_number: i64,
+    head_sha: &str,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let status: Option<String> = tx
+        .query_row(
+            "SELECT status FROM tasks
+             WHERE id=?1 AND json_valid(refs) AND json_extract(refs, '$.pr')=?2",
+            params![id, pr_number],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(status) = status else {
+        tx.commit()?;
+        return Ok(false);
+    };
+    let invalidate = |tx: &Transaction<'_>| -> Result<()> {
+        tx.execute(
+            "DELETE FROM approvals
+             WHERE pr_number=?1 AND review_role='r1' AND task_id=?2",
+            params![pr_number, id],
+        )?;
+        tx.execute(
+            "DELETE FROM r2_sampling_decisions
+             WHERE pr_number=?1 AND head_sha=?2",
+            params![pr_number, head_sha],
+        )?;
+        Ok(())
+    };
+    if status == "merging" {
+        apply_event_tx(
+            tx,
+            "daemon",
+            id,
+            &Event::MergeFailed {
+                reason: "startup merge authority has no exact sampled-R2 decision".into(),
+            },
+            now,
+            invalidate,
+        )?;
+    } else {
+        invalidate(&tx)?;
+        tx.commit()?;
+    }
+    Ok(true)
 }
 
 /// Remove non-authoritative optional-role evidence without consuming the
@@ -10119,6 +10176,7 @@ mod tests {
         let refs: serde_json::Value =
             serde_json::from_str(transition.task.refs.as_deref().unwrap()).unwrap();
         assert!(refs.get(MERGE_RETRY_REF).is_none());
+        assert_eq!(refs[PARKED_REWORK_RETRY_REF], true);
         assert_eq!(refs["remediation_feedback"], feedback);
         let (rework_events, review_events): (i64, i64) = conn
             .query_row(

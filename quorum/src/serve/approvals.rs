@@ -174,6 +174,41 @@ pub(crate) async fn recover(
             continue;
         }
 
+        // The sampled-R2 decision is independent daemon authority. Missing or
+        // differently-task-bound state cannot be substituted by having both
+        // role rows. Invalidate R1 so normal review recreates the decision;
+        // retain an exact R2 row in case the new decision still requires it.
+        let sampling_authoritative = {
+            let p = db_path.to_path_buf();
+            let task_id = appr.task_id;
+            let sha = current_head.clone();
+            run_blocking(move || {
+                let mut conn = quorum_core::db::open(&p)?;
+                match quorum_core::review_audits::r2_requirement(&conn, task_id, pr, &sha) {
+                    Ok(Some(_)) => Ok(true),
+                    Ok(None) | Err(_) => {
+                        tasks::invalidate_recovered_sampling_authority(
+                            &mut conn,
+                            task_id,
+                            pr,
+                            &sha,
+                            super::now_unix(),
+                        )?;
+                        Ok(false)
+                    }
+                }
+            })
+            .await?
+        };
+        if !sampling_authoritative {
+            log(&format!(
+                "approval-recovery: PR #{pr} (task #{}) has no exact sampled-R2 decision — invalidated R1 and deferred to fresh review",
+                appr.task_id
+            ));
+            outcome.deferred += 1;
+            continue;
+        }
+
         // #191: use the shared next_needed_role predicate (#190) instead of
         // hard-coded dual_approved(). Any role not approved for the current SHA
         // defers to normal review (generic recovery resets to in-review and the
@@ -257,9 +292,12 @@ async fn adopt_stranded_verdicts(
         // Resolve the authoring worker + task from the journal row that carries
         // this PR (the #178 awaiting-review position). Without it we can't close
         // the task on merge, so leave the row for the normal path.
+        let Some(row_task_id) = row.task_id else {
+            continue;
+        };
         let Some(worker) = journal_rows
             .iter()
-            .find(|e| e.role == "worker" && e.pr == Some(pr))
+            .find(|e| e.role == "worker" && e.task_id == Some(row_task_id) && e.pr == Some(pr))
         else {
             continue;
         };
@@ -277,38 +315,45 @@ async fn adopt_stranded_verdicts(
             ));
             continue;
         }
-        // The reviewer approved the PR's head as it stands now (it was idle
-        // awaiting review); bind to the current head.
-        let repo = repo_dir.to_path_buf();
-        let exec = Arc::clone(merge_executor);
-        let head = tokio::task::spawn_blocking(move || exec.head_sha(pr, &repo))
-            .await
-            .map_err(|e| QuorumError::Io(format!("head_sha spawn_blocking join: {e}")))?;
-        let Some(head) = head else {
-            continue; // head unknown — leave the row for a later startup
-        };
-
-        // Determine role: if an R1 approval already exists for this PR,
-        // adopt as R2; otherwise as R1.
-        let adopt_role = {
-            let p2 = db_path.to_path_buf();
-            let pr2 = pr;
+        // A mailbox verdict carries no SHA authority. Recover it only from the
+        // one immutable daemon-written launch row for this exact
+        // reviewer/task/PR; an absent or ambiguous launch is not adoptable.
+        let launch = {
+            let p = db_path.to_path_buf();
+            let reviewer = row.agent.clone();
             run_blocking(move || {
-                let conn = quorum_core::db::open(&p2)?;
-                let existing = approvals::get(&conn, pr2, "r1")?;
-                Ok(if existing.is_some() { "r2" } else { "r1" })
+                let conn = quorum_core::db::open(&p)?;
+                quorum_core::agent_runs::review_launch_for_reviewer(&conn, task_id, &reviewer, pr)
             })
             .await?
         };
+        let Some(launch) = launch else {
+            continue;
+        };
+
+        // Live identity is checked outside the database transaction. A moved
+        // head leaves the verdict unconsumed for a fresh review; it must never
+        // be stamped onto the new head.
+        let repo = repo_dir.to_path_buf();
+        let exec = Arc::clone(merge_executor);
+        let current_head = tokio::task::spawn_blocking(move || exec.head_sha(pr, &repo))
+            .await
+            .map_err(|e| QuorumError::Io(format!("head_sha spawn_blocking join: {e}")))?;
+        let Some(current_head) = current_head else {
+            continue; // head unknown — leave the row for a later startup
+        };
+        if current_head != launch.head_sha {
+            continue;
+        }
         let record = approvals::Approval {
             pr_number: pr,
-            review_role: adopt_role.to_string(),
+            review_role: launch.review_role,
             task_id,
             author,
             reviewer: row.agent.clone(),
             verdict: "approved".to_string(),
             blocking_count: 0,
-            approved_head_sha: head,
+            approved_head_sha: launch.head_sha,
         };
         let p = db_path.to_path_buf();
         run_blocking(move || {
@@ -638,6 +683,7 @@ where
 mod tests {
     use super::*;
     use quorum_core::db;
+    use rusqlite::OptionalExtension;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -784,6 +830,8 @@ mod tests {
             },
         )
         .unwrap();
+        quorum_core::review_audits::record_r2_requirement(&mut conn, tid, 208, "2c0c833", true)
+            .unwrap();
         drop(conn);
 
         let concrete = Arc::new(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
@@ -803,6 +851,114 @@ mod tests {
         assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
         assert!(approvals::get_for_pr(&conn, 208).unwrap().is_empty());
         assert!(journal::list_in_flight(&conn).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_sampled_r2_decision_returns_merging_task_to_fresh_r1() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let tid = seed_task(&mut conn, "missing sampling", "Worker-T");
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', refs=json_set(COALESCE(refs, '{}'), '$.pr', 208)
+             WHERE id=?1",
+            [tid],
+        )
+        .unwrap();
+        for (role, reviewer) in [("r1", "Reviewer-1"), ("r2", "Reviewer-2")] {
+            approvals::record(
+                &mut conn,
+                &approvals::Approval {
+                    pr_number: 208,
+                    review_role: role.into(),
+                    task_id: tid,
+                    author: "Worker-T".into(),
+                    reviewer: reviewer.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "same-head".into(),
+                },
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let concrete = Arc::new(MockExec::new(HashMap::from([(
+            208,
+            "same-head".to_string(),
+        )])));
+        let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.deferred, 1);
+        assert!(concrete.merged.lock().unwrap().is_empty());
+        let conn = db::open(&db_path).unwrap();
+        assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "in-review");
+        assert!(approvals::get(&conn, 208, "r1").unwrap().is_none());
+        assert!(approvals::get(&conn, 208, "r2").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn mismatched_sampled_r2_decision_is_deleted_and_cannot_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let tid = seed_task(&mut conn, "mismatched sampling", "Worker-T");
+        let other = seed_task(&mut conn, "sampling owner", "Worker-X");
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', refs=json_set(COALESCE(refs, '{}'), '$.pr', 208)
+             WHERE id=?1",
+            [tid],
+        )
+        .unwrap();
+        for (role, reviewer) in [("r1", "Reviewer-1"), ("r2", "Reviewer-2")] {
+            approvals::record(
+                &mut conn,
+                &approvals::Approval {
+                    pr_number: 208,
+                    review_role: role.into(),
+                    task_id: tid,
+                    author: "Worker-T".into(),
+                    reviewer: reviewer.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "same-head".into(),
+                },
+            )
+            .unwrap();
+        }
+        quorum_core::review_audits::record_r2_requirement(&mut conn, other, 208, "same-head", true)
+            .unwrap();
+        drop(conn);
+
+        let concrete = Arc::new(MockExec::new(HashMap::from([(
+            208,
+            "same-head".to_string(),
+        )])));
+        let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.deferred, 1);
+        assert!(concrete.merged.lock().unwrap().is_empty());
+        let conn = db::open(&db_path).unwrap();
+        assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "in-review");
+        assert!(approvals::get(&conn, 208, "r1").unwrap().is_none());
+        assert!(approvals::get(&conn, 208, "r2").unwrap().is_some());
+        assert!(conn
+            .query_row(
+                "SELECT 1 FROM r2_sampling_decisions WHERE pr_number=208 AND head_sha='same-head'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -948,6 +1104,8 @@ mod tests {
             )
             .unwrap();
         }
+        quorum_core::review_audits::record_r2_requirement(&mut conn, tid, 208, "same-head", true)
+            .unwrap();
         drop(conn);
 
         let concrete = Arc::new(
@@ -1022,6 +1180,8 @@ mod tests {
             )
             .unwrap();
         }
+        quorum_core::review_audits::record_r2_requirement(&mut conn, tid, 208, "same-head", true)
+            .unwrap();
         drop(conn);
 
         let concrete = Arc::new(
@@ -1041,6 +1201,7 @@ mod tests {
         assert_eq!(task.rework_round, 1);
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert!(refs.get(tasks::MERGE_RETRY_REF).is_none());
+        assert_eq!(refs[tasks::PARKED_REWORK_RETRY_REF], true);
         assert!(refs["remediation_feedback"]
             .as_str()
             .unwrap()
@@ -1133,6 +1294,7 @@ mod tests {
         let mut conn = db::open(&db_path).unwrap();
         let tid = seed_task(&mut conn, "impl", "Bellows-d11");
         seed_journal(&mut conn, "Bellows-d11", tid, 208);
+        const HEAD: &str = "2c0c833000000000000000000000000000000000";
         // Pre-seed R2 approval (e.g. from a prior R2 run before restart).
         approvals::record(
             &mut conn,
@@ -1144,17 +1306,34 @@ mod tests {
                 reviewer: "Anvil-d22".into(),
                 verdict: "approved".into(),
                 blocking_count: 0,
-                approved_head_sha: "2c0c833".into(),
+                approved_head_sha: HEAD.into(),
             },
         )
         .unwrap();
+        quorum_core::review_audits::record_r2_requirement(&mut conn, tid, 208, HEAD, true).unwrap();
+        quorum_core::agent_runs::insert_reviewer_with_launch(
+            &conn,
+            tid,
+            "Grommet-d14",
+            "model",
+            "high",
+            "codex",
+            None,
+            1001,
+            None,
+            "review-cap-r1",
+            208,
+            HEAD,
+        )
+        .unwrap()
+        .expect("immutable R1 launch");
         // The prior R1 reviewer's attested approval, still unconsumed in the mailbox.
         let mid = mailbox::append(
             &mut conn,
             &mailbox::MailboxRow {
                 agent: "Grommet-d14".into(),
                 kind: mailbox::MailboxKind::Done,
-                task_id: None,
+                task_id: Some(tid),
                 pr: Some(208),
                 verdict: Some("approved".into()),
                 feedback: None,
@@ -1166,7 +1345,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
+        let exec = exec_arc(MockExec::new(HashMap::from([(208, HEAD.to_string())])));
         let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
             .await
             .unwrap();
@@ -1180,6 +1359,65 @@ mod tests {
             .unwrap()
             .iter()
             .all(|(id, _)| *id != mid));
+    }
+
+    #[tokio::test]
+    async fn stranded_verdict_cannot_adopt_a_force_pushed_head() {
+        const REVIEWED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const CURRENT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let tid = seed_task(&mut conn, "force pushed", "Bellows-d11");
+        seed_journal(&mut conn, "Bellows-d11", tid, 208);
+        quorum_core::agent_runs::insert_reviewer_with_launch(
+            &conn,
+            tid,
+            "Grommet-d14",
+            "model",
+            "high",
+            "codex",
+            None,
+            1001,
+            None,
+            "review-cap-old-head",
+            208,
+            REVIEWED,
+        )
+        .unwrap()
+        .expect("immutable review launch");
+        let mailbox_id = mailbox::append(
+            &mut conn,
+            &mailbox::MailboxRow {
+                agent: "Grommet-d14".into(),
+                kind: mailbox::MailboxKind::Done,
+                task_id: Some(tid),
+                pr: Some(208),
+                verdict: Some("approved".into()),
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: Some("{\"blocking\":0}".into()),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let concrete = Arc::new(MockExec::new(HashMap::from([(208, CURRENT.to_string())])));
+        let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.adopted, 0);
+        assert_eq!(outcome.merged, 0);
+        assert!(concrete.merged.lock().unwrap().is_empty());
+        let conn = db::open(&db_path).unwrap();
+        assert!(approvals::get_for_pr(&conn, 208).unwrap().is_empty());
+        assert!(mailbox::poll_unconsumed(&conn)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == mailbox_id));
     }
 
     /// Crash-recovery safety: a forged/unattested mailbox verdict (no
@@ -1255,6 +1493,8 @@ mod tests {
             },
         )
         .unwrap();
+        quorum_core::review_audits::record_r2_requirement(&mut conn, tid, 208, "abc", true)
+            .unwrap();
         drop(conn);
 
         let mut m = MockExec::new(HashMap::from([(208, "abc".to_string())]));
@@ -1307,7 +1547,8 @@ mod tests {
         assert_eq!(outcome.deferred, 1, "incomplete review deferred");
         let conn = db::open(&db_path).unwrap();
         assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
-        // R1 approval preserved for tick-loop R2 provisioning.
+        // This legacy fixture has no task-level PR association, so recovery
+        // cannot selectively mutate its role row; it still refuses merge.
         assert!(approvals::get(&conn, 208, "r1").unwrap().is_some());
     }
 

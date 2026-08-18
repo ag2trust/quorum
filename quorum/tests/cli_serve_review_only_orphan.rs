@@ -931,10 +931,12 @@ fn orphan_r2_does_not_reuse_torn_down_worker_or_r1_name() {
                 reviewer: r1.into(),
                 verdict: "approved".into(),
                 blocking_count: 0,
-                approved_head_sha: head_sha,
+                approved_head_sha: head_sha.clone(),
             },
         )
         .unwrap();
+        quorum_core::review_audits::record_r2_requirement(&mut conn, task_id, pr, &head_sha, true)
+            .unwrap();
     }
     let names = write_named_pool(home.path(), &["Worker".into(), "R1".into(), "R2".into()]);
 

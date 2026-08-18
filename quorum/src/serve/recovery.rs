@@ -1107,6 +1107,31 @@ pub(crate) async fn recover(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StartupRetryableMerge {
+        calls: AtomicUsize,
+    }
+
+    impl super::super::merge::MergeExecutor for StartupRetryableMerge {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &super::super::merge::MergeContext,
+        ) -> super::super::merge::MergeResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            super::super::merge::MergeResult {
+                success: false,
+                message: "head branch must be updated".into(),
+                failure_kind: Some(super::super::merge::MergeFailureKind::Retryable),
+            }
+        }
+
+        fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some("approved-head".into())
+        }
+    }
 
     fn run_git(dir: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
@@ -2515,6 +2540,91 @@ exec sleep 30
         .await
         .unwrap();
         assert_recovered_sticky_rework(&fixture, &workers, feedback);
+    }
+
+    #[tokio::test]
+    async fn startup_retryable_approval_replay_survives_following_generic_recovery() {
+        let fixture = dormant_fixture();
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        journal::delete(&mut conn, "Dormant").unwrap();
+        conn.execute(
+            "UPDATE claims SET active=0 WHERE target=?1",
+            [tasks::lease_target(fixture.task_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging',reviewer='Reviewer-2' WHERE id=?1",
+            [fixture.task_id],
+        )
+        .unwrap();
+        for (role, reviewer) in [("r1", "Reviewer-1"), ("r2", "Reviewer-2")] {
+            quorum_core::approvals::record(
+                &mut conn,
+                &quorum_core::approvals::Approval {
+                    pr_number: 901,
+                    review_role: role.into(),
+                    task_id: fixture.task_id,
+                    author: "Dormant".into(),
+                    reviewer: reviewer.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "approved-head".into(),
+                },
+            )
+            .unwrap();
+        }
+        quorum_core::review_audits::record_r2_requirement(
+            &mut conn,
+            fixture.task_id,
+            901,
+            "approved-head",
+            true,
+        )
+        .unwrap();
+        drop(conn);
+
+        let concrete = std::sync::Arc::new(StartupRetryableMerge {
+            calls: AtomicUsize::new(0),
+        });
+        let executor: std::sync::Arc<dyn super::super::merge::MergeExecutor> = concrete.clone();
+        let outcome = super::super::approvals::recover(
+            &fixture.config.db_path,
+            &fixture.config.repo_dir,
+            &executor,
+            &fixture.config.base_branch,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.deferred, 1);
+        assert_eq!(concrete.calls.load(Ordering::SeqCst), 1);
+
+        let mut workers = Vec::new();
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut super::super::names::Pool::new_generated(),
+            &mut workers,
+            &mut LifetimeRoster::new(),
+        )
+        .await
+        .unwrap();
+
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::PARKED_REWORK_RETRY_REF], true);
+        assert!(refs["remediation_feedback"]
+            .as_str()
+            .unwrap()
+            .contains("startup approval replay"));
+        assert!(quorum_core::approvals::get_for_pr(&conn, 901)
+            .unwrap()
+            .is_empty());
+        assert_eq!(concrete.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
