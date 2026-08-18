@@ -650,6 +650,8 @@ only through an explicit outside request)
   still runs `cargo fmt`, but skips clippy and tests only when the union of
   `BASE_REF...HEAD` changed paths and porcelain working-tree paths is non-empty and every
   path is `docs/**`, a root-level `*.md`, `LICENSE*`, `README*`, or `.github/**`.
+  Any `*.rs` path or `Cargo.toml`/`Cargo.lock` basename is a build input and overrides
+  those directory/root patterns, retaining the full suite.
   Continuation and integration bases are deliberately ineligible because they compare
   compound histories. Any unresolved base, Git error, malformed path listing, or path
   outside that allowlist runs the full suite. In particular, this is not a broad

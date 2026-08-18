@@ -312,9 +312,10 @@ except (IndexError, ValueError):
     sys.exit(1)
 
 def inert(path):
-    # Rust is always a build input, including a README.rs or LICENSE.rs whose
-    # root-document prefix would otherwise match the allowlist.
-    if path.endswith(b".rs"):
+    # Build inputs always run the full gates, even under an otherwise inert
+    # directory or behind a root-document prefix.
+    basename = path.rpartition(b"/")[2]
+    if path.endswith(b".rs") or basename in (b"Cargo.toml", b"Cargo.lock"):
         return False
     return (
         path.startswith(b"docs/")

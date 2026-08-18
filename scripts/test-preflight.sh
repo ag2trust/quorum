@@ -180,6 +180,19 @@ printf 'nested Rust source\n' > "$INERT_REPO/docs/generated.rs"
 cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
 
 git -C "$INERT_REPO" clean -fd
+mkdir -p "$INERT_REPO/docs" "$INERT_REPO/.github"
+printf '[package]\nname = "nested-fixture"\nversion = "0.0.0"\n' \
+  > "$INERT_REPO/docs/Cargo.toml"
+printf 'nested lockfile\n' > "$INERT_REPO/.github/Cargo.lock"
+: >"$TMP/inert-cargo.log"
+(
+  cd "$INERT_REPO"
+  PREFLIGHT_CARGO_LOG="$TMP/inert-cargo.log" PATH="$BIN:$PATH" ./preflight.sh
+) >"$TMP/inert-nested-manifest.out"
+! grep -q 'skipping clippy + test' "$TMP/inert-nested-manifest.out"
+cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
+
+git -C "$INERT_REPO" clean -fd
 mkdir -p "$INERT_REPO/.claude/skills/quorum"
 printf 'compiled skill input\n' > "$INERT_REPO/.claude/skills/quorum/SKILL.md"
 : >"$TMP/inert-cargo.log"
