@@ -212,8 +212,9 @@ legacy or unknown and is never inferred from status or `refs.pr`) ·
 `depends_on` TEXT (json array of task IDs) ·
 `target_branch` TEXT NULL (authoritative PR base branch; NULL for legacy tasks.
 `task-create` persists its validated `--base-branch` or the configured base at
-creation; legacy rows resolve once before execution. Immutable once populated;
-storage alone does not yet alter lifecycle targeting).
+creation; legacy rows resolve once before execution. Immutable once populated and
+used for worktree provisioning, publication, review validation, remediation, and merge;
+only genuinely targetless legacy rows fall back to the configured base).
 
 ### `errors` — observable *abnormal* failures
 `id` INTEGER PK · `ts` · `source` TEXT · `detail` TEXT · `expires_at` INTEGER NOT NULL.
@@ -633,7 +634,12 @@ only through an explicit outside request)
 - **Review-only entry:** `task-create --review-pr N` creates a task directly in `in-review`
   with `review_only=true`. A blocking verdict enters normal bounded rework; it never falls
   through to generic implementation-worker provisioning, because remediation must retain
-  the adopted PR target.
+  the adopted PR target. Before reviewer provisioning, the daemon validates the live PR base
+  against the task's immutable target branch, with configured-base fallback only for legacy
+  targetless tasks. The daemon revalidates the live base before every reviewer feed and again
+  before formal approval and merge, including restart recovery and policy retries. Review-only
+  remediation integrates that same task target. Storage failures while resolving task authority
+  remain abnormal daemon errors rather than ordinary target rejections or parked remediation.
 - **Existing-PR implementation entry:** `task-create --continue-pr N` creates an `open`
   implementation intent and atomically rejects an already-owned PR. Before provisioning,
   the daemon resolves an open, same-repository, non-fork PR, rechecks exclusive nonterminal
@@ -1862,7 +1868,8 @@ mismatched intent pins, and exact-SHA-delete no-intent or terminal-task pins wit
 scanning the full task history or Git ref namespace in one pass. A retry from `pr_created`
 repeats the same authoritative
 branch/SHA/base validation before any push. Initial PR reconciliation
-also requires the PR base to equal the configured base branch. Rejected or ambiguous
+also requires the PR base to equal the task's immutable target branch, falling back to the
+configured base only for a legacy targetless task. Rejected or ambiguous
 publication parks the task; persisted PR target data is never authority for a publish
 retry. This is protocol ownership plus a best-effort
 worktree `pushurl` lockout, not credential isolation: an agent holding the same GitHub

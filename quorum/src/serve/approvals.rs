@@ -41,6 +41,7 @@ pub(crate) async fn recover(
     db_path: &Path,
     repo_dir: &Path,
     merge_executor: &Arc<dyn merge::MergeExecutor>,
+    configured_base_branch: &str,
     checks_timeout_secs: u64,
     checks_poll_secs: u64,
 ) -> Result<RecoveryOutcome> {
@@ -155,6 +156,7 @@ pub(crate) async fn recover(
             repo_dir,
             merge_executor,
             appr,
+            configured_base_branch,
             checks_timeout_secs,
             checks_poll_secs,
         )
@@ -288,10 +290,13 @@ async fn merge_approved(
     repo_dir: &Path,
     merge_executor: &Arc<dyn merge::MergeExecutor>,
     appr: &approvals::Approval,
+    configured_base_branch: &str,
     checks_timeout_secs: u64,
     checks_poll_secs: u64,
 ) -> Result<bool> {
     let pr = appr.pr_number;
+    let effective_base_branch =
+        super::effective_task_base_branch(db_path, appr.task_id, configured_base_branch).await?;
 
     // Pre-merge conflict check — a superseded base means rework, not merge.
     let repo = repo_dir.to_path_buf();
@@ -350,6 +355,7 @@ async fn merge_approved(
     let ctx = merge::MergeContext {
         reviewer_name: appr.reviewer.clone(),
         review_task_id: appr.task_id,
+        expected_base_branch: effective_base_branch,
     };
     let result = tokio::task::spawn_blocking(move || exec.merge(pr, &repo, &ctx))
         .await
@@ -427,7 +433,7 @@ mod tests {
     /// configurable head SHA per PR.
     struct MockExec {
         heads: HashMap<i64, String>,
-        merged: Mutex<Vec<i64>>,
+        merged: Mutex<Vec<(i64, String)>>,
         conflicting: bool,
         merge_succeeds: bool,
     }
@@ -444,8 +450,11 @@ mod tests {
     }
 
     impl merge::MergeExecutor for MockExec {
-        fn merge(&self, pr: i64, _repo: &Path, _ctx: &merge::MergeContext) -> merge::MergeResult {
-            self.merged.lock().unwrap().push(pr);
+        fn merge(&self, pr: i64, _repo: &Path, ctx: &merge::MergeContext) -> merge::MergeResult {
+            self.merged
+                .lock()
+                .unwrap()
+                .push((pr, ctx.expected_base_branch.clone()));
             merge::MergeResult {
                 success: self.merge_succeeds,
                 message: String::new(),
@@ -514,6 +523,7 @@ mod tests {
         let db_path = dir.path().join("q.db");
         let mut conn = db::open(&db_path).unwrap();
         let tid = seed_task(&mut conn, "impl", "Bellows-d11");
+        assert!(tasks::resolve_target_branch(&mut conn, tid, "develop", 1002).unwrap());
         seed_journal(&mut conn, "Bellows-d11", tid, 208);
         approvals::record(
             &mut conn,
@@ -545,12 +555,18 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
+        let concrete = Arc::new(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
+        let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
             .await
             .unwrap();
 
         assert_eq!(outcome.merged, 1, "matching approval must merge");
+        assert_eq!(
+            concrete.merged.lock().unwrap().as_slice(),
+            &[(208, "develop".to_string())],
+            "restart recovery must pass the immutable task target to merge"
+        );
         // Task closed, approval consumed, journal cleaned.
         let conn = db::open(&db_path).unwrap();
         assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
@@ -584,7 +600,7 @@ mod tests {
 
         // Current head differs from approved head → stale.
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "NEW_sha".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
             .await
             .unwrap();
 
@@ -621,7 +637,7 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "abc".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
             .await
             .unwrap();
 
@@ -677,7 +693,7 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
             .await
             .unwrap();
 
@@ -719,7 +735,7 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
             .await
             .unwrap();
 
@@ -770,7 +786,7 @@ mod tests {
         let mut m = MockExec::new(HashMap::from([(208, "abc".to_string())]));
         m.conflicting = true;
         let exec = exec_arc(m);
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
             .await
             .unwrap();
 
@@ -808,7 +824,7 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
             .await
             .unwrap();
 
@@ -862,7 +878,7 @@ mod tests {
 
         // Current head matches R2 but not R1 → R1 is stale → demoted.
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "sha_new".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
             .await
             .unwrap();
 
