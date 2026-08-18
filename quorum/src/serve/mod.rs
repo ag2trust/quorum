@@ -4344,7 +4344,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
                         COALESCE(length(CAST(t.body AS BLOB)),0)
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
              WHERE d.state NOT IN ('held','active','blocked','completed','cancelled')
-             ORDER BY d.id LIMIT 1",
+             ORDER BY d.freeze_active DESC,d.id LIMIT 1",
             [planner::MAX_PROMPT_BYTES as i64],
             |row| {
                 Ok((
@@ -5575,6 +5575,14 @@ async fn tick_decomposition(
     let Some(snapshot) = snapshot else {
         return Ok(false);
     };
+    if (coordinator.planner_slot.is_some() || coordinator.classifier_slot.is_some())
+        && coordinator.graph_id != Some(snapshot.graph_id)
+    {
+        return Err(QuorumError::Io(format!(
+            "live decomposition process graph {:?} does not match durable coordinator graph {}",
+            coordinator.graph_id, snapshot.graph_id
+        )));
+    }
     coordinator.graph_id = Some(snapshot.graph_id);
     coordinator.classifier_source_task_id = Some(snapshot.source_task_id);
     if coordinator.proposal.is_none() {
@@ -30195,6 +30203,156 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(snapshot.state, "planning");
         assert!(snapshot.freeze_active);
         assert_eq!(snapshot.rejection_summaries, vec!["bounded cycle summary"]);
+    }
+
+    #[tokio::test]
+    async fn retried_older_graph_does_not_shadow_current_freeze_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retry-freeze-priority.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let older_source = tasks::create(
+            &mut conn,
+            "owner",
+            "older exhausted source",
+            Some("retry this source"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let older_graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: older_source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "older-base",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::set_frozen_phase(
+            &mut conn,
+            older_graph,
+            "freeze-requested",
+            "planning",
+            None,
+            3,
+        )
+        .unwrap();
+        for attempt in 0..3 {
+            assert!(quorum_core::decomposition::record_attempt(
+                &mut conn,
+                older_graph,
+                "provider",
+                "planner-provider",
+                "bounded provider failure",
+                4 + attempt * 3,
+            )
+            .unwrap()
+            .is_some());
+            if attempt < 2 {
+                assert!(quorum_core::decomposition::reacquire_freeze(
+                    &mut conn,
+                    older_graph,
+                    5 + attempt * 3,
+                )
+                .unwrap());
+                assert!(quorum_core::decomposition::set_frozen_phase(
+                    &mut conn,
+                    older_graph,
+                    "freeze-requested",
+                    "planning",
+                    None,
+                    6 + attempt * 3,
+                )
+                .unwrap());
+            }
+        }
+
+        let newer_source = tasks::create(
+            &mut conn,
+            "owner",
+            "newer planning source",
+            Some("keep this source moving"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            20,
+        )
+        .unwrap();
+        let newer_graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: newer_source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "newer-base",
+                now: 21,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            quorum_core::decomposition::retry_exhausted_planning(
+                &mut conn,
+                older_source,
+                "operator",
+                22,
+            )
+            .unwrap(),
+            quorum_core::decomposition::PlanningRetryOutcome::Retried {
+                graph_id,
+                generation: 1,
+            } if graph_id == older_graph
+        ));
+        assert_eq!(
+            load_planning_snapshot(&conn).unwrap().unwrap().graph_id,
+            newer_graph
+        );
+        drop(conn);
+
+        let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(tick_decomposition(
+            &config,
+            &mut coordinator,
+            &[],
+            &[],
+            DecompositionLiveWork::default(),
+        )
+        .await
+        .unwrap());
+        assert_eq!(coordinator.graph_id, Some(newer_graph));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let states: Vec<(i64, String, bool)> = conn
+            .prepare(
+                "SELECT id,state,freeze_active FROM task_decompositions
+                 WHERE id IN (?1,?2) ORDER BY id",
+            )
+            .unwrap()
+            .query_map([older_graph, newer_graph], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                (older_graph, "provider-backoff".into(), false),
+                (newer_graph, "draining".into(), true),
+            ]
+        );
     }
 
     #[test]

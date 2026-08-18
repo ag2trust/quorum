@@ -2074,6 +2074,13 @@ graph in provider backoff so the coordinator must reacquire `one_planning_freeze
 ordinary guarded path. Semantic blockers, inconsistent holds, stale authority, materialization,
 delivery evidence, and racing callers are clean negatives.
 
+Coordinator snapshot selection always prioritizes the unique `freeze_active=1` aggregate before
+older provider-backoff aggregates. An explicitly retried graph therefore cannot shadow, stall, or
+consume output from a later graph that already owns the planning freeze; backoff graphs resume in
+ID order only when no freeze owner remains. A live planner or classifier slot also pins its
+in-memory graph identity: any mismatch with the durable selected graph is a loud internal failure,
+never permission to consume that process result for a different aggregate.
+
 Each graph permits at most two operator planning retries. Attempts remain append-only: their
 ordinals increase monotonically across the unchanged source revision and each row records the
 operator retry generation (historical rows are generation zero). Thus each proposal/provider
