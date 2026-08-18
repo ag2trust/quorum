@@ -68,6 +68,7 @@ max_idle_secs = 900              # 15 min without an event
 max_task_wall_secs = 14400      # 4h
 # max_turn_tokens  = 500000
 # max_task_tokens  = 2000000
+# token_limit_basis = "raw"        # raw (default): input + output; uncached: uncached input + output
 max_turn_cost_usd  = 50.0
 max_task_cost_usd  = 100.0
 

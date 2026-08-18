@@ -3034,6 +3034,7 @@ fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry
 pub struct CostLimits {
     pub max_turn_tokens: Option<i64>,
     pub max_task_tokens: Option<i64>,
+    pub token_limit_basis: crate::serve_config::TokenLimitBasis,
     pub max_turn_cost_usd: Option<f64>,
     pub max_task_cost_usd: Option<f64>,
     /// Max seconds an active worker/reviewer may go without emitting an
@@ -3378,7 +3379,11 @@ pub(crate) struct SlotState {
     pending_watchdog_breach: Option<String>,
     pr: Option<i64>,
     rework_count: u32,
+    /// Legacy raw input + output accounting kept in the journal and live
+    /// inspection surfaces for compatibility.
     cost_tokens: i64,
+    /// Selected token-limit-basis cumulative accounting for watchdog ceilings.
+    limit_tokens: i64,
     token_usage: runner::TokenUsage,
     cost_usd: f64,
     task_started_at: std::time::Instant,
@@ -12949,23 +12954,45 @@ async fn consume_mailbox_row(db_path: &std::path::Path, id: i64) -> bool {
 
 /// Reason an agent was killed by a watchdog.
 enum LimitBreached {
-    TurnTokens { turn: i64, max: i64 },
-    TaskTokens { total: i64, max: i64 },
-    TurnCostUsd { turn: f64, max: f64 },
-    TurnCostUsdMissing { max: f64 },
-    TaskCostUsd { total: f64, max: f64 },
-    IdleSecs { elapsed: u64, max: u64 },
-    TaskWallSecs { elapsed: u64, max: u64 },
+    TurnTokens {
+        basis: crate::serve_config::TokenLimitBasis,
+        turn: i64,
+        max: i64,
+    },
+    TaskTokens {
+        basis: crate::serve_config::TokenLimitBasis,
+        total: i64,
+        max: i64,
+    },
+    TurnCostUsd {
+        turn: f64,
+        max: f64,
+    },
+    TurnCostUsdMissing {
+        max: f64,
+    },
+    TaskCostUsd {
+        total: f64,
+        max: f64,
+    },
+    IdleSecs {
+        elapsed: u64,
+        max: u64,
+    },
+    TaskWallSecs {
+        elapsed: u64,
+        max: u64,
+    },
 }
 
 impl std::fmt::Display for LimitBreached {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TurnTokens { turn, max } => {
-                write!(f, "turn tokens {turn} exceeded limit {max}")
+            Self::TurnTokens { basis, turn, max } => {
+                write!(f, "turn tokens ({basis}) {turn} exceeded limit {max}")
             }
-            Self::TaskTokens { total, max } => {
-                write!(f, "task tokens {total} exceeded limit {max}")
+            Self::TaskTokens { basis, total, max } => {
+                write!(f, "task tokens ({basis}) {total} exceeded limit {max}")
             }
             Self::TurnCostUsd { turn, max } => {
                 write!(f, "turn cost ${turn:.4} exceeded limit ${max:.4}")
@@ -12998,6 +13025,7 @@ fn check_post_result_limits(
     if let Some(max) = limits.max_turn_tokens {
         if turn_tokens > max {
             return Some(LimitBreached::TurnTokens {
+                basis: limits.token_limit_basis,
                 turn: turn_tokens,
                 max,
             });
@@ -13006,6 +13034,7 @@ fn check_post_result_limits(
     if let Some(max) = limits.max_task_tokens {
         if cumulative_tokens > max {
             return Some(LimitBreached::TaskTokens {
+                basis: limits.token_limit_basis,
                 total: cumulative_tokens,
                 max,
             });
@@ -13048,6 +13077,20 @@ fn check_post_result_limits(
         }
     }
     None
+}
+
+/// Convert normalized provider usage into the selected watchdog accounting
+/// basis. Saturating conversion ensures malformed huge counters fail closed
+/// rather than wrapping into a negative signed ceiling value.
+fn token_limit_total(
+    usage: runner::TokenUsage,
+    basis: crate::serve_config::TokenLimitBasis,
+) -> i64 {
+    let total = match basis {
+        crate::serve_config::TokenLimitBasis::Raw => usage.live_total_tokens(),
+        crate::serve_config::TokenLimitBasis::Uncached => usage.uncached_total_tokens(),
+    };
+    i64::try_from(total).unwrap_or(i64::MAX)
 }
 
 /// Check wall-clock limits only (called each tick for slots still draining).
@@ -14382,11 +14425,16 @@ async fn drain_events(
                     slot.continuation_id = Some(thread_id.clone());
                 }
                 runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
-                    let turn_tokens = usage.map_or(0, |u| u.live_total_tokens() as i64);
+                    let turn_tokens =
+                        usage.map_or(0, |u| token_limit_total(u, limits.token_limit_basis));
+                    let raw_turn_tokens = usage.map_or(0, |u| {
+                        token_limit_total(u, crate::serve_config::TokenLimitBasis::Raw)
+                    });
                     if let Some(usage) = usage {
                         slot.token_usage.saturating_add_assign(*usage);
                     }
-                    slot.cost_tokens += turn_tokens;
+                    slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
+                    slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
                     // cost_usd is session-cumulative (running total), not per-turn.
                     let prev_cost = slot.cost_usd;
                     if let Some(cost) = cost_usd {
@@ -14395,7 +14443,7 @@ async fn drain_events(
                     let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
                     log(&format!(
                         "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4})",
-                        slot.agent_name, turn_tokens, slot.cost_tokens, slot.cost_usd,
+                        slot.agent_name, turn_tokens, slot.limit_tokens, slot.cost_usd,
                     ));
 
                     let phase = if role == "worker" {
@@ -14437,7 +14485,7 @@ async fn drain_events(
                     let breach = check_post_result_limits(
                         limits,
                         turn_tokens,
-                        slot.cost_tokens,
+                        slot.limit_tokens,
                         turn_cost_usd,
                         slot.cost_usd,
                         slot,
@@ -14450,11 +14498,16 @@ async fn drain_events(
                     usage,
                     cost_usd,
                 } => {
-                    let turn_tokens = usage.map_or(0, |u| u.live_total_tokens() as i64);
+                    let turn_tokens =
+                        usage.map_or(0, |u| token_limit_total(u, limits.token_limit_basis));
+                    let raw_turn_tokens = usage.map_or(0, |u| {
+                        token_limit_total(u, crate::serve_config::TokenLimitBasis::Raw)
+                    });
                     if let Some(usage) = usage {
                         slot.token_usage.saturating_add_assign(*usage);
                     }
-                    slot.cost_tokens += turn_tokens;
+                    slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
+                    slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
                     let prev_cost = slot.cost_usd;
                     if let Some(cost) = cost_usd {
                         slot.cost_usd = *cost;
@@ -14462,7 +14515,7 @@ async fn drain_events(
                     let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
                     log(&format!(
                         "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4}, ERROR)",
-                        slot.agent_name, turn_tokens, slot.cost_tokens, slot.cost_usd,
+                        slot.agent_name, turn_tokens, slot.limit_tokens, slot.cost_usd,
                     ));
 
                     if let Some(ref mut sl) = slot.session_log {
@@ -14499,7 +14552,7 @@ async fn drain_events(
                     let breach = check_post_result_limits(
                         limits,
                         turn_tokens,
-                        slot.cost_tokens,
+                        slot.limit_tokens,
                         turn_cost_usd,
                         slot.cost_usd,
                         slot,
@@ -15666,6 +15719,7 @@ async fn provision_reviewer_reserved(
                 pr: Some(pr),
                 rework_count: 0,
                 cost_tokens: 0,
+                limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -16443,6 +16497,7 @@ async fn spawn_worker(
                     daemon_rework_retry_requested(task.refs.as_deref()),
                 ),
                 cost_tokens: 0,
+                limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -18617,6 +18672,7 @@ async fn spawn_remediation_worker(
                 pr: Some(pr),
                 rework_count: 1,
                 cost_tokens: 0,
+                limit_tokens: 0,
                 token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -20093,6 +20149,7 @@ mod tests {
             pr: None,
             rework_count: 0,
             cost_tokens: 500,
+            limit_tokens: 500,
             token_usage: runner::TokenUsage::default(),
             cost_usd: 0.01,
             task_started_at: now,
@@ -21163,6 +21220,7 @@ mod tests {
                 pr: Some(443),
                 rework_count: 0,
                 cost_tokens: 17,
+                limit_tokens: 17,
                 token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -22324,6 +22382,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             pr: Some(553),
             rework_count: 0,
             cost_tokens: 0,
+            limit_tokens: 0,
             token_usage: runner::TokenUsage::default(),
             cost_usd: 0.0,
             task_started_at: now,
@@ -22704,9 +22763,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[test]
-    fn codex_cached_input_fixture_preserves_live_turn_and_task_caps() {
+    fn codex_cached_input_fixture_selects_raw_or_uncached_token_ceilings() {
         let event = runner::normalize_codex_line(
-            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":900,"cache_write_input_tokens":40,"output_tokens":25,"reasoning_output_tokens":10}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":6590000,"cached_input_tokens":6308339,"cache_write_input_tokens":40,"output_tokens":100,"reasoning_output_tokens":10}}"#,
         )
         .into_iter()
         .next()
@@ -22717,47 +22776,127 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         else {
             panic!("fixture did not normalize to terminal usage");
         };
-        assert_eq!(usage.uncached_input_tokens, 100);
-        assert_eq!(usage.cached_input_tokens, 900);
+        assert_eq!(usage.uncached_input_tokens, 281_661);
+        assert_eq!(usage.cached_input_tokens, 6_308_339);
         assert_eq!(usage.cache_write_input_tokens, 40);
-        assert_eq!(usage.live_total_tokens(), 1_025);
+        assert_eq!(usage.live_total_tokens(), 6_590_100);
+        assert_eq!(usage.uncached_total_tokens(), 281_761);
 
         let slot = make_dummy_slot();
-        let turn_limits = CostLimits {
-            max_turn_tokens: Some(500),
+        let raw_turn_limits = CostLimits {
+            max_turn_tokens: Some(500_000),
             ..Default::default()
         };
         assert!(matches!(
             check_post_result_limits(
-                &turn_limits,
-                usage.live_total_tokens() as i64,
-                usage.live_total_tokens() as i64,
+                &raw_turn_limits,
+                token_limit_total(usage, crate::serve_config::TokenLimitBasis::Raw),
+                token_limit_total(usage, crate::serve_config::TokenLimitBasis::Raw),
                 None,
                 0.0,
                 &slot,
             ),
             Some(LimitBreached::TurnTokens {
-                turn: 1_025,
-                max: 500
+                basis: crate::serve_config::TokenLimitBasis::Raw,
+                turn: 6_590_100,
+                max: 500_000
             })
         ));
 
-        let task_limits = CostLimits {
-            max_task_tokens: Some(1_500),
+        let raw_task_limits = CostLimits {
+            max_task_tokens: Some(500_000),
             ..Default::default()
         };
         assert!(matches!(
             check_post_result_limits(
-                &task_limits,
-                usage.live_total_tokens() as i64,
-                1_600,
+                &raw_task_limits,
+                token_limit_total(usage, crate::serve_config::TokenLimitBasis::Raw),
+                token_limit_total(usage, crate::serve_config::TokenLimitBasis::Raw),
                 None,
                 0.0,
                 &slot,
             ),
             Some(LimitBreached::TaskTokens {
-                total: 1_600,
-                max: 1_500
+                basis: crate::serve_config::TokenLimitBasis::Raw,
+                total: 6_590_100,
+                max: 500_000
+            })
+        ));
+
+        let uncached_limits = CostLimits {
+            max_turn_tokens: Some(500_000),
+            max_task_tokens: Some(500_000),
+            token_limit_basis: crate::serve_config::TokenLimitBasis::Uncached,
+            ..Default::default()
+        };
+        let uncached_tokens =
+            token_limit_total(usage, crate::serve_config::TokenLimitBasis::Uncached);
+        assert!(check_post_result_limits(
+            &uncached_limits,
+            uncached_tokens,
+            uncached_tokens,
+            None,
+            0.0,
+            &slot,
+        )
+        .is_none());
+
+        let lower_uncached_limits = CostLimits {
+            max_turn_tokens: Some(200_000),
+            token_limit_basis: crate::serve_config::TokenLimitBasis::Uncached,
+            ..Default::default()
+        };
+        assert!(matches!(
+            check_post_result_limits(
+                &lower_uncached_limits,
+                uncached_tokens,
+                uncached_tokens,
+                None,
+                0.0,
+                &slot,
+            ),
+            Some(LimitBreached::TurnTokens {
+                basis: crate::serve_config::TokenLimitBasis::Uncached,
+                turn: 281_761,
+                max: 200_000
+            })
+        ));
+    }
+
+    #[test]
+    fn claude_cache_telemetry_does_not_change_raw_token_ceiling() {
+        let event = runner::normalize_claude_line(
+            r#"{"type":"result","result":"done","usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":10,"output_tokens":5}}"#,
+        )
+        .into_iter()
+        .next()
+        .expect("Claude terminal fixture");
+        let runner::AgentEvent::TurnCompleted {
+            usage: Some(usage), ..
+        } = event
+        else {
+            panic!("fixture did not normalize to terminal usage");
+        };
+        assert_eq!(
+            token_limit_total(usage, crate::serve_config::TokenLimitBasis::Raw),
+            105
+        );
+        assert_eq!(
+            token_limit_total(usage, crate::serve_config::TokenLimitBasis::Uncached),
+            25
+        );
+
+        let limits = CostLimits {
+            max_turn_tokens: Some(104),
+            ..Default::default()
+        };
+        let slot = make_dummy_slot();
+        assert!(matches!(
+            check_post_result_limits(&limits, 105, 105, None, 0.0, &slot),
+            Some(LimitBreached::TurnTokens {
+                basis: crate::serve_config::TokenLimitBasis::Raw,
+                turn: 105,
+                max: 104
             })
         ));
     }
@@ -23012,8 +23151,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     #[test]
     fn limit_breached_display_all_variants() {
         let cases: Vec<LimitBreached> = vec![
-            LimitBreached::TurnTokens { turn: 100, max: 50 },
+            LimitBreached::TurnTokens {
+                basis: crate::serve_config::TokenLimitBasis::Raw,
+                turn: 100,
+                max: 50,
+            },
             LimitBreached::TaskTokens {
+                basis: crate::serve_config::TokenLimitBasis::Uncached,
                 total: 1000,
                 max: 500,
             },
@@ -23034,10 +23178,12 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 max: 1800,
             },
         ];
-        for c in cases {
-            let s = c.to_string();
+        let rendered: Vec<String> = cases.into_iter().map(|case| case.to_string()).collect();
+        for s in &rendered {
             assert!(s.contains("exceeded limit"), "bad display: {s}");
         }
+        assert!(rendered[0].contains("(raw)"));
+        assert!(rendered[1].contains("(uncached)"));
         let missing = LimitBreached::TurnCostUsdMissing { max: 0.01 };
         let s = missing.to_string();
         assert!(
@@ -23051,6 +23197,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let limits = CostLimits::default();
         assert!(limits.max_turn_tokens.is_none());
         assert!(limits.max_task_tokens.is_none());
+        assert_eq!(
+            limits.token_limit_basis,
+            crate::serve_config::TokenLimitBasis::Raw
+        );
         assert!(limits.max_turn_cost_usd.is_none());
         assert!(limits.max_task_cost_usd.is_none());
         assert!(limits.max_idle_secs.is_none());
