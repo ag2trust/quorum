@@ -3458,14 +3458,26 @@ impl SlotState {
         }
     }
 
-    async fn finalize_pre_authoritative_exit_evidence(&mut self) {
+    async fn finalize_pre_authoritative_exit_evidence(
+        &mut self,
+        role: &str,
+        limits: &CostLimits,
+    ) -> Option<serde_json::Value> {
         let runner_kind = self.process_kind();
         let output = match &mut self.proc {
             SlotProcess::Running(proc) => proc.finalize_pre_authoritative_evidence().await,
             SlotProcess::Dormant { .. } => Vec::new(),
         };
-        capture_terminal_usage(runner_kind, &output, &mut self.token_usage);
+        let diagnostic = record_captured_terminal_usage(
+            self,
+            role,
+            limits,
+            runner_kind,
+            &output,
+            TerminalUsageAction::ActiveOwnerWatchdogTermination,
+        );
         persist_terminal_output(&mut self.session_log, output);
+        diagnostic
     }
 
     fn live_process_mut(&mut self) -> std::io::Result<&mut runner::RunnerProc> {
@@ -10950,7 +10962,8 @@ async fn tick(
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
-                    dead.finalize_pre_authoritative_exit_evidence().await;
+                    dead.finalize_pre_authoritative_exit_evidence("worker", &config.limits)
+                        .await;
                     if let Some(failure) = dead.classify_pre_authoritative_exit(status) {
                         log(&format!(
                             "worker {} pre-authoritative runner failure classified as {failure}",
@@ -10985,8 +10998,14 @@ async fn tick(
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
         let terminal_action = terminal_usage_action(&disposition);
-        let runner_failure =
-            classify_managed_pre_authoritative_exit(&mut dead, status, &disposition).await;
+        let runner_failure = classify_managed_pre_authoritative_exit(
+            &mut dead,
+            status,
+            &disposition,
+            "worker",
+            &config.limits,
+        )
+        .await;
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -11119,8 +11138,14 @@ async fn tick(
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
         let terminal_action = terminal_usage_action(&disposition);
-        let runner_failure =
-            classify_managed_pre_authoritative_exit(&mut reviewers[i], status, &disposition).await;
+        let runner_failure = classify_managed_pre_authoritative_exit(
+            &mut reviewers[i],
+            status,
+            &disposition,
+            "reviewer",
+            &config.limits,
+        )
+        .await;
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -12811,6 +12836,8 @@ async fn feed_worker_turn(
             // not carry the preceding run's detailed telemetry into the new
             // per-run snapshot.
             slot.token_usage = runner::TokenUsage::default();
+            slot.last_terminal_usage = runner::TokenUsage::default();
+            slot.last_terminal_cost_usd = None;
             slot.live_stats = LiveStats::new();
             slot.turn_ended_at = None;
         }
@@ -16597,11 +16624,14 @@ async fn classify_managed_pre_authoritative_exit(
     slot: &mut SlotState,
     status: std::process::ExitStatus,
     disposition: &tasks::ManagedExitDisposition,
+    role: &str,
+    limits: &CostLimits,
 ) -> Option<runner::RunnerFailure> {
     if !managed_exit_permits_runner_failure(disposition) {
         return None;
     }
-    slot.finalize_pre_authoritative_exit_evidence().await;
+    slot.finalize_pre_authoritative_exit_evidence(role, limits)
+        .await;
     slot.classify_pre_authoritative_exit(status)
 }
 
@@ -20072,7 +20102,14 @@ mod tests {
             BufReader::new(stdout),
         ));
         let mut slot = slot_with_process(proc);
+        slot.cost_tokens = 0;
+        slot.limit_tokens = 0;
+        slot.cost_usd = 0.0;
         let db_dir = tempfile::tempdir().unwrap();
+        let limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
 
         assert!(drain_events(
             &mut slot,
@@ -20092,7 +20129,10 @@ mod tests {
         .await
         .expect("provider must exit without a managed signal");
 
-        slot.finalize_pre_authoritative_exit_evidence().await;
+        let diagnostic = slot
+            .finalize_pre_authoritative_exit_evidence("worker", &limits)
+            .await
+            .expect("late active-owner terminal must emit a diagnostic");
         assert_eq!(
             slot.token_usage,
             runner::TokenUsage {
@@ -20105,6 +20145,23 @@ mod tests {
             },
             "the evidence finalizer must fold usage before teardown drains the remaining pipe"
         );
+        assert_eq!(diagnostic["role"], "worker");
+        assert_eq!(diagnostic["raw_input_tokens"], 100);
+        assert_eq!(diagnostic["uncached_input_tokens"], 20);
+        assert_eq!(diagnostic["cached_input_tokens"], 80);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 10);
+        assert_eq!(diagnostic["output_tokens"], 5);
+        assert_eq!(diagnostic["reasoning_tokens"], 0);
+        assert_eq!(diagnostic["raw_total_tokens"], 105);
+        assert_eq!(diagnostic["uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 105);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_limit_tokens"], 105);
+        assert_eq!(diagnostic["configured_limit_basis"], "raw");
+        assert_eq!(diagnostic["configured_max_task_tokens"], 100);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["breach"], true);
+        assert_eq!(diagnostic["action"], "active_owner_watchdog_termination");
 
         let expected = slot.token_usage;
         let terminal = slot.kill_and_reap().await;
@@ -21261,6 +21318,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             reasoning_tokens: 10,
         };
         slot.token_usage = first_run_usage;
+        slot.last_terminal_usage = first_run_usage;
+        slot.last_terminal_cost_usd = Some(1.25);
         record_managed_usage_snapshot(
             &db_path,
             slot.agent_run_id,
@@ -21288,6 +21347,32 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             runner::TokenUsage::default(),
             "installing a new agent_run must reset only the detailed per-run accumulator"
         );
+        assert_eq!(
+            slot.last_terminal_usage,
+            runner::TokenUsage::default(),
+            "a fresh Codex rework turn must not retain the preceding terminal breakdown"
+        );
+        assert_eq!(slot.last_terminal_cost_usd, None);
+        slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        let watchdog_limits = CostLimits {
+            max_idle_secs: Some(60),
+            ..Default::default()
+        };
+        let breach = check_wall_clock_limits(&watchdog_limits, &slot)
+            .expect("fresh rework turn must be eligible for an idle watchdog breach")
+            .to_string();
+        let diagnostic = terminal_usage_diagnostic(
+            &slot,
+            "worker",
+            &watchdog_limits,
+            Some(&breach),
+            TerminalUsageAction::ActiveOwnerWatchdogTermination,
+        );
+        assert_eq!(diagnostic["raw_input_tokens"], 0);
+        assert_eq!(diagnostic["cached_input_tokens"], 0);
+        assert_eq!(diagnostic["output_tokens"], 0);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["action"], "active_owner_watchdog_termination");
         assert_eq!(
             slot.cost_tokens, 17,
             "legacy task-level live accounting remains cumulative across run rotation"
