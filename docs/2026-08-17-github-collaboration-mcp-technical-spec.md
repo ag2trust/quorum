@@ -427,12 +427,23 @@ Attempt states are `active`, `awaiting_resume`, `completed`, and `revoked`. Oper
 only execution/send state and result fields change. Every outbound GitHub mutation uses the closed
 send states `not_started`, `definitely_unsent`, `ambiguous`, and `confirmed`; local delivery-report
 storage does not enter this remote executor. `request_json` and `response_json` use closed,
-kind-specific schemas and fixed aggregate limits. Terminal rows expire after a seven-day retention
-window. Nonterminal rows have a one-hour execution deadline and therefore cannot remain live
-indefinitely. An attempt becomes terminal with its exact lifecycle turn and expires only after all
-of its rows are terminal and any owned remote pending-review slot has been released; `active` and
-`awaiting_resume` attempts remain tied to the persisted exact pending turn rather than becoming
-reusable identities.
+kind-specific schemas and fixed aggregate limits. A terminal row with a remotely resolved send
+disposition expires after a seven-day retention window. A terminal row that still has
+`send_state=ambiguous` is recovery-authoritative: its `expires_at` is set to the closed
+`RECOVERY_PINNED_EXPIRES_AT` daemon constant, greater than every accepted runtime clock value,
+until exact marker/predicate evidence or a qualifying Repository Service idempotency/fence result
+resolves the remote effect. The value is neither agent input nor operator configuration. On
+resolution, the same row receives an ordinary seven-day expiry measured from that disposition.
+Nonterminal rows have a one-hour execution deadline and therefore cannot remain executable
+indefinitely.
+
+An attempt becomes terminal with its exact lifecycle turn, but its `expires_at` is likewise pinned
+while any recovery-authoritative ambiguous operation refers to it. It receives ordinary terminal
+retention only after all of its rows have a resolved disposition and any owned remote pending-
+review slot has been released. `active` and `awaiting_resume` attempts remain tied to the persisted
+exact pending turn rather than becoming reusable identities. Pinning changes retention, not
+execution: retry-count and wall-clock bounds still terminalize work after one hour, and a pinned
+row grants no agent or lifecycle authority.
 
 State combinations are closed and enforced: `succeeded` requires `confirmed`; a send claim enters
 `running` only with `ambiguous`; a queued row is never `confirmed`; and `confirmed` is never sent
@@ -476,17 +487,20 @@ bounded recovery fails closed rather than risking a duplicate.
 Admission is checked in the enqueue transaction after logically expired terminal rows are swept.
 The fixed initial limits are 64 nonexpired operations created by one run, 128 per collaboration
 attempt, 512 per task, and 4,096 in the repository database. All four counts include terminal
-retention rows so persistent storage, not only active work, is bounded. A request that would
-exceed any limit returns a typed `capacity_exceeded` result and creates no row. Limits are closed
-daemon constants, not agent input or configuration that a managed run can raise.
+retention rows and recovery-pinned ambiguous rows, so persistent storage, not only active work, is
+bounded. A request that would exceed any limit returns a typed `capacity_exceeded` result and
+creates no row. If unresolved ambiguity fills a cap, new publication fails closed and status
+surfaces the pinned count and operation IDs; no sweep, age threshold, or manual prune may discard
+that identity to regain capacity. Limits are closed daemon constants, not agent input or
+configuration that a managed run can raise.
 
 Attempt creation is separately capped at 16 nonexpired attempts per task and 1,024 in the
-repository database, including terminal-retention rows. It returns the same fail-closed capacity
-outcome before provisioning if either cap is reached. Thus the identity table cannot become an
-unbounded side channel around the operation-row limits. Publication-slot admission is separately
-capped at 16 rows per task and 1,024 in the repository. A slot row is deleted after successful
-release, so probing or blocked cleanup cannot create an independent unbounded row class even
-before its first reviewer attempt is created.
+repository database, including terminal-retention and recovery-pinned attempts. It returns the
+same fail-closed capacity outcome before provisioning if either cap is reached. Thus the identity
+table cannot become an unbounded side channel around the operation-row limits. Publication-slot
+admission is separately capped at 16 rows per task and 1,024 in the repository. A slot row is
+deleted after successful release, so probing or blocked cleanup cannot create an independent
+unbounded row class even before its first reviewer attempt is created.
 
 The single daemon claims one queued operation with a guarded `UPDATE ... RETURNING` inside
 `BEGIN IMMEDIATE`. Claim eligibility atomically revalidates that the attempt is active, its
@@ -529,7 +543,10 @@ receives the terminal result. If an exhausted operation is required by a pending
 the daemon uses the existing durable parking path and preserves the exact attempt and marker for
 operator recovery; recovery reconciles that same operation rather than minting a new ID. An
 ambiguous exhausted row remains reconciliation-only after operator recovery unless the exact
-marker/predicate or Repository Service idempotency/fence proof authorizes a disposition.
+marker/predicate or Repository Service idempotency/fence proof authorizes a disposition. Its
+operation and attempt remain recovery-pinned across ordinary retention and daemon downtime. No
+task retry, continuation, operator action, or new capability may replace that operation or attempt
+while ambiguity is the reason for the park; it must adopt or reconcile the exact retained identity.
 
 `github_operation_read` returns `queued`, `running`, `succeeded`, `failed`, or `cancelled`, plus
 the row's closed send disposition, only when the caller is the live `active_run_id` of the
@@ -814,6 +831,10 @@ Required tests include:
   Repository Service accepts the mutation, loses the response, returns an empty marker read, and
   exposes the marker later; no second mutation is sent, and bounded empty reconciliation without a
   qualifying fence fails closed;
+- after advancing beyond ordinary seven-day retention and sweeping, an exhausted ambiguous
+  operation and its attempt remain pinned with the exact request, client request ID, marker, and
+  send disposition; exact continuation/operator recovery returns that same operation and sends no
+  second mutation, while exact remote disposition starts ordinary retention;
 - cleanup deletes only the exact daemon-owned pending review, reconciles crash-after-delete as
   success, and blocks without deletion on a foreign/missing marker, mismatched ID/SHA, or outage;
 - shutdown during probe/delete retains the slot and startup reconciles it before any new reviewer;
@@ -828,8 +849,9 @@ Required tests include:
   visible contribution, and generic marker absence alone never increments the mutation-call count;
 - concurrent duplicate requests produce exactly one outbox row and GitHub write;
 - distinct-ID saturation at the run, attempt, task, and repository caps rejects admission without
-  a row, attempt-table saturation rejects provisioning without a row, and prolonged outage
-  reaches the retry-count/age bound with no further retries or lifecycle budget consumption;
+  a row, attempt-table saturation rejects provisioning without a row, recovery-pinned ambiguity
+  remains counted after sweep and fails closed at those caps, and prolonged outage reaches the
+  retry-count/age bound with no further retries or lifecycle budget consumption;
 - a delayed or backing-off first inline finding prevents every later inline finding and pending-
   review submit from being claimed, and the lifecycle verdict remains rejected;
 - repeated real-process races against one DB preserve SQLite invariants;
@@ -845,10 +867,10 @@ Required tests include:
 Every implementation task is deliberately small or medium and independently reviewable.
 
 1. **M — Agent endpoint, MCP shell, and capability-derived inventory.** Add the narrow daemon
-   endpoint, stable collaboration-attempt issuance, fresh-capability adoption and same-capability
-   turn handoff, route managed `submit`/`react` without semantic changes, add the stdio server and
-   closed schemas, derive role/target in the daemon, and prove the adapter has no direct database or
-   GitHub execution access.
+   endpoint and collaboration-attempt migration, stable attempt issuance and fresh-capability
+   adoption, route managed `submit`/`react` without semantic changes, add the stdio server and
+   closed schemas, derive role/target in the daemon, and prove the adapter has no direct database
+   or GitHub execution access.
 2. **M — Durable operation outbox and daemon executor skeleton.** Add the migration, atomic
    enqueue/claim/revalidation/revocation/result/recovery paths, fixed admission and retry bounds,
    retention, persisted generic send ambiguity, publication-slot reservation, bounded
@@ -862,24 +884,30 @@ Every implementation task is deliberately small or medium and independently revi
 5. **S — Thread replies and reviewer resolution.** Add exact-PR comment lookup, true threaded
    replies, reply ambiguity fencing, outdated context, and reviewer-only resolution.
 6. **M — Claude persistent MCP injection and inventory refresh.** Add explicit strict config for
-   initial/resumed managed roles, same-process `tools/list_changed` handoff, and real-binary
-   two-turn inventory tests.
+   initial/resumed managed roles, wire the guarded same-capability old-attempt settlement/new-
+   attempt bind to the persistent runner, add the same-process `tools/list_changed` handoff, and
+   pass real-binary two-turn authority and inventory tests.
 7. **M — Codex per-run MCP injection.** Add invocation-local config for initial/resumed threads
    and real-binary boundary tests.
-8. **M — Managed prompt and credential-boundary migration.** Replace direct `gh` collaboration
-   instructions only after public-command parity and phase-inventory gates pass, preserve local
-   `git`, scrub inherited GitHub auth/config, and add negative tests.
+8. **M — Contained public CLI compatibility.** Add the closed public-command proxy to the agent
+   endpoint, reuse existing handlers with capability-derived repository scope, preserve bounded
+   stdin/file input and output/exit behavior, and pass the checked-in registry-parity and
+   admin/raw-operation rejection suite.
 9. **M — Delivery reports and initial PR renderer.** Persist bounded reports and render accepted
    task, changes, verification, and notes without changing existing-PR bodies.
-10. **M — Isolated-runtime GitHub boundary.** Update the public Docker contract and smoke tests so
-    agent runtime inputs contain no GitHub credential or database, remote writes require the
-    daemon/broker, and the closed public-command proxy reuses the existing handlers and passes its
-    registry-parity suite through the contained endpoint.
+10. **M — Managed credential-boundary and isolated-runtime migration.** After collaboration,
+    phase-inventory, and public-command parity gates pass, replace direct `gh` collaboration
+    instructions, preserve local `git`, scrub inherited GitHub auth/config, wire the already-built
+    endpoint and proxy into the public Docker profile, and prove through smoke scans that agent
+    runtime inputs contain no GitHub credential or database and remote writes require the
+    daemon/broker. This slice adds no endpoint operation or per-command proxy behavior.
 
 Slices 1 and 2 are foundations. Slice 3 depends on both. Slice 4 depends on 3. Slice 5 depends on
-4. Slices 6 and 7 depend on 1 and can proceed independently. Slice 8 depends on 3–7. Slice 9
-depends on 1–3. Slice 10 depends on 1, 2, 6, 7, and 8. No task may broaden itself into the
-outside MCP or Hosted control-plane implementation.
+4. Slice 6 depends on 1 and 2; slice 7 depends on 1; and both can proceed independently after
+their prerequisites. Slice 8 depends on 1 and may finish before provider or prompt migration.
+Slice 9 depends on 1–3. Slice 10 depends on 3–9. The graph is acyclic: public-command parity is
+delivered by slice 8 before slice 10 consumes it. No task may broaden itself into the outside MCP
+or Hosted control-plane implementation.
 
 ## Rollout
 

@@ -72,21 +72,24 @@ DB path: `~/.quorum/repos/<owner>__<name>/quorum.db`. Repo identity is resolved 
 `QUORUM_REPO` env var (set by the daemon for workers) > cwd git detection (parse the
 `origin` remote URL) > loud error (exit 2). No daemon required for CLI commands. No
 general network server. Agents invoke lifecycle-safe `quorum <subcommand>` operations as
-ordinary shell commands. Managed PR collaboration additionally uses a short-lived,
-credentialless `quorum agent-mcp` stdio process injected by the daemon; it writes bounded,
-run-authorized GitHub operation requests through a narrow local daemon endpoint, and the daemon
-alone writes SQLite and performs the remote operation. The MCP process never receives the Quorum
-database, GitHub credentials, or lifecycle authority.
+ordinary shell commands. Managed PR collaboration additionally uses a credentialless
+`quorum agent-mcp` stdio process injected by the daemon and scoped to the managed provider
+process; persistent providers retain that MCP process across their stdin-fed turns. It writes
+bounded, run-authorized GitHub operation requests through a narrow local daemon endpoint, and the
+daemon alone writes SQLite and performs the remote operation. The MCP process never receives the
+Quorum database, GitHub credentials, or lifecycle authority.
 
 For contained runs, the same local endpoint carries the existing run-scoped `submit` and `react`
-signals, so those commands need neither a database mount nor a broader daemon API. They retain
-their current semantics and are not exposed as MCP tools. Public and admin CLI commands remain
-direct short-lived SQLite operations outside the contained managed runner.
+signals and the closed established public-command family, so those commands need neither a
+database mount nor a broader daemon API. They retain their current semantics and are not exposed
+as MCP tools. Admin commands remain unavailable inside the contained managed runner and use
+direct short-lived SQLite operations only outside it.
 
-Each invocation is a **complete, self-contained, short-lived process**: open the DB,
-perform one atomic op, print JSON to stdout, exit with a meaningful code. There is **no
-state between invocations** — the SQLite file is the sole source of truth. The model is
-`git`-like: every command reconciles current on-disk state and executes atomically.
+Each ordinary CLI invocation is a **complete, self-contained, short-lived process**: direct mode
+opens the DB, while contained public/run-scoped mode performs one bounded endpoint exchange; both
+execute one operation, print JSON to stdout, and exit with a meaningful code. There is **no state
+between CLI invocations** — the SQLite file is the sole durable source of truth. The model is
+`git`-like: every command reconciles current persisted state and executes atomically.
 
 ## Motivation
 
@@ -102,16 +105,22 @@ Quorum-mediated collaboration operations.
 
 ## CLI-first coordination plus managed-agent MCP
 
-General coordination stays CLI-first: each short-lived command opens SQLite, performs one
-atomic operation, emits JSON, and exits. Quorum does not add a general HTTP daemon, remote MCP
-listener, OAuth surface, port, or second source of coordination state.
+General coordination stays CLI-first. Outside a contained managed runner, each short-lived
+command opens SQLite, performs one atomic operation, emits JSON, and exits; inside one, the same
+public CLI surface uses the closed local endpoint exchange above. Quorum does not add a general
+HTTP daemon, remote MCP listener, OAuth surface, port, or second source of coordination state.
 
 Managed GitHub collaboration is the narrow exception because direct Repository Service
 credentials and shell-composed Markdown are the wrong boundary for an untrusted coding run. The
 daemon injects one tools-only stdio MCP whose inventory is derived from the exact live run role.
-The adapter remains short-lived and stateless; it forwards closed typed requests to a narrow local
-daemon endpoint, SQLite holds the durable operation request, and `quorum serve` executes remote
-GitHub work outside transactions. Restricted internal model roles receive no MCP. The separate
+The adapter lifetime follows the managed provider process: turn-oriented providers receive a
+fresh adapter, while a persistent Claude child retains one adapter and authenticated local-endpoint
+session across its stdin-fed turns. That persistent adapter keeps only bounded, opaque session
+state for the current attempt/lifecycle/inventory descriptor and invalidates it through the
+daemon-authorized phase handoff; the adapter is neither durable authority nor a second source of
+coordination state. It forwards closed typed requests to a narrow local daemon endpoint, SQLite
+holds every durable operation request and binding, and `quorum serve` executes remote GitHub work
+outside transactions. Restricted internal model roles receive no MCP. The separate
 outside/task-creator MCP requires its own authentication and remote-transport design and is not
 implied by this agent interface.
 
