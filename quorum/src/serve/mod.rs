@@ -7774,6 +7774,7 @@ async fn tick(
                             None,
                             false,
                             "graph-blocker",
+                            None,
                         )
                         .await;
                     }
@@ -10361,6 +10362,7 @@ async fn tick(
                             None,
                             false,
                             "agent_failed",
+                            None,
                         )
                         .await;
                     }
@@ -10760,13 +10762,14 @@ async fn tick(
                     .await;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
-                    cleanup_slot(
+                    cleanup_slot_with_terminal_action(
                         config,
                         wt_mgr,
                         name_pool,
                         dead,
                         None,
                         "ownership_transferred",
+                        TerminalUsageAction::TransferredOwnershipCleanup,
                     )
                     .await;
                 }
@@ -10934,13 +10937,14 @@ async fn tick(
                         "worker {} exit ignored after task #{} ownership/state advanced — cleaning up",
                         dead.agent_name, dead.task_id
                     ));
-                    cleanup_slot(
+                    cleanup_slot_with_terminal_action(
                         config,
                         wt_mgr,
                         name_pool,
                         dead,
                         None,
                         "ownership_transferred",
+                        TerminalUsageAction::TransferredOwnershipCleanup,
                     )
                     .await;
                     continue;
@@ -10980,6 +10984,7 @@ async fn tick(
             continue;
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
+        let terminal_action = terminal_usage_action(&disposition);
         let runner_failure =
             classify_managed_pre_authoritative_exit(&mut dead, status, &disposition).await;
         match disposition {
@@ -10996,13 +11001,14 @@ async fn tick(
                     "worker {} exited after recorded submission — cleaning up completed run",
                     dead.agent_name
                 ));
-                cleanup_slot(
+                cleanup_slot_with_terminal_action(
                     config,
                     wt_mgr,
                     name_pool,
                     dead,
                     None,
                     cleanup_reason.expect("recorded outcome has cleanup reason"),
+                    terminal_action,
                 )
                 .await;
                 continue;
@@ -11012,13 +11018,14 @@ async fn tick(
                     "worker {} exit ignored after task ownership/state advanced — cleaning up",
                     dead.agent_name
                 ));
-                cleanup_slot(
+                cleanup_slot_with_terminal_action(
                     config,
                     wt_mgr,
                     name_pool,
                     dead,
                     None,
                     cleanup_reason.expect("transferred outcome has cleanup reason"),
+                    terminal_action,
                 )
                 .await;
                 continue;
@@ -11111,6 +11118,7 @@ async fn tick(
             continue;
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
+        let terminal_action = terminal_usage_action(&disposition);
         let runner_failure =
             classify_managed_pre_authoritative_exit(&mut reviewers[i], status, &disposition).await;
         match disposition {
@@ -11126,12 +11134,13 @@ async fn tick(
                     "reviewer {} exited after recorded verdict — cleaning up completed run",
                     dead.agent_name
                 ));
-                teardown_reviewer(
+                teardown_reviewer_with_terminal_action(
                     config,
                     wt_mgr,
                     name_pool,
                     dead,
                     cleanup_reason.expect("recorded outcome has cleanup reason"),
+                    Some(terminal_action),
                 )
                 .await;
             }
@@ -11141,12 +11150,13 @@ async fn tick(
                     "reviewer {} exit ignored after review ownership/state advanced — cleaning up",
                     dead.agent_name
                 ));
-                teardown_reviewer(
+                teardown_reviewer_with_terminal_action(
                     config,
                     wt_mgr,
                     name_pool,
                     dead,
                     cleanup_reason.expect("transferred outcome has cleanup reason"),
+                    Some(terminal_action),
                 )
                 .await;
             }
@@ -12408,6 +12418,26 @@ fn check_post_result_limits(
     cumulative_cost_usd: f64,
     slot: &SlotState,
 ) -> Option<LimitBreached> {
+    check_post_result_limits_at(
+        limits,
+        turn_tokens,
+        cumulative_tokens,
+        turn_cost_usd,
+        cumulative_cost_usd,
+        slot.last_event_at,
+        slot.task_started_at,
+    )
+}
+
+fn check_post_result_limits_at(
+    limits: &CostLimits,
+    turn_tokens: i64,
+    cumulative_tokens: i64,
+    turn_cost_usd: Option<f64>,
+    cumulative_cost_usd: f64,
+    last_event_at: std::time::Instant,
+    task_started_at: std::time::Instant,
+) -> Option<LimitBreached> {
     if let Some(max) = limits.max_turn_tokens {
         if turn_tokens > max {
             return Some(LimitBreached::TurnTokens {
@@ -12449,7 +12479,7 @@ fn check_post_result_limits(
         }
     }
     let max_idle_secs = max_idle_secs(limits);
-    let elapsed = slot.last_event_at.elapsed().as_secs();
+    let elapsed = last_event_at.elapsed().as_secs();
     if elapsed > max_idle_secs {
         return Some(LimitBreached::IdleSecs {
             elapsed,
@@ -12457,7 +12487,7 @@ fn check_post_result_limits(
         });
     }
     if let Some(max) = limits.max_task_wall_secs {
-        let elapsed = slot.task_started_at.elapsed().as_secs();
+        let elapsed = task_started_at.elapsed().as_secs();
         if elapsed > max {
             return Some(LimitBreached::TaskWallSecs { elapsed, max });
         }
@@ -12528,7 +12558,35 @@ fn terminal_usage_diagnostic(
     breach: Option<&str>,
     action: TerminalUsageAction,
 ) -> serde_json::Value {
-    let usage = slot.last_terminal_usage;
+    terminal_usage_diagnostic_fields(
+        role,
+        &slot.agent_name,
+        slot.task_id,
+        slot.process_kind(),
+        slot.last_terminal_usage,
+        slot.token_usage,
+        slot.limit_tokens,
+        slot.last_terminal_cost_usd,
+        limits,
+        breach,
+        action,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_usage_diagnostic_fields(
+    role: &str,
+    agent_name: &str,
+    task_id: i64,
+    provider: runner::AgentKind,
+    usage: runner::TokenUsage,
+    cumulative_usage: runner::TokenUsage,
+    cumulative_limit_tokens: i64,
+    terminal_cost_usd: Option<f64>,
+    limits: &CostLimits,
+    breach: Option<&str>,
+    action: TerminalUsageAction,
+) -> serde_json::Value {
     let breach_reason = breach.map(|reason| {
         let mut bounded: String = reason.chars().take(512).collect();
         if reason.chars().count() > 512 {
@@ -12539,9 +12597,9 @@ fn terminal_usage_diagnostic(
     serde_json::json!({
         "event": "terminal_usage",
         "role": role,
-        "agent": slot.agent_name,
-        "task_id": slot.task_id,
-        "provider": slot.process_kind().to_string(),
+        "agent": agent_name,
+        "task_id": task_id,
+        "provider": provider.to_string(),
         "raw_input_tokens": usage.input_tokens,
         "uncached_input_tokens": usage.uncached_input_tokens,
         "cached_input_tokens": usage.cached_input_tokens,
@@ -12550,10 +12608,10 @@ fn terminal_usage_diagnostic(
         "reasoning_tokens": usage.reasoning_tokens,
         "raw_total_tokens": usage.live_total_tokens(),
         "uncached_total_tokens": usage.uncached_total_tokens(),
-        "cumulative_raw_total_tokens": slot.token_usage.live_total_tokens(),
-        "cumulative_uncached_total_tokens": slot.token_usage.uncached_total_tokens(),
-        "cumulative_limit_tokens": slot.limit_tokens,
-        "cost_usd": slot.last_terminal_cost_usd,
+        "cumulative_raw_total_tokens": cumulative_usage.live_total_tokens(),
+        "cumulative_uncached_total_tokens": cumulative_usage.uncached_total_tokens(),
+        "cumulative_limit_tokens": cumulative_limit_tokens,
+        "cost_usd": terminal_cost_usd,
         "configured_limit_basis": limits.token_limit_basis.to_string(),
         "configured_max_turn_tokens": limits.max_turn_tokens,
         "configured_max_task_tokens": limits.max_task_tokens,
@@ -12571,12 +12629,79 @@ fn log_terminal_usage_diagnostic(
     limits: &CostLimits,
     breach: Option<&str>,
     action: TerminalUsageAction,
-) {
+) -> serde_json::Value {
     let diagnostic = terminal_usage_diagnostic(slot, role, limits, breach, action);
     log(&format!(
         "{role} {} result terminal usage diagnostic: {diagnostic}",
         slot.agent_name
     ));
+    diagnostic
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_captured_terminal_usage_fields(
+    role: &str,
+    limits: &CostLimits,
+    kind: runner::AgentKind,
+    output: &[runner::CapturedOutput],
+    action: TerminalUsageAction,
+    agent_name: &str,
+    task_id: i64,
+    token_usage: &mut runner::TokenUsage,
+    last_terminal_usage: &mut runner::TokenUsage,
+    last_terminal_cost_usd: &mut Option<f64>,
+    cost_tokens: &mut i64,
+    limit_tokens: &mut i64,
+    cost_usd: &mut f64,
+    last_event_at: std::time::Instant,
+    task_started_at: std::time::Instant,
+    session_log: &mut Option<session_log::SessionLog>,
+) -> Option<serde_json::Value> {
+    let terminal = capture_terminal_usage(kind, output, token_usage)?;
+    *last_terminal_usage = terminal.usage;
+    *last_terminal_cost_usd = terminal.cost_usd;
+    let turn_tokens = token_limit_total(terminal.usage, limits.token_limit_basis);
+    let raw_turn_tokens =
+        token_limit_total(terminal.usage, crate::serve_config::TokenLimitBasis::Raw);
+    *cost_tokens = cost_tokens.saturating_add(raw_turn_tokens);
+    *limit_tokens = limit_tokens.saturating_add(turn_tokens);
+    let previous_cost = *cost_usd;
+    if let Some(cost) = terminal.cost_usd {
+        *cost_usd = cost;
+    }
+    let turn_cost_usd = terminal
+        .cost_usd
+        .map(|cost| (cost - previous_cost).max(0.0));
+    let breach = check_post_result_limits_at(
+        limits,
+        turn_tokens,
+        *limit_tokens,
+        turn_cost_usd,
+        *cost_usd,
+        last_event_at,
+        task_started_at,
+    )
+    .map(|breach| breach.to_string());
+    let diagnostic = terminal_usage_diagnostic_fields(
+        role,
+        agent_name,
+        task_id,
+        kind,
+        *last_terminal_usage,
+        *token_usage,
+        *limit_tokens,
+        *last_terminal_cost_usd,
+        limits,
+        breach.as_deref(),
+        action,
+    );
+    log(&format!(
+        "{role} {agent_name} result terminal usage diagnostic: {diagnostic}"
+    ));
+    if let Some(session_log) = session_log {
+        session_log.update_cost(*cost_tokens, terminal.cost_usd);
+    }
+    Some(diagnostic)
 }
 
 /// Check wall-clock limits only (called each tick for slots still draining).
@@ -13164,13 +13289,14 @@ async fn settle_dormant_worker_feed_failure(
                 "ownership_transferred",
             )
             .await;
-            cleanup_slot(
+            cleanup_slot_with_terminal_action(
                 config,
                 wt_mgr,
                 name_pool,
                 worker,
                 None,
                 "ownership_transferred",
+                TerminalUsageAction::TransferredOwnershipCleanup,
             )
             .await;
             Ok(DormantWorkerFeedFailureDisposition::Settled)
@@ -13560,39 +13686,17 @@ async fn park_worker_slot_dormant(
     let runner_kind = slot.process_kind();
     let old = slot.become_dormant()?;
     let captured = old.kill_and_reap().await;
-    if let Some(terminal) = capture_terminal_usage(runner_kind, &captured, &mut slot.token_usage) {
-        slot.last_terminal_usage = terminal.usage;
-        slot.last_terminal_cost_usd = terminal.cost_usd;
-        let turn_tokens = token_limit_total(terminal.usage, limits.token_limit_basis);
-        let raw_turn_tokens =
-            token_limit_total(terminal.usage, crate::serve_config::TokenLimitBasis::Raw);
-        slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
-        slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
-        let previous_cost = slot.cost_usd;
-        if let Some(cost) = terminal.cost_usd {
-            slot.cost_usd = cost;
-        }
-        let turn_cost_usd = terminal
-            .cost_usd
-            .map(|cost| (cost - previous_cost).max(0.0));
-        let breach = check_post_result_limits(
-            limits,
-            turn_tokens,
-            slot.limit_tokens,
-            turn_cost_usd,
-            slot.cost_usd,
-            slot,
-        );
-        let breach = breach.map(|breach| breach.to_string());
-        log_terminal_usage_diagnostic(
-            slot,
-            "worker",
-            limits,
-            breach.as_deref(),
-            TerminalUsageAction::RecordedOutcomeCleanup,
-        );
+    if record_captured_terminal_usage(
+        slot,
+        "worker",
+        limits,
+        runner_kind,
+        &captured,
+        TerminalUsageAction::RecordedOutcomeCleanup,
+    )
+    .is_some()
+    {
         if let Some(session_log) = &mut slot.session_log {
-            session_log.update_cost(slot.cost_tokens, terminal.cost_usd);
             session_log.set_phase("awaiting-review");
         }
     }
@@ -14224,6 +14328,37 @@ fn capture_terminal_usage(
         }
     }
     terminal
+}
+
+/// Fold one late terminal record into the existing normalized counters and
+/// emit its lifecycle-inert diagnostic. Callers supply the already-authoritative
+/// action; this helper never reads or writes lifecycle state.
+fn record_captured_terminal_usage(
+    slot: &mut SlotState,
+    role: &str,
+    limits: &CostLimits,
+    kind: runner::AgentKind,
+    output: &[runner::CapturedOutput],
+    action: TerminalUsageAction,
+) -> Option<serde_json::Value> {
+    record_captured_terminal_usage_fields(
+        role,
+        limits,
+        kind,
+        output,
+        action,
+        &slot.agent_name,
+        slot.task_id,
+        &mut slot.token_usage,
+        &mut slot.last_terminal_usage,
+        &mut slot.last_terminal_cost_usd,
+        &mut slot.cost_tokens,
+        &mut slot.limit_tokens,
+        &mut slot.cost_usd,
+        slot.last_event_at,
+        slot.task_started_at,
+        &mut slot.session_log,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16763,10 +16898,37 @@ async fn cleanup_slot(
         finalize_verdict,
         true,
         end_reason,
+        None,
     )
     .await;
 }
 
+/// Cleanup after the managed-exit classifier has already decided that this
+/// process no longer owns lifecycle. Late terminal telemetry is diagnostic
+/// only and cannot replay that disposition.
+async fn cleanup_slot_with_terminal_action(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    state: SlotState,
+    finalize_verdict: Option<&str>,
+    end_reason: &str,
+    action: TerminalUsageAction,
+) {
+    cleanup_slot_inner(
+        config,
+        wt_mgr,
+        name_pool,
+        state,
+        finalize_verdict,
+        true,
+        end_reason,
+        Some(action),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn cleanup_slot_inner(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -16775,6 +16937,7 @@ async fn cleanup_slot_inner(
     finalize_verdict: Option<&str>,
     delete_branch: bool,
     end_reason: &str,
+    terminal_action: Option<TerminalUsageAction>,
 ) {
     let mut usage = managed_usage_record(&state, "worker");
     log(&format!(
@@ -16790,7 +16953,28 @@ async fn cleanup_slot_inner(
 
     let runner_kind = state.proc.kind();
     let terminal = state.proc.kill_and_reap().await;
-    capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
+    if let Some(action) = terminal_action {
+        record_captured_terminal_usage_fields(
+            "worker",
+            &config.limits,
+            runner_kind,
+            &terminal,
+            action,
+            &state.agent_name,
+            state.task_id,
+            &mut state.token_usage,
+            &mut state.last_terminal_usage,
+            &mut state.last_terminal_cost_usd,
+            &mut state.cost_tokens,
+            &mut state.limit_tokens,
+            &mut state.cost_usd,
+            state.last_event_at,
+            state.task_started_at,
+            &mut state.session_log,
+        );
+    } else {
+        capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
+    }
     persist_terminal_output(&mut state.session_log, terminal);
     usage.usage = state.token_usage;
     if let Some(ref mut sl) = state.session_log {
@@ -16936,15 +17120,48 @@ async fn teardown_reviewer(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
+    state: SlotState,
+    end_reason: &str,
+) {
+    teardown_reviewer_with_terminal_action(config, wt_mgr, name_pool, state, end_reason, None)
+        .await;
+}
+
+async fn teardown_reviewer_with_terminal_action(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
     mut state: SlotState,
     end_reason: &str,
+    terminal_action: Option<TerminalUsageAction>,
 ) {
     let mut usage = managed_usage_record(&state, "reviewer");
     log(&format!("tearing down reviewer {}", state.agent_name));
 
     let runner_kind = state.proc.kind();
     let terminal = state.proc.kill_and_reap().await;
-    capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
+    if let Some(action) = terminal_action {
+        record_captured_terminal_usage_fields(
+            "reviewer",
+            &config.limits,
+            runner_kind,
+            &terminal,
+            action,
+            &state.agent_name,
+            state.task_id,
+            &mut state.token_usage,
+            &mut state.last_terminal_usage,
+            &mut state.last_terminal_cost_usd,
+            &mut state.cost_tokens,
+            &mut state.limit_tokens,
+            &mut state.cost_usd,
+            state.last_event_at,
+            state.task_started_at,
+            &mut state.session_log,
+        );
+    } else {
+        capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
+    }
     persist_terminal_output(&mut state.session_log, terminal);
     usage.usage = state.token_usage;
     if let Some(ref mut sl) = state.session_log {
@@ -22603,6 +22820,74 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
     }
 
+    #[test]
+    fn persistent_cleanup_capture_emits_classified_terminal_diagnostic() {
+        let output = vec![runner::CapturedOutput::Stdout(
+            r#"{"type":"result","result":"done","is_error":false,"usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":10,"output_tokens":5}}"#
+                .into(),
+        )];
+        let limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
+
+        for (role, action) in [
+            ("worker", TerminalUsageAction::RecordedOutcomeCleanup),
+            ("reviewer", TerminalUsageAction::TransferredOwnershipCleanup),
+        ] {
+            let mut token_usage = runner::TokenUsage::default();
+            let mut last_terminal_usage = runner::TokenUsage::default();
+            let mut last_terminal_cost_usd = None;
+            let mut cost_tokens = 0;
+            let mut limit_tokens = 0;
+            let mut cost_usd = 0.0;
+            let mut session_log = None;
+            let diagnostic = record_captured_terminal_usage_fields(
+                role,
+                &limits,
+                runner::AgentKind::Claude,
+                &output,
+                action,
+                "Test-1",
+                1,
+                &mut token_usage,
+                &mut last_terminal_usage,
+                &mut last_terminal_cost_usd,
+                &mut cost_tokens,
+                &mut limit_tokens,
+                &mut cost_usd,
+                std::time::Instant::now(),
+                std::time::Instant::now(),
+                &mut session_log,
+            )
+            .expect("late persistent terminal record must produce a diagnostic");
+
+            assert_eq!(diagnostic["role"], role);
+            assert_eq!(diagnostic["raw_input_tokens"], 100);
+            assert_eq!(diagnostic["uncached_input_tokens"], 20);
+            assert_eq!(diagnostic["cached_input_tokens"], 80);
+            assert_eq!(diagnostic["cache_write_input_tokens"], 10);
+            assert_eq!(diagnostic["output_tokens"], 5);
+            assert_eq!(diagnostic["raw_total_tokens"], 105);
+            assert_eq!(diagnostic["uncached_total_tokens"], 25);
+            assert_eq!(diagnostic["cumulative_raw_total_tokens"], 105);
+            assert_eq!(diagnostic["cumulative_limit_tokens"], 105);
+            assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+            assert_eq!(diagnostic["breach"], true);
+            assert_eq!(
+                diagnostic["action"],
+                match action {
+                    TerminalUsageAction::RecordedOutcomeCleanup => "recorded_outcome_cleanup",
+                    TerminalUsageAction::TransferredOwnershipCleanup => {
+                        "transferred_ownership_cleanup"
+                    }
+                    _ => unreachable!("fixture uses only cleanup actions"),
+                }
+            );
+            assert_eq!(token_usage.live_total_tokens(), 105);
+        }
+    }
+
     #[tokio::test]
     async fn rejected_reviewer_attachment_closes_run_with_buffered_terminal_usage() {
         let dir = tempfile::tempdir().unwrap();
@@ -27212,6 +27497,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 "authoritative outcome entered runner failure taxonomy"
             );
         }
+        assert_eq!(
+            terminal_usage_action(&tasks::ManagedExitDisposition::OutcomeRecorded).as_str(),
+            "recorded_outcome_cleanup"
+        );
+        assert_eq!(
+            terminal_usage_action(&tasks::ManagedExitDisposition::OwnershipTransferred).as_str(),
+            "transferred_ownership_cleanup"
+        );
     }
 
     #[tokio::test]
@@ -27257,6 +27550,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+        assert_eq!(runs.len(), 2, "cleanup must not duplicate lifecycle runs");
         assert_eq!(runs[0].end_reason.as_deref(), Some("completed"));
         assert_eq!(runs[1].end_reason.as_deref(), Some("ownership_transferred"));
         assert!(
