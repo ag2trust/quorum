@@ -6,7 +6,7 @@
 
 use super::agent::{self, AgentProc, AgentSpec};
 use super::codex_agent::{CodexProc, CodexSpec};
-use super::runner::{AgentEvent, AgentKind, RunnerProc};
+use super::runner::{AgentEvent, AgentKind, CapturedOutput, RunnerFailure, RunnerProc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -943,6 +943,27 @@ fn provider_failure(slot: &PlannerSlot, reason: &str, byte_count_kind: &str) -> 
     PlannerPoll::ProviderFailed(summary)
 }
 
+fn planner_exit_failure(slot: &PlannerSlot, failure: RunnerFailure) -> PlannerPoll {
+    provider_failure(
+        slot,
+        &format!(
+            "planner provider exited without a terminal response ({}): {}",
+            failure.disposition(),
+            failure.detail()
+        ),
+        "exact",
+    )
+}
+
+fn stderr_capture_was_truncated(output: &[CapturedOutput]) -> bool {
+    output.iter().any(|line| {
+        matches!(
+            line,
+            CapturedOutput::StderrTruncated { .. } | CapturedOutput::StderrBytesTruncated { .. }
+        )
+    })
+}
+
 /// Drain a bounded amount of output. Timeout and output violations are
 /// provider failures; the caller must kill and reap the returned terminal slot.
 pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
@@ -1007,7 +1028,7 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
             ));
         }
         if slot.proc.kind() == AgentKind::Codex {
-            if let Some(failure) = slot.proc.observed_pre_authoritative_failure() {
+            if let Some(failure) = slot.proc.observed_planner_live_failure() {
                 return Some(provider_failure(
                     slot,
                     &format!(
@@ -1086,7 +1107,7 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
     };
     if slot.proc.kind() == AgentKind::Codex && slot.codex_terminal_candidate && stdout_complete {
         let status = status?;
-        let _ = slot.proc.finalize_pre_authoritative_evidence().await;
+        let evidence = slot.proc.finalize_pre_authoritative_evidence().await;
         if !status.success() {
             return Some(provider_failure(
                 slot,
@@ -1096,7 +1117,14 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                 "exact",
             ));
         }
-        if let Some(failure) = slot.proc.observed_strict_pre_authoritative_failure() {
+        if stderr_capture_was_truncated(&evidence) {
+            return Some(provider_failure(
+                slot,
+                "planner stderr exceeded bounded diagnostic capture",
+                "exact",
+            ));
+        }
+        if let Some(failure) = slot.proc.observed_planner_terminal_failure() {
             return Some(provider_failure(
                 slot,
                 &format!(
@@ -1108,7 +1136,18 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
         }
         return Some(parsed_poll(slot));
     }
-    if status.is_some() {
+    if let Some(status) = status {
+        let evidence = slot.proc.finalize_pre_authoritative_evidence().await;
+        if stderr_capture_was_truncated(&evidence) {
+            return Some(provider_failure(
+                slot,
+                "planner stderr exceeded bounded diagnostic capture",
+                "exact",
+            ));
+        }
+        if let Some(failure) = slot.proc.classify_pre_authoritative_exit(status) {
+            return Some(planner_exit_failure(slot, failure));
+        }
         return Some(provider_failure(
             slot,
             "planner exited without a terminal response",
@@ -1169,6 +1208,34 @@ mod tests {
             dir,
             "codex",
             &format!("exec /bin/cat '{}'", stdout_path.display()),
+        );
+        spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir,
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn spawn_fake_codex_with_stderr(dir: &Path, stdout: &str, stderr: &str) -> PlannerSlot {
+        let stdout_path = dir.join("stdout.jsonl");
+        let stderr_path = dir.join("stderr.txt");
+        std::fs::write(&stdout_path, stdout).unwrap();
+        std::fs::write(&stderr_path, stderr).unwrap();
+        let runner = executable_script(
+            dir,
+            "codex",
+            &format!(
+                "/bin/cat '{}' >&2\nexec /bin/cat '{}'",
+                stderr_path.display(),
+                stdout_path.display()
+            ),
         );
         spawn_planner(
             AgentKind::Codex,
@@ -1616,6 +1683,136 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn codex_planner_accepts_changed_unclassified_stderr_before_clean_terminal() {
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let stdout = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({"type":"thread.started","thread_id":"fixture-thread"}),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type":"turn.completed"}),
+        );
+        for stderr in [
+            "Reading additional input from stdin...\n",
+            "Codex changed its informational input notice.\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut slot = spawn_fake_codex_with_stderr(dir.path(), &stdout, stderr).await;
+            let outcome = poll_to_terminal(&mut slot).await;
+            assert!(matches!(
+                outcome,
+                PlannerPoll::Done(PlannerResponse::Plan { ref tasks }) if tasks.len() == 2
+            ));
+            slot.kill_and_reap().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_unclassified_stderr_still_fails_without_clean_terminal() {
+        let stderr = "Codex changed its informational input notice.\n";
+        let cases = [
+            (
+                "turn-failed",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"provider failed\"}}\n",
+                "planner provider protocol failed (unclassified)",
+            ),
+            (
+                "error-event",
+                "{\"type\":\"error\",\"message\":\"provider failed\"}\n",
+                "planner provider protocol failed (unclassified)",
+            ),
+            (
+                "malformed",
+                "not-json\n",
+                "planner provider protocol failed",
+            ),
+            (
+                "early-eof",
+                "{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}\n",
+                "Codex stderr did not match a bounded provider signal",
+            ),
+        ];
+        for (name, stdout, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut slot = spawn_fake_codex_with_stderr(dir.path(), stdout, stderr).await;
+            let outcome = poll_to_terminal(&mut slot).await;
+            let diagnostic = failure_json(&outcome);
+            assert!(
+                diagnostic["failure"].as_str().unwrap().contains(expected),
+                "{name} discarded its authoritative bounded failure evidence: {diagnostic}",
+            );
+            slot.kill_and_reap().await;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout.jsonl");
+        let stderr_path = dir.path().join("stderr.txt");
+        std::fs::write(
+            &stdout_path,
+            "{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}\n",
+        )
+        .unwrap();
+        std::fs::write(&stderr_path, stderr).unwrap();
+        let runner = executable_script(
+            dir.path(),
+            "codex",
+            &format!(
+                "/bin/cat '{}' >&2\n/bin/cat '{}'\nexit 7",
+                stderr_path.display(),
+                stdout_path.display()
+            ),
+        );
+        let mut slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let outcome = poll_to_terminal(&mut slot).await;
+        let diagnostic = failure_json(&outcome);
+        assert!(diagnostic["failure"]
+            .as_str()
+            .unwrap()
+            .contains("Codex stderr did not match a bounded provider signal"));
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_rejects_truncated_stderr_after_terminal() {
+        let response = serde_json::json!({"outcome":"plan","tasks":[task("core", &[])]});
+        let stdout = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type":"turn.completed"}),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let stderr = "x".repeat(16 * 1024 + 1);
+        let mut slot = spawn_fake_codex_with_stderr(dir.path(), &stdout, &stderr).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::ProviderFailed(ref summary) if summary.contains("stderr exceeded bounded")
+        ));
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn codex_terminal_candidate_requires_clean_exit_and_final_evidence() {
         let response = serde_json::json!({
             "outcome": "plan",
@@ -1637,7 +1834,7 @@ mod tests {
             ),
             (
                 "trailing-stderr",
-                "printf '%s\\n' 'fatal trailing error' >&2",
+                "printf '%s\\n' 'error: unexpected argument --future' >&2",
             ),
         ];
         for (name, trailer) in cases {
@@ -1665,6 +1862,13 @@ mod tests {
                 matches!(outcome, PlannerPoll::ProviderFailed(_)),
                 "{name} acquired planner authority"
             );
+            if name == "trailing-stderr" {
+                let diagnostic = failure_json(&outcome);
+                assert!(diagnostic["failure"]
+                    .as_str()
+                    .unwrap()
+                    .contains("non-failover"));
+            }
             slot.kill_and_reap().await;
         }
     }
