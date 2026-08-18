@@ -437,10 +437,12 @@ pub enum Command {
         /// credentials (e.g. ANTHROPIC_API_KEY) in the daemon environment.
         #[arg(long)]
         no_bare_agent: bool,
-        /// Max tokens (input+output) per single turn. Exceeding kills the agent.
+        /// Max tokens per single turn using the serve file token_limit_basis
+        /// (raw input+output by default). Exceeding kills the agent.
         #[arg(long)]
         max_turn_tokens: Option<i64>,
-        /// Max cumulative tokens (input+output) per task. Exceeding kills the agent.
+        /// Max cumulative tokens per task using the serve file token_limit_basis
+        /// (raw input+output by default). Exceeding kills the agent.
         #[arg(long)]
         max_task_tokens: Option<i64>,
         /// Max USD cost per single turn (delta from session-cumulative total_cost_usd).
@@ -733,7 +735,7 @@ pub enum Command {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn classify_defaults_to_operator_login_and_allows_explicit_bare_auth() {
@@ -750,5 +752,19 @@ mod tests {
             panic!("expected classify command");
         };
         assert!(!no_bare_agent);
+    }
+
+    #[test]
+    fn serve_token_ceiling_help_names_the_selected_config_basis() {
+        let mut command = Cli::command();
+        let serve = command
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand");
+        let help = serve.render_long_help().to_string();
+        assert!(help.contains("token_limit_basis"), "serve help: {help}");
+        assert!(
+            help.contains("raw input+output by default"),
+            "serve help: {help}"
+        );
     }
 }

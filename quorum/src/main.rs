@@ -78,6 +78,7 @@ primary = 100
 ## Token / cost / wall-clock limits (unlimited when absent)
 # max_turn_tokens = 200000
 # max_task_tokens = 1000000
+# token_limit_basis = \"raw\" # raw (default) | uncached
 # max_turn_cost_usd = 5.0
 # max_task_cost_usd = 50.0
 # max_idle_secs = 900
@@ -1256,6 +1257,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_no_bare = resolve_bool(no_bare_agent, file_cfg.no_bare_agent, true);
             let r_max_turn_tokens = resolve_opt(max_turn_tokens, file_cfg.max_turn_tokens);
             let r_max_task_tokens = resolve_opt(max_task_tokens, file_cfg.max_task_tokens);
+            let r_token_limit_basis =
+                resolve_token_limit_basis(file_cfg.token_limit_basis.as_deref())?;
+            validate_token_ceilings(r_max_turn_tokens.value, r_max_task_tokens.value)?;
             let r_max_turn_cost = resolve_opt(max_turn_cost_usd, file_cfg.max_turn_cost_usd);
             let r_max_task_cost = resolve_opt(max_task_cost_usd, file_cfg.max_task_cost_usd);
             serve_config::validate_routed_cost_limits(
@@ -1349,6 +1353,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 idle_timeout_secs: &r_idle_timeout,
                 max_turn_tokens: &r_max_turn_tokens,
                 max_task_tokens: &r_max_task_tokens,
+                token_limit_basis: &r_token_limit_basis,
                 max_turn_cost_usd: &r_max_turn_cost,
                 max_task_cost_usd: &r_max_task_cost,
                 merge_checks_timeout_secs: &r_merge_checks_timeout,
@@ -1412,6 +1417,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 limits: serve::CostLimits {
                     max_turn_tokens: r_max_turn_tokens.value,
                     max_task_tokens: r_max_task_tokens.value,
+                    token_limit_basis: r_token_limit_basis.value,
                     max_turn_cost_usd: r_max_turn_cost.value,
                     max_task_cost_usd: r_max_task_cost.value,
                     max_idle_secs: r_max_idle.value,

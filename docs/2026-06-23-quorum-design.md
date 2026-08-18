@@ -260,6 +260,16 @@ cached input, so durable uncached input is `input_tokens -
 cached_input_tokens` (saturating at zero); its cached, cache-write, output, and
 reasoning-output values are retained independently.
 
+Managed worker and reviewer token watchdog ceilings are a repository serve
+policy. `token_limit_basis = "raw"` is the default and preserves the legacy
+meaning of both `max_turn_tokens` and `max_task_tokens`: provider-reported
+`input_tokens + output_tokens`. An explicit `token_limit_basis = "uncached"`
+uses normalized `uncached_input_tokens + output_tokens`, with saturating
+arithmetic; it never falls back to raw input when normalized telemetry is
+required. The resolved basis is shown at daemon startup and included in token
+ceiling breach diagnostics. Unknown bases and non-positive token ceilings are
+usage errors.
+
 ## TTL — self-expiring data (no manual pruning, ever)
 
 **Layer A — logical expiry (instant, free, the part that matters).** Write time:

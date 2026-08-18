@@ -69,6 +69,37 @@ impl RunnerKind {
     }
 }
 
+/// Token counters used by the managed-agent token watchdog ceilings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TokenLimitBasis {
+    /// Provider-reported input plus output tokens; the historical behavior.
+    #[default]
+    Raw,
+    /// Normalized uncached input plus output tokens.
+    Uncached,
+}
+
+impl std::fmt::Display for TokenLimitBasis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Raw => write!(f, "raw"),
+            Self::Uncached => write!(f, "uncached"),
+        }
+    }
+}
+
+impl TokenLimitBasis {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "raw" => Ok(Self::Raw),
+            "uncached" => Ok(Self::Uncached),
+            other => Err(QuorumError::Usage(format!(
+                "token_limit_basis must be \"raw\" or \"uncached\", got \"{other}\""
+            ))),
+        }
+    }
+}
+
 // Keep the field declarations and the set inspected by the consumption guard in
 // one macro invocation. Adding a field extends `DECLARED_SERVE_FILE_CONFIG_KEYS`
 // automatically; the guard test then fails until it is either consumed at
@@ -137,6 +168,7 @@ declare_serve_file_config! {
     no_bare_agent: Option<bool>,
     max_turn_tokens: Option<i64>,
     max_task_tokens: Option<i64>,
+    token_limit_basis: Option<String>,
     max_turn_cost_usd: Option<f64>,
     max_task_cost_usd: Option<f64>,
     max_turn_wall_secs: Option<u64>,
@@ -212,6 +244,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("no_bare_agent", ConfigKeyDisposition::Runtime),
     ("max_turn_tokens", ConfigKeyDisposition::Runtime),
     ("max_task_tokens", ConfigKeyDisposition::Runtime),
+    ("token_limit_basis", ConfigKeyDisposition::Runtime),
     ("max_turn_cost_usd", ConfigKeyDisposition::Runtime),
     ("max_task_cost_usd", ConfigKeyDisposition::Runtime),
     ("max_turn_wall_secs", ConfigKeyDisposition::Runtime),
@@ -623,6 +656,8 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
     validate_percentage_pool("collector", &routing.collector, profiles)?;
     validate_complexity_pools("worker", &routing.worker, profiles)?;
     validate_complexity_pools("reviewer", &routing.reviewer, profiles)?;
+    resolve_token_limit_basis(config.token_limit_basis.as_deref())?;
+    validate_token_ceilings(config.max_turn_tokens, config.max_task_tokens)?;
     validate_routed_cost_limits(config, config.max_turn_cost_usd, config.max_task_cost_usd)?;
     Ok(())
 }
@@ -959,6 +994,39 @@ pub fn resolve_opt_str(flag: Option<&str>, file: Option<&str>) -> Sourced<Option
     }
 }
 
+/// Resolve the file-only token watchdog accounting policy. Missing preserves
+/// the historical raw provider input + output behavior.
+pub fn resolve_token_limit_basis(file: Option<&str>) -> Result<Sourced<TokenLimitBasis>> {
+    match file {
+        Some(value) => Ok(Sourced {
+            value: TokenLimitBasis::parse(value)?,
+            source: Source::File,
+        }),
+        None => Ok(Sourced {
+            value: TokenLimitBasis::Raw,
+            source: Source::Default,
+        }),
+    }
+}
+
+/// Reject unusable ceilings before the daemon can claim work.
+pub fn validate_token_ceilings(
+    max_turn_tokens: Option<i64>,
+    max_task_tokens: Option<i64>,
+) -> Result<()> {
+    for (name, value) in [
+        ("max_turn_tokens", max_turn_tokens),
+        ("max_task_tokens", max_task_tokens),
+    ] {
+        if let Some(value) = value.filter(|value| *value <= 0) {
+            return Err(QuorumError::Usage(format!(
+                "{name} must be greater than zero, got {value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn resolve_bool(flag: bool, file: Option<bool>, default: bool) -> Sourced<bool> {
     if flag {
         return Sourced {
@@ -998,6 +1066,7 @@ pub struct BannerData<'a> {
     pub idle_timeout_secs: &'a Sourced<Option<u64>>,
     pub max_turn_tokens: &'a Sourced<Option<i64>>,
     pub max_task_tokens: &'a Sourced<Option<i64>>,
+    pub token_limit_basis: &'a Sourced<TokenLimitBasis>,
     pub max_turn_cost_usd: &'a Sourced<Option<f64>>,
     pub max_task_cost_usd: &'a Sourced<Option<f64>>,
     pub merge_checks_timeout_secs: &'a Sourced<u64>,
@@ -1093,6 +1162,10 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!(
         "  max_task_tokens:           {}",
         opt_i64(d.max_task_tokens)
+    ));
+    lines.push(format!(
+        "  token_limit_basis:         {}",
+        d.token_limit_basis
     ));
     lines.push(format!(
         "  max_turn_cost_usd:         {}",
@@ -1282,6 +1355,32 @@ primary = 100
         let default = resolve_idle_limit::<u64>(None, None, None, None);
         assert_eq!(default.value, None);
         assert_eq!(default.source, Source::Default);
+    }
+
+    #[test]
+    fn token_limit_basis_defaults_to_raw_and_parses_uncached() {
+        let default = resolve_token_limit_basis(None).unwrap();
+        assert_eq!(default.value, TokenLimitBasis::Raw);
+        assert_eq!(default.source, Source::Default);
+
+        let uncached = resolve_token_limit_basis(Some("uncached")).unwrap();
+        assert_eq!(uncached.value, TokenLimitBasis::Uncached);
+        assert_eq!(uncached.source, Source::File);
+    }
+
+    #[test]
+    fn token_limit_policy_rejects_invalid_basis_and_nonpositive_ceilings() {
+        let invalid_basis: ServeFileConfig =
+            toml::from_str(&format!("token_limit_basis = \"cached\"\n{VALID_ROUTING}")).unwrap();
+        let basis_err = validate_model_routing(&invalid_basis).unwrap_err();
+        assert_eq!(basis_err.exit_code(), 2);
+        assert!(basis_err.to_string().contains("token_limit_basis"));
+
+        for (turn, task) in [(Some(0), None), (None, Some(-1))] {
+            let err = validate_token_ceilings(turn, task).unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert!(err.to_string().contains("greater than zero"));
+        }
     }
 
     #[test]
@@ -1957,6 +2056,10 @@ worktree_base = "/tmp/wt"
     #[test]
     fn banner_shows_config_path() {
         let routing_cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let token_limit_basis = Sourced {
+            value: TokenLimitBasis::Raw,
+            source: Source::Default,
+        };
         let b = banner(&BannerData {
             config_path: Some("/path/to/config.toml"),
             repo: &Sourced {
@@ -2017,6 +2120,7 @@ worktree_base = "/tmp/wt"
                 value: None,
                 source: Source::Default,
             },
+            token_limit_basis: &token_limit_basis,
             max_turn_cost_usd: &Sourced {
                 value: None,
                 source: Source::Default,
@@ -2048,6 +2152,10 @@ worktree_base = "/tmp/wt"
             "{b}"
         );
         assert!(b.contains("8 (file)"), "cap should show file source: {b}");
+        assert!(
+            b.contains("token_limit_basis:         raw (default)"),
+            "raw token basis should be shown: {b}"
+        );
         assert!(
             !b.contains("max_turn_wall_secs"),
             "deprecated turn-wall ceiling must not appear in the resolved banner: {b}"

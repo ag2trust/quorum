@@ -1080,6 +1080,12 @@ impl TokenUsage {
         self.input_tokens.saturating_add(self.output_tokens)
     }
 
+    /// Normalized non-cache input plus output for explicit uncached ceilings.
+    pub fn uncached_total_tokens(self) -> u64 {
+        self.uncached_input_tokens
+            .saturating_add(self.output_tokens)
+    }
+
     pub fn saturating_add_assign(&mut self, other: Self) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.uncached_input_tokens = self
