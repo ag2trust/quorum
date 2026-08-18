@@ -1110,8 +1110,8 @@ async fn task_target_branch(
         Ok(tasks::get(&conn, task_id)?.and_then(|task| task.target_branch))
     })
     .await
-    .map_err(|error| format!("initial target branch read join failure: {error}"))?
-    .map_err(|error| format!("initial target branch read failed: {error}"))?;
+    .map_err(|error| format!("task target branch read join failure: {error}"))?
+    .map_err(|error| format!("task target branch read failed: {error}"))?;
     match branch {
         Some(branch) => {
             tasks::validate_target_branch(&branch).map_err(|error| {
@@ -1121,6 +1121,19 @@ async fn task_target_branch(
         }
         None => Ok(None),
     }
+}
+
+/// Resolve the branch every task-scoped lifecycle boundary must use. New
+/// tasks carry an immutable target; only genuinely legacy rows fall back to
+/// the daemon-wide configured base.
+async fn effective_task_base_branch(
+    db_path: &Path,
+    task_id: i64,
+    configured_base_branch: &str,
+) -> std::result::Result<String, String> {
+    Ok(task_target_branch(db_path, task_id)
+        .await?
+        .unwrap_or_else(|| configured_base_branch.to_string()))
 }
 
 fn publication_base_branch(
@@ -1784,6 +1797,19 @@ fn validate_reviewer_pr_target(
         }
     }
     Ok(())
+}
+
+async fn validate_reviewer_pr_target_for_task(
+    resolved: &ResolvedReviewerPrTarget,
+    expected_pr: i64,
+    gated_head_sha: &str,
+    db_path: &Path,
+    task_id: i64,
+    configured_base_branch: &str,
+) -> std::result::Result<(), String> {
+    let effective_base =
+        effective_task_base_branch(db_path, task_id, configured_base_branch).await?;
+    validate_reviewer_pr_target(resolved, expected_pr, gated_head_sha, &effective_base)
 }
 
 /// Persist one reviewer target only while the exact reservation still owns an
@@ -14180,8 +14206,15 @@ async fn provision_reviewer_reserved(
     )
     .await?;
     if let Some(resolved) = &resolved_target {
-        if let Err(reason) =
-            validate_reviewer_pr_target(resolved, pr, head_sha, &config.base_branch)
+        if let Err(reason) = validate_reviewer_pr_target_for_task(
+            resolved,
+            pr,
+            head_sha,
+            &config.db_path,
+            worker.task_id,
+            &config.base_branch,
+        )
+        .await
         {
             log(&format!(
                 "{}: {reason} — reviewer not acquired or spawned",
@@ -17037,6 +17070,8 @@ async fn bind_sticky_remediation_pr_baseline(
     task_id: i64,
     pr: i64,
 ) -> std::result::Result<(), String> {
+    let effective_base_branch =
+        effective_task_base_branch(&config.db_path, task_id, &config.base_branch).await?;
     let program = config
         .pr_target_program
         .as_deref()
@@ -17064,10 +17099,10 @@ async fn bind_sticky_remediation_pr_baseline(
             "PR #{pr} is a fork head; daemon has no supported safe push mechanism"
         ));
     }
-    if target.base_ref.as_deref() != Some(&config.base_branch) {
+    if target.base_ref.as_deref() != Some(effective_base_branch.as_str()) {
         return Err(format!(
-            "PR #{pr} targets base {:?}, expected {}",
-            target.base_ref, config.base_branch
+            "PR #{pr} targets base {:?}, expected {effective_base_branch}",
+            target.base_ref
         ));
     }
 
@@ -17221,6 +17256,9 @@ async fn spawn_remediation_worker(
     feedback: &str,
 ) -> Result<RemediationSpawnOutcome> {
     let db_path = &config.db_path;
+    let effective_base_branch = effective_task_base_branch(db_path, task_id, &config.base_branch)
+        .await
+        .map_err(QuorumError::Io)?;
 
     // Fetch task body + author for context and branch resolution.
     let (task_body, task_author, task_review_only) = {
@@ -17442,7 +17480,7 @@ async fn spawn_remediation_worker(
                     .await?;
                 wt_mgr.verify_head_sha(&wt_path, &target.head_sha).await?;
                 let base_merge = wt_mgr
-                    .integrate_continuation_base(&wt_path, &config.base_branch)
+                    .integrate_continuation_base(&wt_path, &effective_base_branch)
                     .await?;
                 wt_mgr.disable_push(&wt_path).await.map_err(|error| {
                     format!("remediation push lockout failed for PR #{pr}: {error}")
@@ -17554,7 +17592,7 @@ async fn spawn_remediation_worker(
             .as_ref()
             .zip(remediation_base_merge)
             .map(|(target, base_merge)| {
-                continuation_worker_context(target, &config.base_branch, base_merge)
+                continuation_worker_context(target, &effective_base_branch, base_merge)
             });
     let prompt = reviewer::build_remediation_turn(
         &agent_name,
@@ -24470,6 +24508,50 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn targeted_sticky_remediation_uses_task_base_not_configured_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("targeted-sticky-remediation.db");
+        let pr: i64 = 703;
+        let baseline_sha = "7037037037037037037037037037037037037037";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = seed_sticky_rework_task(&mut conn, pr, Some(baseline_sha));
+            assert!(tasks::resolve_target_branch(&mut conn, id, "develop", now_unix()).unwrap());
+            pr_targets::upsert(
+                &mut conn,
+                id,
+                pr,
+                "daemon/live-worker-t703",
+                baseline_sha,
+                false,
+            )
+            .unwrap();
+            id
+        };
+        let gh = fake_gh_returning(
+            dir.path(),
+            "gh-targeted-sticky-remediation",
+            &open_pr_target_json("daemon/live-worker-t703", baseline_sha, "develop"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(gh);
+
+        bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect("sticky remediation must validate against the task target");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            baseline_sha
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn sticky_baseline_fills_missing_intent_from_live_when_persisted_matches() {
         // #448 regression: pr_targets seeded from a prior spawn but the initial
         // publication intent still carries expected_remote_sha=None. The live
@@ -25564,6 +25646,37 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(stored.head_ref, "feature/review");
         assert_eq!(stored.head_sha, "gated-sha");
         assert!(!stored.is_fork);
+    }
+
+    #[tokio::test]
+    async fn targeted_task_reviewer_uses_task_base_not_configured_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("targeted-review.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = seed_reserved_review_task(&mut conn, 42, "winner");
+        assert!(tasks::resolve_target_branch(&mut conn, task_id, "develop", 102).unwrap());
+        let mut resolved = live_reviewer_target(42, "feature/review", "gated-sha");
+        resolved.target.base_ref = Some("develop".into());
+
+        validate_reviewer_pr_target_for_task(&resolved, 42, "gated-sha", &db_path, task_id, "main")
+            .await
+            .expect("reviewer validation must honor the immutable task target");
+
+        resolved.target.base_ref = Some("main".into());
+        let error = validate_reviewer_pr_target_for_task(
+            &resolved,
+            42,
+            "gated-sha",
+            &db_path,
+            task_id,
+            "main",
+        )
+        .await
+        .expect_err("configured-base PR must not replace a targeted task's base");
+        assert!(
+            error.contains("expected develop"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
