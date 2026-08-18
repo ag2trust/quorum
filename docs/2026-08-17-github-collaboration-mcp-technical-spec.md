@@ -114,6 +114,24 @@ that exact pending turn retains the collaboration attempt even though it receive
 `agent_runs` row and run capability. A new rework round, re-review launch, role, PR, launch SHA, or
 provider turn receives a new attempt.
 
+A persistent-child runner may keep one live run capability across logical turns, but it never
+reuses a collaboration attempt. Before feeding a warm worker its next rework turn, the daemon
+settles network ownership outside a DB transaction: every claimed child has completed or been
+killed and reaped, and every post-network-handoff ambiguous mutation has reached the
+exact-marker/idempotency/fence disposition defined below. If any old mutation remains remotely
+ambiguous, the daemon parks the pending turn for infrastructure recovery and does not bind or feed
+the next turn.
+
+Once settlement is provable, one `BEGIN IMMEDIATE` transaction revalidates the same live
+capability, task, worker identity, PR, old and new lifecycle generations, authoritative pending
+rework turn, and absence of another active attempt; cancels every remaining queued row from the
+old attempt and proves all other old rows have a safe terminal disposition; terminalizes the old
+attempt and sets its `active_run_id` to NULL; inserts the new attempt with that same run ID and the
+new generation; and stores the new attempt ID with the pending turn. The
+`UNIQUE(active_run_id)` constraint therefore guards both sides of the handoff. A crash exposes
+either the complete old binding or the complete new binding, never a detached partial transition.
+Failed validation accepts no new MCP work and does not fall back to reusing the old attempt.
+
 Only the daemon provisioning path may adopt an interrupted attempt. In the same transaction that
 issues the replacement capability, it must prove the persisted pending-turn identity, task,
 agent, role, PR, lifecycle generation, launch SHA, and provider continuation all still match,
@@ -123,20 +141,51 @@ attempt and cancels its unclaimed writes; it never falls back to a new attempt o
 This is the durable handoff for Codex thread continuation and daemon restart, not a general
 cross-run lookup facility.
 
+The MCP process receives an adapter-only collaboration descriptor containing the expected attempt
+ID, lifecycle generation, and inventory hash. It is never exposed as a tool argument or returned
+to the model. Every collaboration request carries that descriptor beside the run capability, and
+the endpoint atomically compares it with the run's current binding. This prevents a request issued
+from a cached old turn from being reinterpreted under a new attempt that happens to use the same
+live capability. Public CLI requests are not attempt-scoped and use the compatibility path below.
+
 The initial endpoint is a local framed-JSON IPC channel, implemented as an owner-only Unix-domain
 socket on supported runtimes. It does not listen on TCP. Each bounded request carries the run
 capability and one closed operation; responses use closed bounded schemas. The daemon exposes
-only existing `submit`/`react` signals and the role-scoped MCP operations through this channel—no
-SQL, filesystem path, arbitrary CLI, or raw GitHub request. A container runtime may project this
-single socket into the runner without projecting the database or Repository Service socket.
+the existing `submit`/`react` signals, the role-scoped MCP operations, and the established public
+CLI compatibility family through this channel—no SQL, daemon filesystem path, arbitrary command,
+admin command, or raw GitHub request. A container runtime may project this single socket into the
+runner without projecting the database or Repository Service socket.
+
+### Contained public CLI compatibility
+
+The current capability contract makes public commands available to every managed run. An isolated
+runner therefore uses its ordinary `quorum` CLI, but the CLI detects `QUORUM_AGENT_ENDPOINT` and
+forwards public operations instead of opening SQLite. The initial closed command enum is exactly
+`task-create`, `task-list`, `task-get`, `task-update`, `task-close`, `post`, `read`, `peek`, `log`,
+`pin`, `unpin`, `pins`, `inspect`, `status`, `tail`, `perf`, `roster`, `help`, `init`, `sweep`, and
+`upgrade`, matching the authoritative public-command table. A checked-in parity test fails if that
+table/registry and the endpoint enum drift. `submit` and `react` retain their separate run-scoped
+schemas; removed commands and admin commands remain unavailable.
+
+Each public command has a closed, bounded request schema and invokes the existing command/core
+handler with the capability-derived repository. A supplied repository is only an assertion that
+must match that binding. The proxy preserves the command's validation, authorization, text-safety,
+output shape, and exit code; it grants no authority beyond the existing public handler and adds no
+collaboration, run-scoped, or admin operation. File and stdin inputs are read and UTF-8/NUL-
+validated by the contained CLI and sent as bounded content, never as a daemon-side path. Watches
+and tails use repeated bounded page requests with short DB reads rather than an open transaction
+or unbounded response. Thus containment removes direct DB access without removing the established
+managed-run public surface.
 
 ## MCP process and provider injection
 
-`quorum agent-mcp` is a short-lived tools-only MCP server over stdio. It uses the official Rust
-MCP SDK's stdio server transport at a Cargo.lock-pinned version and forwards typed operations to
-the daemon through the injected local agent endpoint. The endpoint is not a Repository Service
-or arbitrary database channel. Stdout is protocol-only; bounded diagnostics go to stderr and
-never include request bodies, responses, or capabilities.
+`quorum agent-mcp` is a managed-provider-process-scoped, tools-only MCP server over stdio. It uses
+the official Rust MCP SDK's stdio server transport at a Cargo.lock-pinned version and forwards
+typed operations to the daemon through the injected local agent endpoint. A persistent Claude
+child retains this same MCP process and connection across its stdin-fed turns; providers that
+respawn per turn receive a new process. The endpoint is not a Repository Service or arbitrary
+database channel. Stdout is protocol-only; bounded diagnostics go to stderr and never include
+request bodies, responses, or capabilities.
 
 The logical MCP server name is `github`, yielding familiar client-visible names such as
 `mcp__github__pull_request_read`. The daemon injects only this per-run server into ordinary worker
@@ -148,13 +197,34 @@ and reviewer launches:
   persistent Codex configuration and MUST preserve the provider-issued thread ID on resume.
 - Restricted classifiers, planners, collectors, and doctors receive no GitHub MCP.
 
-Provider CLI syntax is covered by real installed-binary argument tests. Fake runners are
-insufficient because malformed MCP configuration fails before their protocol begins.
+Claude keeps its established one persistent child and MCP connection across stdin-fed turns. Its
+MCP process keeps one authenticated duplex session to the local endpoint; ordinary CLI proxy
+requests remain independent bounded exchanges. After the same-capability handoff commits, the
+daemon sends that session a bounded `inventory_changed` control frame containing the new
+adapter-only descriptor and inventory hash. The control frame is never forwarded to the model. If
+the session is absent or the frame cannot be delivered, the pending turn remains unfed.
+
+On that frame, `quorum agent-mcp` invalidates its old collaboration descriptor, refuses
+collaboration calls as `stale_inventory`, and emits MCP `notifications/tools/list_changed`. The
+next client `tools/list` uses the new descriptor, returns the phase-scoped inventory, and
+acknowledges that exact inventory to the daemon. The daemon does not feed the rework prompt until
+that acknowledgement arrives within the existing bounded provider startup window. Failure to
+relist is a loud provider/configuration failure that preserves the exact pending rework turn; it
+never falls back to direct `gh` or exposes the union of both phase toolsets.
+
+Provider CLI syntax is covered by real installed-binary argument tests. The installed Claude
+boundary test also proves that the pinned client honors `tools/list_changed` and relists between
+two stdin turns. Fake runners are insufficient because malformed MCP configuration or a client
+that caches the first inventory fails outside their protocol. Rollout for warm Claude is blocked
+if that real-client inventory transition is not supported.
 
 ## Role-scoped tool inventory
 
-The server advertises only tools valid for the derived live run. An agent cannot discover a
-forbidden mutation and cannot enable a larger toolset through arguments or environment.
+The server advertises only tools valid for the derived live run, current collaboration attempt,
+and lifecycle generation. An agent cannot discover a forbidden mutation and cannot enable a
+larger toolset through arguments or environment. On a same-process phase change, the old list is
+invalid before the new one is acknowledged; endpoint authorization remains authoritative even if
+a client invokes a cached tool name.
 
 | Tool | Reviewer | Rework worker | Initial worker |
 |---|---:|---:|---:|
@@ -306,11 +376,15 @@ CREATE TABLE github_agent_operations (
   request_json        TEXT NOT NULL,
   state               TEXT NOT NULL
                       CHECK(state IN ('queued','running','succeeded','failed','cancelled')),
+  send_state          TEXT NOT NULL DEFAULT 'not_started'
+                      CHECK(send_state IN ('not_started','definitely_unsent',
+                                           'ambiguous','confirmed')),
   attempts            INTEGER NOT NULL DEFAULT 0,
   next_attempt_at     INTEGER,
   deadline_at         INTEGER NOT NULL,
   review_sequence     INTEGER,
   github_marker       TEXT,
+  remote_object_id    TEXT,
   response_json       TEXT,
   error_kind          TEXT,
   error_summary       TEXT,
@@ -350,13 +424,22 @@ CREATE TABLE github_review_publication_slots (
 
 Attempt states are `active`, `awaiting_resume`, `completed`, and `revoked`. Operation states are
 `queued`, `running`, `succeeded`, `failed`, and `cancelled`. Requests are immutable after enqueue;
-only execution state/result fields change. `request_json` and `response_json` use closed,
-kind-specific schemas and fixed aggregate limits. Terminal rows expire after a seven-day
-retention window. Nonterminal rows have a one-hour execution deadline and therefore cannot remain
-live indefinitely. An attempt becomes terminal with its exact lifecycle turn and expires only
-after all of its rows are terminal and any owned remote pending-review slot has been released;
-`active` and `awaiting_resume` attempts remain tied to the persisted exact pending turn rather
-than becoming reusable identities.
+only execution/send state and result fields change. Every outbound GitHub mutation uses the closed
+send states `not_started`, `definitely_unsent`, `ambiguous`, and `confirmed`; local delivery-report
+storage does not enter this remote executor. `request_json` and `response_json` use closed,
+kind-specific schemas and fixed aggregate limits. Terminal rows expire after a seven-day retention
+window. Nonterminal rows have a one-hour execution deadline and therefore cannot remain live
+indefinitely. An attempt becomes terminal with its exact lifecycle turn and expires only after all
+of its rows are terminal and any owned remote pending-review slot has been released; `active` and
+`awaiting_resume` attempts remain tied to the persisted exact pending turn rather than becoming
+reusable identities.
+
+State combinations are closed and enforced: `succeeded` requires `confirmed`; a send claim enters
+`running` only with `ambiguous`; a queued row is never `confirmed`; and `confirmed` is never sent
+again. Cancelling a queued `not_started` or `definitely_unsent` row retains that disposition as
+proof that it produced no remote effect. A terminal `failed` or `cancelled` row may retain
+`ambiguous` solely to record that remote disposition is unknown, but no ordinary or operator retry
+may turn that ambiguity into another mutation without the proof required below.
 
 Every mutation accepts an optional `clientRequestId`, matching the role of an idempotency key. If
 it is absent, the adapter derives it from the collaboration attempt, operation kind, target, and
@@ -364,10 +447,31 @@ canonical closed-schema request. The `operation_id` and hidden marker are determ
 attempt and client request ID. Identical retries across fresh-capability resumes of the exact turn
 therefore return the original durable operation without relying on agent discipline; a caller
 supplies a distinct ID only when intentionally repeating identical content. Every write body
-receives the marker where GitHub permits one. Before a row's first send, after a crash in the
-ambiguous post-request/pre-commit window, and before any resend, the daemon queries the exact
-PR/review/thread for that marker or an operation-specific idempotent state predicate. Expiry or
-re-creation of a row does not change its marker.
+receives the marker where GitHub permits one. Expiry or recovery of a row does not change its
+marker, request, or Repository Service idempotency key.
+
+A mutation send claim atomically changes `queued -> running` and
+`not_started|definitely_unsent -> ambiguous` in its guarded `BEGIN IMMEDIATE` transaction before
+Repository Service I/O. A successful response or exact marker/state reconciliation changes the
+row to `succeeded/confirmed` and persists the remote object ID when one exists. The same live
+invocation may record `definitely_unsent` only with a closed transport proof that no request was
+handed off: it returns to `queued` if authority remains valid or becomes `cancelled` if revocation
+won. Timeout, cancellation, process death, lost response, daemon crash, or an unrecognized result
+leaves `send_state=ambiguous`. For pending-review create, this operation state and the slot's
+`create_send_state` are a single coupled state machine: every transition compares and updates both
+in the same transaction, and disagreement blocks the slot as a storage fault.
+
+A due row with `send_state=ambiguous` is reconciliation-only. Its claim may query the exact
+PR/review/thread for the marker or an operation-specific idempotent state predicate, but it MUST
+NOT repeat a non-idempotent mutation merely because the marker is absent. A marker hit or predicate
+proving the requested effect records `confirmed`; an absent marker authorizes another send only if
+the Repository Service either applies the same stable idempotency key with an exactly-once replay
+contract or returns a closed operation-scope ordering fence proving the prior invocation has a
+terminal no-effect disposition and the marker read is linearized after it. The latter result moves
+the row to `definitely_unsent`; the next send claim must re-enter `ambiguous` before I/O. A generic
+GET, elapsed delay, consecutive empty reads, local child exit, or adapter restart is not a fence.
+Without marker evidence, an idempotent predicate, or one of those Repository Service guarantees,
+bounded recovery fails closed rather than risking a duplicate.
 
 Admission is checked in the enqueue transaction after logically expired terminal rows are swept.
 The fixed initial limits are 64 nonexpired operations created by one run, 128 per collaboration
@@ -408,10 +512,13 @@ never authorize a verdict.
 
 On graceful shutdown the daemon stops claiming new rows and gives a claimed Repository Service
 call only its existing 30-second kill/reap bound. Startup treats every orphaned `running` row as
-reconciliation-required. If its attempt is active or later exactly adopted, the executor checks
-the marker before resend. If the attempt is revoked, startup may perform the read-only marker
-check to record whether the already-authorized call landed, but it never resends; absent evidence
-becomes `cancelled`. Network calls, sleeps, and response parsing never hold a DB transaction.
+reconciliation-required with its persisted send state. If its attempt is active or later exactly
+adopted, the executor applies the ambiguity rules above before any possible resend. If the attempt
+is revoked, startup may perform the read-only marker/predicate check to record whether the
+already-authorized call landed, but it never resends. A definite pre-handoff failure may become
+`cancelled`; an absent marker for an ambiguous revoked write remains an inconclusive,
+non-resendable terminal record and may later record `completed_after_revocation=1` if the marker
+appears. Network calls, sleeps, and response parsing never hold a DB transaction.
 
 Each operation permits at most eight claim/reconciliation cycles and at most one hour from
 `created_at`; the earlier limit wins. Backoff is exponential with jitter and a fixed maximum.
@@ -420,14 +527,17 @@ automatic path sends it again. Saturation and exhaustion are infrastructure outc
 no `errors` row and consume no rework, reviewer-provision, or provider-retry budget. The caller
 receives the terminal result. If an exhausted operation is required by a pending lifecycle submit,
 the daemon uses the existing durable parking path and preserves the exact attempt and marker for
-operator recovery; recovery reconciles and requeues that same operation rather than minting a new
-ID.
+operator recovery; recovery reconciles that same operation rather than minting a new ID. An
+ambiguous exhausted row remains reconciliation-only after operator recovery unless the exact
+marker/predicate or Repository Service idempotency/fence proof authorizes a disposition.
 
-`github_operation_read` returns `queued`, `running`, `succeeded`, `failed`, or `cancelled` only
-when the caller is the live `active_run_id` of the operation's attempt. A freshly provisioned exact
-continuation can therefore observe adopted operations; a revoked prior run cannot. A tool call
-waits at most the existing 30-second publication bound; if unfinished it returns the operation ID
-and a pending result rather than blocking the agent or creating a second request.
+`github_operation_read` returns `queued`, `running`, `succeeded`, `failed`, or `cancelled`, plus
+the row's closed send disposition, only when the caller is the live `active_run_id` of the
+operation's attempt. It never returns the hidden marker or transport credentials. A freshly
+provisioned exact continuation can therefore observe adopted operations and distinguish a queued
+unsent write from reconciliation-required ambiguity; a revoked prior run cannot. A tool call waits
+at most the existing 30-second publication bound; if unfinished it returns the operation ID and a
+pending result rather than blocking the agent or creating a second request.
 
 ### Daemon-owned pending-review slot and cleanup
 
@@ -493,15 +603,16 @@ never resent merely because a pending-review read is empty. A late create result
 review ID and leaves the slot cleanup-required; it never replaces a newer owner.
 
 The daemon claims cleanup with a guarded `cleanup_required -> cleanup_running` update under
-`BEGIN IMMEDIATE`, commits, and performs no more than a bounded read/delete/re-read sequence
+`BEGIN IMMEDIATE`; that transaction also cancels every still-queued create row while retaining its
+send disposition. It commits, then performs no more than a bounded read/delete/re-read sequence
 through the Repository Service. It deletes only the current pending review with the exact stored
-owner marker, PR, publisher scope, launch SHA, and remote ID when known. After the guarded
-transition away from `owned` has made every queued create permanently unclaimable, no pending
-review is idempotent cleanup success for `not_started` or `definitely_unsent` because no invocation
-is in flight and no prior invocation can still land. A `confirmed` create has a persisted remote
-ID; cleanup addresses that exact ID instead of trusting an empty pending-review listing. An exact
-delete success, authoritative exact-ID lookup showing it is no longer pending, or 404 after the
-exact delete is success because the one create has already reached a terminal remote disposition.
+owner marker, PR, publisher scope, launch SHA, and remote ID when known. After that transition has
+made every queued create permanently unclaimable, no pending review is idempotent cleanup success
+for `not_started` or `definitely_unsent` because no invocation is in flight and no prior invocation
+can still land. A `confirmed` create has a persisted remote ID; cleanup addresses that exact ID
+instead of trusting an empty pending-review listing. An exact delete success, authoritative
+exact-ID lookup showing it is no longer pending, or 404 after the exact delete is success because
+the one create has already reached a terminal remote disposition.
 A timeout or crash after delete is reconciled through that exact ID: confirmed non-pending state
 completes cleanup, while the same exact marker may be retried. A foreign or ambiguous review is
 never deleted and makes the slot `blocked`.
@@ -585,6 +696,14 @@ operation to a trusted credential broker that mints exact-repository, minimum-pe
 short-lived GitHub App installation authority. The public runtime never receives Hosted user,
 installation, KMS, or session identity.
 
+Every mutation response uses a closed disposition: confirmed effect with exact remote evidence,
+definitely unsent with pre-handoff transport proof, or ambiguous. An adapter may additionally
+claim stable-key exactly-once replay or an operation-scope ordering fence only when its
+implementation and conformance tests prove the semantics stated in the outbox section. Ordinary
+GitHub/`gh` marker reads do not provide either guarantee. The initial self-hosted adapter therefore
+keeps a lost-response comment, inline finding, reply, or review submission reconciliation-only
+until its marker appears; bounded exhaustion parks/fails closed instead of resending from absence.
+
 Formal approval, request-changes, branch publication, cleanup, checks, and merge may share the
 Repository Service implementation later, but agent tools never expose those methods. The first
 increment must not combine this refactor with a semantic merge-flow rewrite.
@@ -601,10 +720,12 @@ components are infrastructure outcomes. They MUST NOT:
 - duplicate a comment, inline finding, reply, or submitted review.
 
 Retryable operations remain queued only within the fixed attempt and wall-clock bounds above,
-using bounded exponential backoff and jitter. Permanent closed-schema input errors fail the
-operation and return actionable tool feedback. Authorization loss, repository deselection,
-credential failure, or an invalid current PR target fails closed and is surfaced as an
-infrastructure/authority condition for operator recovery; it is never rewritten as code rework.
+using bounded exponential backoff and jitter. A queued `ambiguous` row retries reconciliation,
+not the mutation; only `not_started` or `definitely_unsent` may take a send claim. Permanent
+closed-schema input errors fail the operation and return actionable tool feedback. Authorization
+loss, repository deselection, credential failure, or an invalid current PR target fails closed and
+is surfaced as an infrastructure/authority condition for operator recovery; it is never rewritten
+as code rework.
 
 A reviewer lifecycle submit is atomically rejected unless the sealed review sequence satisfies
 the complete predecessor and immutable-SHA guard above. This is a core submit guard, not a prompt
@@ -655,7 +776,9 @@ Required tests include:
 - a worker cannot advertise or invoke reviewer-only tools;
 - a reviewer cannot request APPROVE, REQUEST_CHANGES, merge, PR creation, or a raw API call;
 - run A cannot address task, PR, revision, operation, comment, or thread belonging to run B;
-- the local agent endpoint rejects public/admin CLI commands, raw SQL, and unknown operations;
+- the contained CLI reaches every checked-in public command through the endpoint with matching
+  validation, output, and exit codes, while admin/removed commands, raw SQL, daemon paths, and
+  unknown operations are rejected;
 - revoked and ended capabilities enqueue nothing;
 - queued writes are cancelled on task cancellation, phase exit, non-resumable revocation, and
   reviewer head movement; a running write in each race is reconciled at most once and never
@@ -664,6 +787,13 @@ Required tests include:
   reconciliation rules without inferring a lifecycle outcome;
 - a fresh capability for the exact persisted Claude/Codex continuation adopts the same attempt,
   operation IDs, markers, and pending review, while a changed task/role/PR/SHA/turn cannot adopt;
+- a persistent Claude initial-worker turn, intervening review, and warm rework turn use the same
+  live run capability but distinct attempt IDs and lifecycle generations; the guarded handoff
+  cancels old queued work, waits for claimed/ambiguous work to reach a safe disposition, and
+  rejects stale-descriptor operations without inserting them into the new attempt;
+- the real installed Claude client receives only the initial inventory on turn one, honors
+  `tools/list_changed`, relists, and receives only the rework inventory before its stdin-fed turn;
+  a missing relist prevents that turn from being fed and preserves it for recovery;
 - crash after pending-review create, cancellation/head movement racing create, and a failed or
   cancelled post-create sequence all leave a marker-owned cleanup barrier that survives restart;
 - cleanup cannot claim until every old review network child has completed or been killed, reaped,
@@ -680,6 +810,10 @@ Required tests include:
 - repeated empty reads for an ambiguous create exhaust into `blocked`, while immediate absence is
   terminal only for persisted `not_started`/`definitely_unsent` state or after the specified
   remote fence;
+- for each of general comments, pending-review inline comments, and thread replies, the fake
+  Repository Service accepts the mutation, loses the response, returns an empty marker read, and
+  exposes the marker later; no second mutation is sent, and bounded empty reconciliation without a
+  qualifying fence fails closed;
 - cleanup deletes only the exact daemon-owned pending review, reconciles crash-after-delete as
   success, and blocks without deletion on a foreign/missing marker, mismatched ID/SHA, or outage;
 - shutdown during probe/delete retains the slot and startup reconciles it before any new reviewer;
@@ -690,7 +824,8 @@ Required tests include:
 - authored Markdown with lists, tables, fences, suggestions, Unicode, quotes, and newlines reaches
   the fake GitHub boundary structurally unchanged;
 - NUL, invalid schema, oversized bodies/results, excessive pages/comments, and unknown fields fail;
-- crash-after-GitHub-success reconciliation produces exactly one visible contribution;
+- crash-after-GitHub-success reconciliation for every non-idempotent mutation produces exactly one
+  visible contribution, and generic marker absence alone never increments the mutation-call count;
 - concurrent duplicate requests produce exactly one outbox row and GitHub write;
 - distinct-ID saturation at the run, attempt, task, and repository caps rejects admission without
   a row, attempt-table saturation rejects provisioning without a row, and prolonged outage
@@ -710,37 +845,41 @@ Required tests include:
 Every implementation task is deliberately small or medium and independently reviewable.
 
 1. **M — Agent endpoint, MCP shell, and capability-derived inventory.** Add the narrow daemon
-   endpoint, stable collaboration-attempt issuance and exact-continuation adoption, route managed
-   `submit`/`react` without semantic changes, add the stdio server and closed schemas, derive
-   role/target in the daemon, and prove the adapter has no direct database or GitHub execution
-   access.
+   endpoint, stable collaboration-attempt issuance, fresh-capability adoption and same-capability
+   turn handoff, route managed `submit`/`react` without semantic changes, add the stdio server and
+   closed schemas, derive role/target in the daemon, and prove the adapter has no direct database or
+   GitHub execution access.
 2. **M — Durable operation outbox and daemon executor skeleton.** Add the migration, atomic
    enqueue/claim/revalidation/revocation/result/recovery paths, fixed admission and retry bounds,
-   retention, publication-slot reservation, persisted create ambiguity, bounded cleanup/status
-   skeleton, shutdown reconciliation, and fake Repository Service.
+   retention, persisted generic send ambiguity, publication-slot reservation, bounded
+   cleanup/status skeleton, shutdown reconciliation, and fake Repository Service.
 3. **M — PR read and general-comment operations.** Add bounded reads, exact target checks,
-   Markdown-safe general comments, markers, and outage classification.
+   Markdown-safe general comments, markers, ambiguity fencing, and outage classification.
 4. **M — Pending reviews and inline findings.** Add create/resume/submit COMMENT review,
    validated single/multiline anchors for the launch SHA, durable sequence/seal dependencies, and
-   marker-verified orphan-draft cleanup and ambiguity fencing across restart/re-review/R1-to-R2,
-   plus the complete-publication-before-verdict submit guard.
+   marker-verified orphan-draft cleanup plus create/inline/submit ambiguity fencing across
+   restart/re-review/R1-to-R2, and the complete-publication-before-verdict submit guard.
 5. **S — Thread replies and reviewer resolution.** Add exact-PR comment lookup, true threaded
-   replies, outdated context, and reviewer-only resolution.
-6. **S — Claude per-run MCP injection.** Add explicit strict config for initial/resumed managed
-   roles and real-binary boundary tests.
+   replies, reply ambiguity fencing, outdated context, and reviewer-only resolution.
+6. **M — Claude persistent MCP injection and inventory refresh.** Add explicit strict config for
+   initial/resumed managed roles, same-process `tools/list_changed` handoff, and real-binary
+   two-turn inventory tests.
 7. **M — Codex per-run MCP injection.** Add invocation-local config for initial/resumed threads
    and real-binary boundary tests.
 8. **M — Managed prompt and credential-boundary migration.** Replace direct `gh` collaboration
-   instructions, preserve local `git`, scrub inherited GitHub auth/config, and add negative tests.
+   instructions only after public-command parity and phase-inventory gates pass, preserve local
+   `git`, scrub inherited GitHub auth/config, and add negative tests.
 9. **M — Delivery reports and initial PR renderer.** Persist bounded reports and render accepted
    task, changes, verification, and notes without changing existing-PR bodies.
 10. **M — Isolated-runtime GitHub boundary.** Update the public Docker contract and smoke tests so
-    agent runtime inputs contain no GitHub credential and remote writes require the daemon/broker.
+    agent runtime inputs contain no GitHub credential or database, remote writes require the
+    daemon/broker, and the closed public-command proxy reuses the existing handlers and passes its
+    registry-parity suite through the contained endpoint.
 
 Slices 1 and 2 are foundations. Slice 3 depends on both. Slice 4 depends on 3. Slice 5 depends on
 4. Slices 6 and 7 depend on 1 and can proceed independently. Slice 8 depends on 3–7. Slice 9
-depends on 1–3. Slice 10 depends on 2, 6, 7, and 8. No task may broaden itself into the outside MCP
-or Hosted control-plane implementation.
+depends on 1–3. Slice 10 depends on 1, 2, 6, 7, and 8. No task may broaden itself into the
+outside MCP or Hosted control-plane implementation.
 
 ## Rollout
 
@@ -748,6 +887,13 @@ The MCP is enabled for managed agents only when the daemon executor and applicab
 are ready. There is no silent fallback to direct `gh` inside a managed prompt: a missing MCP is a
 loud provider/configuration failure. Operators may continue using ordinary `gh` outside managed
 runs.
+
+Contained rollout additionally requires parity for every registered public command and the
+installed-Claude two-turn inventory test. A warm persistent Claude worker is not migrated until it
+can complete the same-capability attempt handoff, acknowledge the rework inventory, and reject old
+turn descriptors. Until those gates pass, that provider/profile remains on the existing managed
+runtime as one unit; Quorum does not partially remove its public CLI or direct-collaboration
+instructions.
 
 During migration, formal daemon GitHub commands and the collector retain their existing paths.
 After all managed collaboration prompts use MCP and negative tests pass, the design may remove the
