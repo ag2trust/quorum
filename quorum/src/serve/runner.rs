@@ -100,6 +100,11 @@ pub(super) struct FailureObservation {
     pub detail: Option<String>,
     pub terminal_success: bool,
     pub unknown_failure: bool,
+    /// Bounded stderr that has no recognized provider meaning is retained for
+    /// an unsuccessful exit, but cannot by itself contradict a completed
+    /// Codex planner turn. Codex can emit informational stderr while it is
+    /// still producing valid JSONL.
+    pub deferred_stderr: bool,
 }
 
 impl FailureObservation {
@@ -109,6 +114,7 @@ impl FailureObservation {
             detail: None,
             terminal_success: false,
             unknown_failure: false,
+            deferred_stderr: false,
         }
     }
 
@@ -118,6 +124,7 @@ impl FailureObservation {
             detail: Some(detail.into()),
             terminal_success: false,
             unknown_failure: false,
+            deferred_stderr: false,
         }
     }
 
@@ -127,6 +134,15 @@ impl FailureObservation {
             detail: Some(detail.into()),
             terminal_success: false,
             unknown_failure: true,
+            deferred_stderr: false,
+        }
+    }
+
+    pub fn deferred_stderr(detail: impl Into<String>) -> Self {
+        Self {
+            detail: Some(detail.into()),
+            deferred_stderr: true,
+            ..Self::inert()
         }
     }
 
@@ -149,6 +165,7 @@ struct FailureTrackerState {
     terminal_success: bool,
     saw_protocol_line: bool,
     unknown_failure: Option<String>,
+    deferred_stderr: Option<String>,
     incomplete_evidence: Option<String>,
 }
 
@@ -219,6 +236,9 @@ impl FailureTracker {
         if observation.unknown_failure && state.unknown_failure.is_none() {
             state.unknown_failure = observation.detail.clone();
         }
+        if observation.deferred_stderr && state.deferred_stderr.is_none() {
+            state.deferred_stderr = observation.detail.clone();
+        }
         let Some(disposition) = observation.disposition else {
             return;
         };
@@ -260,6 +280,23 @@ impl FailureTracker {
         observed_failure(&state)
     }
 
+    /// Planner-only view: unknown bounded Codex stderr is useful evidence if
+    /// the process exits without a terminal result, but is not authoritative
+    /// while valid JSONL is still arriving.
+    pub fn observed_planner_live_failure(&self) -> Option<RunnerFailure> {
+        let state = self.0.lock().expect("failure tracker poisoned");
+        observed_failure_without_deferred_stderr(&state)
+    }
+
+    /// Planner-only terminal-success view. A clean Codex exit after
+    /// `turn.completed` wins over informational/unclassified stderr, while
+    /// all protocol, classified, conflicting, and read-boundary evidence
+    /// remains fail-closed.
+    pub fn observed_planner_terminal_failure(&self) -> Option<RunnerFailure> {
+        let state = self.0.lock().expect("failure tracker poisoned");
+        observed_strict_failure_without_deferred_stderr(&state)
+    }
+
     /// Grok withholds terminal success until EOF and zero exit, so any earlier
     /// protocol/diagnostic failure remains authoritative even if a later
     /// syntactically valid `end` was observed. Other providers retain their
@@ -277,7 +314,47 @@ fn observed_failure(state: &FailureTrackerState) -> Option<RunnerFailure> {
     observed_strict_failure(state)
 }
 
+fn observed_failure_without_deferred_stderr(state: &FailureTrackerState) -> Option<RunnerFailure> {
+    if state.terminal_success {
+        return None;
+    }
+    observed_strict_failure_without_deferred_stderr(state)
+}
+
 fn observed_strict_failure(state: &FailureTrackerState) -> Option<RunnerFailure> {
+    if let Some(detail) = &state.incomplete_evidence {
+        return Some(RunnerFailure::new(
+            FailureDisposition::Unclassified,
+            detail.clone(),
+        ));
+    }
+    if state.conflicting {
+        return Some(RunnerFailure::new(
+            FailureDisposition::Unclassified,
+            "provider emitted conflicting failure evidence",
+        ));
+    }
+    if let Some(failure) = &state.classified {
+        return Some(failure.clone());
+    }
+    if let Some(detail) = &state.unknown_failure {
+        return Some(RunnerFailure::new(
+            FailureDisposition::Unclassified,
+            detail.clone(),
+        ));
+    }
+    if let Some(detail) = &state.deferred_stderr {
+        return Some(RunnerFailure::new(
+            FailureDisposition::Unclassified,
+            detail.clone(),
+        ));
+    }
+    None
+}
+
+fn observed_strict_failure_without_deferred_stderr(
+    state: &FailureTrackerState,
+) -> Option<RunnerFailure> {
     if let Some(detail) = &state.incomplete_evidence {
         return Some(RunnerFailure::new(
             FailureDisposition::Unclassified,
@@ -814,9 +891,18 @@ impl RunnerProc {
         }
     }
 
-    /// Return any failure or incomplete evidence even after a syntactic
-    /// terminal-success record. Callers must first finalize bounded process
-    /// evidence and prove the provider process exited successfully.
+    pub fn observed_planner_live_failure(&self) -> Option<RunnerFailure> {
+        self.failure_tracker().observed_planner_live_failure()
+    }
+
+    pub fn observed_planner_terminal_failure(&self) -> Option<RunnerFailure> {
+        self.failure_tracker().observed_planner_terminal_failure()
+    }
+
+    /// Return any bounded failure evidence even after a syntactic terminal
+    /// record. A caller that has separately established a nonzero exit must
+    /// use this strict view so deferred stderr remains available for its
+    /// durable failure summary.
     pub fn observed_strict_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
         self.failure_tracker().observed_strict_failure()
     }
