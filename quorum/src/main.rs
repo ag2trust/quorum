@@ -147,6 +147,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Message { .. } => "message",
         cli::Command::React { .. } => "react",
         cli::Command::Submit { .. } => "submit",
+        cli::Command::ReviewDraft { .. } => "review-draft",
         cli::Command::Serve { .. } => "serve",
         cli::Command::SessionRegister { .. } => "session-register",
         cli::Command::Activity { .. } => "activity",
@@ -1025,6 +1026,35 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 note: summary,
                 to_agent: None,
                 payload,
+            };
+            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
+        cli::Command::ReviewDraft {
+            agent,
+            pr,
+            blocking,
+            feedback_file,
+            run_id,
+        } => {
+            let feedback = input::read_text(input::TextSource::File(feedback_file))?;
+            verdict::validate_review_draft(blocking, &feedback).map_err(QuorumError::Usage)?;
+            let rid = resolve_run_id(run_id, "review-draft")?;
+            let db = paths::db_path()?;
+            let mut conn = quorum_core::db::open(&db)?;
+            let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, "reviewer", None)
+                .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
+            let row = quorum_core::mailbox::MailboxRow {
+                agent,
+                kind: quorum_core::mailbox::MailboxKind::ReviewDraft,
+                task_id: Some(cap.task_id),
+                pr: Some(pr),
+                verdict: None,
+                feedback: Some(feedback),
+                note: None,
+                to_agent: None,
+                payload: verdict::attestation_payload(Some(blocking)),
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));

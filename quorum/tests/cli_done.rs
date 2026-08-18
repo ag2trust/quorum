@@ -523,6 +523,179 @@ fn submit_with_valid_run_id_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
+// review-draft — non-authoritative reviewer continuation signal
+// ---------------------------------------------------------------------------
+
+fn write_draft_feedback(home: &std::path::Path, body: &[u8]) -> std::path::PathBuf {
+    let path = home.join("draft-feedback.txt");
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn review_draft_requires_matching_reviewer_run_identity() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    let feedback = write_draft_feedback(home.path(), b"Need another analysis pass.");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env_remove("QUORUM_RUN_ID")
+        .args([
+            "review-draft",
+            "--agent",
+            "Reviewer",
+            "--pr",
+            "60",
+            "--blocking",
+            "1",
+            "--feedback-file",
+        ])
+        .arg(&feedback)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("requires daemon run identity"));
+
+    issue_cap(home.path(), "worker-run", 8, "Worker", "worker");
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "worker-run")
+        .args([
+            "review-draft",
+            "--agent",
+            "Worker",
+            "--pr",
+            "60",
+            "--blocking",
+            "1",
+            "--feedback-file",
+        ])
+        .arg(&feedback)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("role mismatch"));
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    assert!(quorum_core::mailbox::poll_unconsumed(&conn)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn review_draft_rejects_zero_or_invalid_feedback_before_mailbox_write() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "review-run", 8, "Reviewer", "reviewer");
+    let valid = write_draft_feedback(home.path(), b"Need another analysis pass.");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "review-run")
+        .args([
+            "review-draft",
+            "--agent",
+            "Reviewer",
+            "--pr",
+            "60",
+            "--blocking",
+            "0",
+            "--feedback-file",
+        ])
+        .arg(&valid)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("positive --blocking"));
+
+    let missing = home.path().join("missing-feedback.txt");
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "review-run")
+        .args([
+            "review-draft",
+            "--agent",
+            "Reviewer",
+            "--pr",
+            "60",
+            "--blocking",
+            "1",
+            "--feedback-file",
+        ])
+        .arg(&missing)
+        .assert()
+        .code(2);
+
+    let invalid = write_draft_feedback(home.path(), b"bad\0summary");
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "review-run")
+        .args([
+            "review-draft",
+            "--agent",
+            "Reviewer",
+            "--pr",
+            "60",
+            "--blocking",
+            "1",
+            "--feedback-file",
+        ])
+        .arg(&invalid)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("embedded NUL"));
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    assert!(quorum_core::mailbox::poll_unconsumed(&conn)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn review_draft_writes_capability_bound_distinct_mailbox_row() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "review-run", 8, "Reviewer", "reviewer");
+    let feedback =
+        write_draft_feedback(home.path(), b"Check the cancellation path before deciding.");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "review-run")
+        .args([
+            "review-draft",
+            "--agent",
+            "Reviewer",
+            "--pr",
+            "60",
+            "--blocking",
+            "2",
+            "--feedback-file",
+        ])
+        .arg(&feedback)
+        .assert()
+        .success();
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let rows = quorum_core::mailbox::poll_unconsumed(&conn).unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0].1;
+    assert_eq!(row.kind, quorum_core::mailbox::MailboxKind::ReviewDraft);
+    assert_eq!(row.task_id, Some(8));
+    assert_eq!(row.pr, Some(60));
+    assert_eq!(row.verdict, None);
+    assert_eq!(
+        row.feedback.as_deref(),
+        Some("Check the cancellation path before deciding.")
+    );
+    assert_eq!(row.payload.as_deref(), Some("{\"blocking\":2}"));
+}
+
+// ---------------------------------------------------------------------------
 // `quorum done` (deprecated alias, must still work)
 // ---------------------------------------------------------------------------
 
