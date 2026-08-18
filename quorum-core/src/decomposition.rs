@@ -494,6 +494,7 @@ fn planning_retry_candidate(
                AND (t.refs IS NULL OR (
                     json_valid(t.refs)
                     AND json_type(t.refs,'$.pr') IS NULL
+                    AND json_type(t.refs,'$.daemon_publication') IS NULL
                     AND json_type(t.refs,'$.recovery_delivery') IS NULL))
                AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.graph_id=d.id)
                AND NOT EXISTS (SELECT 1 FROM decomposition_cleanup c WHERE c.graph_id=d.id)
@@ -4376,6 +4377,9 @@ mod tests {
             "UPDATE tasks SET reviewer='reviewer' WHERE id=1",
             "UPDATE tasks SET completion_provenance='merged' WHERE id=1",
             "UPDATE tasks SET refs=json_object('pr',42) WHERE id=1",
+            "UPDATE tasks SET refs=json_object('daemon_publication',json_object(\
+                 'pr',42,'branch','daemon/source','local_sha','abc',\
+                 'expected_remote_sha','def','stage','push')) WHERE id=1",
         ] {
             let (conn, graph) = exhausted_provider();
             conn.execute(mutation, []).unwrap();

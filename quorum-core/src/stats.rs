@@ -3421,6 +3421,22 @@ mod tests {
         assert_eq!(graph.operator_retry_cap, 2);
 
         c.execute(
+            "UPDATE tasks SET refs=json_object('daemon_publication',json_object(\
+                 'pr',42,'branch','daemon/source','local_sha','abc',\
+                 'expected_remote_sha','def','stage','push')) WHERE id=?1",
+            [source],
+        )
+        .unwrap();
+        assert!(
+            !decomposition_status(&c, 100)
+                .unwrap()
+                .unwrap()
+                .retryable_planning_hold
+        );
+        c.execute("UPDATE tasks SET refs=NULL WHERE id=?1", [source])
+            .unwrap();
+
+        c.execute(
             "UPDATE task_decompositions SET provider_failures=2 WHERE id=?1",
             [graph_id],
         )
