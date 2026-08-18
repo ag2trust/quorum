@@ -7781,7 +7781,14 @@ async fn tick(
                         row.agent, reviewer_task_id
                     ));
                     let reviewer = reviewers.remove(ri);
-                    teardown_reviewer(config, wt_mgr, name_pool, reviewer, "graph-blocker").await;
+                    teardown_reviewer_after_recorded_outcome(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        reviewer,
+                        "graph-blocker",
+                    )
+                    .await;
                     if let Some(wi) = workers
                         .iter()
                         .position(|worker| worker.task_id == reviewer_task_id)
@@ -8107,18 +8114,25 @@ async fn tick(
                                     }
                                 }
                                 let r = reviewers.remove(ri);
-                                teardown_reviewer(
-                                    config,
-                                    wt_mgr,
-                                    name_pool,
-                                    r,
-                                    if r2_added {
-                                        "r2-pending"
-                                    } else {
-                                        "r2-spawn-failed"
-                                    },
-                                )
-                                .await;
+                                if r2_added {
+                                    teardown_reviewer_after_authority_transfer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "r2-pending",
+                                    )
+                                    .await;
+                                } else {
+                                    teardown_reviewer_after_recorded_outcome(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "r2-spawn-failed",
+                                    )
+                                    .await;
+                                }
                                 if let PreReviewChecksGate::Failed { failing_checks } = ci_gate {
                                     pre_review_checks.remove(&reviewer_task_id);
                                     handle_pre_review_checks_failure(
@@ -8144,8 +8158,14 @@ async fn tick(
                                  counterpart, R1 approval stored, Phase 5 will retry"
                                 ));
                                 let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r, "r2-no-branch")
-                                    .await;
+                                teardown_reviewer_after_recorded_outcome(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    r,
+                                    "r2-no-branch",
+                                )
+                                .await;
                                 if !consume_mailbox_row(&db_path, *id).await {
                                     break;
                                 }
@@ -8294,7 +8314,14 @@ async fn tick(
                         )
                         .await;
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r, "stale-sha").await;
+                        teardown_reviewer_after_recorded_outcome(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            r,
+                            "stale-sha",
+                        )
+                        .await;
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -8335,7 +8362,14 @@ async fn tick(
                             cleanup_slot(config, wt_mgr, name_pool, w, None, "merged").await;
                         }
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
+                        teardown_reviewer_after_recorded_outcome(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            r,
+                            "verdict:approved",
+                        )
+                        .await;
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -8394,8 +8428,14 @@ async fn tick(
                             set_task_body(&db_path, reviewer_task_id, tasks::MERGE_BLOCKED_BODY)
                                 .await;
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
-                                .await;
+                            teardown_reviewer_after_recorded_outcome(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                "verdict:approved",
+                            )
+                            .await;
                         } else {
                             // Non-review-only: fire MergeConflict (merging → rework
                             // directly, skipping the reviewer hop).
@@ -8545,7 +8585,7 @@ async fn tick(
                                 Some(_) => {
                                     // Rework cap exceeded → failed. Clean up.
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -8571,7 +8611,7 @@ async fn tick(
                                 None => {
                                     // MergeConflict event failed — clean up.
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -8837,7 +8877,7 @@ async fn tick(
                                 Some(_) => {
                                     // Rework cap exceeded → failed. Clean up.
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -8862,7 +8902,7 @@ async fn tick(
                                 }
                                 None => {
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -9061,7 +9101,7 @@ async fn tick(
                                     }
                                     Some(_) => {
                                         let r = reviewers.remove(ri);
-                                        teardown_reviewer(
+                                        teardown_reviewer_after_recorded_outcome(
                                             config,
                                             wt_mgr,
                                             name_pool,
@@ -9087,7 +9127,7 @@ async fn tick(
                                     }
                                     None => {
                                         let r = reviewers.remove(ri);
-                                        teardown_reviewer(
+                                        teardown_reviewer_after_recorded_outcome(
                                             config,
                                             wt_mgr,
                                             name_pool,
@@ -9410,7 +9450,7 @@ async fn tick(
                                 }
                                 Some(_) => {
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -9435,7 +9475,7 @@ async fn tick(
                                 }
                                 None => {
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -9564,7 +9604,14 @@ async fn tick(
                         }
 
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
+                        teardown_reviewer_after_recorded_outcome(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            r,
+                            "verdict:approved",
+                        )
+                        .await;
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
                         {
                             let w = workers.remove(wi);
@@ -9607,8 +9654,14 @@ async fn tick(
                                 )
                                 .await;
                                 let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
-                                    .await;
+                                teardown_reviewer_after_recorded_outcome(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    r,
+                                    "verdict:approved",
+                                )
+                                .await;
                                 if let Some(wi) =
                                     workers.iter().position(|w| w.task_id == reviewer_task_id)
                                 {
@@ -9652,7 +9705,7 @@ async fn tick(
                                     )
                                     .await;
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(
+                                    teardown_reviewer_after_recorded_outcome(
                                         config,
                                         wt_mgr,
                                         name_pool,
@@ -9814,7 +9867,7 @@ async fn tick(
                                         Some(_) => {
                                             // Rework cap exceeded → failed. Clean up.
                                             let r = reviewers.remove(ri);
-                                            teardown_reviewer(
+                                            teardown_reviewer_after_recorded_outcome(
                                                 config,
                                                 wt_mgr,
                                                 name_pool,
@@ -9840,7 +9893,7 @@ async fn tick(
                                         }
                                         None => {
                                             let r = reviewers.remove(ri);
-                                            teardown_reviewer(
+                                            teardown_reviewer_after_recorded_outcome(
                                                 config,
                                                 wt_mgr,
                                                 name_pool,
@@ -10086,8 +10139,14 @@ async fn tick(
                         Some(_) => {
                             // Rework cap exceeded → failed. Clean up both.
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:changes")
-                                .await;
+                            teardown_reviewer_after_recorded_outcome(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                "verdict:changes",
+                            )
+                            .await;
                             if let Some(wi) =
                                 workers.iter().position(|w| w.task_id == reviewer_task_id)
                             {
@@ -17207,6 +17266,46 @@ async fn teardown_reviewer(
         .await;
 }
 
+/// A Phase 2 mailbox verdict has already been made durable. Any provider
+/// terminal record recovered during cleanup is observational only.
+async fn teardown_reviewer_after_recorded_outcome(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    state: SlotState,
+    end_reason: &str,
+) {
+    teardown_reviewer_with_terminal_action(
+        config,
+        wt_mgr,
+        name_pool,
+        state,
+        end_reason,
+        Some(TerminalUsageAction::RecordedOutcomeCleanup),
+    )
+    .await;
+}
+
+/// A Phase 2 verdict handed review authority to another reviewer. Late
+/// provider telemetry remains cleanup-only for the retired reviewer.
+async fn teardown_reviewer_after_authority_transfer(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    state: SlotState,
+    end_reason: &str,
+) {
+    teardown_reviewer_with_terminal_action(
+        config,
+        wt_mgr,
+        name_pool,
+        state,
+        end_reason,
+        Some(TerminalUsageAction::TransferredOwnershipCleanup),
+    )
+    .await;
+}
+
 async fn teardown_reviewer_with_terminal_action(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -17214,13 +17313,13 @@ async fn teardown_reviewer_with_terminal_action(
     mut state: SlotState,
     end_reason: &str,
     terminal_action: Option<TerminalUsageAction>,
-) {
+) -> Option<serde_json::Value> {
     let mut usage = managed_usage_record(&state, "reviewer");
     log(&format!("tearing down reviewer {}", state.agent_name));
 
     let runner_kind = state.proc.kind();
     let terminal = state.proc.kill_and_reap().await;
-    if let Some(action) = terminal_action {
+    let diagnostic = if let Some(action) = terminal_action {
         record_captured_terminal_usage_fields(
             "reviewer",
             &config.limits,
@@ -17238,10 +17337,11 @@ async fn teardown_reviewer_with_terminal_action(
             state.last_event_at,
             state.task_started_at,
             &mut state.session_log,
-        );
+        )
     } else {
         capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
-    }
+        None
+    };
     persist_terminal_output(&mut state.session_log, terminal);
     usage.usage = state.token_usage;
     if let Some(ref mut sl) = state.session_log {
@@ -17278,6 +17378,7 @@ async fn teardown_reviewer_with_terminal_action(
 
     name_pool.release(&state.agent_name);
     log(&format!("reviewer {} torn down", state.agent_name));
+    diagnostic
 }
 
 /// Record an R2 audit row from stashed metadata (best-effort).
@@ -23260,6 +23361,225 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .find(|run| run.id == reviewer_run_id)
             .unwrap();
         assert_eq!(run.end_reason.as_deref(), Some("attachment-failed"));
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, reviewer_run_id)
+                .unwrap()
+                .unwrap(),
+            quorum_core::token_usage::TokenUsage {
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 3,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mailbox_verdict_before_buffered_reviewer_terminal_emits_recorded_cleanup_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviewer-verdict-terminal.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id, mailbox_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "reviewer terminal cleanup",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("author must claim fixture task");
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Reviewer", Some(task_id), &[], 3600, now + 2)
+                .unwrap()
+                .expect("reviewer must claim fixture task");
+            let reviewer_run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "Reviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now + 2,
+            )
+            .unwrap();
+            let mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Reviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(464),
+                    verdict: Some("changes".into()),
+                    feedback: Some("fix the blocker".into()),
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Reviewer",
+                task_id,
+                &Event::VerdictChanges,
+                now + 3,
+            )
+            .unwrap();
+            (task_id, reviewer_run_id, mailbox_id)
+        };
+
+        let fixture = dir.path().join("reviewer-terminal.sh");
+        std::fs::write(
+            &fixture,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":80,\"cache_write_input_tokens\":10,\"output_tokens\":5,\"reasoning_output_tokens\":3}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let proc = runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: &repo_dir,
+                prompt: "review",
+                environment: &[],
+                mode: runner::LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &runner::AdapterConfig {
+                executable: fixture.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut reviewer = slot_with_process(proc);
+        reviewer.agent_name = "Reviewer".into();
+        reviewer.task_id = task_id;
+        reviewer.agent_run_id = Some(reviewer_run_id);
+        reviewer.worktree_path = dir.path().join("review-worktree");
+        reviewer.branch = "reviewer-terminal-fixture".into();
+        reviewer.cost_tokens = 0;
+        reviewer.limit_tokens = 0;
+        reviewer.cost_usd = 0.0;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if reviewer.try_wait().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture provider must buffer its terminal record before teardown");
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir);
+        config.limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Reviewer").unwrap();
+        let diagnostic = teardown_reviewer_with_terminal_action(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            reviewer,
+            "verdict:changes",
+            Some(TerminalUsageAction::RecordedOutcomeCleanup),
+        )
+        .await
+        .expect("buffered terminal record must emit a diagnostic");
+
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::mark_consumed(&mut conn, mailbox_id).unwrap();
+        }
+        assert_eq!(diagnostic["event"], "terminal_usage");
+        assert_eq!(diagnostic["role"], "reviewer");
+        assert_eq!(diagnostic["agent"], "Reviewer");
+        assert_eq!(diagnostic["task_id"], task_id);
+        assert_eq!(diagnostic["provider"], "codex");
+        assert_eq!(diagnostic["raw_input_tokens"], 100);
+        assert_eq!(diagnostic["uncached_input_tokens"], 20);
+        assert_eq!(diagnostic["cached_input_tokens"], 80);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 10);
+        assert_eq!(diagnostic["output_tokens"], 5);
+        assert_eq!(diagnostic["reasoning_tokens"], 3);
+        assert_eq!(diagnostic["raw_total_tokens"], 105);
+        assert_eq!(diagnostic["uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 105);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_limit_tokens"], 105);
+        assert_eq!(diagnostic["configured_limit_basis"], "raw");
+        assert_eq!(diagnostic["configured_max_task_tokens"], 100);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["breach"], true);
+        assert!(diagnostic["breach_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("task tokens (raw) 105 exceeded limit 100")));
+        assert_eq!(diagnostic["action"], "recorded_outcome_cleanup");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "rework"
+        );
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1,
+            "cleanup must not duplicate the reviewer run"
+        );
+        let rework_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_rework'",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rework_events, 1, "cleanup must not replay the verdict");
+        let alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind='alert'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alerts, 0, "recorded cleanup must not raise an alert");
         assert_eq!(
             quorum_core::token_usage::usage_for_agent_run(&conn, reviewer_run_id)
                 .unwrap()
