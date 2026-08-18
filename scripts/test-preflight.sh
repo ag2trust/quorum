@@ -51,7 +51,8 @@ git remote add origin "$REMOTE"
 
 printf 'base\n' > state
 printf 'pub fn tracked_fixture() {}\n' > tracked.rs
-git add state tracked.rs
+printf '/target\n' > .gitignore
+git add .gitignore state tracked.rs
 git commit -qm 'base'
 git branch -M main
 git push -q origin main
@@ -943,6 +944,7 @@ PY
 # Cargo's compile/no-run diagnostics are captured by the structured collector,
 # then replayed by preflight before it returns the same failure status as the
 # former direct `cargo test` gate.
+rm -f target/preflight-timing/last-green.json
 if PREFLIGHT_CARGO_FAIL=compile PATH="$BIN:$PATH" ./preflight.sh \
   >"$TMP/full-compile-failure.out" 2>&1; then
   echo 'expected compile/no-run failure to reject full preflight' >&2
