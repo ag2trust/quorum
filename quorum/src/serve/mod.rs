@@ -13552,11 +13552,50 @@ async fn dispose_dead_turn_runner_worker(
 /// dormant worker whose crash-recovery row still advertises the reaped process
 /// PID and a stale phase — restart recovery trusts that PID and would call
 /// `killpg` on whatever process group has since reused it.
-async fn park_worker_slot_dormant(db_path: &Path, slot: &mut SlotState) -> std::io::Result<()> {
+async fn park_worker_slot_dormant(
+    db_path: &Path,
+    slot: &mut SlotState,
+    limits: &CostLimits,
+) -> std::io::Result<()> {
     let runner_kind = slot.process_kind();
     let old = slot.become_dormant()?;
     let captured = old.kill_and_reap().await;
-    capture_terminal_usage(runner_kind, &captured, &mut slot.token_usage);
+    if let Some(terminal) = capture_terminal_usage(runner_kind, &captured, &mut slot.token_usage) {
+        slot.last_terminal_usage = terminal.usage;
+        slot.last_terminal_cost_usd = terminal.cost_usd;
+        let turn_tokens = token_limit_total(terminal.usage, limits.token_limit_basis);
+        let raw_turn_tokens =
+            token_limit_total(terminal.usage, crate::serve_config::TokenLimitBasis::Raw);
+        slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
+        slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
+        let previous_cost = slot.cost_usd;
+        if let Some(cost) = terminal.cost_usd {
+            slot.cost_usd = cost;
+        }
+        let turn_cost_usd = terminal
+            .cost_usd
+            .map(|cost| (cost - previous_cost).max(0.0));
+        let breach = check_post_result_limits(
+            limits,
+            turn_tokens,
+            slot.limit_tokens,
+            turn_cost_usd,
+            slot.cost_usd,
+            slot,
+        );
+        let breach = breach.map(|breach| breach.to_string());
+        log_terminal_usage_diagnostic(
+            slot,
+            "worker",
+            limits,
+            breach.as_deref(),
+            TerminalUsageAction::RecordedOutcomeCleanup,
+        );
+        if let Some(session_log) = &mut slot.session_log {
+            session_log.update_cost(slot.cost_tokens, terminal.cost_usd);
+            session_log.set_phase("awaiting-review");
+        }
+    }
     persist_terminal_output(&mut slot.session_log, captured);
     record_managed_usage_snapshot(
         db_path,
@@ -13611,7 +13650,7 @@ async fn park_or_cleanup_delivered_worker_slot(
     mut dead: SlotState,
 ) {
     let db_path = config.db_path.clone();
-    match park_worker_slot_dormant(&db_path, &mut dead).await {
+    match park_worker_slot_dormant(&db_path, &mut dead, &config.limits).await {
         Ok(()) => {
             log(&format!(
                 "worker {} parked dormant after delivering task #{} — awaiting reviewer",
@@ -14150,11 +14189,18 @@ fn persist_terminal_output(
 /// Teardown output is lifecycle-inert, but it can contain the terminal usage
 /// line that arrived after the daemon consumed a mailbox verdict. Retain that
 /// telemetry before closing the managed run without replaying the event.
+#[derive(Clone, Copy)]
+struct CapturedTerminalUsage {
+    usage: runner::TokenUsage,
+    cost_usd: Option<f64>,
+}
+
 fn capture_terminal_usage(
     kind: runner::AgentKind,
     output: &[runner::CapturedOutput],
     usage_total: &mut runner::TokenUsage,
-) {
+) -> Option<CapturedTerminalUsage> {
+    let mut terminal = None;
     for captured in output {
         let runner::CapturedOutput::Stdout(raw_line) = captured else {
             continue;
@@ -14162,15 +14208,22 @@ fn capture_terminal_usage(
         for event in runner::normalize_line(kind, raw_line) {
             match event {
                 runner::AgentEvent::TurnCompleted {
-                    usage: Some(usage), ..
+                    usage: Some(usage),
+                    cost_usd,
                 }
                 | runner::AgentEvent::TurnFailed {
-                    usage: Some(usage), ..
-                } => usage_total.saturating_add_assign(usage),
+                    usage: Some(usage),
+                    cost_usd,
+                    ..
+                } => {
+                    usage_total.saturating_add_assign(usage);
+                    terminal = Some(CapturedTerminalUsage { usage, cost_usd });
+                }
                 _ => {}
             }
         }
     }
+    terminal
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -21348,7 +21401,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.error_turn_count = 3;
         slot.last_error_text = Some("prior transient failure".into());
 
-        park_worker_slot_dormant(&db_path, &mut slot).await.unwrap();
+        park_worker_slot_dormant(&db_path, &mut slot, &CostLimits::default())
+            .await
+            .unwrap();
 
         // Live process torn down, logical slot preserved.
         assert!(matches!(
@@ -21469,6 +21524,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             output_tokens: 4,
             reasoning_tokens: 2,
         };
+        slot.cost_tokens = 34;
+        slot.limit_tokens = 14;
+        let limits = CostLimits {
+            token_limit_basis: crate::serve_config::TokenLimitBasis::Uncached,
+            max_task_tokens: Some(50),
+            ..Default::default()
+        };
 
         assert!(
             drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
@@ -21491,7 +21553,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .await
         .expect("scripted provider must exit after buffering its terminal record");
 
-        park_worker_slot_dormant(&db_path, &mut slot).await.unwrap();
+        park_worker_slot_dormant(&db_path, &mut slot, &limits)
+            .await
+            .unwrap();
 
         let expected = runner::TokenUsage {
             input_tokens: 130,
@@ -21502,6 +21566,29 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             reasoning_tokens: 9,
         };
         assert_eq!(slot.token_usage, expected);
+        assert_eq!(slot.last_terminal_usage.input_tokens, 100);
+        assert_eq!(slot.last_terminal_usage.uncached_input_tokens, 60);
+        assert_eq!(slot.last_terminal_cost_usd, None);
+        assert_eq!(slot.cost_tokens, 154);
+        assert_eq!(slot.limit_tokens, 94);
+        let diagnostic = terminal_usage_diagnostic(
+            &slot,
+            "worker",
+            &limits,
+            Some("task tokens (uncached) 94 exceeded limit 50"),
+            TerminalUsageAction::RecordedOutcomeCleanup,
+        );
+        assert_eq!(diagnostic["raw_input_tokens"], 100);
+        assert_eq!(diagnostic["uncached_input_tokens"], 60);
+        assert_eq!(diagnostic["cached_input_tokens"], 40);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 6);
+        assert_eq!(diagnostic["output_tokens"], 20);
+        assert_eq!(diagnostic["reasoning_tokens"], 7);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 154);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 94);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["breach"], true);
+        assert_eq!(diagnostic["action"], "recorded_outcome_cleanup");
         let conn = quorum_core::db::open(&db_path).unwrap();
         assert_eq!(
             quorum_core::token_usage::usage_for_agent_run(&conn, run_id)
@@ -21529,7 +21616,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.continuation_id = None;
         slot.pr = Some(1);
 
-        let err = park_worker_slot_dormant(&db_path, &mut slot)
+        let err = park_worker_slot_dormant(&db_path, &mut slot, &CostLimits::default())
             .await
             .expect_err("park must refuse a Codex slot without its provider-issued thread id");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -21555,7 +21642,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.continuation_id = Some("provider-thread-42".into());
         slot.pr = Some(1);
 
-        let err = park_worker_slot_dormant(&unwritable_db, &mut slot)
+        let err = park_worker_slot_dormant(&unwritable_db, &mut slot, &CostLimits::default())
             .await
             .expect_err("an unwritable journal DB must not be reported as a successful park");
         assert!(
