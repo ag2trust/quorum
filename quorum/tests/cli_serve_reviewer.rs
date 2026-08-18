@@ -1138,6 +1138,116 @@ fn merge_failure_feeds_rework_to_worker() {
 }
 
 #[test]
+fn final_boundary_head_drift_promptly_provisions_fresh_r1() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Final-boundary head drift");
+    let merge_calls = home.path().join("stale-authority-merge-calls");
+    let merge_cmd = format!(
+        "printf x >> {}; echo 'pull request head SHA does not match expected head commit' >&2; exit 1",
+        merge_calls.display()
+    );
+    let mut handle = ServeHandle::start_with_merge(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &merge_cmd,
+    );
+
+    assert!(handle.wait_for("spawning agent", 15));
+    assert!(handle.wait_for("result", 15));
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+
+    assert!(handle.wait_for("spawning reviewer", 15));
+    assert!(handle.wait_for("result", 15));
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    complete_r2_review(home.path(), &mut handle, "1");
+
+    assert!(
+        handle.wait_for("tearing down reviewer", 15),
+        "stale-authority reviewer was not settled: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("R1: reviewer", 15),
+        "fresh R1 was not provisioned promptly after final-boundary drift: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "fresh R1 did not start its review turn: {:?}",
+        handle.lines
+    );
+
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    assert!(
+        quorum_core::approvals::get_for_pr(&conn, 1)
+            .unwrap()
+            .is_empty(),
+        "head drift must invalidate the completed approval set"
+    );
+    let (r1_runs, r2_runs, live_reviewers, watchdog_failures): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM agent_runs
+                WHERE task_id=1 AND role='reviewer' AND sub_role IS NULL),
+               (SELECT COUNT(*) FROM agent_runs
+                WHERE task_id=1 AND role='reviewer' AND sub_role='r2'),
+               (SELECT COUNT(*) FROM journal
+                WHERE task_id=1 AND role='reviewer'),
+               (SELECT COUNT(*) FROM events
+                WHERE subject='task#1' AND kind='agent_failed')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(r1_runs, 2, "the replacement must be exactly one fresh R1");
+    assert_eq!(r2_runs, 1, "head drift must not provision another R2 first");
+    assert_eq!(live_reviewers, 1, "only the replacement R1 may remain live");
+    assert_eq!(
+        watchdog_failures, 0,
+        "review convergence must not depend on the idle watchdog"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&merge_calls).unwrap(),
+        "x",
+        "head drift must cause exactly one merge invocation"
+    );
+
+    handle.stop();
+}
+
+#[test]
 fn no_verdict_reviewer_replacement_preserves_pr_for_rework() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();

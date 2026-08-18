@@ -10471,6 +10471,16 @@ async fn tick(
                                         "stale merge authority disposition join: {error}"
                                     ))
                                 })??;
+                                // The completed sticky reviewer still owns a
+                                // live roster slot. Leaving it resident would
+                                // make both Phase 5 provisioning paths treat
+                                // this task as paired and suppress the fresh
+                                // R1 required by the invalidated approvals.
+                                // Settle it only after the durable disposition
+                                // succeeds so the same tick can provision R1.
+                                let r = reviewers.remove(ri);
+                                teardown_reviewer(config, wt_mgr, name_pool, r, "stale-authority")
+                                    .await;
                             }
                             merge::MergeFailureKind::PolicyBlocked
                             | merge::MergeFailureKind::PolicyPending => {
