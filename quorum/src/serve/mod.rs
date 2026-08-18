@@ -4454,6 +4454,12 @@ enum StartupDecompositionState {
     Blocked,
 }
 
+impl StartupDecompositionState {
+    fn defers_lifecycle_recovery(self) -> bool {
+        self == Self::Frozen
+    }
+}
+
 fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupDecompositionState> {
     use rusqlite::OptionalExtension;
     let row: Option<(String, bool, Option<String>)> = conn
@@ -4461,7 +4467,7 @@ fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupD
             "SELECT state,freeze_active,accepted_proposal_json
              FROM task_decompositions
              WHERE state NOT IN ('held','completed','cancelled')
-             ORDER BY id LIMIT 1",
+             ORDER BY freeze_active DESC,id LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -6973,7 +6979,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     // pass that can complete, merge, reset, or provision task lifecycle.
     let startup_decomposition =
         reconcile_decomposition_startup(config, &mut decomposition_coordinator).await?;
-    let recovered_frozen_decomposition = startup_decomposition == StartupDecompositionState::Frozen;
+    let recovered_frozen_decomposition = startup_decomposition.defers_lifecycle_recovery();
 
     // Cleanup is an authority gate, including frozen-decomposition restarts:
     // no recovery path may discard its journal/provenance before all eligible
@@ -30322,6 +30328,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
         let mut coordinator = DecompositionCoordinator::default();
+        let startup_state = reconcile_decomposition_startup(&config, &mut coordinator)
+            .await
+            .unwrap();
+        assert_eq!(startup_state, StartupDecompositionState::Frozen);
+        assert!(startup_state.defers_lifecycle_recovery());
+        assert_eq!(coordinator.graph_id, Some(newer_graph));
+
         assert!(tick_decomposition(
             &config,
             &mut coordinator,
