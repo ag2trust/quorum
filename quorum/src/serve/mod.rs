@@ -12804,10 +12804,35 @@ fn record_captured_terminal_usage_fields(
     log(&format!(
         "{role} {agent_name} result terminal usage diagnostic: {diagnostic}"
     ));
+    #[cfg(test)]
+    TEST_TERMINAL_USAGE_DIAGNOSTICS
+        .lock()
+        .unwrap()
+        .push(diagnostic.clone());
     if let Some(session_log) = session_log {
         session_log.update_cost(*cost_tokens, terminal.cost_usd);
     }
     Some(diagnostic)
+}
+
+#[cfg(test)]
+static TEST_TERMINAL_USAGE_DIAGNOSTICS: std::sync::LazyLock<
+    std::sync::Mutex<Vec<serde_json::Value>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[cfg(test)]
+fn take_terminal_usage_diagnostics_for_test(agent: &str) -> Vec<serde_json::Value> {
+    let mut diagnostics = TEST_TERMINAL_USAGE_DIAGNOSTICS.lock().unwrap();
+    let mut matching = Vec::new();
+    diagnostics.retain(|diagnostic| {
+        if diagnostic["agent"] == agent {
+            matching.push(diagnostic.clone());
+            false
+        } else {
+            true
+        }
+    });
+    matching
 }
 
 /// Check wall-clock limits only (called each tick for slots still draining).
@@ -23373,6 +23398,412 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 reasoning_tokens: 3,
             }
         );
+    }
+
+    #[cfg(unix)]
+    async fn buffered_codex_reviewer_slot_for_phase2_test(
+        dir: &tempfile::TempDir,
+        repo_dir: &Path,
+        task_id: i64,
+        reviewer_run_id: i64,
+        agent: &str,
+    ) -> SlotState {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = dir.path().join(format!("{agent}-terminal.sh"));
+        std::fs::write(
+            &fixture,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":80,\"cache_write_input_tokens\":10,\"output_tokens\":5,\"reasoning_output_tokens\":3}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let proc = runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: repo_dir,
+                prompt: "review",
+                environment: &[],
+                mode: runner::LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &runner::AdapterConfig {
+                executable: fixture.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut reviewer = slot_with_process(proc);
+        reviewer.agent_name = agent.into();
+        reviewer.task_id = task_id;
+        reviewer.agent_run_id = Some(reviewer_run_id);
+        reviewer.worktree_path = dir.path().join(format!("{agent}-worktree"));
+        reviewer.branch = format!("{agent}-terminal-fixture");
+        reviewer.cost_tokens = 0;
+        reviewer.limit_tokens = 0;
+        reviewer.cost_usd = 0.0;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if reviewer.try_wait().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture provider must buffer its terminal record before teardown");
+        reviewer
+    }
+
+    async fn tick_phase2_reviewer_fixture(
+        config: &ServeConfig,
+        name_pool: &mut Pool,
+        reviewers: &mut Vec<SlotState>,
+    ) {
+        let wt_mgr = WorktreeManager::new();
+        let mut workers = Vec::new();
+        let mut pre_review_checks = HashMap::new();
+        let mut pending_reviewer_resumes = HashMap::new();
+        let mut poison_tracker = PoisonTracker::new();
+        let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+        let mut drain_state = DrainState::new();
+        let mut lifetime_roster = LifetimeRoster::new();
+        for reviewer in reviewers.iter() {
+            lifetime_roster.register(&reviewer.agent_name);
+        }
+        let mut classifier_slot = None;
+        let mut decomposition_coordinator = DecompositionCoordinator::default();
+        let mut classifier_consec_errors = 0;
+        let mut classifier_backoff_until = None;
+        let mut doctor_slot = None;
+        let mut doctored_tasks = std::collections::HashSet::new();
+        let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        tick(
+            config,
+            &wt_mgr,
+            name_pool,
+            &mut workers,
+            reviewers,
+            &mut pre_review_checks,
+            &mut pending_reviewer_resumes,
+            &mut poison_tracker,
+            &mut claim_skip_logs,
+            &mut drain_state,
+            &mut lifetime_roster,
+            &mut classifier_slot,
+            &mut decomposition_coordinator,
+            &mut classifier_consec_errors,
+            &mut classifier_backoff_until,
+            &mut doctor_slot,
+            &mut doctored_tasks,
+            &signal_count,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase2_mailbox_verdict_reaps_buffered_terminal_with_recorded_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("phase2-reviewer-terminal.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id, mailbox_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "phase 2 reviewer terminal cleanup",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::claim(
+                &mut conn,
+                "Phase2Reviewer",
+                Some(task_id),
+                &[],
+                3600,
+                now + 2,
+            )
+            .unwrap()
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET rework_round=?1 WHERE id=?2",
+                rusqlite::params![quorum_core::lifecycle::REWORK_CAP, task_id],
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "Phase2Reviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now + 2,
+            )
+            .unwrap();
+            let mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Phase2Reviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(464),
+                    verdict: Some("changes".into()),
+                    feedback: Some("fix the blocker".into()),
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            (task_id, run_id, mailbox_id)
+        };
+        let reviewer = buffered_codex_reviewer_slot_for_phase2_test(
+            &dir,
+            &repo_dir,
+            task_id,
+            reviewer_run_id,
+            "Phase2Reviewer",
+        )
+        .await;
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir);
+        config.limits = CostLimits {
+            max_task_tokens: Some(100),
+            ..Default::default()
+        };
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Phase2Reviewer").unwrap();
+        let mut reviewers = vec![reviewer];
+        assert!(take_terminal_usage_diagnostics_for_test("Phase2Reviewer").is_empty());
+
+        tick_phase2_reviewer_fixture(&config, &mut name_pool, &mut reviewers).await;
+
+        assert!(
+            reviewers.is_empty(),
+            "Phase 2 must reap the accepted reviewer"
+        );
+        let diagnostics = take_terminal_usage_diagnostics_for_test("Phase2Reviewer");
+        assert_eq!(diagnostics.len(), 1, "one late terminal diagnostic");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic["event"], "terminal_usage");
+        assert_eq!(diagnostic["role"], "reviewer");
+        assert_eq!(diagnostic["provider"], "codex");
+        assert_eq!(diagnostic["raw_input_tokens"], 100);
+        assert_eq!(diagnostic["uncached_input_tokens"], 20);
+        assert_eq!(diagnostic["cached_input_tokens"], 80);
+        assert_eq!(diagnostic["cache_write_input_tokens"], 10);
+        assert_eq!(diagnostic["output_tokens"], 5);
+        assert_eq!(diagnostic["reasoning_tokens"], 3);
+        assert_eq!(diagnostic["raw_total_tokens"], 105);
+        assert_eq!(diagnostic["uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_raw_total_tokens"], 105);
+        assert_eq!(diagnostic["cumulative_uncached_total_tokens"], 25);
+        assert_eq!(diagnostic["cumulative_limit_tokens"], 105);
+        assert_eq!(diagnostic["configured_limit_basis"], "raw");
+        assert_eq!(diagnostic["configured_max_task_tokens"], 100);
+        assert_eq!(diagnostic["cost_usd"], serde_json::Value::Null);
+        assert_eq!(diagnostic["breach"], true);
+        assert_eq!(diagnostic["action"], "recorded_outcome_cleanup");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "failed"
+        );
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1,
+            "cleanup must not duplicate the reviewer run"
+        );
+        let verdict_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_failed'",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict_events, 1, "cleanup must not replay the verdict");
+        let consumed: bool = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed, "Phase 2 must consume the accepted verdict");
+        let terminal_alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind='alert' AND body LIKE '%terminal%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminal_alerts, 0, "late telemetry must not raise an alert");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn phase2_unrecorded_verdict_teardown_keeps_buffered_terminal_unclassified() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("phase2-unrecorded-terminal.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id, mailbox_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "phase 2 unrecorded reviewer terminal",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::claim(
+                &mut conn,
+                "UnrecordedReviewer",
+                Some(task_id),
+                &[],
+                3600,
+                now + 2,
+            )
+            .unwrap()
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "UnrecordedReviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now + 2,
+            )
+            .unwrap();
+            let mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "UnrecordedReviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: None,
+                    verdict: Some("approved".into()),
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: Some(r#"{"blocking":0}"#.into()),
+                },
+            )
+            .unwrap();
+            (task_id, run_id, mailbox_id)
+        };
+        let reviewer = buffered_codex_reviewer_slot_for_phase2_test(
+            &dir,
+            &repo_dir,
+            task_id,
+            reviewer_run_id,
+            "UnrecordedReviewer",
+        )
+        .await;
+        let config = pre_review_ci_test_config(db_path.clone(), repo_dir);
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("UnrecordedReviewer").unwrap();
+        let mut reviewers = vec![reviewer];
+        assert!(take_terminal_usage_diagnostics_for_test("UnrecordedReviewer").is_empty());
+
+        tick_phase2_reviewer_fixture(&config, &mut name_pool, &mut reviewers).await;
+
+        assert!(
+            reviewers.is_empty(),
+            "invalid verdict branch must reap reviewer"
+        );
+        assert!(
+            take_terminal_usage_diagnostics_for_test("UnrecordedReviewer").is_empty(),
+            "unrecorded verdict cleanup must not claim a recorded terminal action"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let verdict_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE subject=?1 AND kind IN ('task_merging','task_rework','task_failed')",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verdict_events, 0, "unrecorded verdict must stay inert");
+        let consumed: bool = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed);
     }
 
     #[cfg(unix)]
