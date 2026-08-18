@@ -333,6 +333,9 @@ CREATE TABLE github_review_publication_slots (
                                        'cleanup_running','blocked')),
   pending_review_id    TEXT,
   review_owner_marker  TEXT,
+  create_send_state    TEXT NOT NULL DEFAULT 'not_started'
+                       CHECK(create_send_state IN ('not_started','definitely_unsent',
+                                                   'ambiguous','confirmed')),
   cleanup_attempts     INTEGER NOT NULL DEFAULT 0,
   next_cleanup_at      INTEGER,
   cleanup_deadline_at  INTEGER,
@@ -441,6 +444,15 @@ authored summary. A successful or reconciled create persists the remote review I
 publication slot. If the create response is lost, the marker, publisher scope, PR, and immutable
 launch SHA are the recovery identity; the daemon never guesses from review position or body text.
 
+The create claim transaction changes its slot's `create_send_state` from `not_started` to
+`ambiguous` before committing and before Repository Service I/O. A successful response or exact
+marker reconciliation changes it to `confirmed`. It may change to `definitely_unsent` only when
+the same live Repository Service invocation returns a closed transport result proving that it
+failed before handing any request to GitHub; timeout, cancellation, process death, lost response,
+daemon crash, or an unrecognized result is always `ambiguous`. After a crash, startup therefore
+defaults conservatively from the persisted pre-I/O state without inferring non-delivery from a
+dead child.
+
 Before provisioning the first reviewer or any distinct re-review/R1/R2 attempt, the daemon
 atomically inserts the unique `(publisher_scope, pr_number)` slot in `probing` state. It commits,
 uses the Repository Service to read that publisher's current pending review, and then performs one
@@ -463,23 +475,43 @@ the owning task is terminal; cancellation removes agent authority, not daemon ho
 
 `cleanup_required` is not yet claimable while any network operation for the old review attempt is
 still running or reconciliation-required. The daemon first lets the bounded child finish or
-kills and reaps it, records/reconciles its terminal outcome, and proves that no queued row can be
-sent. In particular, an in-flight create cannot pass an empty-review probe and land after the slot
-is released. A late create result persists its review ID and leaves the slot cleanup-required;
-it never replaces a newer owner.
+kills and reaps it, records/reconciles its local outcome, and proves that no queued row can be
+sent. Killing and reaping proves only local process ownership; it does not prove that GitHub has
+finished an already-sent request. An `ambiguous` create is therefore reconciliation-only and is
+never resent merely because a pending-review read is empty. A late create result persists its
+review ID and leaves the slot cleanup-required; it never replaces a newer owner.
 
 The daemon claims cleanup with a guarded `cleanup_required -> cleanup_running` update under
 `BEGIN IMMEDIATE`, commits, and performs no more than a bounded read/delete/re-read sequence
 through the Repository Service. It deletes only the current pending review with the exact stored
-owner marker, PR, publisher scope, launch SHA, and remote ID when known. No pending review, or a
-404 after an exact delete, is idempotent cleanup success. A timeout or crash after delete is
-reconciled by re-reading: absence completes cleanup, while the same exact marker may be retried.
-A foreign or ambiguous review is never deleted and makes the slot `blocked`.
+owner marker, PR, publisher scope, launch SHA, and remote ID when known. For `not_started` or
+`definitely_unsent`, no pending review is idempotent cleanup success because no create can still
+land. A `confirmed` create has a persisted remote ID; cleanup addresses that exact ID instead of
+trusting an empty pending-review listing. An exact delete success, authoritative exact-ID lookup
+showing it is no longer pending, or 404 after the exact delete is success because the one create
+has already reached a terminal remote disposition. A timeout or crash after delete is reconciled
+through that exact ID: confirmed non-pending state completes cleanup, while the same exact marker
+may be retried. A foreign or ambiguous review is never deleted and makes the slot `blocked`.
+
+For `ambiguous`, an empty read is only one negative observation. It leaves the slot
+`cleanup_required`, increments the bounded reconciliation count, and schedules another read after
+backoff; it cannot release the slot or authorize another create. Reconciliation succeeds if the
+marker later appears. Before deleting it, the daemon durably records the remote ID and changes the
+send state to `confirmed` in a guarded transaction; the subsequent exact delete/re-read can then
+be reconciled across another crash. Ambiguous reconciliation may also succeed on absence only if
+the Repository Service returns a closed publisher-scope/PR fence proving that every create
+admitted before the fence—including a request whose caller was killed—has reached a terminal
+remote disposition and that the final pending-review read is linearized after those dispositions.
+A generic successful GET, elapsed delay, consecutive empty reads, local child exit, or adapter
+restart is not such a fence. An adapter that cannot provide the guarantee, including a self-hosted
+`gh` child killed after possible send, MUST leave the slot blocked when bounded reconciliation
+exhausts rather than guess that the draft will never appear.
 
 Cleanup and the initial empty-slot probe share a maximum of eight claim/reconciliation cycles and
 one hour per recovery generation, use bounded backoff, the existing 30-second command kill/reap
-and output limits, and never hold a database transaction across GitHub I/O. Exhaustion changes the
-slot to `blocked`; it does not create a verdict, lifecycle transition, rework, or reviewer/provider
+and output limits, and never hold a database transaction across GitHub I/O. Each empty read of an
+`ambiguous` create consumes a cycle but does not alter its ambiguity. Exhaustion changes the slot
+to `blocked`; it does not create a verdict, lifecycle transition, rework, or reviewer/provider
 budget charge. A nonterminal task waiting for the slot uses the existing durable infrastructure
 parking path. A terminal owner retains a bounded status-visible cleanup blocker. An
 operator-authorized retry of a later parked task may reset the same slot's cleanup generation
@@ -494,11 +526,13 @@ the slot nor changes lifecycle. Startup treats `probing` and `cleanup_running` a
 reconciliation-required, retaining the exact marker, review ID, attempt count, and deadline; it
 reads remote state before any delete or slot release.
 
-Only after marker-verified deletion or confirmed absence does the daemon delete the slot row. A
-distinct attempt then repeats the fresh probe before atomically acquiring the slot. This barrier
-applies on startup, re-review, and the R1-to-R2 handoff, so a new reviewer can neither attach to
-stale draft content nor bypass cleanup during a GitHub outage. The cleanup result is publication
-housekeeping only and never substitutes for, infers, or posts a formal review verdict.
+Only after marker-verified deletion, absence with `not_started`/`definitely_unsent`, exact-ID
+non-pending proof for `confirmed`, or a fenced final absence for `ambiguous` does the daemon delete
+the slot row. A distinct attempt then repeats the fresh probe before atomically acquiring the
+slot. This barrier applies on startup, re-review, and the R1-to-R2 handoff, so a new reviewer can
+neither attach to stale draft content nor bypass cleanup during a GitHub outage. The cleanup
+result is publication housekeeping only and never substitutes for, infers, or posts a formal
+review verdict.
 
 A successful `submit_pending` result, including marker reconciliation after a crash, releases its
 attempt's owned slot because the review is no longer pending. A distinct attempt still performs
@@ -620,7 +654,14 @@ Required tests include:
 - crash after pending-review create, cancellation/head movement racing create, and a failed or
   cancelled post-create sequence all leave a marker-owned cleanup barrier that survives restart;
 - cleanup cannot claim until every old review network child has completed or been killed, reaped,
-  and reconciled, so an in-flight create cannot land after confirmed absence and slot release;
+  and locally reconciled; killing a post-send create then returning one or more empty reads never
+  permits resend or slot release;
+- the fake Repository Service accepts a create, returns the first cleanup read as empty, and makes
+  the marked draft visible only on a later read; the slot remains unavailable until the draft is
+  found, exactly deleted, and proven non-pending by exact ID;
+- repeated empty reads for an ambiguous create exhaust into `blocked`, while immediate absence is
+  terminal only for persisted `not_started`/`definitely_unsent` state or after the specified
+  remote fence;
 - cleanup deletes only the exact daemon-owned pending review, reconciles crash-after-delete as
   success, and blocks without deletion on a foreign/missing marker, mismatched ID/SHA, or outage;
 - shutdown during probe/delete retains the slot and startup reconciles it before any new reviewer;
@@ -657,14 +698,14 @@ Every implementation task is deliberately small or medium and independently revi
    access.
 2. **M — Durable operation outbox and daemon executor skeleton.** Add the migration, atomic
    enqueue/claim/revalidation/revocation/result/recovery paths, fixed admission and retry bounds,
-   retention, publication-slot reservation, bounded cleanup/status skeleton, shutdown
-   reconciliation, and fake Repository Service.
+   retention, publication-slot reservation, persisted create ambiguity, bounded cleanup/status
+   skeleton, shutdown reconciliation, and fake Repository Service.
 3. **M — PR read and general-comment operations.** Add bounded reads, exact target checks,
    Markdown-safe general comments, markers, and outage classification.
 4. **M — Pending reviews and inline findings.** Add create/resume/submit COMMENT review,
    validated single/multiline anchors for the launch SHA, durable sequence/seal dependencies, and
-   marker-verified orphan-draft cleanup across restart/re-review/R1-to-R2, plus the complete-
-   publication-before-verdict submit guard.
+   marker-verified orphan-draft cleanup and ambiguity fencing across restart/re-review/R1-to-R2,
+   plus the complete-publication-before-verdict submit guard.
 5. **S — Thread replies and reviewer resolution.** Add exact-PR comment lookup, true threaded
    replies, outdated context, and reviewer-only resolution.
 6. **S — Claude per-run MCP injection.** Add explicit strict config for initial/resumed managed
