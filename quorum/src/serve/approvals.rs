@@ -68,6 +68,36 @@ pub(crate) async fn recover(
             continue;
         }
         let pr = appr.pr_number;
+        // A policy/infrastructure park is owner-gated. Retained approvals are
+        // evidence, not an automatic retry loop. Likewise an explicit merge
+        // retry is reconciled by the normal daemon tick, which atomically
+        // consumes its one-shot marker and performs the stronger live target
+        // checks; startup recovery must not race or bypass that authority.
+        let replay_deferred = {
+            let p = db_path.to_path_buf();
+            let task_id = appr.task_id;
+            run_blocking(move || {
+                let conn = quorum_core::db::open(&p)?;
+                let Some(task) = tasks::get(&conn, task_id)? else {
+                    return Ok(true);
+                };
+                let merge_retry = task
+                    .refs
+                    .as_deref()
+                    .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                    .and_then(|refs| {
+                        refs.get(tasks::MERGE_RETRY_REF)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    });
+                Ok(task.status == "failed" || merge_retry.is_some())
+            })
+            .await?
+        };
+        if replay_deferred {
+            outcome.deferred += 1;
+            continue;
+        }
         // SHA-bind against the PR's live head. If we can't determine it, leave
         // the record for a future startup rather than merging blind.
         let repo = repo_dir.to_path_buf();

@@ -456,6 +456,19 @@ fn policy_blocked_merge_parks_task_no_rework() {
     );
     assert!(stdout.contains("daemon_resume_status"));
     assert!(stdout.contains("merging"));
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            quorum_core::approvals::get_for_pr(&conn, 1).unwrap().len(),
+            2,
+            "policy park must retain exact-head R1/R2 authority"
+        );
+    }
 
     let retry = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -466,8 +479,8 @@ fn policy_blocked_merge_parks_task_no_rework() {
     assert!(retry.status.success());
     let retry_stdout = String::from_utf8_lossy(&retry.stdout);
     assert!(
-        retry_stdout.contains("\"status\":\"in-review\""),
-        "retry must restore the review stage that can safely re-drive merge: {retry_stdout}"
+        retry_stdout.contains("\"status\":\"merging\""),
+        "retry must request one daemon-owned merge replay: {retry_stdout}"
     );
 
     std::fs::write(
@@ -496,38 +509,27 @@ fn policy_blocked_merge_parks_task_no_rework() {
     )
     .unwrap();
     assert!(
-        retry_handle.wait_for("spawning reviewer", 15),
-        "retried merge did not provision a fresh reviewer: {:?}",
-        retry_handle.lines
-    );
-    let retry_reviewer = retry_handle
-        .extract_agent_name("spawning reviewer ")
-        .expect("could not extract retry reviewer");
-    assert!(
-        retry_handle.wait_for("result", 15),
-        "retry reviewer result not seen: {:?}",
-        retry_handle.lines
-    );
-    quorum_done(
-        home.path(),
-        &[
-            "--agent",
-            &retry_reviewer,
-            "--pr",
-            "1",
-            "--verdict",
-            "approved",
-            "--blocking",
-            "0",
-        ],
-    );
-    complete_r2_review(home.path(), &mut retry_handle, "1");
-    assert!(
-        retry_handle.wait_for("PR #1 merged —", 15),
+        retry_handle.wait_for("PR #1 merged from explicit durable-approval retry", 15),
         "retried task never reached a second merge attempt: {:?}",
         retry_handle.lines
     );
+    assert!(
+        !retry_handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning reviewer")),
+        "unchanged-head retry must not provision another reviewer: {:?}",
+        retry_handle.lines
+    );
     retry_handle.stop();
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    assert_eq!(
+        quorum_core::tasks::get(&conn, 1).unwrap().unwrap().status,
+        "done"
+    );
+    assert!(quorum_core::approvals::get_for_pr(&conn, 1)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
