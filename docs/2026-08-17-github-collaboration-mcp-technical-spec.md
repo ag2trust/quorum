@@ -427,23 +427,34 @@ Attempt states are `active`, `awaiting_resume`, `completed`, and `revoked`. Oper
 only execution/send state and result fields change. Every outbound GitHub mutation uses the closed
 send states `not_started`, `definitely_unsent`, `ambiguous`, and `confirmed`; local delivery-report
 storage does not enter this remote executor. `request_json` and `response_json` use closed,
-kind-specific schemas and fixed aggregate limits. A terminal row with a remotely resolved send
-disposition expires after a seven-day retention window. A terminal row that still has
-`send_state=ambiguous` is recovery-authoritative: its `expires_at` is set to the closed
-`RECOVERY_PINNED_EXPIRES_AT` daemon constant, greater than every accepted runtime clock value,
-until exact marker/predicate evidence or a qualifying Repository Service idempotency/fence result
-resolves the remote effect. The value is neither agent input nor operator configuration. On
-resolution, the same row receives an ordinary seven-day expiry measured from that disposition.
-Nonterminal rows have a one-hour execution deadline and therefore cannot remain executable
-indefinitely.
+kind-specific schemas and fixed aggregate limits. Operation retention is owned by the parent
+collaboration attempt, not by the operation's terminal timestamp. While an attempt is `active` or
+`awaiting_resume`, its `expires_at` and every one of its operation rows' `expires_at` use the closed
+`COLLABORATION_PINNED_EXPIRES_AT` daemon constant, greater than every accepted runtime clock value.
+This includes terminal rows with resolved send dispositions, confirmed idempotency identities, and
+every accepted review-sequence predecessor, whether or not the review has been sealed. The value
+is neither agent input nor operator configuration, and no operation is independently sweepable
+while its parent remains live or exactly resumable.
 
-An attempt becomes terminal with its exact lifecycle turn, but its `expires_at` is likewise pinned
-while any recovery-authoritative ambiguous operation refers to it. It receives ordinary terminal
-retention only after all of its rows have a resolved disposition and any owned remote pending-
-review slot has been released. `active` and `awaiting_resume` attempts remain tied to the persisted
-exact pending turn rather than becoming reusable identities. Pinning changes retention, not
-execution: retry-count and wall-clock bounds still terminalize work after one hour, and a pinned
-row grants no agent or lifecycle authority.
+A terminal row that still has `send_state=ambiguous` is recovery-authoritative and remains pinned
+until exact marker/predicate evidence or a qualifying Repository Service idempotency/fence result
+resolves the remote effect. An attempt becomes irreversibly terminal only as `completed` or
+`revoked`, with `active_run_id=NULL`. It becomes reclamation-ready only after every claimed child
+has completed or been killed and reaped, every operation is terminal with a resolved remote send
+disposition, and any owned pending-review slot has been released through the exact cleanup rules
+below. The first guarded `BEGIN IMMEDIATE` transaction that proves all of those conditions sets
+one fixed seven-day `expires_at` on the attempt and all of its operation rows. Starting this shared
+window is all-or-nothing; a later operation-level result cannot create an earlier deadline. An
+unresolved ambiguous operation or blocked cleanup leaves the group pinned and counted against the
+fixed caps rather than trading correctness for reclamation.
+
+`active` and `awaiting_resume` attempts remain tied to the persisted exact pending turn rather than
+becoming reusable identities. Pinning changes retention, not execution: retry-count and wall-clock
+bounds still terminalize executable work after one hour, and a pinned row grants no agent or
+lifecycle authority. Thus live attempts are bounded in count and operation volume, safely
+reclaimable groups receive a finite post-settlement lifetime, and only exact unresolved remote
+ambiguity or a fail-closed pending-review cleanup blocker can retain a terminal group beyond that
+window under the existing retry and cap accounting.
 
 State combinations are closed and enforced: `succeeded` requires `confirmed`; a send claim enters
 `running` only with `ambiguous`; a queued row is never `confirmed`; and `confirmed` is never sent
@@ -458,8 +469,8 @@ canonical closed-schema request. The `operation_id` and hidden marker are determ
 attempt and client request ID. Identical retries across fresh-capability resumes of the exact turn
 therefore return the original durable operation without relying on agent discipline; a caller
 supplies a distinct ID only when intentionally repeating identical content. Every write body
-receives the marker where GitHub permits one. Expiry or recovery of a row does not change its
-marker, request, or Repository Service idempotency key.
+receives the marker where GitHub permits one. Attempt terminalization, retention-window start, and
+exact continuation do not change its marker, request, or Repository Service idempotency key.
 
 A mutation send claim atomically changes `queued -> running` and
 `not_started|definitely_unsent -> ambiguous` in its guarded `BEGIN IMMEDIATE` transaction before
@@ -484,15 +495,28 @@ GET, elapsed delay, consecutive empty reads, local child exit, or adapter restar
 Without marker evidence, an idempotent predicate, or one of those Repository Service guarantees,
 bounded recovery fails closed rather than risking a duplicate.
 
-Admission is checked in the enqueue transaction after logically expired terminal rows are swept.
+Admission is checked in the enqueue transaction after logically expired terminal attempt groups
+are swept. The sweeper never deletes an operation independently. In one `BEGIN IMMEDIATE`
+transaction it rechecks that the parent is `completed` or `revoked`, has no active run or
+publication slot, is reclamation-ready, and has passed the shared `expires_at`; it then deletes all
+child operations before deleting the attempt. Exact-continuation adoption, mutation claims,
+successful lifecycle-submit admission (including reviewer verdict admission), non-resumable
+terminalization, retention-window start, and sweep all serialize on the same write lock. Adoption
+can succeed only from `awaiting_resume`, and a mutation claim only from `active`. If adoption wins
+first, sweep observes a live parent and deletes nothing. If a claim wins first, terminalization may
+revoke its authority but the group cannot become reclamation-ready until the bounded child and
+remote disposition settle. If terminalization wins first, later adoption and publication fail
+before reclamation can proceed. No network call occurs in any of these transactions.
+
 The fixed initial limits are 64 nonexpired operations created by one run, 128 per collaboration
 attempt, 512 per task, and 4,096 in the repository database. All four counts include terminal
-retention rows and recovery-pinned ambiguous rows, so persistent storage, not only active work, is
-bounded. A request that would exceed any limit returns a typed `capacity_exceeded` result and
-creates no row. If unresolved ambiguity fills a cap, new publication fails closed and status
-surfaces the pinned count and operation IDs; no sweep, age threshold, or manual prune may discard
-that identity to regain capacity. Limits are closed daemon constants, not agent input or
-configuration that a managed run can raise.
+retention rows, live-attempt-pinned rows, and recovery-pinned ambiguous rows, so persistent storage,
+not only active work, is bounded. A request that would exceed any limit returns a typed
+`capacity_exceeded` result and creates no row. If a delayed exact continuation or unresolved
+ambiguity fills a cap, new publication fails closed and status surfaces the pinned count and
+operation IDs; no sweep, age threshold, or manual prune may discard that identity to regain
+capacity. Limits are closed daemon constants, not agent input or configuration that a managed run
+can raise.
 
 Attempt creation is separately capped at 16 nonexpired attempts per task and 1,024 in the
 repository database, including terminal-retention and recovery-pinned attempts. It returns the
@@ -697,9 +721,13 @@ requires the exact current attempt to be sealed, every sequence through the fina
 succeeded without post-revocation completion, the final operation to be `submit_pending`, and the
 immutable launch SHA still to equal a freshly fetched remote PR head. After that bounded fetch,
 the database proof and unchanged-authority check occur in one `BEGIN IMMEDIATE` transaction; the
-same unavoidable post-fetch remote race as the existing launch-SHA attestation remains. A pending
-summary alone, or a succeeded submit with any missing/queued/running/failed/cancelled predecessor,
-cannot authorize the verdict.
+transaction's admission of the lifecycle verdict also changes the attempt to `completed` and
+clears `active_run_id`. A revocation transaction instead makes verdict admission permanently
+impossible. These are the only transitions that release the live-attempt retention barrier, so all
+succeeded predecessors and their idempotency identities remain durable until verdict admission
+has succeeded or can no longer succeed. The same unavoidable post-fetch remote race as the
+existing launch-SHA attestation remains. A pending summary alone, or a succeeded submit with any
+missing/queued/running/failed/cancelled predecessor, cannot authorize the verdict.
 
 ## Repository Service execution
 
@@ -748,6 +776,12 @@ A reviewer lifecycle submit is atomically rejected unless the sealed review sequ
 the complete predecessor and immutable-SHA guard above. This is a core submit guard, not a prompt
 rule. Every worker or reviewer lifecycle submit is also rejected while its collaboration attempt
 has any accepted mutation queued, running, failed, cancelled, or succeeded only after revocation.
+An accepted lifecycle submit records admission, changes the exact attempt to `completed`, and
+clears `active_run_id` in that same `BEGIN IMMEDIATE` transaction; non-resumable authority loss
+records `revoked`, clears the binding, and cancels unclaimed writes in its lifecycle transaction.
+Until one of those transactions commits, the attempt remains `active` or `awaiting_resume` and its
+complete operation identity set remains pinned. For a reviewer, lifecycle-submit admission is the
+verdict-admission point and includes the complete predecessor and immutable-SHA proof above.
 If the coding-runner turn ends while GitHub publication remains pending, the daemon preserves the
 exact attempt as `awaiting_resume` for bounded reconciliation and does not infer completion or a
 verdict from the model's text.
@@ -834,7 +868,16 @@ Required tests include:
 - after advancing beyond ordinary seven-day retention and sweeping, an exhausted ambiguous
   operation and its attempt remain pinned with the exact request, client request ID, marker, and
   send disposition; exact continuation/operator recovery returns that same operation and sends no
-  second mutation, while exact remote disposition starts ordinary retention;
+  second mutation, while exact remote disposition permits the shared retention window only after
+  the parent is irreversibly terminal and the complete group is reclamation-ready;
+- confirmed general and inline comments followed by a provider interruption remain present with
+  their exact request, client request ID, marker, result, and inline predecessor sequence after
+  more than seven days and a sweep while the parent is `awaiting_resume`; exact continuation adopts
+  those rows, identical replay sends no second mutation, and the intact sequence can still admit
+  the verdict;
+- a real-process sweep racing exact-continuation adoption of an `awaiting_resume` attempt more than
+  seven days after a child terminalized deletes nothing in either transaction order; adoption
+  succeeds with the complete identity set intact;
 - cleanup deletes only the exact daemon-owned pending review, reconciles crash-after-delete as
   success, and blocks without deletion on a foreign/missing marker, mismatched ID/SHA, or outage;
 - shutdown during probe/delete retains the slot and startup reconciles it before any new reviewer;
@@ -854,6 +897,10 @@ Required tests include:
   retry-count/age bound with no further retries or lifecycle budget consumption;
 - a delayed or backing-off first inline finding prevents every later inline finding and pending-
   review submit from being claimed, and the lifecycle verdict remains rejected;
+- every succeeded predecessor of a sealed review survives age-based sweep until the same
+  transaction admits the lifecycle verdict and completes the attempt, or until a non-resumable
+  lifecycle transaction revokes it so verdict admission is impossible; the group is absent only
+  after remote settlement, slot release, and its later shared retention deadline;
 - repeated real-process races against one DB preserve SQLite invariants;
 - GitHub timeout/5xx leaves lifecycle and rework counters unchanged;
 - normal Claude and Codex launches receive the scoped MCP, while restricted roles do not;
@@ -868,19 +915,22 @@ Every implementation task is deliberately small or medium and independently revi
 
 1. **M — Agent endpoint, MCP shell, and capability-derived inventory.** Add the narrow daemon
    endpoint and collaboration-attempt migration, stable attempt issuance and fresh-capability
-   adoption, route managed `submit`/`react` without semantic changes, add the stdio server and
-   closed schemas, derive role/target in the daemon, and prove the adapter has no direct database
-   or GitHub execution access.
+   adoption, atomic completed/revoked terminalization at lifecycle admission or authority loss,
+   route managed `submit`/`react` without semantic changes, add the stdio server and closed schemas,
+   derive role/target in the daemon, and prove the adapter has no direct database or GitHub
+   execution access.
 2. **M — Durable operation outbox and daemon executor skeleton.** Add the migration, atomic
    enqueue/claim/revalidation/revocation/result/recovery paths, fixed admission and retry bounds,
-   retention, persisted generic send ambiguity, publication-slot reservation, bounded
-   cleanup/status skeleton, shutdown reconciliation, and fake Repository Service.
+   parent-owned retention and transactional attempt-group sweep, persisted generic send ambiguity,
+   publication-slot reservation, bounded cleanup/status skeleton, shutdown reconciliation, and
+   fake Repository Service.
 3. **M — PR read and general-comment operations.** Add bounded reads, exact target checks,
    Markdown-safe general comments, markers, ambiguity fencing, and outage classification.
 4. **M — Pending reviews and inline findings.** Add create/resume/submit COMMENT review,
    validated single/multiline anchors for the launch SHA, durable sequence/seal dependencies, and
    marker-verified orphan-draft cleanup plus create/inline/submit ambiguity fencing across
-   restart/re-review/R1-to-R2, and the complete-publication-before-verdict submit guard.
+   restart/re-review/R1-to-R2, and the complete-publication-before-verdict submit guard with
+   predecessor retention through verdict admission.
 5. **S — Thread replies and reviewer resolution.** Add exact-PR comment lookup, true threaded
    replies, reply ambiguity fencing, outdated context, and reviewer-only resolution.
 6. **M — Claude persistent MCP injection and inventory refresh.** Add explicit strict config for
@@ -907,7 +957,10 @@ Slices 1 and 2 are foundations. Slice 3 depends on both. Slice 4 depends on 3. S
 their prerequisites. Slice 8 depends on 1 and may finish before provider or prompt migration.
 Slice 9 depends on 1–3. Slice 10 depends on 3–9. The graph is acyclic: public-command parity is
 delivered by slice 8 before slice 10 consumes it. No task may broaden itself into the outside MCP
-or Hosted control-plane implementation.
+or Hosted control-plane implementation. Parent terminalization remains in slice 1, generic
+retention/sweep mechanics and their race coverage remain in slice 2, and review-sequence retention
+coverage remains in slice 4; this ownership correction adds no slice or dependency edge, so all
+ten tasks remain independently reviewable and S/M-sized.
 
 ## Rollout
 
