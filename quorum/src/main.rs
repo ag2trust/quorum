@@ -107,6 +107,10 @@ primary = 100
 ## r2_enabled = true                 # false disables sampling, not the R2 gate
 ## r2_target_per_stratum = 0         # guaranteed coverage before probability
 ## r2_steady_state_p = 1.0           # 1.0 preserves mandatory R2 by default
+
+## Rework ceiling: max changes-to-rework rounds before a task fails. Stamped
+## onto each task at adoption; unset keeps the compiled default (7).
+# max_rework = 7
 ";
 
 fn run() -> Result<i32> {
@@ -1347,6 +1351,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(1.0);
             serve_config::validate_r2_sampling(r_r2_target_per_stratum, r_r2_steady_state_p)?;
 
+            // Rework ceiling: unset preserves the compiled default. Stamped onto
+            // each task at adoption, immutable thereafter.
+            let r_max_rework = file_cfg
+                .max_rework
+                .unwrap_or(quorum_core::lifecycle::REWORK_CAP);
+            serve_config::validate_max_rework(r_max_rework)?;
+
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
             })?;
@@ -1472,6 +1483,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r2_enabled: r_r2_enabled,
                 r2_target_per_stratum: r_r2_target_per_stratum,
                 r2_steady_state_p: r_r2_steady_state_p,
+                max_rework: r_max_rework,
             };
             Ok(serve::run_serve(config)?)
         }

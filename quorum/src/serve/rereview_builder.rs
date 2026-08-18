@@ -31,7 +31,7 @@ pub fn build_rereview_turn(
         None,
         // This test-only compatibility helper builds a re-review, whose first
         // possible persisted value is one completed transition.
-        ReviewCycleContext::from_persisted_rework_round(1),
+        ReviewCycleContext::from_persisted_rework_round(1, quorum_core::lifecycle::REWORK_CAP),
     )
 }
 

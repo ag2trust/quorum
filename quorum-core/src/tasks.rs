@@ -175,7 +175,20 @@ pub struct Task {
     pub edit_count: i64,
     pub continue_pr: Option<i64>,
     pub target_branch: Option<String>,
+    /// Per-task rework ceiling, stamped from the daemon's `max_rework` config at
+    /// first ownership. `None` means unstamped — see [`Task::effective_rework_cap`].
+    pub rework_cap: Option<i64>,
     pub ready: bool,
+}
+
+impl Task {
+    /// Resolved rework ceiling: the stamped per-task value, or the compiled
+    /// [`crate::lifecycle::REWORK_CAP`] when unstamped (historic or unadopted rows).
+    pub fn effective_rework_cap(&self) -> u32 {
+        self.rework_cap
+            .map(|c| c as u32)
+            .unwrap_or(crate::lifecycle::REWORK_CAP)
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -311,7 +324,7 @@ pub fn effect_name(e: &Effect) -> String {
 const COLS: &str = "id, title, body, status, priority, labels, assignee, created_by, \
                     created_at, updated_at, refs, depends_on, author, reviewer, \
                     rework_round, review_only, recovery_attempts, revision, edit_count, \
-                    continue_pr, target_branch";
+                    continue_pr, target_branch, rework_cap";
 
 const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
     SELECT 1 FROM json_each(depends_on) je
@@ -371,6 +384,7 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         edit_count: r.get(18)?,
         continue_pr: r.get(19)?,
         target_branch: r.get(20)?,
+        rework_cap: r.get(21)?,
         ready: false,
     })
 }
@@ -2110,6 +2124,7 @@ where
         author: task.author.clone(),
         reviewer: task.reviewer.clone(),
         rework_round: task.rework_round as u32,
+        rework_cap: task.effective_rework_cap(),
         pr: extract_pr_from_refs(&task.refs),
         review_only: task.review_only,
     };
@@ -4117,6 +4132,20 @@ pub fn resolve_target_branch(
         "UPDATE tasks SET target_branch=?2, updated_at=?3 \
          WHERE id=?1 AND target_branch IS NULL",
         params![task_id, branch, now],
+    )?;
+    tx.commit()?;
+    Ok(n > 0)
+}
+
+/// Stamp a task's per-task rework ceiling from the daemon's `max_rework` config,
+/// immutable once populated (mirrors [`resolve_target_branch`]). Returns whether
+/// a row was updated — `false` when the task is missing or already stamped.
+pub fn stamp_rework_cap(conn: &mut Connection, task_id: i64, cap: u32, now: i64) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let n = tx.execute(
+        "UPDATE tasks SET rework_cap=?2, updated_at=?3 \
+         WHERE id=?1 AND rework_cap IS NULL",
+        params![task_id, i64::from(cap), now],
     )?;
     tx.commit()?;
     Ok(n > 0)
@@ -8453,6 +8482,7 @@ mod tests {
             author: Some("worker-1".into()),
             reviewer: None,
             rework_round: 0,
+            rework_cap: crate::lifecycle::REWORK_CAP,
             pr: Some("343".into()),
             review_only: false,
         };
@@ -12118,6 +12148,40 @@ mod tests {
     }
 
     #[test]
+    fn stamp_rework_cap_sets_once_and_defaults_before() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(&mut conn, "a", "t", None, 0, None, None, None, None, 1).unwrap();
+        // Unstamped: NULL column, effective cap is the compiled default.
+        let task = get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.rework_cap, None);
+        assert_eq!(task.effective_rework_cap(), crate::lifecycle::REWORK_CAP);
+
+        assert!(stamp_rework_cap(&mut conn, id, 10, 2).unwrap());
+        let task = get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.rework_cap, Some(10));
+        assert_eq!(task.effective_rework_cap(), 10);
+        assert_eq!(task.updated_at, 2);
+    }
+
+    #[test]
+    fn stamp_rework_cap_immutable_once_populated() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(&mut conn, "a", "t", None, 0, None, None, None, None, 1).unwrap();
+        assert!(stamp_rework_cap(&mut conn, id, 10, 2).unwrap());
+        // A second stamp is a no-op: the cap is frozen at first adoption.
+        assert!(!stamp_rework_cap(&mut conn, id, 12, 3).unwrap());
+        let task = get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.rework_cap, Some(10));
+        assert_eq!(task.updated_at, 2);
+    }
+
+    #[test]
+    fn stamp_rework_cap_missing_task() {
+        let (_dir, mut conn) = open_tmp();
+        assert!(!stamp_rework_cap(&mut conn, 999, 10, 1).unwrap());
+    }
+
+    #[test]
     fn target_branch_concurrent_resolve() {
         let contenders = 8;
         for round in 0..20 {
@@ -12210,6 +12274,10 @@ mod tests {
         assert_eq!(v, crate::db::SCHEMA_VERSION);
         let task = get(&conn, 1).unwrap().unwrap();
         assert!(task.target_branch.is_none());
+        // v55: the added rework_cap column is nullable; legacy rows stay NULL and
+        // fall back to the compiled cap, preserving historic behaviour.
+        assert!(task.rework_cap.is_none());
+        assert_eq!(task.effective_rework_cap(), crate::lifecycle::REWORK_CAP);
         assert_eq!(task.title, "old");
     }
 }

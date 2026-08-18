@@ -1143,6 +1143,7 @@ mod tests {
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
+            max_rework: quorum_core::lifecycle::REWORK_CAP,
             codex_sandbox: "danger-full-access".into(),
             pr_target_program: None,
         }

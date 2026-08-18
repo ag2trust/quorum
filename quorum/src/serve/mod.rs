@@ -91,12 +91,15 @@ fn load_review_cycle_context(
     task_id: i64,
 ) -> Result<review_cycle_context::ReviewCycleContext> {
     let conn = quorum_core::db::open(db_path)?;
-    let rework_round = conn.query_row(
-        "SELECT rework_round FROM tasks WHERE id=?1",
+    let (rework_round, rework_cap): (i64, Option<i64>) = conn.query_row(
+        "SELECT rework_round, rework_cap FROM tasks WHERE id=?1",
         [task_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(review_cycle_context::ReviewCycleContext::from_persisted_rework_round(rework_round))
+    let cap = rework_cap
+        .map(|c| c as u32)
+        .unwrap_or(quorum_core::lifecycle::REWORK_CAP);
+    Ok(review_cycle_context::ReviewCycleContext::from_persisted_rework_round(rework_round, cap))
 }
 
 fn prepare_reviewer_authority(
@@ -612,7 +615,7 @@ fn r2_required_for_head(
     if matches!(
         tasks::get(conn, task_id),
         Ok(Some(task))
-            if task.rework_round >= i64::from(quorum_core::lifecycle::REWORK_CAP)
+            if task.rework_round >= i64::from(task.effective_rework_cap())
     ) {
         return false;
     }
@@ -645,7 +648,7 @@ fn decide_r2_requirement(
     {
         return Ok(required);
     }
-    if task.rework_round >= i64::from(quorum_core::lifecycle::REWORK_CAP) {
+    if task.rework_round >= i64::from(task.effective_rework_cap()) {
         return quorum_core::review_audits::record_r2_requirement(
             conn, task_id, pr_number, head_sha, false,
         );
@@ -3104,6 +3107,9 @@ pub struct ServeConfig {
     pub r2_target_per_stratum: i64,
     /// Probability of an R2 after its stratum reaches the coverage target.
     pub r2_steady_state_p: f64,
+    /// Maximum rework rounds before a task fails. Stamped onto each task at
+    /// adoption; unset in config falls back to `lifecycle::REWORK_CAP`.
+    pub max_rework: u32,
     /// Codex sandbox mode (default: "danger-full-access").
     pub codex_sandbox: String,
     /// Test-only override for the `gh` binary used by live PR target
@@ -5989,20 +5995,28 @@ async fn store_classifier_response(
     pending_task_ids: &[i64],
     pending_inputs: &[quorum_core::classify::ClassificationInput],
     classifier_model: &str,
+    max_rework: u32,
 ) -> std::result::Result<usize, String> {
     let results = classifier::parse_validated_response(text, pending_task_ids)?;
     let path = db_path.to_path_buf();
     let pending_inputs = pending_inputs.to_vec();
+    let pending_task_ids = pending_task_ids.to_vec();
     let version = quorum_core::classify::classifier_provenance(classifier_model);
     let stored = tokio::task::spawn_blocking(move || -> Result<usize> {
         let mut conn = quorum_core::db::open(&path)?;
-        quorum_core::classify::store_classifications_for_inputs(
+        let stored = quorum_core::classify::store_classifications_for_inputs(
             &mut conn,
             &results,
             &pending_inputs,
             &version,
             now_unix(),
-        )
+        )?;
+        // Classification is the earliest per-task daemon adoption point: stamp
+        // the configured rework ceiling here, immutable once populated.
+        for id in &pending_task_ids {
+            quorum_core::tasks::stamp_rework_cap(&mut conn, *id, max_rework, now_unix())?;
+        }
+        Ok(stored)
     })
     .await
     .map_err(|error| format!("classifier storage join failed: {error}"))?
@@ -11953,6 +11967,7 @@ async fn tick(
                     &pending_task_ids,
                     &pending_inputs,
                     &classifier_model,
+                    config.max_rework,
                 )
                 .await
                 {
@@ -18384,6 +18399,7 @@ mod tests {
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
+            max_rework: quorum_core::lifecycle::REWORK_CAP,
             codex_sandbox: "danger-full-access".into(),
             pr_target_program: None,
         }
@@ -21861,6 +21877,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
+            max_rework: quorum_core::lifecycle::REWORK_CAP,
             codex_sandbox: "danger-full-access".into(),
             pr_target_program: None,
         }
