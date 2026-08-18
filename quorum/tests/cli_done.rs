@@ -577,6 +577,32 @@ fn review_draft_requires_matching_reviewer_run_identity() {
         .code(2)
         .stderr(predicate::str::contains("role mismatch"));
 
+    issue_cap(
+        home.path(),
+        "foreign-review-run",
+        9,
+        "OtherReviewer",
+        "reviewer",
+    );
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "foreign-review-run")
+        .args([
+            "review-draft",
+            "--agent",
+            "Reviewer",
+            "--pr",
+            "60",
+            "--blocking",
+            "1",
+            "--feedback-file",
+        ])
+        .arg(&feedback)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("agent mismatch"));
+
     let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
     assert!(quorum_core::mailbox::poll_unconsumed(&conn)
         .unwrap()
