@@ -23402,7 +23402,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     #[cfg(unix)]
     async fn buffered_codex_reviewer_slot_for_phase2_test(
-        dir: &tempfile::TempDir,
+        dir: &Path,
         repo_dir: &Path,
         task_id: i64,
         reviewer_run_id: i64,
@@ -23410,7 +23410,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     ) -> SlotState {
         use std::os::unix::fs::PermissionsExt;
 
-        let fixture = dir.path().join(format!("{agent}-terminal.sh"));
+        let fixture = dir.join(format!("{agent}-terminal.sh"));
         std::fs::write(
             &fixture,
             "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":80,\"cache_write_input_tokens\":10,\"output_tokens\":5,\"reasoning_output_tokens\":3}}'\n",
@@ -23441,7 +23441,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         reviewer.agent_name = agent.into();
         reviewer.task_id = task_id;
         reviewer.agent_run_id = Some(reviewer_run_id);
-        reviewer.worktree_path = dir.path().join(format!("{agent}-worktree"));
+        reviewer.worktree_path = dir.join(format!("{agent}-worktree"));
         reviewer.branch = format!("{agent}-terminal-fixture");
         reviewer.cost_tokens = 0;
         reviewer.limit_tokens = 0;
@@ -23459,51 +23459,80 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         reviewer
     }
 
-    async fn tick_phase2_reviewer_fixture(
-        config: &ServeConfig,
-        name_pool: &mut Pool,
-        reviewers: &mut Vec<SlotState>,
-    ) {
-        let wt_mgr = WorktreeManager::new();
-        let mut workers = Vec::new();
-        let mut pre_review_checks = HashMap::new();
-        let mut pending_reviewer_resumes = HashMap::new();
-        let mut poison_tracker = PoisonTracker::new();
-        let mut claim_skip_logs = ClaimSkipLogLimiter::new();
-        let mut drain_state = DrainState::new();
-        let mut lifetime_roster = LifetimeRoster::new();
-        for reviewer in reviewers.iter() {
-            lifetime_roster.register(&reviewer.agent_name);
-        }
-        let mut classifier_slot = None;
-        let mut decomposition_coordinator = DecompositionCoordinator::default();
-        let mut classifier_consec_errors = 0;
-        let mut classifier_backoff_until = None;
-        let mut doctor_slot = None;
-        let mut doctored_tasks = std::collections::HashSet::new();
-        let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
-        tick(
-            config,
-            &wt_mgr,
-            name_pool,
-            &mut workers,
-            reviewers,
-            &mut pre_review_checks,
-            &mut pending_reviewer_resumes,
-            &mut poison_tracker,
-            &mut claim_skip_logs,
-            &mut drain_state,
-            &mut lifetime_roster,
-            &mut classifier_slot,
-            &mut decomposition_coordinator,
-            &mut classifier_consec_errors,
-            &mut classifier_backoff_until,
-            &mut doctor_slot,
-            &mut doctored_tasks,
-            &signal_count,
-        )
-        .await
-        .unwrap();
+    fn tick_phase2_reviewer_fixture(
+        config: ServeConfig,
+        mut name_pool: Pool,
+        fixture_dir: std::path::PathBuf,
+        repo_dir: std::path::PathBuf,
+        task_id: i64,
+        reviewer_run_id: i64,
+        agent: String,
+    ) -> (Pool, Vec<SlotState>) {
+        std::thread::Builder::new()
+            .name("phase2-reviewer-fixture".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let mut reviewers = vec![
+                        buffered_codex_reviewer_slot_for_phase2_test(
+                            &fixture_dir,
+                            &repo_dir,
+                            task_id,
+                            reviewer_run_id,
+                            &agent,
+                        )
+                        .await,
+                    ];
+                    let wt_mgr = WorktreeManager::new();
+                    let mut workers = Vec::new();
+                    let mut pre_review_checks = HashMap::new();
+                    let mut pending_reviewer_resumes = HashMap::new();
+                    let mut poison_tracker = PoisonTracker::new();
+                    let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+                    let mut drain_state = DrainState::new();
+                    let mut lifetime_roster = LifetimeRoster::new();
+                    for reviewer in &reviewers {
+                        lifetime_roster.register(&reviewer.agent_name);
+                    }
+                    let mut classifier_slot = None;
+                    let mut decomposition_coordinator = DecompositionCoordinator::default();
+                    let mut classifier_consec_errors = 0;
+                    let mut classifier_backoff_until = None;
+                    let mut doctor_slot = None;
+                    let mut doctored_tasks = std::collections::HashSet::new();
+                    let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+                    tick(
+                        &config,
+                        &wt_mgr,
+                        &mut name_pool,
+                        &mut workers,
+                        &mut reviewers,
+                        &mut pre_review_checks,
+                        &mut pending_reviewer_resumes,
+                        &mut poison_tracker,
+                        &mut claim_skip_logs,
+                        &mut drain_state,
+                        &mut lifetime_roster,
+                        &mut classifier_slot,
+                        &mut decomposition_coordinator,
+                        &mut classifier_consec_errors,
+                        &mut classifier_backoff_until,
+                        &mut doctor_slot,
+                        &mut doctored_tasks,
+                        &signal_count,
+                    )
+                    .await
+                    .unwrap();
+                    (name_pool, reviewers)
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap()
     }
 
     #[cfg(unix)]
@@ -23589,25 +23618,24 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap();
             (task_id, run_id, mailbox_id)
         };
-        let reviewer = buffered_codex_reviewer_slot_for_phase2_test(
-            &dir,
-            &repo_dir,
-            task_id,
-            reviewer_run_id,
-            "Phase2Reviewer",
-        )
-        .await;
-        let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir);
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir.clone());
         config.limits = CostLimits {
             max_task_tokens: Some(100),
             ..Default::default()
         };
         let mut name_pool = Pool::new_generated();
         name_pool.acquire_named("Phase2Reviewer").unwrap();
-        let mut reviewers = vec![reviewer];
         assert!(take_terminal_usage_diagnostics_for_test("Phase2Reviewer").is_empty());
 
-        tick_phase2_reviewer_fixture(&config, &mut name_pool, &mut reviewers).await;
+        let (_name_pool, reviewers) = tick_phase2_reviewer_fixture(
+            config,
+            name_pool,
+            dir.path().to_path_buf(),
+            repo_dir,
+            task_id,
+            reviewer_run_id,
+            "Phase2Reviewer".into(),
+        );
 
         assert!(
             reviewers.is_empty(),
@@ -23752,21 +23780,20 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap();
             (task_id, run_id, mailbox_id)
         };
-        let reviewer = buffered_codex_reviewer_slot_for_phase2_test(
-            &dir,
-            &repo_dir,
-            task_id,
-            reviewer_run_id,
-            "UnrecordedReviewer",
-        )
-        .await;
-        let config = pre_review_ci_test_config(db_path.clone(), repo_dir);
+        let config = pre_review_ci_test_config(db_path.clone(), repo_dir.clone());
         let mut name_pool = Pool::new_generated();
         name_pool.acquire_named("UnrecordedReviewer").unwrap();
-        let mut reviewers = vec![reviewer];
         assert!(take_terminal_usage_diagnostics_for_test("UnrecordedReviewer").is_empty());
 
-        tick_phase2_reviewer_fixture(&config, &mut name_pool, &mut reviewers).await;
+        let (_name_pool, reviewers) = tick_phase2_reviewer_fixture(
+            config,
+            name_pool,
+            dir.path().to_path_buf(),
+            repo_dir,
+            task_id,
+            reviewer_run_id,
+            "UnrecordedReviewer".into(),
+        );
 
         assert!(
             reviewers.is_empty(),
