@@ -100,6 +100,104 @@ fail() { printf '\nPREFLIGHT: FAIL (%s)\n' "$1"; exit 1; }
 TIMING_DIR=target/preflight-timing
 TIMING_ARTIFACT="$TIMING_DIR/timing.json"
 TIMING_SUMMARY="$TIMING_DIR/summary.txt"
+GREEN_CACHE="$TIMING_DIR/last-green.json"
+
+# Gates 2-4 are expensive but purely a function of the working tree.  Keep
+# their cache deliberately local to target/: the branch-base gate still runs
+# on every full invocation because origin/main can advance independently.
+#
+# The fingerprint includes tracked state plus both ordinary and ignored
+# untracked inputs.  target/ is the one intentional exception: it contains
+# Cargo's generated outputs and this cache itself, neither of which is an
+# author input to the gates.  If anything about collection is uncertain, the
+# caller treats it as a cache miss and runs the gates.
+working_tree_fingerprint() {
+  python3 - <<'PY'
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+
+def git(*args):
+    return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL)
+
+def add(hasher, label, value):
+    hasher.update(label)
+    hasher.update(len(value).to_bytes(8, "big"))
+    hasher.update(value)
+
+try:
+    head = git("rev-parse", "--verify", "HEAD^{commit}")
+    status = git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    diff = git("-c", "core.quotepath=false", "diff", "--binary", "--no-ext-diff", "HEAD")
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z")
+    ignored = git("ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+
+    paths = set(untracked.split(b"\0")[:-1]) | set(ignored.split(b"\0")[:-1])
+    hasher = hashlib.sha256()
+    add(hasher, b"HEAD\0", head)
+    add(hasher, b"STATUS\0", status)
+    add(hasher, b"DIFF\0", diff)
+    for path in sorted(path for path in paths if path != b"target" and not path.startswith(b"target/")):
+        metadata = os.lstat(path)
+        add(hasher, b"PATH\0", path)
+        add(hasher, b"MODE\0", str(stat.S_IMODE(metadata.st_mode)).encode())
+        if stat.S_ISREG(metadata.st_mode):
+            with open(path, "rb") as source:
+                add(hasher, b"FILE\0", source.read())
+        elif stat.S_ISLNK(metadata.st_mode):
+            add(hasher, b"LINK\0", os.readlink(path))
+        else:
+            raise RuntimeError(f"unsupported untracked input: {path!r}")
+except BaseException as error:
+    print(f"preflight.sh: cannot fingerprint working tree: {error}", file=sys.stderr)
+    sys.exit(1)
+
+print(hasher.hexdigest())
+PY
+}
+
+has_green_cache() {
+  python3 - "$GREEN_CACHE" "$1" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        cached = json.load(source)
+    expected = {"exit": 0, "fingerprint": sys.argv[2]}
+    if cached != expected:
+        raise ValueError("cache entry is not an exact green fingerprint")
+except BaseException:
+    sys.exit(1)
+PY
+}
+
+write_green_cache() {
+  python3 - "$GREEN_CACHE" "$1" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+cache = sys.argv[1]
+directory = os.path.dirname(cache)
+os.makedirs(directory, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=".last-green.", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        json.dump({"exit": 0, "fingerprint": sys.argv[2]}, output, sort_keys=True)
+        output.write("\n")
+    os.replace(temporary, cache)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
 
 monotonic_now() {
   python3 -c 'import time; print(time.monotonic())'
@@ -308,6 +406,16 @@ print(time.monotonic() - float(sys.argv[1]))
 PY
 ) || fail "finish branch-base timer"
 
+FULL_GATE_FINGERPRINT=
+if FULL_GATE_FINGERPRINT=$(working_tree_fingerprint); then
+  if has_green_cache "$FULL_GATE_FINGERPRINT"; then
+    printf '\nPREFLIGHT: PASS (cached — tree unchanged since last green run)\n'
+    exit 0
+  fi
+else
+  printf 'preflight.sh: fingerprint unavailable; running full gates\n' >&2
+fi
+
 printf '=== preflight 2-4: timing collector (fmt, clippy, compile/no-run, test execution) ===\n'
 if scripts/preflight/timing.sh \
   --test-jobs "$TEST_JOBS" --test-threads "$TEST_THREADS"; then
@@ -335,6 +443,19 @@ else
       exit "$TIMING_STATUS"
       ;;
   esac
+fi
+
+if [ -n "$FULL_GATE_FINGERPRINT" ]; then
+  if FINAL_FINGERPRINT=$(working_tree_fingerprint); then
+    if [ "$FINAL_FINGERPRINT" = "$FULL_GATE_FINGERPRINT" ]; then
+      write_green_cache "$FINAL_FINGERPRINT" \
+        || printf 'preflight.sh: could not write green cache; next run will be full\n' >&2
+    else
+      printf 'preflight.sh: tree changed while gates ran; green cache not written\n' >&2
+    fi
+  else
+    printf 'preflight.sh: could not fingerprint green tree; cache not written\n' >&2
+  fi
 fi
 
 printf '\nPREFLIGHT: PASS (all 4 gates green)\n'

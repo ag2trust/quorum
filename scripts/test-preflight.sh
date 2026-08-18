@@ -50,7 +50,8 @@ git config user.email ci@example.invalid
 git remote add origin "$REMOTE"
 
 printf 'base\n' > state
-git add state
+printf 'pub fn tracked_fixture() {}\n' > tracked.rs
+git add state tracked.rs
 git commit -qm 'base'
 git branch -M main
 git push -q origin main
@@ -447,6 +448,40 @@ data = json.load(open(sys.argv[1]))
 assert data["test_jobs"] == 2
 assert data["test_threads"] == 4
 PY
+python3 - target/preflight-timing/last-green.json <<'PY'
+import json
+import re
+import sys
+
+data = json.load(open(sys.argv[1]))
+assert data["exit"] == 0
+assert re.fullmatch(r"[0-9a-f]{64}", data["fingerprint"])
+PY
+
+# A green full run records the complete working-tree fingerprint. Repeating it
+# without a source change still checks branch base, but does not invoke Cargo.
+: >"$TMP/full-cargo.log"
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/cached.out"
+grep -q 'PREFLIGHT: PASS (cached — tree unchanged since last green run)' \
+  "$TMP/cached.out"
+[ ! -s "$TMP/full-cargo.log" ]
+
+# A tracked Rust source edit must invalidate the green result and re-run every
+# collector gate. An untracked Rust source file is an input too.
+printf '// tracked change\n' >> tracked.rs
+: >"$TMP/full-cargo.log"
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/tracked-cache-miss.out"
+cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/tracked-cache-miss.out"
+
+printf 'pub fn untracked_fixture() {}\n' > untracked.rs
+: >"$TMP/full-cargo.log"
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/untracked-cache-miss.out"
+cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/untracked-cache-miss.out"
 
 if PATH="$BIN:$PATH" scripts/preflight/timing.sh --test-jobs 0 \
   >"$TMP/invalid-test-jobs.out" 2>&1; then
