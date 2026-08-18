@@ -312,13 +312,18 @@ except (IndexError, ValueError):
     sys.exit(1)
 
 def inert(path):
+    # Rust is always a build input, including a README.rs or LICENSE.rs whose
+    # root-document prefix would otherwise match the allowlist.
+    if path.endswith(b".rs"):
+        return False
     return (
         path.startswith(b"docs/")
         or path.startswith(b".github/")
         or (b"/" not in path and (
             path.endswith(b".md")
-            or path.startswith(b"LICENSE")
-            or path.startswith(b"README")
+        ))
+        or (b"/" not in path and (
+            path.startswith(b"LICENSE") or path.startswith(b"README")
         ))
     )
 
