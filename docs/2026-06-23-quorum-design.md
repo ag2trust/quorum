@@ -636,7 +636,10 @@ only through an explicit outside request)
   through to generic implementation-worker provisioning, because remediation must retain
   the adopted PR target. Before reviewer provisioning, the daemon validates the live PR base
   against the task's immutable target branch, with configured-base fallback only for legacy
-  targetless tasks. Review-only remediation integrates that same task target.
+  targetless tasks. The daemon revalidates the live base before every reviewer feed and again
+  before formal approval and merge, including restart recovery and policy retries. Review-only
+  remediation integrates that same task target. Storage failures while resolving task authority
+  remain abnormal daemon errors rather than ordinary target rejections or parked remediation.
 - **Existing-PR implementation entry:** `task-create --continue-pr N` creates an `open`
   implementation intent and atomically rejects an already-owned PR. Before provisioning,
   the daemon resolves an open, same-repository, non-fork PR, rechecks exclusive nonterminal

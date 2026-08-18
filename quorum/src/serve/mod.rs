@@ -1100,22 +1100,24 @@ async fn load_publication_state(
 /// Return the authoritative target for a task. Task creation persists this
 /// field before the daemon can claim the task. Legacy tasks that predate that
 /// contract return `None` and retain the configured-base path.
-async fn task_target_branch(
-    db_path: &Path,
-    task_id: i64,
-) -> std::result::Result<Option<String>, String> {
+async fn task_target_branch(db_path: &Path, task_id: i64) -> Result<Option<String>> {
     let path = db_path.to_path_buf();
     let branch = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let conn = quorum_core::db::open(&path)?;
         Ok(tasks::get(&conn, task_id)?.and_then(|task| task.target_branch))
     })
     .await
-    .map_err(|error| format!("task target branch read join failure: {error}"))?
-    .map_err(|error| format!("task target branch read failed: {error}"))?;
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "task target branch read join failure for task #{task_id}: {error}"
+        ))
+    })??;
     match branch {
         Some(branch) => {
             tasks::validate_target_branch(&branch).map_err(|error| {
-                format!("task #{task_id} has invalid authoritative target branch: {error}")
+                QuorumError::Io(format!(
+                    "task #{task_id} has invalid authoritative target branch: {error}"
+                ))
             })?;
             Ok(Some(branch))
         }
@@ -1130,10 +1132,17 @@ async fn effective_task_base_branch(
     db_path: &Path,
     task_id: i64,
     configured_base_branch: &str,
-) -> std::result::Result<String, String> {
+) -> Result<String> {
     Ok(task_target_branch(db_path, task_id)
         .await?
         .unwrap_or_else(|| configured_base_branch.to_string()))
+}
+
+fn merge_base_remediation_message(summary: &str, effective_base_branch: &str) -> String {
+    format!(
+        "{summary}\n\nPreserve the published PR head, merge {effective_base_branch} into the PR \
+         branch, resolve conflicts, commit, and submit without pushing. Never rebase."
+    )
 }
 
 fn publication_base_branch(
@@ -1442,7 +1451,9 @@ async fn reconcile_publication_intent_with_task_target(
     prior: Option<&PublicationIntent>,
     intent: &mut PublicationIntent,
 ) -> std::result::Result<(), String> {
-    let authoritative_task_target = task_target_branch(db_path, task_id).await?;
+    let authoritative_task_target = task_target_branch(db_path, task_id)
+        .await
+        .map_err(|error| error.to_string())?;
     reject_prior_target_conflict(prior, authoritative_task_target.as_deref())?;
     backfill_intent_target_branch(intent, authoritative_task_target);
     Ok(())
@@ -1806,10 +1817,15 @@ async fn validate_reviewer_pr_target_for_task(
     db_path: &Path,
     task_id: i64,
     configured_base_branch: &str,
-) -> std::result::Result<(), String> {
+) -> Result<std::result::Result<(), String>> {
     let effective_base =
         effective_task_base_branch(db_path, task_id, configured_base_branch).await?;
-    validate_reviewer_pr_target(resolved, expected_pr, gated_head_sha, &effective_base)
+    Ok(validate_reviewer_pr_target(
+        resolved,
+        expected_pr,
+        gated_head_sha,
+        &effective_base,
+    ))
 }
 
 /// Persist one reviewer target only while the exact reservation still owns an
@@ -6223,7 +6239,7 @@ async fn handle_pre_review_checks_failure(
     pr: i64,
     head_sha: &str,
     failing_checks: &[String],
-) {
+) -> Result<()> {
     let names = failing_checks.join(", ");
     let feedback = format!(
         "CI checks failed before review for PR #{pr}: {names}\n\n\
@@ -6285,7 +6301,7 @@ async fn handle_pre_review_checks_failure(
                     pr,
                     &feedback,
                 )
-                .await
+                .await?
                 {
                     let worker = workers.remove(worker_index);
                     cleanup_slot(
@@ -6350,7 +6366,7 @@ async fn handle_pre_review_checks_failure(
                                 "FATAL: worker {} rework journal handoff failed: {error}",
                                 worker.agent_name
                             ));
-                            return;
+                            return Ok(());
                         }
                         log(&format!(
                             "worker {} rework #{} (pre-review CI failure)",
@@ -6377,6 +6393,7 @@ async fn handle_pre_review_checks_failure(
             ));
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6430,7 +6447,7 @@ async fn resume_reviewer_after_ci(
                 &gated_head_sha,
                 &failing_checks,
             )
-            .await;
+            .await?;
             return Ok(true);
         }
         PreReviewChecksGate::Ready => {}
@@ -6458,6 +6475,40 @@ async fn resume_reviewer_after_ci(
             },
             confirmed_head_sha.as_deref().unwrap_or("<missing>")
         ));
+        return Ok(false);
+    }
+
+    // The PR base can be retargeted without moving the head SHA. Require a
+    // fresh live target immediately before feeding the reviewer so a cached
+    // CI result or persisted target can never authorize review of the wrong
+    // base. Lookup outages defer the feed; task-target storage failures remain
+    // abnormal daemon errors.
+    let live_target =
+        match resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await {
+            Ok(target) => ResolvedReviewerPrTarget {
+                target,
+                source: ReviewerPrTargetSource::Live,
+            },
+            Err(error) => {
+                pre_review_checks.remove(&task_id);
+                log(&format!(
+                    "ResumeReviewer: live PR #{pr} target unavailable ({error}); reviewer not fed"
+                ));
+                return Ok(false);
+            }
+        };
+    if let Err(reason) = validate_reviewer_pr_target_for_task(
+        &live_target,
+        pr,
+        &gated_head_sha,
+        &config.db_path,
+        task_id,
+        &config.base_branch,
+    )
+    .await?
+    {
+        pre_review_checks.remove(&task_id);
+        log(&format!("ResumeReviewer: {reason}; reviewer not fed"));
         return Ok(false);
     }
 
@@ -6940,6 +6991,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &config.db_path,
             &config.repo_dir,
             &config.merge_executor,
+            &config.base_branch,
             config.merge_checks_timeout_secs,
             config.merge_checks_poll_secs,
         )
@@ -7758,6 +7810,12 @@ async fn tick(
                         }
                         continue;
                     };
+                    let effective_base_branch = effective_task_base_branch(
+                        &config.db_path,
+                        reviewer_task_id,
+                        &config.base_branch,
+                    )
+                    .await?;
 
                     // Verify the launch SHA *before* recording an approval or
                     // choosing a sampled R2 requirement. Otherwise an R1 that
@@ -8043,7 +8101,7 @@ async fn tick(
                                         &head_sha,
                                         &failing_checks,
                                     )
-                                    .await;
+                                    .await?;
                                 }
                                 if !consume_mailbox_row(&db_path, *id).await {
                                     break;
@@ -8293,7 +8351,7 @@ async fn tick(
                                 &Event::MergeFailed {
                                     reason: format!(
                                         "PR #{pr_num} has conflicts with {}",
-                                        config.base_branch
+                                        effective_base_branch
                                     ),
                                 },
                             )
@@ -8313,12 +8371,12 @@ async fn tick(
                             log(&format!(
                                 "PR #{pr_num} is CONFLICTING — firing MergeConflict"
                             ));
-                            let rework_msg = format!(
-                                "PR #{pr_num} has conflicts with {} \
-                                 (a sibling PR likely merged first).\n\n\
-                                 Preserve the published PR head, merge {} into the PR branch, \
-                                 resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                config.base_branch, config.base_branch
+                            let rework_msg = merge_base_remediation_message(
+                                &format!(
+                                    "PR #{pr_num} has conflicts with {effective_base_branch} \
+                                     (a sibling PR likely merged first)."
+                                ),
+                                &effective_base_branch,
                             );
                             let mc = fire_actionable_rework_event(
                                 &db_path,
@@ -8340,7 +8398,7 @@ async fn tick(
                                             pr_num,
                                             &rework_msg,
                                         )
-                                        .await
+                                        .await?
                                         {
                                             let w = workers.remove(wi);
                                             cleanup_slot(
@@ -8632,7 +8690,7 @@ async fn tick(
                                             pr_num,
                                             &rework_msg,
                                         )
-                                        .await
+                                        .await?
                                         {
                                             let w = workers.remove(wi);
                                             cleanup_slot(
@@ -8825,12 +8883,12 @@ async fn tick(
                                     "PR #{pr_num} became CONFLICTING during checks \
                                      wait — firing MergeConflict"
                                 ));
-                                let rework_msg = format!(
-                                    "PR #{pr_num} has conflicts with {} \
-                                     (detected after checks timeout).\n\n\
-                                     Preserve the published PR head, merge {} into the PR branch, \
-                                     resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                    config.base_branch, config.base_branch
+                                let rework_msg = merge_base_remediation_message(
+                                    &format!(
+                                        "PR #{pr_num} has conflicts with {effective_base_branch} \
+                                         (detected after checks timeout)."
+                                    ),
+                                    &effective_base_branch,
                                 );
                                 let mc = fire_actionable_rework_event(
                                     &db_path,
@@ -8853,7 +8911,7 @@ async fn tick(
                                                 pr_num,
                                                 &rework_msg,
                                             )
-                                            .await
+                                            .await?
                                             {
                                                 let w = workers.remove(wi);
                                                 cleanup_slot(
@@ -9177,12 +9235,12 @@ async fn tick(
                                 "PR #{pr_num} is CONFLICTING at merge time \
                                  — firing MergeConflict"
                             ));
-                            let rework_msg = format!(
-                                "PR #{pr_num} has conflicts with {} \
-                                 (detected at merge time).\n\n\
-                                 Preserve the published PR head, merge {} into the PR branch, \
-                                 resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                config.base_branch, config.base_branch
+                            let rework_msg = merge_base_remediation_message(
+                                &format!(
+                                    "PR #{pr_num} has conflicts with {effective_base_branch} \
+                                     (detected at merge time)."
+                                ),
+                                &effective_base_branch,
                             );
                             let mc = fire_actionable_rework_event(
                                 &db_path,
@@ -9204,7 +9262,7 @@ async fn tick(
                                             pr_num,
                                             &rework_msg,
                                         )
-                                        .await
+                                        .await?
                                         {
                                             let w = workers.remove(wi);
                                             cleanup_slot(
@@ -9370,6 +9428,7 @@ async fn tick(
                             let merge_ctx = merge::MergeContext {
                                 reviewer_name: reviewers[ri].agent_name.clone(),
                                 review_task_id: reviewer_task_id,
+                                expected_base_branch: effective_base_branch.clone(),
                             };
                             tokio::task::spawn_blocking(move || {
                                 executor.merge(pr_num, &repo, &merge_ctx)
@@ -9573,11 +9632,12 @@ async fn tick(
                                 } else {
                                     // in-review → rework
                                     let reviewer_name = reviewers[ri].agent_name.clone();
-                                    let rework_msg = format!(
-                                        "Merge of PR #{pr_num} failed: {}\n\n\
-                                         Preserve the published PR head, merge {} into the PR branch, \
-                                         resolve conflicts, commit, and submit without pushing. Never rebase.",
-                                        merge_result.message, config.base_branch
+                                    let rework_msg = merge_base_remediation_message(
+                                        &format!(
+                                            "Merge of PR #{pr_num} failed: {}",
+                                            merge_result.message
+                                        ),
+                                        &effective_base_branch,
                                     );
                                     let vc = fire_actionable_rework_event(
                                         &db_path,
@@ -9601,7 +9661,7 @@ async fn tick(
                                                     pr_num,
                                                     &rework_msg,
                                                 )
-                                                .await
+                                                .await?
                                                 {
                                                     let w = workers.remove(wi);
                                                     cleanup_slot(
@@ -9884,7 +9944,7 @@ async fn tick(
                                     rework_pr,
                                     feedback,
                                 )
-                                .await
+                                .await?
                                 {
                                     let w = workers.remove(wi);
                                     cleanup_slot(
@@ -11490,7 +11550,7 @@ async fn tick(
                 &head_sha,
                 &failing_checks,
             )
-            .await;
+            .await?;
         }
 
         // ── Phase 5b: Spawn reviewers for orphan in-review tasks ──────
@@ -11660,7 +11720,7 @@ async fn tick(
                         &head_sha,
                         &failing_checks,
                     )
-                    .await;
+                    .await?;
                     continue;
                 }
                 PreReviewChecksGate::Ready => {}
@@ -14214,7 +14274,7 @@ async fn provision_reviewer_reserved(
             worker.task_id,
             &config.base_branch,
         )
-        .await
+        .await?
         {
             log(&format!(
                 "{}: {reason} — reviewer not acquired or spawned",
@@ -16835,9 +16895,9 @@ async fn install_sticky_remediation_lease_and_baseline(
     task_id: i64,
     pr: i64,
     feedback: &str,
-) -> bool {
+) -> Result<bool> {
     if !install_live_worker_remediation_lease(config, agent.clone(), task_id, pr, feedback).await {
-        return false;
+        return Ok(false);
     }
     bind_claimed_sticky_remediation_baseline(config, &agent, task_id, pr, feedback).await
 }
@@ -16848,7 +16908,7 @@ async fn bind_claimed_sticky_remediation_baseline(
     task_id: i64,
     pr: i64,
     feedback: &str,
-) -> bool {
+) -> Result<bool> {
     if pr <= 0 {
         log(&format!(
             "sticky remediation: task #{task_id} has no PR to bind — releasing lease and parking"
@@ -16858,21 +16918,31 @@ async fn bind_claimed_sticky_remediation_baseline(
             "sticky remediation baseline binding failed: no PR identity",
         );
         park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
-        return false;
+        return Ok(false);
     }
-    if let Err(error) = bind_sticky_remediation_pr_baseline(config, task_id, pr).await {
-        log(&format!(
-            "sticky remediation: baseline bind failed for task #{task_id} PR #{pr}: {error} \
-             — releasing lease and parking"
-        ));
-        release_sticky_remediation_lease(&config.db_path, agent, task_id).await;
-        let cause = classified_provisioning_cause(&format!(
-            "sticky remediation baseline binding failed: {error}"
-        ));
-        park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
-        return false;
+    match bind_sticky_remediation_pr_baseline(config, task_id, pr).await {
+        Ok(()) => Ok(true),
+        Err(QuorumError::Usage(error)) => {
+            log(&format!(
+                "sticky remediation: baseline bind rejected for task #{task_id} PR #{pr}: \
+                 {error} — releasing lease and parking"
+            ));
+            release_sticky_remediation_lease(&config.db_path, agent, task_id).await;
+            let cause = classified_provisioning_cause(&format!(
+                "sticky remediation baseline binding failed: {error}"
+            ));
+            park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
+            Ok(false)
+        }
+        Err(error) => {
+            log(&format!(
+                "sticky remediation: abnormal baseline bind failure for task #{task_id} PR #{pr}: \
+                 {error} — releasing lease"
+            ));
+            release_sticky_remediation_lease(&config.db_path, agent, task_id).await;
+            Err(error)
+        }
     }
-    true
 }
 
 /// Commit every recovered startup launch as ordinary live work in one write
@@ -16951,7 +17021,8 @@ async fn resume_recovered_dormant_reworks(
         attempted.insert((task_id, agent.clone()));
         let pr = workers[worker_index].pr.unwrap_or_default();
         let feedback = workers[worker_index].pending_prompt.clone();
-        if !bind_claimed_sticky_remediation_baseline(config, &agent, task_id, pr, &feedback).await {
+        if !bind_claimed_sticky_remediation_baseline(config, &agent, task_id, pr, &feedback).await?
+        {
             let worker = workers.remove(worker_index);
             cleanup_slot(
                 config,
@@ -17069,7 +17140,7 @@ async fn bind_sticky_remediation_pr_baseline(
     config: &ServeConfig,
     task_id: i64,
     pr: i64,
-) -> std::result::Result<(), String> {
+) -> Result<()> {
     let effective_base_branch =
         effective_task_base_branch(&config.db_path, task_id, &config.base_branch).await?;
     let program = config
@@ -17084,26 +17155,26 @@ async fn bind_sticky_remediation_pr_baseline(
         program,
     )
     .await
-    .map_err(|error| format!("live PR #{pr} target lookup failed: {error}"))?;
+    .map_err(|error| QuorumError::Usage(format!("live PR #{pr} target lookup failed: {error}")))?;
     if target.pr != pr {
-        return Err(format!(
+        return Err(QuorumError::Usage(format!(
             "PR identity changed: expected #{pr}, got #{}",
             target.pr
-        ));
+        )));
     }
     if target.state.as_deref() != Some("OPEN") {
-        return Err(format!("PR #{pr} is not open"));
+        return Err(QuorumError::Usage(format!("PR #{pr} is not open")));
     }
     if target.is_fork {
-        return Err(format!(
+        return Err(QuorumError::Usage(format!(
             "PR #{pr} is a fork head; daemon has no supported safe push mechanism"
-        ));
+        )));
     }
     if target.base_ref.as_deref() != Some(effective_base_branch.as_str()) {
-        return Err(format!(
+        return Err(QuorumError::Usage(format!(
             "PR #{pr} targets base {:?}, expected {effective_base_branch}",
             target.base_ref
-        ));
+        )));
     }
 
     let db_path = config.db_path.clone();
@@ -17113,8 +17184,12 @@ async fn bind_sticky_remediation_pr_baseline(
         persist_sticky_remediation_baseline(&mut conn, task_id, pr, &target_owned)
     })
     .await
-    .map_err(|error| format!("sticky baseline persistence join failure: {error}"))?
-    .map_err(|error| format!("sticky baseline persistence failed: {error}"))
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "sticky baseline persistence join failure for task #{task_id}: {error}"
+        ))
+    })??;
+    Ok(())
 }
 
 /// Guarded write: upsert the durable `pr_targets` baseline and, if the current
@@ -17256,9 +17331,8 @@ async fn spawn_remediation_worker(
     feedback: &str,
 ) -> Result<RemediationSpawnOutcome> {
     let db_path = &config.db_path;
-    let effective_base_branch = effective_task_base_branch(db_path, task_id, &config.base_branch)
-        .await
-        .map_err(QuorumError::Io)?;
+    let effective_base_branch =
+        effective_task_base_branch(db_path, task_id, &config.base_branch).await?;
 
     // Fetch task body + author for context and branch resolution.
     let (task_body, task_author, task_review_only) = {
@@ -18743,7 +18817,8 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567",
             &["test".into()],
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             workers.len(),
             1,
@@ -24075,6 +24150,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[test]
+    fn merge_remediation_instruction_uses_effective_task_base() {
+        let message =
+            merge_base_remediation_message("PR #636 has conflicts with develop", "develop");
+        assert!(message.contains("merge develop into the PR branch"));
+        assert!(!message.contains("merge main into the PR branch"));
+    }
+
+    #[test]
     fn continue_pr_baseline_is_immutable_after_first_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("q.db");
@@ -24552,6 +24635,19 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn sticky_task_target_storage_failure_is_abnormal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing-parent").join("quorum.db");
+        let config = sticky_baseline_test_config(db_path, dir.path().to_path_buf());
+
+        let error = bind_sticky_remediation_pr_baseline(&config, 77, 703)
+            .await
+            .expect_err("storage failures must not become a parked target rejection");
+        assert_eq!(error.exit_code(), 3, "unexpected error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn sticky_baseline_fills_missing_intent_from_live_when_persisted_matches() {
         // #448 regression: pr_targets seeded from a prior spawn but the initial
         // publication intent still carries expected_remote_sha=None. The live
@@ -24628,7 +24724,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
             .await
             .expect_err("live head movement outside persisted baseline must fail");
-        assert!(error.contains("moved outside"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("moved outside"),
+            "unexpected error: {error}"
+        );
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         // Persisted baseline unchanged.
@@ -24666,7 +24765,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
             .await
             .expect_err("a closed PR must not receive a remediation turn");
-        assert!(error.contains("not open"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("not open"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]
@@ -24694,7 +24796,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
             .await
             .expect_err("a retargeted PR must not receive a remediation turn");
-        assert!(error.contains("targets base"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("targets base"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]
@@ -24721,7 +24826,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
             .await
             .expect_err("a renamed head_ref must not receive a remediation turn");
-        assert!(error.contains("moved outside"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("moved outside"),
+            "unexpected error: {error}"
+        );
 
         // Persisted baseline still intact.
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -24754,7 +24862,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
             .await
             .expect_err("an unavailable live target must not authorize the turn");
-        assert!(error.contains("live PR"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("live PR"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]
@@ -24776,7 +24887,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
             .await
             .expect_err("fork PR must not be pushed by the daemon");
-        assert!(error.contains("fork"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("fork"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]
@@ -24843,7 +24957,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             pr,
             "fix failed CI",
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             !installed,
             "a moved head must not authorize a provider turn"
@@ -24921,7 +25036,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             pr,
             "fix failed CI",
         )
-        .await;
+        .await
+        .unwrap();
         assert!(installed, "the exact gated head must authorize the turn");
 
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -24958,7 +25074,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             pr,
             "fix the failing check",
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             !installed,
             "baseline bind failure must reject the sticky turn"
@@ -25660,6 +25777,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         validate_reviewer_pr_target_for_task(&resolved, 42, "gated-sha", &db_path, task_id, "main")
             .await
+            .expect("task target read must succeed")
             .expect("reviewer validation must honor the immutable task target");
 
         resolved.target.base_ref = Some("main".into());
@@ -25672,11 +25790,31 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "main",
         )
         .await
+        .expect("task target read must succeed")
         .expect_err("configured-base PR must not replace a targeted task's base");
         assert!(
             error.contains("expected develop"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn reviewer_task_target_storage_failure_is_abnormal() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_db = dir.path().join("missing-parent").join("quorum.db");
+        let resolved = live_reviewer_target(42, "feature/review", "gated-sha");
+
+        let error = validate_reviewer_pr_target_for_task(
+            &resolved,
+            42,
+            "gated-sha",
+            &missing_db,
+            7,
+            "main",
+        )
+        .await
+        .expect_err("storage failures must escape ordinary target rejection");
+        assert_eq!(error.exit_code(), 3, "unexpected error: {error}");
     }
 
     #[test]
