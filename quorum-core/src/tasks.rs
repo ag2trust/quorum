@@ -41,10 +41,11 @@ pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
 pub const PARKED_UNSATISFIABLE_REF: &str = "daemon_parked_unsatisfiable";
 pub const CLASSIFIER_POLICY_PARKED_REF: &str = "classifier_policy_parked";
 pub const PARKED_REWORK_RETRY_REF: &str = "daemon_rework_retry_requested";
-/// One-shot owner authority to replay an already-approved merge. The CLI writes
-/// `requested`; the single daemon atomically advances it to `attempting` before
-/// any GitHub/CI call. A repeated infrastructure failure parks the task with
-/// `attempting` intact until another explicit retry replaces it with `requested`.
+/// Durable merge-call admission state. The CLI writes `requested` for an
+/// explicit replay; the single daemon atomically advances it to `attempting`
+/// before any GitHub/CI call. The live reviewed path also writes `attempting`
+/// immediately before its first merge call. A crash or infrastructure failure
+/// therefore cannot make an uncertain call eligible for automatic replay.
 pub const MERGE_RETRY_REF: &str = "daemon_merge_retry";
 pub const MERGE_RETRY_REQUESTED: &str = "requested";
 pub const MERGE_RETRY_ATTEMPTING: &str = "attempting";
@@ -1540,9 +1541,10 @@ pub fn complete_approved_merge(
     })
 }
 
-/// Fail closed from an explicit merge replay to ordinary review. Only the
+/// Fail closed from an admitted merge attempt to ordinary review. Only the
 /// named stale roles are invalidated; valid same-head evidence for another
-/// role is preserved for `next_needed_role`.
+/// role is preserved for `next_needed_role`. The attempt marker is consumed in
+/// the same transaction so a later reviewed head can cross a fresh boundary.
 pub fn invalidate_merge_retry(
     conn: &mut Connection,
     id: i64,
@@ -4070,6 +4072,37 @@ pub fn claim_merge_retry(conn: &mut Connection, now: i64) -> Result<Option<Task>
     task.ready = compute_ready(&tx, &task.depends_on)?;
     tx.commit()?;
     Ok(Some(task))
+}
+
+/// Cross the durable boundary immediately before the ordinary reviewed merge
+/// path makes its first remote merge call.
+///
+/// Only a merging task without an existing retry marker can be admitted. A
+/// `requested` marker belongs to the explicit-retry reconciler, while an
+/// `attempting` marker means a prior call may already have escaped. Both fail
+/// closed here. Startup parks `attempting` tasks before approval recovery.
+pub fn begin_approved_merge_attempt(conn: &mut Connection, id: i64, now: i64) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(COALESCE(refs, '{}'), '$.daemon_merge_retry', 'attempting'),
+             updated_at=?2
+         WHERE id=?1 AND status='merging'
+           AND (refs IS NULL OR json_valid(refs))
+           AND json_extract(COALESCE(refs, '{}'), '$.daemon_merge_retry') IS NULL",
+        params![id, now],
+    )?;
+    if changed == 1 {
+        crate::events::emit(
+            &tx,
+            "merge_attempt_started",
+            &lease_target(id),
+            "approved merge call admitted by daemon",
+            now,
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed == 1)
 }
 
 /// Remove stale runnable retry state from terminal tasks in a bounded,
@@ -9784,6 +9817,43 @@ mod tests {
             serde_json::from_str(claimed.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs[MERGE_RETRY_REF], MERGE_RETRY_ATTEMPTING);
         assert!(claim_merge_retry(&mut conn, 14).unwrap().is_none());
+    }
+
+    #[test]
+    fn approved_merge_attempt_is_durable_and_cannot_be_admitted_twice() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":419}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging', author='worker', reviewer='reviewer' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+
+        assert!(begin_approved_merge_attempt(&mut conn, task_id, 11).unwrap());
+        assert!(!begin_approved_merge_attempt(&mut conn, task_id, 12).unwrap());
+        let task = get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[MERGE_RETRY_REF], MERGE_RETRY_ATTEMPTING);
+        let starts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='merge_attempt_started' AND subject=?1",
+                [lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(starts, 1);
     }
 
     #[test]

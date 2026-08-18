@@ -769,10 +769,14 @@ branch. A parked `merging` task restores to `merging` and records
 persisted target tuple, expected base, live head, exact task/role/SHA approvals, durable R2
 sampling decision, and CI. Valid authority performs one merge replay without allocating a
 reviewer; missing or stale authority is invalidated narrowly and returns to `in-review` for
-the first missing role. A repeated policy/infrastructure failure parks again with approvals
-intact. Startup never auto-replays a parked task; an interrupted `attempting` marker is parked
-for another owner retry rather than issuing an uncertain duplicate call. Retry does not change
-PR identity, approvals, dependencies, author/reviewer provenance, or rework count. An
+the first missing role. Legacy tasks without an immutable `target_branch` cannot directly
+replay approval; their approvals are invalidated and review is rebuilt against a persisted
+base. A repeated policy/infrastructure failure parks again with approvals intact. The ordinary
+live reviewed path also writes `attempting` immediately before its first remote merge call, and
+must durably park a policy outcome before tearing down its worker/reviewer. Startup never
+auto-replays a parked task; any interrupted `attempting` marker is parked for another owner
+retry rather than issuing an uncertain duplicate call. Retry does not change PR identity,
+approvals, dependencies, author/reviewer provenance, or rework count. An
 unparked or terminal task is a clean negative (exit 1). One additional clean negative
 (exit 1) fires when the parked task's `depends_on` still contains any `cancelled`
 task id: silently restoring the dependent would just have the sweep re-park it on
@@ -1139,14 +1143,19 @@ On daemon startup, before generic crash recovery:
    verdict against the current PR head SHA via `next_missing_review_role(conn, pr, sha)`.
    If all roles approved for the current SHA → merge. If any role is missing or stale →
    defer to generic recovery (the approval is preserved or dropped per disposition).
-   Parked tasks and tasks carrying an explicit retry marker are excluded: the former require
-   owner authority, while the latter are handled by the bounded live retry reconciler.
+   Before any network call the complete PR-wide row set must name one exact task and immutable
+   author; mixed-task or mixed-author evidence is deferred fail-closed. Parked tasks and tasks
+   carrying a merge-attempt marker are excluded: the former require owner authority, while the
+   latter are handled by the bounded live retry reconciler or uncertain-attempt park.
 2. **Generic recovery** handles `merging` tasks: stays in `merging` only when
    `dual_approved()` confirms all required roles are approved for the same head SHA.
    Incomplete approval (e.g. R1 approved, R2 missing) resets the task to `in-review` via
    `AgentFailed`, so the tick loop provisions the first missing role (#191).
 3. **Phase 5b** (orphan in-review tasks) checks for existing valid R1 approvals: if R1 is
    approved for the current PR SHA, it spawns R2 directly instead of re-running R1 (#191).
+   Reviewer verdict persistence uses the task's durable author when no worker is live. When a
+   repaired R1 returns and an exact task/author/head-bound R2 row was retained, that R2 is reused
+   rather than provisioned again.
 4. **Explicit merge replay** atomically claims at most one `requested` marker per tick. A
    valid replay needs no live reviewer, mailbox row, or roster entry. Graceful shutdown lets
    an admitted call settle; startup parks an uncertain `attempting` marker without a second
