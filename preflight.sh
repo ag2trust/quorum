@@ -130,7 +130,7 @@ def add(hasher, label, value):
 try:
     head = git("rev-parse", "--verify", "HEAD^{commit}")
     status = git("status", "--porcelain=v1", "-z", "--untracked-files=all")
-    diff = git("-c", "core.quotepath=false", "diff", "--binary", "--no-ext-diff", "HEAD")
+    diff = git("-c", "core.quotepath=false", "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD")
     untracked = git("ls-files", "--others", "--exclude-standard", "-z")
     ignored = git("ls-files", "--others", "--ignored", "--exclude-standard", "-z")
 
@@ -166,8 +166,14 @@ import sys
 try:
     with open(sys.argv[1], encoding="utf-8") as source:
         cached = json.load(source)
-    expected = {"exit": 0, "fingerprint": sys.argv[2]}
-    if cached != expected:
+    if (
+        not isinstance(cached, dict)
+        or set(cached) != {"exit", "fingerprint"}
+        or type(cached["exit"]) is not int
+        or cached["exit"] != 0
+        or type(cached["fingerprint"]) is not str
+        or cached["fingerprint"] != sys.argv[2]
+    ):
         raise ValueError("cache entry is not an exact green fingerprint")
 except BaseException:
     sys.exit(1)

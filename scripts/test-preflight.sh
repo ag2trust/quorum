@@ -44,6 +44,12 @@ exit 0
 EOF
 chmod +x "$BIN/cargo"
 
+cat >"$BIN/constant-textconv" <<'EOF'
+#!/bin/sh
+printf 'constant textconv output\n'
+EOF
+chmod +x "$BIN/constant-textconv"
+
 cd "$REPO"
 git config user.name CI
 git config user.email ci@example.invalid
@@ -51,11 +57,13 @@ git remote add origin "$REMOTE"
 
 printf 'base\n' > state
 printf 'pub fn tracked_fixture() {}\n' > tracked.rs
+printf 'tracked.rs diff=constant\n' > .gitattributes
 printf '/target\n' > .gitignore
-git add .gitignore state tracked.rs
+git add .gitattributes .gitignore state tracked.rs
 git commit -qm 'base'
 git branch -M main
 git push -q origin main
+git config diff.constant.textconv "$BIN/constant-textconv"
 
 git switch -qc develop
 printf 'develop\n' >> state
@@ -469,7 +477,8 @@ grep -q 'PREFLIGHT: PASS (cached — tree unchanged since last green run)' \
 [ ! -s "$TMP/full-cargo.log" ]
 
 # A tracked Rust source edit must invalidate the green result and re-run every
-# collector gate. An untracked Rust source file is an input too.
+# collector gate. The configured textconv deliberately erases the diff's
+# contents, so a second dirty edit proves the fingerprint uses raw diff bytes.
 printf '// tracked change\n' >> tracked.rs
 : >"$TMP/full-cargo.log"
 PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
@@ -477,12 +486,41 @@ PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
 cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
 grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/tracked-cache-miss.out"
 
+printf '// second tracked change\n' >> tracked.rs
+: >"$TMP/full-cargo.log"
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/textconv-cache-miss.out"
+cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/textconv-cache-miss.out"
+
 printf 'pub fn untracked_fixture() {}\n' > untracked.rs
 : >"$TMP/full-cargo.log"
 PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
   ./preflight.sh >"$TMP/untracked-cache-miss.out"
 cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
 grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/untracked-cache-miss.out"
+
+# The cache file is ignored and excluded from its own fingerprint, so malformed
+# JSON records must be rejected rather than relying on Python's numeric equality
+# (`false == 0` and `0.0 == 0`).
+for INVALID_EXIT in false 0.0; do
+  python3 - target/preflight-timing/last-green.json "$INVALID_EXIT" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+data = json.load(open(path))
+data["exit"] = json.loads(sys.argv[2])
+with open(path, "w") as output:
+    json.dump(data, output)
+PY
+  : >"$TMP/full-cargo.log"
+  PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+    ./preflight.sh >"$TMP/malformed-cache-miss-$INVALID_EXIT.out"
+  cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
+  grep -q 'PREFLIGHT: PASS (all 4 gates green)' \
+    "$TMP/malformed-cache-miss-$INVALID_EXIT.out"
+done
 
 if PATH="$BIN:$PATH" scripts/preflight/timing.sh --test-jobs 0 \
   >"$TMP/invalid-test-jobs.out" 2>&1; then
