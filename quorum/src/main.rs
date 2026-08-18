@@ -1579,6 +1579,18 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let db = paths::db_path()?;
+            // Backfill is a supported classification writer, so a task it makes
+            // dispatchable must receive the durable adoption-time cap before
+            // claim — otherwise lifecycle/R2/reviewer consumers fall back to the
+            // compiled default despite a configured `max_rework`. Resolves from
+            // the same per-repo serve config as the daemon; when the file is
+            // absent or does not set `max_rework`, falls back to `REWORK_CAP`.
+            let repo_slug = paths::try_resolve_repo().ok_or_else(|| {
+                QuorumError::Usage(
+                    "classify --backfill: cannot resolve the current repository".into(),
+                )
+            })?;
+            let max_rework = serve_config::resolve_max_rework(&repo_slug)?;
             let mut total_stored = 0;
             let mut total_tasks = 0;
             let rt = tokio::runtime::Runtime::new()
@@ -1656,7 +1668,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
                 let stored = {
                     let mut conn = quorum_core::db::open(&db)?;
-                    quorum_core::classify::store_classifications_for_inputs(
+                    quorum_core::classify::store_classifications_and_stamp_rework_cap(
                         &mut conn,
                         &results,
                         &pending_inputs,
@@ -1664,6 +1676,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                             serve::classifier::CLASSIFIER_MODEL,
                         ),
                         quorum_core::clock::now(),
+                        max_rework,
                     )?
                 };
                 total_stored += stored;
