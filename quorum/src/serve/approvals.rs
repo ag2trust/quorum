@@ -68,6 +68,54 @@ pub(crate) async fn recover(
             continue;
         }
         let pr = appr.pr_number;
+        let pr_records: Vec<&approvals::Approval> = records
+            .iter()
+            .filter(|record| record.pr_number == pr)
+            .collect();
+        // A policy/infrastructure park is owner-gated. Retained approvals are
+        // evidence, not an automatic retry loop. Likewise an explicit merge
+        // retry is reconciled by the normal daemon tick, which atomically
+        // consumes its one-shot marker and performs the stronger live target
+        // checks; startup recovery must not race or bypass that authority. A
+        // PR-wide approval set must also name one exact task and author. Mixed
+        // rows are stale evidence, never authority to close whichever task was
+        // encountered first.
+        let replay_deferred = {
+            let p = db_path.to_path_buf();
+            let task_id = appr.task_id;
+            let author = appr.author.clone();
+            let mixed_authority = author.is_empty()
+                || pr_records
+                    .iter()
+                    .any(|record| record.task_id != task_id || record.author != author);
+            run_blocking(move || {
+                if mixed_authority {
+                    return Ok(true);
+                }
+                let conn = quorum_core::db::open(&p)?;
+                let Some(task) = tasks::get(&conn, task_id)? else {
+                    return Ok(true);
+                };
+                if task.author.as_deref() != Some(author.as_str()) {
+                    return Ok(true);
+                }
+                let merge_retry = task
+                    .refs
+                    .as_deref()
+                    .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                    .and_then(|refs| {
+                        refs.get(tasks::MERGE_RETRY_REF)
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    });
+                Ok(task.status == "failed" || merge_retry.is_some())
+            })
+            .await?
+        };
+        if replay_deferred {
+            outcome.deferred += 1;
+            continue;
+        }
         // SHA-bind against the PR's live head. If we can't determine it, leave
         // the record for a future startup rather than merging blind.
         let repo = repo_dir.to_path_buf();
@@ -88,8 +136,6 @@ pub(crate) async fn recover(
         // Validate each role's approval individually (stale SHA, self-review).
         let mut any_invalid = false;
         let mut any_rejected = false;
-        let pr_records: Vec<&approvals::Approval> =
-            records.iter().filter(|a| a.pr_number == pr).collect();
         for role_appr in &pr_records {
             match crate::verdict::dispose_approval(
                 &role_appr.verdict,
@@ -480,7 +526,11 @@ mod tests {
     fn seed_task(conn: &mut rusqlite::Connection, title: &str, worker: &str) -> i64 {
         let tid =
             tasks::create(conn, "boss", title, None, 50, None, None, None, None, 1000).unwrap();
-        tasks::claim(conn, worker, Some(tid), &[], 3600, 1001).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='working', assignee=?2, author=?2 WHERE id=?1",
+            rusqlite::params![tid, worker],
+        )
+        .unwrap();
         tid
     }
 
@@ -572,6 +622,119 @@ mod tests {
         assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
         assert!(approvals::get_for_pr(&conn, 208).unwrap().is_empty());
         assert!(journal::list_in_flight(&conn).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mixed_task_approval_set_is_deferred_before_any_startup_merge_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let unrelated = seed_task(&mut conn, "unrelated", "Worker-X");
+        let parked = seed_task(&mut conn, "parked merge", "Worker-T");
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(COALESCE(refs, '{}'), '$.pr', 208) WHERE id IN (?1, ?2)",
+            rusqlite::params![unrelated, parked],
+        )
+        .unwrap();
+        tasks::park(&mut conn, parked, "credential failure", "merging", 1002)
+            .unwrap()
+            .unwrap();
+        approvals::record(
+            &mut conn,
+            &approvals::Approval {
+                pr_number: 208,
+                review_role: "r1".into(),
+                task_id: unrelated,
+                author: "Worker-X".into(),
+                reviewer: "Reviewer-1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "same-head".into(),
+            },
+        )
+        .unwrap();
+        approvals::record(
+            &mut conn,
+            &approvals::Approval {
+                pr_number: 208,
+                review_role: "r2".into(),
+                task_id: parked,
+                author: "Worker-T".into(),
+                reviewer: "Reviewer-2".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "same-head".into(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let concrete = Arc::new(MockExec::new(HashMap::from([(
+            208,
+            "same-head".to_string(),
+        )])));
+        let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.deferred, 1);
+        assert!(concrete.merged.lock().unwrap().is_empty());
+        let conn = db::open(&db_path).unwrap();
+        assert_ne!(
+            tasks::get(&conn, unrelated).unwrap().unwrap().status,
+            "done"
+        );
+        assert_eq!(tasks::get(&conn, parked).unwrap().unwrap().status, "failed");
+        assert_eq!(approvals::get_for_pr(&conn, 208).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn attempting_marker_prevents_startup_replay_when_policy_park_was_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let tid = seed_task(&mut conn, "uncertain merge", "Worker-T");
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', refs=json_set(COALESCE(refs, '{}'), '$.pr', 208)
+             WHERE id=?1",
+            [tid],
+        )
+        .unwrap();
+        for (role, reviewer) in [("r1", "Reviewer-1"), ("r2", "Reviewer-2")] {
+            approvals::record(
+                &mut conn,
+                &approvals::Approval {
+                    pr_number: 208,
+                    review_role: role.into(),
+                    task_id: tid,
+                    author: "Worker-T".into(),
+                    reviewer: reviewer.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "same-head".into(),
+                },
+            )
+            .unwrap();
+        }
+        assert!(tasks::begin_approved_merge_attempt(&mut conn, tid, 1002).unwrap());
+        drop(conn);
+
+        let concrete = Arc::new(MockExec::new(HashMap::from([(
+            208,
+            "same-head".to_string(),
+        )])));
+        let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.deferred, 1);
+        assert!(concrete.merged.lock().unwrap().is_empty());
+        let conn = db::open(&db_path).unwrap();
+        assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "merging");
+        assert_eq!(approvals::get_for_pr(&conn, 208).unwrap().len(), 2);
     }
 
     /// Acceptance #228: a stale approval (PR head moved since approval) is NOT

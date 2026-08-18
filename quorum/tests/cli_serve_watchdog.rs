@@ -1017,9 +1017,22 @@ fn pending_worker_overage_defers_snapshotted_message_after_feed_becomes_broken()
     let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
     let worker_pid = managed_pid(home.path(), "worker");
 
-    // Freeze the daemon so the message and both synchronization gates are
-    // installed before one tick snapshots the message row.
+    // Serialize behind any daemon write before suspending it. SIGSTOP at an
+    // arbitrary instruction can otherwise strand the SQLite writer lock and
+    // make the mailbox append below fail with Busy while the daemon cannot
+    // advance to release it.
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let mut barrier_conn = quorum_core::db::open(&db).unwrap();
+    let db_write_barrier = quorum_core::db::begin_immediate(&mut barrier_conn)
+        .unwrap_or_else(|error| panic!("could not acquire pre-suspension writer barrier: {error}"));
     handle.suspend();
+    db_write_barrier
+        .commit()
+        .unwrap_or_else(|error| panic!("could not release pre-suspension writer barrier: {error}"));
+    drop(barrier_conn);
+
+    // With the daemon safely frozen outside a write transaction, install the
+    // message and both synchronization gates before one tick snapshots it.
     let message_id = append_worker_message(home.path(), &worker_name);
     std::fs::write(&snapshot_gate, b"waiting").unwrap();
     std::fs::write(&message_gate, b"waiting").unwrap();

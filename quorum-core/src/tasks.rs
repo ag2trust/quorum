@@ -41,6 +41,14 @@ pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
 pub const PARKED_UNSATISFIABLE_REF: &str = "daemon_parked_unsatisfiable";
 pub const CLASSIFIER_POLICY_PARKED_REF: &str = "classifier_policy_parked";
 pub const PARKED_REWORK_RETRY_REF: &str = "daemon_rework_retry_requested";
+/// Durable merge-call admission state. The CLI writes `requested` for an
+/// explicit replay; the single daemon atomically advances it to `attempting`
+/// before any GitHub/CI call. The live reviewed path also writes `attempting`
+/// immediately before its first merge call. A crash or infrastructure failure
+/// therefore cannot make an uncertain call eligible for automatic replay.
+pub const MERGE_RETRY_REF: &str = "daemon_merge_retry";
+pub const MERGE_RETRY_REQUESTED: &str = "requested";
+pub const MERGE_RETRY_ATTEMPTING: &str = "attempting";
 /// Maximum corrupt terminal retry rows reconciled in one daemon tick.  The
 /// bounded batch makes restart cleanup converge without turning one tick into
 /// an unbounded write transaction.
@@ -470,6 +478,11 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
             "refs key 'pr' is daemon-owned; use --review-pr or --continue-pr".into(),
         ));
     }
+    if object.contains_key(MERGE_RETRY_REF) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{MERGE_RETRY_REF}' is daemon-owned; use task-retry"
+        )));
+    }
     Ok(())
 }
 
@@ -518,6 +531,7 @@ fn preserve_protected_refs(
                     | "cx_not_ready_reason"
                     | "cx_by"
                     | "cx_dup_of"
+                    | MERGE_RETRY_REF
             );
             let runner_state =
                 preserve_runner_state && (key.starts_with("runner_") || key.starts_with("codex_"));
@@ -1503,6 +1517,121 @@ pub fn apply_actionable_rework_event(
         )?;
         Ok(())
     })
+}
+
+/// Complete an approved merge and consume its exact task/PR approvals
+/// in the same lifecycle transaction.
+pub fn complete_approved_merge(
+    conn: &mut Connection,
+    id: i64,
+    pr_number: i64,
+    now: i64,
+) -> Result<TransitionResult> {
+    let tx = begin_immediate(conn)?;
+    apply_event_tx(tx, "daemon", id, &Event::MergeSucceeded, now, |tx| {
+        tx.execute(
+            "DELETE FROM approvals WHERE pr_number=?1",
+            params![pr_number],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET refs=json_remove(refs, '$.daemon_merge_retry') WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    })
+}
+
+/// Fail closed from an admitted merge attempt to ordinary review. Only the
+/// named stale roles are invalidated; valid same-head evidence for another
+/// role is preserved for `next_needed_role`. A named stale sampling decision
+/// is removed in the same transaction when R1 must recreate that authority.
+/// The attempt marker is consumed there too so a later reviewed head can cross
+/// a fresh boundary.
+pub struct StaleMergeRetryEvidence<'a> {
+    pub roles: &'a [&'a str],
+    pub sampling_head: Option<&'a str>,
+}
+
+pub fn invalidate_merge_retry(
+    conn: &mut Connection,
+    id: i64,
+    pr_number: i64,
+    stale: StaleMergeRetryEvidence<'_>,
+    reason: &str,
+    now: i64,
+) -> Result<TransitionResult> {
+    let tx = begin_immediate(conn)?;
+    let event = Event::MergeFailed {
+        reason: reason.to_string(),
+    };
+    apply_event_tx(tx, "daemon", id, &event, now, |tx| {
+        for role in stale.roles {
+            tx.execute(
+                "DELETE FROM approvals
+                 WHERE pr_number=?1 AND review_role=?2",
+                params![pr_number, role],
+            )?;
+        }
+        if let Some(head_sha) = stale.sampling_head {
+            tx.execute(
+                "DELETE FROM r2_sampling_decisions
+                 WHERE pr_number=?1 AND head_sha=?2",
+                params![pr_number, head_sha],
+            )?;
+        }
+        tx.execute(
+            "UPDATE tasks SET refs=json_remove(refs, '$.daemon_merge_retry') WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    })
+}
+
+/// Remove non-authoritative optional-role evidence without consuming the
+/// owner-authorized merge attempt.
+///
+/// The task must still own the exact `merging + attempting` boundary. Keeping
+/// that marker makes a crash after this repair conservative: startup parks the
+/// task as an uncertain attempt instead of replaying automatically. The live
+/// caller may reread the complete authority once and issue at most one remote
+/// merge call.
+pub fn repair_merge_retry_evidence(
+    conn: &mut Connection,
+    id: i64,
+    pr_number: i64,
+    stale_roles: &[&str],
+    reason: &str,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET updated_at=?2
+         WHERE id=?1 AND status='merging' AND json_valid(refs)
+           AND json_extract(refs, '$.daemon_merge_retry')='attempting'
+           AND json_extract(refs, '$.pr')=?3",
+        params![id, now, pr_number],
+    )?;
+    if changed == 0 {
+        tx.commit()?;
+        return Ok(false);
+    }
+    for role in stale_roles {
+        tx.execute(
+            "DELETE FROM approvals
+             WHERE pr_number=?1 AND review_role=?2",
+            params![pr_number, role],
+        )?;
+    }
+    crate::events::emit(
+        &tx,
+        "merge_retry_authority_repaired",
+        &lease_target(id),
+        reason,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Apply a daemon-verified worker publication and retire its durable intent in
@@ -3877,14 +4006,7 @@ pub fn retry_parked(
             "invalid persisted resume status for task #{id}: {resume_status}"
         )));
     }
-    let restored_status = if resume_status == "merging" {
-        // A parked merge has no live reviewer/mailbox row left to drive the
-        // merge gate. Restore the durable review phase so Phase 5b provisions
-        // a fresh reviewer and obtains a new approval before another attempt.
-        "in-review"
-    } else {
-        resume_status.as_str()
-    };
+    let restored_status = resume_status.as_str();
     let updated = tx.execute(
         "UPDATE tasks
          SET status=?2,
@@ -3903,6 +4025,20 @@ pub fn retry_parked(
                       '$.daemon_rework_retry_requested',
                       json('true')
                   )
+                  WHEN ?4='merging'
+                  THEN json_set(
+                      json_remove(
+                          refs,
+                          '$.daemon_parked',
+                          '$.daemon_parked_reason',
+                          '$.daemon_parked_unsatisfiable',
+                          '$.daemon_resume_status',
+                          '$.daemon_rework_retry_requested',
+                          '$.daemon_parked_head_check'
+                      ),
+                      '$.daemon_merge_retry',
+                      'requested'
+                  )
                   ELSE json_remove(
                       refs,
                       '$.daemon_parked',
@@ -3910,7 +4046,8 @@ pub fn retry_parked(
                       '$.daemon_parked_unsatisfiable',
                       '$.daemon_resume_status',
                       '$.daemon_rework_retry_requested',
-                      '$.daemon_parked_head_check'
+                      '$.daemon_parked_head_check',
+                      '$.daemon_merge_retry'
                   )
              END,
              updated_at=?3
@@ -3946,6 +4083,87 @@ pub fn retry_parked(
     task.ready = compute_ready(&tx, &task.depends_on)?;
     tx.commit()?;
     Ok(Some(task))
+}
+
+/// Atomically consume at most one owner-authorized merge replay intent.
+///
+/// The transition to `attempting` commits before any network call. If the
+/// daemon crashes after this point, startup parks the uncertain attempt and
+/// requires fresh owner authority rather than issuing a duplicate merge call.
+pub fn claim_merge_retry(conn: &mut Connection, now: i64) -> Result<Option<Task>> {
+    let tx = begin_immediate(conn)?;
+    let id: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM tasks
+             WHERE status='merging' AND json_valid(refs)
+               AND json_extract(refs, '$.daemon_merge_retry')='requested'
+             ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(refs, '$.daemon_merge_retry', 'attempting'),
+             updated_at=?2
+         WHERE id=?1 AND status='merging' AND json_valid(refs)
+           AND json_extract(refs, '$.daemon_merge_retry')='requested'",
+        params![id, now],
+    )?;
+    if changed == 0 {
+        tx.commit()?;
+        return Ok(None);
+    }
+    crate::events::emit(
+        &tx,
+        "merge_retry_started",
+        &lease_target(id),
+        "owner-authorized merge replay claimed by daemon",
+        now,
+    )?;
+    let mut task = tx.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+        params![id],
+        row_to_task,
+    )?;
+    task.ready = compute_ready(&tx, &task.depends_on)?;
+    tx.commit()?;
+    Ok(Some(task))
+}
+
+/// Cross the durable boundary immediately before the ordinary reviewed merge
+/// path makes its first remote merge call.
+///
+/// Only a merging task without an existing retry marker can be admitted. A
+/// `requested` marker belongs to the explicit-retry reconciler, while an
+/// `attempting` marker means a prior call may already have escaped. Both fail
+/// closed here. Startup parks `attempting` tasks before approval recovery.
+pub fn begin_approved_merge_attempt(conn: &mut Connection, id: i64, now: i64) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(COALESCE(refs, '{}'), '$.daemon_merge_retry', 'attempting'),
+             updated_at=?2
+         WHERE id=?1 AND status='merging'
+           AND (refs IS NULL OR json_valid(refs))
+           AND json_extract(COALESCE(refs, '{}'), '$.daemon_merge_retry') IS NULL",
+        params![id, now],
+    )?;
+    if changed == 1 {
+        crate::events::emit(
+            &tx,
+            "merge_attempt_started",
+            &lease_target(id),
+            "approved merge call admitted by daemon",
+            now,
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed == 1)
 }
 
 /// Remove stale runnable retry state from terminal tasks in a bounded,
@@ -8079,6 +8297,9 @@ mod tests {
         }
         let pr_err = validate_creator_refs(Some(r#"{"pr":42,"repo":"o/r"}"#)).unwrap_err();
         assert!(format!("{pr_err}").contains("--continue-pr"));
+        let retry_err =
+            validate_creator_refs(Some(r#"{"daemon_merge_retry":"requested"}"#)).unwrap_err();
+        assert!(format!("{retry_err}").contains("task-retry"));
         assert!(validate_creator_refs(Some(r#"{"ticket":"ABC","repo":"o/r"}"#)).is_ok());
     }
 
@@ -9615,7 +9836,7 @@ mod tests {
     }
 
     #[test]
-    fn parked_merging_retry_restores_review_phase_with_pr_context() {
+    fn parked_merging_retry_records_one_shot_merge_intent_with_pr_context() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create(
             &mut conn,
@@ -9644,10 +9865,229 @@ mod tests {
         let retried = retry_parked(&mut conn, task_id, "operator", true, 12)
             .unwrap()
             .unwrap();
-        assert_eq!(retried.status, "in-review");
+        assert_eq!(retried.status, "merging");
         assert_eq!(extract_pr_number(&retried.refs), Some(419));
         assert_eq!(retried.author.as_deref(), Some("worker"));
         assert_eq!(retried.reviewer.as_deref(), Some("reviewer"));
+        let refs: serde_json::Value =
+            serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[MERGE_RETRY_REF], MERGE_RETRY_REQUESTED);
+
+        let claimed = claim_merge_retry(&mut conn, 13).unwrap().unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(claimed.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[MERGE_RETRY_REF], MERGE_RETRY_ATTEMPTING);
+        assert!(claim_merge_retry(&mut conn, 14).unwrap().is_none());
+    }
+
+    #[test]
+    fn approved_merge_attempt_is_durable_and_cannot_be_admitted_twice() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":419}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging', author='worker', reviewer='reviewer' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+
+        assert!(begin_approved_merge_attempt(&mut conn, task_id, 11).unwrap());
+        assert!(!begin_approved_merge_attempt(&mut conn, task_id, 12).unwrap());
+        let task = get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[MERGE_RETRY_REF], MERGE_RETRY_ATTEMPTING);
+        let starts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='merge_attempt_started' AND subject=?1",
+                [lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(starts, 1);
+    }
+
+    #[test]
+    fn merge_retry_success_atomically_completes_and_consumes_approvals() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":419,"daemon_merge_retry":"attempting"}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging',author='worker',reviewer='r2' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        for role in ["r1", "r2"] {
+            crate::approvals::record(
+                &mut conn,
+                &crate::approvals::Approval {
+                    pr_number: 419,
+                    review_role: role.into(),
+                    task_id,
+                    author: "worker".into(),
+                    reviewer: role.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "head".into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let completed = complete_approved_merge(&mut conn, task_id, 419, 11).unwrap();
+        assert_eq!(completed.task.status, "done");
+        assert!(crate::approvals::get_for_pr(&conn, 419).unwrap().is_empty());
+        let refs: serde_json::Value =
+            serde_json::from_str(completed.task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(MERGE_RETRY_REF).is_none());
+    }
+
+    #[test]
+    fn merge_retry_invalidation_atomically_deletes_stale_role_and_sampling() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":419,"daemon_merge_retry":"attempting"}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging',author='worker',reviewer='r2' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        crate::review_audits::record_r2_requirement(&mut conn, task_id, 419, "head", true).unwrap();
+        for role in ["r1", "r2"] {
+            crate::approvals::record(
+                &mut conn,
+                &crate::approvals::Approval {
+                    pr_number: 419,
+                    review_role: role.into(),
+                    task_id,
+                    author: "worker".into(),
+                    reviewer: role.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "head".into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let invalidated = invalidate_merge_retry(
+            &mut conn,
+            task_id,
+            419,
+            StaleMergeRetryEvidence {
+                roles: &["r2"],
+                sampling_head: Some("head"),
+            },
+            "R2 stale",
+            11,
+        )
+        .unwrap();
+        assert_eq!(invalidated.task.status, "in-review");
+        assert!(crate::approvals::get(&conn, 419, "r1").unwrap().is_some());
+        assert!(crate::approvals::get(&conn, 419, "r2").unwrap().is_none());
+        assert_eq!(
+            crate::review_audits::r2_requirement(&conn, task_id, 419, "head").unwrap(),
+            None
+        );
+        let refs: serde_json::Value =
+            serde_json::from_str(invalidated.task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(MERGE_RETRY_REF).is_none());
+    }
+
+    #[test]
+    fn merge_retry_optional_evidence_repair_retains_attempt_boundary() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":419,"daemon_merge_retry":"attempting"}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging',author='worker',reviewer='r1' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        for role in ["r1", "r2"] {
+            crate::approvals::record(
+                &mut conn,
+                &crate::approvals::Approval {
+                    pr_number: 419,
+                    review_role: role.into(),
+                    task_id,
+                    author: "worker".into(),
+                    reviewer: role.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "head".into(),
+                },
+            )
+            .unwrap();
+        }
+
+        assert!(repair_merge_retry_evidence(
+            &mut conn,
+            task_id,
+            419,
+            &["r2"],
+            "optional R2 stale",
+            11,
+        )
+        .unwrap());
+        let task = get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "merging");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[MERGE_RETRY_REF], MERGE_RETRY_ATTEMPTING);
+        assert!(crate::approvals::get(&conn, 419, "r1").unwrap().is_some());
+        assert!(crate::approvals::get(&conn, 419, "r2").unwrap().is_none());
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE subject=?1 AND kind='merge_retry_authority_repaired'",
+                [lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
     }
 
     #[test]

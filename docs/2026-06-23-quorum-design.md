@@ -377,10 +377,16 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum task-retry --task-id <n> --by <operator>` → operator retry for a task
   durably parked after an automatic bounded failure. General daemon parks restore
   their recorded lifecycle stage as specified in § Explicit cancellation and durable
-  parking, except that a parked merge restores `in-review` so a fresh approval can
-  safely drive the next merge attempt. Provider/auth/quota/protocol parks atomically
-  require and clear their
-  provider-block marker. A provider-parked
+  parking. A parked merge restores `merging` with one durable daemon-owned replay intent;
+  the daemon revalidates the exact persisted PR target, base, head, required role approvals,
+  sampled-R2 decision, and CI before making at most one approval/merge call. Invalid or
+  incomplete authority returns to `in-review` for the first missing role. A missing or
+  differently-task-bound sampling decision invalidates the R1 sampling anchor and decision
+  together, preserving an exact R2 while a fresh R1 recreates the decision. An invalid extra
+  R2 row for a durable sampled skip is removed under the existing one-shot attempt and the
+  complete authority is reread once before any merge call.
+  Provider/auth/quota/protocol parks atomically require and clear their provider-block marker.
+  A provider-parked
   `working` task returns to `open`; a true `rework` task remains unassigned in
   `rework` and is atomically reattached through a dedicated replacement-worker
   claim. Both paths carry the exact persisted failed turn. `in-review` is
@@ -771,10 +777,25 @@ unsatisfiable bit), resets only the crash recovery counter, and emits `task_retr
 `open`, `rework`, and `in-review` restore directly. A `rework` retry also records
 `daemon_rework_retry_requested=true`; startup recovery preserves it and the next
 daemon tick atomically claims and spawns a replacement worker on the same task and
-branch. A parked `merging` task restores to `in-review` because the original approval
-mailbox row and agents were consumed during teardown; the orphan-review reconciler
-obtains fresh R1/R2 approval before the next merge attempt. Retry does not change PR
-identity, approvals, dependencies, author/reviewer provenance, or rework count. An
+branch. A parked `merging` task restores to `merging` and records
+`daemon_merge_retry=requested`. The daemon atomically advances one such intent to
+`attempting` before network work, then revalidates the immutable task/PR association,
+persisted target tuple, expected base, live head, exact task/role/SHA approvals, durable R2
+sampling decision, and CI. Valid authority performs one merge replay without allocating a
+reviewer; missing or stale authority is invalidated narrowly and returns to `in-review` for
+the first missing role. Missing or task-mismatched sampling evidence cannot be replaced by
+otherwise-valid R1/R2 rows: the daemon atomically removes that decision and R1, then normal
+review recreates the decision from a fresh R1 while retaining an exact R2. If a durable skip
+makes R2 optional but a stale extra R2 row exists, the daemon atomically removes only that row
+and rereads the complete authority once under the same `attempting` marker; it never issues
+more than the one merge call authorized by the owner retry. Legacy tasks without an immutable `target_branch` cannot directly
+replay approval; their approvals are invalidated and review is rebuilt against a persisted
+base. A repeated policy/infrastructure failure parks again with approvals intact. The ordinary
+live reviewed path also writes `attempting` immediately before its first remote merge call, and
+must durably park a policy outcome before tearing down its worker/reviewer. Startup never
+auto-replays a parked task; any interrupted `attempting` marker is parked for another owner
+retry rather than issuing an uncertain duplicate call. Retry does not change PR identity,
+approvals, dependencies, author/reviewer provenance, or rework count. An
 unparked or terminal task is a clean negative (exit 1). One additional clean negative
 (exit 1) fires when the parked task's `depends_on` still contains any `cancelled`
 task id: silently restoring the dependent would just have the sweep re-park it on
@@ -999,8 +1020,9 @@ After VerdictApprove (InReview → Merging):
    the merge attempt — the window from step 2 through the master-CI gate can span minutes.
    If conflicting, fire MergeConflict → rework cycle. If mergeable, proceed.
 6. Execute `gh pr merge` — success → Done; policy-blocked → Failed with a durable
-   `merging` resume marker (explicit retry restores `in-review` and re-drives approval);
-   retryable failure → rework.
+   `merging` resume marker while retaining the exact-SHA durable approvals (explicit retry
+   consumes one daemon-owned replay intent after live revalidation); retryable failure →
+   invalidate approvals and enter rework.
 7. Self-update drain: if enabled, a successful merge triggers drain mode →
    exit 75 for the supervisor to rebuild and relaunch.
 8. **Post-merge analytics collector** (#125) — fire-and-forget `tokio::spawn` runs
@@ -1113,8 +1135,9 @@ These are negative invariants — violation of any one is a regression:
 4. **Must NOT allocate or spawn a worker/reviewer** — nothing for them to do.
 5. **Must NOT consume the mailbox row** until the wait resolves (merged, reworked, or
    ceiling-exceeded). The unconsumed row is the durable record that a merge is pending.
-6. **Must NOT delete the approval record** until the merge attempt completes (success or
-   failure). Premature deletion causes restart recovery to re-work instead of re-merge.
+6. **Must NOT delete the approval record** for a policy, credential, infrastructure, or
+   pending failure. Delete it only when the merge succeeds or worker-fixable remediation
+   invalidates the reviewed code boundary.
 
 #### Preserved state during merge-wait
 
@@ -1129,6 +1152,7 @@ The following must remain intact throughout the wait and across restarts:
 | Dependency blocking | `tasks.depends_on` | Already-done deps stay done; blocked deps stay blocked |
 | Task status = `merging` | `tasks.status` column | Restart recovery recognizes this as merge-pending |
 | Mailbox row (unconsumed) | `mailbox` table | Restart re-enters merge flow from unconsumed approval |
+| Explicit retry intent | `tasks.refs.daemon_merge_retry` | Bounds an owner retry to one daemon attempt |
 
 #### Restart reconciliation
 
@@ -1138,12 +1162,23 @@ On daemon startup, before generic crash recovery:
    verdict against the current PR head SHA via `next_missing_review_role(conn, pr, sha)`.
    If all roles approved for the current SHA → merge. If any role is missing or stale →
    defer to generic recovery (the approval is preserved or dropped per disposition).
+   Before any network call the complete PR-wide row set must name one exact task and immutable
+   author; mixed-task or mixed-author evidence is deferred fail-closed. Parked tasks and tasks
+   carrying a merge-attempt marker are excluded: the former require owner authority, while the
+   latter are handled by the bounded live retry reconciler or uncertain-attempt park.
 2. **Generic recovery** handles `merging` tasks: stays in `merging` only when
    `dual_approved()` confirms all required roles are approved for the same head SHA.
    Incomplete approval (e.g. R1 approved, R2 missing) resets the task to `in-review` via
    `AgentFailed`, so the tick loop provisions the first missing role (#191).
 3. **Phase 5b** (orphan in-review tasks) checks for existing valid R1 approvals: if R1 is
    approved for the current PR SHA, it spawns R2 directly instead of re-running R1 (#191).
+   Reviewer verdict persistence uses the task's durable author when no worker is live. When a
+   repaired R1 returns and an exact task/author/head-bound R2 row was retained, that R2 is reused
+   rather than provisioned again.
+4. **Explicit merge replay** atomically claims at most one `requested` marker per tick. A
+   valid replay needs no live reviewer, mailbox row, or roster entry. Graceful shutdown lets
+   an admitted call settle; startup parks an uncertain `attempting` marker without a second
+   GitHub call and preserves its approvals for another explicit retry.
 
 A delivered respawn-per-turn worker is not an orphan while its review is pending. Its
 `awaiting-review` journal row has no PID and durably binds the agent/task, provider and exact
