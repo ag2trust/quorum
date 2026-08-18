@@ -195,9 +195,13 @@ Only `method=create` and `method=submit_pending` are accepted.
 - The submitted `body` is the authored complete-review summary. Publication does not transition
   the Managed Task; the existing explicit `quorum submit` verdict remains separate.
 
-At most one live pending review belongs to one reviewer collaboration attempt. A fresh-capability
-resume of the exact pending reviewer turn adopts the attempt's durable request/review identity
-rather than creating a second review. A different launch SHA or re-review cannot adopt it.
+GitHub's pending review is a slot for one publishing actor on one PR, not an independent draft per
+Quorum attempt. Quorum grants that remote slot to at most one reviewer collaboration attempt. A
+fresh-capability resume of the exact pending reviewer turn adopts the attempt's durable
+request/review identity rather than creating a second review. A different launch SHA, re-review,
+or R1/R2 role cannot adopt the draft; before it starts, the daemon must complete the owned-orphan
+cleanup protocol below. Deletion remains unavailable to agents but is a narrow daemon
+housekeeping operation.
 
 ### `add_comment_to_pending_review`
 
@@ -276,6 +280,7 @@ CREATE TABLE github_collaboration_attempts (
   head_sha              TEXT,
   lifecycle_generation  INTEGER NOT NULL,
   active_run_id         TEXT REFERENCES run_capabilities(run_id),
+  review_owner_marker    TEXT UNIQUE,
   state                 TEXT NOT NULL
                         CHECK(state IN ('active','awaiting_resume','completed','revoked')),
   review_sealed         INTEGER NOT NULL DEFAULT 0 CHECK(review_sealed IN (0,1)),
@@ -317,6 +322,27 @@ CREATE TABLE github_agent_operations (
   UNIQUE(attempt_id, client_request_id),
   UNIQUE(attempt_id, review_sequence)
 );
+
+CREATE TABLE github_review_publication_slots (
+  publisher_scope      TEXT NOT NULL,
+  pr_number            INTEGER NOT NULL,
+  task_id              INTEGER NOT NULL REFERENCES tasks(id),
+  attempt_id           TEXT REFERENCES github_collaboration_attempts(attempt_id),
+  state                TEXT NOT NULL
+                       CHECK(state IN ('probing','owned','cleanup_required',
+                                       'cleanup_running','blocked')),
+  pending_review_id    TEXT,
+  review_owner_marker  TEXT,
+  cleanup_attempts     INTEGER NOT NULL DEFAULT 0,
+  next_cleanup_at      INTEGER,
+  cleanup_deadline_at  INTEGER,
+  error_kind           TEXT,
+  error_summary        TEXT,
+  created_at           INTEGER NOT NULL,
+  updated_at           INTEGER NOT NULL,
+  PRIMARY KEY(publisher_scope, pr_number),
+  UNIQUE(attempt_id)
+);
 ```
 
 Attempt states are `active`, `awaiting_resume`, `completed`, and `revoked`. Operation states are
@@ -325,8 +351,9 @@ only execution state/result fields change. `request_json` and `response_json` us
 kind-specific schemas and fixed aggregate limits. Terminal rows expire after a seven-day
 retention window. Nonterminal rows have a one-hour execution deadline and therefore cannot remain
 live indefinitely. An attempt becomes terminal with its exact lifecycle turn and expires only
-after all of its rows are terminal; `active` and `awaiting_resume` attempts remain tied to the
-persisted exact pending turn rather than becoming reusable identities.
+after all of its rows are terminal and any owned remote pending-review slot has been released;
+`active` and `awaiting_resume` attempts remain tied to the persisted exact pending turn rather
+than becoming reusable identities.
 
 Every mutation accepts an optional `clientRequestId`, matching the role of an idempotency key. If
 it is absent, the adapter derives it from the collaboration attempt, operation kind, target, and
@@ -349,7 +376,10 @@ daemon constants, not agent input or configuration that a managed run can raise.
 Attempt creation is separately capped at 16 nonexpired attempts per task and 1,024 in the
 repository database, including terminal-retention rows. It returns the same fail-closed capacity
 outcome before provisioning if either cap is reached. Thus the identity table cannot become an
-unbounded side channel around the operation-row limits.
+unbounded side channel around the operation-row limits. Publication-slot admission is separately
+capped at 16 rows per task and 1,024 in the repository. A slot row is deleted after successful
+release, so probing or blocked cleanup cannot create an independent unbounded row class even
+before its first reviewer attempt is created.
 
 The single daemon claims one queued operation with a guarded `UPDATE ... RETURNING` inside
 `BEGIN IMMEDIATE`. Claim eligibility atomically revalidates that the attempt is active, its
@@ -396,6 +426,84 @@ continuation can therefore observe adopted operations; a revoked prior run canno
 waits at most the existing 30-second publication bound; if unfinished it returns the operation ID
 and a pending result rather than blocking the agent or creating a second request.
 
+### Daemon-owned pending-review slot and cleanup
+
+`publisher_scope` is an opaque, stable Repository Service namespace: credentials that GitHub
+treats as the same pending-review actor MUST resolve to the same scope. It is daemon-derived,
+never agent input, and contains no Hosted account, installation, session, or KMS identity. This
+contract does not choose the eventual GitHub App actor; it only requires an adapter to preserve
+the namespace equivalence needed for safe serialization and cleanup.
+
+Every reviewer attempt gets an unguessable daemon-owned `review_owner_marker` with at least 128
+bits of randomness that is not returned to the agent. The `create` operation initializes the
+pending review body with that hidden marker, and `submit_pending` appends the same marker after the
+authored summary. A successful or reconciled create persists the remote review ID in the
+publication slot. If the create response is lost, the marker, publisher scope, PR, and immutable
+launch SHA are the recovery identity; the daemon never guesses from review position or body text.
+
+Before provisioning the first reviewer or any distinct re-review/R1/R2 attempt, the daemon
+atomically inserts the unique `(publisher_scope, pr_number)` slot in `probing` state. It commits,
+uses the Repository Service to read that publisher's current pending review, and then performs one
+of these guarded dispositions:
+
+- no pending review: create the new collaboration attempt and capability and change the slot to
+  `owned` by that attempt in one `BEGIN IMMEDIATE` transaction;
+- one pending review whose stored ID (when known), owner marker, PR, publisher scope, and original
+  launch SHA match a terminal Quorum attempt: change the slot to `cleanup_required` for that exact
+  attempt; or
+- a missing/foreign marker, mismatched known ID or SHA, multiple candidates, or an active different
+  attempt: change the slot to `blocked`, delete nothing, and provision no reviewer.
+
+Exact-continuation adoption is the only exception to the distinct-attempt probe: it requires the
+existing `owned` slot to name the same collaboration attempt in addition to all prior adoption
+checks. A terminal attempt, task cancellation, head invalidation, failed/cancelled review
+predecessor after create, or create completed after revocation changes an `owned` slot to
+`cleanup_required` in the same result/lifecycle transaction. Cleanup remains required even when
+the owning task is terminal; cancellation removes agent authority, not daemon housekeeping.
+
+`cleanup_required` is not yet claimable while any network operation for the old review attempt is
+still running or reconciliation-required. The daemon first lets the bounded child finish or
+kills and reaps it, records/reconciles its terminal outcome, and proves that no queued row can be
+sent. In particular, an in-flight create cannot pass an empty-review probe and land after the slot
+is released. A late create result persists its review ID and leaves the slot cleanup-required;
+it never replaces a newer owner.
+
+The daemon claims cleanup with a guarded `cleanup_required -> cleanup_running` update under
+`BEGIN IMMEDIATE`, commits, and performs no more than a bounded read/delete/re-read sequence
+through the Repository Service. It deletes only the current pending review with the exact stored
+owner marker, PR, publisher scope, launch SHA, and remote ID when known. No pending review, or a
+404 after an exact delete, is idempotent cleanup success. A timeout or crash after delete is
+reconciled by re-reading: absence completes cleanup, while the same exact marker may be retried.
+A foreign or ambiguous review is never deleted and makes the slot `blocked`.
+
+Cleanup and the initial empty-slot probe share a maximum of eight claim/reconciliation cycles and
+one hour per recovery generation, use bounded backoff, the existing 30-second command kill/reap
+and output limits, and never hold a database transaction across GitHub I/O. Exhaustion changes the
+slot to `blocked`; it does not create a verdict, lifecycle transition, rework, or reviewer/provider
+budget charge. A nonterminal task waiting for the slot uses the existing durable infrastructure
+parking path. A terminal owner retains a bounded status-visible cleanup blocker. An
+operator-authorized retry of a later parked task may reset the same slot's cleanup generation
+and rebind only its waiting-task pointer after infrastructure repair, but it does not create a new
+slot, owner marker, review, or automatic unbounded retry path. Transitioning an owned attempt to
+cleanup starts a fresh bounded cleanup generation; time spent in the valid owned review turn does
+not consume its cleanup deadline.
+
+Graceful shutdown stops new probe and cleanup claims. A claimed Repository Service child receives
+the same bounded kill/reap treatment as an agent operation, and the signal itself neither releases
+the slot nor changes lifecycle. Startup treats `probing` and `cleanup_running` as
+reconciliation-required, retaining the exact marker, review ID, attempt count, and deadline; it
+reads remote state before any delete or slot release.
+
+Only after marker-verified deletion or confirmed absence does the daemon delete the slot row. A
+distinct attempt then repeats the fresh probe before atomically acquiring the slot. This barrier
+applies on startup, re-review, and the R1-to-R2 handoff, so a new reviewer can neither attach to
+stale draft content nor bypass cleanup during a GitHub outage. The cleanup result is publication
+housekeeping only and never substitutes for, infers, or posts a formal review verdict.
+
+A successful `submit_pending` result, including marker reconciliation after a crash, releases its
+attempt's owned slot because the review is no longer pending. A distinct attempt still performs
+the fresh remote probe, which fails closed if GitHub contradicts that recorded result.
+
 ### Pending-review ordering
 
 Review publication is one durable sequence within the reviewer collaboration attempt. `create`
@@ -405,6 +513,8 @@ transaction; after sealing, new inline findings and a second submit are rejected
 claim a review-sequence row only after every lower sequence has `succeeded` without
 `completed_after_revocation`. A queued, running, or backing-off predecessor blocks later rows; a
 failed or cancelled predecessor terminally fails its dependents without sending them to GitHub.
+If create may have landed, that failure also schedules the daemon-owned cleanup barrier before any
+distinct reviewer attempt.
 
 This serializes create, all accepted inline findings in enqueue order, and final COMMENT
 submission even when later rows are otherwise due first. The reviewer lifecycle submit guard
@@ -507,6 +617,15 @@ Required tests include:
   reconciliation rules without inferring a lifecycle outcome;
 - a fresh capability for the exact persisted Claude/Codex continuation adopts the same attempt,
   operation IDs, markers, and pending review, while a changed task/role/PR/SHA/turn cannot adopt;
+- crash after pending-review create, cancellation/head movement racing create, and a failed or
+  cancelled post-create sequence all leave a marker-owned cleanup barrier that survives restart;
+- cleanup cannot claim until every old review network child has completed or been killed, reaped,
+  and reconciled, so an in-flight create cannot land after confirmed absence and slot release;
+- cleanup deletes only the exact daemon-owned pending review, reconciles crash-after-delete as
+  success, and blocks without deletion on a foreign/missing marker, mismatched ID/SHA, or outage;
+- shutdown during probe/delete retains the slot and startup reconciles it before any new reviewer;
+- re-review and R1-to-R2 provisioning cannot begin until the prior publisher/PR slot is confirmed
+  empty, and cleanup exhaustion consumes no lifecycle or reviewer/provider budget;
 - moved heads reject new inline review work and cannot authorize a verdict;
 - invalid path/line/side/range and foreign/outdated thread anchors fail visibly;
 - authored Markdown with lists, tables, fences, suggestions, Unicode, quotes, and newlines reaches
@@ -538,12 +657,14 @@ Every implementation task is deliberately small or medium and independently revi
    access.
 2. **M — Durable operation outbox and daemon executor skeleton.** Add the migration, atomic
    enqueue/claim/revalidation/revocation/result/recovery paths, fixed admission and retry bounds,
-   retention, shutdown reconciliation, and fake Repository Service.
+   retention, publication-slot reservation, bounded cleanup/status skeleton, shutdown
+   reconciliation, and fake Repository Service.
 3. **M — PR read and general-comment operations.** Add bounded reads, exact target checks,
    Markdown-safe general comments, markers, and outage classification.
 4. **M — Pending reviews and inline findings.** Add create/resume/submit COMMENT review,
    validated single/multiline anchors for the launch SHA, durable sequence/seal dependencies, and
-   the complete-publication-before-verdict submit guard.
+   marker-verified orphan-draft cleanup across restart/re-review/R1-to-R2, plus the complete-
+   publication-before-verdict submit guard.
 5. **S — Thread replies and reviewer resolution.** Add exact-PR comment lookup, true threaded
    replies, outdated context, and reviewer-only resolution.
 6. **S — Claude per-run MCP injection.** Add explicit strict config for initial/resumed managed
