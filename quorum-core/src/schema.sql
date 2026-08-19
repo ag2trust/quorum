@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- v53: authoritative nullable target branch. Resolved to the daemon-configured
     -- base before first execution; immutable once populated.
     target_branch TEXT,
-    -- v55: nullable per-task rework ceiling. Stamped from the daemon's
+    -- v56: nullable per-task rework ceiling. Stamped from the daemon's
     -- `max_rework` config at first ownership; immutable once populated. NULL
     -- means unstamped and falls back to the compiled REWORK_CAP, preserving
     -- historic behaviour for existing rows.
@@ -188,6 +188,8 @@ CREATE TABLE IF NOT EXISTS task_decompositions (
     plan_revision           INTEGER NOT NULL DEFAULT 1,
     proposal_attempts       INTEGER NOT NULL DEFAULT 0,
     provider_failures       INTEGER NOT NULL DEFAULT 0,
+    operator_retry_count    INTEGER NOT NULL DEFAULT 0
+                                  CHECK(operator_retry_count BETWEEN 0 AND 2),
     planner_provider        TEXT,
     planner_model           TEXT,
     planner_session_id      TEXT,
@@ -231,6 +233,7 @@ CREATE TABLE IF NOT EXISTS decomposition_attempts (
     source_revision  INTEGER NOT NULL,
     kind             TEXT NOT NULL CHECK(kind IN ('proposal','provider','blocker','recovery')),
     ordinal          INTEGER NOT NULL,
+    retry_generation INTEGER NOT NULL DEFAULT 0 CHECK(retry_generation BETWEEN 0 AND 2),
     reason_code      TEXT NOT NULL,
     summary          TEXT NOT NULL,
     created_at       INTEGER NOT NULL,

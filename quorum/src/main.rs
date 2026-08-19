@@ -1115,13 +1115,48 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     output::emit(&quorum_core::tasks::TaskCompact::from(&task));
                     Ok(0)
                 }
-                None => {
-                    output::emit(&serde_json::json!({
-                        "ok": false,
-                        "reason": "task is not daemon-parked or provider-blocked",
-                    }));
-                    Ok(1)
-                }
+                None => match quorum_core::decomposition::retry_exhausted_planning(
+                    &mut conn, task_id, &by, now,
+                )? {
+                    quorum_core::decomposition::PlanningRetryOutcome::Retried {
+                        graph_id,
+                        generation,
+                    } => {
+                        let task = quorum_core::tasks::get(&conn, task_id)?.ok_or_else(|| {
+                            QuorumError::Io(format!(
+                                "retried decomposition source #{task_id} disappeared"
+                            ))
+                        })?;
+                        output::emit(&serde_json::json!({
+                            "ok": true,
+                            "outcome": "decomposition-planning-retried",
+                            "graph_id": graph_id,
+                            "retry_generation": generation,
+                            "task": quorum_core::tasks::TaskCompact::from(&task),
+                        }));
+                        Ok(0)
+                    }
+                    quorum_core::decomposition::PlanningRetryOutcome::RetryCapExhausted {
+                        retry_count,
+                    } => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "outcome": "decomposition-planning-retry-rejected",
+                            "reason": "operator retry cap exhausted; inspect the planning failures and rescope or close the source",
+                            "retry_count": retry_count,
+                            "retry_cap": quorum_core::decomposition::MAX_OPERATOR_RETRIES,
+                        }));
+                        Ok(1)
+                    }
+                    quorum_core::decomposition::PlanningRetryOutcome::NotEligible => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "outcome": "task-retry-rejected",
+                            "reason": "task is not daemon-parked, provider-blocked, or an eligible exhausted decomposition source",
+                        }));
+                        Ok(1)
+                    }
+                },
             }
         }
         cli::Command::DecompositionAdoptRecovery {

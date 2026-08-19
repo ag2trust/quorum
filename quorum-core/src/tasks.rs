@@ -12274,7 +12274,7 @@ mod tests {
         assert_eq!(v, crate::db::SCHEMA_VERSION);
         let task = get(&conn, 1).unwrap().unwrap();
         assert!(task.target_branch.is_none());
-        // v55: the added rework_cap column is nullable; legacy rows stay NULL and
+        // v56: the added rework_cap column is nullable; legacy rows stay NULL and
         // fall back to the compiled cap, preserving historic behaviour.
         assert!(task.rework_cap.is_none());
         assert_eq!(task.effective_rework_cap(), crate::lifecycle::REWORK_CAP);
