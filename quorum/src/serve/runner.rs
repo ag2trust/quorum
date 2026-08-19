@@ -572,11 +572,22 @@ pub struct LaunchRequest<'a> {
 pub struct AgentMcpServer {
     pub command: &'static str,
     pub args: &'static [&'static str],
+    /// Names whose values the provider must copy from its managed launch
+    /// environment into the stdio child. Values never enter provider args.
+    pub env_vars: &'static [&'static str],
 }
+
+pub const AGENT_MCP_ENV_VARS: &[&str] = &[
+    "QUORUM_REPO",
+    "QUORUM_AGENT",
+    "QUORUM_RUN_ID",
+    "QUORUM_AGENT_ENDPOINT",
+];
 
 pub const AGENT_MCP_SERVER: AgentMcpServer = AgentMcpServer {
     command: "quorum",
     args: &["agent-mcp"],
+    env_vars: AGENT_MCP_ENV_VARS,
 };
 
 impl LaunchRequest<'_> {
@@ -585,14 +596,8 @@ impl LaunchRequest<'_> {
     /// collectors intentionally use the normal provider protocol while still
     /// having no managed worker/reviewer endpoint authority.
     pub fn agent_mcp_server(&self) -> Option<AgentMcpServer> {
-        const REQUIRED: [&str; 4] = [
-            "QUORUM_REPO",
-            "QUORUM_AGENT",
-            "QUORUM_RUN_ID",
-            "QUORUM_AGENT_ENDPOINT",
-        ];
         (self.mode == LaunchMode::Normal
-            && REQUIRED.iter().all(|required| {
+            && AGENT_MCP_ENV_VARS.iter().all(|required| {
                 self.environment
                     .iter()
                     .any(|(key, value)| key == required && !value.is_empty())
@@ -1373,10 +1378,20 @@ mod tests {
         }
         assert_eq!(AGENT_MCP_SERVER.command, "quorum");
         assert_eq!(AGENT_MCP_SERVER.args, ["agent-mcp"]);
+        assert_eq!(
+            AGENT_MCP_SERVER.env_vars,
+            [
+                "QUORUM_REPO",
+                "QUORUM_AGENT",
+                "QUORUM_RUN_ID",
+                "QUORUM_AGENT_ENDPOINT",
+            ]
+        );
         let command_surface = format!(
-            "{} {}",
+            "{} {} {}",
             AGENT_MCP_SERVER.command,
-            AGENT_MCP_SERVER.args.join(" ")
+            AGENT_MCP_SERVER.args.join(" "),
+            AGENT_MCP_SERVER.env_vars.join(" ")
         );
         for forbidden in [".sqlite", "GH_TOKEN", "GITHUB_TOKEN", "ghp_"] {
             assert!(!command_surface.contains(forbidden), "{command_surface}");
@@ -1747,7 +1762,9 @@ mod tests {
             ["<exec>", "<resume>", "<provider-issued-thread-42>"]
         );
         assert!(
-            codex_args.contains(r#"<mcp_servers.github={command="quorum",args=["agent-mcp"]}>"#),
+            codex_args.contains(
+                r#"<mcp_servers.github={command="quorum",args=["agent-mcp"],env_vars=["QUORUM_REPO","QUORUM_AGENT","QUORUM_RUN_ID","QUORUM_AGENT_ENDPOINT"]}>"#
+            ),
             "{codex_args}"
         );
         assert_eq!(
