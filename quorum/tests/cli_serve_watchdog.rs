@@ -429,10 +429,10 @@ fn wait_for_process_terminated(pid: i32) {
 
 fn append_worker_message(home: &std::path::Path, target: &str) -> i64 {
     let db = home.join("repos/test__repo/quorum.db");
-    let mut conn = quorum_core::db::open(&db).unwrap();
-    quorum_core::mailbox::append(
-        &mut conn,
-        &quorum_core::mailbox::MailboxRow {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut conn = quorum_core::db::open(&db).unwrap();
+        let row = quorum_core::mailbox::MailboxRow {
             agent: "MessageSender".into(),
             kind: quorum_core::mailbox::MailboxKind::Message,
             task_id: None,
@@ -442,9 +442,15 @@ fn append_worker_message(home: &std::path::Path, target: &str) -> i64 {
             note: None,
             to_agent: Some(target.into()),
             payload: Some("queued while completion is pending".into()),
-        },
-    )
-    .unwrap()
+        };
+        match quorum_core::mailbox::append(&mut conn, &row) {
+            Ok(id) => return id,
+            Err(quorum_core::error::QuorumError::Busy) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("could not append worker message: {error}"),
+        }
+    }
 }
 
 fn mailbox_row_is_consumed(home: &std::path::Path, id: i64) -> bool {
