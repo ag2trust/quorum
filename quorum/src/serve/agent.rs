@@ -2,8 +2,8 @@
 
 use super::runner::{
     capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
-    CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation, FailureTracker,
-    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
+    AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation,
+    FailureTracker, LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
 };
 use super::stream::{self, Event};
 use std::path::PathBuf;
@@ -47,6 +47,7 @@ pub struct AgentProc {
 /// (#206) — without it the Skill call is silently denied and the review
 /// degrades to an unstructured read.
 pub(crate) const ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,Skill";
+const AGENT_MCP_ALLOWED_TOOL: &str = "mcp__github__*";
 /// Build a stream-json user turn. The claude CLI requires `message.role` and
 /// exits 1 on the first message without it — every turn fed to an agent MUST
 /// go through this helper (first live run died instantly on a role-less turn).
@@ -54,6 +55,18 @@ pub fn user_turn(content: &str) -> String {
     serde_json::json!({
         "type": "user",
         "message": { "role": "user", "content": content }
+    })
+    .to_string()
+}
+
+fn claude_mcp_config(server: AgentMcpServer) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            "github": {
+                "command": server.command,
+                "args": server.args,
+            }
+        }
     })
     .to_string()
 }
@@ -105,7 +118,12 @@ impl AgentProc {
             env_vars: request.environment.to_vec(),
         };
         let mut proc = match request.mode {
-            LaunchMode::Normal => Self::spawn(&spec, config.executable)?,
+            LaunchMode::Normal => Self::spawn_configured(
+                &spec,
+                config.executable,
+                RestrictedMode::None,
+                request.agent_mcp_server(),
+            )?,
             LaunchMode::Restricted => Self::spawn_restricted(&spec, config.executable)?,
         };
         let turn = user_turn(request.prompt);
@@ -303,7 +321,7 @@ impl AgentProc {
     }
 
     pub fn spawn(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, RestrictedMode::None)
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::None, None)
     }
 
     /// Spawn a closed-book classifier while preserving the configured auth
@@ -311,7 +329,7 @@ impl AgentProc {
     /// credential restrictions of `--bare`; the empty tool surface prevents
     /// the classifier from acquiring context beyond its supplied turn.
     pub fn spawn_restricted(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, RestrictedMode::ClosedBook)
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::ClosedBook, None)
     }
 
     /// Spawn a read-only planning turn. Unlike the closed-book classifier,
@@ -319,13 +337,14 @@ impl AgentProc {
     /// write files, load customizations, or persist a provider session.
     #[allow(dead_code)] // consumed by the pending daemon decomposition coordinator
     pub fn spawn_planner(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, RestrictedMode::Planner)
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::Planner, None)
     }
 
     fn spawn_configured(
         spec: &AgentSpec,
         agent_bin: Option<&str>,
         restricted: RestrictedMode,
+        agent_mcp: Option<AgentMcpServer>,
     ) -> std::io::Result<Self> {
         let bin = agent_bin.unwrap_or("claude");
         let mut cmd = Command::new(bin);
@@ -341,6 +360,12 @@ impl AgentProc {
             .arg(&spec.effort);
 
         cmd.arg("--session-id").arg(&spec.session_id);
+
+        if let Some(server) = agent_mcp {
+            cmd.arg("--mcp-config")
+                .arg(claude_mcp_config(server))
+                .arg("--strict-mcp-config");
+        }
 
         if restricted != RestrictedMode::None {
             cmd.arg("--safe-mode")
@@ -363,10 +388,22 @@ impl AgentProc {
         // cannot edit files, run git/gh, or signal `quorum submit` — it stalls
         // forever in awaiting-review (observed second live run). Restricted
         // classifier spawns pass an empty list in addition to `--tools ""`.
+        let allowed_tools = match agent_mcp {
+            Some(_) if spec.allowed_tools.is_empty() => AGENT_MCP_ALLOWED_TOOL.to_string(),
+            Some(_)
+                if !spec
+                    .allowed_tools
+                    .split(',')
+                    .any(|tool| tool == AGENT_MCP_ALLOWED_TOOL) =>
+            {
+                format!("{},{}", spec.allowed_tools, AGENT_MCP_ALLOWED_TOOL)
+            }
+            _ => spec.allowed_tools.clone(),
+        };
         cmd.arg("--permission-mode")
             .arg("dontAsk")
             .arg("--allowedTools")
-            .arg(&spec.allowed_tools);
+            .arg(allowed_tools);
 
         if spec.bare {
             cmd.arg("--bare");
@@ -866,8 +903,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut spec = classifier_spec(tmp.path(), true);
         spec.env_vars = no_auth_env(tmp.path());
+        spec.env_vars.extend([
+            ("QUORUM_REPO".into(), "owner/repo".into()),
+            ("QUORUM_AGENT".into(), "Keel-test".into()),
+            ("QUORUM_RUN_ID".into(), "run-capability".into()),
+            (
+                "QUORUM_AGENT_ENDPOINT".into(),
+                "/tmp/quorum-agent-mcp-boundary.sock".into(),
+            ),
+        ]);
 
-        let mut proc = AgentProc::spawn(&spec, None).expect("spawn claude");
+        let mut proc = AgentProc::spawn_configured(
+            &spec,
+            None,
+            RestrictedMode::None,
+            Some(crate::serve::runner::AGENT_MCP_SERVER),
+        )
+        .expect("spawn claude with strict MCP config");
         proc.feed_turn(&user_turn("ping")).await.expect("feed turn");
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
             .await

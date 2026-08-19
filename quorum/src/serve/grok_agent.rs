@@ -7,8 +7,9 @@
 
 use super::runner::{
     capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
-    CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation, FailureTracker,
-    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage, WorkerTurnRequest,
+    AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation,
+    FailureTracker, LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
+    WorkerTurnRequest,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -133,6 +134,18 @@ impl GrokSpec {
 
 fn invalid_input(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+fn grok_mcp_config(server: AgentMcpServer) -> String {
+    serde_json::json!({
+        "mcp_servers": {
+            "github": {
+                "command": server.command,
+                "args": server.args,
+            }
+        }
+    })
+    .to_string()
 }
 
 fn common_args(
@@ -364,24 +377,31 @@ impl GrokProc {
             Some(session_id) => resume_args(session_id, &spec)?,
             None => headless_args(&spec, request.mode)?,
         };
-        Self::spawn_command(&spec, &args, config.executable)
+        Self::spawn_command(&spec, &args, request.agent_mcp_server(), config.executable)
     }
 
     #[cfg(test)]
     fn spawn(spec: &GrokSpec, grok_bin: Option<&str>) -> std::io::Result<Self> {
         let args = headless_args(spec, LaunchMode::Normal)?;
-        Self::spawn_command(spec, &args, grok_bin)
+        Self::spawn_command(spec, &args, None, grok_bin)
     }
 
     fn spawn_command(
         spec: &GrokSpec,
         args: &[String],
+        agent_mcp: Option<AgentMcpServer>,
         grok_bin: Option<&str>,
     ) -> std::io::Result<Self> {
         let mut command = Command::new(grok_bin.unwrap_or("grok"));
         command.args(args);
         for (key, value) in &spec.env_vars {
             command.env(key, value);
+        }
+        // Grok has no headless MCP flag. Its supported invocation-local
+        // configuration boundary is the JSON `GROK_CONFIG` overlay; keep the
+        // generated server out of the operator's persistent config.toml.
+        if let Some(server) = agent_mcp {
+            command.env("GROK_CONFIG", grok_mcp_config(server));
         }
         command
             .current_dir(&spec.worktree)
@@ -1265,7 +1285,14 @@ mod tests {
         let mut spec = test_spec(worktree.path());
         spec.prompt = "noop".into();
         spec.env_vars = no_auth_env(root.path());
-        let mut proc = GrokProc::spawn(&spec, None).expect("spawn grok");
+        let args = headless_args(&spec, LaunchMode::Normal).unwrap();
+        let mut proc = GrokProc::spawn_command(
+            &spec,
+            &args,
+            Some(crate::serve::runner::AGENT_MCP_SERVER),
+            None,
+        )
+        .expect("spawn grok with invocation-local MCP config");
         let _lines = wait_for_real_cli_terminal_failure(&mut proc).await;
         proc.kill_and_reap().await;
     }
@@ -1316,6 +1343,10 @@ mod tests {
         let output = std::process::Command::new("grok")
             .args(args)
             .envs(spec.env_vars.iter().map(|(key, value)| (key, value)))
+            .env(
+                "GROK_CONFIG",
+                grok_mcp_config(crate::serve::runner::AGENT_MCP_SERVER),
+            )
             .current_dir(&spec.worktree)
             .stdin(Stdio::null())
             .output()

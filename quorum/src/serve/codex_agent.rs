@@ -8,8 +8,8 @@
 use super::codex_stream::{self, Event};
 use super::runner::{
     capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
-    CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation, FailureTracker,
-    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
+    AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation,
+    FailureTracker, LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
 };
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -35,7 +35,11 @@ pub struct CodexSpec {
 
 /// Build the argument list for `codex exec --json` (first turn).
 pub fn exec_args(spec: &CodexSpec) -> Vec<String> {
-    vec![
+    exec_args_configured(spec, None)
+}
+
+fn exec_args_configured(spec: &CodexSpec, agent_mcp: Option<AgentMcpServer>) -> Vec<String> {
+    let mut args = vec![
         "exec".into(),
         "--json".into(),
         "--model".into(),
@@ -49,14 +53,26 @@ pub fn exec_args(spec: &CodexSpec) -> Vec<String> {
         spec.worktree.display().to_string(),
         "--skip-git-repo-check".into(),
         "--ignore-user-config".into(),
-        spec.prompt.clone(),
-    ]
+    ];
+    append_agent_mcp_override(&mut args, agent_mcp);
+    args.push(spec.prompt.clone());
+    args
 }
 
 /// Build the argument list for `codex exec resume <thread_id> --json`
 /// (continuation turn).
 pub fn resume_args(thread_id: &str, model: &str, effort: &str, prompt: &str) -> Vec<String> {
-    vec![
+    resume_args_configured(thread_id, model, effort, prompt, None)
+}
+
+fn resume_args_configured(
+    thread_id: &str,
+    model: &str,
+    effort: &str,
+    prompt: &str,
+    agent_mcp: Option<AgentMcpServer>,
+) -> Vec<String> {
+    let mut args = vec![
         "exec".into(),
         "resume".into(),
         thread_id.into(),
@@ -68,8 +84,30 @@ pub fn resume_args(thread_id: &str, model: &str, effort: &str, prompt: &str) -> 
         "--dangerously-bypass-approvals-and-sandbox".into(),
         "--skip-git-repo-check".into(),
         "--ignore-user-config".into(),
-        prompt.into(),
-    ]
+    ];
+    append_agent_mcp_override(&mut args, agent_mcp);
+    args.push(prompt.into());
+    args
+}
+
+fn append_agent_mcp_override(args: &mut Vec<String>, server: Option<AgentMcpServer>) {
+    let Some(server) = server else {
+        return;
+    };
+    let server_args = server
+        .args
+        .iter()
+        .map(|arg| serde_json::to_string(arg).expect("static MCP argument serializes"))
+        .collect::<Vec<_>>()
+        .join(",");
+    args.extend([
+        "-c".into(),
+        format!(
+            "mcp_servers.github={{command={},args=[{}]}}",
+            serde_json::to_string(server.command).expect("static MCP command serializes"),
+            server_args
+        ),
+    ]);
 }
 
 /// Build the restricted single-turn argument list used by classifiers.
@@ -150,6 +188,7 @@ impl CodexProc {
                 request.worktree,
                 request.prompt,
                 request.environment,
+                request.agent_mcp_server(),
                 config.executable,
             );
         }
@@ -162,7 +201,9 @@ impl CodexProc {
             env_vars: request.environment.to_vec(),
         };
         match request.mode {
-            LaunchMode::Normal => Self::spawn(&spec, config.executable),
+            LaunchMode::Normal => {
+                Self::spawn_configured(&spec, request.agent_mcp_server(), config.executable)
+            }
             LaunchMode::Restricted => Self::spawn_restricted(&spec, config.executable),
         }
     }
@@ -359,10 +400,11 @@ impl CodexProc {
         worktree: &std::path::Path,
         prompt: &str,
         env_vars: &[(String, String)],
+        agent_mcp: Option<AgentMcpServer>,
         codex_bin: Option<&str>,
     ) -> std::io::Result<Self> {
         let bin = codex_bin.unwrap_or("codex");
-        let args = resume_args(thread_id, model, effort, prompt);
+        let args = resume_args_configured(thread_id, model, effort, prompt, agent_mcp);
         let mut cmd = Command::new(bin);
         cmd.args(&args);
         for (k, v) in env_vars {
@@ -403,8 +445,16 @@ impl CodexProc {
     }
 
     pub fn spawn(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
+        Self::spawn_configured(spec, None, codex_bin)
+    }
+
+    fn spawn_configured(
+        spec: &CodexSpec,
+        agent_mcp: Option<AgentMcpServer>,
+        codex_bin: Option<&str>,
+    ) -> std::io::Result<Self> {
         let bin = codex_bin.unwrap_or("codex");
-        let args = exec_args(spec);
+        let args = exec_args_configured(spec, agent_mcp);
         let mut cmd = Command::new(bin);
         cmd.args(&args);
         for (k, v) in &spec.env_vars {
@@ -1052,7 +1102,9 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
             prompt: "ping".into(),
             env_vars: no_auth_env(tmp.path()),
         };
-        let mut proc = CodexProc::spawn(&spec, None).expect("spawn codex");
+        let mut proc =
+            CodexProc::spawn_configured(&spec, Some(crate::serve::runner::AGENT_MCP_SERVER), None)
+                .expect("spawn codex with invocation-local MCP");
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
             .await
             .expect("codex produced no event within 60s — args may hang the CLI");
@@ -1239,11 +1291,12 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let args = resume_args(
+        let args = resume_args_configured(
             "00000000-0000-0000-0000-000000000000",
             "o4-mini",
             "high",
             "continue",
+            Some(crate::serve::runner::AGENT_MCP_SERVER),
         );
         let mut cmd = std::process::Command::new("codex");
         cmd.args(&args);
