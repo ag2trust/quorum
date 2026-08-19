@@ -346,6 +346,9 @@ pub enum Command {
         #[arg(long = "run-id")]
         run_id: Option<String>,
     },
+    /// Run the credentialless, tools-only managed-agent MCP server over stdio.
+    #[command(name = "agent-mcp")]
+    AgentMcp,
     /// Signal task completion (worker) or emit a review verdict (reviewer).
     /// The daemon endpoint writes the mailbox row after deriving authority from
     /// the run capability; CLI task, PR, and identity flags are compatibility inputs.
