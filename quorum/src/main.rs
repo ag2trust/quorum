@@ -1605,6 +1605,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::Classify {
             backfill,
+            config: config_flag,
             agent_bin,
             no_bare_agent,
         } => {
@@ -1617,15 +1618,33 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             // Backfill is a supported classification writer, so a task it makes
             // dispatchable must receive the durable adoption-time cap before
             // claim — otherwise lifecycle/R2/reviewer consumers fall back to the
-            // compiled default despite a configured `max_rework`. Resolves from
-            // the same per-repo serve config as the daemon; when the file is
-            // absent or does not set `max_rework`, falls back to `REWORK_CAP`.
-            let repo_slug = paths::try_resolve_repo().ok_or_else(|| {
-                QuorumError::Usage(
-                    "classify --backfill: cannot resolve the current repository".into(),
-                )
-            })?;
-            let max_rework = serve_config::resolve_max_rework(&repo_slug)?;
+            // compiled default despite a configured `max_rework`.
+            //
+            // When the operator passes `--config <path>`, resolve from that
+            // exact file so the stamped cap matches the daemon started with
+            // the same `--config`. When absent, resolve from the same
+            // per-repo default path the daemon uses. Explicit-config missing
+            // must fail exit 2 (same policy as `serve --config`) so backfill
+            // cannot silently diverge from an intended non-default policy;
+            // an absent default file falls back to `REWORK_CAP`, matching
+            // `serve` without a config.
+            let max_rework = if let Some(ref p) = config_flag {
+                let path = std::path::Path::new(p);
+                if !path.exists() {
+                    return Err(QuorumError::Usage(format!(
+                        "classify --config: file not found: {}",
+                        path.display()
+                    )));
+                }
+                serve_config::resolve_max_rework_at(path)?
+            } else {
+                let repo_slug = paths::try_resolve_repo().ok_or_else(|| {
+                    QuorumError::Usage(
+                        "classify --backfill: cannot resolve the current repository".into(),
+                    )
+                })?;
+                serve_config::resolve_max_rework(&repo_slug)?
+            };
             let mut total_stored = 0;
             let mut total_tasks = 0;
             let rt = tokio::runtime::Runtime::new()
