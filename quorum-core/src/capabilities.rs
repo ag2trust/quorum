@@ -55,6 +55,7 @@ struct LiveAgentRun {
     task_id: i64,
     agent: String,
     role: String,
+    ended_at: Option<i64>,
     review_pr: Option<i64>,
     review_revision: Option<String>,
 }
@@ -142,7 +143,7 @@ pub fn resolve_live_run_context(
 
     let live_run = if capability.role == "reviewer" {
         conn.query_row(
-            "SELECT id,task_id,agent_name,role,review_pr,review_head_sha
+            "SELECT id,task_id,agent_name,role,ended_at,review_pr,review_head_sha
              FROM agent_runs
              WHERE review_cap_run_id=?1 AND role='reviewer' AND ended_at IS NULL",
             [&capability.run_id],
@@ -152,17 +153,21 @@ pub fn resolve_live_run_context(
                     task_id: row.get(1)?,
                     agent: row.get(2)?,
                     role: row.get(3)?,
-                    review_pr: row.get(4)?,
-                    review_revision: row.get(5)?,
+                    ended_at: row.get(4)?,
+                    review_pr: row.get(5)?,
+                    review_revision: row.get(6)?,
                 })
             },
         )
         .optional()?
         .ok_or_else(|| authority_error("no matching live reviewer run"))?
     } else {
-        // Worker runs predate the reviewer-only exact launch columns. Refuse
-        // ambiguous tuples: a leaked second live capability or agent-run row
-        // must fail closed instead of being paired by reusable agent name.
+        // Worker runs predate the reviewer-only exact launch columns. Preserve
+        // every candidate after capability issuance so an ended earlier run
+        // cannot be hidden by filtering directly to a later live row. Without
+        // an exact worker capability foreign key, any second historical or
+        // live candidate must fail closed instead of being paired by reusable
+        // agent name.
         let active_capabilities: i64 = conn.query_row(
             "SELECT COUNT(*) FROM run_capabilities
              WHERE task_id=?1 AND agent=?2 AND role='worker' AND revoked_at IS NULL",
@@ -173,11 +178,11 @@ pub fn resolve_live_run_context(
             return Err(authority_error("worker capability is ambiguous"));
         }
         let mut statement = conn.prepare(
-            "SELECT id,task_id,agent_name,role
+            "SELECT id,task_id,agent_name,role,ended_at
              FROM agent_runs
-             WHERE task_id=?1 AND agent_name=?2 AND role='worker' AND ended_at IS NULL
+             WHERE task_id=?1 AND agent_name=?2 AND role='worker'
                AND spawned_at>=?3
-             ORDER BY id DESC LIMIT 2",
+             ORDER BY spawned_at,id LIMIT 2",
         )?;
         let runs = statement
             .query_map(
@@ -188,6 +193,7 @@ pub fn resolve_live_run_context(
                         task_id: row.get(1)?,
                         agent: row.get(2)?,
                         role: row.get(3)?,
+                        ended_at: row.get(4)?,
                         review_pr: None,
                         review_revision: None,
                     })
@@ -195,9 +201,13 @@ pub fn resolve_live_run_context(
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         if runs.len() != 1 {
-            return Err(authority_error("no unambiguous live worker run"));
+            return Err(authority_error("worker run history is ambiguous"));
         }
-        runs.into_iter().next().expect("one worker run")
+        let run = runs.into_iter().next().expect("one worker run");
+        if run.ended_at.is_some() {
+            return Err(authority_error("matching worker run has ended"));
+        }
+        run
     };
 
     if live_run.task_id != capability.task_id
@@ -675,6 +685,25 @@ mod tests {
         )
         .unwrap();
         assert_resolver_rejects_without_mailbox_write(&c, "ended-run", "worker");
+    }
+
+    #[test]
+    fn resolve_live_run_rejects_ended_worker_capability_reused_by_later_run() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        let first_run_id = insert_live_worker(&mut c, 1, "Worker", "stale-capability");
+        c.execute(
+            "UPDATE agent_runs SET ended_at=20,end_reason='completed' WHERE id=?1",
+            [first_run_id],
+        )
+        .unwrap();
+
+        // A later process can have a durable run row without its capability
+        // when capability issuance fails. The still-active earlier capability
+        // must not be paired with this newer live row by reusable identity.
+        crate::agent_runs::insert(&c, 1, "Worker", "worker", "model", "high", "codex", 30).unwrap();
+
+        assert_resolver_rejects_without_mailbox_write(&c, "stale-capability", "worker");
     }
 
     #[test]
