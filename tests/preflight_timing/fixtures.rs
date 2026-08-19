@@ -137,6 +137,12 @@ impl Fixture {
         command
             .current_dir(&self.repo)
             .env("PATH", path)
+            .env("QUORUM_HOME", self.repo.join("production-quorum-home"))
+            .env("QUORUM_REPO", "production/repo")
+            .env(
+                "PREFLIGHT_UNSAFE_QUORUM_HOME",
+                self.repo.join("production-quorum-home"),
+            )
             .env("PREFLIGHT_TIMING_SCENARIO", scenario.env_value())
             .env(
                 "PREFLIGHT_TEST_EXECUTABLE",
@@ -185,6 +191,12 @@ impl Fixture {
                 "0.2",
             ])
             .env("PATH", path)
+            .env("QUORUM_HOME", self.repo.join("production-quorum-home"))
+            .env("QUORUM_REPO", "production/repo")
+            .env(
+                "PREFLIGHT_UNSAFE_QUORUM_HOME",
+                self.repo.join("production-quorum-home"),
+            )
             .env("PREFLIGHT_TIMING_SCENARIO", scenario.env_value())
             .env(
                 "PREFLIGHT_TEST_EXECUTABLE",
@@ -768,6 +780,14 @@ fn abrupt_owner_group_death_reaps_separate_descendant_groups() {
 }
 
 const CARGO_SHIM: &str = r##"#!/bin/sh
+[ "${QUORUM_HOME:-}" != "${PREFLIGHT_UNSAFE_QUORUM_HOME:-}" ] || {
+  printf '%s\n' 'cargo inherited the production Quorum home' >&2
+  exit 98
+}
+[ "${QUORUM_REPO:-}" = quorum/preflight ] || {
+  printf '%s\n' 'cargo did not inherit the isolated preflight repository' >&2
+  exit 98
+}
 case "$1" in
   fmt|clippy) exit 0 ;;
   test)
@@ -786,6 +806,14 @@ exit 99
 "##;
 
 const TEST_FAILURE_SHIM: &str = r##"#!/bin/sh
+[ "${QUORUM_HOME:-}" != "${PREFLIGHT_UNSAFE_QUORUM_HOME:-}" ] || {
+  printf '%s\n' 'test inherited the production Quorum home' >&2
+  exit 98
+}
+[ "${QUORUM_REPO:-}" = quorum/preflight ] || {
+  printf '%s\n' 'test did not inherit the isolated preflight repository' >&2
+  exit 98
+}
 printf '%s\n' 'fixture test failure: assertion failed' >&2
 exit 42
 "##;

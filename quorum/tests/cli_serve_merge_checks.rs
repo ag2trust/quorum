@@ -343,6 +343,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -373,6 +385,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -2271,7 +2284,7 @@ fn approved_without_pr_skips_merge() {
         handle.lines
     );
 
-    // Reviewer signals approved WITHOUT --pr (the bug trigger).
+    // The endpoint derives the daemon-owned PR when the reviewer omits --pr.
     quorum_done(
         home.path(),
         &[
@@ -2285,8 +2298,8 @@ fn approved_without_pr_skips_merge() {
     );
 
     assert!(
-        handle.wait_for("missing PR number", 15),
-        "expected missing-PR warning log. Lines: {:?}",
+        handle.wait_for("R2 GATE", 15),
+        "endpoint-derived PR did not reach the post-review gate. Lines: {:?}",
         handle.lines
     );
 
@@ -2295,7 +2308,7 @@ fn approved_without_pr_skips_merge() {
     });
     assert!(
         !saw_merge_attempt,
-        "merge should NOT be attempted without PR number. Lines: {:?}",
+        "the pending R2 gate must still prevent a merge. Lines: {:?}",
         handle.lines
     );
 

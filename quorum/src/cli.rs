@@ -332,8 +332,8 @@ pub enum Command {
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
     },
-    /// Signal a non-terminal agent state to the daemon. The daemon tracks
-    /// the state and surfaces it via `quorum status`.
+    /// Signal a non-terminal agent state to the daemon. Managed calls are
+    /// forwarded to the daemon endpoint, which derives the authoritative task.
     React {
         #[arg(long)]
         agent: String,
@@ -347,7 +347,8 @@ pub enum Command {
         run_id: Option<String>,
     },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
-    /// Writes a mailbox row for the daemon to consume.
+    /// The daemon endpoint writes the mailbox row after deriving authority from
+    /// the run capability; CLI task, PR, and identity flags are compatibility inputs.
     ///
     /// Requires daemon run identity: `--run-id` flag or `QUORUM_RUN_ID` env var.
     /// Identity is validated against the capability — `--agent` must match.
