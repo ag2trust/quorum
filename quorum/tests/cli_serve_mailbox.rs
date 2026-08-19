@@ -281,46 +281,50 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
-fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
-    let db = home.join("repos").join("test__repo").join("quorum.db");
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&db, &mut hasher);
-    std::env::temp_dir()
-        .join(format!(
-            "quorum-agent-{:016x}",
-            std::hash::Hasher::finish(&hasher)
-        ))
-        .join("endpoint.sock")
-}
-
-fn quorum_done(home: &std::path::Path, args: &[&str]) {
+/// Append a Done row directly for daemon-side mailbox handling tests.
+///
+/// These scenarios intentionally create stale or concurrent rows, including
+/// before the daemon endpoint exists and while the daemon is suspended.
+fn append_done_row(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
         .zip(args.iter().skip(1))
         .find(|(k, _)| **k == "--agent")
         .map(|(_, v)| *v)
-        .expect("quorum_done requires --agent");
-    let role = if args.contains(&"--verdict") {
+        .expect("append_done_row requires --agent");
+    let value = |flag| {
+        args.iter()
+            .zip(args.iter().skip(1))
+            .find(|(key, _)| **key == flag)
+            .map(|(_, value)| *value)
+    };
+    let role = if value("--verdict").is_some() {
         "reviewer"
     } else {
         "worker"
     };
     let run_id = resolve_run_id(home, agent, role);
-    let mut cmd_args = vec!["done"];
-    cmd_args.extend_from_slice(args);
-    let out = Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home)
-        .env("QUORUM_REPO", "test/repo")
-        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
-        .env("QUORUM_RUN_ID", &run_id)
-        .args(&cmd_args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "done failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    let task_id = quorum_core::capabilities::active_for_agent(&conn, agent)
+        .unwrap()
+        .filter(|capability| capability.run_id == run_id)
+        .map(|capability| capability.task_id)
+        .expect("append_done_row issued an active capability");
+    let blocking =
+        value("--blocking").map(|raw| raw.parse::<u32>().expect("--blocking must be a number"));
+    let row = quorum_core::mailbox::MailboxRow {
+        agent: agent.to_string(),
+        kind: quorum_core::mailbox::MailboxKind::Done,
+        task_id: Some(task_id),
+        pr: value("--pr").map(|raw| raw.parse::<i64>().expect("--pr must be a number")),
+        verdict: value("--verdict").map(str::to_string),
+        feedback: value("--feedback").map(str::to_string),
+        note: None,
+        to_agent: None,
+        payload: blocking.map(|count| format!(r#"{{"blocking":{count}}}"#)),
+    };
+    quorum_core::mailbox::append(&mut conn, &row).unwrap();
 }
 
 fn append_phase4c_barrier(conn: &mut rusqlite::Connection, target: &str) {
@@ -537,7 +541,7 @@ fn unmatched_done_row_consumed_as_passive_phantom() {
     seed_task(home.path(), "Task for unmatched row test");
 
     // Write a Done row for a name outside the daemon's pool.
-    quorum_done(home.path(), &["--agent", "GhostAgent"]);
+    append_done_row(home.path(), &["--agent", "GhostAgent"]);
 
     let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
@@ -586,7 +590,7 @@ fn unmatched_done_row_does_not_drive_lifecycle() {
 
     // No tasks seeded — the daemon idles, no worker gets spawned. Any lifecycle
     // event that shows up can only be a phantom driven by the ghost Done row.
-    quorum_done(home.path(), &["--agent", "GhostAgent", "--pr", "42"]);
+    append_done_row(home.path(), &["--agent", "GhostAgent", "--pr", "42"]);
 
     let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
@@ -691,7 +695,7 @@ fn phantom_done_row_for_owned_name_still_consumed() {
     );
 
     // Plant a done row post-teardown — this simulates a phantom.
-    quorum_done(home.path(), &["--agent", &worker_name]);
+    append_done_row(home.path(), &["--agent", &worker_name]);
 
     // Assert the daemon consumes this row (does NOT leave it).
     assert!(
@@ -740,8 +744,8 @@ fn non_roster_done_rows_consumed_as_phantoms() {
         .unwrap();
 
     // Plant Done rows for names outside the daemon's pool.
-    quorum_done(home.path(), &["--agent", "Aardvark0"]);
-    quorum_done(home.path(), &["--agent", "Beluga0"]);
+    append_done_row(home.path(), &["--agent", "Aardvark0"]);
+    append_done_row(home.path(), &["--agent", "Beluga0"]);
 
     let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
@@ -842,7 +846,7 @@ fn stale_done_row_drained_on_name_reuse() {
     // Plant a stale Done+approved row for "Agent0" BEFORE serve starts.
     // If this isn't drained, the daemon would apply the verdict to the
     // new worker that acquires "Agent0".
-    quorum_done(
+    append_done_row(
         home.path(),
         &[
             "--agent",
@@ -937,7 +941,7 @@ fn rework_feed_failure_releases_task() {
     let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
 
     // Worker signals completion; the daemon publishes and creates the PR.
-    quorum_done(home.path(), &["--agent", &worker_name]);
+    append_done_row(home.path(), &["--agent", &worker_name]);
 
     assert!(
         handle.wait_for("spawning reviewer", 15),
@@ -993,7 +997,7 @@ fn rework_feed_failure_releases_task() {
 
     // Reviewer signals "changes" verdict — daemon will try to feed rework
     // to the (now dead) worker, which should fail.
-    quorum_done(
+    append_done_row(
         home.path(),
         &[
             "--agent",

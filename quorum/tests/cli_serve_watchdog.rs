@@ -838,6 +838,7 @@ fn worker_submission_before_terminal_overage_is_cleanup_only() {
     let late_submit = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home.path()))
         .args([
             "submit",
             "--agent",
