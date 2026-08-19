@@ -69,6 +69,12 @@ const MAX_FETCHED_EVIDENCE_RECORDS: usize =
 const MAX_FETCHED_EVIDENCE_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FETCHED_EVIDENCE_ARRAY_DEPTH: usize = 2;
 
+/// Parse failures are durable operator-facing telemetry, not a place to retain
+/// unbounded model-derived text. The fixed shape fields always fit, while a
+/// long validation reason is safely shortened at a UTF-8 boundary.
+const MAX_PARSE_FAILURE_ERROR_BYTES: usize = 2 * 1024;
+const PARSE_FAILURE_REASON_TRUNCATION: &str = "... [reason truncated]";
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCollectorResponse {
@@ -227,6 +233,70 @@ fn extract_collector_json(text: &str) -> Option<&str> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollectorResponseShape {
+    trimmed_starts_with_object: bool,
+    json_fence_present: bool,
+    code_fence_present: bool,
+    json_extracted: bool,
+}
+
+fn collector_response_shape(text: &str) -> CollectorResponseShape {
+    let trimmed = text.trim();
+    CollectorResponseShape {
+        trimmed_starts_with_object: trimmed.starts_with('{'),
+        json_fence_present: trimmed.contains("```json"),
+        code_fence_present: trimmed.contains("```"),
+        json_extracted: extract_collector_json(text).is_some(),
+    }
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn bounded_parse_failure_reason(reason: &str, max_bytes: usize) -> String {
+    let safe_reason = reason.replace('\0', "�");
+    if safe_reason.len() <= max_bytes {
+        return safe_reason;
+    }
+    if max_bytes <= PARSE_FAILURE_REASON_TRUNCATION.len() {
+        return truncate_utf8_bytes(&safe_reason, max_bytes).to_string();
+    }
+
+    let prefix_len = max_bytes - PARSE_FAILURE_REASON_TRUNCATION.len();
+    format!(
+        "{}{}",
+        truncate_utf8_bytes(&safe_reason, prefix_len),
+        PARSE_FAILURE_REASON_TRUNCATION
+    )
+}
+
+fn format_parse_failure(pr_number: i64, response_text: &str, parse_error: &QuorumError) -> String {
+    let shape = collector_response_shape(response_text);
+    let prefix = format!(
+        "collector response parse failed for PR #{pr_number} — response len {}; reason: ",
+        response_text.len()
+    );
+    let suffix = format!(
+        "; shape: trimmed_starts_with_object={}, json_fence_present={}, \
+         code_fence_present={}, json_extracted={}",
+        shape.trimmed_starts_with_object,
+        shape.json_fence_present,
+        shape.code_fence_present,
+        shape.json_extracted,
+    );
+    let reason_limit = MAX_PARSE_FAILURE_ERROR_BYTES.saturating_sub(prefix.len() + suffix.len());
+    format!(
+        "{prefix}{}{suffix}",
+        bounded_parse_failure_reason(&parse_error.to_string(), reason_limit)
+    )
 }
 
 fn validate_finding(
@@ -740,14 +810,8 @@ pub async fn run_collection_with_inputs(
         COLLECTOR_VERSION,
     ) {
         Ok(response) => response,
-        Err(_) => {
-            let err_text = format!(
-                "collector response parse failed for PR #{} — response len {}",
-                request.pr_number,
-                response_text.len()
-            );
-            record_failure(request, &err_text, attempted_at).await;
-            return Err(QuorumError::Io(err_text));
+        Err(error) => {
+            return Err(record_parse_failure(request, &response_text, &error, attempted_at).await);
         }
     };
     let findings = validated.findings;
@@ -812,6 +876,17 @@ pub async fn run_collection_with_inputs(
             Err(QuorumError::Io(err_text))
         }
     }
+}
+
+async fn record_parse_failure(
+    request: &CollectionRequest,
+    response_text: &str,
+    parse_error: &QuorumError,
+    attempted_at: i64,
+) -> QuorumError {
+    let error_text = format_parse_failure(request.pr_number, response_text, parse_error);
+    record_failure(request, &error_text, attempted_at).await;
+    QuorumError::Io(error_text)
 }
 
 /// Record a failed run + log to `errors`. Best-effort: a follow-up failure here
@@ -1718,6 +1793,87 @@ mod tests {
         inputs: &CollectorInputs,
     ) -> Result<ValidatedCollectorResponse> {
         parse_and_validate_response(response, inputs, Some(7), "collector-model", "v-test")
+    }
+
+    async fn assert_parse_failure_is_recorded(
+        response_text: &str,
+        reason_substring: &str,
+        expected_shape: &str,
+    ) {
+        let (_dir, db_path) = tmp_conn();
+        let request = CollectionRequest::new(
+            52,
+            Some(7),
+            None,
+            db_path.clone(),
+            std::env::current_dir().unwrap(),
+            None,
+            true,
+        );
+        let parse_error = parse_fixture(response_text, &parser_inputs(&[10], &[])).unwrap_err();
+        assert!(parse_error.to_string().contains(reason_substring));
+
+        let returned = record_parse_failure(&request, response_text, &parse_error, 1000).await;
+        assert!(returned.to_string().contains(reason_substring));
+
+        let conn = db::open(&db_path).unwrap();
+        let run = review_findings::get_run(&conn, 52).unwrap().unwrap();
+        let error = run.error.as_deref().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.findings_count, 0);
+        assert!(error.contains(reason_substring));
+        assert!(error.contains(&format!("response len {}", response_text.len())));
+        assert!(
+            error.contains(expected_shape),
+            "unexpected failure detail: {error}"
+        );
+
+        let logged: String = conn
+            .query_row(
+                "SELECT detail FROM errors WHERE source='review-collector'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(logged, error);
+        assert!(review_findings::list_for_pr(&conn, 52).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_failure_records_non_json_reason_and_shape() {
+        assert_parse_failure_is_recorded(
+            "I could not produce the requested response.",
+            "collector response is not a JSON object",
+            "trimmed_starts_with_object=false, json_fence_present=false, \
+             code_fence_present=false, json_extracted=false",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parse_failure_records_invalid_json_reason_and_shape() {
+        assert_parse_failure_is_recorded(
+            r#"{"findings":[],"followup_artifacts":[]"#,
+            "invalid collector response:",
+            "trimmed_starts_with_object=true, json_fence_present=false, \
+             code_fence_present=false, json_extracted=true",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parse_failure_records_validation_reason_and_fenced_shape() {
+        let response_text = format!(
+            "```json\n{}\n```",
+            response(vec![finding("invalid-kind", 10)], vec![])
+        );
+        assert_parse_failure_is_recorded(
+            &response_text,
+            "invalid collector finding kind: invalid-kind",
+            "trimmed_starts_with_object=false, json_fence_present=true, \
+             code_fence_present=true, json_extracted=true",
+        )
+        .await;
     }
 
     #[test]

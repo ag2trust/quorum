@@ -4,7 +4,9 @@
 //! (other-repo merge does NOT trigger drain), drain timeout path,
 //! queued tasks survive restart, and T3: drain timeout with merge-in-progress.
 
+use std::collections::hash_map::DefaultHasher;
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -14,6 +16,15 @@ use std::time::Duration;
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
+}
+
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = DefaultHasher::new();
+    db.hash(&mut hasher);
+    std::env::temp_dir()
+        .join(format!("quorum-agent-{:016x}", hasher.finish()))
+        .join("endpoint.sock")
 }
 
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
@@ -333,6 +344,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()

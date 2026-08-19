@@ -579,6 +579,8 @@ fn reconstruct_dormant_slots(
             cost_tokens: recovery.entry.cost_tokens,
             limit_tokens: recovery.limit_tokens,
             token_usage: recovery.token_usage,
+            last_terminal_usage: super::runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
             cost_usd: recovery.entry.cost_usd,
             task_started_at: now,
             turn_started_at: now,

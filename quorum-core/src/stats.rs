@@ -279,6 +279,10 @@ pub struct DecompositionStatusView {
     pub dispatch_hold: Option<String>,
     pub proposal_attempts: i64,
     pub provider_failures: i64,
+    pub hold_code: Option<String>,
+    pub retryable_planning_hold: bool,
+    pub operator_retry_count: i64,
+    pub operator_retry_cap: i64,
     pub planner_provider: Option<String>,
     pub planner_model: Option<String>,
     pub accepted_plan_revision: Option<i64>,
@@ -486,7 +490,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let queue_tasks_list = queue_tasks(conn)?;
     let reviewing = reviewing_tasks(conn, &daemon_agents)?;
     let pipeline = pipeline_tasks(conn, now)?;
-    let decomposition = decomposition_status(conn)?;
+    let decomposition = decomposition_status(conn, now)?;
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
     let alerts = alert_messages(conn, now)?;
     let merge_blockers = merge_blockers(conn, now)?;
@@ -1397,12 +1401,13 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
 
 /// The schema guarantees at most one active graph/freeze. A held planning result is
 /// also useful owner-facing state, so fall back to the newest non-completed aggregate.
-fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusView>> {
+fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<DecompositionStatusView>> {
     let graph = conn
         .query_row(
             "SELECT d.id, d.source_task_id, t.title, t.status, d.state, d.active,
                     d.proposal_attempts, d.provider_failures, d.planner_provider,
-                    d.planner_model, d.accepted_plan_revision, d.hold_summary
+                    d.planner_model, d.accepted_plan_revision, d.hold_summary,
+                    d.hold_code,d.operator_retry_count
              FROM task_decompositions d
              JOIN tasks t ON t.id=d.source_task_id
              WHERE d.active=1 OR d.freeze_active=1
@@ -1424,6 +1429,8 @@ fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusV
                     r.get::<_, Option<String>>(9)?,
                     r.get::<_, Option<i64>>(10)?,
                     r.get::<_, Option<String>>(11)?,
+                    r.get::<_, Option<String>>(12)?,
+                    r.get::<_, i64>(13)?,
                 ))
             },
         )
@@ -1441,10 +1448,14 @@ fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusV
         planner_model,
         accepted_plan_revision,
         hold_summary,
+        hold_code,
+        operator_retry_count,
     )) = graph
     else {
         return Ok(None);
     };
+    let retryable_planning_hold =
+        crate::decomposition::exhausted_planning_retry_is_eligible(conn, source_task_id, now)?;
 
     let mut stmt = conn.prepare(
         "SELECT m.task_id, m.local_key, t.title, t.status, t.depends_on
@@ -1525,6 +1536,10 @@ fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusV
         dispatch_hold,
         proposal_attempts,
         provider_failures,
+        hold_code,
+        retryable_planning_hold,
+        operator_retry_count,
+        operator_retry_cap: crate::decomposition::MAX_OPERATOR_RETRIES,
         planner_provider,
         planner_model,
         accepted_plan_revision,
@@ -3351,7 +3366,7 @@ mod tests {
             .unwrap();
         }
 
-        let graph = decomposition_status(&c).unwrap().unwrap();
+        let graph = decomposition_status(&c, 100).unwrap().unwrap();
         assert_eq!(graph.source_task_id, source);
         assert_eq!(
             graph.dispatch_hold.as_deref(),
@@ -3363,6 +3378,134 @@ mod tests {
         assert_eq!(graph.members[1].prerequisites, vec![child_a]);
         assert_eq!(graph.reasons.len(), 6, "owner-facing reasons stay bounded");
         assert_eq!(graph.reasons[0], "child failed");
+    }
+
+    #[test]
+    fn decomposition_status_distinguishes_retryable_exhaustion_and_retry_count() {
+        let (_d, mut c) = open_tmp();
+        let source =
+            crate::tasks::create(&mut c, "A", "source", None, 0, None, None, None, None, 100)
+                .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed' WHERE id=?1",
+            params![source],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,planned_source_revision,provider_failures,
+                 operator_retry_count,hold_code,hold_summary,created_at,updated_at)
+             VALUES (?1,'held',1,3,1,'provider-attempts-exhausted',
+                     'bounded provider summary',100,100)",
+            params![source],
+        )
+        .unwrap();
+        let graph_id = c.last_insert_rowid();
+        for ordinal in 1..=6 {
+            c.execute(
+                "INSERT INTO decomposition_attempts(
+                     graph_id,source_revision,kind,ordinal,retry_generation,
+                     reason_code,summary,created_at)
+                 VALUES (?1,1,'provider',?2,?3,'provider-failure','bounded',100)",
+                params![graph_id, ordinal, i64::from(ordinal > 3)],
+            )
+            .unwrap();
+        }
+        let graph = decomposition_status(&c, 100).unwrap().unwrap();
+        assert_eq!(
+            graph.hold_code.as_deref(),
+            Some("provider-attempts-exhausted")
+        );
+        assert!(graph.retryable_planning_hold);
+        assert_eq!(graph.operator_retry_count, 1);
+        assert_eq!(graph.operator_retry_cap, 2);
+
+        c.execute(
+            "UPDATE tasks SET refs=json_object('daemon_publication',json_object(\
+                 'pr',42,'branch','daemon/source','local_sha','abc',\
+                 'expected_remote_sha','def','stage','push')) WHERE id=?1",
+            [source],
+        )
+        .unwrap();
+        assert!(
+            !decomposition_status(&c, 100)
+                .unwrap()
+                .unwrap()
+                .retryable_planning_hold
+        );
+        c.execute("UPDATE tasks SET refs=NULL WHERE id=?1", [source])
+            .unwrap();
+
+        c.execute(
+            "UPDATE task_decompositions SET provider_failures=2 WHERE id=?1",
+            [graph_id],
+        )
+        .unwrap();
+        assert!(
+            !decomposition_status(&c, 100)
+                .unwrap()
+                .unwrap()
+                .retryable_planning_hold
+        );
+
+        c.execute(
+            "UPDATE task_decompositions
+             SET provider_failures=3,accepted_proposal_json='[]' WHERE id=?1",
+            [graph_id],
+        )
+        .unwrap();
+        assert!(
+            !decomposition_status(&c, 100)
+                .unwrap()
+                .unwrap()
+                .retryable_planning_hold
+        );
+
+        c.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json=NULL WHERE id=?1",
+            [graph_id],
+        )
+        .unwrap();
+        let child = crate::tasks::create(
+            &mut c,
+            "A",
+            "materialized child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision)
+             VALUES (?1,?2,'child',1)",
+            params![graph_id, child],
+        )
+        .unwrap();
+        assert!(
+            !decomposition_status(&c, 100)
+                .unwrap()
+                .unwrap()
+                .retryable_planning_hold
+        );
+
+        c.execute(
+            "DELETE FROM task_graph_members WHERE graph_id=?1",
+            [graph_id],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE task_decompositions
+             SET hold_code='scope-blocker',operator_retry_count=0 WHERE id=?1",
+            [graph_id],
+        )
+        .unwrap();
+        let semantic = decomposition_status(&c, 100).unwrap().unwrap();
+        assert!(!semantic.retryable_planning_hold);
+        assert_eq!(semantic.hold_code.as_deref(), Some("scope-blocker"));
     }
 
     #[test]

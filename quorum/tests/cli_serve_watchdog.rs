@@ -346,13 +346,20 @@ fi
         None
     }
 
-    fn suspend(&mut self) {
+    /// Stop the daemon only after this process holds the SQLite write lock.
+    /// Otherwise SIGSTOP can freeze the daemon inside a write transaction and
+    /// make the test's subsequent mailbox append fail with SQLITE_BUSY.
+    fn suspend_after_db_quiescent(&mut self, home: &std::path::Path) {
+        let db = home.join("repos/test__repo/quorum.db");
+        let mut conn = quorum_core::db::open(&db).unwrap();
+        let tx = quorum_core::db::begin_immediate(&mut conn).unwrap();
         let pid = self.child.id() as libc::pid_t;
         assert_eq!(
             unsafe { libc::kill(pid, libc::SIGSTOP) },
             0,
             "failed to suspend daemon process {pid}"
         );
+        tx.commit().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             let output = Command::new("ps")
@@ -422,10 +429,10 @@ fn wait_for_process_terminated(pid: i32) {
 
 fn append_worker_message(home: &std::path::Path, target: &str) -> i64 {
     let db = home.join("repos/test__repo/quorum.db");
-    let mut conn = quorum_core::db::open(&db).unwrap();
-    quorum_core::mailbox::append(
-        &mut conn,
-        &quorum_core::mailbox::MailboxRow {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut conn = quorum_core::db::open(&db).unwrap();
+        let row = quorum_core::mailbox::MailboxRow {
             agent: "MessageSender".into(),
             kind: quorum_core::mailbox::MailboxKind::Message,
             task_id: None,
@@ -435,9 +442,15 @@ fn append_worker_message(home: &std::path::Path, target: &str) -> i64 {
             note: None,
             to_agent: Some(target.into()),
             payload: Some("queued while completion is pending".into()),
-        },
-    )
-    .unwrap()
+        };
+        match quorum_core::mailbox::append(&mut conn, &row) {
+            Ok(id) => return id,
+            Err(quorum_core::error::QuorumError::Busy) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("could not append worker message: {error}"),
+        }
+    }
 }
 
 fn mailbox_row_is_consumed(home: &std::path::Path, id: i64) -> bool {
@@ -562,6 +575,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     rid
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -592,6 +617,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -615,6 +641,7 @@ fn rework_cap_kills_worker_and_releases_task() {
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home.path()))
         .arg("init")
         .status()
         .unwrap();
@@ -817,6 +844,7 @@ fn worker_submission_before_terminal_overage_is_cleanup_only() {
     let late_submit = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home.path()))
         .args([
             "submit",
             "--agent",
@@ -831,7 +859,7 @@ fn worker_submission_before_terminal_overage_is_cleanup_only() {
     assert!(!false_alert, "recorded submission emitted a watchdog alert");
     assert!(
         !late_submit.status.success()
-            && String::from_utf8_lossy(&late_submit.stderr).contains("revoked"),
+            && String::from_utf8_lossy(&late_submit.stderr).contains("agent endpoint rejected"),
         "retiring run remained able to submit after cleanup: status={}, stdout={}, stderr={}",
         late_submit.status,
         String::from_utf8_lossy(&late_submit.stdout),
@@ -1017,22 +1045,9 @@ fn pending_worker_overage_defers_snapshotted_message_after_feed_becomes_broken()
     let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
     let worker_pid = managed_pid(home.path(), "worker");
 
-    // Serialize behind any daemon write before suspending it. SIGSTOP at an
-    // arbitrary instruction can otherwise strand the SQLite writer lock and
-    // make the mailbox append below fail with Busy while the daemon cannot
-    // advance to release it.
-    let db = home.path().join("repos/test__repo/quorum.db");
-    let mut barrier_conn = quorum_core::db::open(&db).unwrap();
-    let db_write_barrier = quorum_core::db::begin_immediate(&mut barrier_conn)
-        .unwrap_or_else(|error| panic!("could not acquire pre-suspension writer barrier: {error}"));
-    handle.suspend();
-    db_write_barrier
-        .commit()
-        .unwrap_or_else(|error| panic!("could not release pre-suspension writer barrier: {error}"));
-    drop(barrier_conn);
-
-    // With the daemon safely frozen outside a write transaction, install the
-    // message and both synchronization gates before one tick snapshots it.
+    // Freeze the daemon so the message and both synchronization gates are
+    // installed before one tick snapshots the message row.
+    handle.suspend_after_db_quiescent(home.path());
     let message_id = append_worker_message(home.path(), &worker_name);
     std::fs::write(&snapshot_gate, b"waiting").unwrap();
     std::fs::write(&message_gate, b"waiting").unwrap();

@@ -4,6 +4,7 @@
 //! exits with a stable code: 0 success · 1 clean "didn't get it"/not-holder · 2 usage/bad
 //! input · 3 internal/DB/migration error.
 
+mod agent_client;
 mod cheatsheet;
 mod cli;
 mod cockpit;
@@ -147,6 +148,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Message { .. } => "message",
         cli::Command::React { .. } => "react",
         cli::Command::Submit { .. } => "submit",
+        cli::Command::ReviewDraft { .. } => "review-draft",
         cli::Command::Serve { .. } => "serve",
         cli::Command::SessionRegister { .. } => "session-register",
         cli::Command::Activity { .. } => "activity",
@@ -916,23 +918,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 }
             }
             let rid = resolve_run_id(run_id, "react")?;
-            let db = paths::db_path()?;
-            let conn = quorum_core::db::open(&db)?;
-            quorum_core::capabilities::validate(&conn, &rid, &agent, "worker", Some(task_id))
-                .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
-            let mut conn = conn;
-            let row = quorum_core::mailbox::MailboxRow {
-                agent,
-                kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
-                task_id: Some(task_id),
-                pr: None,
-                verdict: None,
-                feedback: None,
-                note: Some(state),
-                to_agent: None,
-                payload: None,
-            };
-            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            // Retain the legacy intent flags, but never trust them as target
+            // authority: the endpoint derives agent and task from `rid`.
+            let _ = (agent, task_id);
+            let id = agent_client::react(&rid, &state)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
@@ -992,39 +981,47 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let rid = resolve_run_id(run_id, "submit")?;
+            if let Some(raw) = feedback_json.as_deref() {
+                graph_blocker::parse_feedback(raw).map_err(QuorumError::Usage)?;
+            }
+            // The endpoint derives agent, task, PR, role, and revision from the
+            // capability. These parsed compatibility flags are not authority.
+            let _ = (agent, pr);
+            let id = agent_client::submit(agent_client::Submit {
+                capability: &rid,
+                summary: summary.as_deref(),
+                verdict: verdict.as_deref(),
+                feedback: feedback.as_deref(),
+                feedback_json: feedback_json.as_deref(),
+                blocking,
+            })?;
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
+        cli::Command::ReviewDraft {
+            agent,
+            pr,
+            blocking,
+            feedback_file,
+            run_id,
+        } => {
+            let feedback = input::read_text(input::TextSource::File(feedback_file))?;
+            verdict::validate_review_draft(blocking, &feedback).map_err(QuorumError::Usage)?;
+            let rid = resolve_run_id(run_id, "review-draft")?;
             let db = paths::db_path()?;
             let mut conn = quorum_core::db::open(&db)?;
-            let expected_role = if verdict.is_some() {
-                "reviewer"
-            } else {
-                "worker"
-            };
-            let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, expected_role, None)
+            let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, "reviewer", None)
                 .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
-            let kind = quorum_core::mailbox::MailboxKind::Done;
-            let payload = if let Some(raw) = feedback_json {
-                let graph_feedback =
-                    graph_blocker::parse_feedback(&raw).map_err(QuorumError::Usage)?;
-                if graph_feedback.affected_task != cap.task_id {
-                    return Err(QuorumError::Usage(format!(
-                        "graph-blocker affected_task {} does not match reviewer task {}",
-                        graph_feedback.affected_task, cap.task_id
-                    )));
-                }
-                Some(graph_blocker::encode(rid, graph_feedback).map_err(QuorumError::Usage)?)
-            } else {
-                verdict::attestation_payload(blocking)
-            };
             let row = quorum_core::mailbox::MailboxRow {
                 agent,
-                kind,
+                kind: quorum_core::mailbox::MailboxKind::ReviewDraft,
                 task_id: Some(cap.task_id),
-                pr,
-                verdict,
-                feedback,
-                note: summary,
+                pr: Some(pr),
+                verdict: None,
+                feedback: Some(feedback),
+                note: None,
                 to_agent: None,
-                payload,
+                payload: verdict::attestation_payload(Some(blocking)),
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
@@ -1081,13 +1078,48 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     output::emit(&quorum_core::tasks::TaskCompact::from(&task));
                     Ok(0)
                 }
-                None => {
-                    output::emit(&serde_json::json!({
-                        "ok": false,
-                        "reason": "task is not daemon-parked or provider-blocked",
-                    }));
-                    Ok(1)
-                }
+                None => match quorum_core::decomposition::retry_exhausted_planning(
+                    &mut conn, task_id, &by, now,
+                )? {
+                    quorum_core::decomposition::PlanningRetryOutcome::Retried {
+                        graph_id,
+                        generation,
+                    } => {
+                        let task = quorum_core::tasks::get(&conn, task_id)?.ok_or_else(|| {
+                            QuorumError::Io(format!(
+                                "retried decomposition source #{task_id} disappeared"
+                            ))
+                        })?;
+                        output::emit(&serde_json::json!({
+                            "ok": true,
+                            "outcome": "decomposition-planning-retried",
+                            "graph_id": graph_id,
+                            "retry_generation": generation,
+                            "task": quorum_core::tasks::TaskCompact::from(&task),
+                        }));
+                        Ok(0)
+                    }
+                    quorum_core::decomposition::PlanningRetryOutcome::RetryCapExhausted {
+                        retry_count,
+                    } => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "outcome": "decomposition-planning-retry-rejected",
+                            "reason": "operator retry cap exhausted; inspect the planning failures and rescope or close the source",
+                            "retry_count": retry_count,
+                            "retry_cap": quorum_core::decomposition::MAX_OPERATOR_RETRIES,
+                        }));
+                        Ok(1)
+                    }
+                    quorum_core::decomposition::PlanningRetryOutcome::NotEligible => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "outcome": "task-retry-rejected",
+                            "reason": "task is not daemon-parked, provider-blocked, or an eligible exhausted decomposition source",
+                        }));
+                        Ok(1)
+                    }
+                },
             }
         }
         cli::Command::DecompositionAdoptRecovery {

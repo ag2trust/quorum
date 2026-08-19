@@ -489,6 +489,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -519,6 +531,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -530,22 +543,25 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     );
 }
 
-/// Initial worker submissions deliberately omit `--pr`: the daemon creates
-/// that PR. A sticky rework worker may only echo the daemon-owned PR back.
+/// Lifecycle-only fixtures inject a daemon-owned rework completion directly;
+/// managed CLI routing is covered by `agent_cli_endpoint.rs`.
 fn quorum_submit_existing_worker_pr(home: &std::path::Path, agent: &str, pr: &str) {
-    let run_id = resolve_run_id(home, agent, "worker");
-    let out = Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home)
-        .env("QUORUM_REPO", "test/repo")
-        .env("QUORUM_RUN_ID", &run_id)
-        .args(["submit", "--agent", agent, "--pr", pr])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "rework submit with daemon-owned PR failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let mut conn = quorum_core::db::open(&home.join("repos/test__repo/quorum.db")).unwrap();
+    quorum_core::mailbox::append(
+        &mut conn,
+        &quorum_core::mailbox::MailboxRow {
+            agent: agent.into(),
+            kind: quorum_core::mailbox::MailboxKind::Done,
+            task_id: Some(1),
+            pr: Some(pr.parse().unwrap()),
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        },
+    )
+    .unwrap();
 }
 
 #[test]
@@ -1867,8 +1883,18 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Worker signals done with PR (doesn't know task was cancelled)
-    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+    // A cancelled run's endpoint completion is rejected before it can enqueue
+    // a stale lifecycle signal.
+    let run_id = resolve_run_id(home.path(), &worker_name, "worker");
+    let rejected = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home.path()))
+        .env("QUORUM_RUN_ID", run_id)
+        .args(["done", "--agent", &worker_name, "--pr", "1"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
 
     // Daemon should detect the cancelled task and clean up.  Two valid
     // orderings: (a) done signal arrives first → "lifecycle rejected", or

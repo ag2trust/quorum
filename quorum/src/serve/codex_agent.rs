@@ -226,7 +226,7 @@ impl CodexProc {
         if text.is_empty() {
             FailureObservation::inert()
         } else {
-            FailureObservation::unknown_failure(
+            FailureObservation::deferred_stderr(
                 "Codex stderr did not match a bounded provider signal",
             )
         }
@@ -241,6 +241,14 @@ impl CodexProc {
 
     pub fn observed_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
         self.failures.observed_failure()
+    }
+
+    pub fn observed_planner_live_failure(&self) -> Option<RunnerFailure> {
+        self.failures.observed_planner_live_failure()
+    }
+
+    pub fn observed_planner_terminal_failure(&self) -> Option<RunnerFailure> {
+        self.failures.observed_planner_terminal_failure()
     }
 
     pub(super) fn failure_tracker(&self) -> FailureTracker {
@@ -1114,6 +1122,80 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
             event.is_some(),
             "codex rejected the planner isolation arguments before authentication"
         );
+    }
+
+    /// The planner supplies its prompt positionally while stdin is `/dev/null`.
+    /// Current Codex releases can write an informational notice about that
+    /// stdin shape before the first JSONL event. Keep this a real-binary
+    /// boundary check without requiring a network-authenticated turn: the
+    /// spawned no-auth process must eventually report its structured failure
+    /// despite the captured notice.
+    #[tokio::test]
+    async fn real_cli_planner_stderr_notice_does_not_mask_structured_auth_failure() {
+        if !codex_available() {
+            eprintln!("skipped: no codex binary on PATH");
+            return;
+        }
+        let codex_home = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let spec = CodexSpec {
+            model: "gpt-5.6-sol".into(),
+            effort: "high".into(),
+            sandbox: "read-only".into(),
+            worktree: worktree.path().to_path_buf(),
+            prompt: "return an empty JSON object".into(),
+            env_vars: no_auth_env(codex_home.path()),
+        };
+        let mut proc = CodexProc::spawn_planner(&spec, None).expect("spawn planner codex");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_raw_line())
+            .await
+            .expect("planner codex produced no JSONL event within 60s");
+        assert!(event.is_some(), "planner codex exited before JSONL startup");
+
+        let stderr = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let output = proc.drain_diagnostics();
+                if output
+                    .iter()
+                    .any(|line| matches!(line, CapturedOutput::Stderr(text) if !text.is_empty()))
+                {
+                    return output;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("planner stdin shape emitted no bounded informational stderr");
+        assert!(stderr
+            .iter()
+            .any(|line| matches!(line, CapturedOutput::Stderr(text) if !text.is_empty())));
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let raw = proc
+                    .next_raw_line()
+                    .await
+                    .expect("planner Codex ended before a structured auth/provider failure");
+                if matches!(
+                    codex_stream::parse_line(&raw),
+                    Some(Event::TurnFailed { .. } | Event::Error { .. })
+                ) {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            terminal.is_ok(),
+            "planner Codex did not report a structured auth/provider failure within 60s"
+        );
+        assert_eq!(
+            proc.observed_planner_live_failure()
+                .expect("structured auth failure remains authoritative")
+                .disposition(),
+            FailureDisposition::ProviderUnavailable,
+        );
+        let _ = proc.kill_and_reap().await;
     }
 
     /// Positive contract: the first event from `codex exec --json` must be

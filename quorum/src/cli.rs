@@ -332,8 +332,8 @@ pub enum Command {
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
     },
-    /// Signal a non-terminal agent state to the daemon. The daemon tracks
-    /// the state and surfaces it via `quorum status`.
+    /// Signal a non-terminal agent state to the daemon. Managed calls are
+    /// forwarded to the daemon endpoint, which derives the authoritative task.
     React {
         #[arg(long)]
         agent: String,
@@ -347,7 +347,8 @@ pub enum Command {
         run_id: Option<String>,
     },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
-    /// Writes a mailbox row for the daemon to consume.
+    /// The daemon endpoint writes the mailbox row after deriving authority from
+    /// the run capability; CLI task, PR, and identity flags are compatibility inputs.
     ///
     /// Requires daemon run identity: `--run-id` flag or `QUORUM_RUN_ID` env var.
     /// Identity is validated against the capability — `--agent` must match.
@@ -381,6 +382,25 @@ pub enum Command {
         #[arg(long)]
         blocking: Option<u32>,
         /// Daemon-issued run capability token. Falls back to QUORUM_RUN_ID env var.
+        #[arg(long = "run-id")]
+        run_id: Option<String>,
+    },
+    /// Send a non-authoritative blocking-review draft to the daemon. This is
+    /// continuation context only: it never records a verdict or changes task lifecycle.
+    ///
+    /// Requires daemon reviewer run identity: `--run-id` flag or `QUORUM_RUN_ID` env var.
+    ReviewDraft {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        pr: i64,
+        /// Positive count of BLOCKING findings in the draft.
+        #[arg(long)]
+        blocking: u32,
+        /// Read the bounded continuation summary from a text file.
+        #[arg(long = "feedback-file")]
+        feedback_file: PathBuf,
+        /// Daemon-issued reviewer run capability token. Falls back to QUORUM_RUN_ID env var.
         #[arg(long = "run-id")]
         run_id: Option<String>,
     },
@@ -591,7 +611,7 @@ pub enum Command {
         #[arg(long = "reason-file")]
         reason_file: Option<PathBuf>,
     },
-    /// Explicitly retry a task parked by the daemon after a bounded failure.
+    /// Explicitly retry a daemon park, provider block, or eligible exhausted decomposition plan.
     TaskRetry {
         #[arg(long = "task-id")]
         task_id: i64,
