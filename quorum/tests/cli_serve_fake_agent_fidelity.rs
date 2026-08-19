@@ -4,8 +4,17 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
+
+// These fidelity cases exercise signal-managed daemon subprocesses, not daemon
+// concurrency. Keep their process lifecycles disjoint under parallel test runs.
+fn serialize_daemon_processes() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -178,6 +187,7 @@ impl ServeHandle {
 /// as a real subprocess, creating a mailbox row that the daemon then processes.
 #[test]
 fn side_effects_mode_creates_real_submit_mailbox_row() {
+    let _daemon_guard = serialize_daemon_processes();
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -221,6 +231,7 @@ fn side_effects_mode_creates_real_submit_mailbox_row() {
 /// The daemon should parse them and update tool_count/now_label in the live sidecar.
 #[test]
 fn emit_tool_use_mode_exercises_tool_count_and_now_label() {
+    let _daemon_guard = serialize_daemon_processes();
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -325,6 +336,7 @@ fn emit_tool_use_mode_exercises_tool_count_and_now_label() {
 /// turn 2 succeeds normally.
 #[test]
 fn error_result_triggers_auto_refeed() {
+    let _daemon_guard = serialize_daemon_processes();
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -370,6 +382,7 @@ fn error_result_triggers_auto_refeed() {
 /// daemon fires AgentFailed and the task returns to open.
 #[test]
 fn repeated_error_results_fire_agent_failed() {
+    let _daemon_guard = serialize_daemon_processes();
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
