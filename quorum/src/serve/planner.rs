@@ -19,7 +19,7 @@ pub const CLAUDE_PLANNER_MODEL: &str = "claude-opus-4-6";
 pub const PLANNER_EFFORT: &str = "high";
 pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
-pub const MAX_STDOUT_BYTES: usize = 128 * 1024;
+pub const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_FAILURE_SUMMARY_BYTES: usize = 2048;
 const MAX_FAILURE_REASON_BYTES: usize = 256;
@@ -1690,6 +1690,42 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["-c", "model_reasoning_effort=xhigh"]));
         assert_eq!(args.last(), Some(&"exact bounded prompt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_survives_exploration_stdout_before_terminal_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let exploration = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "id": "tool-1",
+                "aggregated_output": "x".repeat(1024),
+            }
+        });
+        let mut output = format!("{}\n", exploration).repeat(210);
+        assert!(output.len() > 200 * 1024);
+        output.push_str(&format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type": "turn.completed"})
+        ));
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::Done(PlannerResponse::Plan { ref tasks }) if tasks.len() == 2
+        ));
+        slot.kill_and_reap().await;
     }
 
     #[cfg(unix)]
