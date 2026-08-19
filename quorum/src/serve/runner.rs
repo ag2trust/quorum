@@ -1454,13 +1454,19 @@ mod tests {
         let turn = dir.join("turn.log");
         let environment = dir.join("environment.log");
         let grok_config = dir.join("grok-config.log");
+        let grok_overlay = dir.join("grok-overlay.log");
         std::fs::write(
             &runner,
             format!(
                 "#!/bin/sh\n\
                  for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done > '{}'\n\
                  printf '%s\\n' \"$QUORUM_ADAPTER_TEST\" > '{}'\n\
-                 printf '%s\\n' \"$GROK_CONFIG\" > '{}'\n\
+                 if [ -n \"$GROK_HOME\" ] && [ -f \"$GROK_HOME/config.toml\" ]; then\n\
+                   cp \"$GROK_HOME/config.toml\" '{}'\n\
+                 else\n\
+                   : > '{}'\n\
+                 fi\n\
+                 printf '%s\\n' \"${{GROK_CONFIG+x}}\" > '{}'\n\
                  if [ \"$1\" = '-p' ]; then\n\
                    IFS= read -r line\n\
                    printf '%s\\n' \"$line\" > '{}'\n\
@@ -1472,6 +1478,8 @@ mod tests {
                 args.display(),
                 environment.display(),
                 grok_config.display(),
+                grok_config.display(),
+                grok_overlay.display(),
                 turn.display(),
             ),
         )
@@ -1744,6 +1752,21 @@ mod tests {
         let grok_bin = recording_runner(grok_dir.path());
         let mut grok_environment = managed_environment();
         grok_environment.push(("QUORUM_ADAPTER_TEST".into(), "managed-grok".into()));
+        let original_grok_home = grok_dir.path().join("original-grok-home");
+        std::fs::create_dir_all(original_grok_home.join("sessions")).unwrap();
+        std::fs::write(
+            original_grok_home.join("config.toml"),
+            "[models]\ndefault_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            original_grok_home
+                .join("sessions")
+                .join("persisted-session"),
+            "provider-issued-grok-session-42",
+        )
+        .unwrap();
+        grok_environment.push(("GROK_HOME".into(), original_grok_home.display().to_string()));
         let mut grok = RunnerProc::launch(
             &LaunchRequest {
                 model: "grok-4.5",
@@ -1775,15 +1798,44 @@ mod tests {
             grok_args.contains("<exact grok pending turn>"),
             "{grok_args}"
         );
+        assert!(grok_args.contains("<--no-leader>"), "{grok_args}");
         let grok_config = std::fs::read_to_string(grok_dir.path().join("grok-config.log")).unwrap();
-        let grok_config: serde_json::Value = serde_json::from_str(grok_config.trim()).unwrap();
+        let grok_config: toml::Value = toml::from_str(&grok_config).unwrap();
         assert_eq!(
-            grok_config,
-            serde_json::json!({
-                "mcp_servers": {
-                    "github": {"command": "quorum", "args": ["agent-mcp"]}
-                }
-            })
+            grok_config["mcp_servers"]["github"]["command"].as_str(),
+            Some("quorum")
+        );
+        assert_eq!(
+            grok_config["mcp_servers"]["github"]["args"]
+                .as_array()
+                .unwrap(),
+            &[toml::Value::String("agent-mcp".into())]
+        );
+        assert_eq!(
+            grok_config["models"]["default_reasoning_effort"].as_str(),
+            Some("high"),
+            "the invocation-local layer must retain the operator config"
+        );
+        assert_eq!(
+            std::fs::read_to_string(grok_dir.path().join("grok-overlay.log"))
+                .unwrap()
+                .trim(),
+            "",
+            "the filtered GROK_CONFIG overlay must not be used"
+        );
+        assert_eq!(
+            std::fs::read_to_string(original_grok_home.join("config.toml")).unwrap(),
+            "[models]\ndefault_reasoning_effort = \"high\"\n",
+            "managed injection must not mutate persistent Grok config"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                original_grok_home
+                    .join("sessions")
+                    .join("persisted-session")
+            )
+            .unwrap(),
+            "provider-issued-grok-session-42"
         );
 
         for surface in [claude_args, codex_args, grok_args] {
@@ -1799,16 +1851,25 @@ mod tests {
         for (model, expected_kind) in [
             ("claude-haiku-4-5-20251001", AgentKind::Claude),
             ("gpt-5.6-terra", AgentKind::Codex),
+            ("grok-4.5", AgentKind::Grok),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let executable = recording_runner(dir.path());
+            let grok_home = dir.path().join("restricted-grok-home");
+            std::fs::create_dir_all(&grok_home).unwrap();
+            std::fs::write(
+                grok_home.join("config.toml"),
+                "[models]\ndefault_reasoning_effort = \"low\"\n",
+            )
+            .unwrap();
+            let environment = vec![("GROK_HOME".into(), grok_home.display().to_string())];
             let mut proc = launch_recording_runner(
                 &LaunchRequest {
                     model,
                     effort: "low",
                     worktree: dir.path(),
                     prompt: "restricted prompt",
-                    environment: &[],
+                    environment: &environment,
                     mode: LaunchMode::Restricted,
                     continuation_id: None,
                 },
@@ -1838,7 +1899,19 @@ mod tests {
                         "{args}"
                     );
                 }
-                AgentKind::Grok => unreachable!("fixture contains only Claude and Codex"),
+                AgentKind::Grok => {
+                    assert!(args.contains("<read-only>"), "{args}");
+                    assert!(args.contains("<dontAsk>"), "{args}");
+                    let config =
+                        std::fs::read_to_string(dir.path().join("grok-config.log")).unwrap();
+                    assert!(!config.contains("mcp_servers"), "{config}");
+                    assert_eq!(
+                        std::fs::read_to_string(dir.path().join("grok-overlay.log"))
+                            .unwrap()
+                            .trim(),
+                        ""
+                    );
+                }
             }
         }
     }

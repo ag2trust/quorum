@@ -12,6 +12,8 @@ use super::runner::{
     WorkerTurnRequest,
 };
 use std::collections::VecDeque;
+use std::io::Write;
+use std::os::unix::fs::{symlink, OpenOptionsExt};
 use std::path::PathBuf;
 #[cfg(test)]
 use std::pin::Pin;
@@ -136,16 +138,123 @@ fn invalid_input(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
 }
 
-fn grok_mcp_config(server: AgentMcpServer) -> String {
-    serde_json::json!({
-        "mcp_servers": {
-            "github": {
-                "command": server.command,
-                "args": server.args,
+struct GrokMcpConfigHome {
+    root: tempfile::TempDir,
+}
+
+impl GrokMcpConfigHome {
+    fn create(spec: &GrokSpec, server: AgentMcpServer) -> std::io::Result<Self> {
+        let source_home = grok_home_for_child(spec)?;
+        std::fs::create_dir_all(&source_home)?;
+        // Session storage must survive the invocation-local config home so a
+        // later `--resume` resolves the exact provider-issued identity.
+        std::fs::create_dir_all(source_home.join("sessions"))?;
+
+        let linked_entries = std::fs::read_dir(&source_home)?
+            .map(|entry| entry.map(|entry| (entry.file_name(), entry.path())))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Keep the shadow under the provider's real home so Grok's workspace
+        // sandbox sees the same trusted state root it uses without injection.
+        let root = tempfile::Builder::new()
+            .prefix("quorum-config-")
+            .tempdir_in(&source_home)?;
+        for (name, path) in linked_entries {
+            if name == "config.toml" || name.to_string_lossy().starts_with("quorum-config-") {
+                continue;
             }
+            symlink(path, root.path().join(name))?;
         }
+
+        let source_config = source_home.join("config.toml");
+        let mut config = match std::fs::read_to_string(&source_config) {
+            Ok(contents) => toml::from_str::<toml::Value>(&contents).map_err(|error| {
+                invalid_input(format!(
+                    "Grok config '{}' is invalid: {error}",
+                    source_config.display()
+                ))
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                toml::Value::Table(toml::Table::new())
+            }
+            Err(error) => return Err(error),
+        };
+        let root_table = config
+            .as_table_mut()
+            .ok_or_else(|| invalid_input("Grok config root must be a TOML table"))?;
+        let mcp_servers = root_table
+            .entry("mcp_servers")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| invalid_input("Grok config mcp_servers must be a TOML table"))?;
+        mcp_servers.insert(
+            "github".into(),
+            toml::Value::Table(toml::Table::from_iter([
+                ("command".into(), toml::Value::String(server.command.into())),
+                (
+                    "args".into(),
+                    toml::Value::Array(
+                        server
+                            .args
+                            .iter()
+                            .map(|arg| toml::Value::String((*arg).into()))
+                            .collect(),
+                    ),
+                ),
+            ])),
+        );
+
+        let rendered = toml::to_string_pretty(&config).map_err(|error| {
+            std::io::Error::other(format!("failed to render Grok MCP config: {error}"))
+        })?;
+        let config_path = root.path().join("config.toml");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(config_path)?;
+        file.write_all(rendered.as_bytes())?;
+        file.sync_all()?;
+
+        Ok(Self { root })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.root.path()
+    }
+}
+
+fn grok_home_for_child(spec: &GrokSpec) -> std::io::Result<PathBuf> {
+    fn requested<'a>(spec: &'a GrokSpec, key: &str) -> Option<&'a str> {
+        spec.env_vars
+            .iter()
+            .rev()
+            .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+    }
+
+    let grok_home = match requested(spec, "GROK_HOME") {
+        Some(value) => (!value.is_empty()).then(|| PathBuf::from(value)),
+        None => std::env::var_os("GROK_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+    };
+    let path = if let Some(path) = grok_home {
+        path
+    } else {
+        let home = match requested(spec, "HOME") {
+            Some(value) => (!value.is_empty()).then(|| PathBuf::from(value)),
+            None => std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        }
+        .or_else(|| directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf()))
+        .ok_or_else(|| invalid_input("cannot resolve Grok home for managed MCP config"))?;
+        home.join(".grok")
+    };
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        spec.worktree.join(path)
     })
-    .to_string()
 }
 
 fn common_args(
@@ -351,6 +460,9 @@ pub struct GrokProc {
     stdout_complete: bool,
     terminal_exit_status: Option<std::process::ExitStatus>,
     worker_request: Option<Box<WorkerTurnRequest>>,
+    // Keeps the invocation-local full config layer alive until the child and
+    // its MCP subprocess have been killed and reaped.
+    _mcp_config_home: Option<GrokMcpConfigHome>,
 }
 
 impl GrokProc {
@@ -392,16 +504,26 @@ impl GrokProc {
         agent_mcp: Option<AgentMcpServer>,
         grok_bin: Option<&str>,
     ) -> std::io::Result<Self> {
+        let has_agent_mcp = agent_mcp.is_some();
+        let mcp_config_home = agent_mcp
+            .map(|server| GrokMcpConfigHome::create(spec, server))
+            .transpose()?;
         let mut command = Command::new(grok_bin.unwrap_or("grok"));
         command.args(args);
+        // A shared leader resolves its own persistent config and would discard
+        // this process-scoped layer. Managed MCP turns therefore stay on the
+        // dedicated headless process that owns their exact run capability.
+        if has_agent_mcp {
+            command.arg("--no-leader");
+        }
         for (key, value) in &spec.env_vars {
             command.env(key, value);
         }
-        // Grok has no headless MCP flag. Its supported invocation-local
-        // configuration boundary is the JSON `GROK_CONFIG` overlay; keep the
-        // generated server out of the operator's persistent config.toml.
-        if let Some(server) = agent_mcp {
-            command.env("GROK_CONFIG", grok_mcp_config(server));
+        // `GROK_CONFIG` deliberately drops code-execution tables including
+        // mcp_servers. Point this process at a private full config.toml layer;
+        // all non-config provider state remains linked to the original home.
+        if let Some(home) = &mcp_config_home {
+            command.env("GROK_HOME", home.path());
         }
         command
             .current_dir(&spec.worktree)
@@ -444,6 +566,7 @@ impl GrokProc {
             stdout_complete: false,
             terminal_exit_status: None,
             worker_request: None,
+            _mcp_config_home: mcp_config_home,
         })
     }
 
@@ -886,6 +1009,67 @@ mod tests {
     }
 
     #[test]
+    fn managed_mcp_uses_full_config_layer_and_preserves_provider_state() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let original_home = root.path().join("grok-home");
+        std::fs::create_dir_all(original_home.join("sessions")).unwrap();
+        std::fs::write(
+            original_home.join("config.toml"),
+            "[models]\ndefault_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            original_home.join("sessions").join("existing"),
+            "session-42",
+        )
+        .unwrap();
+        std::fs::write(original_home.join("auth-state"), "preserved").unwrap();
+
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = vec![("GROK_HOME".into(), original_home.display().to_string())];
+        let managed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(managed.path().join("config.toml")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config["models"]["default_reasoning_effort"].as_str(),
+            Some("high")
+        );
+        assert_eq!(
+            config["mcp_servers"]["github"]["command"].as_str(),
+            Some("quorum")
+        );
+        assert_eq!(
+            config["mcp_servers"]["github"]["args"].as_array().unwrap(),
+            &[toml::Value::String("agent-mcp".into())]
+        );
+        assert!(std::fs::symlink_metadata(managed.path().join("sessions"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(managed.path().join("sessions").join("existing")).unwrap(),
+            "session-42"
+        );
+        std::fs::write(managed.path().join("sessions").join("continued"), "same-id").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(original_home.join("sessions").join("continued")).unwrap(),
+            "same-id"
+        );
+        assert_eq!(
+            std::fs::read_to_string(managed.path().join("auth-state")).unwrap(),
+            "preserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(original_home.join("config.toml")).unwrap(),
+            "[models]\ndefault_reasoning_effort = \"high\"\n"
+        );
+    }
+
+    #[test]
     fn initial_argument_shape_is_pinned() {
         let spec = test_spec(std::path::Path::new("/tmp/repo"));
         assert_eq!(
@@ -1122,6 +1306,7 @@ mod tests {
             stdout_complete: false,
             terminal_exit_status: None,
             worker_request: None,
+            _mcp_config_home: None,
         }
     }
 
@@ -1297,6 +1482,47 @@ mod tests {
         proc.kill_and_reap().await;
     }
 
+    #[test]
+    fn real_cli_inspect_resolves_managed_mcp_from_full_config_layer() {
+        if !grok_available() {
+            eprintln!("skipped: no official grok binary on PATH");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = no_auth_env(root.path());
+        let managed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        let output = std::process::Command::new("grok")
+            .args(["inspect", "--json"])
+            .envs(spec.env_vars.iter().map(|(key, value)| (key, value)))
+            .env("GROK_HOME", managed.path())
+            .current_dir(&spec.worktree)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run official Grok config inspection");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let github = report["mcpServers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|server| server["name"] == "github")
+            .expect("official Grok loader omitted managed github MCP server");
+        assert_eq!(github["transport"], "stdio");
+        assert!(
+            github["target"]
+                .as_str()
+                .is_some_and(|target| target.contains("quorum")),
+            "{github}"
+        );
+    }
+
     #[tokio::test]
     async fn real_cli_auth_failure_is_structured_and_does_not_echo_api_key() {
         if !grok_available() {
@@ -1339,14 +1565,14 @@ mod tests {
         spec.prompt = "noop".into();
         spec.env_vars = no_auth_env(root.path());
         let mut args = resume_args("00000000-0000-0000-0000-000000000000", &spec).unwrap();
+        args.push("--no-leader".into());
         args.push("--help".into());
+        let managed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
         let output = std::process::Command::new("grok")
             .args(args)
             .envs(spec.env_vars.iter().map(|(key, value)| (key, value)))
-            .env(
-                "GROK_CONFIG",
-                grok_mcp_config(crate::serve::runner::AGENT_MCP_SERVER),
-            )
+            .env("GROK_HOME", managed.path())
             .current_dir(&spec.worktree)
             .stdin(Stdio::null())
             .output()
