@@ -606,7 +606,7 @@ only through an explicit outside request)
 - `ChecksFailed` → Rework · effects: IncrementReworkRound, ResumeWorker
 - `VerdictChanges` (review_only=true) → Rework · effects: IncrementReworkRound,
   ResumeWorker (at the rework cap → Failed · effects: NotifyOwner, ReleaseLease)
-- `VerdictChanges` (rework_round ≥ REWORK_CAP) → Failed · effects: NotifyOwner, ReleaseLease
+- `VerdictChanges` (rework_round ≥ the task's stamped rework cap) → Failed · effects: NotifyOwner, ReleaseLease
 - `AgentFailed` → InReview (**sticky**) · effects: ReleaseLease, NotifyOwner, SpawnReviewer
 - `LeaseExpired` → InReview (**sticky**) · effects: ReleaseLease, SpawnReviewer
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
@@ -658,10 +658,19 @@ only through an explicit outside request)
   `**/*.md` or `.claude/**` rule: `.claude/skills/quorum/SKILL.md`, `schema.sql`, and the
   served web assets are `include_str!` build inputs. The daemon's CI remains the
   unconditional full-suite backstop.
-- **Rework cap:** `REWORK_CAP = 7`. When `rework_round >= 7` and an actionable rework
-  event (VerdictChanges, ChecksFailed, or MergeConflict) fires,
-  the task goes to Failed (not Rework). Rounds are consumed only by review verdicts,
-  CI failures, and merge conflicts on delivered work — never by infrastructure
+- **Rework cap:** per-task, configured, and frozen at daemon adoption. The serve
+  config knob `max_rework` (validated `>= 1`; unset falls back to the compiled
+  default `REWORK_CAP = 7`) is stamped onto each task inside the *same* write
+  transaction that accepts its classification, so the accepted refs and the
+  immutable adoption-time cap land or roll back together. All supported
+  classification writers (the daemon classifier and `quorum classify --backfill`)
+  stamp; the immutable-once `WHERE rework_cap IS NULL` guard means a later config
+  change only affects newly-adopted tasks. Legacy rows that predate the migration
+  and never re-enter classification stay `NULL` and resolve to the compiled
+  default. When `rework_round >= <the task's stamped cap>` and an actionable
+  rework event (VerdictChanges, ChecksFailed, or MergeConflict) fires, the task
+  goes to Failed (not Rework). Rounds are consumed only by review verdicts, CI
+  failures, and merge conflicts on delivered work — never by infrastructure
   failures (provisioning, worker death, lease lapse), which park the task instead.
 - **Review-only entry:** `task-create --review-pr N` creates a task directly in `in-review`
   with `review_only=true`. A blocking verdict enters normal bounded rework; it never falls
@@ -894,12 +903,15 @@ coverage floor. A negative floor or probability outside `0.0..=1.0` is a usage
 error; values are never clamped. `r2_enabled = false` disables sampling, not the
 R2 safety gate, and therefore also leaves R2 mandatory.
 
-R2 is skipped when R1 approves after `rework_round` has reached `REWORK_CAP`
-and that PR head has no prior decision. At that point no bounded rework round
-remains for an R2 changes verdict, so R1 approval is the final review gate. The
-skip is recorded for that PR head through the same daemon-owned sampling-decision
-mechanism. A prior decision requiring R2 remains authoritative if the branch
-later returns to that head.
+R2 is skipped when R1 approves after `rework_round` has reached that task's
+stamped rework cap (see the Rework cap bullet earlier in this document —
+configured via `max_rework`, frozen per-task at daemon adoption, and falling
+back to the compiled default only for legacy unstamped rows) and that PR head
+has no prior decision. At that point no bounded rework round remains for an R2
+changes verdict, so R1 approval is the final review gate. The skip is recorded
+for that PR head through the same daemon-owned sampling-decision mechanism. A
+prior decision requiring R2 remains authoritative if the branch later returns
+to that head.
 
 When R1 approves, Quorum records a sampling decision in a daemon-owned table,
 keyed by both PR number and head SHA; it is not task refs because task refs are

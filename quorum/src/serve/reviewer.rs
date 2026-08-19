@@ -981,7 +981,10 @@ mod tests {
                     "Worker-1",
                     "high",
                     Some(context),
-                    ReviewCycleContext::from_persisted_rework_round(1),
+                    ReviewCycleContext::from_persisted_rework_round(
+                        1,
+                        quorum_core::lifecycle::REWORK_CAP,
+                    ),
                 ),
                 true,
             ),
@@ -1121,7 +1124,10 @@ mod tests {
                     "Worker-1",
                     "high",
                     Some(context),
-                    ReviewCycleContext::from_persisted_rework_round(1),
+                    ReviewCycleContext::from_persisted_rework_round(
+                        1,
+                        quorum_core::lifecycle::REWORK_CAP,
+                    ),
                 ),
             ),
         ];
@@ -1445,9 +1451,10 @@ mod tests {
             );
         }
 
-        let context = ReviewCycleContext::from_persisted_rework_round(i64::from(
+        let context = ReviewCycleContext::from_persisted_rework_round(
+            i64::from(quorum_core::lifecycle::REWORK_CAP),
             quorum_core::lifecycle::REWORK_CAP,
-        ));
+        );
         for kind in [AgentKind::Claude, AgentKind::Codex] {
             let r1 = build_review_prompt_for_kind_with_context_and_cycle(
                 kind,
@@ -2114,7 +2121,10 @@ mod tests {
                 "W",
                 "high",
                 Some(context),
-                ReviewCycleContext::from_persisted_rework_round(1),
+                ReviewCycleContext::from_persisted_rework_round(
+                    1,
+                    quorum_core::lifecycle::REWORK_CAP,
+                ),
             ),
         ];
         for prompt in prompts {
@@ -2158,7 +2168,10 @@ mod tests {
                 "W",
                 "high",
                 None,
-                ReviewCycleContext::from_persisted_rework_round(1),
+                ReviewCycleContext::from_persisted_rework_round(
+                    1,
+                    quorum_core::lifecycle::REWORK_CAP
+                ),
             )
         );
     }

@@ -108,6 +108,10 @@ primary = 100
 ## r2_enabled = true                 # false disables sampling, not the R2 gate
 ## r2_target_per_stratum = 0         # guaranteed coverage before probability
 ## r2_steady_state_p = 1.0           # 1.0 preserves mandatory R2 by default
+
+## Rework ceiling: max changes-to-rework rounds before a task fails. Stamped
+## onto each task at adoption; unset keeps the compiled default (7).
+# max_rework = 7
 ";
 
 fn run() -> Result<i32> {
@@ -1349,6 +1353,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(1.0);
             serve_config::validate_r2_sampling(r_r2_target_per_stratum, r_r2_steady_state_p)?;
 
+            // Rework ceiling: unset preserves the compiled default. Stamped onto
+            // each task at adoption, immutable thereafter.
+            let r_max_rework = file_cfg
+                .max_rework
+                .unwrap_or(quorum_core::lifecycle::REWORK_CAP);
+            serve_config::validate_max_rework(r_max_rework)?;
+
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
             })?;
@@ -1474,6 +1485,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r2_enabled: r_r2_enabled,
                 r2_target_per_stratum: r_r2_target_per_stratum,
                 r2_steady_state_p: r_r2_steady_state_p,
+                max_rework: r_max_rework,
             };
             Ok(serve::run_serve(config)?)
         }
@@ -1560,6 +1572,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::Classify {
             backfill,
+            config: config_flag,
             agent_bin,
             no_bare_agent,
         } => {
@@ -1569,6 +1582,36 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let db = paths::db_path()?;
+            // Backfill is a supported classification writer, so a task it makes
+            // dispatchable must receive the durable adoption-time cap before
+            // claim — otherwise lifecycle/R2/reviewer consumers fall back to the
+            // compiled default despite a configured `max_rework`.
+            //
+            // When the operator passes `--config <path>`, resolve from that
+            // exact file so the stamped cap matches the daemon started with
+            // the same `--config`. When absent, resolve from the same
+            // per-repo default path the daemon uses. Explicit-config missing
+            // must fail exit 2 (same policy as `serve --config`) so backfill
+            // cannot silently diverge from an intended non-default policy;
+            // an absent default file falls back to `REWORK_CAP`, matching
+            // `serve` without a config.
+            let max_rework = if let Some(ref p) = config_flag {
+                let path = std::path::Path::new(p);
+                if !path.exists() {
+                    return Err(QuorumError::Usage(format!(
+                        "classify --config: file not found: {}",
+                        path.display()
+                    )));
+                }
+                serve_config::resolve_max_rework_at(path)?
+            } else {
+                let repo_slug = paths::try_resolve_repo().ok_or_else(|| {
+                    QuorumError::Usage(
+                        "classify --backfill: cannot resolve the current repository".into(),
+                    )
+                })?;
+                serve_config::resolve_max_rework(&repo_slug)?
+            };
             let mut total_stored = 0;
             let mut total_tasks = 0;
             let rt = tokio::runtime::Runtime::new()
@@ -1646,7 +1689,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
                 let stored = {
                     let mut conn = quorum_core::db::open(&db)?;
-                    quorum_core::classify::store_classifications_for_inputs(
+                    quorum_core::classify::store_classifications_and_stamp_rework_cap(
                         &mut conn,
                         &results,
                         &pending_inputs,
@@ -1654,6 +1697,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                             serve::classifier::CLASSIFIER_MODEL,
                         ),
                         quorum_core::clock::now(),
+                        max_rework,
                     )?
                 };
                 total_stored += stored;

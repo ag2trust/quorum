@@ -559,6 +559,13 @@ pub enum Command {
         /// Backfill all tasks (any status) that lack a complete classification.
         #[arg(long)]
         backfill: bool,
+        /// Path to the same TOML config the daemon consumes. When present,
+        /// backfill stamps `rework_cap` from this file. Default:
+        /// `~/.quorum/serve/<owner>__<repo>.toml` if present, mirroring
+        /// `serve`. Pass the daemon's `--config` value to guarantee the
+        /// stamped cap matches the daemon's `max_rework` policy.
+        #[arg(long)]
+        config: Option<String>,
         /// Override the agent binary (default: "claude").
         #[arg(long)]
         agent_bin: Option<String>,
@@ -760,10 +767,16 @@ mod tests {
     #[test]
     fn classify_defaults_to_operator_login_and_allows_explicit_bare_auth() {
         let default = Cli::try_parse_from(["quorum", "classify", "--backfill"]).unwrap();
-        let Command::Classify { no_bare_agent, .. } = default.command else {
+        let Command::Classify {
+            no_bare_agent,
+            config,
+            ..
+        } = default.command
+        else {
             panic!("expected classify command");
         };
         assert!(no_bare_agent);
+        assert!(config.is_none());
 
         let explicit_bare =
             Cli::try_parse_from(["quorum", "classify", "--backfill", "--no-bare-agent=false"])
@@ -772,6 +785,22 @@ mod tests {
             panic!("expected classify command");
         };
         assert!(!no_bare_agent);
+    }
+
+    #[test]
+    fn classify_accepts_explicit_config_path_mirroring_serve() {
+        let parsed = Cli::try_parse_from([
+            "quorum",
+            "classify",
+            "--backfill",
+            "--config",
+            "/tmp/explicit.toml",
+        ])
+        .unwrap();
+        let Command::Classify { config, .. } = parsed.command else {
+            panic!("expected classify command");
+        };
+        assert_eq!(config.as_deref(), Some("/tmp/explicit.toml"));
     }
 
     #[test]
