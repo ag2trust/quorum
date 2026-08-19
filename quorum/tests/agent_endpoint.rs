@@ -434,6 +434,28 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
     }
     assert_eq!(mailbox_count(&db), before);
 
+    // A bounded processing failure must own the blocking transaction through
+    // rollback. Releasing the contended write lock after the failure cannot
+    // allow detached work to append a late lifecycle signal.
+    let mut lock_conn = quorum_core::db::open(&db).unwrap();
+    let lock_tx = quorum_core::db::begin_immediate(&mut lock_conn).unwrap();
+    let timeout_endpoint = endpoint.clone();
+    let timed_out = std::thread::spawn(move || {
+        exchange(
+            &timeout_endpoint,
+            &request(
+                "worker-cap",
+                json!({"type":"submit","summary":"must not commit late"}),
+            ),
+        )
+    });
+    let denied = timed_out.join().unwrap();
+    assert_eq!(denied["ok"], false, "unexpected response: {denied}");
+    drop(lock_tx);
+    drop(lock_conn);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(mailbox_count(&db), before);
+
     let reaction = exchange(
         &endpoint,
         &request("worker-cap", json!({"type":"react","state":"note"})),

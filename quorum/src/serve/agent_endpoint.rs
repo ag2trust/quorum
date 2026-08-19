@@ -15,7 +15,10 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
@@ -29,6 +32,10 @@ pub const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 32;
 const PROTOCOL_VERSION: u8 = 1;
 const SOCKET_FILE: &str = "endpoint.sock";
+const PROCESSING: u8 = 0;
+const CANCELLED: u8 = 1;
+const COMMITTING: u8 = 2;
+const COMPLETE: u8 = 3;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -318,26 +325,19 @@ async fn run_listener(
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
-    connections.abort_all();
+    drop(listener);
+    // Stateful spawn_blocking work is not abortable. Drain every admitted
+    // connection so endpoint teardown cannot precede its commit or rollback.
     while connections.join_next().await.is_some() {}
 }
 
 async fn serve_connection(mut stream: UnixStream, db_path: PathBuf, repository: String) {
     let response = match read_request(&mut stream).await {
-        Ok(request) => match tokio::time::timeout(
-            PROCESS_TIMEOUT,
-            process_request(db_path, repository, request),
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
+        Ok(request) => match process_request(db_path, repository, request).await {
+            Ok(response) => response,
+            Err(error) => {
                 super::log(error.code);
                 error.response()
-            }
-            Err(_) => {
-                super::log("agent_endpoint_process_timeout");
-                Response::failure("timeout", "request processing timed out")
             }
         },
         Err(error) => {
@@ -396,6 +396,15 @@ async fn process_request(
     repository: String,
     request: Request,
 ) -> std::result::Result<Response, EndpointFailure> {
+    process_request_with_timeout(db_path, repository, request, PROCESS_TIMEOUT).await
+}
+
+async fn process_request_with_timeout(
+    db_path: PathBuf,
+    repository: String,
+    request: Request,
+    process_timeout: Duration,
+) -> std::result::Result<Response, EndpointFailure> {
     if request.version != PROTOCOL_VERSION {
         return Err(EndpointFailure::new(
             "unsupported_version",
@@ -411,15 +420,47 @@ async fn process_request(
             "run authority rejected",
         ));
     }
-    tokio::task::spawn_blocking(move || process_request_blocking(&db_path, &repository, request))
-        .await
-        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?
+
+    let state = Arc::new(AtomicU8::new(PROCESSING));
+    let deadline = Instant::now() + process_timeout;
+    let blocking_state = Arc::clone(&state);
+    let mut task = tokio::task::spawn_blocking(move || {
+        process_request_blocking(&db_path, &repository, request, &blocking_state, deadline)
+    });
+
+    match tokio::time::timeout(process_timeout, &mut task).await {
+        Ok(result) => {
+            result.map_err(|_| EndpointFailure::new("internal", "request processing failed"))?
+        }
+        Err(_) => {
+            // Cancellation is permitted only before the blocking transaction owns
+            // commit. If commit already won the race, wait for and report its real
+            // result. Otherwise join the rollback before returning a timeout so no
+            // authoritative write can appear after the bounded failure.
+            let cancelled = state
+                .compare_exchange(PROCESSING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+            let result = task
+                .await
+                .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+            if cancelled {
+                Err(EndpointFailure::new(
+                    "timeout",
+                    "request processing timed out",
+                ))
+            } else {
+                result
+            }
+        }
+    }
 }
 
 fn process_request_blocking(
     db_path: &Path,
     repository: &str,
     request: Request,
+    state: &AtomicU8,
+    deadline: Instant,
 ) -> std::result::Result<Response, EndpointFailure> {
     let mut conn = quorum_core::db::open(db_path)
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
@@ -513,8 +554,20 @@ fn process_request_blocking(
             ));
         }
     };
-    tx.commit()
-        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    if Instant::now() >= deadline {
+        let _ = state.compare_exchange(PROCESSING, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
+    }
+    state
+        .compare_exchange(PROCESSING, COMMITTING, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| EndpointFailure::new("timeout", "request processing timed out"))?;
+    if tx.commit().is_err() {
+        state.store(COMPLETE, Ordering::Release);
+        return Err(EndpointFailure::new(
+            "internal",
+            "request processing failed",
+        ));
+    }
+    state.store(COMPLETE, Ordering::Release);
     Ok(response)
 }
 
@@ -643,6 +696,7 @@ fn insert_mailbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     #[test]
     fn inventories_are_phase_scoped() {
@@ -659,5 +713,77 @@ mod tests {
         assert_eq!(names(LiveRunPhase::ReworkWorker).len(), 5);
         assert_eq!(names(LiveRunPhase::Reviewer).len(), 7);
         assert!(!names(LiveRunPhase::Reviewer).contains(&ProtocolOperation::DeliveryReportWrite));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_transaction_rolls_back_before_failure_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("quorum.db");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks
+             (id,title,status,assignee,created_by,created_at,updated_at)
+             VALUES (1,'endpoint timeout','working','Worker','test',10,10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+             VALUES ('timeout-cap',1,'Worker','worker',10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_runs
+             (task_id,agent_name,role,model,effort,provider,spawned_at)
+             VALUES (1,'Worker','worker','test','high','test',10)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let (locked_tx, locked_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let lock_db = db_path.clone();
+        let holder = std::thread::spawn(move || {
+            let mut conn = quorum_core::db::open(&lock_db).unwrap();
+            let tx = begin_immediate(&mut conn).unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(tx);
+        });
+        locked_rx.recv().unwrap();
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            release_tx.send(()).unwrap();
+        });
+        let error = process_request_with_timeout(
+            db_path.clone(),
+            "test/repo".into(),
+            Request {
+                version: PROTOCOL_VERSION,
+                capability: "timeout-cap".into(),
+                operation: Operation::Submit {
+                    summary: Some("must roll back".into()),
+                    verdict: None,
+                    feedback: None,
+                    feedback_json: None,
+                    blocking: None,
+                },
+            },
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "timeout");
+        releaser.join().unwrap();
+        holder.join().unwrap();
+
+        let mailbox_count: i64 = quorum_core::db::open(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM mailbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mailbox_count, 0);
     }
 }
