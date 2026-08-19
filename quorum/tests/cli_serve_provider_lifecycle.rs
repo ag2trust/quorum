@@ -16,6 +16,18 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn init_git_repo(dir: &std::path::Path) {
     let d = dir.to_string_lossy();
     for args in [
@@ -1061,6 +1073,7 @@ fi
         command
             .env("QUORUM_HOME", self.home.path())
             .env("QUORUM_REPO", "test/repo")
+            .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(self.home.path()))
             .env("QUORUM_RUN_ID", run_id)
             .args(["done", "--agent", agent])
             .args(done_args);

@@ -569,6 +569,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     rid
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -599,6 +611,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -622,6 +635,7 @@ fn rework_cap_kills_worker_and_releases_task() {
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home.path()))
         .arg("init")
         .status()
         .unwrap();
@@ -838,7 +852,7 @@ fn worker_submission_before_terminal_overage_is_cleanup_only() {
     assert!(!false_alert, "recorded submission emitted a watchdog alert");
     assert!(
         !late_submit.status.success()
-            && String::from_utf8_lossy(&late_submit.stderr).contains("revoked"),
+            && String::from_utf8_lossy(&late_submit.stderr).contains("agent endpoint rejected"),
         "retiring run remained able to submit after cleanup: status={}, stdout={}, stderr={}",
         late_submit.status,
         String::from_utf8_lossy(&late_submit.stdout),

@@ -4,6 +4,7 @@
 //! exits with a stable code: 0 success · 1 clean "didn't get it"/not-holder · 2 usage/bad
 //! input · 3 internal/DB/migration error.
 
+mod agent_client;
 mod cheatsheet;
 mod cli;
 mod cockpit;
@@ -917,23 +918,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 }
             }
             let rid = resolve_run_id(run_id, "react")?;
-            let db = paths::db_path()?;
-            let conn = quorum_core::db::open(&db)?;
-            quorum_core::capabilities::validate(&conn, &rid, &agent, "worker", Some(task_id))
-                .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
-            let mut conn = conn;
-            let row = quorum_core::mailbox::MailboxRow {
-                agent,
-                kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
-                task_id: Some(task_id),
-                pr: None,
-                verdict: None,
-                feedback: None,
-                note: Some(state),
-                to_agent: None,
-                payload: None,
-            };
-            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            // Retain the legacy intent flags, but never trust them as target
+            // authority: the endpoint derives agent and task from `rid`.
+            let _ = (agent, task_id);
+            let id = agent_client::react(&rid, &state)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
@@ -993,41 +981,20 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let rid = resolve_run_id(run_id, "submit")?;
-            let db = paths::db_path()?;
-            let mut conn = quorum_core::db::open(&db)?;
-            let expected_role = if verdict.is_some() {
-                "reviewer"
-            } else {
-                "worker"
-            };
-            let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, expected_role, None)
-                .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
-            let kind = quorum_core::mailbox::MailboxKind::Done;
-            let payload = if let Some(raw) = feedback_json {
-                let graph_feedback =
-                    graph_blocker::parse_feedback(&raw).map_err(QuorumError::Usage)?;
-                if graph_feedback.affected_task != cap.task_id {
-                    return Err(QuorumError::Usage(format!(
-                        "graph-blocker affected_task {} does not match reviewer task {}",
-                        graph_feedback.affected_task, cap.task_id
-                    )));
-                }
-                Some(graph_blocker::encode(rid, graph_feedback).map_err(QuorumError::Usage)?)
-            } else {
-                verdict::attestation_payload(blocking)
-            };
-            let row = quorum_core::mailbox::MailboxRow {
-                agent,
-                kind,
-                task_id: Some(cap.task_id),
-                pr,
-                verdict,
-                feedback,
-                note: summary,
-                to_agent: None,
-                payload,
-            };
-            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            if let Some(raw) = feedback_json.as_deref() {
+                graph_blocker::parse_feedback(raw).map_err(QuorumError::Usage)?;
+            }
+            // The endpoint derives agent, task, PR, role, and revision from the
+            // capability. These parsed compatibility flags are not authority.
+            let _ = (agent, pr);
+            let id = agent_client::submit(agent_client::Submit {
+                capability: &rid,
+                summary: summary.as_deref(),
+                verdict: verdict.as_deref(),
+                feedback: feedback.as_deref(),
+                feedback_json: feedback_json.as_deref(),
+                blocking,
+            })?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
