@@ -1011,6 +1011,30 @@ pub(crate) async fn recover(
             let p = db_path.clone();
             let tid = task.id;
 
+            // An owner retry is durable daemon work, even when its retained
+            // role evidence is incomplete or stale. Approval recovery defers
+            // every marked task, and the live retry reconciler must consume
+            // `requested` exactly once so it can validate that evidence and
+            // return to the first missing role. Demoting here would strand the
+            // marker on an in-review task that neither reconciler can claim.
+            let merge_retry_requested = task
+                .refs
+                .as_deref()
+                .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                .and_then(|refs| {
+                    refs.get(tasks::MERGE_RETRY_REF)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some(tasks::MERGE_RETRY_REQUESTED);
+            if merge_retry_requested {
+                log(&format!(
+                    "recovery: preserving owner-requested merge replay for task #{tid}"
+                ));
+                continue;
+            }
+
             // #191: stay in merging only when ALL required review roles are
             // approved for the same SHA (genuine merge-wait). Incomplete
             // approval (e.g. R1 only with R2 still required) resets to
@@ -1085,6 +1109,31 @@ pub(crate) async fn recover(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct StartupRetryableMerge {
+        calls: AtomicUsize,
+    }
+
+    impl super::super::merge::MergeExecutor for StartupRetryableMerge {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &super::super::merge::MergeContext,
+        ) -> super::super::merge::MergeResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            super::super::merge::MergeResult {
+                success: false,
+                message: "head branch must be updated".into(),
+                failure_kind: Some(super::super::merge::MergeFailureKind::Retryable),
+            }
+        }
+
+        fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some("approved-head".into())
+        }
+    }
 
     fn run_git(dir: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
@@ -1369,6 +1418,90 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 1, "recovery duplicated {table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_requested_merge_retry_with_missing_role_evidence() {
+        for retain_r1 in [false, true] {
+            let fixture = dormant_fixture();
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            let now = super::super::now_unix();
+            let retry_task = tasks::create(
+                &mut conn,
+                "owner",
+                "requested merge retry",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":902,"daemon_merge_retry":"requested"}"#),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET status='merging', author='Worker-Retry', target_branch='main'
+                 WHERE id=?1",
+                [retry_task],
+            )
+            .unwrap();
+            if retain_r1 {
+                approvals::record(
+                    &mut conn,
+                    &approvals::Approval {
+                        pr_number: 902,
+                        review_role: "r1".into(),
+                        task_id: retry_task,
+                        author: "Worker-Retry".into(),
+                        reviewer: "Reviewer-R1".into(),
+                        verdict: "approved".into(),
+                        blocking_count: 0,
+                        approved_head_sha: "head-a".into(),
+                    },
+                )
+                .unwrap();
+            }
+            drop(conn);
+
+            let mut names = super::super::names::Pool::new_generated();
+            let mut workers = Vec::new();
+            let mut roster = LifetimeRoster::new();
+            let wt_mgr = WorktreeManager::new();
+            recover(
+                &fixture.config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut roster,
+            )
+            .await
+            .unwrap();
+
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            let task = tasks::get(&conn, retry_task).unwrap().unwrap();
+            assert_eq!(task.status, "merging");
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                refs[tasks::MERGE_RETRY_REF],
+                tasks::MERGE_RETRY_REQUESTED,
+                "restart must not strand requested authority on an in-review task"
+            );
+            let failed_events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE subject=?1 AND kind='agent_failed'",
+                    [tasks::lease_target(retry_task)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(failed_events, 0);
+            let claimed = tasks::claim_merge_retry(&mut conn, now + 1)
+                .unwrap()
+                .expect("the live reconciler must still be able to consume the retry");
+            assert_eq!(claimed.id, retry_task);
         }
     }
 
@@ -2410,6 +2543,91 @@ exec sleep 30
         .await
         .unwrap();
         assert_recovered_sticky_rework(&fixture, &workers, feedback);
+    }
+
+    #[tokio::test]
+    async fn startup_retryable_approval_replay_survives_following_generic_recovery() {
+        let fixture = dormant_fixture();
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        journal::delete(&mut conn, "Dormant").unwrap();
+        conn.execute(
+            "UPDATE claims SET active=0 WHERE target=?1",
+            [tasks::lease_target(fixture.task_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging',reviewer='Reviewer-2' WHERE id=?1",
+            [fixture.task_id],
+        )
+        .unwrap();
+        for (role, reviewer) in [("r1", "Reviewer-1"), ("r2", "Reviewer-2")] {
+            quorum_core::approvals::record(
+                &mut conn,
+                &quorum_core::approvals::Approval {
+                    pr_number: 901,
+                    review_role: role.into(),
+                    task_id: fixture.task_id,
+                    author: "Dormant".into(),
+                    reviewer: reviewer.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "approved-head".into(),
+                },
+            )
+            .unwrap();
+        }
+        quorum_core::review_audits::record_r2_requirement(
+            &mut conn,
+            fixture.task_id,
+            901,
+            "approved-head",
+            true,
+        )
+        .unwrap();
+        drop(conn);
+
+        let concrete = std::sync::Arc::new(StartupRetryableMerge {
+            calls: AtomicUsize::new(0),
+        });
+        let executor: std::sync::Arc<dyn super::super::merge::MergeExecutor> = concrete.clone();
+        let outcome = super::super::approvals::recover(
+            &fixture.config.db_path,
+            &fixture.config.repo_dir,
+            &executor,
+            &fixture.config.base_branch,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.deferred, 1);
+        assert_eq!(concrete.calls.load(Ordering::SeqCst), 1);
+
+        let mut workers = Vec::new();
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut super::super::names::Pool::new_generated(),
+            &mut workers,
+            &mut LifetimeRoster::new(),
+        )
+        .await
+        .unwrap();
+
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::PARKED_REWORK_RETRY_REF], true);
+        assert!(refs["remediation_feedback"]
+            .as_str()
+            .unwrap()
+            .contains("startup approval replay"));
+        assert!(quorum_core::approvals::get_for_pr(&conn, 901)
+            .unwrap()
+            .is_empty());
+        assert_eq!(concrete.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
