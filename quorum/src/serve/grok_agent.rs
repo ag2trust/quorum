@@ -35,6 +35,7 @@ pub const MAX_CONFIGURED_TURNS: u32 = 256;
 const RESTRICTED_SANDBOX: &str = "read-only";
 const RESTRICTED_PERMISSION_MODE: &str = "dontAsk";
 const RESTRICTED_MAX_TURNS: u32 = 8;
+const MANAGED_WORKSPACE_SANDBOX: &str = "quorum_managed_workspace";
 const STDOUT_LINE_BYTES: usize = 1024 * 1024;
 const TERMINAL_STDOUT_LINES: usize = 256;
 const MAX_SESSION_ID_BYTES: usize = 1024;
@@ -140,12 +141,17 @@ fn invalid_input(message: impl Into<String>) -> std::io::Error {
 
 struct GrokMcpConfigHome {
     root: tempfile::TempDir,
+    sandbox_profile: Option<&'static str>,
 }
 
 impl GrokMcpConfigHome {
     fn create(spec: &GrokSpec, server: AgentMcpServer) -> std::io::Result<Self> {
         let source_home = grok_home_for_child(spec)?;
         std::fs::create_dir_all(&source_home)?;
+        let source_home = std::fs::canonicalize(source_home)?;
+        let source_home_text = source_home.to_str().ok_or_else(|| {
+            invalid_input("Grok home must be valid UTF-8 for managed configuration")
+        })?;
         // Session storage must survive the invocation-local config home so a
         // later `--resume` resolves the exact provider-issued identity.
         std::fs::create_dir_all(source_home.join("sessions"))?;
@@ -159,11 +165,65 @@ impl GrokMcpConfigHome {
             .prefix("quorum-config-")
             .tempdir_in(&source_home)?;
         for (name, path) in linked_entries {
-            if name == "config.toml" || name.to_string_lossy().starts_with("quorum-config-") {
+            if matches!(
+                name.to_str(),
+                Some("config.toml" | "sandbox.toml" | "hooks" | "hooks-paths")
+            ) || name.to_string_lossy().starts_with("quorum-config-")
+            {
                 continue;
             }
             symlink(path, root.path().join(name))?;
         }
+
+        // Workspace-family profiles kernel-protect these two direct global
+        // hook sources and refuse symlinks there. Keep real nodes in the
+        // process home, referencing the original hook directory through the
+        // registry so the operator's restrictions remain active.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(root.path().join("hooks"))?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(root.path().join("hooks"))?;
+
+        let source_hooks = source_home.join("hooks");
+        let mut hooks_paths = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(root.path().join("hooks-paths"))?;
+        match std::fs::symlink_metadata(&source_hooks) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_input("Grok hooks directory must not be a symlink"));
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                hooks_paths.write_all(source_home_text.as_bytes())?;
+                hooks_paths.write_all(b"/hooks")?;
+                hooks_paths.write_all(b"\n")?;
+            }
+            Ok(_) => return Err(invalid_input("Grok hooks path must be a directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let source_hooks_paths = source_home.join("hooks-paths");
+        match std::fs::symlink_metadata(&source_hooks_paths) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_input(
+                    "Grok hooks-paths registry must not be a symlink",
+                ));
+            }
+            Ok(metadata) if metadata.is_file() => {
+                let mut source = std::fs::File::open(source_hooks_paths)?;
+                std::io::copy(&mut source, &mut hooks_paths)?;
+            }
+            Ok(_) => return Err(invalid_input("Grok hooks-paths registry must be a file")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        hooks_paths.sync_all()?;
 
         let source_config = source_home.join("config.toml");
         let mut config = match std::fs::read_to_string(&source_config) {
@@ -215,12 +275,69 @@ impl GrokMcpConfigHome {
         file.write_all(rendered.as_bytes())?;
         file.sync_all()?;
 
-        Ok(Self { root })
+        let sandbox_profile =
+            (spec.sandbox == DEFAULT_SANDBOX).then_some(MANAGED_WORKSPACE_SANDBOX);
+        if let Some(profile) = sandbox_profile {
+            let sandbox = toml::Value::Table(toml::Table::from_iter([(
+                "profiles".into(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    profile.into(),
+                    toml::Value::Table(toml::Table::from_iter([
+                        (
+                            "extends".into(),
+                            toml::Value::String(DEFAULT_SANDBOX.into()),
+                        ),
+                        (
+                            "read_write".into(),
+                            toml::Value::Array(vec![toml::Value::String(source_home_text.into())]),
+                        ),
+                    ])),
+                )])),
+            )]));
+            let rendered = toml::to_string_pretty(&sandbox).map_err(|error| {
+                std::io::Error::other(format!(
+                    "failed to render Grok managed sandbox config: {error}"
+                ))
+            })?;
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(root.path().join("sandbox.toml"))?;
+            file.write_all(rendered.as_bytes())?;
+            file.sync_all()?;
+        }
+
+        Ok(Self {
+            root,
+            sandbox_profile,
+        })
     }
 
     fn path(&self) -> &std::path::Path {
         self.root.path()
     }
+
+    fn sandbox_profile(&self) -> Option<&'static str> {
+        self.sandbox_profile
+    }
+}
+
+fn args_with_managed_sandbox(
+    args: &[String],
+    profile: Option<&str>,
+) -> std::io::Result<Vec<String>> {
+    let mut args = args.to_vec();
+    let Some(profile) = profile else {
+        return Ok(args);
+    };
+    let sandbox = args
+        .iter()
+        .position(|arg| arg == "--sandbox")
+        .and_then(|position| args.get_mut(position + 1))
+        .ok_or_else(|| invalid_input("managed Grok launch omitted its sandbox argument"))?;
+    *sandbox = profile.into();
+    Ok(args)
 }
 
 fn grok_home_for_child(spec: &GrokSpec) -> std::io::Result<PathBuf> {
@@ -508,6 +625,12 @@ impl GrokProc {
         let mcp_config_home = agent_mcp
             .map(|server| GrokMcpConfigHome::create(spec, server))
             .transpose()?;
+        let args = args_with_managed_sandbox(
+            args,
+            mcp_config_home
+                .as_ref()
+                .and_then(GrokMcpConfigHome::sandbox_profile),
+        )?;
         let mut command = Command::new(grok_bin.unwrap_or("grok"));
         command.args(args);
         // A shared leader resolves its own persistent config and would discard
@@ -520,8 +643,9 @@ impl GrokProc {
             command.env(key, value);
         }
         // `GROK_CONFIG` deliberately drops code-execution tables including
-        // mcp_servers. Point this process at a private full config.toml layer;
-        // all non-config provider state remains linked to the original home.
+        // mcp_servers. Point this process at a private full config.toml layer.
+        // Its custom workspace profile grants the original Grok state root,
+        // preserving durable session/auth writes through the linked entries.
         if let Some(home) = &mcp_config_home {
             command.env("GROK_HOME", home.path());
         }
@@ -1025,6 +1149,9 @@ mod tests {
         )
         .unwrap();
         std::fs::write(original_home.join("auth-state"), "preserved").unwrap();
+        std::fs::create_dir(original_home.join("hooks")).unwrap();
+        std::fs::write(original_home.join("hooks").join("guard.json"), "restricted").unwrap();
+        std::fs::write(original_home.join("hooks-paths"), "/operator/guard-hooks\n").unwrap();
 
         let mut spec = test_spec(worktree.path());
         spec.env_vars = vec![("GROK_HOME".into(), original_home.display().to_string())];
@@ -1046,10 +1173,49 @@ mod tests {
             config["mcp_servers"]["github"]["args"].as_array().unwrap(),
             &[toml::Value::String("agent-mcp".into())]
         );
+        let sandbox: toml::Value =
+            toml::from_str(&std::fs::read_to_string(managed.path().join("sandbox.toml")).unwrap())
+                .unwrap();
+        let profile = &sandbox["profiles"][MANAGED_WORKSPACE_SANDBOX];
+        assert_eq!(profile["extends"].as_str(), Some(DEFAULT_SANDBOX));
+        assert_eq!(
+            profile["read_write"].as_array().unwrap(),
+            &[toml::Value::String(
+                std::fs::canonicalize(&original_home)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            )]
+        );
+        let managed_args = args_with_managed_sandbox(
+            &headless_args(&spec, LaunchMode::Normal).unwrap(),
+            managed.sandbox_profile(),
+        )
+        .unwrap();
+        assert!(managed_args
+            .windows(2)
+            .any(|pair| { pair == ["--sandbox", MANAGED_WORKSPACE_SANDBOX] }));
         assert!(std::fs::symlink_metadata(managed.path().join("sessions"))
             .unwrap()
             .file_type()
             .is_symlink());
+        assert!(std::fs::symlink_metadata(managed.path().join("hooks"))
+            .unwrap()
+            .file_type()
+            .is_dir());
+        assert!(
+            !std::fs::symlink_metadata(managed.path().join("hooks-paths"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(managed.path().join("hooks-paths")).unwrap(),
+            format!(
+                "{}/hooks\n/operator/guard-hooks\n",
+                std::fs::canonicalize(&original_home).unwrap().display()
+            )
+        );
         assert_eq!(
             std::fs::read_to_string(managed.path().join("sessions").join("existing")).unwrap(),
             "session-42"
@@ -1066,6 +1232,91 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(original_home.join("config.toml")).unwrap(),
             "[models]\ndefault_reasoning_effort = \"high\"\n"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn managed_workspace_sandbox_persists_fresh_state_for_exact_resume() {
+        fn seatbelt_literal(path: &std::path::Path) -> String {
+            path.display()
+                .to_string()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        }
+
+        fn seatbelt_profile(managed: &GrokMcpConfigHome) -> String {
+            let sandbox: toml::Value = toml::from_str(
+                &std::fs::read_to_string(managed.path().join("sandbox.toml")).unwrap(),
+            )
+            .unwrap();
+            let mut writable = vec![managed.path().to_path_buf()];
+            writable.extend(
+                sandbox["profiles"][MANAGED_WORKSPACE_SANDBOX]["read_write"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|path| std::path::PathBuf::from(path.as_str().unwrap())),
+            );
+            let grants = writable
+                .iter()
+                .map(|path| {
+                    format!(
+                        "(allow file-write* (subpath \"{}\"))",
+                        seatbelt_literal(path)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("(version 1)\n(allow default)\n(deny file-write*)\n{grants}\n")
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let original_home = root.path().join("grok-home");
+        std::fs::create_dir_all(&original_home).unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = vec![("GROK_HOME".into(), original_home.display().to_string())];
+        let session_id = "provider-issued-grok-session-42";
+
+        let fresh =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        let status = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                &seatbelt_profile(&fresh),
+                "/bin/sh",
+                "-c",
+                "mkdir -p \"$GROK_HOME/sessions\" && printf fresh > \"$GROK_HOME/sessions/$SESSION_ID\"",
+            ])
+            .env("GROK_HOME", fresh.path())
+            .env("SESSION_ID", session_id)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fresh sandboxed state write failed");
+        drop(fresh);
+
+        let resumed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        let status = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                &seatbelt_profile(&resumed),
+                "/bin/sh",
+                "-c",
+                "test \"$(cat \"$GROK_HOME/sessions/$SESSION_ID\")\" = fresh && printf resumed > \"$GROK_HOME/sessions/$SESSION_ID\"",
+            ])
+            .env("GROK_HOME", resumed.path())
+            .env("SESSION_ID", session_id)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "sandboxed resume did not find fresh state"
+        );
+        assert_eq!(
+            std::fs::read_to_string(original_home.join("sessions").join(session_id)).unwrap(),
+            "resumed"
         );
     }
 

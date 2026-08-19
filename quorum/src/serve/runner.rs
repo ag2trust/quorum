@@ -1454,6 +1454,7 @@ mod tests {
         let turn = dir.join("turn.log");
         let environment = dir.join("environment.log");
         let grok_config = dir.join("grok-config.log");
+        let grok_sandbox = dir.join("grok-sandbox.log");
         let grok_overlay = dir.join("grok-overlay.log");
         std::fs::write(
             &runner,
@@ -1463,6 +1464,11 @@ mod tests {
                  printf '%s\\n' \"$QUORUM_ADAPTER_TEST\" > '{}'\n\
                  if [ -n \"$GROK_HOME\" ] && [ -f \"$GROK_HOME/config.toml\" ]; then\n\
                    cp \"$GROK_HOME/config.toml\" '{}'\n\
+                 else\n\
+                   : > '{}'\n\
+                 fi\n\
+                 if [ -n \"$GROK_HOME\" ] && [ -f \"$GROK_HOME/sandbox.toml\" ]; then\n\
+                   cp \"$GROK_HOME/sandbox.toml\" '{}'\n\
                  else\n\
                    : > '{}'\n\
                  fi\n\
@@ -1479,6 +1485,8 @@ mod tests {
                 environment.display(),
                 grok_config.display(),
                 grok_config.display(),
+                grok_sandbox.display(),
+                grok_sandbox.display(),
                 grok_overlay.display(),
                 turn.display(),
             ),
@@ -1799,6 +1807,10 @@ mod tests {
             "{grok_args}"
         );
         assert!(grok_args.contains("<--no-leader>"), "{grok_args}");
+        assert!(
+            grok_args.contains("<--sandbox>\n<quorum_managed_workspace>"),
+            "{grok_args}"
+        );
         let grok_config = std::fs::read_to_string(grok_dir.path().join("grok-config.log")).unwrap();
         let grok_config: toml::Value = toml::from_str(&grok_config).unwrap();
         assert_eq!(
@@ -1822,6 +1834,22 @@ mod tests {
                 .trim(),
             "",
             "the filtered GROK_CONFIG overlay must not be used"
+        );
+        let grok_sandbox: toml::Value = toml::from_str(
+            &std::fs::read_to_string(grok_dir.path().join("grok-sandbox.log")).unwrap(),
+        )
+        .unwrap();
+        let profile = &grok_sandbox["profiles"]["quorum_managed_workspace"];
+        assert_eq!(profile["extends"].as_str(), Some("workspace"));
+        assert_eq!(
+            profile["read_write"].as_array().unwrap(),
+            &[toml::Value::String(
+                std::fs::canonicalize(&original_grok_home)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            )],
+            "the managed profile must restore Grok's durable state root"
         );
         assert_eq!(
             std::fs::read_to_string(original_grok_home.join("config.toml")).unwrap(),
@@ -1905,6 +1933,9 @@ mod tests {
                     let config =
                         std::fs::read_to_string(dir.path().join("grok-config.log")).unwrap();
                     assert!(!config.contains("mcp_servers"), "{config}");
+                    let sandbox =
+                        std::fs::read_to_string(dir.path().join("grok-sandbox.log")).unwrap();
+                    assert!(!sandbox.contains("quorum_managed_workspace"), "{sandbox}");
                     assert_eq!(
                         std::fs::read_to_string(dir.path().join("grok-overlay.log"))
                             .unwrap()
