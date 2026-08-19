@@ -173,6 +173,23 @@ impl EndpointFailure {
         Self { code, message }
     }
 
+    /// Only daemon-side faults warrant an operator-visible log entry.
+    fn is_abnormal(&self) -> bool {
+        match self.code {
+            "internal" => true,
+            "unauthorized"
+            | "malformed_frame"
+            | "request_too_large"
+            | "malformed_request"
+            | "unsupported_version"
+            | "timeout"
+            | "invalid_operation"
+            | "forbidden_operation"
+            | "operation_unavailable" => false,
+            _ => true,
+        }
+    }
+
     fn response(self) -> Response {
         Response::failure(self.code, self.message)
     }
@@ -336,12 +353,16 @@ async fn serve_connection(mut stream: UnixStream, db_path: PathBuf, repository: 
         Ok(request) => match process_request(db_path, repository, request).await {
             Ok(response) => response,
             Err(error) => {
-                super::log(error.code);
+                if error.is_abnormal() {
+                    super::log(error.code);
+                }
                 error.response()
             }
         },
         Err(error) => {
-            super::log(error.code);
+            if error.is_abnormal() {
+                super::log(error.code);
+            }
             error.response()
         }
     };
@@ -697,6 +718,24 @@ fn insert_mailbox(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn only_abnormal_endpoint_failures_are_logged() {
+        for code in [
+            "unauthorized",
+            "malformed_frame",
+            "request_too_large",
+            "malformed_request",
+            "unsupported_version",
+            "timeout",
+            "invalid_operation",
+            "forbidden_operation",
+            "operation_unavailable",
+        ] {
+            assert!(!EndpointFailure::new(code, "expected rejection").is_abnormal());
+        }
+        assert!(EndpointFailure::new("internal", "processing failed").is_abnormal());
+    }
 
     #[test]
     fn inventories_are_phase_scoped() {
