@@ -27,6 +27,18 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("names.txt");
     let mut f = std::fs::File::create(&path).unwrap();
@@ -199,6 +211,7 @@ fn serve_spawns_agent_and_tears_down_on_done() {
         let done_out = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home.path())
             .env("QUORUM_REPO", "test/repo")
+            .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home.path()))
             .env("QUORUM_RUN_ID", &run_id)
             .args(["done", "--agent", &agent_name, "--pr", "1"])
             .output()

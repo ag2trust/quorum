@@ -16,6 +16,18 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn init_git_repo(dir: &std::path::Path) {
     let d = dir.to_string_lossy();
     for args in [
@@ -1061,6 +1073,7 @@ fi
         command
             .env("QUORUM_HOME", self.home.path())
             .env("QUORUM_REPO", "test/repo")
+            .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(self.home.path()))
             .env("QUORUM_RUN_ID", run_id)
             .args(["done", "--agent", agent])
             .args(done_args);
@@ -1070,6 +1083,36 @@ fi
             "done failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Append a Done row for recovery tests that intentionally signal while
+    /// the endpoint is unavailable or the pre-restart capability is revoked.
+    fn append_done(&self, agent: &str, args: &[&str]) {
+        let value = |flag| {
+            args.iter()
+                .zip(args.iter().skip(1))
+                .find(|(key, _)| **key == flag)
+                .map(|(_, value)| *value)
+        };
+        let blocking =
+            value("--blocking").map(|raw| raw.parse::<u32>().expect("--blocking must be a number"));
+        let verdict = value("--verdict");
+        let row = quorum_core::mailbox::MailboxRow {
+            agent: agent.to_string(),
+            kind: quorum_core::mailbox::MailboxKind::Done,
+            task_id: Some(1),
+            pr: verdict
+                .is_some()
+                .then(|| value("--pr"))
+                .flatten()
+                .map(|raw| raw.parse::<i64>().expect("--pr must be a number")),
+            verdict: verdict.map(str::to_string),
+            feedback: value("--feedback").map(str::to_string),
+            note: None,
+            to_agent: None,
+            payload: blocking.map(|count| format!(r#"{{"blocking":{count}}}"#)),
+        };
+        quorum_core::mailbox::append(&mut self.db(), &row).unwrap();
     }
 
     fn retry_parked(&self) {
@@ -1616,7 +1659,7 @@ fn restart_recovery_retains_journal_pr_when_worker_omits_pr() {
     // Crash before the worker signal is observed. Startup must recover the
     // exact journal identity even though the durable mailbox row has no PR.
     case.handle.crash_mut();
-    case.done(&worker, &[]);
+    case.append_done(&worker, &[]);
     case.restart_after_stop("codex", "gpt-5.6-terra", None);
     case.handle.wait_for("startup worker recovery: folded");
 
@@ -1992,7 +2035,7 @@ fn changed_worker_routing_remediation_resumes_original_worker_layout() {
     case.handle
         .wait_for(&format!("worker {original_worker} result"));
     let original_thread = format!("thread-{original_worker}");
-    case.done(&original_worker, &["--pr", "1"]);
+    case.append_done(&original_worker, &["--pr", "1"]);
 
     case.handle.wait_for("spawning reviewer ");
     let reviewer = case.handle.agent_after("spawning reviewer ");
@@ -2017,7 +2060,7 @@ fn changed_worker_routing_remediation_resumes_original_worker_layout() {
         "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
     ));
     case.handle.wait_for(&format!("reviewer {reviewer} result"));
-    case.done(
+    case.append_done(
         &reviewer,
         &[
             "--pr",
@@ -2071,7 +2114,7 @@ fn changed_worker_routing_remediation_resumes_original_worker_layout() {
     );
     drop(conn);
 
-    case.done(&remediation, &["--pr", "1"]);
+    case.append_done(&remediation, &["--pr", "1"]);
     case.handle.wait_for("lifecycle: task #1 -> in-review");
     case.handle.stop();
 }

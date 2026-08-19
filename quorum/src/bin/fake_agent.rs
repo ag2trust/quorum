@@ -295,10 +295,9 @@ fn main() {
         cumulative_cost += (input_tokens + output_tokens) as f64 * cost_per_token;
 
         let is_error = error_result_count > 0 && turn <= error_result_count;
-        emit_result(turn, cumulative_cost, is_error);
-
         if side_effects && turn == 1 {
             run_quorum_submit();
         }
+        emit_result(turn, cumulative_cost, is_error);
     }
 }
