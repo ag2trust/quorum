@@ -255,9 +255,16 @@ fn install_fixtures(db: &Path) {
     tx.commit().unwrap();
 }
 
-fn command(endpoint: &Path, capability: &str, args: &[&str]) -> assert_cmd::assert::Assert {
+fn command(
+    home: &Path,
+    endpoint: &Path,
+    capability: &str,
+    args: &[&str],
+) -> assert_cmd::assert::Assert {
     let mut command = Command::new(quorum_bin());
     command
+        .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .env("QUORUM_AGENT_ENDPOINT", endpoint)
         .env("QUORUM_RUN_ID", capability)
         .args(args)
@@ -301,6 +308,7 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
     let before = mailbox_count(&db);
 
     let worker = success_id(command(
+        &home,
         &endpoint,
         "worker-cap",
         &[
@@ -314,6 +322,7 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
         ],
     ));
     let reviewer = success_id(command(
+        &home,
         &endpoint,
         "reviewer-cap",
         &[
@@ -331,6 +340,7 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
         ],
     ));
     let graph = success_id(command(
+        &home,
         &endpoint,
         "graph-cap",
         &[
@@ -346,6 +356,7 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
         ],
     ));
     let reaction = success_id(command(
+        &home,
         &endpoint,
         "reactor-cap",
         &[
@@ -459,7 +470,7 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
             ],
         ),
     ] {
-        command(&endpoint, capability, &args)
+        command(&home, &endpoint, capability, &args)
             .code(2)
             .stderr(predicates::str::contains("agent endpoint rejected"));
     }
@@ -473,12 +484,18 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
 
 #[test]
 fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
-    let missing = tempfile::tempdir().unwrap().path().join("missing.sock");
-    command(&missing, "capability", &["submit", "--agent", "Worker"])
-        .code(3)
-        .stderr(predicates::str::contains("agent endpoint request failed"));
-
     let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let missing = root.path().join("missing.sock");
+    command(
+        &home,
+        &missing,
+        "capability",
+        &["submit", "--agent", "Worker"],
+    )
+    .code(3)
+    .stderr(predicates::str::contains("agent endpoint request failed"));
+
     let timeout_socket = root.path().join("timeout.sock");
     let listener = UnixListener::bind(&timeout_socket).unwrap();
     let timeout_server = thread::spawn(move || {
@@ -486,6 +503,7 @@ fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
         thread::sleep(Duration::from_secs(6));
     });
     command(
+        &home,
         &timeout_socket,
         "capability",
         &["submit", "--agent", "Worker"],
@@ -506,6 +524,7 @@ fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
         stream.write_all(b"nope").unwrap();
     });
     command(
+        &home,
         &malformed_socket,
         "capability",
         &[
