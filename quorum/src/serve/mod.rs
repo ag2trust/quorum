@@ -10920,7 +10920,34 @@ async fn tick(
                                                     "no worker for rework on task #{reviewer_task_id} \
                                                      (merge failure) — spawning remediation worker"
                                                 ));
-                                                if pr_num > 0 && !drain_state.draining {
+                                                if pr_num <= 0 {
+                                                    log(&format!(
+                                                        "no PR — cannot spawn remediation \
+                                                         for task #{reviewer_task_id}"
+                                                    ));
+                                                    fire_event(
+                                                        &db_path,
+                                                        "daemon",
+                                                        reviewer_task_id,
+                                                        &Event::AgentFailed {
+                                                            reason:
+                                                                "no worker and no PR for rework"
+                                                                    .into(),
+                                                        },
+                                                    )
+                                                    .await;
+                                                } else if drain_state.draining {
+                                                    // The atomic merge disposition above
+                                                    // already persisted one actionable turn in
+                                                    // `rework`. Graceful drain suppresses new
+                                                    // processes, but it is not an agent
+                                                    // failure: leave the feedback and one-shot
+                                                    // retry marker for restart reconciliation.
+                                                    log(&format!(
+                                                        "draining — deferring durable merge-failure \
+                                                         remediation for task #{reviewer_task_id}"
+                                                    ));
+                                                } else {
                                                     let spawn_ok = spawn_remediation_worker(
                                                         config,
                                                         wt_mgr,
@@ -10944,22 +10971,6 @@ async fn tick(
                                                         )
                                                         .await;
                                                     }
-                                                } else {
-                                                    log(&format!(
-                                                        "no PR or draining — cannot spawn remediation \
-                                                         for task #{reviewer_task_id}"
-                                                    ));
-                                                    fire_event(
-                                                        &db_path,
-                                                        "daemon",
-                                                        reviewer_task_id,
-                                                        &Event::AgentFailed {
-                                                            reason:
-                                                                "no worker and no PR for rework"
-                                                                    .into(),
-                                                        },
-                                                    )
-                                                    .await;
                                                 }
                                             }
                                         }
