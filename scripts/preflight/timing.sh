@@ -2184,7 +2184,16 @@ def main() -> int:
         return self_test()
 
     wrapper_path = os.path.abspath(__file__)
-    return collect(args, wrapper_path)
+    # Tests deliberately exercise failing CLI paths, and exit-3 diagnostics
+    # may open (and therefore migrate) a Quorum database. Never let a test
+    # process inherit an agent's production QUORUM_HOME. The override belongs
+    # here, at the collector boundary, so Cargo, test supervisors, and every
+    # test executable inherit the same isolated home even when an individual
+    # test forgets to provide one.
+    with tempfile.TemporaryDirectory(prefix="quorum-preflight-") as quorum_home:
+        os.environ["QUORUM_HOME"] = quorum_home
+        os.environ["QUORUM_REPO"] = "quorum/preflight"
+        return collect(args, wrapper_path)
 
 
 if __name__ == "__main__":
