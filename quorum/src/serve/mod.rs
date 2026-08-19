@@ -4,6 +4,7 @@
 //! spawns/drives agents, and shuts down cleanly on Ctrl-C. See spec §3.
 
 pub mod agent;
+pub mod agent_endpoint;
 pub mod approvals;
 pub mod classifier;
 pub mod cleanup;
@@ -2463,6 +2464,27 @@ fn runner_adapter_config<'a>(
     }
 }
 
+fn managed_run_environment(
+    config: &ServeConfig,
+    agent: &str,
+    capability: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut environment = vec![
+        ("QUORUM_REPO".into(), config.repo.clone()),
+        ("QUORUM_AGENT".into(), agent.to_string()),
+        (
+            "QUORUM_AGENT_ENDPOINT".into(),
+            agent_endpoint::locator(&config.db_path)
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ];
+    if let Some(capability) = capability {
+        environment.push(("QUORUM_RUN_ID".into(), capability.to_string()));
+    }
+    environment
+}
+
 #[cfg(test)]
 fn configured_reviewer_selection<'a>(
     provider_explicit: bool,
@@ -3207,7 +3229,12 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| QuorumError::Io(format!("failed to create tokio runtime: {e}")))?;
 
-    let result = rt.block_on(tick_loop(&config, daemon_pid));
+    let result = rt.block_on(async {
+        let endpoint = agent_endpoint::AgentEndpoint::start(&config.db_path, &config.repo).await?;
+        let result = tick_loop(&config, daemon_pid).await;
+        endpoint.shutdown().await;
+        result
+    });
 
     // Release the lock on clean shutdown (best-effort).
     if let Ok(conn) = quorum_core::db::open(&config.db_path) {
@@ -13000,17 +13027,15 @@ async fn feed_worker_turn(
         } else {
             None
         };
-        let mut env_vars: Vec<(String, String)> = vec![
-            ("QUORUM_REPO".into(), config.repo.clone()),
-            ("QUORUM_AGENT".into(), slot.agent_name.clone()),
-        ];
         let launch_capability = dormant_authority
             .as_ref()
             .map(|authority| &authority.cap_run_id)
             .or(slot.cap_run_id.as_ref());
-        if let Some(rid) = launch_capability {
-            env_vars.push(("QUORUM_RUN_ID".into(), rid.clone()));
-        }
+        let env_vars = managed_run_environment(
+            config,
+            &slot.agent_name,
+            launch_capability.map(String::as_str),
+        );
 
         let launch = runner::RunnerProc::launch(
             &runner::LaunchRequest {
@@ -15379,11 +15404,7 @@ async fn provision_reviewer_reserved(
     };
     let prompt = format!("{prompt}\n\n{task_contract}");
 
-    let reviewer_env = vec![
-        ("QUORUM_REPO".into(), config.repo.clone()),
-        ("QUORUM_AGENT".into(), reviewer_name.clone()),
-        ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
-    ];
+    let reviewer_env = managed_run_environment(config, &reviewer_name, Some(cap_run_id.as_str()));
     let reviewer_agent_bin = agent_bin_for_kind(config, reviewer_kind);
     let continuation_id = runner_continuation_id(
         reviewer_kind,
@@ -16285,11 +16306,7 @@ async fn spawn_worker(
         }
     }
 
-    let worker_env_vars = vec![
-        ("QUORUM_REPO".into(), config.repo.clone()),
-        ("QUORUM_AGENT".into(), agent_name.clone()),
-        ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
-    ];
+    let worker_env_vars = managed_run_environment(config, &agent_name, Some(cap_run_id.as_str()));
 
     let body = task.body.as_deref().unwrap_or(&task.title);
     let mut prompt_text = retry_turn.as_ref().map_or_else(
@@ -18457,11 +18474,7 @@ async fn spawn_remediation_worker(
         config.limits.max_task_cost_usd,
     );
 
-    let remediation_env = vec![
-        ("QUORUM_REPO".into(), config.repo.clone()),
-        ("QUORUM_AGENT".into(), agent_name.clone()),
-        ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
-    ];
+    let remediation_env = managed_run_environment(config, &agent_name, Some(cap_run_id.as_str()));
 
     // An implementation task must resume the immutable profile from its first
     // worker run. Only workerless review-only remediation has no allocation to
@@ -19091,6 +19104,32 @@ mod tests {
             codex_sandbox: "danger-full-access".into(),
             pr_target_program: None,
         }
+    }
+
+    #[test]
+    fn managed_run_environment_exposes_only_scoped_coordination_values() {
+        let config = pre_review_checks_config(
+            PathBuf::from("/private/daemon/quorum.db"),
+            PathBuf::from("/worktree"),
+        );
+        let environment = managed_run_environment(&config, "Worker-1", Some("run-capability"));
+        let environment: std::collections::BTreeMap<_, _> = environment.into_iter().collect();
+        assert_eq!(environment.len(), 4);
+        assert_eq!(environment["QUORUM_REPO"], "owner/repo");
+        assert_eq!(environment["QUORUM_AGENT"], "Worker-1");
+        assert_eq!(environment["QUORUM_RUN_ID"], "run-capability");
+        assert_eq!(
+            environment["QUORUM_AGENT_ENDPOINT"],
+            agent_endpoint::locator(&config.db_path)
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert!(!environment.contains_key("QUORUM_HOME"));
+        assert!(!environment.contains_key("GH_TOKEN"));
+        assert!(!environment.contains_key("GITHUB_TOKEN"));
+        assert!(environment
+            .values()
+            .all(|value| value != "/private/daemon/quorum.db"));
     }
 
     async fn complete_pre_review_timeout_cycle(
