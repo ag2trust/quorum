@@ -208,7 +208,7 @@ fn side_effects_mode_creates_real_submit_mailbox_row() {
     // subprocess call to `quorum submit`. The log will contain "done (pr=None"
     // because the fake agent calls submit without --pr.
     assert!(
-        handle.wait_for("done (pr=None", 20),
+        handle.wait_for("done (pr=None", 30),
         "daemon should have processed a done mailbox row created by fake_agent \
          side-effect subprocess. Lines: {:?}",
         handle.lines

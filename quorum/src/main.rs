@@ -5,6 +5,7 @@
 //! input · 3 internal/DB/migration error.
 
 mod agent_client;
+mod agent_mcp;
 mod cheatsheet;
 mod cli;
 mod cockpit;
@@ -121,7 +122,7 @@ fn run() -> Result<i32> {
     // Best-effort: log genuinely abnormal failures (exit 3) — never normal lost-race (1) or
     // usage errors (2).
     if let Err(ref e) = result {
-        if e.exit_code() == 3 {
+        if e.exit_code() == 3 && source != "agent-mcp" {
             best_effort_errlog(source, &e.to_string());
         }
     }
@@ -151,6 +152,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Sweep => "sweep",
         cli::Command::Message { .. } => "message",
         cli::Command::React { .. } => "react",
+        cli::Command::AgentMcp => "agent-mcp",
         cli::Command::Submit { .. } => "submit",
         cli::Command::ReviewDraft { .. } => "review-draft",
         cli::Command::Serve { .. } => "serve",
@@ -927,6 +929,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let _ = (agent, task_id);
             let id = agent_client::react(&rid, &state)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
+        cli::Command::AgentMcp => {
+            agent_mcp::run()?;
             Ok(0)
         }
         cli::Command::Submit {
