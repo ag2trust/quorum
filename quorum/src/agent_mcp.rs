@@ -89,7 +89,8 @@ impl ProtocolOperation {
                         "owner": bounded_string(1, 100),
                         "repo": bounded_string(1, 100),
                         "pullNumber": positive_integer(),
-                        "page": {"type":"integer","minimum":1},
+                        "after": bounded_string(1, 512),
+                        "page": {"type":"integer","minimum":1,"maximum":100},
                         "perPage": {"type":"integer","minimum":1,"maximum":100}
                     }),
                     &["method", "owner", "repo", "pullNumber"],
@@ -112,19 +113,7 @@ impl ProtocolOperation {
             ),
             Self::PullRequestReviewWrite => (
                 "Create or submit the current reviewer's pending COMMENT review for the bound pull request.",
-                github_schema(
-                    json!({
-                        "method": {"type":"string","enum":["create","submit_pending"]},
-                        "owner": bounded_string(1, 100),
-                        "repo": bounded_string(1, 100),
-                        "pullNumber": positive_integer(),
-                        "commitID": bounded_string(40, 40),
-                        "event": {"type":"string","enum":["COMMENT"]},
-                        "body": bounded_string(1, 32768),
-                        "clientRequestId": bounded_string(1, 128)
-                    }),
-                    &["method", "owner", "repo", "pullNumber"],
-                ),
+                pending_review_schema(),
                 false,
             ),
             Self::AddCommentToPendingReview => (
@@ -242,6 +231,36 @@ fn github_schema(properties: Value, required: &[&str]) -> Arc<Map<String, Value>
             .expect("static tool schema is an object")
             .clone(),
     )
+}
+
+fn pending_review_schema() -> Arc<Map<String, Value>> {
+    let mut schema = github_schema(
+        json!({
+            "method": {"type":"string","enum":["create","submit_pending"]},
+            "owner": bounded_string(1, 100),
+            "repo": bounded_string(1, 100),
+            "pullNumber": positive_integer(),
+            "commitID": bounded_string(40, 40),
+            "event": {"type":"string","enum":["COMMENT"]},
+            "body": bounded_string(1, 32768),
+            "clientRequestId": bounded_string(1, 128)
+        }),
+        &["method", "owner", "repo", "pullNumber"],
+    );
+    Arc::make_mut(&mut schema).insert(
+        "oneOf".into(),
+        json!([
+            {
+                "properties": {"method": {"const": "create"}},
+                "required": ["method", "commitID"]
+            },
+            {
+                "properties": {"method": {"const": "submit_pending"}},
+                "required": ["method", "event", "body"]
+            }
+        ]),
+    );
+    schema
 }
 
 #[derive(Debug, Serialize)]

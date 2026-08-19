@@ -352,6 +352,15 @@ fn tool_names(response: &Value) -> Vec<&str> {
         .collect()
 }
 
+fn tool<'a>(response: &'a Value, name: &str) -> &'a Value {
+    response["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .unwrap_or_else(|| panic!("missing advertised tool {name}: {response:#}"))
+}
+
 fn assert_tool_error(response: &Value, message: &str) {
     assert_eq!(response["result"]["isError"], true, "{response:#}");
     assert_eq!(
@@ -461,6 +470,29 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
             "resolve_review_thread",
             "github_operation_read"
         ]
+    );
+    let pull_request_read = &tool(&reviewer_tools, "pull_request_read")["inputSchema"];
+    assert_eq!(
+        pull_request_read["properties"]["after"],
+        json!({"type":"string","minLength":1,"maxLength":512})
+    );
+    assert_eq!(
+        pull_request_read["properties"]["page"],
+        json!({"type":"integer","minimum":1,"maximum":100})
+    );
+    let pending_review = &tool(&reviewer_tools, "pull_request_review_write")["inputSchema"];
+    assert_eq!(
+        pending_review["oneOf"],
+        json!([
+            {
+                "properties":{"method":{"const":"create"}},
+                "required":["method","commitID"]
+            },
+            {
+                "properties":{"method":{"const":"submit_pending"}},
+                "required":["method","event","body"]
+            }
+        ])
     );
     let wrong_role = reviewer.request(
         3,
