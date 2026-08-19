@@ -114,7 +114,12 @@ CREATE TABLE IF NOT EXISTS tasks (
         CHECK (completion_provenance IS NULL OR completion_provenance IN ('merged','manual')),
     -- v53: authoritative nullable target branch. Resolved to the daemon-configured
     -- base before first execution; immutable once populated.
-    target_branch TEXT
+    target_branch TEXT,
+    -- v56: nullable per-task rework ceiling. Stamped from the daemon's
+    -- `max_rework` config at first ownership; immutable once populated. NULL
+    -- means unstamped and falls back to the compiled REWORK_CAP, preserving
+    -- historic behaviour for existing rows.
+    rework_cap INTEGER
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 -- Bounded REVIEWING projection: each status is read newest-first, then at most two

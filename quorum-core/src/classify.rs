@@ -4,7 +4,7 @@
 use crate::complexity;
 use crate::db::begin_immediate;
 use crate::error::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -347,6 +347,53 @@ pub fn store_classifications_for_inputs(
     now: i64,
 ) -> Result<usize> {
     let tx = begin_immediate(conn)?;
+    let stored = store_classifications_tx(
+        &tx,
+        results,
+        expected_inputs,
+        classifier_provenance,
+        now,
+        None,
+    )?;
+    tx.commit()?;
+    Ok(stored)
+}
+
+/// Atomic variant used by the daemon: accepts each classification and stamps the
+/// per-task rework ceiling in the *same* transaction. Classification acceptance is
+/// the earliest per-task adoption point, so the immutable adoption-time cap must
+/// land or roll back with the accepted refs — a crash between two separate
+/// transactions would leave the task dispatchable at the compiled default despite
+/// a configured `max_rework`.
+pub fn store_classifications_and_stamp_rework_cap(
+    conn: &mut Connection,
+    results: &[TaskClassification],
+    expected_inputs: &[ClassificationInput],
+    classifier_provenance: &str,
+    now: i64,
+    rework_cap: u32,
+) -> Result<usize> {
+    let tx = begin_immediate(conn)?;
+    let stored = store_classifications_tx(
+        &tx,
+        results,
+        expected_inputs,
+        classifier_provenance,
+        now,
+        Some(rework_cap),
+    )?;
+    tx.commit()?;
+    Ok(stored)
+}
+
+fn store_classifications_tx(
+    tx: &Transaction<'_>,
+    results: &[TaskClassification],
+    expected_inputs: &[ClassificationInput],
+    classifier_provenance: &str,
+    now: i64,
+    rework_cap: Option<u32>,
+) -> Result<usize> {
     let mut stored = 0;
     let expected: std::collections::HashMap<i64, (i64, &str)> = expected_inputs
         .iter()
@@ -376,7 +423,7 @@ pub fn store_classifications_for_inputs(
             continue;
         };
 
-        let Some(current_input) = classifier_input_for_task(&tx, result.task_id)? else {
+        let Some(current_input) = classifier_input_for_task(tx, result.task_id)? else {
             continue;
         };
         if classification_inputs(std::slice::from_ref(&current_input))[0].fingerprint
@@ -409,14 +456,24 @@ pub fn store_classifications_for_inputs(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             if let Some(reason) = parking_reason(&sanitized, review_only, continue_pr.is_some()) {
-                crate::tasks::park_classified_task_tx(&tx, result.task_id, reason, now)?;
+                crate::tasks::park_classified_task_tx(tx, result.task_id, reason, now)?;
             } else {
-                crate::tasks::restore_classified_task_tx(&tx, result.task_id, now)?;
+                crate::tasks::restore_classified_task_tx(tx, result.task_id, now)?;
+            }
+
+            // Stamp the immutable adoption-time rework ceiling in the same
+            // transaction as the accepted classification: both must land or
+            // roll back together.
+            if let Some(cap) = rework_cap {
+                tx.execute(
+                    "UPDATE tasks SET rework_cap = ?2, updated_at = ?3 \
+                     WHERE id = ?1 AND rework_cap IS NULL",
+                    params![result.task_id, i64::from(cap), now],
+                )?;
             }
         }
     }
 
-    tx.commit()?;
     Ok(stored)
 }
 
@@ -1243,6 +1300,109 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn store_and_stamp_rework_cap_persists_cap_with_accepted_classification() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "stamped adoption", 1);
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            store_classifications_and_stamp_rework_cap(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &pending,
+                "test:v2",
+                2_000_000,
+                10,
+            )
+            .unwrap(),
+            1
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(crate::tasks::classification_is_complete(&task.refs));
+        // Adoption-time cap landed with the accepted refs in one write.
+        assert_eq!(task.rework_cap, Some(10));
+    }
+
+    #[test]
+    fn store_and_stamp_rework_cap_leaves_cap_unset_when_classification_rejected() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "rejected refs", 1);
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+
+        // Invalidate the snapshot so the classifier result is rejected.
+        crate::tasks::update(
+            &mut conn,
+            "test-agent",
+            task_id,
+            &crate::tasks::TaskUpdate {
+                body: Some("materially changed"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            2_000_001,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store_classifications_and_stamp_rework_cap(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &pending,
+                "test:v2",
+                2_000_002,
+                10,
+            )
+            .unwrap(),
+            0
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        // Neither the refs nor the cap moved: they land or roll back together.
+        assert!(!crate::tasks::classification_is_complete(&task.refs));
+        assert_eq!(task.rework_cap, None);
+    }
+
+    #[test]
+    fn store_and_stamp_rework_cap_preserves_first_stamped_value() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "cap already stamped", 1);
+        // Pre-stamp with 7, mimicking a task adopted under an earlier config.
+        assert!(crate::tasks::stamp_rework_cap(&mut conn, task_id, 7, 2_000_000).unwrap());
+
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            store_classifications_and_stamp_rework_cap(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &pending,
+                "test:v2",
+                2_000_001,
+                10,
+            )
+            .unwrap(),
+            1
+        );
+        // Immutable-once: the WHERE rework_cap IS NULL guard preserves the
+        // earlier adoption-time value even when reconstructing classification
+        // under a newer config.
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.rework_cap, Some(7));
     }
 
     #[test]

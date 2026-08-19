@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 55;
+pub const SCHEMA_VERSION: i64 = 56;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -850,6 +850,15 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                     [],
                 )?;
             }
+        }
+        // v56 = nullable per-task rework ceiling. Existing rows stay NULL and
+        // fall back to the compiled REWORK_CAP, preserving historic behaviour;
+        // the daemon stamps the configured value onto tasks at adoption,
+        // immutable once populated. Renumbered from v55 during the merge with
+        // main's independently shipped v55 (decomposition operator retries)
+        // so both additive migrations converge without reinterpreting history.
+        if current < 56 && !column_exists(conn, "tasks", "rework_cap")? {
+            conn.execute("ALTER TABLE tasks ADD COLUMN rework_cap INTEGER", [])?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())

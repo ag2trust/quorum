@@ -195,6 +195,9 @@ declare_serve_file_config! {
     r2_target_per_stratum: Option<i64>,
     /// Sampling probability once a stratum reaches its coverage floor.
     r2_steady_state_p: Option<f64>,
+    /// Maximum rework rounds before a task fails. Stamped onto each task at
+    /// adoption, immutable thereafter; unset falls back to the compiled default.
+    max_rework: Option<u32>,
     /// Runner-specific Codex configuration.
     codex: Option<CodexFileConfig>,
     /// Transport-only Grok adapter configuration. Managed Grok roles remain disabled.
@@ -268,6 +271,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("r2_enabled", ConfigKeyDisposition::Runtime),
     ("r2_target_per_stratum", ConfigKeyDisposition::Runtime),
     ("r2_steady_state_p", ConfigKeyDisposition::Runtime),
+    ("max_rework", ConfigKeyDisposition::Runtime),
     ("codex", ConfigKeyDisposition::Runtime),
     ("grok", ConfigKeyDisposition::Runtime),
     #[cfg(test)]
@@ -862,6 +866,15 @@ pub fn validate_r2_sampling(target_per_stratum: i64, steady_state_p: f64) -> Res
     Ok(())
 }
 
+/// Validate the configured rework ceiling. A cap of zero would fail every task
+/// on its first requested change, so it is rejected as a configuration error.
+pub fn validate_max_rework(max_rework: u32) -> Result<()> {
+    if max_rework == 0 {
+        return Err(QuorumError::Usage("max_rework must be >= 1 (got 0)".into()));
+    }
+    Ok(())
+}
+
 /// Tracks where each resolved config value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -1277,6 +1290,41 @@ pub fn task_create_base_branch(repo: &str) -> Result<String> {
         QuorumError::Usage(format!("bad serve config {}: {error}", path.display()))
     })?;
     Ok(config.base_branch.unwrap_or_else(|| "main".into()))
+}
+
+/// Resolve the rework ceiling that a supported non-daemon classification writer
+/// (currently `quorum classify --backfill`) must stamp when it makes a task
+/// newly dispatchable.
+///
+/// Uses the same per-repository config location and validation as `serve`.
+/// When the config file is absent or does not set `max_rework`, this falls back
+/// to the compiled [`quorum_core::lifecycle::REWORK_CAP`], matching serve.
+pub fn resolve_max_rework(repo: &str) -> Result<u32> {
+    resolve_max_rework_at(&default_config_path(repo)?)
+}
+
+/// Path-parameterised variant of [`resolve_max_rework`]. Directly testable.
+pub fn resolve_max_rework_at(path: &Path) -> Result<u32> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(quorum_core::lifecycle::REWORK_CAP);
+        }
+        Err(error) => {
+            return Err(QuorumError::Io(format!(
+                "cannot read serve config {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let config: ServeFileConfig = toml::from_str(&contents).map_err(|error| {
+        QuorumError::Usage(format!("bad serve config {}: {error}", path.display()))
+    })?;
+    let cap = config
+        .max_rework
+        .unwrap_or(quorum_core::lifecycle::REWORK_CAP);
+    validate_max_rework(cap)?;
+    Ok(cap)
 }
 
 #[cfg(test)]
@@ -2051,6 +2099,61 @@ worktree_base = "/tmp/wt"
         }
         validate_r2_sampling(0, 0.0).unwrap();
         validate_r2_sampling(3, 1.0).unwrap();
+    }
+
+    #[test]
+    fn max_rework_validation_rejects_zero_with_usage_exit() {
+        let err = validate_max_rework(0).unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+        validate_max_rework(1).unwrap();
+        validate_max_rework(10).unwrap();
+    }
+
+    #[test]
+    fn resolve_max_rework_at_missing_file_returns_compiled_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.toml");
+        assert_eq!(
+            resolve_max_rework_at(&missing).unwrap(),
+            quorum_core::lifecycle::REWORK_CAP
+        );
+    }
+
+    #[test]
+    fn resolve_max_rework_at_unset_key_returns_compiled_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "repo = \"owner/repo\"\n").unwrap();
+        assert_eq!(
+            resolve_max_rework_at(&path).unwrap(),
+            quorum_core::lifecycle::REWORK_CAP
+        );
+    }
+
+    #[test]
+    fn resolve_max_rework_at_set_value_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "max_rework = 10\n").unwrap();
+        assert_eq!(resolve_max_rework_at(&path).unwrap(), 10);
+    }
+
+    #[test]
+    fn resolve_max_rework_at_zero_is_a_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "max_rework = 0\n").unwrap();
+        let err = resolve_max_rework_at(&path).unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+    }
+
+    #[test]
+    fn resolve_max_rework_at_bad_toml_is_a_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "not = valid = toml\n").unwrap();
+        let err = resolve_max_rework_at(&path).unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
     }
 
     #[test]

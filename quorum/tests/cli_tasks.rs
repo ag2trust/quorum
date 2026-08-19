@@ -1574,3 +1574,55 @@ fn task_list_brief_omits_body_full_get_keeps_it() {
         .stdout(predicates::str::contains(SENTINEL))
         .stdout(predicates::str::contains("\"notes\""));
 }
+
+// -- classify --backfill: explicit-config divergence coverage ----------------
+//
+// `serve --config <path>` lets an operator override the default per-repo
+// config location. `classify --backfill` stamps `rework_cap` too, so it must
+// share the same config policy — otherwise backfill could permanently stamp
+// a cap different from the daemon's configured `max_rework`. The dispatcher
+// therefore accepts an explicit `--config <path>` (mirroring serve) and
+// fails exit 2 when that explicit path does not exist rather than silently
+// falling back to the default file.
+
+#[test]
+fn classify_explicit_config_missing_file_fails_usage() {
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("not-here.toml");
+    quorum(home.path())
+        .args([
+            "classify",
+            "--backfill",
+            "--config",
+            missing.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("file not found"));
+}
+
+#[test]
+fn classify_explicit_config_bad_toml_fails_usage() {
+    let home = tempfile::tempdir().unwrap();
+    let bad = home.path().join("bad.toml");
+    std::fs::write(&bad, "not = valid = toml\n").unwrap();
+    quorum(home.path())
+        .args(["classify", "--backfill", "--config", bad.to_str().unwrap()])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn classify_explicit_config_zero_max_rework_fails_usage() {
+    // Divergence coverage: the same validation the daemon applies to
+    // `max_rework=0` must reject an explicit backfill config with the same
+    // value before any classifier spawns — otherwise `classify --backfill`
+    // could accept a config the daemon would refuse to start with.
+    let home = tempfile::tempdir().unwrap();
+    let cfg = home.path().join("explicit.toml");
+    std::fs::write(&cfg, "max_rework = 0\n").unwrap();
+    quorum(home.path())
+        .args(["classify", "--backfill", "--config", cfg.to_str().unwrap()])
+        .assert()
+        .code(2);
+}
