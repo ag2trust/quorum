@@ -271,23 +271,6 @@ fn command(
         .assert()
 }
 
-fn command_without_quorum_home(
-    private_home: &Path,
-    endpoint: &Path,
-    capability: &str,
-    args: &[&str],
-) -> assert_cmd::assert::Assert {
-    let mut command = Command::new(quorum_bin());
-    command
-        .env_remove("QUORUM_HOME")
-        .env("HOME", private_home)
-        .env("QUORUM_REPO", "test/repo")
-        .env("QUORUM_AGENT_ENDPOINT", endpoint)
-        .env("QUORUM_RUN_ID", capability)
-        .args(args)
-        .assert()
-}
-
 fn mailbox_count(db: &Path) -> i64 {
     quorum_core::db::open(db)
         .unwrap()
@@ -397,12 +380,12 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
             "blocked",
         ],
     ));
-    let private_home = root.path().join("private-home");
-    std::fs::create_dir_all(&private_home).unwrap();
     let worker_note_file = root.path().join("worker-note.txt");
     std::fs::write(&worker_note_file, "worker progress").unwrap();
-    let worker_note = success_note_id(command_without_quorum_home(
-        &private_home,
+    // QUORUM_HOME is deliberately present: managed endpoint authority must
+    // still win over a provider that inherited it.
+    let worker_note = success_note_id(command(
+        &home,
         &endpoint,
         "worker-cap",
         &[
@@ -417,8 +400,8 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
     ));
     let reviewer_note_file = root.path().join("reviewer-note.txt");
     std::fs::write(&reviewer_note_file, "review progress").unwrap();
-    let reviewer_note = success_note_id(command_without_quorum_home(
-        &private_home,
+    let reviewer_note = success_note_id(command(
+        &home,
         &endpoint,
         "reviewer-cap",
         &[
@@ -568,7 +551,7 @@ fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
     let note_file = root.path().join("note.txt");
     std::fs::write(&note_file, "progress").unwrap();
     let missing = root.path().join("missing.sock");
-    command_without_quorum_home(
+    command(
         &home,
         &missing,
         "capability",
@@ -591,7 +574,7 @@ fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
         let (_stream, _) = listener.accept().unwrap();
         thread::sleep(Duration::from_secs(6));
     });
-    command_without_quorum_home(
+    command(
         &home,
         &timeout_socket,
         "capability",
@@ -620,7 +603,7 @@ fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
         stream.write_all(&4_u32.to_be_bytes()).unwrap();
         stream.write_all(b"nope").unwrap();
     });
-    command_without_quorum_home(
+    command(
         &home,
         &malformed_socket,
         "capability",

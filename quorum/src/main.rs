@@ -533,12 +533,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         .into(),
                 ));
             }
-            // Managed launch environments deliberately expose only the scoped
-            // endpoint, never QUORUM_HOME. A public CLI invocation with an
-            // explicit database home remains on the ordinary task-update path
-            // even if it inherited unrelated run-scoped environment values.
-            let managed_run = std::env::var_os("QUORUM_HOME").is_none()
-                && std::env::var_os("QUORUM_RUN_ID").is_some()
+            // A complete run capability envelope always takes the scoped
+            // path. In particular, a provider must not regain caller-selected
+            // task/agent writes merely by inheriting QUORUM_HOME.
+            let managed_run = std::env::var_os("QUORUM_RUN_ID").is_some()
                 && std::env::var_os("QUORUM_AGENT_ENDPOINT").is_some();
             if managed_run {
                 if has_field_update || note.is_none() {

@@ -180,6 +180,9 @@ fn cancel_task(home: &std::path::Path, task_id: i64) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env_remove("QUORUM_AGENT")
+        .env_remove("QUORUM_RUN_ID")
+        .env_remove("QUORUM_AGENT_ENDPOINT")
         .args([
             "task-update",
             "--agent",
