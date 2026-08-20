@@ -73,7 +73,7 @@ primary = 100
 
 ## Grok Build settings for managed worker roles only.
 # [grok]
-# sandbox = \"workspace\"                 # off|workspace
+# sandbox = \"off\"                        # off|workspace (default: off)
 # permission_mode = \"bypassPermissions\"
 # max_turns = 64                         # 1..=256
 
