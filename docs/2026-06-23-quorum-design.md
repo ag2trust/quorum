@@ -2188,13 +2188,19 @@ failed sibling or graph blocker, and fewer than two active implementation siblin
 children sort before unrelated new work, but reserve no idle capacity and never interrupt active
 unrelated work. Active siblings may finish after another child fails; no later child may start.
 
-A reviewer may submit a capability-bound, closed graph-blocker verdict for a decomposition defect.
-After validating the current run, head, membership, and evidence, the daemon atomically fails the
-affected child and blocks the graph without consuming ordinary rework. The source remains
-decomposed and the blocked graph remains active until source cancellation; recovery requires a
-replacement source, not automatic replanning after delivery has begun. The only exception is the
-evidence-bound adoption of an already merged continuation described below; it does not unblock,
-replan, or otherwise repair a blocked graph.
+A reviewer may submit a capability-bound, closed graph-blocker verdict only for a genuine safety
+or authority boundary violation: a change that would grant authority, break restricted-role or
+phase isolation, escape the managed repository, or expose secrets. A correct, safe change that
+requires a bounded edit outside a generated child's `write` deliverables, including a
+`read_only_reference` path, instead receives a BLOCKING `changes` verdict. That feedback names the
+specific required edit and explicitly authorizes the rework worker to make the minimal, justified
+edit in the named file or files, treating the assigned file list as advisory for that remediation.
+After validating a graph-blocker against the current run, head, membership, and evidence, the
+daemon atomically fails the affected child and blocks the graph without consuming ordinary rework.
+The source remains decomposed and the blocked graph remains active until source cancellation;
+recovery requires a replacement source, not automatic replanning after delivery has begun. The
+only exception is the evidence-bound adoption of an already merged continuation described below;
+it does not unblock, replan, or otherwise repair a blocked graph.
 
 A narrow incident-recovery primitive may adopt the exact merged delivery of a done managed
 continuation task for the final failed member of an otherwise complete live graph (`state` active
