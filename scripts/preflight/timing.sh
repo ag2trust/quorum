@@ -416,7 +416,7 @@ def load_test_result_cache(path: Path) -> dict[str, dict]:
             ):
                 raise ValueError("cache entry is not an exact green result")
         return cached
-    except BaseException:
+    except Exception:
         return {}
 
 
@@ -497,7 +497,7 @@ def cache_passing_test_results(
     if changed:
         try:
             write_test_result_cache(path, cached)
-        except BaseException as exc:
+        except Exception as exc:
             print(
                 "preflight timing: could not write test-result cache; "
                 f"next run will execute cache misses: {exc}",
@@ -2231,6 +2231,37 @@ def self_test() -> int:
         assert json.loads(cache_path.read_text()) == {
             digest: {"exit": 0, "target_name": "passing_test"}
         }
+
+        # Interrupts are lifecycle signals, not cache misses.
+        original_read_text = Path.read_text
+
+        def interrupted_read(*_args: object, **_kwargs: object) -> str:
+            raise KeyboardInterrupt
+
+        Path.read_text = interrupted_read
+        try:
+            try:
+                load_test_result_cache(cache_path)
+                raise AssertionError("cache read swallowed KeyboardInterrupt")
+            except KeyboardInterrupt:
+                pass
+        finally:
+            Path.read_text = original_read_text
+
+        original_write_cache = write_test_result_cache
+
+        def interrupted_write(*_args: object, **_kwargs: object) -> None:
+            raise KeyboardInterrupt
+
+        globals()["write_test_result_cache"] = interrupted_write
+        try:
+            try:
+                cache_passing_test_results(cache_path, cached, runnable, hashes)
+                raise AssertionError("cache write swallowed KeyboardInterrupt")
+            except KeyboardInterrupt:
+                pass
+        finally:
+            globals()["write_test_result_cache"] = original_write_cache
 
         cached_binary = {
             "target_name": "passing_test",
