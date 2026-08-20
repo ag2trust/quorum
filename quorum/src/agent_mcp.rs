@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -41,6 +41,10 @@ struct GithubServer {
     endpoint: PathBuf,
     capability: String,
     repository: String,
+    // `tools/list` is the only inventory a client can cache. Track the phase
+    // actually returned there instead of taking an asynchronous watcher
+    // baseline, which could miss a transition before its first poll.
+    advertised_phase: Arc<Mutex<Option<RunPhase>>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -437,6 +441,20 @@ impl GithubServer {
             _ => Err(EndpointFailure::Unavailable),
         }
     }
+
+    fn record_advertised_phase(&self, phase: RunPhase) {
+        *self
+            .advertised_phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(phase);
+    }
+
+    fn phase_changed_since_advertisement(&self, phase: RunPhase) -> bool {
+        self.advertised_phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some_and(|advertised| advertised != phase)
+    }
 }
 
 fn expected_inventory(phase: RunPhase) -> Vec<ProtocolOperation> {
@@ -504,9 +522,9 @@ impl ServerHandler for GithubServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
-        let tools = self
-            .inventory()
-            .await?
+        let inventory = self.inventory().await?;
+        self.record_advertised_phase(inventory.phase);
+        let tools = inventory
             .operations
             .into_iter()
             .map(ProtocolOperation::tool)
@@ -578,11 +596,6 @@ impl ServerHandler for GithubServer {
 /// daemon-derived phase. The endpoint remains the authority for every call;
 /// this only tells clients to rediscover the changed inventory.
 async fn notify_phase_changes(server: GithubServer, peer: Peer<RoleServer>) {
-    let mut phase = server
-        .inventory()
-        .await
-        .ok()
-        .map(|inventory| inventory.phase);
     let mut interval = tokio::time::interval(PHASE_POLL_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
@@ -592,12 +605,12 @@ async fn notify_phase_changes(server: GithubServer, peer: Peer<RoleServer>) {
         let Ok(inventory) = server.inventory().await else {
             continue;
         };
-        if phase.is_some_and(|previous| previous != inventory.phase)
-            && peer.notify_tool_list_changed().await.is_err()
-        {
-            return;
+        if server.phase_changed_since_advertisement(inventory.phase) {
+            if peer.notify_tool_list_changed().await.is_err() {
+                return;
+            }
+            server.record_advertised_phase(inventory.phase);
         }
-        phase = Some(inventory.phase);
     }
 }
 
@@ -612,6 +625,7 @@ pub fn run() -> Result<()> {
         endpoint: PathBuf::from(endpoint),
         capability,
         repository,
+        advertised_phase: Arc::default(),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -632,6 +646,29 @@ pub fn run() -> Result<()> {
         watcher.abort();
         result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delayed_watcher_snapshot_detects_change_after_tools_list() {
+        let server = GithubServer {
+            endpoint: PathBuf::from("/tmp/agent-endpoint"),
+            capability: "run-capability".into(),
+            repository: "owner/repository".into(),
+            advertised_phase: Arc::default(),
+        };
+
+        // This models the client caching its initial list before the task
+        // enters rework, while the watcher has not yet completed any poll.
+        server.record_advertised_phase(RunPhase::InitialWorker);
+        assert!(server.phase_changed_since_advertisement(RunPhase::ReworkWorker));
+
+        server.record_advertised_phase(RunPhase::ReworkWorker);
+        assert!(!server.phase_changed_since_advertisement(RunPhase::ReworkWorker));
+    }
 }
 
 fn required_env(name: &str, max_bytes: usize) -> Result<String> {

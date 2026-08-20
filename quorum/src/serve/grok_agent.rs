@@ -13,6 +13,7 @@ use super::runner::{
 };
 use std::collections::VecDeque;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{symlink, OpenOptionsExt};
 use std::path::PathBuf;
 #[cfg(test)]
@@ -39,6 +40,8 @@ const MANAGED_WORKSPACE_SANDBOX: &str = "quorum_managed_workspace";
 const STDOUT_LINE_BYTES: usize = 1024 * 1024;
 const TERMINAL_STDOUT_LINES: usize = 256;
 const MAX_SESSION_ID_BYTES: usize = 1024;
+const AUTH_STATE_FILE: &str = "auth.json";
+const AUTH_LOCK_FILE: &str = "auth.json.lock";
 
 #[cfg(test)]
 struct InjectedStderrReadError;
@@ -141,6 +144,7 @@ fn invalid_input(message: impl Into<String>) -> std::io::Error {
 
 struct GrokMcpConfigHome {
     root: tempfile::TempDir,
+    source_home: PathBuf,
     sandbox_profile: Option<&'static str>,
 }
 
@@ -155,6 +159,7 @@ impl GrokMcpConfigHome {
         // Session storage must survive the invocation-local config home so a
         // later `--resume` resolves the exact provider-issued identity.
         std::fs::create_dir_all(source_home.join("sessions"))?;
+        ensure_auth_lock(&source_home)?;
 
         let linked_entries = std::fs::read_dir(&source_home)?
             .map(|entry| entry.map(|entry| (entry.file_name(), entry.path())))
@@ -170,6 +175,15 @@ impl GrokMcpConfigHome {
                 Some("config.toml" | "sandbox.toml" | "hooks" | "hooks-paths")
             ) || name.to_string_lossy().starts_with("quorum-config-")
             {
+                continue;
+            }
+            // Grok refreshes OAuth by atomically replacing auth.json. A
+            // rename would replace a symlink in this disposable home instead
+            // of its target, so materialize it and persist it on teardown.
+            // Other state, including the provider's auth lock, remains linked
+            // to the durable home.
+            if name == AUTH_STATE_FILE {
+                copy_auth_state(&path, &root.path().join(&name))?;
                 continue;
             }
             symlink(path, root.path().join(name))?;
@@ -310,6 +324,7 @@ impl GrokMcpConfigHome {
 
         Ok(Self {
             root,
+            source_home,
             sandbox_profile,
         })
     }
@@ -321,6 +336,77 @@ impl GrokMcpConfigHome {
     fn sandbox_profile(&self) -> Option<&'static str> {
         self.sandbox_profile
     }
+
+    fn persist_auth_state(&self) -> std::io::Result<()> {
+        let _lock = acquire_auth_lock(&self.source_home)?;
+        let auth_state = self.root.path().join(AUTH_STATE_FILE);
+        let metadata = match std::fs::metadata(&auth_state) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file() {
+            return Err(invalid_input("Grok auth state must be a regular file"));
+        }
+
+        let mut replacement = tempfile::Builder::new()
+            .prefix(".quorum-auth-")
+            .tempfile_in(&self.source_home)?;
+        replacement
+            .as_file()
+            .set_permissions(metadata.permissions())?;
+        let mut source = std::fs::File::open(auth_state)?;
+        std::io::copy(&mut source, replacement.as_file_mut())?;
+        replacement.as_file_mut().sync_all()?;
+        replacement
+            .persist(self.source_home.join(AUTH_STATE_FILE))
+            .map_err(|error| error.error)?;
+        Ok(())
+    }
+}
+
+fn ensure_auth_lock(source_home: &std::path::Path) -> std::io::Result<()> {
+    let _lock = acquire_auth_lock(source_home)?;
+    Ok(())
+}
+
+fn acquire_auth_lock(source_home: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(source_home.join(AUTH_LOCK_FILE))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(lock)
+}
+
+impl Drop for GrokMcpConfigHome {
+    fn drop(&mut self) {
+        // GrokProc keeps this home through kill-and-reap, so this runs only
+        // after the provider can no longer update its invocation-local file.
+        // Drop cannot surface an error; a later launch still retains the
+        // previous durable credential if the handoff itself fails.
+        let _ = self.persist_auth_state();
+    }
+}
+
+fn copy_auth_state(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(source)?;
+    if !metadata.is_file() {
+        return Err(invalid_input("Grok auth state must be a regular file"));
+    }
+    let mut destination = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(destination)?;
+    destination.set_permissions(metadata.permissions())?;
+    let mut source = std::fs::File::open(source)?;
+    std::io::copy(&mut source, &mut destination)?;
+    destination.sync_all()
 }
 
 fn args_with_managed_sandbox(
@@ -1232,6 +1318,48 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(original_home.join("config.toml")).unwrap(),
             "[models]\ndefault_reasoning_effort = \"high\"\n"
+        );
+    }
+
+    #[test]
+    fn managed_mcp_persists_atomic_auth_refresh_for_exact_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let original_home = root.path().join("grok-home");
+        std::fs::create_dir_all(&original_home).unwrap();
+        std::fs::write(original_home.join(AUTH_STATE_FILE), "initial-refresh-token").unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = vec![("GROK_HOME".into(), original_home.display().to_string())];
+
+        let fresh =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        assert!(
+            !std::fs::symlink_metadata(fresh.path().join(AUTH_STATE_FILE))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(std::fs::symlink_metadata(fresh.path().join(AUTH_LOCK_FILE))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // This is the OAuth provider's write-temp-and-rename pattern. It
+        // must survive destruction of the invocation-local config home.
+        let replacement = fresh.path().join("auth.json.refresh");
+        std::fs::write(&replacement, "refreshed-token").unwrap();
+        std::fs::rename(&replacement, fresh.path().join(AUTH_STATE_FILE)).unwrap();
+        drop(fresh);
+        assert_eq!(
+            std::fs::read_to_string(original_home.join(AUTH_STATE_FILE)).unwrap(),
+            "refreshed-token"
+        );
+
+        let resumed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(resumed.path().join(AUTH_STATE_FILE)).unwrap(),
+            "refreshed-token"
         );
     }
 
