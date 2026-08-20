@@ -1046,6 +1046,16 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                     }
                     slot.response_text.push_str(&text);
                 }
+                AgentEvent::CompletedAssistantText { text, .. } => {
+                    if text.len() > MAX_RESPONSE_BYTES {
+                        return Some(provider_failure(
+                            slot,
+                            "planner response exceeded 64 KiB",
+                            "exact-through-last-line",
+                        ));
+                    }
+                    slot.response_text = text;
+                }
                 _ => {}
             }
         }

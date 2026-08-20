@@ -1292,6 +1292,7 @@ async fn spawn_and_run_classifier(
                 for event in line.events {
                     match event {
                         AgentEvent::AssistantText { text } => response_text.push_str(&text),
+                        AgentEvent::CompletedAssistantText { text, .. } => response_text = text,
                         AgentEvent::TurnCompleted { usage, .. } => {
                             if let Some(usage) = usage {
                                 usage_total.saturating_add_assign(usage);

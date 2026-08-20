@@ -15652,7 +15652,8 @@ async fn drain_events(
                     return Ok(breach);
                 }
 
-                runner::AgentEvent::AssistantText { .. } => {
+                runner::AgentEvent::AssistantText { .. }
+                | runner::AgentEvent::CompletedAssistantText { .. } => {
                     slot.live_stats.record_event();
                     write_live_sidecar(slot);
                 }

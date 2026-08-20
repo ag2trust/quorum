@@ -687,10 +687,13 @@ fn codex_line_limit_error(limit: usize) -> std::io::Error {
 fn normalize_event(event: Event) -> Vec<AgentEvent> {
     match event {
         Event::ThreadStarted { thread_id } => vec![AgentEvent::ThreadStarted { thread_id }],
+        Event::ItemStarted {
+            item: codex_stream::Item::AgentMessage { text, .. },
+        } if !text.is_empty() => vec![AgentEvent::AssistantText { text }],
+        Event::ItemCompleted {
+            item: codex_stream::Item::AgentMessage { id, text },
+        } if !text.is_empty() => vec![AgentEvent::CompletedAssistantText { item_id: id, text }],
         Event::ItemStarted { item } | Event::ItemCompleted { item } => match item {
-            codex_stream::Item::AgentMessage { text, .. } if !text.is_empty() => {
-                vec![AgentEvent::AssistantText { text }]
-            }
             codex_stream::Item::CommandExecution { command, .. } => vec![AgentEvent::Activity {
                 kind: ActivityKind::ToolUse,
                 summary: tool_summary("command", &serde_json::json!({"command": command})),
@@ -833,6 +836,35 @@ mod tests {
         assert_eq!(args[12], "--ignore-user-config");
         assert_eq!(args[13], "say hello");
         assert_eq!(args.len(), 14);
+    }
+
+    #[test]
+    fn agent_message_normalization_distinguishes_started_from_completed() {
+        let text = "complete response\nwith exact bytes: \u{00e9}";
+        let started = normalize_event(Event::ItemStarted {
+            item: codex_stream::Item::AgentMessage {
+                id: "item_42".into(),
+                text: text.into(),
+            },
+        });
+        let completed = normalize_event(Event::ItemCompleted {
+            item: codex_stream::Item::AgentMessage {
+                id: "item_42".into(),
+                text: text.into(),
+            },
+        });
+
+        assert_eq!(
+            started,
+            vec![AgentEvent::AssistantText { text: text.into() }]
+        );
+        assert_eq!(
+            completed,
+            vec![AgentEvent::CompletedAssistantText {
+                item_id: "item_42".into(),
+                text: text.into(),
+            }]
+        );
     }
 
     #[test]

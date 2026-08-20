@@ -123,7 +123,7 @@ fn tool_snippet(name: &str, input: &serde_json::Value) -> Option<String> {
 pub fn render_agent_event(event: &AgentEvent) -> Option<String> {
     match event {
         AgentEvent::ThreadStarted { .. } => None,
-        AgentEvent::AssistantText { text } => {
+        AgentEvent::AssistantText { text } | AgentEvent::CompletedAssistantText { text, .. } => {
             if text.is_empty() {
                 None
             } else {
