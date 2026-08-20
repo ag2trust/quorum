@@ -71,7 +71,7 @@ primary = 100
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
 # base_branch = \"main\"
 
-## Grok Build transport validation only; managed Grok roles are not enabled.
+## Grok Build settings for managed worker roles only.
 # [grok]
 # sandbox = \"workspace\"                 # off|workspace
 # permission_mode = \"bypassPermissions\"
@@ -1382,6 +1382,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 .as_ref()
                 .and_then(|c| c.sandbox.clone())
                 .unwrap_or_else(|| "danger-full-access".to_string());
+            let grok = serve_config::resolve_grok_adapter(file_cfg.grok.as_ref())?;
 
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
@@ -1458,6 +1459,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 names_file: r_names.value.map(std::path::PathBuf::from),
                 agent_bin: r_agent_bin.value,
                 codex_sandbox,
+                grok,
                 pr_target_program: None,
                 model_profiles,
                 routing,

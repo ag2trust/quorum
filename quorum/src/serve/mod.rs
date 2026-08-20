@@ -2507,7 +2507,11 @@ fn runner_adapter_config<'a>(
             .as_deref()
             .unwrap_or(agent::ALLOWED_TOOLS),
         codex_sandbox: &config.codex_sandbox,
-        grok: Default::default(),
+        grok: grok_agent::GrokAdapterConfig {
+            sandbox: &config.grok.sandbox,
+            permission_mode: &config.grok.permission_mode,
+            max_turns: config.grok.max_turns,
+        },
     }
 }
 
@@ -3227,6 +3231,8 @@ pub struct ServeConfig {
     pub max_rework: u32,
     /// Codex sandbox mode (default: "danger-full-access").
     pub codex_sandbox: String,
+    /// Validated Grok adapter settings used by every managed worker launch.
+    pub grok: crate::serve_config::GrokResolvedConfig,
     /// Test-only override for the `gh` binary used by live PR target
     /// resolution. None → look up "gh" on PATH.
     pub pr_target_program: Option<PathBuf>,
@@ -20322,6 +20328,7 @@ mod tests {
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             codex_sandbox: "danger-full-access".into(),
+            grok: Default::default(),
             pr_target_program: None,
         }
     }
@@ -22068,6 +22075,121 @@ mod tests {
         assert!(handoff.pending_turn.continuation_id.is_none());
         assert_eq!(handoff.session_id, "grok-session-exact");
         slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_grok_adapter_survives_initial_and_resumed_worker_launches() {
+        fn assert_worker_args(path: &Path, resumed: bool) {
+            let args: Vec<_> = std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            assert!(
+                args.windows(2).any(|pair| pair == ["--sandbox", "off"]),
+                "args={args:?}"
+            );
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
+            assert!(args.windows(2).any(|pair| pair == ["--max-turns", "1"]));
+            assert_eq!(
+                args.starts_with(&["--resume".into(), "grok-session-initial".into()]),
+                resumed
+            );
+        }
+
+        async fn wait_for_worker_args(path: &Path) {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if std::fs::read_to_string(path).is_ok_and(|args| args.lines().count() >= 12) {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Grok fixture did not record its launch arguments");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let program = grok_worker_fixture_program(
+            dir.path(),
+            r#"printf '%s\n' "$@" > "$GROK_ARGS_FILE"
+printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
+        );
+        let mut config = pre_review_ci_test_config(dir.path().join("quorum.db"), worktree.clone());
+        config.grok = crate::serve_config::GrokResolvedConfig {
+            sandbox: "off".into(),
+            permission_mode: "bypassPermissions".into(),
+            max_turns: 1,
+        };
+
+        let initial_args = dir.path().join("initial-args");
+        let initial_environment = vec![(
+            "GROK_ARGS_FILE".into(),
+            initial_args.to_string_lossy().into_owned(),
+        )];
+        let initial_request = runner::RunnerRequest {
+            launch: runner::LaunchRequest {
+                model: "grok-4.5",
+                effort: "high",
+                worktree: &worktree,
+                prompt: "implement the task",
+                environment: &initial_environment,
+                mode: runner::LaunchMode::Normal,
+                continuation_id: None,
+            },
+            task_id: 1,
+            role_assignment_id: 1,
+            responsibility_key: "worker:1:1",
+            agent: "Grok-worker",
+            role: "worker",
+            pending_turn: PendingTurn {
+                provider: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+                prompt: "implement the task".into(),
+                turn_kind: "initial".into(),
+                continuation_id: None,
+                requested: false,
+            },
+        };
+        let initial = runner::RunnerProc::launch_internal_worker(
+            &initial_request,
+            &runner_adapter_config(&config, program.to_str()),
+        )
+        .await
+        .unwrap();
+        wait_for_worker_args(&initial_args).await;
+        assert_worker_args(&initial_args, false);
+        initial.kill_and_reap().await;
+
+        let resumed_args = dir.path().join("resumed-args");
+        let resumed_environment = vec![(
+            "GROK_ARGS_FILE".into(),
+            resumed_args.to_string_lossy().into_owned(),
+        )];
+        let resumed = runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: "grok-4.5",
+                effort: "high",
+                worktree: &worktree,
+                prompt: "apply review feedback",
+                environment: &resumed_environment,
+                mode: runner::LaunchMode::Normal,
+                continuation_id: Some("grok-session-initial"),
+            },
+            &runner_adapter_config(&config, program.to_str()),
+        )
+        .await
+        .unwrap();
+        wait_for_worker_args(&resumed_args).await;
+        assert_worker_args(&resumed_args, true);
+        resumed.kill_and_reap().await;
     }
 
     #[cfg(unix)]
@@ -24010,6 +24132,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             codex_sandbox: "danger-full-access".into(),
+            grok: Default::default(),
             pr_target_program: None,
         }
     }

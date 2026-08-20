@@ -200,7 +200,7 @@ declare_serve_file_config! {
     max_rework: Option<u32>,
     /// Runner-specific Codex configuration.
     codex: Option<CodexFileConfig>,
-    /// Transport-only Grok adapter configuration. Managed Grok roles remain disabled.
+    /// Grok adapter configuration for managed worker roles.
     grok: Option<GrokFileConfig>,
 }
 
@@ -513,17 +513,28 @@ pub struct GrokResolvedConfig {
     pub max_turns: u32,
 }
 
+impl Default for GrokResolvedConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: crate::serve::grok_agent::DEFAULT_SANDBOX.into(),
+            permission_mode: crate::serve::grok_agent::DEFAULT_PERMISSION_MODE.into(),
+            max_turns: crate::serve::grok_agent::DEFAULT_MAX_TURNS,
+        }
+    }
+}
+
 pub fn resolve_grok_adapter(file: Option<&GrokFileConfig>) -> Result<GrokResolvedConfig> {
+    let defaults = GrokResolvedConfig::default();
     let resolved = GrokResolvedConfig {
         sandbox: file
             .and_then(|config| config.sandbox.clone())
-            .unwrap_or_else(|| crate::serve::grok_agent::DEFAULT_SANDBOX.into()),
+            .unwrap_or(defaults.sandbox),
         permission_mode: file
             .and_then(|config| config.permission_mode.clone())
-            .unwrap_or_else(|| crate::serve::grok_agent::DEFAULT_PERMISSION_MODE.into()),
+            .unwrap_or(defaults.permission_mode),
         max_turns: file
             .and_then(|config| config.max_turns)
-            .unwrap_or(crate::serve::grok_agent::DEFAULT_MAX_TURNS),
+            .unwrap_or(defaults.max_turns),
     };
     crate::serve::grok_agent::GrokAdapterConfig {
         sandbox: &resolved.sandbox,
