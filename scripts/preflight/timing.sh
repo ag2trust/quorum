@@ -21,6 +21,7 @@ wall-clocking its run.
 Outputs (under ``target/preflight-timing/`` by default):
   timing.json                  — machine-readable artifact
   summary.txt                  — human-readable summary + bounded top-N
+  test-results.json            — successful test-binary result cache
   cargo-test-no-run.jsonl      — raw cargo JSON stream
   cargo-test-no-run.stderr     — cargo stderr
   rustc-invocations.jsonl      — per-rustc-invocation timing log
@@ -45,6 +46,7 @@ test-execution phase returns 128 plus the received signal number.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import select
@@ -376,6 +378,141 @@ def compile_tests(
         log_entries,
         chained_wrapper,
     )
+
+
+# ---------------------------------------------------------------------------
+# Test-result cache
+# ---------------------------------------------------------------------------
+
+
+def executable_hash(executable: str) -> str | None:
+    """Return the produced executable's content hash, or miss safely."""
+    try:
+        digest = hashlib.sha256()
+        with open(executable, "rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
+def load_test_result_cache(path: Path) -> dict[str, dict]:
+    """Read only an exact green cache; malformed data is a full cache miss."""
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(cached, dict):
+            raise ValueError("cache is not an object")
+        for executable_digest, result in cached.items():
+            if (
+                not isinstance(executable_digest, str)
+                or len(executable_digest) != 64
+                or any(char not in "0123456789abcdef" for char in executable_digest)
+                or not isinstance(result, dict)
+                or set(result) != {"exit", "target_name"}
+                or type(result["exit"]) is not int
+                or result["exit"] != 0
+                or not isinstance(result["target_name"], str)
+            ):
+                raise ValueError("cache entry is not an exact green result")
+        return cached
+    except BaseException:
+        return {}
+
+
+def write_test_result_cache(path: Path, cached: dict[str, dict]) -> None:
+    """Publish successful binary results atomically, like last-green.json."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".test-results.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(cached, output, sort_keys=True)
+            output.write("\n")
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def record_cached_test_result(binary: dict) -> None:
+    binary["cached"] = True
+    binary["execute_secs"] = 0.0
+    binary["execute_exit_code"] = 0
+    binary["execute_outcome"] = "cached_pass"
+
+
+def select_test_binaries_to_execute(
+    binaries: list[dict], cache_path: Path,
+) -> tuple[list[dict], dict[str, dict], dict[int, str]]:
+    """Mark cache hits and return only binaries that still need execution.
+
+    Hash the actual output rather than build inputs: the timing wrapper can
+    chain sccache, whose rebuilds need not produce deterministic paths or
+    timestamps. This intentionally reduces repeat coverage for unchanged
+    concurrency canaries; changed binaries always run, and operators can
+    delete test-results.json to force a full execution pass.
+    """
+    cached = load_test_result_cache(cache_path)
+    runnable: list[dict] = []
+    executable_hashes: dict[int, str] = {}
+    for binary in binaries:
+        digest = executable_hash(binary["executable"])
+        if digest is not None and digest in cached:
+            record_cached_test_result(binary)
+            continue
+        runnable.append(binary)
+        if digest is not None:
+            executable_hashes[id(binary)] = digest
+    return runnable, cached, executable_hashes
+
+
+def cache_passing_test_results(
+    path: Path,
+    cached: dict[str, dict],
+    binaries: list[dict],
+    executable_hashes: dict[int, str],
+) -> None:
+    """Cache only tests that completed with a successful, clean result."""
+    changed = False
+    for binary in binaries:
+        digest = executable_hashes.get(id(binary))
+        cleanup = binary.get("cleanup") or {}
+        if (
+            digest is not None
+            and binary.get("execute_exit_code") == 0
+            and binary.get("execute_outcome") == "passed"
+            and cleanup.get("complete") is True
+        ):
+            cached[digest] = {
+                "exit": 0,
+                "target_name": (
+                    binary.get("target_name")
+                    or Path(binary["executable"]).name
+                ),
+            }
+            changed = True
+    if changed:
+        try:
+            write_test_result_cache(path, cached)
+        except BaseException as exc:
+            print(
+                "preflight timing: could not write test-result cache; "
+                f"next run will execute cache misses: {exc}",
+                file=sys.stderr,
+            )
+
+
+def test_execution_counts(binaries: list[dict]) -> tuple[int, int, int]:
+    cached = sum(binary.get("cached") is True for binary in binaries)
+    executed = sum(
+        binary.get("cached") is not True
+        and "execute_exit_code" in binary
+        for binary in binaries
+    )
+    return executed, cached, len(binaries) - executed - cached
 
 
 class CollectorInterrupted(BaseException):
@@ -1675,6 +1812,12 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
         lines.append(f"  {g['name']:<24} {g['duration_secs']:>10.2f}s  {tag}")
     lines.append("")
     binaries = data.get("test_binaries") or []
+    executed, cached, not_run = test_execution_counts(binaries)
+    execution_line = f"test binaries: {executed} executed, {cached} cached"
+    if not_run:
+        execution_line += f", {not_run} not run"
+    lines.append(execution_line)
+    lines.append("")
     top = slowest(binaries, top_n)
     lines.append(
         f"slowest test binaries (top {len(top)} of {len(binaries)}):"
@@ -1705,6 +1848,7 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
     out.mkdir(parents=True, exist_ok=True)
     artifact = out / "timing.json"
     summary = out / "summary.txt"
+    test_result_cache = out / "test-results.json"
     compile_log = out / "cargo-test-no-run.jsonl"
     stderr_log = out / "cargo-test-no-run.stderr"
     rustc_log = out / "rustc-invocations.jsonl"
@@ -1775,20 +1919,27 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
         }
 
     if status == 0:
+        runnable, cached_results, executable_hashes = (
+            select_test_binaries_to_execute(binaries, test_result_cache)
+        )
+        cached_count = len(binaries) - len(runnable)
         print(
-            f"=== timing 4/4: run {len(binaries)} test binaries "
-            f"(--test-jobs {args.test_jobs}, "
+            f"=== timing 4/4: run {len(runnable)} of {len(binaries)} test binaries "
+            f"({cached_count} cached; --test-jobs {args.test_jobs}, "
             f"--test-threads {args.test_threads}, "
             f"{args.test_timeout_secs:g}s deadline each) ===",
             flush=True,
         )
         t0 = now()
         exec_rc, interrupted_signal, test_failure = execute_test_binaries(
-            binaries,
+            runnable,
             args.test_jobs,
             args.test_threads,
             args.test_timeout_secs,
             args.term_grace_secs,
+        )
+        cache_passing_test_results(
+            test_result_cache, cached_results, runnable, executable_hashes
         )
         if test_failure is not None:
             first_failure = test_failure
@@ -1796,6 +1947,7 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
         if interrupted_signal is not None:
             status = 128 + interrupted_signal
 
+    executed_count, cached_count, not_run_count = test_execution_counts(binaries)
     data = {
         "version": 3,
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1808,6 +1960,11 @@ def collect(args: argparse.Namespace, wrapper_path: str) -> int:
         "first_failure": first_failure,
         "gates": gates,
         "test_binaries": binaries,
+        "test_execution": {
+            "executed": executed_count,
+            "cached": cached_count,
+            "not_run": not_run_count,
+        },
         "top_n_slowest": slowest(binaries, args.top_n),
         "rustc_wrapper": wrapper_stats,
     }
@@ -2048,6 +2205,88 @@ def self_test() -> int:
         assert matched2 == 0 and entries2 == 0
         assert binaries2[0]["compile_no_run_secs"] is None
 
+    # ---- test-result cache ----
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        cache_path = out / "test-results.json"
+        executable = out / "passing-test"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        binary = {
+            "target_name": "passing_test",
+            "executable": str(executable),
+        }
+
+        runnable, cached, hashes = select_test_binaries_to_execute(
+            [binary], cache_path
+        )
+        assert runnable == [binary]
+        rc, interrupted, failure = execute_test_binaries(
+            runnable, jobs=1, threads=1, timeout_secs=5, term_grace_secs=0.1
+        )
+        assert (rc, interrupted, failure) == (0, None, None)
+        cache_passing_test_results(cache_path, cached, runnable, hashes)
+        digest = executable_hash(str(executable))
+        assert digest is not None
+        assert json.loads(cache_path.read_text()) == {
+            digest: {"exit": 0, "target_name": "passing_test"}
+        }
+
+        cached_binary = {
+            "target_name": "passing_test",
+            "executable": str(executable),
+        }
+        runnable, _, _ = select_test_binaries_to_execute(
+            [cached_binary], cache_path
+        )
+        assert runnable == []
+        assert cached_binary["cached"] is True
+        assert cached_binary["execute_secs"] == 0.0
+
+        # A changed executable must run even if its target name is unchanged.
+        executable.write_text("#!/bin/sh\n# changed\nexit 0\n")
+        executable.chmod(0o755)
+        changed_binary = {
+            "target_name": "passing_test",
+            "executable": str(executable),
+        }
+        runnable, _, _ = select_test_binaries_to_execute(
+            [changed_binary], cache_path
+        )
+        assert runnable == [changed_binary]
+
+        # Corrupt cache data is a full miss and a green run replaces it.
+        cache_path.write_text("not json\n")
+        runnable, cached, hashes = select_test_binaries_to_execute(
+            [changed_binary], cache_path
+        )
+        assert runnable == [changed_binary] and cached == {}
+        rc, interrupted, failure = execute_test_binaries(
+            runnable, jobs=1, threads=1, timeout_secs=5, term_grace_secs=0.1
+        )
+        assert (rc, interrupted, failure) == (0, None, None)
+        cache_passing_test_results(cache_path, cached, runnable, hashes)
+        assert executable_hash(str(executable)) in json.loads(
+            cache_path.read_text()
+        )
+
+        failing = out / "failing-test"
+        failing.write_text("#!/bin/sh\nexit 42\n")
+        failing.chmod(0o755)
+        failed_binary = {
+            "target_name": "failing_test",
+            "executable": str(failing),
+        }
+        runnable, cached, hashes = select_test_binaries_to_execute(
+            [failed_binary], cache_path
+        )
+        rc, interrupted, failure = execute_test_binaries(
+            runnable, jobs=1, threads=1, timeout_secs=5, term_grace_secs=0.1
+        )
+        assert rc == 42 and interrupted is None and failure is not None
+        cache_passing_test_results(cache_path, cached, runnable, hashes)
+        assert executable_hash(str(failing)) not in cached
+
     # ---- (1) artifact + bounded top-N ----
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp)
@@ -2093,6 +2332,7 @@ def self_test() -> int:
         assert len(parsed["top_n_slowest"]) == 5
 
         emit_summary(summary, data, top_n=5)
+        assert "test binaries: 20 executed, 0 cached" in summary.read_text()
         rows = [
             ln for ln in summary.read_text().splitlines()
             if ln.startswith("  bin_")
