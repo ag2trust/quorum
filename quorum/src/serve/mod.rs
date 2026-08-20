@@ -14683,7 +14683,7 @@ struct DurableGrokWorkerIdentity {
     assignment_effort: String,
 }
 
-/// Atomically hand off a Grok initial worker's terminal session identity.
+/// Atomically hand off a fresh Grok worker's terminal session identity.
 ///
 /// Grok issues its identity only at terminal end, so accepting completion first
 /// and persisting later would allow a continuation decision to race missing or
@@ -14749,7 +14749,9 @@ async fn persist_initial_grok_worker_session(
                 [task_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
-        if status != "working" || assignee.as_deref() != Some(agent.as_str()) {
+        if !matches!(status.as_str(), "working" | "rework")
+            || assignee.as_deref() != Some(agent.as_str())
+        {
             return Err(QuorumError::Io(format!(
                 "Grok worker terminal identity arrived after task #{task_id} left its exact working assignment"
             )));
@@ -14876,7 +14878,7 @@ async fn persist_initial_grok_worker_session(
         );
         let updated = tx.execute(
             "UPDATE tasks SET refs=?2,updated_at=?3
-             WHERE id=?1 AND status='working' AND assignee=?4 AND revision=?5",
+             WHERE id=?1 AND status IN ('working','rework') AND assignee=?4 AND revision=?5",
             rusqlite::params![task_id, refs.to_string(), now_unix(), agent, revision],
         )?;
         if updated != 1 {
@@ -19930,19 +19932,58 @@ async fn spawn_remediation_worker(
 
     let launch_continuation_id =
         runner_continuation_id(remediation_kind, &session_id, continuation_id.as_deref());
-    let spawn_result = runner::RunnerProc::launch(
-        &runner::LaunchRequest {
-            model: &remediation_model,
-            effort: &remediation_effort,
-            worktree: &wt_path,
-            prompt: &prompt,
-            environment: &remediation_env,
-            mode: runner::LaunchMode::Normal,
-            continuation_id: launch_continuation_id,
-        },
-        &runner_adapter_config(config, agent_bin_for_kind(config, remediation_kind)),
-    )
-    .await;
+    let fresh_grok_handoff =
+        remediation_kind == runner::AgentKind::Grok && launch_continuation_id.is_none();
+    let launch = runner::LaunchRequest {
+        model: &remediation_model,
+        effort: &remediation_effort,
+        worktree: &wt_path,
+        prompt: &prompt,
+        environment: &remediation_env,
+        mode: runner::LaunchMode::Normal,
+        continuation_id: launch_continuation_id,
+    };
+    let spawn_result = if fresh_grok_handoff {
+        // A workerless review-only task begins its first managed Grok turn in
+        // lifecycle rework, but it has no provider session to resume. Retain
+        // the exact fresh-worker request so Grok's terminal-only session ID
+        // is durable before TurnCompleted.
+        let assignment = worker_assignment.as_ref().ok_or_else(|| {
+            QuorumError::Io(
+                "fresh Grok remediation is missing its durable worker assignment".into(),
+            )
+        })?;
+        runner::RunnerProc::launch_internal_worker(
+            &runner::RunnerRequest {
+                launch,
+                task_id,
+                role_assignment_id: assignment.id,
+                responsibility_key: &assignment.responsibility_key,
+                agent: &agent_name,
+                role: "worker",
+                pending_turn: PendingTurn {
+                    provider: "grok".into(),
+                    model: remediation_model.clone(),
+                    effort: remediation_effort.clone(),
+                    prompt: prompt.clone(),
+                    // This is the first provider turn, even though the
+                    // lifecycle is rework; later remediation resumes its
+                    // terminal-issued continuation normally.
+                    turn_kind: "initial".into(),
+                    continuation_id: None,
+                    requested: false,
+                },
+            },
+            &runner_adapter_config(config, agent_bin_for_kind(config, remediation_kind)),
+        )
+        .await
+    } else {
+        runner::RunnerProc::launch(
+            &launch,
+            &runner_adapter_config(config, agent_bin_for_kind(config, remediation_kind)),
+        )
+        .await
+    };
 
     match spawn_result {
         Ok(proc) => {
@@ -20022,7 +20063,15 @@ async fn spawn_remediation_worker(
                 reviewed_head_sha: None,
                 continuation_id,
                 pending_prompt: prompt,
-                pending_turn_kind: "rework".into(),
+                // A workerless review-only Grok remediation begins the
+                // provider conversation fresh. Keep the initial turn marker
+                // aligned with its retained RunnerRequest; `rework_count`
+                // independently drives the lifecycle's ReworkPushed event.
+                pending_turn_kind: if fresh_grok_handoff {
+                    "initial".into()
+                } else {
+                    "rework".into()
+                },
             });
 
             log(&format!(
@@ -22074,6 +22123,126 @@ mod tests {
         assert_eq!(handoff.pending_turn.turn_kind, "initial");
         assert!(handoff.pending_turn.continuation_id.is_none());
         assert_eq!(handoff.session_id, "grok-session-exact");
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_grok_provider_retry_in_rework_persists_terminal_session_before_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"grok-retry-session\"}'",
+        )
+        .await;
+
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let refs = serde_json::json!({
+                "cx_est": 3,
+                "cx_size": "M",
+                "cx_ready": true,
+                "cx_not_ready_reason": null,
+                "cx_by": "internal-test:v2",
+                "runner_retry": {
+                    "provider": "grok",
+                    "model": "grok-4.5",
+                    "effort": "high",
+                    "prompt": "preserve the exact internal initial prompt",
+                    "turn_kind": "initial",
+                    "requested": true,
+                }
+            });
+            conn.execute(
+                "UPDATE tasks SET status='rework',assignee=NULL,refs=?2 WHERE id=?1",
+                rusqlite::params![task_id, refs.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
+                [quorum_core::tasks::lease_target(task_id)],
+            )
+            .unwrap();
+            let reclaimed = tasks::claim_provider_retry_rework(
+                &mut conn,
+                "Internal-grok",
+                task_id,
+                3600,
+                now_unix(),
+            )
+            .unwrap()
+            .expect("no-session Grok retry must reclaim exact rework authority");
+            assert_eq!(reclaimed.status, "rework");
+            assert_eq!(reclaimed.assignee.as_deref(), Some("Internal-grok"));
+        }
+
+        assert!(
+            drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none(),
+            "a fresh Grok retry must hand off its terminal session before TurnCompleted"
+        );
+        assert_eq!(slot.continuation_id.as_deref(), Some("grok-retry-session"));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .expect("fresh retry terminal identity must be durable")
+                .session_id,
+            "grok-retry-session"
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_grok_remediation_in_rework_keeps_initial_handoff_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"grok-remediation-session\"}'",
+        )
+        .await;
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [task_id])
+                .unwrap();
+        }
+
+        let request = slot
+            .worker_request()
+            .expect("fresh remediation must retain its terminal-handoff request");
+        assert_eq!(request.pending_turn.turn_kind, "initial");
+        assert!(request.pending_turn.continuation_id.is_none());
+        assert_eq!(slot.pending_turn_kind, "initial");
+
+        assert!(
+            drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none(),
+            "a fresh Grok remediation must hand off its terminal session before TurnCompleted"
+        );
+        assert_eq!(
+            slot.continuation_id.as_deref(),
+            Some("grok-remediation-session")
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "grok-remediation-session"
+        );
+        drop(conn);
         slot.kill_and_reap().await;
     }
 
