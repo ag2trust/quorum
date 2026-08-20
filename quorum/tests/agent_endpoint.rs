@@ -319,6 +319,13 @@ fn mailbox_count(db: &Path) -> i64 {
         .unwrap()
 }
 
+fn task_note_count(db: &Path) -> i64 {
+    quorum_core::db::open(db)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM task_notes", [], |row| row.get(0))
+        .unwrap()
+}
+
 #[test]
 fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
     let root = tempfile::tempdir().unwrap();
@@ -356,6 +363,7 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
 
     install_authority_fixtures(&db);
     let before = mailbox_count(&db);
+    let notes_before = task_note_count(&db);
 
     let inventory = exchange(
         &endpoint,
@@ -425,14 +433,47 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
         ),
         exchange(
             &endpoint,
+            &request("missing", json!({"type":"append_note","note":"denied"})),
+        ),
+        exchange(
+            &endpoint,
+            &request("revoked-cap", json!({"type":"append_note","note":"denied"})),
+        ),
+        exchange(
+            &endpoint,
+            &request("ended-cap", json!({"type":"append_note","note":"denied"})),
+        ),
+        exchange(
+            &endpoint,
+            &request("old-cap", json!({"type":"append_note","note":"denied"})),
+        ),
+        exchange(
+            &endpoint,
+            &request("worker-cap", json!({"type":"append_note","note":""})),
+        ),
+        exchange(
+            &endpoint,
+            &request(
+                "worker-cap",
+                json!({"type":"append_note","note":"bad\u{0000}note"}),
+            ),
+        ),
+        exchange(
+            &endpoint,
             &json!({"version":1,"capability":"worker-cap","operation":{"type":"raw_sql"}}),
         ),
         exchange_raw(&endpoint, 5, b"nope!"),
+        exchange_raw(&endpoint, 1, &[0xff]),
         exchange_raw(&endpoint, (MAX_REQUEST_BYTES + 1) as u32, &[]),
     ] {
         assert_eq!(denied["ok"], false, "unexpected response: {denied}");
     }
     assert_eq!(mailbox_count(&db), before);
+    assert_eq!(
+        task_note_count(&db),
+        notes_before,
+        "rejected calls wrote notes"
+    );
 
     // A bounded processing failure must own the blocking transaction through
     // rollback. Releasing the contended write lock after the failure cannot
@@ -461,6 +502,28 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
         &request("worker-cap", json!({"type":"react","state":"note"})),
     );
     assert_eq!(reaction["ok"], true);
+    let worker_note = exchange(
+        &endpoint,
+        &request(
+            "worker-cap",
+            json!({"type":"append_note","note":"worker progress"}),
+        ),
+    );
+    assert_eq!(worker_note["version"], 1);
+    assert_eq!(worker_note["ok"], true);
+    assert_eq!(worker_note["result"]["type"], "task_note");
+    assert!(worker_note["result"]["note_id"].as_i64().unwrap() > 0);
+    let reviewer_note = exchange(
+        &endpoint,
+        &request(
+            "reviewer-cap",
+            json!({"type":"append_note","note":"review progress"}),
+        ),
+    );
+    assert_eq!(reviewer_note["version"], 1);
+    assert_eq!(reviewer_note["ok"], true);
+    assert_eq!(reviewer_note["result"]["type"], "task_note");
+    assert!(reviewer_note["result"]["note_id"].as_i64().unwrap() > 0);
     let reviewer_submit = exchange(
         &endpoint,
         &request(
@@ -537,6 +600,26 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
                 None,
                 Some("Delivered endpoint".into()),
             ),
+        ]
+    );
+    let notes: Vec<(i64, String, String)> = conn
+        .prepare("SELECT task_id,agent,body FROM task_notes WHERE id IN (?1,?2) ORDER BY id")
+        .unwrap()
+        .query_map(
+            params![
+                worker_note["result"]["note_id"].as_i64().unwrap(),
+                reviewer_note["result"]["note_id"].as_i64().unwrap(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        notes,
+        vec![
+            (100, "Worker".into(), "worker progress".into()),
+            (101, "Reviewer".into(), "review progress".into()),
         ]
     );
     drop(conn);

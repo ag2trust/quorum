@@ -27,6 +27,9 @@ struct Request<'a> {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation<'a> {
+    AppendNote {
+        note: &'a str,
+    },
     Submit {
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<&'a str>,
@@ -58,6 +61,7 @@ struct Response {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ResponseResult {
+    TaskNote { note_id: i64 },
     Mailbox { mailbox_id: i64 },
 }
 
@@ -78,7 +82,7 @@ pub struct Submit<'a> {
 }
 
 pub fn submit(request: Submit<'_>) -> Result<i64> {
-    exchange(
+    mailbox_id(exchange(
         request.capability,
         Operation::Submit {
             summary: request.summary,
@@ -87,14 +91,26 @@ pub fn submit(request: Submit<'_>) -> Result<i64> {
             feedback_json: request.feedback_json,
             blocking: request.blocking,
         },
-    )
+    )?)
 }
 
 pub fn react(capability: &str, state: &str) -> Result<i64> {
-    exchange(capability, Operation::React { state })
+    mailbox_id(exchange(capability, Operation::React { state })?)
 }
 
-fn exchange(capability: &str, operation: Operation<'_>) -> Result<i64> {
+/// Append a capability-scoped progress note. The daemon derives the task and
+/// agent; callers provide only their run capability and bounded note text.
+pub fn append_note(capability: &str, note: &str) -> Result<i64> {
+    if note.is_empty() || note.contains('\0') || note.len() > MAX_FRAME_BYTES {
+        return Err(QuorumError::Usage(
+            "managed progress note must be non-empty, within the endpoint limit, and contain no NUL"
+                .into(),
+        ));
+    }
+    note_id(exchange(capability, Operation::AppendNote { note })?)
+}
+
+fn exchange(capability: &str, operation: Operation<'_>) -> Result<ResponseResult> {
     let endpoint = endpoint()?;
     let request = Request {
         version: PROTOCOL_VERSION,
@@ -140,9 +156,7 @@ fn exchange(capability: &str, operation: Operation<'_>) -> Result<i64> {
         ));
     }
     match (response.ok, response.result, response.error) {
-        (true, Some(ResponseResult::Mailbox { mailbox_id }), None) if mailbox_id > 0 => {
-            Ok(mailbox_id)
-        }
+        (true, Some(result), None) => Ok(result),
         (false, None, Some(error)) if !error.code.is_empty() && !error.message.is_empty() => {
             endpoint_rejection(error.code)
         }
@@ -152,7 +166,25 @@ fn exchange(capability: &str, operation: Operation<'_>) -> Result<i64> {
     }
 }
 
-fn endpoint_rejection(code: String) -> Result<i64> {
+fn mailbox_id(result: ResponseResult) -> Result<i64> {
+    match result {
+        ResponseResult::Mailbox { mailbox_id } if mailbox_id > 0 => Ok(mailbox_id),
+        _ => Err(QuorumError::Io(
+            "agent endpoint returned malformed response".into(),
+        )),
+    }
+}
+
+fn note_id(result: ResponseResult) -> Result<i64> {
+    match result {
+        ResponseResult::TaskNote { note_id } if note_id > 0 => Ok(note_id),
+        _ => Err(QuorumError::Io(
+            "agent endpoint returned malformed response".into(),
+        )),
+    }
+}
+
+fn endpoint_rejection<T>(code: String) -> Result<T> {
     match code.as_str() {
         "unauthorized" | "invalid_operation" | "forbidden_operation" | "operation_unavailable" => {
             Err(QuorumError::Usage(format!(

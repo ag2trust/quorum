@@ -1798,6 +1798,9 @@ fn cancellation_after_remediation_claim_prevents_provisioning() {
     let cancelled = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env_remove("QUORUM_AGENT")
+        .env_remove("QUORUM_RUN_ID")
+        .env_remove("QUORUM_AGENT_ENDPOINT")
         .args([
             "task-update",
             "--task-id",

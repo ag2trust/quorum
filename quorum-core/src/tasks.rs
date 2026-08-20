@@ -4763,22 +4763,36 @@ pub fn add_note(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let id = add_note_tx(&tx, agent, task_id, body, now)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Append one task note inside a caller-owned write transaction.
+///
+/// Capability-bound endpoint operations use this boundary after deriving their
+/// task and agent in the same transaction. It contains only the durable note
+/// write: lifecycle housekeeping remains with standalone task-update calls.
+pub fn add_note_tx(
+    tx: &Transaction<'_>,
+    agent: &str,
+    task_id: i64,
+    body: &str,
+    now: i64,
+) -> Result<Option<i64>> {
     let exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
         params![task_id],
         |r| r.get(0),
     )?;
     if !exists {
-        tx.commit()?;
         return Ok(None);
     }
     tx.execute(
         "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, ?3, ?4)",
         params![task_id, now, agent, body],
     )?;
-    let id = tx.last_insert_rowid();
-    tx.commit()?;
-    Ok(Some(id))
+    Ok(Some(tx.last_insert_rowid()))
 }
 
 fn notes_for(conn: &Connection, task_id: i64) -> Result<Vec<Note>> {

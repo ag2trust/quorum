@@ -11,7 +11,13 @@ use predicates::prelude::PredicateBooleanExt;
 
 fn quorum(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("quorum").unwrap();
-    c.env("QUORUM_HOME", home).env("QUORUM_REPO", "test/repo");
+    c.env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        // Public task-command tests must not inherit this managed worker's
+        // endpoint credentials into their subprocesses.
+        .env_remove("QUORUM_AGENT")
+        .env_remove("QUORUM_RUN_ID")
+        .env_remove("QUORUM_AGENT_ENDPOINT");
     c
 }
 
