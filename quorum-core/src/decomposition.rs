@@ -2109,7 +2109,8 @@ pub fn adopt_recovery_delivery(
 }
 
 /// Explicitly authorize the exact durable delivery of a completed managed
-/// continuation for the final failed member of an active decomposition.
+/// continuation for the final failed member of an active decomposition, or of
+/// a boundary-violation-blocked decomposition when that block names this child.
 ///
 /// This is the operator recovery path for a known pair, not a discovery
 /// mechanism and not general task equivalence. It substitutes durable daemon
@@ -2160,7 +2161,17 @@ pub fn adopt_explicit_recovery_delivery(
              WHERE original.id=?1 AND original.id!=recovery.id
                AND original.status='failed'
                AND member.active=1 AND member.plan_revision=graph.accepted_plan_revision
-               AND graph.state='active' AND graph.active=1
+               AND graph.active=1
+               AND (
+                    graph.state='active'
+                    OR (
+                        graph.state='blocked'
+                        AND graph.hold_code=?4
+                        AND json_valid(graph.hold_summary)
+                        AND json_type(graph.hold_summary,'$.affected_task')='integer'
+                        AND json_extract(graph.hold_summary,'$.affected_task')=original.id
+                    )
+               )
                AND source.status='decomposed'
                AND NOT EXISTS (
                     SELECT 1 FROM task_graph_members sibling
@@ -2248,7 +2259,8 @@ pub fn adopt_explicit_recovery_delivery(
             params![
                 input.original_child_id,
                 input.recovery_task_id,
-                crate::tasks::COMPLETION_PROVENANCE_MERGED
+                crate::tasks::COMPLETION_PROVENANCE_MERGED,
+                GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION
             ],
             |row| {
                 Ok(RecoveryDelivery {
@@ -2367,7 +2379,11 @@ fn finalize_recovery_delivery(
         ),
         now,
     )?;
-    complete_graph_if_final_child(tx, original_child_id, now)?;
+    if explicit_authority.is_some() {
+        complete_graph_after_explicit_boundary_recovery(tx, original_child_id, now)?;
+    } else {
+        complete_graph_if_final_child(tx, original_child_id, now)?;
+    }
     Ok(())
 }
 
@@ -2378,13 +2394,47 @@ pub(crate) fn complete_graph_if_final_child(
     task_id: i64,
     now: i64,
 ) -> Result<bool> {
+    complete_graph_if_final_child_with_boundary_recovery(tx, task_id, now, false)
+}
+
+/// The explicit operator recovery path may complete a blocked graph only when
+/// the persisted boundary blocker names the child whose exact delivery it just
+/// adopted. Ordinary child completion intentionally cannot clear a block.
+fn complete_graph_after_explicit_boundary_recovery(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    now: i64,
+) -> Result<bool> {
+    complete_graph_if_final_child_with_boundary_recovery(tx, task_id, now, true)
+}
+
+fn complete_graph_if_final_child_with_boundary_recovery(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    now: i64,
+    allow_boundary_recovery: bool,
+) -> Result<bool> {
     let graph: Option<(i64, i64)> = tx
         .query_row(
             "SELECT d.id,d.source_task_id
              FROM task_graph_members m
              JOIN task_decompositions d ON d.id=m.graph_id
-             WHERE m.task_id=?1 AND m.active=1 AND d.state='active' AND d.active=1",
-            [task_id],
+             WHERE m.task_id=?1 AND m.active=1 AND d.active=1
+               AND (
+                    d.state='active'
+                    OR (
+                        ?2=1 AND d.state='blocked'
+                        AND d.hold_code=?3
+                        AND json_valid(d.hold_summary)
+                        AND json_type(d.hold_summary,'$.affected_task')='integer'
+                        AND json_extract(d.hold_summary,'$.affected_task')=m.task_id
+                    )
+               )",
+            params![
+                task_id,
+                allow_boundary_recovery,
+                GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION
+            ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -2402,9 +2452,27 @@ pub(crate) fn complete_graph_if_final_child(
         return Ok(false);
     }
     let graph_changed = tx.execute(
-        "UPDATE task_decompositions SET state='completed',active=0,freeze_active=0,updated_at=?2
-         WHERE id=?1 AND state='active' AND active=1",
-        params![graph_id, now],
+        "UPDATE task_decompositions
+         SET state='completed',active=0,freeze_active=0,hold_code=NULL,hold_summary=NULL,
+             updated_at=?2
+         WHERE id=?1 AND active=1
+           AND (
+                state='active'
+                OR (
+                    ?3=1 AND state='blocked'
+                    AND hold_code=?4
+                    AND json_valid(hold_summary)
+                    AND json_type(hold_summary,'$.affected_task')='integer'
+                    AND json_extract(hold_summary,'$.affected_task')=?5
+                )
+           )",
+        params![
+            graph_id,
+            now,
+            allow_boundary_recovery,
+            GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION,
+            task_id
+        ],
     )?;
     if graph_changed != 1 {
         return Ok(false);
@@ -5894,6 +5962,110 @@ mod tests {
             )
             .unwrap();
         assert_eq!(completed_events, 0);
+    }
+
+    #[test]
+    fn explicit_recovery_completes_boundary_blocked_graph_for_affected_child() {
+        let mut fixture = RecoveryFixture::new();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET status='in-review',reviewer='blocker',assignee='blocker'
+                 WHERE id=?1",
+                [fixture.original],
+            )
+            .unwrap();
+        add_reviewer_authority(
+            &mut fixture.conn,
+            fixture.original,
+            "blocker",
+            "boundary-blocker-run",
+            "reviewer",
+            50,
+        );
+        let evidence = vec!["review evidence".into()];
+        assert!(block_graph(
+            &mut fixture.conn,
+            &GraphBlocker {
+                task_id: fixture.original,
+                reviewer: "blocker",
+                run_id: "boundary-blocker-run",
+                category: GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION,
+                violated_boundary: "child crossed a safety boundary",
+                evidence: &evidence,
+                now: 51,
+            }
+        )
+        .unwrap());
+        fixture.make_explicit_eligible();
+
+        assert!(fixture.explicit_adoption(90_000));
+        assert_graph_completed(
+            &fixture.conn,
+            fixture.graph,
+            1,
+            &[
+                fixture.siblings[0],
+                fixture.siblings[1],
+                fixture.siblings[2],
+                fixture.original,
+            ],
+        );
+        let holds: (Option<String>, Option<String>) = fixture
+            .conn
+            .query_row(
+                "SELECT hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [fixture.graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(holds, (None, None));
+    }
+
+    #[test]
+    fn explicit_recovery_refuses_boundary_block_for_another_child_without_mutation() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+        fixture
+            .conn
+            .execute(
+                "UPDATE task_decompositions
+                 SET state='blocked',hold_code=?2,hold_summary=?3
+                 WHERE id=?1",
+                params![
+                    fixture.graph,
+                    GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION,
+                    serde_json::json!({
+                        "affected_task": fixture.siblings[0],
+                        "violated_boundary": "another child crossed a safety boundary",
+                        "evidence": ["review evidence"]
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        assert!(!fixture.explicit_adoption(90_000));
+        let state: (String, String, String, i64) = fixture
+            .conn
+            .query_row(
+                "SELECT child.status,graph.state,source.status,
+                        (SELECT count(*) FROM decomposition_attempts
+                         WHERE graph_id=graph.id AND kind='recovery'
+                           AND reason_code='explicit-delivery-adoption')
+                 FROM tasks child
+                 JOIN task_graph_members member ON member.task_id=child.id
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks source ON source.id=graph.source_task_id
+                 WHERE child.id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("failed".into(), "blocked".into(), "decomposed".into(), 0)
+        );
     }
 
     #[test]
