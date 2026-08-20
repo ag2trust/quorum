@@ -2118,8 +2118,9 @@ pub fn adopt_recovery_delivery(
 ///
 /// This is the operator recovery path for a known pair, not a discovery
 /// mechanism and not general task equivalence. It substitutes durable daemon
-/// evidence for the automatic path's short-lived events: a completed managed
-/// worker must precede the persisted final PR target, an approved managed
+/// evidence for the automatic path's short-lived events: the final managed
+/// worker run must complete before the persisted final PR target or be merged,
+/// an approved managed
 /// reviewer must be bound to that exact target head, and daemon-owned merged
 /// completion provenance must close the chain. Conflicting `source_task`
 /// metadata is rejected; absent metadata grants no authority beyond this
@@ -2224,8 +2225,9 @@ pub fn adopt_explicit_recovery_delivery(
                       ON assignment.id=worker.role_assignment_id
                     WHERE worker.task_id=recovery.id AND worker.role='worker'
                       AND worker.sub_role IS NULL AND worker.ended_at IS NOT NULL
-                      AND worker.end_reason='completed'
-                      AND worker.ended_at<=recovery_target.resolved_at
+                      AND worker.end_reason IN ('completed','merged')
+                      AND (worker.end_reason='merged'
+                           OR worker.ended_at<=recovery_target.resolved_at)
                       AND worker.id=(
                            SELECT MAX(latest_worker.id) FROM agent_runs latest_worker
                            WHERE latest_worker.task_id=recovery.id
@@ -3325,6 +3327,26 @@ mod tests {
                 .execute(
                     "UPDATE pr_targets SET resolved_at=20 WHERE task_id=?1",
                     [self.recovery],
+                )
+                .unwrap();
+        }
+
+        fn add_final_worker_run(&mut self, end_reason: &str, ended_at: i64) {
+            let assignment: i64 = self
+                .conn
+                .query_row(
+                    "SELECT id FROM role_assignments
+                     WHERE task_id=?1 AND role='worker' AND pr_number IS NULL",
+                    [self.recovery],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+                         role_assignment_id,spawned_at,ended_at,end_reason)
+                     VALUES (?1,'worker','worker','sol','high','codex',?2,21,?3,?4)",
+                    params![self.recovery, assignment, ended_at, end_reason],
                 )
                 .unwrap();
         }
@@ -6215,7 +6237,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_recovery_completes_boundary_blocked_graph_for_affected_child() {
+    fn explicit_recovery_adopts_final_merged_worker_after_target_resolution() {
         let mut fixture = RecoveryFixture::new();
         fixture
             .conn
@@ -6248,6 +6270,7 @@ mod tests {
         )
         .unwrap());
         fixture.make_explicit_eligible();
+        fixture.add_final_worker_run("merged", 26);
 
         assert!(fixture.explicit_adoption(90_000));
         assert_graph_completed(
@@ -6261,6 +6284,20 @@ mod tests {
                 fixture.original,
             ],
         );
+        let (provenance, refs): (Option<String>, String) = fixture
+            .conn
+            .query_row(
+                "SELECT completion_provenance,refs FROM tasks WHERE id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance.as_deref(),
+            Some(crate::tasks::COMPLETION_PROVENANCE_MERGED)
+        );
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["recovery_delivery"]["recovery_task"], fixture.recovery);
         let holds: (Option<String>, Option<String>) = fixture
             .conn
             .query_row(
@@ -6319,7 +6356,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_recovery_adopts_durable_delivery_after_event_expiry() {
+    fn explicit_recovery_adopts_final_completed_worker_before_target_resolution_after_event_expiry()
+    {
         let mut fixture = RecoveryFixture::new();
         fixture.make_explicit_eligible();
 
@@ -6481,6 +6519,18 @@ mod tests {
                             [fixture.recovery],
                         )
                         .unwrap();
+                }),
+            ),
+            (
+                "latest worker drained",
+                Box::new(|fixture| {
+                    fixture.add_final_worker_run("drain", 26);
+                }),
+            ),
+            (
+                "latest worker failed",
+                Box::new(|fixture| {
+                    fixture.add_final_worker_run("failed", 26);
                 }),
             ),
             (

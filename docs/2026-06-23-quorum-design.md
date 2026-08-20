@@ -2239,8 +2239,9 @@ recovery-authority surface. The same `BEGIN IMMEDIATE` transaction rechecks acti
 failed/final-child state, repository and PR identity, creator-selected continuation authority,
 and exact target/head agreement. It permits absent `source_task` metadata because the caller has
 named the exact pair, but rejects conflicting metadata. Instead of expiring feed events it requires
-the durable daemon chain: a completed assigned worker before the persisted final PR target, an
-assigned approved reviewer bound to that exact target head and sampling decision, and merged
+the durable daemon chain: the final assigned worker run is either `completed` before the persisted
+final PR target or `merged` (which may end after that target resolves), an assigned approved
+reviewer bound to that exact target head and sampling decision, and merged
 completion provenance. Success writes the operator, source, child, recovery task, PR, and head to
 the decomposition recovery ledger and child recovery projection before final-child completion. On
 an active graph this is ordinary completion. On a blocked graph it is permitted only when the hold
