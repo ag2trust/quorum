@@ -43,6 +43,8 @@ const MAX_SESSION_ID_BYTES: usize = 1024;
 const AUTH_STATE_FILE: &str = "auth.json";
 const AUTH_LOCK_FILE: &str = "auth.json.lock";
 const MANAGED_CONFIG_FILES: &[&str] = &["config.toml", "managed_config.toml", "requirements.toml"];
+const SYSTEM_GROK_CONFIG_DIR: &str = "/etc/grok";
+const SYSTEM_MANAGED_CONFIG_FILES: &[&str] = &["managed_config.toml", "requirements.toml"];
 
 #[cfg(test)]
 struct InjectedStderrReadError;
@@ -152,6 +154,24 @@ struct GrokMcpConfigHome {
 
 impl GrokMcpConfigHome {
     fn create(spec: &GrokSpec, server: AgentMcpServer) -> std::io::Result<Self> {
+        Self::create_with_system_config_dir(
+            spec,
+            server,
+            std::path::Path::new(SYSTEM_GROK_CONFIG_DIR),
+        )
+    }
+
+    fn create_with_system_config_dir(
+        spec: &GrokSpec,
+        server: AgentMcpServer,
+        system_config_dir: &std::path::Path,
+    ) -> std::io::Result<Self> {
+        if let Some(path) = system_mcp_or_plugin_source(system_config_dir)? {
+            return Err(invalid_input(format!(
+                "managed Grok MCP refuses system MCP/plugin source '{}'",
+                path.display()
+            )));
+        }
         if let Some(path) = project_mcp_source(&spec.worktree)? {
             return Err(invalid_input(format!(
                 "managed Grok MCP refuses project MCP source '{}'",
@@ -402,6 +422,23 @@ fn project_mcp_source(worktree: &std::path::Path) -> std::io::Result<Option<Path
     Ok(None)
 }
 
+/// Grok loads organization-controlled managed and requirements files from an
+/// absolute system directory in addition to the invocation's private home.
+/// Those layers cannot be replaced with private copies. Refuse a managed
+/// launch if they could register provider-native tools, rather than letting
+/// them bypass the daemon-derived role/phase inventory.
+fn system_mcp_or_plugin_source(
+    system_config_dir: &std::path::Path,
+) -> std::io::Result<Option<PathBuf>> {
+    for filename in SYSTEM_MANAGED_CONFIG_FILES {
+        let path = system_config_dir.join(filename);
+        if has_toml_mcp_or_plugin_source(&path, "system")? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
 fn has_project_mcp_servers(path: &std::path::Path) -> std::io::Result<bool> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -438,6 +475,32 @@ fn has_project_mcp_servers(path: &std::path::Path) -> std::io::Result<bool> {
     }))
 }
 
+fn has_toml_mcp_or_plugin_source(path: &std::path::Path, scope: &str) -> std::io::Result<bool> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let config = toml::from_str::<toml::Value>(&contents).map_err(|error| {
+        invalid_input(format!(
+            "Grok {scope} config '{}' is invalid: {error}",
+            path.display()
+        ))
+    })?;
+    let root = config
+        .as_table()
+        .ok_or_else(|| invalid_input(format!("Grok {scope} config root must be a TOML table")))?;
+    Ok([
+        "mcp_servers",
+        "mcpServers",
+        "plugins",
+        "marketplace",
+        "marketplaces",
+    ]
+    .into_iter()
+    .any(|key| root.get(key).is_some_and(toml_value_is_nonempty_table)))
+}
+
 fn toml_value_is_nonempty_table(value: &toml::Value) -> bool {
     value.as_table().is_some_and(|table| !table.is_empty())
 }
@@ -467,10 +530,18 @@ fn write_managed_config_layer(
     let root = config
         .as_table_mut()
         .ok_or_else(|| invalid_input("Grok config root must be a TOML table"))?;
-    root.remove("mcp_servers");
-    // Plugins can contribute stdio MCP servers independently of the TOML
-    // table, so a managed invocation must not retain their discovery paths.
-    root.remove("plugins");
+    for key in [
+        "mcp_servers",
+        "mcpServers",
+        "plugins",
+        "marketplace",
+        "marketplaces",
+    ] {
+        root.remove(key);
+    }
+    // Plugins and marketplaces can contribute stdio MCP servers independently
+    // of the native server table, so a managed invocation must not retain
+    // their discovery paths.
     if let Some(server) = server {
         root.insert(
             "mcp_servers".into(),
@@ -1401,6 +1472,7 @@ mod tests {
             original_home.join("config.toml"),
             "[models]\ndefault_reasoning_effort = \"high\"\n\
              [plugins]\npaths = [\"/operator/plugins\"]\n\
+             [[marketplace.sources]]\nname = \"operator\"\ngit = \"https://example.invalid/operator\"\n\
              [mcp_servers.operator]\ncommand = \"operator-mcp\"\n",
         )
         .unwrap();
@@ -1449,12 +1521,14 @@ mod tests {
         assert_eq!(config["mcp_servers"].as_table().unwrap().len(), 1);
         assert!(config["mcp_servers"].get("operator").is_none());
         assert!(config.get("plugins").is_none());
+        assert!(config.get("marketplace").is_none());
         for config_name in ["managed_config.toml", "requirements.toml"] {
             let layer: toml::Value =
                 toml::from_str(&std::fs::read_to_string(managed.path().join(config_name)).unwrap())
                     .unwrap();
             assert!(layer.get("mcp_servers").is_none(), "{config_name}: {layer}");
             assert!(layer.get("plugins").is_none(), "{config_name}: {layer}");
+            assert!(layer.get("marketplace").is_none(), "{config_name}: {layer}");
         }
         let sandbox: toml::Value =
             toml::from_str(&std::fs::read_to_string(managed.path().join("sandbox.toml")).unwrap())
@@ -1516,6 +1590,7 @@ mod tests {
             std::fs::read_to_string(original_home.join("config.toml")).unwrap(),
             "[models]\ndefault_reasoning_effort = \"high\"\n\
              [plugins]\npaths = [\"/operator/plugins\"]\n\
+             [[marketplace.sources]]\nname = \"operator\"\ngit = \"https://example.invalid/operator\"\n\
              [mcp_servers.operator]\ncommand = \"operator-mcp\"\n"
         );
     }
@@ -2272,6 +2347,47 @@ mod tests {
                 "{error}"
             );
             std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn managed_mcp_rejects_system_mcp_and_plugin_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = vec![(
+            "GROK_HOME".into(),
+            root.path().join("grok-home").display().to_string(),
+        )];
+
+        for (filename, contents) in [
+            (
+                "managed_config.toml",
+                "[mcp_servers.operator]\ncommand = \"operator-mcp\"\n",
+            ),
+            (
+                "requirements.toml",
+                "[plugins]\npaths = [\"/operator/plugins\"]\n",
+            ),
+            (
+                "managed_config.toml",
+                "[[marketplace.sources]]\nname = \"operator\"\ngit = \"https://example.invalid/operator\"\n",
+            ),
+        ] {
+            let system_config_dir = tempfile::tempdir_in(root.path()).unwrap();
+            let source = system_config_dir.path().join(filename);
+            std::fs::write(&source, contents).unwrap();
+            let error = GrokMcpConfigHome::create_with_system_config_dir(
+                &spec,
+                crate::serve::runner::AGENT_MCP_SERVER,
+                system_config_dir.path(),
+            )
+            .err()
+            .expect("managed Grok must reject a system tool source");
+            assert!(
+                error.to_string().contains(&source.display().to_string()),
+                "{error}"
+            );
         }
     }
 
