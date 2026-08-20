@@ -412,6 +412,9 @@ impl AgentProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+        if agent_mcp.is_some() {
+            strip_managed_mcp_authority(&mut cmd);
+        }
         if restricted == RestrictedMode::Planner {
             strip_coordination_env(&mut cmd);
         }
@@ -763,6 +766,16 @@ enum RestrictedMode {
     Planner,
 }
 
+/// The daemon endpoint is capability-scoped by the four QUORUM_* run fields.
+/// Do not let the provider forward unrelated operator credentials to its
+/// nested stdio child: the endpoint must never acquire ambient GitHub or
+/// Quorum-home authority merely because Claude happens to inherit it.
+fn strip_managed_mcp_authority(cmd: &mut Command) {
+    for name in ["GH_TOKEN", "GITHUB_TOKEN", "QUORUM_HOME", "GH_CONFIG_DIR"] {
+        cmd.env_remove(name);
+    }
+}
+
 fn strip_coordination_env(cmd: &mut Command) {
     for name in [
         "QUORUM_AGENT",
@@ -887,6 +900,122 @@ mod tests {
             bare,
             allowed_tools: String::new(),
             env_vars: vec![],
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_mcp_claude_child_scrubs_ambient_authority() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        struct EnvRestore {
+            name: &'static str,
+            previous: Option<OsString>,
+        }
+
+        impl EnvRestore {
+            fn poison(name: &'static str, value: &str) -> Self {
+                let previous = std::env::var_os(name);
+                std::env::set_var(name, value);
+                Self { name, previous }
+            }
+        }
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                if let Some(value) = self.previous.take() {
+                    std::env::set_var(self.name, value);
+                } else {
+                    std::env::remove_var(self.name);
+                }
+            }
+        }
+
+        let _environment = ENV_LOCK.lock().await;
+        let _gh = EnvRestore::poison("GH_TOKEN", "ambient-gh-token");
+        let _github = EnvRestore::poison("GITHUB_TOKEN", "ambient-github-token");
+        let _quorum_home = EnvRestore::poison("QUORUM_HOME", "/ambient/quorum-home");
+        let _gh_config = EnvRestore::poison("GH_CONFIG_DIR", "/ambient/gh-config");
+
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("mcp-child-environment.log");
+        let fake_quorum = root.path().join("quorum");
+        std::fs::write(
+            &fake_quorum,
+            format!(
+                "#!/bin/sh\n\\
+                 {{\n\\
+                   printf 'arg=%s\\n' \"$1\"\n\\
+                   printf 'repo=%s\\n' \"$QUORUM_REPO\"\n\\
+                   printf 'agent=%s\\n' \"$QUORUM_AGENT\"\n\\
+                   printf 'run=%s\\n' \"$QUORUM_RUN_ID\"\n\\
+                   printf 'endpoint=%s\\n' \"$QUORUM_AGENT_ENDPOINT\"\n\\
+                   printf 'gh=%s\\n' \"$GH_TOKEN\"\n\\
+                   printf 'github=%s\\n' \"$GITHUB_TOKEN\"\n\\
+                   printf 'quorum_home=%s\\n' \"$QUORUM_HOME\"\n\\
+                   printf 'gh_config=%s\\n' \"$GH_CONFIG_DIR\"\n\\
+                 }} > '{}'\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_quorum, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_claude = root.path().join("claude");
+        std::fs::write(
+            &fake_claude,
+            "#!/bin/sh\nquorum agent-mcp\nprintf '%s\\n' '{\"type\":\"result\",\"result\":\"done\",\"is_error\":false}'\nwhile IFS= read -r _line; do :; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut spec = classifier_spec(root.path(), true);
+        spec.env_vars = vec![
+            (
+                "PATH".into(),
+                format!(
+                    "{}:{}",
+                    root.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            ),
+            ("QUORUM_REPO".into(), "owner/repo".into()),
+            ("QUORUM_AGENT".into(), "Worker-test".into()),
+            ("QUORUM_RUN_ID".into(), "run-capability".into()),
+            (
+                "QUORUM_AGENT_ENDPOINT".into(),
+                "/tmp/quorum-agent.sock".into(),
+            ),
+        ];
+        let proc = AgentProc::spawn_configured(
+            &spec,
+            fake_claude.to_str(),
+            RestrictedMode::None,
+            Some(crate::serve::runner::AGENT_MCP_SERVER),
+        )
+        .unwrap();
+        for _ in 0..100 {
+            if capture.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let _ = proc.kill_and_reap().await;
+
+        let captured = std::fs::read_to_string(&capture)
+            .expect("managed Claude did not launch its configured MCP child");
+        assert!(captured.contains("arg=agent-mcp\n"), "{captured}");
+        assert!(captured.contains("repo=owner/repo\n"), "{captured}");
+        assert!(captured.contains("agent=Worker-test\n"), "{captured}");
+        assert!(captured.contains("run=run-capability\n"), "{captured}");
+        assert!(
+            captured.contains("endpoint=/tmp/quorum-agent.sock\n"),
+            "{captured}"
+        );
+        for absent in ["gh=\n", "github=\n", "quorum_home=\n", "gh_config=\n"] {
+            assert!(captured.contains(absent), "{captured}");
         }
     }
 
