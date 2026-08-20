@@ -1427,9 +1427,9 @@ pub fn cancel_source_graph(
         ));
     }
     let tx = begin_immediate(conn)?;
-    let source: Option<(i64, String, i64, String, Option<String>, i64)> = tx
+    let source: Option<(i64, String, String, Option<String>, i64)> = tx
         .query_row(
-            "SELECT d.id,d.state,d.active,t.created_by,t.assignee,t.revision
+            "SELECT d.id,d.state,t.created_by,t.assignee,t.revision
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
              WHERE d.source_task_id=?1",
             [source_task_id],
@@ -1440,12 +1440,11 @@ pub fn cancel_source_graph(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((graph_id, state, active, creator, assignee, revision)) = source else {
+    let Some((graph_id, state, creator, assignee, revision)) = source else {
         tx.commit()?;
         return Ok(SourceCancellation::NotGraphSource);
     };
@@ -1454,10 +1453,12 @@ pub fn cancel_source_graph(
             "decomposed source cancellation requires --expected-revision".into(),
         ));
     };
-    if creator != caller && assignee.as_deref() != Some(caller)
+    // Cancellation is the universal terminal escape hatch for any non-terminal
+    // graph state (planning/backoff/held/active/blocked/…). Only refuse on
+    // authority mismatch, stale revision, or an already-terminal graph.
+    if (creator != caller && assignee.as_deref() != Some(caller))
         || revision != expected_revision
-        || active != 1
-        || !matches!(state.as_str(), "active" | "blocked")
+        || matches!(state.as_str(), "completed" | "cancelled")
     {
         tx.commit()?;
         return Ok(SourceCancellation::Rejected);
@@ -1666,7 +1667,10 @@ fn cancel_graph_in_tx(
         [graph_id],
     )?;
     tx.execute(
-        "UPDATE task_decompositions SET state='cancelled',active=0,freeze_active=0,updated_at=?2
+        "UPDATE task_decompositions
+             SET state='cancelled',active=0,freeze_active=0,
+                 frozen_base_sha=NULL,hold_code=NULL,hold_summary=NULL,
+                 updated_at=?2
          WHERE id=?1",
         params![graph_id, now],
     )?;
@@ -4957,6 +4961,182 @@ mod tests {
             cancel_source_graph(&mut conn, "owner", 1, None, 5),
             Err(QuorumError::Usage(_))
         ));
+    }
+
+    fn assert_source_and_graph_cancelled(conn: &Connection, graph: i64) {
+        let row: (
+            String,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT d.state,d.active,d.freeze_active,d.frozen_base_sha,
+                        d.hold_code,d.hold_summary,t.status
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "cancelled", "graph state");
+        assert_eq!(row.1, 0, "graph active flag");
+        assert_eq!(row.2, 0, "graph freeze_active flag");
+        assert!(row.3.is_none(), "frozen_base_sha cleared");
+        assert!(row.4.is_none(), "hold_code cleared");
+        assert!(row.5.is_none(), "hold_summary cleared");
+        assert_eq!(row.6, "cancelled", "source task status");
+    }
+
+    #[test]
+    fn source_cancellation_from_provider_backoff_releases_zero_child_graph() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        record_attempt(&mut conn, graph, "provider", "timeout", "first", 3)
+            .unwrap()
+            .unwrap();
+        let pre: (String, i64, i64) = conn
+            .query_row(
+                "SELECT state,active,freeze_active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            pre,
+            ("provider-backoff".into(), 0, 0),
+            "precondition: stranded in provider-backoff"
+        );
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 5).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        assert_source_and_graph_cancelled(&conn, graph);
+
+        let members: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_graph_members WHERE graph_id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 0, "no members to clean up");
+        let cleanups: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM decomposition_cleanup WHERE graph_id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleanups, 0, "no cleanup intents to persist");
+        let events: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='task_cancelled' AND subject='task#1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "task_cancelled emitted once");
+    }
+
+    #[test]
+    fn source_cancellation_from_held_state_releases_exhausted_graph() {
+        let (mut conn, graph) = exhausted_provider();
+        let pre: (String, i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT state,active,freeze_active,hold_code
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (pre.0, pre.1, pre.2),
+            ("held".into(), 0, 0),
+            "precondition: exhausted planning stranded in held"
+        );
+        assert!(pre.3.is_some(), "precondition: hold_code populated");
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 20).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        assert_source_and_graph_cancelled(&conn, graph);
+    }
+
+    #[test]
+    fn source_cancellation_from_freeze_requested_releases_pre_children_graph() {
+        let mut conn = setup();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let pre: (String, i64, i64) = conn
+            .query_row(
+                "SELECT state,active,freeze_active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pre, ("freeze-requested".into(), 0, 1));
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 5).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        assert_source_and_graph_cancelled(&conn, graph);
+    }
+
+    #[test]
+    fn source_cancellation_rejects_terminal_graph_states() {
+        for terminal in ["completed", "cancelled"] {
+            let mut conn = setup();
+            let graph = begin(&mut conn);
+            conn.execute(
+                "UPDATE task_decompositions SET state=?2,active=0,freeze_active=0 WHERE id=?1",
+                params![graph, terminal],
+            )
+            .unwrap();
+            let source_status_before: String = conn
+                .query_row("SELECT status FROM tasks WHERE id=1", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                cancel_source_graph(&mut conn, "owner", 1, Some(1), 5).unwrap(),
+                SourceCancellation::Rejected,
+                "terminal graph state {terminal} must refuse cancellation"
+            );
+            let source_status_after: String = conn
+                .query_row("SELECT status FROM tasks WHERE id=1", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                source_status_before, source_status_after,
+                "terminal refusal must not mutate source"
+            );
+        }
     }
 
     #[test]
