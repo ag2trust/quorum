@@ -2,8 +2,8 @@
 
 use super::runner::{
     capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
-    CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation, FailureTracker,
-    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
+    AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation,
+    FailureTracker, LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
 };
 use super::stream::{self, Event};
 use std::path::PathBuf;
@@ -47,6 +47,7 @@ pub struct AgentProc {
 /// (#206) — without it the Skill call is silently denied and the review
 /// degrades to an unstructured read.
 pub(crate) const ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,Skill";
+const AGENT_MCP_ALLOWED_TOOL: &str = "mcp__github__*";
 /// Build a stream-json user turn. The claude CLI requires `message.role` and
 /// exits 1 on the first message without it — every turn fed to an agent MUST
 /// go through this helper (first live run died instantly on a role-less turn).
@@ -54,6 +55,18 @@ pub fn user_turn(content: &str) -> String {
     serde_json::json!({
         "type": "user",
         "message": { "role": "user", "content": content }
+    })
+    .to_string()
+}
+
+fn claude_mcp_config(server: AgentMcpServer) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            "github": {
+                "command": server.command,
+                "args": server.args,
+            }
+        }
     })
     .to_string()
 }
@@ -105,7 +118,12 @@ impl AgentProc {
             env_vars: request.environment.to_vec(),
         };
         let mut proc = match request.mode {
-            LaunchMode::Normal => Self::spawn(&spec, config.executable)?,
+            LaunchMode::Normal => Self::spawn_configured(
+                &spec,
+                config.executable,
+                RestrictedMode::None,
+                request.agent_mcp_server(),
+            )?,
             LaunchMode::Restricted => Self::spawn_restricted(&spec, config.executable)?,
         };
         let turn = user_turn(request.prompt);
@@ -303,7 +321,7 @@ impl AgentProc {
     }
 
     pub fn spawn(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, RestrictedMode::None)
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::None, None)
     }
 
     /// Spawn a closed-book classifier while preserving the configured auth
@@ -311,7 +329,7 @@ impl AgentProc {
     /// credential restrictions of `--bare`; the empty tool surface prevents
     /// the classifier from acquiring context beyond its supplied turn.
     pub fn spawn_restricted(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, RestrictedMode::ClosedBook)
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::ClosedBook, None)
     }
 
     /// Spawn a read-only planning turn. Unlike the closed-book classifier,
@@ -319,13 +337,14 @@ impl AgentProc {
     /// write files, load customizations, or persist a provider session.
     #[allow(dead_code)] // consumed by the pending daemon decomposition coordinator
     pub fn spawn_planner(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, RestrictedMode::Planner)
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::Planner, None)
     }
 
     fn spawn_configured(
         spec: &AgentSpec,
         agent_bin: Option<&str>,
         restricted: RestrictedMode,
+        agent_mcp: Option<AgentMcpServer>,
     ) -> std::io::Result<Self> {
         let bin = agent_bin.unwrap_or("claude");
         let mut cmd = Command::new(bin);
@@ -341,6 +360,12 @@ impl AgentProc {
             .arg(&spec.effort);
 
         cmd.arg("--session-id").arg(&spec.session_id);
+
+        if let Some(server) = agent_mcp {
+            cmd.arg("--mcp-config")
+                .arg(claude_mcp_config(server))
+                .arg("--strict-mcp-config");
+        }
 
         if restricted != RestrictedMode::None {
             cmd.arg("--safe-mode")
@@ -363,10 +388,22 @@ impl AgentProc {
         // cannot edit files, run git/gh, or signal `quorum submit` — it stalls
         // forever in awaiting-review (observed second live run). Restricted
         // classifier spawns pass an empty list in addition to `--tools ""`.
+        let allowed_tools = match agent_mcp {
+            Some(_) if spec.allowed_tools.is_empty() => AGENT_MCP_ALLOWED_TOOL.to_string(),
+            Some(_)
+                if !spec
+                    .allowed_tools
+                    .split(',')
+                    .any(|tool| tool == AGENT_MCP_ALLOWED_TOOL) =>
+            {
+                format!("{},{}", spec.allowed_tools, AGENT_MCP_ALLOWED_TOOL)
+            }
+            _ => spec.allowed_tools.clone(),
+        };
         cmd.arg("--permission-mode")
             .arg("dontAsk")
             .arg("--allowedTools")
-            .arg(&spec.allowed_tools);
+            .arg(allowed_tools);
 
         if spec.bare {
             cmd.arg("--bare");
@@ -374,6 +411,9 @@ impl AgentProc {
 
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
+        }
+        if agent_mcp.is_some() {
+            strip_managed_mcp_authority(&mut cmd);
         }
         if restricted == RestrictedMode::Planner {
             strip_coordination_env(&mut cmd);
@@ -726,6 +766,16 @@ enum RestrictedMode {
     Planner,
 }
 
+/// The daemon endpoint is capability-scoped by the four QUORUM_* run fields.
+/// Do not let the provider forward unrelated operator credentials to its
+/// nested stdio child: the endpoint must never acquire ambient GitHub or
+/// Quorum-home authority merely because Claude happens to inherit it.
+fn strip_managed_mcp_authority(cmd: &mut Command) {
+    for name in ["GH_TOKEN", "GITHUB_TOKEN", "QUORUM_HOME", "GH_CONFIG_DIR"] {
+        cmd.env_remove(name);
+    }
+}
+
 fn strip_coordination_env(cmd: &mut Command) {
     for name in [
         "QUORUM_AGENT",
@@ -853,6 +903,122 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_mcp_claude_child_scrubs_ambient_authority() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        struct EnvRestore {
+            name: &'static str,
+            previous: Option<OsString>,
+        }
+
+        impl EnvRestore {
+            fn poison(name: &'static str, value: &str) -> Self {
+                let previous = std::env::var_os(name);
+                std::env::set_var(name, value);
+                Self { name, previous }
+            }
+        }
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                if let Some(value) = self.previous.take() {
+                    std::env::set_var(self.name, value);
+                } else {
+                    std::env::remove_var(self.name);
+                }
+            }
+        }
+
+        let _environment = ENV_LOCK.lock().await;
+        let _gh = EnvRestore::poison("GH_TOKEN", "ambient-gh-token");
+        let _github = EnvRestore::poison("GITHUB_TOKEN", "ambient-github-token");
+        let _quorum_home = EnvRestore::poison("QUORUM_HOME", "/ambient/quorum-home");
+        let _gh_config = EnvRestore::poison("GH_CONFIG_DIR", "/ambient/gh-config");
+
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("mcp-child-environment.log");
+        let fake_quorum = root.path().join("quorum");
+        std::fs::write(
+            &fake_quorum,
+            format!(
+                "#!/bin/sh\n\\
+                 {{\n\\
+                   printf 'arg=%s\\n' \"$1\"\n\\
+                   printf 'repo=%s\\n' \"$QUORUM_REPO\"\n\\
+                   printf 'agent=%s\\n' \"$QUORUM_AGENT\"\n\\
+                   printf 'run=%s\\n' \"$QUORUM_RUN_ID\"\n\\
+                   printf 'endpoint=%s\\n' \"$QUORUM_AGENT_ENDPOINT\"\n\\
+                   printf 'gh=%s\\n' \"$GH_TOKEN\"\n\\
+                   printf 'github=%s\\n' \"$GITHUB_TOKEN\"\n\\
+                   printf 'quorum_home=%s\\n' \"$QUORUM_HOME\"\n\\
+                   printf 'gh_config=%s\\n' \"$GH_CONFIG_DIR\"\n\\
+                 }} > '{}'\n",
+                capture.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_quorum, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_claude = root.path().join("claude");
+        std::fs::write(
+            &fake_claude,
+            "#!/bin/sh\nquorum agent-mcp\nprintf '%s\\n' '{\"type\":\"result\",\"result\":\"done\",\"is_error\":false}'\nwhile IFS= read -r _line; do :; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut spec = classifier_spec(root.path(), true);
+        spec.env_vars = vec![
+            (
+                "PATH".into(),
+                format!(
+                    "{}:{}",
+                    root.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            ),
+            ("QUORUM_REPO".into(), "owner/repo".into()),
+            ("QUORUM_AGENT".into(), "Worker-test".into()),
+            ("QUORUM_RUN_ID".into(), "run-capability".into()),
+            (
+                "QUORUM_AGENT_ENDPOINT".into(),
+                "/tmp/quorum-agent.sock".into(),
+            ),
+        ];
+        let proc = AgentProc::spawn_configured(
+            &spec,
+            fake_claude.to_str(),
+            RestrictedMode::None,
+            Some(crate::serve::runner::AGENT_MCP_SERVER),
+        )
+        .unwrap();
+        for _ in 0..100 {
+            if capture.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let _ = proc.kill_and_reap().await;
+
+        let captured = std::fs::read_to_string(&capture)
+            .expect("managed Claude did not launch its configured MCP child");
+        assert!(captured.contains("arg=agent-mcp\n"), "{captured}");
+        assert!(captured.contains("repo=owner/repo\n"), "{captured}");
+        assert!(captured.contains("agent=Worker-test\n"), "{captured}");
+        assert!(captured.contains("run=run-capability\n"), "{captured}");
+        assert!(
+            captured.contains("endpoint=/tmp/quorum-agent.sock\n"),
+            "{captured}"
+        );
+        for absent in ["gh=\n", "github=\n", "quorum_home=\n", "gh_config=\n"] {
+            assert!(captured.contains(absent), "{captured}");
+        }
+    }
+
     /// Positive contract: a production-built spec must clear the CLI's
     /// argument validation. Any stream event back (init, assistant,
     /// result — even an auth-failure result) proves the args parsed;
@@ -866,8 +1032,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut spec = classifier_spec(tmp.path(), true);
         spec.env_vars = no_auth_env(tmp.path());
+        spec.env_vars.extend([
+            ("QUORUM_REPO".into(), "owner/repo".into()),
+            ("QUORUM_AGENT".into(), "Keel-test".into()),
+            ("QUORUM_RUN_ID".into(), "run-capability".into()),
+            (
+                "QUORUM_AGENT_ENDPOINT".into(),
+                "/tmp/quorum-agent-mcp-boundary.sock".into(),
+            ),
+        ]);
 
-        let mut proc = AgentProc::spawn(&spec, None).expect("spawn claude");
+        let mut proc = AgentProc::spawn_configured(
+            &spec,
+            None,
+            RestrictedMode::None,
+            Some(crate::serve::runner::AGENT_MCP_SERVER),
+        )
+        .expect("spawn claude with strict MCP config");
         proc.feed_turn(&user_turn("ping")).await.expect("feed turn");
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
             .await

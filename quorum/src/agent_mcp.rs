@@ -13,14 +13,14 @@ use rmcp::{
         ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
         ToolAnnotations,
     },
-    service::RequestContext,
+    service::{Peer, RequestContext},
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -28,6 +28,11 @@ use tokio::net::UnixStream;
 const PROTOCOL_VERSION: u8 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// The MCP adapter is a credentialless child of a persistent provider, so it
+/// learns daemon phase transitions by asking the endpoint for its derived
+/// inventory. This keeps the adapter out of the database while promptly
+/// invalidating clients' cached tool lists.
+const PHASE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CAPABILITY_BYTES: usize = 128;
 const MAX_ENV_BYTES: usize = 4096;
 
@@ -36,6 +41,10 @@ struct GithubServer {
     endpoint: PathBuf,
     capability: String,
     repository: String,
+    // `tools/list` is the only inventory a client can cache. Track the phase
+    // actually returned there instead of taking an asynchronous watcher
+    // baseline, which could miss a transition before its first poll.
+    advertised_phase: Arc<Mutex<Option<RunPhase>>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -319,13 +328,19 @@ enum RunPhase {
 }
 
 #[derive(Debug)]
+struct Inventory {
+    phase: RunPhase,
+    operations: Vec<ProtocolOperation>,
+}
+
+#[derive(Debug)]
 enum EndpointFailure {
     Rejected(String),
     Unavailable,
 }
 
 impl GithubServer {
-    async fn inventory(&self) -> std::result::Result<Vec<ProtocolOperation>, McpError> {
+    async fn inventory(&self) -> std::result::Result<Inventory, McpError> {
         let response = self
             .exchange(EndpointOperation::Inventory)
             .await
@@ -374,7 +389,7 @@ impl GithubServer {
                 None,
             ));
         }
-        Ok(operations)
+        Ok(Inventory { phase, operations })
     }
 
     async fn exchange(
@@ -426,6 +441,20 @@ impl GithubServer {
             _ => Err(EndpointFailure::Unavailable),
         }
     }
+
+    fn record_advertised_phase(&self, phase: RunPhase) {
+        *self
+            .advertised_phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(phase);
+    }
+
+    fn phase_changed_since_advertisement(&self, phase: RunPhase) -> bool {
+        self.advertised_phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some_and(|advertised| advertised != phase)
+    }
 }
 
 fn expected_inventory(phase: RunPhase) -> Vec<ProtocolOperation> {
@@ -476,7 +505,12 @@ fn tool_error(code: &str) -> CallToolResult {
 
 impl ServerHandler for GithubServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
             .with_server_info(Implementation::new("github", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Only tools authorized for this exact managed run are exposed. Workers may write only the assigned worktree and repository.",
@@ -488,9 +522,10 @@ impl ServerHandler for GithubServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
-        let tools = self
-            .inventory()
-            .await?
+        let inventory = self.inventory().await?;
+        self.record_advertised_phase(inventory.phase);
+        let tools = inventory
+            .operations
             .into_iter()
             .map(ProtocolOperation::tool)
             .collect();
@@ -557,6 +592,28 @@ impl ServerHandler for GithubServer {
     }
 }
 
+/// Keep a persistent provider's cached MCP tool list aligned with the
+/// daemon-derived phase. The endpoint remains the authority for every call;
+/// this only tells clients to rediscover the changed inventory.
+async fn notify_phase_changes(server: GithubServer, peer: Peer<RoleServer>) {
+    let mut interval = tokio::time::interval(PHASE_POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+        let Ok(inventory) = server.inventory().await else {
+            continue;
+        };
+        if server.phase_changed_since_advertisement(inventory.phase) {
+            if peer.notify_tool_list_changed().await.is_err() {
+                return;
+            }
+            server.record_advertised_phase(inventory.phase);
+        }
+    }
+}
+
 pub fn run() -> Result<()> {
     let endpoint = required_env("QUORUM_AGENT_ENDPOINT", MAX_ENV_BYTES)?;
     let capability = required_env("QUORUM_RUN_ID", MAX_CAPABILITY_BYTES)?;
@@ -568,6 +625,7 @@ pub fn run() -> Result<()> {
         endpoint: PathBuf::from(endpoint),
         capability,
         repository,
+        advertised_phase: Arc::default(),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -575,14 +633,18 @@ pub fn run() -> Result<()> {
         .map_err(|_| QuorumError::Io("failed to start agent MCP runtime".into()))?;
     runtime.block_on(async move {
         let service = server
+            .clone()
             .serve(rmcp::transport::stdio())
             .await
             .map_err(|_| QuorumError::Io("agent MCP initialization failed".into()))?;
-        service
+        let watcher = tokio::spawn(notify_phase_changes(server, service.peer().clone()));
+        let result = service
             .waiting()
             .await
-            .map_err(|_| QuorumError::Io("agent MCP service failed".into()))?;
-        Ok(())
+            .map(|_| ())
+            .map_err(|_| QuorumError::Io("agent MCP service failed".into()));
+        watcher.abort();
+        result
     })
 }
 
@@ -595,4 +657,27 @@ fn required_env(name: &str, max_bytes: usize) -> Result<String> {
         )));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delayed_watcher_snapshot_detects_change_after_tools_list() {
+        let server = GithubServer {
+            endpoint: PathBuf::from("/tmp/agent-endpoint"),
+            capability: "run-capability".into(),
+            repository: "owner/repository".into(),
+            advertised_phase: Arc::default(),
+        };
+
+        // This models the client caching its initial list before the task
+        // enters rework, while the watcher has not yet completed any poll.
+        server.record_advertised_phase(RunPhase::InitialWorker);
+        assert!(server.phase_changed_since_advertisement(RunPhase::ReworkWorker));
+
+        server.record_advertised_phase(RunPhase::ReworkWorker);
+        assert!(!server.phase_changed_since_advertisement(RunPhase::ReworkWorker));
+    }
 }

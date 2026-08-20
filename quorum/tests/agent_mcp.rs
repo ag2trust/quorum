@@ -300,6 +300,21 @@ impl McpProcess {
         }
     }
 
+    fn wait_for_notification(&self, method: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| panic!("no MCP notification for {method}: {error}"));
+            let value: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|error| panic!("stdout was not MCP JSON: {error}: {line:?}"));
+            if value["method"] == method {
+                return value;
+            }
+        }
+    }
+
     fn initialize(&mut self) -> Value {
         let response = self.request(
             1,
@@ -394,6 +409,7 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
     assert_eq!(initialized["result"]["serverInfo"]["name"], "github");
     let capabilities = initialized["result"]["capabilities"].as_object().unwrap();
     assert_eq!(capabilities.keys().collect::<Vec<_>>(), vec!["tools"]);
+    assert_eq!(capabilities["tools"]["listChanged"], true);
 
     let initial = worker.request(2, "tools/list", json!({}));
     assert_eq!(tool_names(&initial), vec!["delivery_report_write"]);
@@ -444,6 +460,8 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
             [],
         )
         .unwrap();
+    let notification = worker.wait_for_notification("notifications/tools/list_changed");
+    assert!(notification.get("id").is_none());
     let rework = worker.request(8, "tools/list", json!({}));
     assert_eq!(
         tool_names(&rework),

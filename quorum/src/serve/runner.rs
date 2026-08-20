@@ -564,6 +564,48 @@ pub struct LaunchRequest<'a> {
     pub continuation_id: Option<&'a str>,
 }
 
+/// Credentialless stdio server registered only for a complete daemon-managed
+/// worker or reviewer run envelope. Provider adapters receive the command
+/// shape, never a database path, GitHub credential, role, or phase inventory;
+/// the daemon endpoint derives and enforces all of that authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentMcpServer {
+    pub command: &'static str,
+    pub args: &'static [&'static str],
+    /// Names whose values the provider must copy from its managed launch
+    /// environment into the stdio child. Values never enter provider args.
+    pub env_vars: &'static [&'static str],
+}
+
+pub const AGENT_MCP_ENV_VARS: &[&str] = &[
+    "QUORUM_REPO",
+    "QUORUM_AGENT",
+    "QUORUM_RUN_ID",
+    "QUORUM_AGENT_ENDPOINT",
+];
+
+pub const AGENT_MCP_SERVER: AgentMcpServer = AgentMcpServer {
+    command: "quorum",
+    args: &["agent-mcp"],
+    env_vars: AGENT_MCP_ENV_VARS,
+};
+
+impl LaunchRequest<'_> {
+    /// Restricted/internal turns lack this complete capability envelope. The
+    /// run capability is the discriminator rather than `Normal` alone because
+    /// collectors intentionally use the normal provider protocol while still
+    /// having no managed worker/reviewer endpoint authority.
+    pub fn agent_mcp_server(&self) -> Option<AgentMcpServer> {
+        (self.mode == LaunchMode::Normal
+            && AGENT_MCP_ENV_VARS.iter().all(|required| {
+                self.environment
+                    .iter()
+                    .any(|(key, value)| key == required && !value.is_empty())
+            }))
+        .then_some(AGENT_MCP_SERVER)
+    }
+}
+
 /// Complete identity for one internally exercised managed worker launch.
 /// Public/configured Grok role selection remains rejected elsewhere; this
 /// request exists so transport plumbing cannot drop task, assignment, role,
@@ -1280,6 +1322,82 @@ fn truncate_label(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn managed_environment() -> Vec<(String, String)> {
+        vec![
+            ("QUORUM_REPO".into(), "owner/repo".into()),
+            ("QUORUM_AGENT".into(), "Keel-test".into()),
+            ("QUORUM_RUN_ID".into(), "run-capability".into()),
+            (
+                "QUORUM_AGENT_ENDPOINT".into(),
+                "/tmp/quorum-agent.sock".into(),
+            ),
+        ]
+    }
+
+    fn mcp_request<'a>(mode: LaunchMode, environment: &'a [(String, String)]) -> LaunchRequest<'a> {
+        LaunchRequest {
+            model: "gpt-5.6-terra",
+            effort: "high",
+            worktree: std::path::Path::new("/tmp/worktree"),
+            prompt: "exact pending turn",
+            environment,
+            mode,
+            continuation_id: Some("provider-issued-thread"),
+        }
+    }
+
+    #[test]
+    fn agent_mcp_registration_requires_normal_managed_run_authority() {
+        let environment = managed_environment();
+
+        assert_eq!(
+            mcp_request(LaunchMode::Normal, &environment).agent_mcp_server(),
+            Some(AGENT_MCP_SERVER)
+        );
+        assert_eq!(
+            mcp_request(LaunchMode::Restricted, &environment).agent_mcp_server(),
+            None,
+            "restricted roles remain isolated even if authority is accidentally supplied"
+        );
+        for missing in [
+            "QUORUM_REPO",
+            "QUORUM_AGENT",
+            "QUORUM_RUN_ID",
+            "QUORUM_AGENT_ENDPOINT",
+        ] {
+            let incomplete: Vec<_> = environment
+                .iter()
+                .filter(|(key, _)| key != missing)
+                .cloned()
+                .collect();
+            assert_eq!(
+                mcp_request(LaunchMode::Normal, &incomplete).agent_mcp_server(),
+                None,
+                "missing {missing} must suppress registration"
+            );
+        }
+        assert_eq!(AGENT_MCP_SERVER.command, "quorum");
+        assert_eq!(AGENT_MCP_SERVER.args, ["agent-mcp"]);
+        assert_eq!(
+            AGENT_MCP_SERVER.env_vars,
+            [
+                "QUORUM_REPO",
+                "QUORUM_AGENT",
+                "QUORUM_RUN_ID",
+                "QUORUM_AGENT_ENDPOINT",
+            ]
+        );
+        let command_surface = format!(
+            "{} {} {}",
+            AGENT_MCP_SERVER.command,
+            AGENT_MCP_SERVER.args.join(" "),
+            AGENT_MCP_SERVER.env_vars.join(" ")
+        );
+        for forbidden in [".sqlite", "GH_TOKEN", "GITHUB_TOKEN", "ghp_"] {
+            assert!(!command_surface.contains(forbidden), "{command_surface}");
+        }
+    }
+
     #[test]
     fn durable_token_conversion_rejects_every_overflowing_bucket() {
         let maximum = TokenUsage {
@@ -1350,12 +1468,26 @@ mod tests {
         let args = dir.join("args.log");
         let turn = dir.join("turn.log");
         let environment = dir.join("environment.log");
+        let grok_config = dir.join("grok-config.log");
+        let grok_sandbox = dir.join("grok-sandbox.log");
+        let grok_overlay = dir.join("grok-overlay.log");
         std::fs::write(
             &runner,
             format!(
                 "#!/bin/sh\n\
                  for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done > '{}'\n\
                  printf '%s\\n' \"$QUORUM_ADAPTER_TEST\" > '{}'\n\
+                 if [ -n \"$GROK_HOME\" ] && [ -f \"$GROK_HOME/config.toml\" ]; then\n\
+                   cp \"$GROK_HOME/config.toml\" '{}'\n\
+                 else\n\
+                   : > '{}'\n\
+                 fi\n\
+                 if [ -n \"$GROK_HOME\" ] && [ -f \"$GROK_HOME/sandbox.toml\" ]; then\n\
+                   cp \"$GROK_HOME/sandbox.toml\" '{}'\n\
+                 else\n\
+                   : > '{}'\n\
+                 fi\n\
+                 printf '%s\\n' \"${{GROK_CONFIG+x}}\" > '{}'\n\
                  if [ \"$1\" = '-p' ]; then\n\
                    IFS= read -r line\n\
                    printf '%s\\n' \"$line\" > '{}'\n\
@@ -1366,6 +1498,11 @@ mod tests {
                  fi\n",
                 args.display(),
                 environment.display(),
+                grok_config.display(),
+                grok_config.display(),
+                grok_sandbox.display(),
+                grok_sandbox.display(),
+                grok_overlay.display(),
                 turn.display(),
             ),
         )
@@ -1532,20 +1669,252 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn managed_launches_inject_exact_provider_mcp_boundaries_and_pending_turns() {
+        let claude_dir = tempfile::tempdir().unwrap();
+        let claude_bin = recording_runner(claude_dir.path());
+        let mut claude_environment = managed_environment();
+        claude_environment.push(("QUORUM_ADAPTER_TEST".into(), "managed-claude".into()));
+        let claude_session = "00000000-0000-4000-8000-000000000042";
+        let mut claude = RunnerProc::launch(
+            &LaunchRequest {
+                model: "claude-sonnet-5",
+                effort: "high",
+                worktree: claude_dir.path(),
+                prompt: "exact claude pending turn",
+                environment: &claude_environment,
+                mode: LaunchMode::Normal,
+                continuation_id: Some(claude_session),
+            },
+            &AdapterConfig {
+                executable: claude_bin.to_str(),
+                claude_bare: true,
+                claude_allowed_tools: "Bash,Read",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        while claude.next_raw_line().await.is_some() {}
+        claude.kill_and_reap().await;
+        let claude_args = std::fs::read_to_string(claude_dir.path().join("args.log")).unwrap();
+        assert!(
+            claude_args.contains(&format!("<{claude_session}>")),
+            "{claude_args}"
+        );
+        assert!(claude_args.contains("<--mcp-config>"), "{claude_args}");
+        assert!(
+            claude_args.contains("<--strict-mcp-config>"),
+            "{claude_args}"
+        );
+        assert!(
+            claude_args.contains("<Bash,Read,mcp__github__*>"),
+            "{claude_args}"
+        );
+        let config_line = claude_args
+            .lines()
+            .find(|line| line.contains("\"mcpServers\""))
+            .expect("Claude MCP JSON argument");
+        let config: serde_json::Value =
+            serde_json::from_str(config_line.trim_matches(&['<', '>'][..])).unwrap();
+        assert_eq!(
+            config,
+            serde_json::json!({
+                "mcpServers": {
+                    "github": {"command": "quorum", "args": ["agent-mcp"]}
+                }
+            })
+        );
+        let turn = std::fs::read_to_string(claude_dir.path().join("turn.log")).unwrap();
+        let turn: serde_json::Value = serde_json::from_str(turn.trim()).unwrap();
+        assert_eq!(turn["message"]["content"], "exact claude pending turn");
+
+        let codex_dir = tempfile::tempdir().unwrap();
+        let codex_bin = recording_runner(codex_dir.path());
+        let mut codex_environment = managed_environment();
+        codex_environment.push(("QUORUM_ADAPTER_TEST".into(), "managed-codex".into()));
+        let mut codex = RunnerProc::launch(
+            &LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: codex_dir.path(),
+                prompt: "exact codex pending turn",
+                environment: &codex_environment,
+                mode: LaunchMode::Normal,
+                continuation_id: Some("provider-issued-thread-42"),
+            },
+            &AdapterConfig {
+                executable: codex_bin.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        while codex.next_raw_line().await.is_some() {}
+        codex.kill_and_reap().await;
+        let codex_args = std::fs::read_to_string(codex_dir.path().join("args.log")).unwrap();
+        let codex_argv: Vec<_> = codex_args.lines().collect();
+        assert_eq!(
+            &codex_argv[..3],
+            ["<exec>", "<resume>", "<provider-issued-thread-42>"]
+        );
+        assert!(
+            codex_args.contains(
+                r#"<mcp_servers.github={command="quorum",args=["agent-mcp"],env_vars=["QUORUM_REPO","QUORUM_AGENT","QUORUM_RUN_ID","QUORUM_AGENT_ENDPOINT"]}>"#
+            ),
+            "{codex_args}"
+        );
+        assert_eq!(
+            codex_argv.last(),
+            Some(&"<exact codex pending turn>"),
+            "{codex_args}"
+        );
+
+        let grok_dir = tempfile::tempdir().unwrap();
+        let grok_bin = recording_runner(grok_dir.path());
+        let mut grok_environment = managed_environment();
+        grok_environment.push(("QUORUM_ADAPTER_TEST".into(), "managed-grok".into()));
+        let original_grok_home = grok_dir.path().join("original-grok-home");
+        std::fs::create_dir_all(original_grok_home.join("sessions")).unwrap();
+        std::fs::write(
+            original_grok_home.join("config.toml"),
+            "[models]\ndefault_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            original_grok_home
+                .join("sessions")
+                .join("persisted-session"),
+            "provider-issued-grok-session-42",
+        )
+        .unwrap();
+        grok_environment.push(("GROK_HOME".into(), original_grok_home.display().to_string()));
+        let mut grok = RunnerProc::launch(
+            &LaunchRequest {
+                model: "grok-4.5",
+                effort: "high",
+                worktree: grok_dir.path(),
+                prompt: "exact grok pending turn",
+                environment: &grok_environment,
+                mode: LaunchMode::Normal,
+                continuation_id: Some("provider-issued-grok-session-42"),
+            },
+            &AdapterConfig {
+                executable: grok_bin.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        while grok.next_raw_line().await.is_some() {}
+        grok.kill_and_reap().await;
+        let grok_args = std::fs::read_to_string(grok_dir.path().join("args.log")).unwrap();
+        assert!(
+            grok_args.starts_with("<--resume>\n<provider-issued-grok-session-42>"),
+            "{grok_args}"
+        );
+        assert!(
+            grok_args.contains("<exact grok pending turn>"),
+            "{grok_args}"
+        );
+        assert!(grok_args.contains("<--no-leader>"), "{grok_args}");
+        assert!(
+            grok_args.contains("<--sandbox>\n<quorum_managed_workspace>"),
+            "{grok_args}"
+        );
+        let grok_config = std::fs::read_to_string(grok_dir.path().join("grok-config.log")).unwrap();
+        let grok_config: toml::Value = toml::from_str(&grok_config).unwrap();
+        assert_eq!(
+            grok_config["mcp_servers"]["github"]["command"].as_str(),
+            Some("quorum")
+        );
+        assert_eq!(
+            grok_config["mcp_servers"]["github"]["args"]
+                .as_array()
+                .unwrap(),
+            &[toml::Value::String("agent-mcp".into())]
+        );
+        assert_eq!(
+            grok_config["models"]["default_reasoning_effort"].as_str(),
+            Some("high"),
+            "the invocation-local layer must retain the operator config"
+        );
+        assert_eq!(
+            std::fs::read_to_string(grok_dir.path().join("grok-overlay.log"))
+                .unwrap()
+                .trim(),
+            "",
+            "the filtered GROK_CONFIG overlay must not be used"
+        );
+        let grok_sandbox: toml::Value = toml::from_str(
+            &std::fs::read_to_string(grok_dir.path().join("grok-sandbox.log")).unwrap(),
+        )
+        .unwrap();
+        let profile = &grok_sandbox["profiles"]["quorum_managed_workspace"];
+        assert_eq!(profile["extends"].as_str(), Some("workspace"));
+        assert_eq!(
+            profile["read_write"].as_array().unwrap(),
+            &[toml::Value::String(
+                std::fs::canonicalize(&original_grok_home)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            )],
+            "the managed profile must restore Grok's durable state root"
+        );
+        assert_eq!(
+            std::fs::read_to_string(original_grok_home.join("config.toml")).unwrap(),
+            "[models]\ndefault_reasoning_effort = \"high\"\n",
+            "managed injection must not mutate persistent Grok config"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                original_grok_home
+                    .join("sessions")
+                    .join("persisted-session")
+            )
+            .unwrap(),
+            "provider-issued-grok-session-42"
+        );
+
+        for surface in [claude_args, codex_args, grok_args] {
+            for forbidden in ["GH_TOKEN", "GITHUB_TOKEN", ".sqlite", "db_path"] {
+                assert!(!surface.contains(forbidden), "{surface}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn restricted_launch_dispatches_to_each_safe_adapter() {
         for (model, expected_kind) in [
             ("claude-haiku-4-5-20251001", AgentKind::Claude),
             ("gpt-5.6-terra", AgentKind::Codex),
+            ("grok-4.5", AgentKind::Grok),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let executable = recording_runner(dir.path());
+            let grok_home = dir.path().join("restricted-grok-home");
+            std::fs::create_dir_all(&grok_home).unwrap();
+            std::fs::write(
+                grok_home.join("config.toml"),
+                "[models]\ndefault_reasoning_effort = \"low\"\n",
+            )
+            .unwrap();
+            let environment = vec![("GROK_HOME".into(), grok_home.display().to_string())];
             let mut proc = launch_recording_runner(
                 &LaunchRequest {
                     model,
                     effort: "low",
                     worktree: dir.path(),
                     prompt: "restricted prompt",
-                    environment: &[],
+                    environment: &environment,
                     mode: LaunchMode::Restricted,
                     continuation_id: None,
                 },
@@ -1575,7 +1944,22 @@ mod tests {
                         "{args}"
                     );
                 }
-                AgentKind::Grok => unreachable!("fixture contains only Claude and Codex"),
+                AgentKind::Grok => {
+                    assert!(args.contains("<read-only>"), "{args}");
+                    assert!(args.contains("<dontAsk>"), "{args}");
+                    let config =
+                        std::fs::read_to_string(dir.path().join("grok-config.log")).unwrap();
+                    assert!(!config.contains("mcp_servers"), "{config}");
+                    let sandbox =
+                        std::fs::read_to_string(dir.path().join("grok-sandbox.log")).unwrap();
+                    assert!(!sandbox.contains("quorum_managed_workspace"), "{sandbox}");
+                    assert_eq!(
+                        std::fs::read_to_string(dir.path().join("grok-overlay.log"))
+                            .unwrap()
+                            .trim(),
+                        ""
+                    );
+                }
             }
         }
     }

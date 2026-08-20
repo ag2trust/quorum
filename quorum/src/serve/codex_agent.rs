@@ -8,8 +8,8 @@
 use super::codex_stream::{self, Event};
 use super::runner::{
     capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
-    CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation, FailureTracker,
-    LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
+    AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation,
+    FailureTracker, LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
 };
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -35,7 +35,11 @@ pub struct CodexSpec {
 
 /// Build the argument list for `codex exec --json` (first turn).
 pub fn exec_args(spec: &CodexSpec) -> Vec<String> {
-    vec![
+    exec_args_configured(spec, None)
+}
+
+fn exec_args_configured(spec: &CodexSpec, agent_mcp: Option<AgentMcpServer>) -> Vec<String> {
+    let mut args = vec![
         "exec".into(),
         "--json".into(),
         "--model".into(),
@@ -49,14 +53,26 @@ pub fn exec_args(spec: &CodexSpec) -> Vec<String> {
         spec.worktree.display().to_string(),
         "--skip-git-repo-check".into(),
         "--ignore-user-config".into(),
-        spec.prompt.clone(),
-    ]
+    ];
+    append_agent_mcp_override(&mut args, agent_mcp);
+    args.push(spec.prompt.clone());
+    args
 }
 
 /// Build the argument list for `codex exec resume <thread_id> --json`
 /// (continuation turn).
 pub fn resume_args(thread_id: &str, model: &str, effort: &str, prompt: &str) -> Vec<String> {
-    vec![
+    resume_args_configured(thread_id, model, effort, prompt, None)
+}
+
+fn resume_args_configured(
+    thread_id: &str,
+    model: &str,
+    effort: &str,
+    prompt: &str,
+    agent_mcp: Option<AgentMcpServer>,
+) -> Vec<String> {
+    let mut args = vec![
         "exec".into(),
         "resume".into(),
         thread_id.into(),
@@ -68,8 +84,37 @@ pub fn resume_args(thread_id: &str, model: &str, effort: &str, prompt: &str) -> 
         "--dangerously-bypass-approvals-and-sandbox".into(),
         "--skip-git-repo-check".into(),
         "--ignore-user-config".into(),
-        prompt.into(),
-    ]
+    ];
+    append_agent_mcp_override(&mut args, agent_mcp);
+    args.push(prompt.into());
+    args
+}
+
+fn append_agent_mcp_override(args: &mut Vec<String>, server: Option<AgentMcpServer>) {
+    let Some(server) = server else {
+        return;
+    };
+    let server_args = server
+        .args
+        .iter()
+        .map(|arg| serde_json::to_string(arg).expect("static MCP argument serializes"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let env_vars = server
+        .env_vars
+        .iter()
+        .map(|name| serde_json::to_string(name).expect("static MCP environment name serializes"))
+        .collect::<Vec<_>>()
+        .join(",");
+    args.extend([
+        "-c".into(),
+        format!(
+            "mcp_servers.github={{command={},args=[{}],env_vars=[{}]}}",
+            serde_json::to_string(server.command).expect("static MCP command serializes"),
+            server_args,
+            env_vars
+        ),
+    ]);
 }
 
 /// Build the restricted single-turn argument list used by classifiers.
@@ -150,6 +195,7 @@ impl CodexProc {
                 request.worktree,
                 request.prompt,
                 request.environment,
+                request.agent_mcp_server(),
                 config.executable,
             );
         }
@@ -162,7 +208,9 @@ impl CodexProc {
             env_vars: request.environment.to_vec(),
         };
         match request.mode {
-            LaunchMode::Normal => Self::spawn(&spec, config.executable),
+            LaunchMode::Normal => {
+                Self::spawn_configured(&spec, request.agent_mcp_server(), config.executable)
+            }
             LaunchMode::Restricted => Self::spawn_restricted(&spec, config.executable),
         }
     }
@@ -359,10 +407,11 @@ impl CodexProc {
         worktree: &std::path::Path,
         prompt: &str,
         env_vars: &[(String, String)],
+        agent_mcp: Option<AgentMcpServer>,
         codex_bin: Option<&str>,
     ) -> std::io::Result<Self> {
         let bin = codex_bin.unwrap_or("codex");
-        let args = resume_args(thread_id, model, effort, prompt);
+        let args = resume_args_configured(thread_id, model, effort, prompt, agent_mcp);
         let mut cmd = Command::new(bin);
         cmd.args(&args);
         for (k, v) in env_vars {
@@ -403,8 +452,16 @@ impl CodexProc {
     }
 
     pub fn spawn(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
+        Self::spawn_configured(spec, None, codex_bin)
+    }
+
+    fn spawn_configured(
+        spec: &CodexSpec,
+        agent_mcp: Option<AgentMcpServer>,
+        codex_bin: Option<&str>,
+    ) -> std::io::Result<Self> {
         let bin = codex_bin.unwrap_or("codex");
-        let args = exec_args(spec);
+        let args = exec_args_configured(spec, agent_mcp);
         let mut cmd = Command::new(bin);
         cmd.args(&args);
         for (k, v) in &spec.env_vars {
@@ -1030,6 +1087,148 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
         ]
     }
 
+    fn managed_mcp_env(
+        codex_home: &std::path::Path,
+        shim_dir: &std::path::Path,
+    ) -> Vec<(String, String)> {
+        let inherited_path = std::env::var("PATH").unwrap_or_default();
+        let mut environment = no_auth_env(codex_home);
+        environment.extend([
+            (
+                "PATH".into(),
+                format!("{}:{inherited_path}", shim_dir.display()),
+            ),
+            ("QUORUM_REPO".into(), "owner/repo".into()),
+            ("QUORUM_AGENT".into(), "Lever-test".into()),
+            ("QUORUM_RUN_ID".into(), "run-capability".into()),
+            (
+                "QUORUM_AGENT_ENDPOINT".into(),
+                "/tmp/quorum-agent-test.sock".into(),
+            ),
+        ]);
+        environment
+    }
+
+    async fn wait_for_mcp_launches(path: &std::path::Path, expected: usize) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let capture = std::fs::read_to_string(path).unwrap_or_default();
+                if capture.matches("launch-end\n").count() >= expected {
+                    return capture;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("real Codex did not launch the configured MCP child")
+    }
+
+    /// Codex 0.148 clears an MCP child's environment before copying its
+    /// defaults and the names in `env_vars`. Exercise that real provider
+    /// boundary for a fresh provider-issued thread and its exact resume.
+    #[tokio::test]
+    async fn real_cli_forwards_managed_environment_to_fresh_and_resumed_mcp_children() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !codex_available() {
+            eprintln!("skipped: no codex binary on PATH");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let capture = tmp.path().join("mcp-environment.log");
+        let fake_quorum = tmp.path().join("quorum");
+        std::fs::write(
+            &fake_quorum,
+            format!(
+                r#"#!/bin/sh
+{{
+  printf 'arg=%s\n' "$1"
+  printf 'repo=%s\n' "$QUORUM_REPO"
+  printf 'agent=%s\n' "$QUORUM_AGENT"
+  printf 'run=%s\n' "$QUORUM_RUN_ID"
+  printf 'endpoint=%s\n' "$QUORUM_AGENT_ENDPOINT"
+  printf 'gh=%s\n' "$GH_TOKEN"
+  printf 'github=%s\n' "$GITHUB_TOKEN"
+  printf 'launch-end\n'
+}} >> '{}'
+while IFS= read -r request; do :; done
+"#,
+                capture.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_quorum).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_quorum, permissions).unwrap();
+
+        let codex_home = tmp.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        let environment = managed_mcp_env(&codex_home, tmp.path());
+        let spec = CodexSpec {
+            model: "o4-mini".into(),
+            effort: "high".into(),
+            sandbox: "read-only".into(),
+            worktree: tmp.path().to_path_buf(),
+            prompt: "exact fresh pending turn".into(),
+            env_vars: environment.clone(),
+        };
+
+        let mut fresh =
+            CodexProc::spawn_configured(&spec, Some(crate::serve::runner::AGENT_MCP_SERVER), None)
+                .expect("spawn fresh Codex with invocation-local MCP");
+        let thread_id =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), fresh.next_event())
+                .await
+                .expect("fresh Codex emitted no provider thread identity")
+            {
+                Some(Event::ThreadStarted { thread_id }) => thread_id,
+                other => panic!("fresh Codex did not issue a thread identity: {other:?}"),
+            };
+        wait_for_mcp_launches(&capture, 1).await;
+        let _ = fresh.kill_and_reap().await;
+
+        let resumed = CodexProc::spawn_resume(
+            &thread_id,
+            "o4-mini",
+            "high",
+            "read-only",
+            tmp.path(),
+            "exact resumed pending turn",
+            &environment,
+            Some(crate::serve::runner::AGENT_MCP_SERVER),
+            None,
+        )
+        .expect("resume exact provider-issued Codex thread with invocation-local MCP");
+        let captured = wait_for_mcp_launches(&capture, 2).await;
+        let _ = resumed.kill_and_reap().await;
+
+        let launches: Vec<_> = captured.split("launch-end\n").collect();
+        assert!(launches.len() >= 3, "{captured}");
+        for launch in &launches[..2] {
+            assert!(launch.contains("arg=agent-mcp\n"), "{launch}");
+            assert!(launch.contains("repo=owner/repo\n"), "{launch}");
+            assert!(launch.contains("agent=Lever-test\n"), "{launch}");
+            assert!(launch.contains("run=run-capability\n"), "{launch}");
+            assert!(
+                launch.contains("endpoint=/tmp/quorum-agent-test.sock\n"),
+                "{launch}"
+            );
+            assert!(launch.contains("gh=\n"), "{launch}");
+            assert!(launch.contains("github=\n"), "{launch}");
+        }
+
+        let resume = resume_args_configured(
+            &thread_id,
+            "o4-mini",
+            "high",
+            "exact resumed pending turn",
+            Some(crate::serve::runner::AGENT_MCP_SERVER),
+        );
+        assert_eq!(&resume[..3], ["exec", "resume", thread_id.as_str()]);
+        assert_eq!(resume.last().unwrap(), "exact resumed pending turn");
+    }
+
     /// Positive contract: `codex exec --json` with production args must emit
     /// at least a thread.started event before dying on auth. Any event back
     /// proves arguments parsed; instant exit with zero events is the
@@ -1052,7 +1251,9 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
             prompt: "ping".into(),
             env_vars: no_auth_env(tmp.path()),
         };
-        let mut proc = CodexProc::spawn(&spec, None).expect("spawn codex");
+        let mut proc =
+            CodexProc::spawn_configured(&spec, Some(crate::serve::runner::AGENT_MCP_SERVER), None)
+                .expect("spawn codex with invocation-local MCP");
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
             .await
             .expect("codex produced no event within 60s — args may hang the CLI");
@@ -1239,11 +1440,12 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let args = resume_args(
+        let args = resume_args_configured(
             "00000000-0000-0000-0000-000000000000",
             "o4-mini",
             "high",
             "continue",
+            Some(crate::serve::runner::AGENT_MCP_SERVER),
         );
         let mut cmd = std::process::Command::new("codex");
         cmd.args(&args);
