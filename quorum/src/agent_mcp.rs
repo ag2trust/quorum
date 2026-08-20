@@ -648,6 +648,17 @@ pub fn run() -> Result<()> {
     })
 }
 
+fn required_env(name: &str, max_bytes: usize) -> Result<String> {
+    let value = std::env::var(name)
+        .map_err(|_| QuorumError::Usage(format!("agent-mcp requires {name}")))?;
+    if value.is_empty() || value.len() > max_bytes || value.contains('\0') {
+        return Err(QuorumError::Usage(format!(
+            "agent-mcp received invalid {name}"
+        )));
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,15 +680,4 @@ mod tests {
         server.record_advertised_phase(RunPhase::ReworkWorker);
         assert!(!server.phase_changed_since_advertisement(RunPhase::ReworkWorker));
     }
-}
-
-fn required_env(name: &str, max_bytes: usize) -> Result<String> {
-    let value = std::env::var(name)
-        .map_err(|_| QuorumError::Usage(format!("agent-mcp requires {name}")))?;
-    if value.is_empty() || value.len() > max_bytes || value.contains('\0') {
-        return Err(QuorumError::Usage(format!(
-            "agent-mcp received invalid {name}"
-        )));
-    }
-    Ok(value)
 }

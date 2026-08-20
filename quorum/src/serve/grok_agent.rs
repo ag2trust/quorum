@@ -373,6 +373,7 @@ fn ensure_auth_lock(source_home: &std::path::Path) -> std::io::Result<()> {
 fn acquire_auth_lock(source_home: &std::path::Path) -> std::io::Result<std::fs::File> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
