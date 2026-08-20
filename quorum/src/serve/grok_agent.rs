@@ -145,6 +145,7 @@ fn invalid_input(message: impl Into<String>) -> std::io::Error {
 struct GrokMcpConfigHome {
     root: tempfile::TempDir,
     source_home: PathBuf,
+    auth_snapshot: Option<Vec<u8>>,
     sandbox_profile: Option<&'static str>,
 }
 
@@ -159,7 +160,11 @@ impl GrokMcpConfigHome {
         // Session storage must survive the invocation-local config home so a
         // later `--resume` resolves the exact provider-issued identity.
         std::fs::create_dir_all(source_home.join("sessions"))?;
-        ensure_auth_lock(&source_home)?;
+        // Take the same lock Grok uses before snapshotting auth state. It is
+        // released before the provider starts; teardown compares this exact
+        // snapshot and never restores an unchanged stale copy over a newer
+        // managed refresh.
+        let auth_lock = acquire_auth_lock(&source_home)?;
 
         let linked_entries = std::fs::read_dir(&source_home)?
             .map(|entry| entry.map(|entry| (entry.file_name(), entry.path())))
@@ -169,6 +174,7 @@ impl GrokMcpConfigHome {
         let root = tempfile::Builder::new()
             .prefix("quorum-config-")
             .tempdir_in(&source_home)?;
+        let mut auth_snapshot = None;
         for (name, path) in linked_entries {
             if matches!(
                 name.to_str(),
@@ -183,11 +189,12 @@ impl GrokMcpConfigHome {
             // Other state, including the provider's auth lock, remains linked
             // to the durable home.
             if name == AUTH_STATE_FILE {
-                copy_auth_state(&path, &root.path().join(&name))?;
+                auth_snapshot = Some(copy_auth_state(&path, &root.path().join(&name))?);
                 continue;
             }
             symlink(path, root.path().join(name))?;
         }
+        drop(auth_lock);
 
         // Workspace-family profiles kernel-protect these two direct global
         // hook sources and refuse symlinks there. Keep real nodes in the
@@ -255,26 +262,24 @@ impl GrokMcpConfigHome {
         let root_table = config
             .as_table_mut()
             .ok_or_else(|| invalid_input("Grok config root must be a TOML table"))?;
-        let mcp_servers = root_table
-            .entry("mcp_servers")
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-            .as_table_mut()
-            .ok_or_else(|| invalid_input("Grok config mcp_servers must be a TOML table"))?;
-        mcp_servers.insert(
-            "github".into(),
-            toml::Value::Table(toml::Table::from_iter([
-                ("command".into(), toml::Value::String(server.command.into())),
-                (
-                    "args".into(),
-                    toml::Value::Array(
-                        server
-                            .args
-                            .iter()
-                            .map(|arg| toml::Value::String((*arg).into()))
-                            .collect(),
+        root_table.insert(
+            "mcp_servers".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "github".into(),
+                toml::Value::Table(toml::Table::from_iter([
+                    ("command".into(), toml::Value::String(server.command.into())),
+                    (
+                        "args".into(),
+                        toml::Value::Array(
+                            server
+                                .args
+                                .iter()
+                                .map(|arg| toml::Value::String((*arg).into()))
+                                .collect(),
+                        ),
                     ),
-                ),
-            ])),
+                ])),
+            )])),
         );
 
         let rendered = toml::to_string_pretty(&config).map_err(|error| {
@@ -325,6 +330,7 @@ impl GrokMcpConfigHome {
         Ok(Self {
             root,
             source_home,
+            auth_snapshot,
             sandbox_profile,
         })
     }
@@ -340,34 +346,36 @@ impl GrokMcpConfigHome {
     fn persist_auth_state(&self) -> std::io::Result<()> {
         let _lock = acquire_auth_lock(&self.source_home)?;
         let auth_state = self.root.path().join(AUTH_STATE_FILE);
-        let metadata = match std::fs::metadata(&auth_state) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
+        let durable_auth_state = self.source_home.join(AUTH_STATE_FILE);
+        let Some((permissions, contents)) = read_auth_state(&auth_state)? else {
+            // Preserve a concurrent refresh or logout. An invocation that
+            // removed its own unchanged snapshot may only remove the durable
+            // state if no other managed invocation changed it first.
+            if self.auth_snapshot.is_some()
+                && read_auth_state(&durable_auth_state)?.map(|(_, contents)| contents)
+                    == self.auth_snapshot
+            {
+                std::fs::remove_file(durable_auth_state)?;
+            }
+            return Ok(());
         };
-        if !metadata.is_file() {
-            return Err(invalid_input("Grok auth state must be a regular file"));
+        // A private auth copy that was not refreshed must never overwrite a
+        // newer durable credential written by another managed Grok home.
+        if self.auth_snapshot.as_deref() == Some(contents.as_slice()) {
+            return Ok(());
         }
 
         let mut replacement = tempfile::Builder::new()
             .prefix(".quorum-auth-")
             .tempfile_in(&self.source_home)?;
-        replacement
-            .as_file()
-            .set_permissions(metadata.permissions())?;
-        let mut source = std::fs::File::open(auth_state)?;
-        std::io::copy(&mut source, replacement.as_file_mut())?;
+        replacement.as_file().set_permissions(permissions)?;
+        replacement.as_file_mut().write_all(&contents)?;
         replacement.as_file_mut().sync_all()?;
         replacement
-            .persist(self.source_home.join(AUTH_STATE_FILE))
+            .persist(durable_auth_state)
             .map_err(|error| error.error)?;
         Ok(())
     }
-}
-
-fn ensure_auth_lock(source_home: &std::path::Path) -> std::io::Result<()> {
-    let _lock = acquire_auth_lock(source_home)?;
-    Ok(())
 }
 
 fn acquire_auth_lock(source_home: &std::path::Path) -> std::io::Result<std::fs::File> {
@@ -394,20 +402,35 @@ impl Drop for GrokMcpConfigHome {
     }
 }
 
-fn copy_auth_state(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
-    let metadata = std::fs::metadata(source)?;
-    if !metadata.is_file() {
-        return Err(invalid_input("Grok auth state must be a regular file"));
-    }
+fn copy_auth_state(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<Vec<u8>> {
+    let (permissions, contents) = read_auth_state(source)?
+        .ok_or_else(|| invalid_input("Grok auth state disappeared during setup"))?;
     let mut destination = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .open(destination)?;
-    destination.set_permissions(metadata.permissions())?;
-    let mut source = std::fs::File::open(source)?;
-    std::io::copy(&mut source, &mut destination)?;
-    destination.sync_all()
+    destination.set_permissions(permissions)?;
+    destination.write_all(&contents)?;
+    destination.sync_all()?;
+    Ok(contents)
+}
+
+fn read_auth_state(
+    path: &std::path::Path,
+) -> std::io::Result<Option<(std::fs::Permissions, Vec<u8>)>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
+        return Err(invalid_input("Grok auth state must be a regular file"));
+    }
+    Ok(Some((metadata.permissions(), std::fs::read(path)?)))
 }
 
 fn args_with_managed_sandbox(
@@ -1227,7 +1250,8 @@ mod tests {
         std::fs::create_dir_all(original_home.join("sessions")).unwrap();
         std::fs::write(
             original_home.join("config.toml"),
-            "[models]\ndefault_reasoning_effort = \"high\"\n",
+            "[models]\ndefault_reasoning_effort = \"high\"\n\
+             [mcp_servers.operator]\ncommand = \"operator-mcp\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -1260,6 +1284,8 @@ mod tests {
             config["mcp_servers"]["github"]["args"].as_array().unwrap(),
             &[toml::Value::String("agent-mcp".into())]
         );
+        assert_eq!(config["mcp_servers"].as_table().unwrap().len(), 1);
+        assert!(config["mcp_servers"].get("operator").is_none());
         let sandbox: toml::Value =
             toml::from_str(&std::fs::read_to_string(managed.path().join("sandbox.toml")).unwrap())
                 .unwrap();
@@ -1318,7 +1344,8 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(original_home.join("config.toml")).unwrap(),
-            "[models]\ndefault_reasoning_effort = \"high\"\n"
+            "[models]\ndefault_reasoning_effort = \"high\"\n\
+             [mcp_servers.operator]\ncommand = \"operator-mcp\"\n"
         );
     }
 
@@ -1361,6 +1388,44 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(resumed.path().join(AUTH_STATE_FILE)).unwrap(),
             "refreshed-token"
+        );
+    }
+
+    #[test]
+    fn managed_mcp_never_restores_an_unchanged_stale_auth_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let original_home = root.path().join("grok-home");
+        std::fs::create_dir_all(&original_home).unwrap();
+        std::fs::write(original_home.join(AUTH_STATE_FILE), "initial-refresh-token").unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = vec![("GROK_HOME".into(), original_home.display().to_string())];
+
+        let older =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        let refreshed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        let replacement = refreshed.path().join("auth.json.refresh");
+        std::fs::write(&replacement, "newer-refresh-token").unwrap();
+        std::fs::rename(&replacement, refreshed.path().join(AUTH_STATE_FILE)).unwrap();
+        drop(refreshed);
+        assert_eq!(
+            std::fs::read_to_string(original_home.join(AUTH_STATE_FILE)).unwrap(),
+            "newer-refresh-token"
+        );
+
+        // The older home did not refresh. Its teardown must observe that its
+        // private snapshot is unchanged and leave the newer durable token.
+        drop(older);
+        assert_eq!(
+            std::fs::read_to_string(original_home.join(AUTH_STATE_FILE)).unwrap(),
+            "newer-refresh-token"
+        );
+        let resumed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(resumed.path().join(AUTH_STATE_FILE)).unwrap(),
+            "newer-refresh-token"
         );
     }
 
@@ -1872,6 +1937,12 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         let mut spec = test_spec(worktree.path());
         spec.env_vars = no_auth_env(root.path());
+        let source_config = grok_home_for_child(&spec).unwrap().join("config.toml");
+        std::fs::write(
+            source_config,
+            "[mcp_servers.operator]\ncommand = \"operator-mcp\"\n",
+        )
+        .unwrap();
         let managed =
             GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
         let output = std::process::Command::new("grok")
@@ -1888,9 +1959,9 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        let github = report["mcpServers"]
-            .as_array()
-            .unwrap()
+        let mcp_servers = report["mcpServers"].as_array().unwrap();
+        assert_eq!(mcp_servers.len(), 1, "{report}");
+        let github = mcp_servers
             .iter()
             .find(|server| server["name"] == "github")
             .expect("official Grok loader omitted managed github MCP server");
