@@ -107,7 +107,7 @@ mkdir -p docs
 printf 'integration docs\n' > docs/integration.md
 PREFLIGHT_CARGO_LOG="$TMP/integration-cargo.log" PATH="$BIN:$PATH" \
   ./preflight.sh >"$TMP/integration-full.out"
-grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/integration-full.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green;' "$TMP/integration-full.out"
 ! grep -q 'skipping clippy + test' "$TMP/integration-full.out"
 grep -q '^clippy ' "$TMP/integration-cargo.log"
 rm -rf docs
@@ -342,7 +342,7 @@ git branch --set-upstream-to=origin/daemon/continuation-t3
 PATH="$BIN:$PATH" ./preflight.sh >"$TMP/full-merge-continuation.out"
 grep -q 'configured-upstream continuation-owned commits' \
   "$TMP/full-merge-continuation.out"
-grep -q 'PREFLIGHT: PASS (all 4 gates green)' \
+grep -q 'PREFLIGHT: PASS (all 4 gates green;' \
   "$TMP/full-merge-continuation.out"
 PATH="$BIN:$PATH" git push -q origin \
   "$CONTINUATION_HEAD_SHA:refs/heads/daemon/continuation-t3"
@@ -580,8 +580,12 @@ EOF
 PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
   ./preflight.sh >"$TMP/full.out"
 cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
-grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/full.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green;' "$TMP/full.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green; 0 test binaries executed, 0 cached)' \
+  "$TMP/full.out"
 grep -q '^  branch_base .*  ok$' target/preflight-timing/summary.txt
+grep -q '^test binaries: 0 executed, 0 cached$' \
+  target/preflight-timing/summary.txt
 grep -q '"name": "branch_base"' target/preflight-timing/timing.json
 grep -q 'slowest test binaries (top 0 of 0):' \
   target/preflight-timing/summary.txt
@@ -633,21 +637,21 @@ printf '// tracked change\n' >> tracked.rs
 PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
   ./preflight.sh >"$TMP/tracked-cache-miss.out"
 cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
-grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/tracked-cache-miss.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green;' "$TMP/tracked-cache-miss.out"
 
 printf '// second tracked change\n' >> tracked.rs
 : >"$TMP/full-cargo.log"
 PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
   ./preflight.sh >"$TMP/textconv-cache-miss.out"
 cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
-grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/textconv-cache-miss.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green;' "$TMP/textconv-cache-miss.out"
 
 printf 'pub fn untracked_fixture() {}\n' > untracked.rs
 : >"$TMP/full-cargo.log"
 PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
   ./preflight.sh >"$TMP/untracked-cache-miss.out"
 cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
-grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/untracked-cache-miss.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green;' "$TMP/untracked-cache-miss.out"
 
 # The cache file is ignored and excluded from its own fingerprint, so malformed
 # JSON records must be rejected rather than relying on Python's numeric equality
@@ -667,7 +671,7 @@ PY
   PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
     ./preflight.sh >"$TMP/malformed-cache-miss-$INVALID_EXIT.out"
   cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
-  grep -q 'PREFLIGHT: PASS (all 4 gates green)' \
+  grep -q 'PREFLIGHT: PASS (all 4 gates green;' \
     "$TMP/malformed-cache-miss-$INVALID_EXIT.out"
 done
 
