@@ -1870,8 +1870,8 @@ The process runs in its own process group. The adapter retains that group ID ind
 of the leader's reap state, so teardown kills descendants holding inherited pipes before it
 drains bounded output and reaps the child.
 
-An `end` event is the protocol's success marker, but managed success will additionally
-require exit status zero when Grok lifecycle roles are enabled. `error`, non-zero exit,
+An `end` event is the protocol's success marker, but managed worker success additionally
+requires exit status zero. `error`, non-zero exit,
 EOF without `end`, missing session identity, timeout, and forced termination are failure
 paths; the adapter never fabricates a terminal event from EOF or exit alone. Grok emits
 the session identity late, so no continuation may be relied on before `end`.
@@ -1931,7 +1931,7 @@ Capabilities are fixed internal facts, not a negotiation framework:
 
 | Capability | Claude | Codex | Grok Build |
 |---|---:|---:|---:|
-| resumable continuation | yes | yes | transport only |
+| resumable continuation | yes | yes | yes (workers only) |
 | JSON event stream | yes | yes | yes |
 | token usage | yes | yes | when complete |
 | authoritative stream-provided USD cost | yes | no | when complete |
@@ -1940,10 +1940,9 @@ Capabilities are fixed internal facts, not a negotiation framework:
 
 Never fabricate missing telemetry. Token, wall-clock, task-wall, and idle limits
 continue when their data is observable. Codex does not expose reliable ChatGPT
-subscription USD cost per turn. Grok exposes USD only for a server-complete ledger;
-its managed accounting semantics remain disabled with its lifecycle roles. If a Codex
-daemon is configured with a USD safety limit, startup fails loudly rather than ignoring
-it or failing every completed turn.
+subscription USD cost per turn. Grok workers use token and wall-clock bounds; no USD
+pricing or cost accounting is enabled. If a Codex daemon is configured with a USD safety
+limit, startup fails loudly rather than ignoring it or failing every completed turn.
 
 Use the minimum Codex sandbox proven by the full lifecycle canary. Begin validation
 with `danger-full-access` because runs use git, GitHub CLI, Quorum, repository hooks,
@@ -2068,7 +2067,7 @@ opus = 100
 opus = 100
 ```
 
-Grok worker transport validation vocabulary:
+Grok worker adapter configuration:
 
 ```toml
 [grok]
@@ -2096,7 +2095,8 @@ review stage: R1 and R2 use the same reviewer eligibility pool but separate bags
 Startup fails before any claim when a profile is invalid, a required pool is absent or empty,
 a profile is duplicated in a pool, a percentage is not a positive integer, a pool does not total
 100, or legacy fixed-model routing is present. Never infer runner kind from an executable
-filename. Runner-specific process options remain scoped under `[claude]` or `[codex]`.
+filename. Runner-specific process options remain scoped under `[claude]`, `[codex]`, or
+`[grok]`.
 
 ### Bounded task decomposition
 
