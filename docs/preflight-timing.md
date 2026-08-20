@@ -8,6 +8,11 @@ that worktree replaces both files. A `branch_base` failure starts no collector,
 so it produces no new timing artifact and a prior artifact can remain at this
 path; never treat that prior file as evidence for the failed run.
 
+When test execution is reached, the same directory also holds the local
+per-binary green-result cache, `test-results.json`. Like Cargo outputs and the
+whole-tree `last-green.json` cache, it is under `target/`, is per-worktree, and
+is not committed.
+
 If the collector reaches compile/no-run, it also leaves these raw inputs in the
 same directory:
 
@@ -38,6 +43,7 @@ the complete author-gate artifact is required.
 | `first_failure` | The first failed gate or test binary, including its exit/outcome details and a target-specific Cargo `rerun_command` when compiler-artifact identity is sufficient. JSON `null` on success. |
 | `gates` | Ordered objects with `name`, `duration_secs`, and `exit_code`. Full preflight prepends `branch_base`; the collector records `cargo_fmt`, `cargo_clippy`, `cargo_test_no_run`, and `test_execute` until a failure stops later gates. |
 | `test_binaries` | One object per Cargo test executable discovered during the compile/no-run gate. Its identity fields are `package_id`, `manifest_path`, `target_name`, `target_kinds`, `executable`, and `fresh`; execution fields are described below. It is empty when compilation was never reached. |
+| `test_execution` | Aggregate execution accounting: `executed`, `cached`, and `not_run` counts. `not_run` covers binaries left unscheduled after fail-fast cancellation. |
 | `top_n_slowest` | A bounded, descending copy of the slowest entries in `test_binaries`. |
 | `rustc_wrapper` | Correlation accounting (`matched`, `log_entries`, and `log_path`) once compile/no-run starts; `{}` for an earlier fmt or clippy failure. |
 
@@ -59,6 +65,44 @@ including descendants that created separate process groups, no longer exist
 and the supervisor reaped the children it owns. `error` also retains a
 transient process-discovery diagnostic when fallback or a later snapshot still
 allowed cleanup to complete. A timeout uses exit code `124`.
+
+A cache hit instead has `cached: true`, `execute_secs: 0.0`,
+`execute_exit_code: 0`, and `execute_outcome: "cached_pass"`. It has no
+`cleanup` object because the collector did not launch a supervisor or test
+process. A normally executed binary has no `cached` field. Consumers must use
+the `cached` marker and `test_execution` counts rather than treating a zero
+execution duration as proof that the binary ran.
+
+### Per-binary green-result cache
+
+Before execution, the collector SHA-256 hashes each discovered executable's
+produced file contents. `test-results.json` maps each such lowercase digest to
+an exact green record:
+
+```json
+{
+  "<sha256 executable contents>": {"exit": 0, "target_name": "..."}
+}
+```
+
+Only a completed direct execution with exit code zero and complete descendant
+cleanup is eligible. Successful records are written with a temporary file and
+`os.replace`; failures, timeouts, interrupted runs, incomplete cleanup,
+fail-fast cancellations, and binaries never launched are never cached. The
+collector validates the complete cache object on read. Missing, malformed, or
+unreadable cache data, and any executable-hashing failure, are cache misses and
+run the binary normally. A cache-write failure leaves the just-completed gate
+result intact but leaves no durable result for a later run, which therefore
+executes that binary again.
+
+The hash deliberately keys on the produced executable, not build inputs:
+Cargo may rebuild through `sccache`, so input-derived or path-derived keys are
+not a correctness substitute. An executable whose contents change always runs.
+Unchanged concurrency canaries consequently receive fewer repeat executions;
+operators investigating flakes can delete
+`target/preflight-timing/test-results.json` to force a full binary-execution
+pass.
+
 The collector compiles once and then runs at most `test_jobs` discovered
 executables concurrently. After the first observed nonzero exit or incomplete
 cleanup, it schedules no more binaries and closes every other active
@@ -148,6 +192,13 @@ to decide which phase to investigate. A compile value of `n/a` means the wrapper
 binary, not that its compile time was zero. The binary name in the text table
 is truncated to 40 characters; use `timing.json` for the full executable path
 and package identity.
+
+Above that table, `test binaries: X executed, Y cached` reports the same
+accounting as `test_execution` (and adds `Z not run` for a partial fail-fast
+run). On a green full author gate, the final `PREFLIGHT: PASS` line repeats the
+executed and cached counts. A whole-tree `last-green.json` hit remains an
+earlier short circuit and keeps its existing `PREFLIGHT: PASS (cached — tree
+unchanged since last green run)` output without running the collector.
 
 ## Optional loaded-worktree comparison
 

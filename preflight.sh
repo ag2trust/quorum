@@ -272,6 +272,26 @@ for gate in json.load(open(sys.argv[1])).get("gates", []):
 PY
 }
 
+test_execution_summary() {
+  python3 - "$TIMING_ARTIFACT" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+binaries = data.get("test_binaries")
+if not isinstance(binaries, list):
+    raise ValueError("timing artifact has no test-binaries list")
+
+cached = sum(binary.get("cached") is True for binary in binaries)
+executed = sum(
+    binary.get("cached") is not True and "execute_exit_code" in binary
+    for binary in binaries
+    if isinstance(binary, dict)
+)
+print(f"{executed} test binaries executed, {cached} cached")
+PY
+}
+
 # Print the number of changed files only when every change is inert.  This is
 # intentionally byte-oriented: Git paths need not be valid UTF-8, and a
 # malformed status or diff query must leave the caller on the full-gate path.
@@ -551,4 +571,6 @@ if [ -n "$FULL_GATE_FINGERPRINT" ]; then
   fi
 fi
 
-printf '\nPREFLIGHT: PASS (all 4 gates green)\n'
+TEST_EXECUTION_SUMMARY=$(test_execution_summary) \
+  || fail "read test execution counts"
+printf '\nPREFLIGHT: PASS (all 4 gates green; %s)\n' "$TEST_EXECUTION_SUMMARY"
