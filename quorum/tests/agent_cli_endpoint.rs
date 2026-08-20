@@ -271,6 +271,23 @@ fn command(
         .assert()
 }
 
+fn command_without_quorum_home(
+    private_home: &Path,
+    endpoint: &Path,
+    capability: &str,
+    args: &[&str],
+) -> assert_cmd::assert::Assert {
+    let mut command = Command::new(quorum_bin());
+    command
+        .env_remove("QUORUM_HOME")
+        .env("HOME", private_home)
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", endpoint)
+        .env("QUORUM_RUN_ID", capability)
+        .args(args)
+        .assert()
+}
+
 fn mailbox_count(db: &Path) -> i64 {
     quorum_core::db::open(db)
         .unwrap()
@@ -284,6 +301,17 @@ fn success_id(assertion: assert_cmd::assert::Assert) -> i64 {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["ok"], true);
     value["mailbox_id"].as_i64().unwrap()
+}
+
+fn success_note_id(assertion: assert_cmd::assert::Assert) -> i64 {
+    let output = assertion.success().get_output().clone();
+    assert!(output.stderr.is_empty(), "unexpected stderr: {output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value.as_object().unwrap().len(), 2);
+    let id = value["note_id"].as_i64().unwrap();
+    assert!(id > 0);
+    id
 }
 
 #[test]
@@ -369,6 +397,40 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
             "blocked",
         ],
     ));
+    let private_home = root.path().join("private-home");
+    std::fs::create_dir_all(&private_home).unwrap();
+    let worker_note_file = root.path().join("worker-note.txt");
+    std::fs::write(&worker_note_file, "worker progress").unwrap();
+    let worker_note = success_note_id(command_without_quorum_home(
+        &private_home,
+        &endpoint,
+        "worker-cap",
+        &[
+            "task-update",
+            "--agent",
+            "Impostor",
+            "--task-id",
+            "999",
+            "--note-file",
+            worker_note_file.to_str().unwrap(),
+        ],
+    ));
+    let reviewer_note_file = root.path().join("reviewer-note.txt");
+    std::fs::write(&reviewer_note_file, "review progress").unwrap();
+    let reviewer_note = success_note_id(command_without_quorum_home(
+        &private_home,
+        &endpoint,
+        "reviewer-cap",
+        &[
+            "task-update",
+            "--agent",
+            "Impostor",
+            "--task-id",
+            "999",
+            "--note-file",
+            reviewer_note_file.to_str().unwrap(),
+        ],
+    ));
 
     let conn = quorum_core::db::open(&db).unwrap();
     let rows: Vec<MailboxShape> = conn
@@ -440,6 +502,22 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
     );
     assert_eq!(graph_payload["run_id"], "graph-cap");
     assert_eq!(graph_payload["feedback"]["affected_task"], 102);
+    let notes: Vec<(i64, String, String)> = conn
+        .prepare("SELECT task_id,agent,body FROM task_notes WHERE id IN (?1,?2) ORDER BY id")
+        .unwrap()
+        .query_map(params![worker_note, reviewer_note], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        notes,
+        vec![
+            (100, "Worker".into(), "worker progress".into()),
+            (101, "Reviewer".into(), "review progress".into()),
+        ]
+    );
     drop(conn);
 
     for (capability, args) in [
@@ -486,12 +564,23 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
 fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let note_file = root.path().join("note.txt");
+    std::fs::write(&note_file, "progress").unwrap();
     let missing = root.path().join("missing.sock");
-    command(
+    command_without_quorum_home(
         &home,
         &missing,
         "capability",
-        &["submit", "--agent", "Worker"],
+        &[
+            "task-update",
+            "--agent",
+            "Worker",
+            "--task-id",
+            "1",
+            "--note-file",
+            note_file.to_str().unwrap(),
+        ],
     )
     .code(3)
     .stderr(predicates::str::contains("agent endpoint request failed"));
@@ -502,11 +591,19 @@ fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
         let (_stream, _) = listener.accept().unwrap();
         thread::sleep(Duration::from_secs(6));
     });
-    command(
+    command_without_quorum_home(
         &home,
         &timeout_socket,
         "capability",
-        &["submit", "--agent", "Worker"],
+        &[
+            "task-update",
+            "--agent",
+            "Worker",
+            "--task-id",
+            "1",
+            "--note-file",
+            note_file.to_str().unwrap(),
+        ],
     )
     .code(3)
     .stderr(predicates::str::contains("request timed out"));
@@ -523,18 +620,18 @@ fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
         stream.write_all(&4_u32.to_be_bytes()).unwrap();
         stream.write_all(b"nope").unwrap();
     });
-    command(
+    command_without_quorum_home(
         &home,
         &malformed_socket,
         "capability",
         &[
-            "react",
+            "task-update",
             "--agent",
             "Worker",
             "--task-id",
             "1",
-            "--state",
-            "note",
+            "--note-file",
+            note_file.to_str().unwrap(),
         ],
     )
     .code(3)

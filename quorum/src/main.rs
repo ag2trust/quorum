@@ -533,6 +533,28 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         .into(),
                 ));
             }
+            // Managed launch environments deliberately expose only the scoped
+            // endpoint, never QUORUM_HOME. A public CLI invocation with an
+            // explicit database home remains on the ordinary task-update path
+            // even if it inherited unrelated run-scoped environment values.
+            let managed_run = std::env::var_os("QUORUM_HOME").is_none()
+                && std::env::var_os("QUORUM_RUN_ID").is_some()
+                && std::env::var_os("QUORUM_AGENT_ENDPOINT").is_some();
+            if managed_run {
+                if has_field_update || note.is_none() {
+                    return Err(QuorumError::Usage(
+                        "daemon-managed task-update supports only --note-stdin or --note-file"
+                            .into(),
+                    ));
+                }
+                let run_id = resolve_run_id(None, "task-update")?;
+                // Retain prompt-compatible flags, but derive authoritative
+                // agent and task from the run capability at the endpoint.
+                let _ = (agent, task_id);
+                let note_id = agent_client::append_note(&run_id, note.as_deref().unwrap())?;
+                output::emit(&serde_json::json!({ "ok": true, "note_id": note_id }));
+                return Ok(0);
+            }
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let task = if has_field_update {
                 let fields = quorum_core::tasks::TaskUpdate {

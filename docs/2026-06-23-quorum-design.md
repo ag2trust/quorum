@@ -2477,16 +2477,23 @@ identity**.
 
 | Context | How identified | What it can do |
 |---|---|---|
-| **Daemon-managed run** | `QUORUM_RUN_ID` env var set by `quorum serve` at spawn time. Each run ID is a unique opaque token tied to exactly one `(run_id, task_id, role)` triple. The daemon records it in `agent_runs`. | `submit` and `react` for its own task only. The run ID is verified against `agent_runs` — a run can only signal on the task and role it was spawned for. All public commands are also available. |
+| **Daemon-managed run** | `QUORUM_RUN_ID` env var set by `quorum serve` at spawn time. Each run ID is a unique opaque token tied to exactly one `(run_id, task_id, role)` triple. The daemon records it in `agent_runs`. | `submit`, `react`, and progress-note append for its own task only. The run ID is verified against `agent_runs` — a run can only signal or append a note on the task and role it was spawned for. All public commands are also available. |
 | **External named caller** | Any invocation without `QUORUM_RUN_ID`. Identified by `--agent <name>`. | Public commands only (see table below). |
 | **Operator / admin** | Human or privileged script. No special token — admin commands are inherently manual and loud. | Public + admin commands. |
 
 The daemon generates a unique run ID (128-bit hex) for **each** spawned
 worker/reviewer and injects `QUORUM_RUN_ID=<id>` into its environment. The
 run ID is recorded in `agent_runs` with the associated `task_id` and `role`
-(worker/r1/r2). CLI commands that require run identity (`submit`, `react`)
-verify `QUORUM_RUN_ID` against `agent_runs` — a worker for task #5 cannot
-submit on behalf of task #7.
+(worker/r1/r2). CLI commands that require run identity (`submit`, `react`,
+and note-only `task-update`) verify `QUORUM_RUN_ID` against `agent_runs` — a
+worker for task #5 cannot submit or append a note on behalf of task #7.
+
+The daemon-owned local endpoint accepts only bounded, framed JSON operations:
+`submit`, `react`, and `append_note`. `append_note` accepts one non-empty,
+NUL-free note and derives both task and agent from the live run capability; it
+does not expose task fields, refs, dependencies, status, SQL, or arbitrary
+task updates. A revoked, ended, unknown, mismatched, or phase-ineligible run
+is rejected without a write.
 
 **Why per-run, not per-daemon?** A shared daemon token is a process-tree
 membership proof but not an authorization boundary — it proves "the daemon
@@ -2508,6 +2515,7 @@ Their CLI surface is:
 |---|---|
 | `submit` | Signal task completion (`--pr N`) or emit review verdict (`--verdict approved\|changes`). Requires `QUORUM_RUN_ID`; verified against the run's task and role. |
 | `react` | Signal non-terminal agent state (blocked/failed/needs-info). Requires `QUORUM_RUN_ID`. |
+| `task-update --note-stdin\|--note-file` | Append one progress note through the scoped endpoint. The supplied task and agent flags are compatibility inputs only; the live run capability derives both. |
 | `post` | Post a feed message (public command, available to all). |
 | All public commands | See table below. |
 
@@ -2845,10 +2853,11 @@ changes.
 
 ### Invariants (new, in addition to the existing 11)
 
-12. **Per-run capability gate.** `submit` and `react` require `QUORUM_RUN_ID`
-    matching an active row in `agent_runs` for the correct `(task_id, role)`.
-    Absent or mismatched → exit 2. The run ID is per-spawn, immutable, and
-    dies with the agent process.
+12. **Per-run capability gate.** `submit`, `react`, and note-only managed
+    `task-update` require `QUORUM_RUN_ID` matching an active row in
+    `agent_runs` for the correct `(task_id, role)`. Absent or mismatched →
+    exit 2. The run ID is per-spawn, immutable, and dies with the agent
+    process.
 13. **Message content is lifecycle-inert.** No feed message body, kind, or
     ref field triggers a lifecycle transition. Lifecycle transitions happen
     only through the mailbox (consumed by the daemon) or direct CLI commands

@@ -48,6 +48,9 @@ struct Request {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
+    AppendNote {
+        note: String,
+    },
     Submit {
         #[serde(default)]
         summary: Option<String>,
@@ -123,6 +126,9 @@ struct Response {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ResponseResult {
+    TaskNote {
+        note_id: i64,
+    },
     Mailbox {
         mailbox_id: i64,
     },
@@ -489,6 +495,20 @@ fn process_request_blocking(
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
 
     let response = match request.operation {
+        Operation::AppendNote { note } => {
+            let context = resolve_any_role(&tx, &request.capability)?;
+            validate_progress_note(&note)?;
+            let note_id = quorum_core::tasks::add_note_tx(
+                &tx,
+                &context.agent,
+                context.task_id,
+                &note,
+                quorum_core::clock::now(),
+            )
+            .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?
+            .ok_or_else(|| EndpointFailure::new("internal", "request processing failed"))?;
+            Response::success(ResponseResult::TaskNote { note_id })
+        }
         Operation::Submit {
             summary,
             verdict,
@@ -616,6 +636,16 @@ fn validate_text(value: Option<&str>) -> std::result::Result<(), EndpointFailure
         return Err(EndpointFailure::new(
             "invalid_operation",
             "operation contains invalid text",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_progress_note(note: &str) -> std::result::Result<(), EndpointFailure> {
+    if note.is_empty() || note.len() > MAX_REQUEST_BYTES || note.contains('\0') {
+        return Err(EndpointFailure::new(
+            "invalid_operation",
+            "invalid progress note",
         ));
     }
     Ok(())
