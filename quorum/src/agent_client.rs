@@ -28,6 +28,8 @@ struct Request<'a> {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation<'a> {
     AppendNote {
+        task_id: i64,
+        agent: &'a str,
         note: &'a str,
     },
     Submit {
@@ -81,6 +83,13 @@ pub struct Submit<'a> {
     pub blocking: Option<u32>,
 }
 
+pub struct AppendNote<'a> {
+    pub capability: &'a str,
+    pub task_id: i64,
+    pub agent: &'a str,
+    pub note: &'a str,
+}
+
 pub fn submit(request: Submit<'_>) -> Result<i64> {
     mailbox_id(exchange(
         request.capability,
@@ -98,16 +107,27 @@ pub fn react(capability: &str, state: &str) -> Result<i64> {
     mailbox_id(exchange(capability, Operation::React { state })?)
 }
 
-/// Append a capability-scoped progress note. The daemon derives the task and
-/// agent; callers provide only their run capability and bounded note text.
-pub fn append_note(capability: &str, note: &str) -> Result<i64> {
-    if note.is_empty() || note.contains('\0') || note.len() > MAX_FRAME_BYTES {
+/// Append a capability-scoped progress note. The daemon derives authority from
+/// the capability and verifies the prompt-compatible identity flags before it
+/// appends the bounded note text.
+pub fn append_note(request: AppendNote<'_>) -> Result<i64> {
+    if request.note.is_empty()
+        || request.note.contains('\0')
+        || request.note.len() > MAX_FRAME_BYTES
+    {
         return Err(QuorumError::Usage(
             "managed progress note must be non-empty, within the endpoint limit, and contain no NUL"
                 .into(),
         ));
     }
-    note_id(exchange(capability, Operation::AppendNote { note })?)
+    note_id(exchange(
+        request.capability,
+        Operation::AppendNote {
+            task_id: request.task_id,
+            agent: request.agent,
+            note: request.note,
+        },
+    )?)
 }
 
 fn exchange(capability: &str, operation: Operation<'_>) -> Result<ResponseResult> {
