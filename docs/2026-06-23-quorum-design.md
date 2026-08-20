@@ -1,6 +1,6 @@
 # Quorum — Design Spec
 
-**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, no-CI contract 2026-07-23, coding-runner boundary 2026-07-24, explicit-cancellation contract 2026-07-26)
+**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, no-CI contract 2026-07-23, coding-runner boundary 2026-07-24, explicit-cancellation contract 2026-07-26, source-cancellation escape hatch 2026-08-20)
 **Status:** Implemented (v1) · CLI + daemon · lifecycle state machine (`lifecycle.rs`)
 · v2 boundary specified (§ Daemon-only execution; corrected — supersedes PR #375)
 **Repo:** `~/dev/quorum`
@@ -2273,11 +2273,18 @@ the sole adoption authority. The complete predicate is specified in the decompos
 specification.
 
 The final child merge marks the source and graph done in the same transaction that marks that
-child done. Source dependents remain blocked until then. Cancelling a source atomically makes the
-graph non-runnable, cancels unfinished children, revokes authority, and records idempotent cleanup
-intents. The daemon then stops processes and closes/removes only unmerged, revocable artifacts.
-Lifecycle history, reviews, and merged delivery records remain. Direct child cancellation is
-rejected. Cleanup intent execution is a durable lease state machine
+child done. Source dependents remain blocked until then. Cancelling a source atomically makes
+the graph non-runnable, cancels unfinished children, revokes authority, and records idempotent
+cleanup intents. The daemon then stops processes and closes/removes only unmerged, revocable
+artifacts. Lifecycle history, reviews, and merged delivery records remain. Direct child
+cancellation is rejected. Source cancellation is the universal terminal escape hatch: it accepts
+any non-terminal graph state — including the pre-children planning states (`freeze-requested`,
+`draining`, `planning`, `validating`, `preclassifying`, `provider-backoff`, `held`) as well as
+`active` and `blocked` — and atomically clears any pending planner freeze/backoff/hold, tearing
+down whatever is in flight. It refuses only on authority mismatch (creator/assignee), stale
+`--expected-revision`, or an already-terminal graph (`completed`/`cancelled`); internal graph state
+is never a cancellation gate. This preserves the wider invariant that a non-terminal task is always
+cancellable by an authorized caller. Cleanup intent execution is a durable lease state machine
 (`pending -> running -> done|pending|exhausted`) with a three-attempt cap. Startup returns an
 interrupted running lease to pending below the cap and exhausts it at the cap. Claims are atomic,
 require a cancelled inactive graph and current graph membership, and preserve per-task action
