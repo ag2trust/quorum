@@ -1618,7 +1618,12 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
         for key in ["review_model", "classifier_model", "collector_model"] {
             let cfg: ServeFileConfig = toml::from_str(&format!("{key} = \"grok-4.5\"\n")).unwrap();
             let error = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
-            assert!(error.to_string().contains("not enabled"), "{key}: {error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("enabled only for managed workers"),
+                "{key}: {error}"
+            );
         }
     }
 
