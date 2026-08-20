@@ -652,6 +652,24 @@ only through an explicit outside request)
   skip those gates. Missing, malformed, or unreadable cache entries and every fingerprint
   error are cache misses. Fingerprinting never writes the index or uses the network; the
   daemon does not use this optimization and merge CI remains the full backstop.
+- **Author-side per-binary test cache:** When the whole-tree cache misses, fmt, clippy,
+  and compile/no-run still run in full. Before direct test-binary execution, the collector
+  hashes each produced executable's contents with SHA-256 and looks up the per-worktree,
+  uncommitted `target/preflight-timing/test-results.json` cache. It maps a digest to exact
+  `{ "exit": 0, "target_name": "..." }` green records. Only completed direct executions
+  with exit zero and complete cleanup are atomically published (temporary file plus
+  `os.replace`); failed, timed-out, interrupted, cancelled, incomplete-cleanup, and
+  unlaunched binaries are never cached. Missing, malformed, unreadable, or invalid cache
+  data and executable-hash failures are cache misses, so the binary runs; a write failure
+  leaves no durable result and the next run executes it again. A cache hit is evidence, not
+  an execution: its `timing.json` binary entry has `cached: true`, `cached_pass`, zero
+  duration, and no cleanup object. `test_execution` and the summary/final full-pass line
+  report executed versus cached counts (and `not_run` for partial fail-fast output). The
+  key is the produced file, not inputs or build paths, so a changed executable always runs
+  even through sccache. This deliberately reduces repeat concurrency-canary coverage for
+  unchanged binaries; delete `target/preflight-timing/test-results.json` to force a full
+  binary-execution pass. The daemon does not use this optimization and merge CI remains the
+  full backstop.
 - **Author-side inert diffs:** After a cache miss, the ordinary single-base author path
   still runs `cargo fmt`, but skips clippy and tests only when the union of
   `BASE_REF...HEAD` changed paths and porcelain working-tree paths is non-empty and every
