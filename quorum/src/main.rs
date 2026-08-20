@@ -122,11 +122,19 @@ fn run() -> Result<i32> {
     // Best-effort: log genuinely abnormal failures (exit 3) — never normal lost-race (1) or
     // usage errors (2).
     if let Err(ref e) = result {
-        if e.exit_code() == 3 && source != "agent-mcp" {
+        if e.exit_code() == 3 && source != "agent-mcp" && !managed_endpoint_command(source) {
             best_effort_errlog(source, &e.to_string());
         }
     }
     result
+}
+
+/// Managed endpoint calls deliberately lack repository authority. In
+/// particular, an endpoint failure must not be followed by an error-log write
+/// that opens the provider's private Quorum database.
+fn managed_endpoint_command(source: &str) -> bool {
+    matches!(source, "task-update" | "react" | "submit")
+        && std::env::var_os("QUORUM_RUN_ID").is_some()
 }
 
 fn command_source(cmd: &cli::Command) -> &'static str {
@@ -533,11 +541,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         .into(),
                 ));
             }
-            // A complete run capability envelope always takes the scoped
-            // path. In particular, a provider must not regain caller-selected
-            // task/agent writes merely by inheriting QUORUM_HOME.
-            let managed_run = std::env::var_os("QUORUM_RUN_ID").is_some()
-                && std::env::var_os("QUORUM_AGENT_ENDPOINT").is_some();
+            // A run identity always takes the scoped path. In particular, a
+            // provider must not regain caller-selected task/agent writes by
+            // inheriting QUORUM_HOME or by losing its endpoint setting.
+            let managed_run = std::env::var_os("QUORUM_RUN_ID").is_some();
             if managed_run {
                 if has_field_update || note.is_none() {
                     return Err(QuorumError::Usage(
@@ -546,10 +553,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     ));
                 }
                 let run_id = resolve_run_id(None, "task-update")?;
-                // Retain prompt-compatible flags, but derive authoritative
-                // agent and task from the run capability at the endpoint.
-                let _ = (agent, task_id);
-                let note_id = agent_client::append_note(&run_id, note.as_deref().unwrap())?;
+                // Retain prompt-compatible flags as identity constraints; the
+                // endpoint derives the authoritative task and agent from the
+                // run capability and rejects a mismatch before writing.
+                let note_id = agent_client::append_note(agent_client::AppendNote {
+                    capability: &run_id,
+                    task_id,
+                    agent: &agent,
+                    note: note.as_deref().unwrap(),
+                })?;
                 output::emit(&serde_json::json!({ "ok": true, "note_id": note_id }));
                 return Ok(0);
             }

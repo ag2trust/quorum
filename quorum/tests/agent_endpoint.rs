@@ -449,13 +449,16 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
         ),
         exchange(
             &endpoint,
-            &request("worker-cap", json!({"type":"append_note","note":""})),
+            &request(
+                "worker-cap",
+                json!({"type":"append_note","task_id":100,"agent":"Worker","note":""}),
+            ),
         ),
         exchange(
             &endpoint,
             &request(
                 "worker-cap",
-                json!({"type":"append_note","note":"bad\u{0000}note"}),
+                json!({"type":"append_note","task_id":100,"agent":"Worker","note":"bad\u{0000}note"}),
             ),
         ),
         exchange(
@@ -506,7 +509,7 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
         &endpoint,
         &request(
             "worker-cap",
-            json!({"type":"append_note","note":"worker progress"}),
+            json!({"type":"append_note","task_id":100,"agent":"Worker","note":"worker progress"}),
         ),
     );
     assert_eq!(worker_note["version"], 1);
@@ -517,7 +520,7 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
         &endpoint,
         &request(
             "reviewer-cap",
-            json!({"type":"append_note","note":"review progress"}),
+            json!({"type":"append_note","task_id":101,"agent":"Reviewer","note":"review progress"}),
         ),
     );
     assert_eq!(reviewer_note["version"], 1);

@@ -271,10 +271,34 @@ fn command(
         .assert()
 }
 
+fn command_without_quorum_home(
+    private_home: &Path,
+    endpoint: &Path,
+    capability: &str,
+    args: &[&str],
+) -> assert_cmd::assert::Assert {
+    let mut command = Command::new(quorum_bin());
+    command
+        .env_remove("QUORUM_HOME")
+        .env("HOME", private_home)
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", endpoint)
+        .env("QUORUM_RUN_ID", capability)
+        .args(args)
+        .assert()
+}
+
 fn mailbox_count(db: &Path) -> i64 {
     quorum_core::db::open(db)
         .unwrap()
         .query_row("SELECT COUNT(*) FROM mailbox", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn task_note_count(db: &Path) -> i64 {
+    quorum_core::db::open(db)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM task_notes", [], |row| row.get(0))
         .unwrap()
 }
 
@@ -382,18 +406,20 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
     ));
     let worker_note_file = root.path().join("worker-note.txt");
     std::fs::write(&worker_note_file, "worker progress").unwrap();
-    // QUORUM_HOME is deliberately present: managed endpoint authority must
-    // still win over a provider that inherited it.
-    let worker_note = success_note_id(command(
-        &home,
+    // Grok runs with an invocation-private HOME and no QUORUM_HOME. The note
+    // must still reach the daemon-owned database through its endpoint.
+    let private_home = root.path().join("private-home");
+    std::fs::create_dir_all(&private_home).unwrap();
+    let worker_note = success_note_id(command_without_quorum_home(
+        &private_home,
         &endpoint,
         "worker-cap",
         &[
             "task-update",
             "--agent",
-            "Impostor",
+            "Worker",
             "--task-id",
-            "999",
+            "100",
             "--note-file",
             worker_note_file.to_str().unwrap(),
         ],
@@ -407,9 +433,9 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
         &[
             "task-update",
             "--agent",
-            "Impostor",
+            "Reviewer",
             "--task-id",
-            "999",
+            "101",
             "--note-file",
             reviewer_note_file.to_str().unwrap(),
         ],
@@ -502,6 +528,89 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
         ]
     );
     drop(conn);
+    assert!(
+        !private_home.join(".quorum").exists(),
+        "managed note command opened a private Quorum home"
+    );
+
+    let notes_before_rejections = task_note_count(&db);
+    for (capability, args) in [
+        (
+            "worker-cap",
+            vec![
+                "task-update",
+                "--agent",
+                "Impostor",
+                "--task-id",
+                "100",
+                "--note-file",
+                worker_note_file.to_str().unwrap(),
+            ],
+        ),
+        (
+            "worker-cap",
+            vec![
+                "task-update",
+                "--agent",
+                "Worker",
+                "--task-id",
+                "999",
+                "--note-file",
+                worker_note_file.to_str().unwrap(),
+            ],
+        ),
+        (
+            "revoked-cap",
+            vec![
+                "task-update",
+                "--agent",
+                "Revoked",
+                "--task-id",
+                "104",
+                "--note-file",
+                worker_note_file.to_str().unwrap(),
+            ],
+        ),
+        (
+            "ended-cap",
+            vec![
+                "task-update",
+                "--agent",
+                "Ended",
+                "--task-id",
+                "105",
+                "--note-file",
+                worker_note_file.to_str().unwrap(),
+            ],
+        ),
+    ] {
+        command_without_quorum_home(&private_home, &endpoint, capability, &args)
+            .code(2)
+            .stderr(predicates::str::contains("agent endpoint rejected"));
+    }
+
+    let body_file = root.path().join("body.txt");
+    std::fs::write(&body_file, "new body").unwrap();
+    for extra in [
+        vec!["--status", "working"],
+        vec!["--refs", r#"{"issue":1}"#],
+        vec!["--body-file", body_file.to_str().unwrap()],
+        vec!["--depends-on", "[]"],
+    ] {
+        let mut args = vec!["task-update", "--agent", "Worker", "--task-id", "100"];
+        args.extend(extra);
+        args.extend(["--note-file", worker_note_file.to_str().unwrap()]);
+        command_without_quorum_home(&private_home, &endpoint, "worker-cap", &args)
+            .code(2)
+            .stderr(predicates::str::contains(
+                "daemon-managed task-update supports only",
+            ));
+    }
+    assert_eq!(
+        task_note_count(&db),
+        notes_before_rejections,
+        "rejected managed updates appended notes"
+    );
 
     for (capability, args) in [
         ("revoked-cap", vec!["submit", "--agent", "Revoked"]),
@@ -546,13 +655,13 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
 #[test]
 fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
     let root = tempfile::tempdir().unwrap();
-    let home = root.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
+    let private_home = root.path().join("private-home");
+    std::fs::create_dir_all(&private_home).unwrap();
     let note_file = root.path().join("note.txt");
     std::fs::write(&note_file, "progress").unwrap();
     let missing = root.path().join("missing.sock");
-    command(
-        &home,
+    command_without_quorum_home(
+        &private_home,
         &missing,
         "capability",
         &[
@@ -574,8 +683,8 @@ fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
         let (_stream, _) = listener.accept().unwrap();
         thread::sleep(Duration::from_secs(6));
     });
-    command(
-        &home,
+    command_without_quorum_home(
+        &private_home,
         &timeout_socket,
         "capability",
         &[
@@ -603,8 +712,8 @@ fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
         stream.write_all(&4_u32.to_be_bytes()).unwrap();
         stream.write_all(b"nope").unwrap();
     });
-    command(
-        &home,
+    command_without_quorum_home(
+        &private_home,
         &malformed_socket,
         "capability",
         &[
@@ -620,4 +729,8 @@ fn unavailable_timed_out_and_malformed_endpoints_fail_closed() {
     .code(3)
     .stderr(predicates::str::contains("malformed response"));
     malformed_server.join().unwrap();
+    assert!(
+        !private_home.join(".quorum").exists(),
+        "failed managed calls opened a private Quorum home"
+    );
 }

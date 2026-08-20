@@ -2490,10 +2490,12 @@ worker for task #5 cannot submit or append a note on behalf of task #7.
 
 The daemon-owned local endpoint accepts only bounded, framed JSON operations:
 `submit`, `react`, and `append_note`. `append_note` accepts one non-empty,
-NUL-free note and derives both task and agent from the live run capability; it
-does not expose task fields, refs, dependencies, status, SQL, or arbitrary
-task updates. A revoked, ended, unknown, mismatched, or phase-ineligible run
-is rejected without a write.
+NUL-free note plus the prompt-compatible task and agent identity flags. The
+live run capability remains authoritative, and the endpoint rejects a flag
+that does not agree with its derived task or agent. It does not expose task
+field mutation, refs, dependencies, status, SQL, or arbitrary task updates. A
+revoked, ended, unknown, mismatched, or phase-ineligible run is rejected
+without a write.
 
 **Why per-run, not per-daemon?** A shared daemon token is a process-tree
 membership proof but not an authorization boundary — it proves "the daemon
@@ -2515,7 +2517,7 @@ Their CLI surface is:
 |---|---|
 | `submit` | Signal task completion (`--pr N`) or emit review verdict (`--verdict approved\|changes`). Requires `QUORUM_RUN_ID`; verified against the run's task and role. |
 | `react` | Signal non-terminal agent state (blocked/failed/needs-info). Requires `QUORUM_RUN_ID`. |
-| `task-update --note-stdin\|--note-file` | Append one progress note through the scoped endpoint. The supplied task and agent flags are compatibility inputs only; the live run capability derives both. |
+| `task-update --note-stdin\|--note-file` | Append one progress note through the scoped endpoint. The supplied task and agent flags are compatibility inputs, which must agree with the task and agent derived from the live run capability. |
 | `post` | Post a feed message (public command, available to all). |
 | All public commands | See table below. |
 

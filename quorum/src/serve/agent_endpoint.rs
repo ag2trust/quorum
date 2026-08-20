@@ -49,6 +49,8 @@ struct Request {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
     AppendNote {
+        task_id: i64,
+        agent: String,
         note: String,
     },
     Submit {
@@ -495,8 +497,18 @@ fn process_request_blocking(
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
 
     let response = match request.operation {
-        Operation::AppendNote { note } => {
+        Operation::AppendNote {
+            task_id,
+            agent,
+            note,
+        } => {
             let context = resolve_any_role(&tx, &request.capability)?;
+            if task_id != context.task_id || agent != context.agent {
+                return Err(EndpointFailure::new(
+                    "invalid_operation",
+                    "task identity does not match run authority",
+                ));
+            }
             validate_progress_note(&note)?;
             let note_id = quorum_core::tasks::add_note_tx(
                 &tx,

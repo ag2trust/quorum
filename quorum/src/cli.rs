@@ -104,7 +104,8 @@ pub enum Command {
     /// `--note-stdin`/`--note-file` appends a breadcrumb to the task's note history. Notes
     /// have **no assignee guard** (any agent can leave one) and can be combined with the
     /// other field updates in the same call. A daemon-managed run may use only this
-    /// note operation; its task and agent are derived from the run capability.
+    /// note operation; its task and agent are derived from the run capability and must
+    /// agree with the required flags.
     ///
     /// Verdict transitions are daemon-managed only — use `quorum submit --verdict`.
     TaskUpdate {
