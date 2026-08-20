@@ -1037,14 +1037,21 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                     }
                 }
                 AgentEvent::AssistantText { text } => {
-                    if slot.response_text.len().saturating_add(text.len()) > MAX_RESPONSE_BYTES {
-                        return Some(provider_failure(
-                            slot,
-                            "planner response exceeded 64 KiB",
-                            "exact-through-last-line",
-                        ));
+                    // Claude streams its terminal response as assistant text. Codex
+                    // started agent-message events are only provisional: use the
+                    // provider-confirmed completed event below as its sole response
+                    // candidate so narration cannot be concatenated into JSON.
+                    if slot.proc.kind() == AgentKind::Claude {
+                        if slot.response_text.len().saturating_add(text.len()) > MAX_RESPONSE_BYTES
+                        {
+                            return Some(provider_failure(
+                                slot,
+                                "planner response exceeded 64 KiB",
+                                "exact-through-last-line",
+                            ));
+                        }
+                        slot.response_text.push_str(&text);
                     }
-                    slot.response_text.push_str(&text);
                 }
                 AgentEvent::CompletedAssistantText { text, .. } => {
                     if text.len() > MAX_RESPONSE_BYTES {
@@ -1693,6 +1700,99 @@ mod tests {
             outcome,
             PlannerPoll::Done(PlannerResponse::Plan { ref tasks }) if tasks.len() == 2
         ));
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_uses_only_the_latest_completed_agent_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let output = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": "intermediate narration"}
+            }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "command_execution", "id": "tool-1", "aggregated_output": "tool output"}
+            }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-2", "text": response.to_string()}
+            }),
+            // This provisional output arrives after the completed response. It
+            // must not be appended to the terminal candidate.
+            serde_json::json!({
+                "type": "item.started",
+                "item": {"type": "agent_message", "id": "message-3", "text": "more narration"}
+            }),
+            serde_json::json!({"type": "turn.completed"}),
+        );
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::Done(PlannerResponse::Plan { ref tasks }) if tasks.len() == 2
+        ));
+        assert_eq!(slot.response_text, response.to_string());
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_does_not_fall_back_from_malformed_latest_completed_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let output = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": valid.to_string()}
+            }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-2", "text": "not a JSON response"}
+            }),
+            serde_json::json!({"type": "turn.completed"}),
+        );
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(outcome, PlannerPoll::ProviderFailed(_)));
+        assert_eq!(slot.response_text, "not a JSON response");
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_requires_a_completed_agent_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.started",
+                "item": {"type": "agent_message", "id": "message-1", "text": valid.to_string()}
+            }),
+            serde_json::json!({"type": "turn.completed"}),
+        );
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(outcome, PlannerPoll::ProviderFailed(_)));
+        assert!(slot.response_text.is_empty());
         slot.kill_and_reap().await;
     }
 
