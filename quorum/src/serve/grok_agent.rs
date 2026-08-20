@@ -28,7 +28,8 @@ use tokio::process::{Child, ChildStdout, Command};
 
 pub const SUPPORTED_MODEL: &str = "grok-4.5";
 pub const SUPPORTED_EFFORTS: &[&str] = &["low", "medium", "high"];
-pub const DEFAULT_SANDBOX: &str = "workspace";
+pub const DEFAULT_SANDBOX: &str = "off";
+pub const EXPLICIT_WORKSPACE_SANDBOX: &str = "workspace";
 pub const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 pub const DEFAULT_MAX_TURNS: u32 = 64;
 pub const MAX_CONFIGURED_TURNS: u32 = 256;
@@ -301,7 +302,7 @@ impl GrokMcpConfigHome {
         }
 
         let sandbox_profile =
-            (spec.sandbox == DEFAULT_SANDBOX).then_some(MANAGED_WORKSPACE_SANDBOX);
+            (spec.sandbox == EXPLICIT_WORKSPACE_SANDBOX).then_some(MANAGED_WORKSPACE_SANDBOX);
         if let Some(profile) = sandbox_profile {
             let sandbox = toml::Value::Table(toml::Table::from_iter([(
                 "profiles".into(),
@@ -310,7 +311,7 @@ impl GrokMcpConfigHome {
                     toml::Value::Table(toml::Table::from_iter([
                         (
                             "extends".into(),
-                            toml::Value::String(DEFAULT_SANDBOX.into()),
+                            toml::Value::String(EXPLICIT_WORKSPACE_SANDBOX.into()),
                         ),
                         (
                             "read_write".into(),
@@ -1481,6 +1482,7 @@ mod tests {
         std::fs::write(original_home.join("hooks-paths"), "/operator/guard-hooks\n").unwrap();
 
         let mut spec = test_spec(worktree.path());
+        spec.sandbox = EXPLICIT_WORKSPACE_SANDBOX.into();
         spec.env_vars = vec![("GROK_HOME".into(), original_home.display().to_string())];
         let managed =
             GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
@@ -1516,7 +1518,10 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(managed.path().join("sandbox.toml")).unwrap())
                 .unwrap();
         let profile = &sandbox["profiles"][MANAGED_WORKSPACE_SANDBOX];
-        assert_eq!(profile["extends"].as_str(), Some(DEFAULT_SANDBOX));
+        assert_eq!(
+            profile["extends"].as_str(),
+            Some(EXPLICIT_WORKSPACE_SANDBOX)
+        );
         assert_eq!(
             profile["read_write"].as_array().unwrap(),
             &[toml::Value::String(
@@ -1698,6 +1703,7 @@ mod tests {
         let original_home = root.path().join("grok-home");
         std::fs::create_dir_all(&original_home).unwrap();
         let mut spec = test_spec(worktree.path());
+        spec.sandbox = EXPLICIT_WORKSPACE_SANDBOX.into();
         spec.env_vars = vec![("GROK_HOME".into(), original_home.display().to_string())];
         let session_id = "provider-issued-grok-session-42";
 
@@ -1759,7 +1765,7 @@ mod tests {
                 "--permission-mode",
                 "bypassPermissions",
                 "--sandbox",
-                "workspace",
+                "off",
                 "--max-turns",
                 "64",
                 "--verbatim",
@@ -1775,11 +1781,74 @@ mod tests {
             &args[..4],
             ["--resume", "019f-session", "-p", "inspect the repository"]
         );
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--sandbox", "workspace"]));
+        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "off"]));
         assert!(!args.iter().any(|arg| arg.contains("allowedTools")));
         assert!(!args.iter().any(|arg| arg == "--bare"));
+    }
+
+    #[test]
+    fn default_launch_omits_the_managed_workspace_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let original_home = root.path().join("grok-home");
+        std::fs::create_dir_all(&original_home).unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = vec![("GROK_HOME".into(), original_home.display().to_string())];
+
+        assert_eq!(spec.sandbox, "off");
+        let managed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        assert!(managed.sandbox_profile().is_none());
+        assert!(!managed.path().join("sandbox.toml").exists());
+
+        for args in [
+            args_with_managed_sandbox(
+                &headless_args(&spec, LaunchMode::Normal).unwrap(),
+                managed.sandbox_profile(),
+            )
+            .unwrap(),
+            args_with_managed_sandbox(
+                &resume_args("019f-session", &spec).unwrap(),
+                managed.sandbox_profile(),
+            )
+            .unwrap(),
+        ] {
+            assert!(args.windows(2).any(|pair| pair == ["--sandbox", "off"]));
+            assert!(!args.iter().any(|arg| arg == MANAGED_WORKSPACE_SANDBOX));
+        }
+    }
+
+    #[test]
+    fn explicit_workspace_still_builds_the_managed_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let original_home = root.path().join("grok-home");
+        std::fs::create_dir_all(&original_home).unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.sandbox = EXPLICIT_WORKSPACE_SANDBOX.into();
+        spec.env_vars = vec![("GROK_HOME".into(), original_home.display().to_string())];
+
+        let managed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        assert_eq!(managed.sandbox_profile(), Some(MANAGED_WORKSPACE_SANDBOX));
+        assert!(managed.path().join("sandbox.toml").exists());
+
+        for args in [
+            args_with_managed_sandbox(
+                &headless_args(&spec, LaunchMode::Normal).unwrap(),
+                managed.sandbox_profile(),
+            )
+            .unwrap(),
+            args_with_managed_sandbox(
+                &resume_args("019f-session", &spec).unwrap(),
+                managed.sandbox_profile(),
+            )
+            .unwrap(),
+        ] {
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["--sandbox", MANAGED_WORKSPACE_SANDBOX]));
+        }
     }
 
     #[test]

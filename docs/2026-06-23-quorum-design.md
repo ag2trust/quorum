@@ -2071,10 +2071,25 @@ Grok worker adapter configuration:
 
 ```toml
 [grok]
-sandbox = "workspace"              # off | workspace
+sandbox = "off"                    # off | workspace (default: off)
 permission_mode = "bypassPermissions"
 max_turns = 64                      # 1..=256
 ```
+
+`sandbox = "off"` is the production-capable default. Quorum provisions every managed
+worker as a linked Git worktree, so the worker must be able to write the linked
+worktree's `.git/index.lock` and the common-dir `FETCH_HEAD`, run repository hooks and
+preflight, and invoke the scoped daemon completion endpoint. The attended task #53
+canary (2026-08-19) attempted the previous `workspace` default against the linked-worktree
+layout: the worker completed the requested README edit but its `git add`/`git commit`
+could not create the linked-worktree `index.lock`, preflight's `git fetch` could not
+write the common-dir `FETCH_HEAD`, and the generated `quorum_managed_workspace` profile
+granted only the Grok state root. The default is therefore `off`. Operators may still
+explicitly set `sandbox = "workspace"` to exercise the existing managed workspace
+profile for transport experiments; the profile, its extension of the native `workspace`
+sandbox, and the Grok state-root read/write grant are preserved for that opt-in path.
+Broader Grok lifecycle validation (remediation, R1, R2, restart, shutdown, mailbox, and
+cost-limit canaries) remains outstanding as recorded below.
 
 `grok-4.5` may be selected only by a worker routing pool. Planner, reviewer,
 classifier, and collector Grok selections are rejected at startup. The `[grok]`

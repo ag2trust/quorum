@@ -1804,7 +1804,11 @@ mod tests {
                 claude_bare: false,
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
-                grok: Default::default(),
+                grok: crate::serve::grok_agent::GrokAdapterConfig {
+                    sandbox: "workspace",
+                    permission_mode: crate::serve::grok_agent::DEFAULT_PERMISSION_MODE,
+                    max_turns: crate::serve::grok_agent::DEFAULT_MAX_TURNS,
+                },
             },
         )
         .await
