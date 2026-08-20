@@ -1670,7 +1670,7 @@ fn cancel_graph_in_tx(
         "UPDATE task_decompositions
              SET state='cancelled',active=0,freeze_active=0,
                  frozen_base_sha=NULL,hold_code=NULL,hold_summary=NULL,
-                 updated_at=?2
+                 planner_assignment_id=NULL,updated_at=?2
          WHERE id=?1",
         params![graph_id, now],
     )?;
@@ -4963,42 +4963,53 @@ mod tests {
         ));
     }
 
+    struct CancelledSnapshot {
+        state: String,
+        active: i64,
+        freeze_active: i64,
+        frozen_base_sha: Option<String>,
+        hold_code: Option<String>,
+        hold_summary: Option<String>,
+        planner_assignment_id: Option<i64>,
+        source_status: String,
+    }
+
     fn assert_source_and_graph_cancelled(conn: &Connection, graph: i64) {
-        let row: (
-            String,
-            i64,
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-        ) = conn
+        let snapshot = conn
             .query_row(
                 "SELECT d.state,d.active,d.freeze_active,d.frozen_base_sha,
-                        d.hold_code,d.hold_summary,t.status
+                        d.hold_code,d.hold_summary,d.planner_assignment_id,t.status
                  FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
                  WHERE d.id=?1",
                 [graph],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
+                    Ok(CancelledSnapshot {
+                        state: row.get(0)?,
+                        active: row.get(1)?,
+                        freeze_active: row.get(2)?,
+                        frozen_base_sha: row.get(3)?,
+                        hold_code: row.get(4)?,
+                        hold_summary: row.get(5)?,
+                        planner_assignment_id: row.get(6)?,
+                        source_status: row.get(7)?,
+                    })
                 },
             )
             .unwrap();
-        assert_eq!(row.0, "cancelled", "graph state");
-        assert_eq!(row.1, 0, "graph active flag");
-        assert_eq!(row.2, 0, "graph freeze_active flag");
-        assert!(row.3.is_none(), "frozen_base_sha cleared");
-        assert!(row.4.is_none(), "hold_code cleared");
-        assert!(row.5.is_none(), "hold_summary cleared");
-        assert_eq!(row.6, "cancelled", "source task status");
+        assert_eq!(snapshot.state, "cancelled", "graph state");
+        assert_eq!(snapshot.active, 0, "graph active flag");
+        assert_eq!(snapshot.freeze_active, 0, "graph freeze_active flag");
+        assert!(
+            snapshot.frozen_base_sha.is_none(),
+            "frozen_base_sha cleared"
+        );
+        assert!(snapshot.hold_code.is_none(), "hold_code cleared");
+        assert!(snapshot.hold_summary.is_none(), "hold_summary cleared");
+        assert!(
+            snapshot.planner_assignment_id.is_none(),
+            "planner_assignment_id cleared"
+        );
+        assert_eq!(snapshot.source_status, "cancelled", "source task status");
     }
 
     #[test]
@@ -5052,6 +5063,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events, 1, "task_cancelled emitted once");
+    }
+
+    #[test]
+    fn source_cancellation_from_routed_provider_backoff_releases_planner_assignment_link() {
+        let (_dir, mut conn) = file_setup();
+        let request = planner_request();
+        let pool = planner_pool();
+        let (graph, assignment) = begin_routed_planning(
+            &mut conn,
+            &BeginRoutedPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                assignment: &request,
+                pool: &pool,
+                seed: 7,
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        // Drive the routed aggregate into provider-backoff. `record_attempt`
+        // accepts any non-terminal, inactive state, so the freeze-requested
+        // aggregate transitions on the first provider failure. The
+        // planner_assignment_id link persists across that transition.
+        record_attempt(&mut conn, graph, "provider", "timeout", "first", 4)
+            .unwrap()
+            .unwrap();
+        let pre: (String, i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT state,active,freeze_active,planner_assignment_id
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (pre.0, pre.1, pre.2, pre.3),
+            ("provider-backoff".into(), 0, 0, Some(assignment.id)),
+            "precondition: routed provider-backoff still binds the planner assignment"
+        );
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 6).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        assert_source_and_graph_cancelled(&conn, graph);
+
+        // The role assignment itself is immutable evidence and must survive.
+        let assignment_survives: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM role_assignments WHERE id=?1",
+                [assignment.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            assignment_survives, 1,
+            "immutable planner assignment row is retained as evidence"
+        );
     }
 
     #[test]
