@@ -1159,6 +1159,12 @@ pub enum AgentEvent {
     AssistantText {
         text: String,
     },
+    /// A completed Codex `agent_message`. Unlike `AssistantText`, this is a
+    /// provider-confirmed final item and retains its provider item identity.
+    CompletedAssistantText {
+        item_id: String,
+        text: String,
+    },
     Activity {
         kind: ActivityKind,
         summary: String,

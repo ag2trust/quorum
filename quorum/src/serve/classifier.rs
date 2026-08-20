@@ -271,6 +271,14 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
                     }
                     slot.response_text.push_str(&text);
                 }
+                AgentEvent::CompletedAssistantText { text, .. } => {
+                    if text.len() > MAX_CLASSIFIER_RESPONSE_BYTES {
+                        return Some(ClassifierResult::Error(
+                            "classifier response exceeded 64 KiB".into(),
+                        ));
+                    }
+                    slot.response_text = text;
+                }
                 _ => {}
             }
         }
