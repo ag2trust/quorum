@@ -1196,6 +1196,7 @@ mod tests {
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             codex_sandbox: "danger-full-access".into(),
+            grok: Default::default(),
             pr_target_program: None,
         }
     }
@@ -1419,6 +1420,68 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "recovery duplicated {table}");
         }
+    }
+
+    #[tokio::test]
+    async fn restart_reconstructs_grok_worker_with_exact_terminal_session() {
+        let fixture = dormant_fixture();
+        {
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+            let mut refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            runner_state::set_continuation(
+                &mut refs,
+                ContinuationSlot::Worker,
+                &runner_state::ContinuationIdentity {
+                    provider: "grok".into(),
+                    id: "grok-terminal-session".into(),
+                },
+            );
+            tasks::update_refs_daemon(
+                &mut conn,
+                fixture.task_id,
+                &refs.to_string(),
+                super::super::now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE agent_runs SET model='grok-4.5',effort='high',provider='grok' \
+                 WHERE task_id=?1 AND role='worker'",
+                [fixture.task_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE journal SET provider='grok',continuation_id='grok-terminal-session' \
+                 WHERE task_id=?1 AND role='worker'",
+                [fixture.task_id],
+            )
+            .unwrap();
+        }
+
+        let wt_mgr = WorktreeManager::new();
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(workers.len(), 1);
+        let worker = &workers[0];
+        assert_eq!(worker.process_kind(), super::super::runner::AgentKind::Grok);
+        assert_eq!(
+            worker.continuation_id_for_launch(),
+            Some("grok-terminal-session")
+        );
+        assert_eq!(worker.model, "grok-4.5");
+        assert_eq!(worker.effort, "high");
     }
 
     #[tokio::test]

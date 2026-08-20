@@ -200,7 +200,7 @@ declare_serve_file_config! {
     max_rework: Option<u32>,
     /// Runner-specific Codex configuration.
     codex: Option<CodexFileConfig>,
-    /// Transport-only Grok adapter configuration. Managed Grok roles remain disabled.
+    /// Grok adapter configuration for managed worker roles.
     grok: Option<GrokFileConfig>,
 }
 
@@ -359,14 +359,7 @@ pub fn resolve_roles(
         .or(cli_agent)
         .or(file.agent.as_deref());
     let provider = RunnerKind::from_str_opt(provider_name)?;
-    if provider == RunnerKind::Grok {
-        return Err(QuorumError::Usage(
-            "provider=\"grok\" is not enabled for managed lifecycle roles; \
-             the built-in Grok transport is validation-only"
-                .into(),
-        ));
-    }
-    let provider_explicit = file.provider.is_some();
+    let provider_explicit = provider_name.is_some();
 
     let (
         worker_default_model,
@@ -375,24 +368,33 @@ pub fn resolve_roles(
         review_default_effort,
         classifier_default_model,
         classifier_default_effort,
-    ) = if provider_explicit && provider == RunnerKind::Codex {
-        (
+    ) = match (provider_explicit, provider) {
+        (true, RunnerKind::Codex) => (
             "gpt-5.6-terra",
             "medium",
             "gpt-5.6-terra",
             "high",
             "gpt-5.6-luna",
             "medium",
-        )
-    } else {
-        (
+        ),
+        // Provider selection controls workers only for Grok. Reviewer,
+        // classifier, and collector roles retain their non-Grok defaults.
+        (true, RunnerKind::Grok) => (
+            "grok-4.5",
+            "high",
+            legacy_model,
+            legacy_effort,
+            "claude-haiku-4-5-20251001",
+            "low",
+        ),
+        _ => (
             legacy_model,
             legacy_effort,
             legacy_model,
             legacy_effort,
             "claude-haiku-4-5-20251001",
             "low",
-        )
+        ),
     };
 
     let classifier_model = file
@@ -440,7 +442,6 @@ pub fn resolve_roles(
         || file.classifier_model.is_some()
         || file.collector_model.is_some();
     for (role, model) in [
-        ("worker", roles.worker_model.as_str()),
         ("review", roles.review_model.as_str()),
         ("classifier", roles.classifier_model.as_str()),
         ("collector", roles.collector_model.as_str()),
@@ -449,7 +450,7 @@ pub fn resolve_roles(
             .is_ok_and(|kind| kind == crate::serve::runner::AgentKind::Grok)
         {
             return Err(QuorumError::Usage(format!(
-                "{role}_model \"{model}\" selects Grok, but managed Grok lifecycle roles are not enabled"
+                "{role}_model \"{model}\" selects Grok, but Grok is enabled only for managed workers"
             )));
         }
     }
@@ -464,10 +465,15 @@ pub fn resolve_roles(
         ] {
             let actual =
                 crate::serve::runner::AgentKind::for_model(model).map_err(QuorumError::Usage)?;
+            if (provider == RunnerKind::Grok && role != "worker")
+                || (role == "worker" && actual == crate::serve::runner::AgentKind::Grok)
+            {
+                continue;
+            }
             let expected = match provider {
                 RunnerKind::Claude => crate::serve::runner::AgentKind::Claude,
                 RunnerKind::Codex => crate::serve::runner::AgentKind::Codex,
-                RunnerKind::Grok => unreachable!("Grok provider was rejected above"),
+                RunnerKind::Grok => crate::serve::runner::AgentKind::Grok,
             };
             if actual != expected {
                 return Err(QuorumError::Usage(format!(
@@ -507,17 +513,28 @@ pub struct GrokResolvedConfig {
     pub max_turns: u32,
 }
 
+impl Default for GrokResolvedConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: crate::serve::grok_agent::DEFAULT_SANDBOX.into(),
+            permission_mode: crate::serve::grok_agent::DEFAULT_PERMISSION_MODE.into(),
+            max_turns: crate::serve::grok_agent::DEFAULT_MAX_TURNS,
+        }
+    }
+}
+
 pub fn resolve_grok_adapter(file: Option<&GrokFileConfig>) -> Result<GrokResolvedConfig> {
+    let defaults = GrokResolvedConfig::default();
     let resolved = GrokResolvedConfig {
         sandbox: file
             .and_then(|config| config.sandbox.clone())
-            .unwrap_or_else(|| crate::serve::grok_agent::DEFAULT_SANDBOX.into()),
+            .unwrap_or(defaults.sandbox),
         permission_mode: file
             .and_then(|config| config.permission_mode.clone())
-            .unwrap_or_else(|| crate::serve::grok_agent::DEFAULT_PERMISSION_MODE.into()),
+            .unwrap_or(defaults.permission_mode),
         max_turns: file
             .and_then(|config| config.max_turns)
-            .unwrap_or(crate::serve::grok_agent::DEFAULT_MAX_TURNS),
+            .unwrap_or(defaults.max_turns),
     };
     crate::serve::grok_agent::GrokAdapterConfig {
         sandbox: &resolved.sandbox,
@@ -621,11 +638,7 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
         let expected = match expected {
             RunnerKind::Claude => crate::serve::runner::AgentKind::Claude,
             RunnerKind::Codex => crate::serve::runner::AgentKind::Codex,
-            RunnerKind::Grok => {
-                return Err(QuorumError::Usage(format!(
-                    "model profile \"{name}\" selects Grok, but managed Grok lifecycle roles are not enabled"
-                )))
-            }
+            RunnerKind::Grok => crate::serve::runner::AgentKind::Grok,
         };
         if actual != expected {
             return Err(QuorumError::Usage(format!(
@@ -640,7 +653,9 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
             crate::serve::runner::AgentKind::Codex => {
                 matches!(profile.effort.as_str(), "low" | "medium" | "high" | "xhigh")
             }
-            crate::serve::runner::AgentKind::Grok => false,
+            crate::serve::runner::AgentKind::Grok => {
+                matches!(profile.effort.as_str(), "low" | "medium" | "high")
+            }
         };
         if !effort_supported {
             return Err(QuorumError::Usage(format!(
@@ -660,9 +675,35 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
     validate_percentage_pool("collector", &routing.collector, profiles)?;
     validate_complexity_pools("worker", &routing.worker, profiles)?;
     validate_complexity_pools("reviewer", &routing.reviewer, profiles)?;
+    validate_grok_role_gate("classifier", &routing.classifier, profiles)?;
+    validate_grok_role_gate("planner", &routing.planner, profiles)?;
+    validate_grok_role_gate("collector", &routing.collector, profiles)?;
+    for (complexity, pool) in &routing.reviewer {
+        validate_grok_role_gate(&format!("reviewer.{complexity}"), pool, profiles)?;
+    }
     resolve_token_limit_basis(config.token_limit_basis.as_deref())?;
     validate_token_ceilings(config.max_turn_tokens, config.max_task_tokens)?;
     validate_routed_cost_limits(config, config.max_turn_cost_usd, config.max_task_cost_usd)?;
+    Ok(())
+}
+
+/// Grok Build is available only to managed worker pools. Keeping this check at
+/// the routing boundary means a valid Grok profile cannot accidentally become
+/// selectable by a planner, reviewer, classifier, or collector.
+fn validate_grok_role_gate(
+    role: &str,
+    pool: &PercentagePool,
+    profiles: &BTreeMap<String, ModelProfile>,
+) -> Result<()> {
+    if let Some((profile_id, _)) = pool.iter().find(|(profile_id, _)| {
+        profiles
+            .get(*profile_id)
+            .is_some_and(|profile| profile.runner == "grok")
+    }) {
+        return Err(QuorumError::Usage(format!(
+            "routing.{role} profile \"{profile_id}\" selects Grok, which is enabled only for worker roles"
+        )));
+    }
     Ok(())
 }
 
@@ -700,10 +741,12 @@ pub fn validate_routed_cost_limits(
         return Ok(());
     };
     if (max_turn_cost_usd.is_some() || max_task_cost_usd.is_some())
-        && referenced_profile_ids(routing).any(|profile_id| profiles[profile_id].runner == "codex")
+        && referenced_profile_ids(routing)
+            .any(|profile_id| matches!(profiles[profile_id].runner.as_str(), "codex" | "grok"))
     {
         return Err(QuorumError::Usage(
-            "USD cost limits are unsupported when routing can select a Codex profile".into(),
+            "USD cost limits are unsupported when routing can select a Codex or Grok profile"
+                .into(),
         ));
     }
     Ok(())
@@ -1561,7 +1604,7 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
     }
 
     #[test]
-    fn grok_provider_and_role_models_remain_transport_only() {
+    fn grok_is_available_only_for_legacy_worker_selection() {
         assert_eq!(
             RunnerKind::from_str_opt(Some("grok")).unwrap(),
             RunnerKind::Grok
@@ -1574,19 +1617,26 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
             ("", Some("grok")),
         ] {
             let config: ServeFileConfig = toml::from_str(source).unwrap();
-            let error = resolve_roles(&config, cli_agent, "sonnet", "high").unwrap_err();
-            assert!(error.to_string().contains("not enabled"), "{error}");
+            let roles = resolve_roles(&config, cli_agent, "sonnet", "high").unwrap();
+            assert_eq!(roles.worker_model, "grok-4.5");
         }
 
-        for key in [
-            "worker_model",
-            "review_model",
-            "classifier_model",
-            "collector_model",
-        ] {
+        let worker: ServeFileConfig = toml::from_str("worker_model = \"grok-4.5\"\n").unwrap();
+        assert_eq!(
+            resolve_roles(&worker, None, "sonnet", "high")
+                .unwrap()
+                .worker_model,
+            "grok-4.5"
+        );
+        for key in ["review_model", "classifier_model", "collector_model"] {
             let cfg: ServeFileConfig = toml::from_str(&format!("{key} = \"grok-4.5\"\n")).unwrap();
             let error = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
-            assert!(error.to_string().contains("not enabled"), "{key}: {error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("enabled only for managed workers"),
+                "{key}: {error}"
+            );
         }
     }
 
@@ -1842,6 +1892,37 @@ worktree_base = "/tmp/wt"
     }
 
     #[test]
+    fn routing_rejects_usd_limits_when_worker_can_select_grok() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let profiles = cfg.model_profiles.as_mut().unwrap();
+        profiles.get_mut("primary").unwrap().runner = "claude".into();
+        profiles.get_mut("primary").unwrap().model = "claude-sonnet-4-6".into();
+        profiles.insert(
+            "grok-worker".into(),
+            ModelProfile {
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+            },
+        );
+        for pool in cfg.routing.as_mut().unwrap().worker.values_mut() {
+            pool.clear();
+            pool.insert("grok-worker".into(), 100);
+        }
+
+        cfg.max_turn_cost_usd = Some(1.0);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("Grok"), "{err}");
+
+        cfg.max_turn_cost_usd = None;
+        cfg.max_task_cost_usd = Some(10.0);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("Grok"), "{err}");
+    }
+
+    #[test]
     fn routing_rejects_missing_role_and_complexity_pools() {
         let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
         cfg.routing.as_mut().unwrap().collector.clear();
@@ -1949,7 +2030,51 @@ worktree_base = "/tmp/wt"
     }
 
     #[test]
-    fn planner_accepts_matching_codex_profile_and_rejects_mismatch_and_grok() {
+    fn worker_allows_grok_but_other_managed_roles_reject_it() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        cfg.model_profiles.as_mut().unwrap().insert(
+            "grok-worker".into(),
+            ModelProfile {
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+            },
+        );
+        for pool in cfg.routing.as_mut().unwrap().worker.values_mut() {
+            pool.clear();
+            pool.insert("grok-worker".into(), 100);
+        }
+        validate_model_routing(&cfg).unwrap();
+
+        {
+            let routing = cfg.routing.as_mut().unwrap();
+            routing.reviewer.get_mut("1").unwrap().clear();
+            routing
+                .reviewer
+                .get_mut("1")
+                .unwrap()
+                .insert("grok-worker".into(), 100);
+        }
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(err.to_string().contains("reviewer"), "{err}");
+
+        {
+            let routing = cfg.routing.as_mut().unwrap();
+            routing.reviewer.get_mut("1").unwrap().clear();
+            routing
+                .reviewer
+                .get_mut("1")
+                .unwrap()
+                .insert("primary".into(), 100);
+            routing.planner.clear();
+            routing.planner.insert("grok-worker".into(), 100);
+        }
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(err.to_string().contains("planner"), "{err}");
+    }
+
+    #[test]
+    fn planner_accepts_matching_codex_profile_and_rejects_mismatch() {
         let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
         let planner = &mut cfg.routing.as_mut().unwrap().planner;
         planner.clear();
@@ -1965,21 +2090,6 @@ worktree_base = "/tmp/wt"
         let err = validate_model_routing(&cfg).unwrap_err();
         assert!(
             err.to_string().contains("does not match runner \"claude\""),
-            "{err}"
-        );
-
-        let profile = cfg
-            .model_profiles
-            .as_mut()
-            .unwrap()
-            .get_mut("primary")
-            .unwrap();
-        profile.runner = "grok".into();
-        profile.model = "grok-4.5".into();
-        let err = validate_model_routing(&cfg).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("managed Grok lifecycle roles are not enabled"),
             "{err}"
         );
     }

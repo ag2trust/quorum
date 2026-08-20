@@ -1570,7 +1570,7 @@ prior backfill are retained as audit data but do not affect the default report.
 
 **Date:** 2026-07-24 (provider-neutral launch and recovery state 2026-08-05)
 **Status:** Approved design; Claude and Codex managed lifecycle active; Grok Build
-transport implemented but not enabled for managed roles.
+is enabled for managed workers only. Planner and reviewer roles remain gated.
 
 ### Decision and boundary
 
@@ -1579,7 +1579,7 @@ Quorum supports exactly three explicit built-in coding runners in this design:
 - `claude` preserves the existing persistent Claude Code stream-json behavior.
 - `codex` uses the stable non-interactive Codex CLI JSONL interface.
 - `grok` uses the official Grok Build CLI's native headless `streaming-json`
-  interface. It is transport-only until separate lifecycle canaries enable roles.
+  interface for managed workers only. Planner and reviewer roles remain gated.
 
 This is a closed Rust enum, not a public provider trait or plugin API:
 
@@ -1718,8 +1718,8 @@ are never rewritten merely to adopt the neutral representation.
 Task creator APIs reject neutral `runner_*` and legacy `codex_*` provider-state refs;
 creator and assignee metadata replacement also preserves existing refs in those namespaces.
 Only the daemon-authoritative refs path may mutate or clear runner state. Managed dispatch
-independently rejects any transport-only runner recovered from durable state, so stale or
-forged metadata cannot enable an uncanaried lifecycle role.
+independently rejects any runner in an ineligible role recovered from durable state, so stale or
+forged metadata cannot enable a planner, reviewer, classifier, or collector role.
 
 ### Claude behavior remains stable
 
@@ -1870,8 +1870,8 @@ The process runs in its own process group. The adapter retains that group ID ind
 of the leader's reap state, so teardown kills descendants holding inherited pipes before it
 drains bounded output and reaps the child.
 
-An `end` event is the protocol's success marker, but managed success will additionally
-require exit status zero when Grok lifecycle roles are enabled. `error`, non-zero exit,
+An `end` event is the protocol's success marker, but managed worker success additionally
+requires exit status zero. `error`, non-zero exit,
 EOF without `end`, missing session identity, timeout, and forced termination are failure
 paths; the adapter never fabricates a terminal event from EOF or exit alone. Grok emits
 the session identity late, so no continuation may be relied on before `end`.
@@ -1914,8 +1914,9 @@ the session identity late, so no continuation may be relied on before `end`.
 
 **Hypotheses and deliberately unverified behavior:**
 
-- Grok has not passed Quorum's worker, remediation, R1, R2, restart, shutdown, mailbox,
-  or cost-limit canaries. No managed lifecycle role routes to this adapter yet.
+- Grok has not passed attended real-CLI worker, remediation, R1, R2, restart, shutdown,
+  mailbox, or cost-limit canaries. Unit/contract coverage enables worker routing only;
+  production use remains gated on those canaries, and planner/reviewer roles remain disabled.
 - Catalog additions, new reasoning efforts, `devbox`/`strict`/custom sandboxes, and
   permission modes other than the pinned profiles may become usable later, but are not
   accepted based on help text alone.
@@ -1930,19 +1931,18 @@ Capabilities are fixed internal facts, not a negotiation framework:
 
 | Capability | Claude | Codex | Grok Build |
 |---|---:|---:|---:|
-| resumable continuation | yes | yes | transport only |
+| resumable continuation | yes | yes | yes (workers only) |
 | JSON event stream | yes | yes | yes |
 | token usage | yes | yes | when complete |
-| authoritative stream-provided USD cost | yes | no | when complete |
+| authoritative stream-provided USD cost | yes | no | no (not managed) |
 | Quorum-managed CLI tool allowlist | yes | no | no |
 | provider-native review skill | optional | not required | not enabled |
 
 Never fabricate missing telemetry. Token, wall-clock, task-wall, and idle limits
 continue when their data is observable. Codex does not expose reliable ChatGPT
-subscription USD cost per turn. Grok exposes USD only for a server-complete ledger;
-its managed accounting semantics remain disabled with its lifecycle roles. If a Codex
-daemon is configured with a USD safety limit, startup fails loudly rather than ignoring
-it or failing every completed turn.
+subscription USD cost per turn. Grok workers use token and wall-clock bounds; no USD
+pricing or cost accounting is enabled. If a Codex daemon is configured with a USD safety
+limit, startup fails loudly rather than ignoring it or failing every completed turn.
 
 Use the minimum Codex sandbox proven by the full lifecycle canary. Begin validation
 with `danger-full-access` because runs use git, GitHub CLI, Quorum, repository hooks,
@@ -2067,7 +2067,7 @@ opus = 100
 opus = 100
 ```
 
-Grok transport validation vocabulary (not a managed runner selection):
+Grok worker adapter configuration:
 
 ```toml
 [grok]
@@ -2076,9 +2076,9 @@ permission_mode = "bypassPermissions"
 max_turns = 64                      # 1..=256
 ```
 
-`agent = "grok"`, `provider = "grok"`, and `grok-4.5` on any managed role are
-rejected at startup. The `[grok]` section exists so the adapter's accepted safety
-profile can be parsed and validated without silently enabling production routing.
+`grok-4.5` may be selected only by a worker routing pool. Planner, reviewer,
+classifier, and collector Grok selections are rejected at startup. The `[grok]`
+section pins the adapter safety profile for those managed worker launches.
 
 Never infer runner kind from the executable filename. Existing top-level
 `no_bare_agent` and `allowed_tools` remain backward-compatible Claude settings.
@@ -2095,7 +2095,8 @@ review stage: R1 and R2 use the same reviewer eligibility pool but separate bags
 Startup fails before any claim when a profile is invalid, a required pool is absent or empty,
 a profile is duplicated in a pool, a percentage is not a positive integer, a pool does not total
 100, or legacy fixed-model routing is present. Never infer runner kind from an executable
-filename. Runner-specific process options remain scoped under `[claude]` or `[codex]`.
+filename. Runner-specific process options remain scoped under `[claude]`, `[codex]`, or
+`[grok]`.
 
 ### Bounded task decomposition
 
@@ -2128,7 +2129,7 @@ Codex planning is supported only through its hardened planner-specific boundary:
 read-only without coordination authority, and a bounded JSONL terminal response remains only a
 candidate until stdout reaches EOF, final diagnostics are bounded and complete, and the process
 exits successfully. Any contradictory or incomplete terminal evidence fails without plan
-authority. Grok planning remains refused because managed Grok lifecycle roles are not enabled.
+authority. Grok planning remains refused because Grok is enabled only for managed workers.
 
 A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Each child
 names its concrete implementation delta, affected paths, non-goals, and any byte-exact source
@@ -2337,8 +2338,8 @@ labels are ignored.
   creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`
   model), `AgentKind::Codex` (known OpenAI models including `gpt-5*`), or the exact
-  transport-only `AgentKind::Grok` model `grok-4.5`. Managed role resolution rejects
-  Grok after this explicit model classification.
+  `AgentKind::Grok` model `grok-4.5`. Managed worker resolution accepts Grok;
+  planner, reviewer, classifier, and collector routing reject it.
 - The resolved provider, model, and effort are persisted in `agent_runs.provider`
   so continuation and recovery cannot switch providers mid-task.
 - A new R1 or R2 assignment selects from the complexity-specific reviewer pool. Review

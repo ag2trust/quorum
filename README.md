@@ -145,8 +145,9 @@ not lifecycle commands.
 
 `quorum serve` reads reusable `[model_profiles]` that bind a provider runner,
 model, and effort, then assigns those profiles through role-specific routing
-pools. The currently enabled managed runners are Claude and Codex; Grok has a
-transport implementation but is not enabled for managed lifecycle roles.
+pools. Claude and Codex are enabled for their configured managed roles; Grok
+Build is enabled only for managed worker pools. Planner, reviewer, classifier,
+and collector routing remain non-Grok.
 
 The complete vocabulary and a production-shaped policy are in
 [`docs/serve-config.example.toml`](docs/serve-config.example.toml). This is a
@@ -315,8 +316,8 @@ result, `2` for bad input, and `3` for an internal or database failure.
 
 This is a non-binding view of ongoing directions, not a release schedule:
 
-- Grok transport exists; managed-role activation and attended lifecycle canaries
-  remain in progress.
+- Grok Build worker routing is active; attended real-CLI worker and lifecycle
+  canaries remain required before production use.
 - Continuity for turn-oriented runners is being matured, including sticky and
   dormant execution states.
 - Provider failover across eligible routing alternatives and durable per-task
