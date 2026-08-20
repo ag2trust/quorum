@@ -46,6 +46,13 @@ and expected behavior, relevant paths, constraints, and verification. Interactiv
 create, inspect, cancel, and recover work; they do not claim tasks, impersonate managed agents,
 call `submit`, grant lifecycle authority, or merge.
 
+Interactive coordinators never start, restart, supervise, stop, signal, or otherwise control
+`quorum serve`. They may inspect daemon health and durable task state with short-lived CLI
+commands. If the daemon is unavailable or requires an operational change, report the evidence
+and hand the action to a separately designated operator session or human owner. Never invoke
+`quorum serve`, `scripts/serve-supervisor.sh`, or send process signals to the daemon from this
+role.
+
 ### Choose the entry mode
 
 New work starts from the configured base branch:
@@ -132,8 +139,9 @@ starts. When the external PR is ready, create a new `--review-pr` task.
 
 ## Operator
 
-Start the manager with `quorum serve`, or `scripts/serve-supervisor.sh` when the managed
-repository needs supervised self-update. Inspect with `quorum status`, `quorum task-list
+This is a separately designated daemon-operator role, not an interactive coordinator. Start the
+manager with `quorum serve`, or `scripts/serve-supervisor.sh` when the managed repository needs
+supervised self-update. Inspect with `quorum status`, `quorum task-list
 --brief`, `quorum task-get --task-id <N>`, `quorum log --refs task#<N>`, and `quorum tail
 <agent>`. Use `quorum kill` only for a stuck managed agent.
 
