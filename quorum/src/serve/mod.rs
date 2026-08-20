@@ -2395,7 +2395,7 @@ pub fn resolve_provider(model: &str) -> Result<runner::AgentKind> {
 }
 
 fn resolve_worker_provider(model: &str) -> Result<runner::AgentKind> {
-    resolve_managed_provider(model, "worker")
+    resolve_provider(model)
 }
 
 fn resolve_managed_provider(model: &str, role: &str) -> Result<runner::AgentKind> {
@@ -2414,7 +2414,7 @@ fn require_configured_provider(
     actual: runner::AgentKind,
     context: &str,
 ) -> Result<()> {
-    let resolved = resolve_managed_provider(model, context)?;
+    let resolved = resolve_worker_provider(model)?;
     if resolved != actual {
         return Err(QuorumError::Io(format!(
             "{context} persisted provider '{actual}' does not match model '{model}' resolved as '{resolved}'"
@@ -2562,10 +2562,11 @@ fn resolve_original_remediation_provider(
     recorded_provider: Option<&str>,
     model: &str,
 ) -> Result<runner::AgentKind> {
-    let model_kind = resolve_managed_provider(model, "remediation")?;
+    let model_kind = resolve_worker_provider(model)?;
     let kind = match recorded_provider {
         Some("claude") => runner::AgentKind::Claude,
         Some("codex") => runner::AgentKind::Codex,
+        Some("grok") => runner::AgentKind::Grok,
         Some(provider) => {
             return Err(QuorumError::Io(format!(
                 "unknown persisted provider '{provider}' for model '{model}'"
@@ -2651,7 +2652,7 @@ fn resolve_remediation_provider(
     let kind = if recorded_provider.is_some() {
         resolve_original_remediation_provider(recorded_provider, &model)?
     } else {
-        resolve_managed_provider(&model, "remediation")?
+        resolve_worker_provider(&model)?
     };
     Ok((model, kind))
 }
@@ -14678,12 +14679,10 @@ struct DurableGrokWorkerIdentity {
 
 /// Atomically hand off a Grok initial worker's terminal session identity.
 ///
-/// Grok is intentionally unreachable from managed configuration, but its
-/// transport boundary is exercised internally. Unlike Codex, Grok issues its
-/// identity only at terminal end, so accepting completion first and persisting
-/// later would allow a continuation decision to race missing or mismatched
-/// authority. Revalidate every durable identity here, then write the exact
-/// pending turn and continuation in one short transaction.
+/// Grok issues its identity only at terminal end, so accepting completion first
+/// and persisting later would allow a continuation decision to race missing or
+/// mismatched authority. Revalidate every durable identity here, then write the
+/// exact pending turn and continuation in one short transaction.
 async fn persist_initial_grok_worker_session(
     db_path: &Path,
     slot: &SlotState,
@@ -15289,7 +15288,7 @@ async fn drain_events(
                     if slot.process_kind() == runner::AgentKind::Grok {
                         if role != "worker" {
                             return Err(QuorumError::Io(
-                                "managed Grok terminal identity is valid only at the internal worker boundary"
+                                "managed Grok terminal identity is valid only at the worker boundary"
                                     .into(),
                             ));
                         }
@@ -17361,19 +17360,47 @@ async fn spawn_worker(
             .as_ref()
             .and_then(|retry| retry.continuation_id.as_deref()),
     );
-    let spawn_result = runner::RunnerProc::launch(
-        &runner::LaunchRequest {
-            model: &resolved_model,
-            effort: &resolved_effort,
-            worktree: &wt_path,
-            prompt: &prompt_text,
-            environment: &worker_env_vars,
-            mode: runner::LaunchMode::Normal,
-            continuation_id,
-        },
-        &runner_adapter_config(config, config.agent_bin.as_deref()),
-    )
-    .await;
+    let launch = runner::LaunchRequest {
+        model: &resolved_model,
+        effort: &resolved_effort,
+        worktree: &wt_path,
+        prompt: &prompt_text,
+        environment: &worker_env_vars,
+        mode: runner::LaunchMode::Normal,
+        continuation_id,
+    };
+    let responsibility_key = worker_responsibility_key(task.id, task.revision);
+    let spawn_result = if resolved_kind == runner::AgentKind::Grok && continuation_id.is_none() {
+        // Grok publishes its provider session only in terminal `end`; retain
+        // the exact worker identity so that handoff is durable before success.
+        runner::RunnerProc::launch_internal_worker(
+            &runner::RunnerRequest {
+                launch,
+                task_id: task.id,
+                role_assignment_id: assignment.id,
+                responsibility_key: &responsibility_key,
+                agent: &agent_name,
+                role: "worker",
+                pending_turn: PendingTurn {
+                    provider: "grok".into(),
+                    model: resolved_model.clone(),
+                    effort: resolved_effort.clone(),
+                    prompt: prompt_text.clone(),
+                    turn_kind: "initial".into(),
+                    continuation_id: None,
+                    requested: false,
+                },
+            },
+            &runner_adapter_config(config, config.agent_bin.as_deref()),
+        )
+        .await
+    } else {
+        runner::RunnerProc::launch(
+            &launch,
+            &runner_adapter_config(config, config.agent_bin.as_deref()),
+        )
+        .await
+    };
 
     match spawn_result {
         Ok(proc) => {
@@ -17422,7 +17449,6 @@ async fn spawn_worker(
                 let prov = provider_str.clone();
                 let tid = task.id;
                 let assignment_id = assignment.id;
-                let responsibility_key = worker_responsibility_key(task.id, task.revision);
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
                     quorum_core::agent_runs::insert_worker_with_assignment(
@@ -19544,7 +19570,7 @@ async fn spawn_remediation_worker(
             None => {
                 let assignment =
                     fresh_assignment.expect("workerless remediation has a fresh assignment");
-                let kind = resolve_managed_provider(&assignment.model, "remediation");
+                let kind = resolve_worker_provider(&assignment.model);
                 kind.map(|kind| {
                     (
                         assignment.model.clone(),
@@ -20929,29 +20955,41 @@ mod tests {
     }
 
     #[test]
-    fn grok_resolves_only_at_the_transport_boundary_not_managed_roles() {
+    fn grok_resolves_for_workers_but_not_other_managed_roles() {
         assert_eq!(
             resolve_provider("grok-4.5").unwrap(),
             runner::AgentKind::Grok
         );
-        for role in ["worker", "remediation", "reviewer", "reviewer recovery"] {
+        assert_eq!(
+            resolve_worker_provider("grok-4.5").unwrap(),
+            runner::AgentKind::Grok
+        );
+        for role in ["reviewer", "reviewer recovery"] {
             let error = resolve_managed_provider("grok-4.5", role).unwrap_err();
             assert!(error.to_string().contains("not enabled"), "{role}: {error}");
         }
-        assert!(resolve_remediation_provider(
-            None,
-            Some("grok-4.5".into()),
-            "claude-opus-4-6",
-            crate::serve_config::RunnerKind::Claude,
-        )
-        .is_err());
-        assert!(resolve_remediation_provider(
-            Some("grok"),
-            Some("grok-4.5".into()),
-            "claude-opus-4-6",
-            crate::serve_config::RunnerKind::Claude,
-        )
-        .is_err());
+        assert_eq!(
+            resolve_remediation_provider(
+                None,
+                Some("grok-4.5".into()),
+                "claude-opus-4-6",
+                crate::serve_config::RunnerKind::Claude,
+            )
+            .unwrap()
+            .1,
+            runner::AgentKind::Grok
+        );
+        assert_eq!(
+            resolve_remediation_provider(
+                Some("grok"),
+                Some("grok-4.5".into()),
+                "claude-opus-4-6",
+                crate::serve_config::RunnerKind::Claude,
+            )
+            .unwrap()
+            .1,
+            runner::AgentKind::Grok
+        );
     }
 
     #[test]
@@ -23879,7 +23917,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[test]
-    fn provider_retry_rejects_transport_only_grok_even_when_identity_matches() {
+    fn provider_retry_accepts_grok_worker_terminal_session_identity() {
         let refs = serde_json::json!({
             "runner_retry": {
                 "provider": "grok",
@@ -23894,10 +23932,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(runner_state::retry_requested(
             &serde_json::from_str(&refs).unwrap()
         ));
-        assert!(
-            runner_retry_turn(Some(&refs)).is_none(),
-            "transport-only Grok must remain invalid in managed retry dispatch"
-        );
+        let retry = runner_retry_turn(Some(&refs)).expect("Grok worker retry");
+        assert_eq!(retry.provider, "grok");
+        assert_eq!(retry.model, "grok-4.5");
+        assert!(retry.continuation_id.is_none());
     }
 
     #[test]

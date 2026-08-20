@@ -1570,7 +1570,7 @@ prior backfill are retained as audit data but do not affect the default report.
 
 **Date:** 2026-07-24 (provider-neutral launch and recovery state 2026-08-05)
 **Status:** Approved design; Claude and Codex managed lifecycle active; Grok Build
-transport implemented but not enabled for managed roles.
+is enabled for managed workers only. Planner and reviewer roles remain gated.
 
 ### Decision and boundary
 
@@ -1579,7 +1579,7 @@ Quorum supports exactly three explicit built-in coding runners in this design:
 - `claude` preserves the existing persistent Claude Code stream-json behavior.
 - `codex` uses the stable non-interactive Codex CLI JSONL interface.
 - `grok` uses the official Grok Build CLI's native headless `streaming-json`
-  interface. It is transport-only until separate lifecycle canaries enable roles.
+  interface for managed workers only. Planner and reviewer roles remain gated.
 
 This is a closed Rust enum, not a public provider trait or plugin API:
 
@@ -1718,8 +1718,8 @@ are never rewritten merely to adopt the neutral representation.
 Task creator APIs reject neutral `runner_*` and legacy `codex_*` provider-state refs;
 creator and assignee metadata replacement also preserves existing refs in those namespaces.
 Only the daemon-authoritative refs path may mutate or clear runner state. Managed dispatch
-independently rejects any transport-only runner recovered from durable state, so stale or
-forged metadata cannot enable an uncanaried lifecycle role.
+independently rejects any runner in an ineligible role recovered from durable state, so stale or
+forged metadata cannot enable a planner, reviewer, classifier, or collector role.
 
 ### Claude behavior remains stable
 
@@ -1914,8 +1914,9 @@ the session identity late, so no continuation may be relied on before `end`.
 
 **Hypotheses and deliberately unverified behavior:**
 
-- Grok has not passed Quorum's worker, remediation, R1, R2, restart, shutdown, mailbox,
-  or cost-limit canaries. No managed lifecycle role routes to this adapter yet.
+- Grok has not passed attended real-CLI worker, remediation, R1, R2, restart, shutdown,
+  mailbox, or cost-limit canaries. Unit/contract coverage enables worker routing only;
+  production use remains gated on those canaries, and planner/reviewer roles remain disabled.
 - Catalog additions, new reasoning efforts, `devbox`/`strict`/custom sandboxes, and
   permission modes other than the pinned profiles may become usable later, but are not
   accepted based on help text alone.
@@ -2067,7 +2068,7 @@ opus = 100
 opus = 100
 ```
 
-Grok transport validation vocabulary (not a managed runner selection):
+Grok worker transport validation vocabulary:
 
 ```toml
 [grok]
@@ -2076,9 +2077,9 @@ permission_mode = "bypassPermissions"
 max_turns = 64                      # 1..=256
 ```
 
-`agent = "grok"`, `provider = "grok"`, and `grok-4.5` on any managed role are
-rejected at startup. The `[grok]` section exists so the adapter's accepted safety
-profile can be parsed and validated without silently enabling production routing.
+`grok-4.5` may be selected only by a worker routing pool. Planner, reviewer,
+classifier, and collector Grok selections are rejected at startup. The `[grok]`
+section pins the adapter safety profile for those managed worker launches.
 
 Never infer runner kind from the executable filename. Existing top-level
 `no_bare_agent` and `allowed_tools` remain backward-compatible Claude settings.
@@ -2128,7 +2129,7 @@ Codex planning is supported only through its hardened planner-specific boundary:
 read-only without coordination authority, and a bounded JSONL terminal response remains only a
 candidate until stdout reaches EOF, final diagnostics are bounded and complete, and the process
 exits successfully. Any contradictory or incomplete terminal evidence fails without plan
-authority. Grok planning remains refused because managed Grok lifecycle roles are not enabled.
+authority. Grok planning remains refused because Grok is enabled only for managed workers.
 
 A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Each child
 names its concrete implementation delta, affected paths, non-goals, and any byte-exact source
@@ -2330,8 +2331,8 @@ labels are ignored.
   creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`
   model), `AgentKind::Codex` (known OpenAI models including `gpt-5*`), or the exact
-  transport-only `AgentKind::Grok` model `grok-4.5`. Managed role resolution rejects
-  Grok after this explicit model classification.
+  `AgentKind::Grok` model `grok-4.5`. Managed worker resolution accepts Grok;
+  planner, reviewer, classifier, and collector routing reject it.
 - The resolved provider, model, and effort are persisted in `agent_runs.provider`
   so continuation and recovery cannot switch providers mid-task.
 - A new R1 or R2 assignment selects from the complexity-specific reviewer pool. Review

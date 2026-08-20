@@ -606,11 +606,9 @@ impl LaunchRequest<'_> {
     }
 }
 
-/// Complete identity for one internally exercised managed worker launch.
-/// Public/configured Grok role selection remains rejected elsewhere; this
-/// request exists so transport plumbing cannot drop task, assignment, role,
-/// or pending-turn identity between launch and terminal persistence.
-#[allow(dead_code)] // constructed only by the dormant internal Grok worker exercise today
+/// Complete identity for one managed Grok worker launch. This request keeps
+/// task, assignment, role, and pending-turn identity intact until Grok emits
+/// its terminal session identity.
 pub struct RunnerRequest<'a> {
     pub launch: LaunchRequest<'a>,
     pub task_id: i64,
@@ -669,9 +667,8 @@ pub enum RunnerProc {
 }
 
 impl RunnerProc {
-    /// Exercise an initial Grok worker through the shared request/process
-    /// boundary without making the provider selectable by managed routing.
-    #[allow(dead_code)] // activation gate intentionally leaves this unreachable in production
+    /// Launch an initial Grok worker through the shared request/process
+    /// boundary so terminal session identity can be persisted atomically.
     pub async fn launch_internal_worker(
         request: &RunnerRequest<'_>,
         config: &AdapterConfig<'_>,
