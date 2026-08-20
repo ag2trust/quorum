@@ -1338,7 +1338,7 @@ pub fn normalize_grok_line(raw: &str) -> Vec<AgentEvent> {
                 .unwrap_or("Grok turn failed")
                 .to_string(),
             usage: terminal_usage(&value),
-            cost_usd: terminal_cost(&value),
+            cost_usd: None,
         }],
         _ => Vec::new(),
     }
@@ -1349,14 +1349,14 @@ fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
         return vec![AgentEvent::TurnFailed {
             message: "Grok end event missing sessionId".into(),
             usage: terminal_usage(value),
-            cost_usd: terminal_cost(value),
+            cost_usd: None,
         }];
     };
     if !valid_session_id(session_id) {
         return vec![AgentEvent::TurnFailed {
             message: "Grok end event missing sessionId or sessionId malformed".into(),
             usage: terminal_usage(value),
-            cost_usd: terminal_cost(value),
+            cost_usd: None,
         }];
     }
     vec![
@@ -1365,7 +1365,7 @@ fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
         },
         AgentEvent::TurnCompleted {
             usage: terminal_usage(value),
-            cost_usd: terminal_cost(value),
+            cost_usd: None,
         },
     ]
 }
@@ -1418,24 +1418,6 @@ fn terminal_usage(value: &serde_json::Value) -> Option<TokenUsage> {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
     })
-}
-
-fn terminal_cost(value: &serde_json::Value) -> Option<f64> {
-    if value
-        .get("cost_is_partial")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        || value
-            .get("usage_is_incomplete")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    {
-        return None;
-    }
-    value
-        .get("total_cost_usd")
-        .and_then(serde_json::Value::as_f64)
-        .filter(|cost| cost.is_finite() && *cost >= 0.0)
 }
 
 #[cfg(test)]
@@ -1858,7 +1840,7 @@ mod tests {
                     output_tokens: 4,
                     ..Default::default()
                 }),
-                cost_usd: Some(0.0125),
+                cost_usd: None,
             }
         );
     }

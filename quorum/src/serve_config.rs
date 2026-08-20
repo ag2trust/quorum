@@ -741,10 +741,12 @@ pub fn validate_routed_cost_limits(
         return Ok(());
     };
     if (max_turn_cost_usd.is_some() || max_task_cost_usd.is_some())
-        && referenced_profile_ids(routing).any(|profile_id| profiles[profile_id].runner == "codex")
+        && referenced_profile_ids(routing)
+            .any(|profile_id| matches!(profiles[profile_id].runner.as_str(), "codex" | "grok"))
     {
         return Err(QuorumError::Usage(
-            "USD cost limits are unsupported when routing can select a Codex profile".into(),
+            "USD cost limits are unsupported when routing can select a Codex or Grok profile"
+                .into(),
         ));
     }
     Ok(())
@@ -1887,6 +1889,37 @@ worktree_base = "/tmp/wt"
         let err = validate_model_routing(&cfg).unwrap_err();
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("USD cost limits"));
+    }
+
+    #[test]
+    fn routing_rejects_usd_limits_when_worker_can_select_grok() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let profiles = cfg.model_profiles.as_mut().unwrap();
+        profiles.get_mut("primary").unwrap().runner = "claude".into();
+        profiles.get_mut("primary").unwrap().model = "claude-sonnet-4-6".into();
+        profiles.insert(
+            "grok-worker".into(),
+            ModelProfile {
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+            },
+        );
+        for pool in cfg.routing.as_mut().unwrap().worker.values_mut() {
+            pool.clear();
+            pool.insert("grok-worker".into(), 100);
+        }
+
+        cfg.max_turn_cost_usd = Some(1.0);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("Grok"), "{err}");
+
+        cfg.max_turn_cost_usd = None;
+        cfg.max_task_cost_usd = Some(10.0);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("Grok"), "{err}");
     }
 
     #[test]

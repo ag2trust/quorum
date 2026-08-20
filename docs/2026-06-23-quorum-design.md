@@ -1934,7 +1934,7 @@ Capabilities are fixed internal facts, not a negotiation framework:
 | resumable continuation | yes | yes | yes (workers only) |
 | JSON event stream | yes | yes | yes |
 | token usage | yes | yes | when complete |
-| authoritative stream-provided USD cost | yes | no | when complete |
+| authoritative stream-provided USD cost | yes | no | no (not managed) |
 | Quorum-managed CLI tool allowlist | yes | no | no |
 | provider-native review skill | optional | not required | not enabled |
 
