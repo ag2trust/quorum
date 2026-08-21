@@ -468,7 +468,7 @@ CREATE TABLE IF NOT EXISTS role_assignments (
     task_id             INTEGER,
     pr_number           INTEGER,
     role                TEXT NOT NULL CHECK(role IN
-                            ('classifier','planner','worker','reviewer','collector')),
+                            ('classifier','planner','arbiter','worker','reviewer','collector')),
     review_stage        TEXT CHECK(review_stage IN ('r1','r2')),
     complexity          TEXT,
     profile_id          TEXT NOT NULL,

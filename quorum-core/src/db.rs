@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 56;
+pub const SCHEMA_VERSION: i64 = 57;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -860,6 +860,62 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         if current < 56 && !column_exists(conn, "tasks", "rework_cap")? {
             conn.execute("ALTER TABLE tasks ADD COLUMN rework_cap INTEGER", [])?;
         }
+        // v57 widens the immutable role-assignment role check to admit the new
+        // managed `arbiter` plan-review role. SQLite cannot ALTER a CHECK, so
+        // the table is rebuilt in place. Foreign keys are not enforced during
+        // migration (matching the v18 rebuilds), so the child references
+        // (agent_runs, task_decompositions, review_collection_runs,
+        // routing_attempts) keep their integer values across the rename. The
+        // rebuild is guarded on the stored constraint text, so it is a no-op on
+        // a fresh DB (SCHEMA_SQL already created the widened table) and on any
+        // re-run.
+        if current < 57 {
+            let role_check_admits_arbiter: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(sql LIKE '%''arbiter''%'), 1) FROM sqlite_master
+                 WHERE type='table' AND name='role_assignments'",
+                [],
+                |row| row.get(0),
+            )?;
+            if role_check_admits_arbiter == 0 {
+                // `routing_attempts_assignment_guard` (created by SCHEMA_SQL
+                // above) references role_assignments by name. legacy_alter_table
+                // keeps the DROP+RENAME from re-parsing that trigger body while
+                // the table is transiently absent; foreign keys are already off.
+                conn.pragma_update(None, "legacy_alter_table", true)?;
+                conn.execute_batch(
+                    "CREATE TABLE role_assignments_new (
+                         id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                         responsibility_key  TEXT NOT NULL UNIQUE,
+                         task_id             INTEGER,
+                         pr_number           INTEGER,
+                         role                TEXT NOT NULL CHECK(role IN
+                                                 ('classifier','planner','arbiter','worker','reviewer','collector')),
+                         review_stage        TEXT CHECK(review_stage IN ('r1','r2')),
+                         complexity          TEXT,
+                         profile_id          TEXT NOT NULL,
+                         provider            TEXT NOT NULL,
+                         runner              TEXT NOT NULL,
+                         model               TEXT NOT NULL,
+                         effort              TEXT NOT NULL,
+                         pool_key            TEXT NOT NULL,
+                         policy_generation   TEXT NOT NULL,
+                         created_at          INTEGER NOT NULL,
+                         CHECK((role = 'reviewer' AND review_stage IS NOT NULL) OR
+                               (role != 'reviewer' AND review_stage IS NULL))
+                     );
+                     INSERT INTO role_assignments_new
+                         SELECT id,responsibility_key,task_id,pr_number,role,review_stage,
+                                complexity,profile_id,provider,runner,model,effort,pool_key,
+                                policy_generation,created_at
+                         FROM role_assignments;
+                     DROP TABLE role_assignments;
+                     ALTER TABLE role_assignments_new RENAME TO role_assignments;
+                     CREATE INDEX IF NOT EXISTS role_assignments_task ON role_assignments(task_id);
+                     CREATE INDEX IF NOT EXISTS role_assignments_pr ON role_assignments(pr_number);",
+                )?;
+                conn.pragma_update(None, "legacy_alter_table", false)?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -1194,6 +1250,98 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn migrates_v56_widens_role_assignment_check_to_admit_arbiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arbiter-role-v56.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            // A pre-v57 role_assignments with the narrow role CHECK and one
+            // historical worker row that must survive the rebuild.
+            conn.execute_batch(
+                "CREATE TABLE role_assignments (
+                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                     responsibility_key  TEXT NOT NULL UNIQUE,
+                     task_id             INTEGER,
+                     pr_number           INTEGER,
+                     role                TEXT NOT NULL CHECK(role IN
+                                             ('classifier','planner','worker','reviewer','collector')),
+                     review_stage        TEXT CHECK(review_stage IN ('r1','r2')),
+                     complexity          TEXT,
+                     profile_id          TEXT NOT NULL,
+                     provider            TEXT NOT NULL,
+                     runner              TEXT NOT NULL,
+                     model               TEXT NOT NULL,
+                     effort              TEXT NOT NULL,
+                     pool_key            TEXT NOT NULL,
+                     policy_generation   TEXT NOT NULL,
+                     created_at          INTEGER NOT NULL,
+                     CHECK((role = 'reviewer' AND review_stage IS NOT NULL) OR
+                           (role != 'reviewer' AND review_stage IS NULL))
+                 );
+                 CREATE INDEX IF NOT EXISTS role_assignments_task ON role_assignments(task_id);
+                 CREATE INDEX IF NOT EXISTS role_assignments_pr ON role_assignments(pr_number);
+                 INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,role,complexity,profile_id,provider,
+                     runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (9,'worker:task:9',9,'worker','M','opus','claude','claude',
+                         'claude-opus-4-8','high','worker.M','generation-1',10);
+                 PRAGMA user_version=56;",
+            )
+            .unwrap();
+            // The narrow constraint really rejects an arbiter row.
+            assert!(conn
+                .execute(
+                    "INSERT INTO role_assignments(
+                         responsibility_key,role,profile_id,provider,runner,model,effort,
+                         pool_key,policy_generation,created_at)
+                     VALUES ('arbiter:pre',?1,'p','codex','codex','gpt-5.6-sol','high',
+                             'arbiter','g',1)",
+                    ["arbiter"],
+                )
+                .is_err());
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // The historical worker assignment survived the rebuild unchanged.
+        assert_eq!(
+            conn.query_row(
+                "SELECT role FROM role_assignments WHERE id=9",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "worker"
+        );
+        // The widened CHECK now admits an arbiter assignment.
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES ('arbiter:graph:1',?1,'p','codex','codex','gpt-5.6-sol','high',
+                     'arbiter','g',2)",
+            ["arbiter"],
+        )
+        .unwrap();
+
+        // Migration is idempotent across reopen (no double rebuild, rows kept).
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM role_assignments", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
         );
     }
 
