@@ -369,6 +369,19 @@ const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
       )
 ))";
 
+// SQL counterpart of the implementation branch in
+// `classification_is_dispatchable`. Callers that need implementation work
+// additionally require `review_only=0`; continuation tasks remain eligible at
+// every classified size, just as they are in the Rust policy.
+const DIRECT_DISPATCH_CLAUSE: &str = "(review_only=1 OR continue_pr IS NOT NULL OR (
+    (json_extract(refs, '$.cx_size') IN ('S','M') OR (
+        json_extract(refs, '$.cx_size')='L'
+        AND json_extract(refs, '$.cx_est') <= 3
+    ))
+    AND NOT (json_extract(refs, '$.cx_est')=5
+             AND json_extract(refs, '$.cx_size')='L')
+))";
+
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
         id: r.get(0)?,
@@ -927,14 +940,6 @@ pub fn claim(
     const NO_PLANNING_FREEZE_CLAUSE: &str = "NOT EXISTS (
         SELECT 1 FROM task_decompositions WHERE freeze_active=1
     )";
-    const DIRECT_DISPATCH_CLAUSE: &str = "(review_only=1 OR continue_pr IS NOT NULL OR (
-        (json_extract(refs, '$.cx_size') IN ('S','M') OR (
-            json_extract(refs, '$.cx_size')='L'
-            AND json_extract(refs, '$.cx_est') <= 3
-        ))
-        AND NOT (json_extract(refs, '$.cx_est')=5
-                 AND json_extract(refs, '$.cx_size')='L')
-    ))";
     // Keep graph authority in this BEGIN IMMEDIATE transaction so sibling
     // claims, failures, and graph blockers cannot race provisioning.
     // Review/rework authority for an already-started child is intentionally not
@@ -4635,6 +4640,46 @@ pub fn list_implementation_ready_open(conn: &Connection) -> Result<Vec<Task>> {
     ))?;
     let mut tasks: Vec<Task> = stmt
         .query_map([], row_to_task)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for task in &mut tasks {
+        task.ready = true;
+    }
+    Ok(tasks)
+}
+
+/// Bounded dispatchable implementation projection for read-only pollers.
+///
+/// Keep the dependency, decomposition, and persisted classification predicates
+/// in SQL so a dashboard does not materialize task bodies for every eligible
+/// task before applying its display bound. The daemon scheduler intentionally
+/// uses the unbounded candidate projection above because it must continue past
+/// temporarily inadmissible candidates when selecting work.
+pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> Result<Vec<Task>> {
+    if limit < 0 {
+        return Err(QuorumError::Usage(
+            "implementation-ready task limit must not be negative".into(),
+        ));
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM tasks
+         WHERE status='open'
+           AND {DEP_READY_CLAUSE}
+           AND {GRAPH_IMPLEMENTATION_READY_CLAUSE}
+           AND review_only=0
+           AND CASE WHEN json_valid(refs) THEN
+               json_type(refs, '$.cx_est')='integer'
+               AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+               AND json_type(refs, '$.cx_size')='text'
+               AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
+               AND {DIRECT_DISPATCH_CLAUSE}
+               AND json_type(refs, '$.cx_ready')='true'
+               AND json_type(refs, '$.cx_not_ready_reason')='null'
+           ELSE 0 END
+         ORDER BY priority DESC, id ASC
+         LIMIT ?1"
+    ))?;
+    let mut tasks: Vec<Task> = stmt
+        .query_map(params![limit], row_to_task)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for task in &mut tasks {
         task.ready = true;
@@ -10889,6 +10934,95 @@ mod tests {
             .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
             .unwrap();
         assert_eq!(err_count, 0, "lost race must not produce error rows");
+    }
+
+    #[test]
+    fn limited_implementation_ready_listing_bounds_materialized_tasks() {
+        let (_dir, mut conn) = open_tmp();
+        let mut ids = Vec::new();
+        for priority in 0..=20 {
+            let body = format!("ready body {priority}: {}", "x".repeat(1024));
+            ids.push(
+                create(
+                    &mut conn,
+                    "boss",
+                    &format!("ready-{priority}"),
+                    Some(&body),
+                    priority,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1000,
+                )
+                .unwrap(),
+            );
+        }
+
+        let listed = list_implementation_ready_open_limited(&conn, 20).unwrap();
+        assert_eq!(listed.len(), 20);
+        assert_eq!(
+            listed.iter().map(|task| task.id).collect::<Vec<_>>(),
+            ids.iter().rev().take(20).copied().collect::<Vec<_>>(),
+        );
+        assert!(listed.iter().all(|task| task.ready));
+        assert!(listed.iter().all(|task| task.id != ids[0]));
+        assert!(matches!(
+            list_implementation_ready_open_limited(&conn, -1),
+            Err(QuorumError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn limited_implementation_ready_listing_filters_before_its_limit() {
+        const DASHBOARD_LIMIT: i64 = 20;
+
+        let (_dir, mut conn) = open_tmp();
+        for priority in 2..=DASHBOARD_LIMIT + 1 {
+            let id = create(
+                &mut conn,
+                "boss",
+                &format!("unready-{priority}"),
+                None,
+                priority,
+                None,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET refs=?1 WHERE id=?2",
+                params![
+                    r#"{"cx_est":2,"cx_size":"S","cx_ready":false,"cx_not_ready_reason":"waiting on design"}"#,
+                    id
+                ],
+            )
+            .unwrap();
+        }
+        let dispatchable = create(
+            &mut conn,
+            "boss",
+            "dispatchable after unready prefix",
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            list_implementation_ready_open_limited(&conn, DASHBOARD_LIMIT)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            [dispatchable],
+        );
     }
 
     #[test]
