@@ -33,9 +33,33 @@ pub type PercentagePool = BTreeMap<String, u8>;
 pub struct RoutingPolicy {
     pub classifier: PercentagePool,
     pub planner: PercentagePool,
+    /// Plan-review Arbiter pool. Absent `[routing.arbiter]` blocks deserialize
+    /// to an empty map (the `#[serde(default)]` sentinel), which
+    /// [`RoutingPolicy::arbiter_pool`] resolves to the planner pool. Profile
+    /// IDs are owner-defined, so no fixed default value could validate against
+    /// an arbitrary config's `[model_profiles]`; mirroring the planner pool is
+    /// the only default that keeps every existing config parsing and
+    /// validating unchanged while carrying the planner's Claude-Opus intent.
+    #[serde(default)]
+    pub arbiter: PercentagePool,
     pub collector: PercentagePool,
     pub worker: BTreeMap<String, PercentagePool>,
     pub reviewer: BTreeMap<String, PercentagePool>,
+}
+
+impl RoutingPolicy {
+    /// Effective Arbiter routing pool. An unset `[routing.arbiter]` block
+    /// (empty map) falls back to the planner pool, so the Arbiter resolves to
+    /// the same Claude Opus 4.8 model the planner uses unless an operator
+    /// configures an explicit override. Dormant: no runtime path resolves an
+    /// Arbiter assignment yet.
+    pub fn arbiter_pool(&self) -> &PercentagePool {
+        if self.arbiter.is_empty() {
+            &self.planner
+        } else {
+            &self.arbiter
+        }
+    }
 }
 
 /// Which CLI runner the daemon uses for all spawned agents.
@@ -672,11 +696,13 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
         .ok_or_else(|| QuorumError::Usage("serve config requires [routing]".into()))?;
     validate_percentage_pool("classifier", &routing.classifier, profiles)?;
     validate_percentage_pool("planner", &routing.planner, profiles)?;
+    validate_percentage_pool("arbiter", routing.arbiter_pool(), profiles)?;
     validate_percentage_pool("collector", &routing.collector, profiles)?;
     validate_complexity_pools("worker", &routing.worker, profiles)?;
     validate_complexity_pools("reviewer", &routing.reviewer, profiles)?;
     validate_grok_role_gate("classifier", &routing.classifier, profiles)?;
     validate_grok_role_gate("planner", &routing.planner, profiles)?;
+    validate_grok_role_gate("arbiter", routing.arbiter_pool(), profiles)?;
     validate_grok_role_gate("collector", &routing.collector, profiles)?;
     for (complexity, pool) in &routing.reviewer {
         validate_grok_role_gate(&format!("reviewer.{complexity}"), pool, profiles)?;
@@ -757,6 +783,7 @@ fn referenced_profile_ids(routing: &RoutingPolicy) -> impl Iterator<Item = &Stri
         .classifier
         .keys()
         .chain(routing.planner.keys())
+        .chain(routing.arbiter_pool().keys())
         .chain(routing.collector.keys())
         .chain(routing.worker.values().flat_map(|pool| pool.keys()))
         .chain(routing.reviewer.values().flat_map(|pool| pool.keys()))
@@ -2090,6 +2117,72 @@ worktree_base = "/tmp/wt"
         let err = validate_model_routing(&cfg).unwrap_err();
         assert!(
             err.to_string().contains("does not match runner \"claude\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn arbiter_defaults_to_planner_pool_when_absent_and_validates() {
+        // VALID_ROUTING carries no [routing.arbiter] block, so the field
+        // deserializes to the empty sentinel and the effective pool mirrors
+        // the planner pool — existing configs keep validating unchanged.
+        let cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        validate_model_routing(&cfg).unwrap();
+        let routing = cfg.routing.as_ref().unwrap();
+        assert!(
+            routing.arbiter.is_empty(),
+            "no explicit [routing.arbiter] block was configured"
+        );
+        assert_eq!(
+            routing.arbiter_pool(),
+            &routing.planner,
+            "absent arbiter pool mirrors the planner pool"
+        );
+        let total: u16 = routing
+            .arbiter_pool()
+            .values()
+            .map(|percentage| u16::from(*percentage))
+            .sum();
+        assert_eq!(total, 100, "effective arbiter pool totals 100");
+    }
+
+    #[test]
+    fn arbiter_pool_must_total_100() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        {
+            let routing = cfg.routing.as_mut().unwrap();
+            routing.arbiter.clear();
+            // `planner` is a valid Claude profile; only the total is wrong.
+            routing.arbiter.insert("planner".into(), 90);
+        }
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains("routing.arbiter") && err.to_string().contains("total"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn grok_rejected_in_arbiter_role() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        cfg.model_profiles.as_mut().unwrap().insert(
+            "grok-worker".into(),
+            ModelProfile {
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+            },
+        );
+        {
+            let routing = cfg.routing.as_mut().unwrap();
+            routing.arbiter.clear();
+            routing.arbiter.insert("grok-worker".into(), 100);
+        }
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains("routing.arbiter") && err.to_string().contains("Grok"),
             "{err}"
         );
     }

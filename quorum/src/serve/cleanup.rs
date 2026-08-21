@@ -757,6 +757,7 @@ mod tests {
             routing: crate::serve_config::RoutingPolicy {
                 classifier: pool.clone(),
                 planner: pool.clone(),
+                arbiter: pool.clone(),
                 collector: pool.clone(),
                 worker: (1..=5)
                     .map(|level| (level.to_string(), pool.clone()))
