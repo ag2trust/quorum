@@ -101,7 +101,9 @@ pub fn load(conn: &Connection, task_id: i64) -> Result<Option<GraphReviewContext
             "generated review task is not in the current active graph plan".into(),
         ));
     }
-    if !valid_field(&member.local_key) || !valid_field(&member.title) || !valid_field(&member.body)
+    // The body is the structured assignment assembled from multiple bounded planner fields.
+    // Its aggregate bound is enforced by `to_bounded_json` below.
+    if !valid_field(&member.local_key) || !valid_field(&member.title) || member.body.contains('\0')
     {
         return Err(QuorumError::Usage(
             "generated review assignment contains invalid bounded text".into(),
@@ -415,6 +417,23 @@ mod tests {
             [serde_json::to_string(&ids).unwrap()],
         )
         .unwrap();
+        assert!(load(&conn, 3).is_err());
+    }
+
+    #[test]
+    fn assignment_body_uses_total_context_bound_not_scalar_field_bound() {
+        let conn = fixture();
+        let body = "x".repeat(MAX_REVIEW_FIELD_BYTES + 1);
+        conn.execute("UPDATE tasks SET body=?1 WHERE id=3", [&body])
+            .unwrap();
+
+        let context = load(&conn, 3).unwrap().unwrap();
+        assert_eq!(context.assigned_requirements, body);
+        assert!(context.to_bounded_json().unwrap().len() <= MAX_REVIEW_CONTEXT_BYTES);
+
+        let oversized = "x".repeat(MAX_REVIEW_CONTEXT_BYTES);
+        conn.execute("UPDATE tasks SET body=?1 WHERE id=3", [&oversized])
+            .unwrap();
         assert!(load(&conn, 3).is_err());
     }
 
