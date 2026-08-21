@@ -192,7 +192,8 @@ fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
     // Start with the task-core projection that repeats the dependency and graph predicates
     // used by a claim, then apply the same persisted classification admission the daemon uses
     // before it attempts an implementation claim. Do not substitute a recent/open task page.
-    let mut ready_all = quorum_core::tasks::list_implementation_ready_open(&conn)?;
+    let mut ready_all =
+        quorum_core::tasks::list_implementation_ready_open_limited(&conn, STATE_BAND_LIMIT as i64)?;
     ready_all.retain(|task| {
         !task.review_only
             && quorum_core::tasks::classification_is_dispatchable(
@@ -203,7 +204,7 @@ fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
     });
     let ready_count = ready_all.len();
     let ready = ready_all
-        .drain(..ready_count.min(STATE_BAND_LIMIT))
+        .into_iter()
         .map(|task| task_summary(&conn, &task, now))
         .collect::<quorum_core::error::Result<Vec<_>>>()?;
     let planning = state_band(&conn, "status IN ('planning', 'decomposed')", now)?;
@@ -1339,6 +1340,39 @@ mod tests {
         assert_eq!(
             payload["needs_attention"]["blocked_tasks"]["count"],
             json!(1)
+        );
+        assert_checkpoint_released(&state.db_path);
+    }
+
+    #[test]
+    fn state_ready_band_uses_the_limited_ready_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let mut conn = quorum_core::db::open(&state.db_path).unwrap();
+        for index in 0..=STATE_BAND_LIMIT {
+            let id = create_test_task(&mut conn, &format!("ready-{index}"), None, None);
+            conn.execute(
+                "UPDATE tasks SET refs=?1 WHERE id=?2",
+                rusqlite::params![
+                    r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null}"#,
+                    id
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let payload = state_payload(&state).unwrap();
+        assert_eq!(
+            payload["queue_bands"]["ready"]["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            STATE_BAND_LIMIT
+        );
+        assert_eq!(
+            payload["queue_bands"]["ready"]["count"],
+            json!(STATE_BAND_LIMIT)
         );
         assert_checkpoint_released(&state.db_path);
     }

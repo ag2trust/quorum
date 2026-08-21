@@ -4642,6 +4642,36 @@ pub fn list_implementation_ready_open(conn: &Connection) -> Result<Vec<Task>> {
     Ok(tasks)
 }
 
+/// Bounded version of [`list_implementation_ready_open`] for read-only pollers.
+///
+/// Keep the dependency and decomposition predicates in SQL so a dashboard does
+/// not materialize task bodies for every eligible task before applying its
+/// display bound. The daemon scheduler intentionally uses the unbounded
+/// projection above because it must continue past temporarily inadmissible
+/// candidates when selecting work.
+pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> Result<Vec<Task>> {
+    if limit < 0 {
+        return Err(QuorumError::Usage(
+            "implementation-ready task limit must not be negative".into(),
+        ));
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM tasks
+         WHERE status='open'
+           AND {DEP_READY_CLAUSE}
+           AND {GRAPH_IMPLEMENTATION_READY_CLAUSE}
+         ORDER BY priority DESC, id ASC
+         LIMIT ?1"
+    ))?;
+    let mut tasks: Vec<Task> = stmt
+        .query_map(params![limit], row_to_task)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for task in &mut tasks {
+        task.ready = true;
+    }
+    Ok(tasks)
+}
+
 /// List rework tasks whose dependencies satisfy the same SQL eligibility
 /// predicate used by remediation claims. Durable remediation reconciliation
 /// uses this read before provisioning so dependency-blocked retries retain
@@ -10889,6 +10919,43 @@ mod tests {
             .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
             .unwrap();
         assert_eq!(err_count, 0, "lost race must not produce error rows");
+    }
+
+    #[test]
+    fn limited_implementation_ready_listing_bounds_materialized_tasks() {
+        let (_dir, mut conn) = open_tmp();
+        let mut ids = Vec::new();
+        for priority in 0..=20 {
+            let body = format!("ready body {priority}: {}", "x".repeat(1024));
+            ids.push(
+                create(
+                    &mut conn,
+                    "boss",
+                    &format!("ready-{priority}"),
+                    Some(&body),
+                    priority,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1000,
+                )
+                .unwrap(),
+            );
+        }
+
+        let listed = list_implementation_ready_open_limited(&conn, 20).unwrap();
+        assert_eq!(listed.len(), 20);
+        assert_eq!(
+            listed.iter().map(|task| task.id).collect::<Vec<_>>(),
+            ids.iter().rev().take(20).copied().collect::<Vec<_>>(),
+        );
+        assert!(listed.iter().all(|task| task.ready));
+        assert!(listed.iter().all(|task| task.id != ids[0]));
+        assert!(matches!(
+            list_implementation_ready_open_limited(&conn, -1),
+            Err(QuorumError::Usage(_))
+        ));
     }
 
     #[test]
