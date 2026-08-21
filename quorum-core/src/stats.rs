@@ -1175,13 +1175,14 @@ fn execution_current_progress(
             let activity = live_reviewer
                 .map(|run| reviewer_activity(run, review_stage.0))
                 .unwrap_or_else(|| review_stage.2.into());
-            let condition = live_reviewer.and_then(live_condition).or_else(|| {
-                Some(if review_stage.1 == Some("R2") {
+            let condition = match live_reviewer {
+                Some(run) => live_condition(run),
+                None => Some(if review_stage.1 == Some("R2") {
                     "Awaiting R2 assignment".into()
                 } else {
                     "Awaiting R1 assignment".into()
-                })
-            });
+                }),
+            };
             (
                 TaskProgressStage {
                     label: review_stage.0.into(),
@@ -5527,6 +5528,41 @@ mod tests {
             progress.condition.as_deref(),
             Some("Waiting for operator input")
         );
+    }
+
+    #[test]
+    fn progress_live_reviewer_has_no_awaiting_assignment_condition() {
+        let (_d, mut c) = open_tmp();
+        let task_id = progress_task(&mut c, "live review");
+        set_status(&c, task_id, "in-review");
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "reviewer".into(),
+                role: "reviewer".into(),
+                task_id: Some(task_id),
+                session_id: "session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        let progress = projection(&c, task_id);
+        assert_eq!(progress.stage.label, "First review");
+        assert_eq!(progress.stage.activity, "First review in progress");
+        assert_eq!(progress.condition, None);
     }
 
     #[test]
