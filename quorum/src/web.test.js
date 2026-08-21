@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}, TextDecoder};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, navigableRuns, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -125,3 +125,50 @@ assert.equal(Object.keys(detail.tailState).length, 0);
 assert.equal(liveAgentTitle({name: 'A-100', task_id: 42}), 'A-100 · Task #42 · Live tail');
 assert.equal(liveAgentTitle({name: 'A-100', task_id: null}), 'A-100 · Live tail');
 assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="liveAgentTable"/);
+
+// The initial dashboard promotes only task health, active work, attention, pipeline, and
+// the server's ready/claimable projection. A stale recent-task list must not replace queue_bands.ready.
+const model = dashboardModel({
+  health: {verdict: 'attention'},
+  working_now: Array.from({length: MAX_COCKPIT_ITEMS + 3}, (_, id) => ({name: `agent-${id}`})),
+  tasks: [{id: 999, title: 'not the queue'}],
+  queue_bands: {
+    planning: {count: 2}, ready: {count: 4, tasks: [{id: 7, title: 'authoritative'}]},
+    working: {count: 3}, reviewing: {count: 1}, merging: {count: 1},
+    terminal: {failed: 2, cancelled: 1}, attention: {count: 2},
+  },
+  needs_attention: {blocked_tasks: {count: 1, tasks: [{id: 8}]}, alerts: [{body: 'watch'}]},
+});
+assert.equal(model.queue.length, 1);
+assert.equal(model.queue[0].id, 7);
+assert.equal(model.working.length, MAX_COCKPIT_ITEMS);
+assert.equal(model.pipeline.at(-1)[0], 'Terminal outcomes');
+assert.equal(model.pipeline.at(-1)[1], 3);
+assert.equal(model.attention[0][0], 'Blocked tasks');
+
+// Stored values remain text data. The browser renderer assigns this through textContent;
+// there is no HTML interpolation path for task titles, alerts, or agent names.
+assert.equal(textValue('<img src=x onerror=alert(1)>'), '<img src=x onerror=alert(1)>');
+assert.equal(textValue(null), '');
+assert.equal(bounded(Array.from({length: MAX_COCKPIT_ITEMS + 1}), MAX_COCKPIT_ITEMS).length, MAX_COCKPIT_ITEMS);
+const client = fs.readFileSync('quorum/src/web.js', 'utf8');
+assert.doesNotMatch(client, /\.innerHTML\s*=/);
+assert.match(client, /textContent/);
+
+// Task-detail runs are database records and deliberately do not contain session-log `dir`.
+// They must not turn into a nonfunctional `#run-undefined` stream link.
+assert.equal(navigableRuns([{id: 12, agent: 'A-12', role: 'worker'}]).length, 0);
+assert.equal(navigableRuns([{dir: 'A-12-42', meta: {agent: 'A-12'}}]).length, 1);
+
+// A hidden/failed refresh cannot make a second request overlap; failure visibly marks the
+// last successful data stale and the following success clears that condition.
+let refresh = pollState({inFlight: false, lastSuccess: null, failed: false, stale: false}, 'start', 100);
+assert.equal(refresh.inFlight, true);
+refresh = pollState({inFlight: false, lastSuccess: 100, failed: false, stale: false}, 'failure', 105);
+assert.equal(refresh.stale, true);
+assert.equal(refresh.failed, true);
+refresh = pollState(refresh, 'success', 106);
+assert.equal(refresh.inFlight, false);
+assert.equal(refresh.lastSuccess, 106);
+assert.equal(refresh.failed, false);
+assert.equal(refresh.stale, false);

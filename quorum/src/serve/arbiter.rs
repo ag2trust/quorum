@@ -617,7 +617,13 @@ mod tests {
         let runner = executable_script(
             dir,
             "claude",
-            &format!("exec /bin/cat '{}'", stdout_path.display()),
+            // Claude receives its first turn through stdin. Keeping the fixture alive until
+            // that line is written prevents an eager `cat` exit from turning this provider
+            // protocol test into a scheduler-dependent BrokenPipe.
+            &format!(
+                "read -r _ || true\nexec /bin/cat '{}'",
+                stdout_path.display()
+            ),
         );
         spawn_arbiter(
             AgentKind::Claude,
