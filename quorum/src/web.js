@@ -440,17 +440,19 @@
     try { const response = await fetch('/api/tasks/' + encodeURIComponent(id)); if (!response.ok) throw new Error('Task request failed'); const payload = await response.json(); if (epoch !== taskDetailEpoch) return; renderTaskDetail(payload); }
     catch (_) { if (epoch !== taskDetailEpoch) return; put($('taskTitle'), 'Task #' + id); put($('taskBody'), 'Task detail could not be loaded.'); }
   }
-  function renderTaskList(tasks, append = false) {
-    const table = $('taskList'); if (!append) { table.replaceChildren(); appendRow(table, ['Task', 'Status', 'Priority', 'Assignee', 'Updated'], true); }
+  function renderTaskList(tasks) {
+    // Task-list pagination is page navigation, not an unbounded retained history.
+    // The current page plus its header is always the whole task-list DOM.
+    const table = $('taskList'); table.replaceChildren(); appendRow(table, ['Task', 'Status', 'Priority', 'Assignee', 'Updated'], true);
     bounded(tasks, MAX_TASK_LIST_ITEMS).forEach(task => appendRow(table, [taskLink(task), boundedText(task.status) || '—', task.priority == null ? '—' : 'P' + boundedText(task.priority), boundedText(task.assignee) || '—', displayTimestamp(task.updated_at)]));
   }
-  async function loadTasks(cursor = null, append = false) {
+  async function loadTasks(cursor = null) {
     if (taskListInFlight) return; taskListInFlight = true;
     try {
       const suffix = cursor ? '?limit=' + MAX_TASK_LIST_ITEMS + '&cursor=' + encodeURIComponent(cursor) : '?limit=' + MAX_TASK_LIST_ITEMS;
       const response = await fetch('/api/tasks' + suffix); if (!response.ok) throw new Error('Task list request failed');
-      const payload = await response.json(); renderTaskList(payload.tasks || [], append); taskListBefore = payload.next_cursor || null; $('moreTasks').classList.toggle('hidden', !taskListBefore);
-    } catch (_) { if (!append) { $('taskList').replaceChildren(); appendRow($('taskList'), ['Tasks'], true); appendRow($('taskList'), ['Task list could not be loaded.']); } }
+      const payload = await response.json(); renderTaskList(payload.tasks || []); taskListBefore = payload.next_cursor || null; $('moreTasks').classList.toggle('hidden', !taskListBefore);
+    } catch (_) { if (!cursor) { $('taskList').replaceChildren(); appendRow($('taskList'), ['Tasks'], true); appendRow($('taskList'), ['Task list could not be loaded.']); } }
     finally { taskListInFlight = false; }
   }
   async function state() {
@@ -494,7 +496,7 @@
   $('rawToggle').onclick = () => { rawMode = !rawMode; $('stream').classList.toggle('hidden', rawMode); $('rawStream').classList.toggle('hidden', !rawMode); put($('rawToggle'), rawMode ? 'Show rendered' : 'Show raw'); if (rawMode) renderRaw(); };
   $('moreRuns').onclick = () => runs(runsBefore, true);
   $('newestRuns').onclick = () => runs(null, true);
-  $('moreTasks').onclick = () => loadTasks(taskListBefore, true);
+  $('moreTasks').onclick = () => loadTasks(taskListBefore);
   function routeFromHash() {
     const id = taskRoute(window.location.hash);
     if (id) return openTask(id, false);

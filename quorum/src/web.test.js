@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}, TextDecoder};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskRoute, journeyModel, taskDetailModel, navigableRuns, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_TASK_LIST_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskRoute, journeyModel, taskDetailModel, navigableRuns, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -180,6 +180,68 @@ assert.equal(liveAgentTitle({name: 'A-100', task_id: null}), 'A-100 · Live tail
 assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="liveAgentTable"/);
 assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="taskList"/);
 assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="taskJourney"/);
+
+class FakeClassList {
+  constructor() { this.values = new Set(); }
+  toggle(value, force) { const enabled = force === undefined ? !this.values.has(value) : Boolean(force); if (enabled) this.values.add(value); else this.values.delete(value); return enabled; }
+  contains(value) { return this.values.has(value); }
+  add(value) { this.values.add(value); }
+  remove(value) { this.values.delete(value); }
+}
+class FakeNode {
+  constructor(id = '') { this.id = id; this.children = []; this.classList = new FakeClassList(); this.dataset = {}; this.listeners = {}; this.textContent = ''; }
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children = children; }
+  addEventListener(name, handler) { this.listeners[name] = handler; }
+}
+class FakeDocument {
+  constructor() {
+    this.hidden = true;
+    this.elements = new Map();
+    ['board', 'tasks', 'agents', 'run', 'task', 'pause', 'backToCockpit', 'start', 'rawToggle', 'moreRuns', 'newestRuns', 'moreTasks', 'taskList'].forEach(id => this.elements.set(id, new FakeNode(id)));
+    this.views = [new FakeNode()]; this.views[0].dataset.view = 'tasks';
+  }
+  getElementById(id) { return this.elements.get(id); }
+  querySelectorAll(selector) { return selector === 'main' ? ['board', 'tasks', 'agents', 'run', 'task'].map(id => this.getElementById(id)) : selector === '[data-view]' ? this.views : []; }
+  createElement() { return new FakeNode(); }
+  createTextNode(text) { const result = new FakeNode(); result.textContent = text; return result; }
+  addEventListener() {}
+}
+
+// Repeated cursor navigation replaces the table's sole page. This exercises the browser
+// handler rather than merely the page-size helper: each page has 100 rows, but older pages
+// must not retain the prior page's text or DOM nodes.
+async function assertTaskPaginationIsBounded() {
+  const document = new FakeDocument(), requests = [];
+  const page = (number, next) => ({
+    tasks: Array.from({length: MAX_TASK_LIST_ITEMS}, (_, offset) => {
+      const id = (number - 1) * MAX_TASK_LIST_ITEMS + offset + 1;
+      return {id, title: `page-${number}-task-${id}`, status: 'open', priority: 1, assignee: 'Worker', updated_at: id};
+    }),
+    next_cursor: next,
+  });
+  const pages = [page(1, 'older-1'), page(2, 'older-2'), page(3, 'older-3'), page(4, null)];
+  const browser = {
+    globalThis: {}, TextDecoder, Node: FakeNode, document,
+    window: {location: {hash: ''}, addEventListener() {}}, setInterval() { return 0; },
+    fetch: async url => { requests.push(url); return {ok: true, json: async () => pages.shift()}; },
+  };
+  vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), browser);
+  document.views[0].listeners.click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const table = document.getElementById('taskList'), more = document.getElementById('moreTasks');
+  for (let number = 1; number <= 4; number++) {
+    assert.equal(table.children.length, MAX_TASK_LIST_ITEMS + 1);
+    assert.equal(table.children[1].children[0].children[0].textContent, `#${(number - 1) * MAX_TASK_LIST_ITEMS + 1} page-${number}-task-${(number - 1) * MAX_TASK_LIST_ITEMS + 1}`);
+    if (number < 4) await more.onclick();
+  }
+  assert.deepEqual(requests, [
+    '/api/tasks?limit=100', '/api/tasks?limit=100&cursor=older-1',
+    '/api/tasks?limit=100&cursor=older-2', '/api/tasks?limit=100&cursor=older-3',
+  ]);
+  assert.equal(more.classList.contains('hidden'), true);
+}
+assertTaskPaginationIsBounded().catch(error => process.nextTick(() => { throw error; }));
 
 // The initial dashboard promotes only task health, active work, attention, pipeline, and
 // the server's ready/claimable projection. A stale recent-task list must not replace queue_bands.ready.
