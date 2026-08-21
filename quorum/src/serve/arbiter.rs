@@ -16,6 +16,10 @@ const MAX_TEXT_BYTES: usize = 8 * 1024;
 /// past the durable-response envelope.
 use super::planner::MAX_RESPONSE_BYTES;
 
+/// Access the planner's source/proposal types and shared caps so the Arbiter
+/// prompt shares the same bounded-input discipline as `planner::build_prompt`.
+use super::planner;
+
 /// Closed reviewer verdict. `Approve` lets the proposal materialize; `Changes`
 /// records findings the planner re-proposes against; `RejectSource` parks the
 /// source for a required human/coordinator decision.
@@ -135,6 +139,53 @@ pub fn has_blocking(findings: &[ArbiterFinding]) -> bool {
     findings.iter().any(|finding| finding.blocking)
 }
 
+/// Build one bounded, closed-book Arbiter review turn.
+///
+/// The Arbiter judges the planner's `proposal_json` against the authoritative
+/// `source` and a caller-provided `structural_summary` (the daemon's own
+/// dependency/coverage digest), then emits exactly one closed verdict. The echo
+/// of the proposal and the structural summary are byte-capped so the whole
+/// prompt stays well under the planner's 128 KiB envelope even for oversized
+/// input.
+pub fn build_arbiter_prompt(
+    source: &planner::PlanningSource<'_>,
+    proposal_json: &str,
+    structural_summary: &str,
+) -> String {
+    let source_json = serde_json::to_string(source).expect("planning source serializes");
+    // Cap the proposal echo at the planner's whole-response envelope (the
+    // largest a well-formed proposal can be) and the structural summary at the
+    // per-field text budget. Sum: prose (~3 KiB) + 64 KiB + 8 KiB + bounded
+    // source stays comfortably under MAX_PROMPT_BYTES.
+    let proposal = truncate_utf8(proposal_json, MAX_RESPONSE_BYTES);
+    let summary = truncate_utf8(structural_summary, MAX_TEXT_BYTES);
+    format!(
+        "You are Quorum's plan-review Arbiter: a single-shot, stateless reviewer that judges the \
+         planner's proposed decomposition before any child materializes. Judge the PROPOSAL against \
+         the authoritative SOURCE and the STRUCTURAL_SUMMARY on four mandates: faithfulness, \
+         coverage and non-overlap, coherence, and decomposability. \
+         Faithfulness: every source requirement and constraint must be carried by some child; \
+         nothing load-bearing may be dropped, weakened, or paraphrased away. \
+         Coverage and non-overlap: the children together must cover the source's scope without \
+         gaps and without two children owning the same work. \
+         Coherence: dependencies must be sane and acyclic, every deliverable must be in-repo, and \
+         each child must have an observable outcome and acceptance criteria. \
+         Decomposability: if the source is too vague or underspecified to split safely, do not \
+         approve or request changes — return reject_source naming the decision the source owner \
+         must make. \
+         Return exactly one valid JSON object and nothing else. Use no markdown or commentary. \
+         The object must be exactly one of these closed shapes: do not omit, rename, or add \
+         fields.\n\
+         APPROVE={{\"outcome\":\"approve\"}}\n\
+         CHANGES={{\"outcome\":\"changes\",\"findings\":[{{\"blocking\":<bool>,\"summary\":\"<text>\",\"child_key\":\"<key-or-empty>\"}}]}}\n\
+         REJECT_SOURCE={{\"outcome\":\"reject_source\",\"reason\":\"<text>\",\"required_decision\":\"<text>\"}}\n\
+         Use approve only when every mandate holds. Use changes with at least one blocking finding \
+         when a mandate is violated but the source itself is decomposable; cite the offending \
+         child_key or leave it empty for a whole-plan finding. Use reject_source only when the \
+         source cannot be split safely.\n\nSOURCE={source_json}\n\nPROPOSAL={proposal}\n\nSTRUCTURAL_SUMMARY={summary}"
+    )
+}
+
 /// Truncate to at most `max_bytes` on a UTF-8 char boundary. Duplicated from
 /// the planner's private helper to keep this dormant module self-contained.
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -244,6 +295,56 @@ mod tests {
             parse_verdict(&big),
             Err(ArbiterParseError::Provider(_))
         ));
+    }
+
+    #[test]
+    fn prompt_contains_mandate_source_and_shapes() {
+        let src = planner::PlanningSource {
+            task_id: 7,
+            revision: 1,
+            title: "Do X",
+            body: Some("preserve `foo`"),
+            dependencies: &[],
+        };
+        let p = build_arbiter_prompt(&src, r#"{"outcome":"plan","tasks":[]}"#, "structural: ok");
+        for needle in [
+            "faithful",
+            "coverage",
+            "reject_source",
+            "\"outcome\":\"approve\"",
+            "SOURCE=",
+            "PROPOSAL=",
+        ] {
+            assert!(p.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn prompt_bounds_oversized_proposal() {
+        let src = planner::PlanningSource {
+            task_id: 1,
+            revision: 1,
+            title: "t",
+            body: None,
+            dependencies: &[],
+        };
+        let big = "x".repeat(200_000);
+        let p = build_arbiter_prompt(&src, &big, "");
+        assert!(p.len() < 128 * 1024, "prompt must stay bounded");
+    }
+
+    #[test]
+    fn prompt_bounds_oversized_summary() {
+        let src = planner::PlanningSource {
+            task_id: 1,
+            revision: 1,
+            title: "t",
+            body: None,
+            dependencies: &[],
+        };
+        let big_summary = "s".repeat(200_000);
+        let p = build_arbiter_prompt(&src, r#"{"outcome":"plan","tasks":[]}"#, &big_summary);
+        assert!(p.len() < 128 * 1024, "prompt must stay bounded");
     }
 
     #[test]
