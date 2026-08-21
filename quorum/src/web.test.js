@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}, TextDecoder};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, navigableRuns, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -154,6 +154,11 @@ assert.equal(bounded(Array.from({length: MAX_COCKPIT_ITEMS + 1}), MAX_COCKPIT_IT
 const client = fs.readFileSync('quorum/src/web.js', 'utf8');
 assert.doesNotMatch(client, /\.innerHTML\s*=/);
 assert.match(client, /textContent/);
+
+// Task-detail runs are database records and deliberately do not contain session-log `dir`.
+// They must not turn into a nonfunctional `#run-undefined` stream link.
+assert.equal(navigableRuns([{id: 12, agent: 'A-12', role: 'worker'}]).length, 0);
+assert.equal(navigableRuns([{dir: 'A-12-42', meta: {agent: 'A-12'}}]).length, 1);
 
 // A hidden/failed refresh cannot make a second request overlap; failure visibly marks the
 // last successful data stale and the following success clears that condition.

@@ -8,6 +8,9 @@
   const MAX_NORMALIZED_EVENTS_PER_RECORD = 100;
   const MAX_COCKPIT_ITEMS = 12;
   const bounded = (items, max = MAX_COCKPIT_ITEMS) => Array.isArray(items) ? items.slice(0, max) : [];
+  // `/api/tasks/:id` exposes durable agent-run database rows, not log directories.
+  // Only the run-list endpoint's `dir` is a valid stream navigation target.
+  const navigableRuns = runs => bounded(runs).filter(run => typeof (run && run.dir) === 'string' && run.dir.length > 0);
   const textValue = value => value == null ? '' : String(value);
   const ellipsize = (text, max = 90) => text.length > max ? text.slice(0, max - 1) + '…' : text;
 
@@ -177,7 +180,7 @@
       ],
     };
   }
-  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, textValue, pollState, dashboardModel};
+  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, navigableRuns, textValue, pollState, dashboardModel};
   if (typeof document === 'undefined') return;
 
   let openRun = null, openRunTitle = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null, tailState = {}, tailInFlight = false, tailEpoch = 0, runsEpoch = 0, currentRunsBefore = null, stateInFlight = false, lastSuccess = null, stateFailed = false;
@@ -273,8 +276,8 @@
     if (dependencies.length) { root.append(detailHeading('Dependencies')); const list = document.createElement('div'); list.className = 'meta'; dependencies.forEach(id => list.append(taskLink({id, title: 'dependency'}))); root.append(list); }
     const children = bounded(task.generated_children, MAX_COCKPIT_ITEMS);
     if (children.length) { root.append(detailHeading('Generated tasks')); const list = document.createElement('div'); list.className = 'meta'; children.forEach(child => list.append(taskLink(child))); root.append(list); }
-    const runs = bounded(payload.runs, MAX_COCKPIT_ITEMS);
-    if (runs.length) { root.append(detailHeading('Runs')); const list = document.createElement('div'); list.className = 'meta'; runs.forEach(run => list.append(runLink(run.dir, (run.meta && run.meta.agent) || run.dir))); root.append(list); }
+    const runs = navigableRuns(payload.runs);
+    if (runs.length) { root.append(detailHeading('Session-log runs')); const list = document.createElement('div'); list.className = 'meta'; runs.forEach(run => list.append(runLink(run.dir, (run.meta && run.meta.agent) || run.dir))); root.append(list); }
   }
   async function openTask(id) {
     show('task'); put($('taskTitle'), 'Loading task #' + id + '…'); $('taskMeta').replaceChildren(); $('taskBody').replaceChildren(); $('taskRefs').replaceChildren();
