@@ -1774,6 +1774,34 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn codex_planner_does_not_fall_back_from_empty_latest_completed_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let output = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": valid.to_string()}
+            }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-2", "text": ""}
+            }),
+            serde_json::json!({"type": "turn.completed"}),
+        );
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(outcome, PlannerPoll::ProviderFailed(_)));
+        assert!(slot.response_text.is_empty());
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn codex_planner_requires_a_completed_agent_message() {
         let dir = tempfile::tempdir().unwrap();
         let valid = serde_json::json!({

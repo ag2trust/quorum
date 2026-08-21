@@ -692,7 +692,7 @@ fn normalize_event(event: Event) -> Vec<AgentEvent> {
         } if !text.is_empty() => vec![AgentEvent::AssistantText { text }],
         Event::ItemCompleted {
             item: codex_stream::Item::AgentMessage { id, text },
-        } if !text.is_empty() => vec![AgentEvent::CompletedAssistantText { item_id: id, text }],
+        } => vec![AgentEvent::CompletedAssistantText { item_id: id, text }],
         Event::ItemStarted { item } | Event::ItemCompleted { item } => match item {
             codex_stream::Item::CommandExecution { command, .. } => vec![AgentEvent::Activity {
                 kind: ActivityKind::ToolUse,
