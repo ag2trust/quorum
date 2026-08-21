@@ -151,7 +151,7 @@ impl AssignmentRequest {
         validate_text("responsibility key", &self.responsibility_key)?;
         if !matches!(
             self.role.as_str(),
-            "classifier" | "planner" | "worker" | "reviewer" | "collector"
+            "classifier" | "planner" | "arbiter" | "worker" | "reviewer" | "collector"
         ) {
             return usage("invalid managed role");
         }
@@ -521,7 +521,7 @@ fn validate_scope(request: &AssignmentRequest, pool: &ValidatedPool) -> Result<(
                 .expect("request validation pins stage");
             format!("reviewer.{complexity}.{stage}")
         }
-        "classifier" | "planner" | "collector" => {
+        "classifier" | "planner" | "arbiter" | "collector" => {
             if request.complexity.is_some() {
                 return usage("fixed-role assignment must not have complexity");
             }

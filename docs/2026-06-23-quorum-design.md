@@ -2041,6 +2041,8 @@ terra = 80
 opus = 20
 [routing.planner]
 opus = 100
+[routing.arbiter]
+opus = 100
 [routing.collector]
 terra = 100
 [routing.worker.1]
@@ -2091,8 +2093,10 @@ sandbox, and the Grok state-root read/write grant are preserved for that opt-in 
 Broader Grok lifecycle validation (remediation, R1, R2, restart, shutdown, mailbox, and
 cost-limit canaries) remains outstanding as recorded below.
 
-`grok-4.5` may be selected only by a worker routing pool. Planner, reviewer,
-classifier, and collector Grok selections are rejected at startup. The `[grok]`
+`grok-4.5` may be selected only by a worker routing pool. Planner, arbiter, reviewer,
+classifier, and collector Grok selections are rejected at startup. The `[routing.arbiter]`
+pool selects the plan-review Arbiter and defaults to the planner pool when omitted, so an
+existing configuration without it keeps working. The `[grok]`
 section pins the adapter safety profile for those managed worker launches.
 
 Never infer runner kind from the executable filename. Existing top-level
@@ -2147,18 +2151,40 @@ exits successfully. Any contradictory or incomplete terminal evidence fails with
 authority. Grok planning remains refused because Grok is enabled only for managed workers.
 
 A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Each child
-names its concrete implementation delta, affected paths, non-goals, and any byte-exact source
-literals it carries. Tasks follow independently deliverable code or ownership seams; preserved
+names its concrete implementation delta, affected paths, and non-goals, and carries every
+load-bearing source requirement forward faithfully in the child that owns it. Tasks follow
+independently deliverable code or ownership seams; preserved
 behavior and regression-only expectations remain criteria or non-goals rather than synthetic
 implementation work. Before any task row is created, deterministic validation checks the closed
-shape, references, cycles, prohibited synthetic integration work, and byte-exact coverage of
-the lexicographically sorted, distinct prefix of source-marked literals that fits both the 8 KiB
-`preserved_literals` field and its 8 KiB aggregate budget (Markdown code plus quoted
-literal/label/tag/message values), then
-classifies the complete proposal as one batch. Every child must be
+shape, references, cycles, prohibited synthetic integration work, and the structured deliverables
+manifest (below); it no longer requires a byte-exact echo of source-marked literals. Plan
+faithfulness — that every load-bearing source requirement and constraint is carried forward,
+nothing is dropped or silently weakened, the children cover the source without overlap, and the
+plan is coherent — is judged by the Arbiter plan-review gate (below), not by a deterministic
+literal match. Only after the Arbiter approves is the complete proposal classified as one batch.
+Every child must be
 admission-ready, nonduplicate, and size S or M under the same execution-size rubric given to the
 planner. Admission readiness means the scope is sufficiently clear for delivery; it is distinct
 from runtime readiness, which still requires dependencies to be done.
+
+**Arbiter plan-review gate.** Between deterministic validation and materialization the daemon
+gates every structurally valid proposal on a single-shot, stateless **Arbiter** — a model
+reviewer spawned fresh per proposal in the same frozen read-only repository view the planner used,
+selected from the `[routing.arbiter]` pool (defaulting to the planner pool). The Arbiter judges the
+proposal against the authoritative source on four mandates — faithfulness, coverage and
+non-overlap, coherence, and decomposability — and emits exactly one closed verdict, parsed with the
+planner's fail-closed discipline. The Arbiter only emits a verdict; the daemon alone transitions
+lifecycle and materializes children (lifecycle authority stays with the daemon). Verdict mapping:
+*approve* (or a *changes* verdict with no blocking finding) advances the graph from `validating`
+to `preclassifying`, and the unchanged classification/materialization path then creates the
+children; *changes* with at least one blocking finding records a normal `proposal` attempt whose
+summary is the Arbiter's findings and returns the graph to `planning` so the planner re-proposes
+against those findings; *reject_source* holds the graph and fails the source for a required
+owner decision, materializing no children; and a malformed, absent, or provider/protocol-failed
+verdict records a `provider` attempt (fail closed — never a silent approval). A *changes* verdict
+consumes the existing three-per-revision proposal budget; a provider failure consumes the separate
+provider budget. The gate is keyed on the guarded `validating -> preclassifying` transition, so a
+daemon restart that re-spawns and re-polls a fresh Arbiter cannot double-materialize.
 
 Each proposed child also carries a bounded structured deliverables manifest that distinguishes
 requested writes from read-only contextual references. Deterministic validation rejects a write
