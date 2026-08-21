@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -332,14 +332,21 @@ fn complete_r2_review_after(
 
 fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     let db = home.join("repos").join("test__repo").join("quorum.db");
-    let mut conn = quorum_core::db::open(&db).unwrap();
-    match quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
-        Some(cap) => cap.run_id,
-        None => {
-            let rid = format!("test-{agent}-{}", std::process::id());
-            quorum_core::capabilities::issue(&mut conn, &rid, 0, agent, role, 1000).unwrap();
-            rid
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let conn = quorum_core::db::open(&db).unwrap();
+        if let Some(cap) = quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
+            if cap.role == role
+                && quorum_core::capabilities::resolve_live_run_context(&conn, &cap.run_id, role)
+                    .is_ok()
+            {
+                return cap.run_id;
+            }
         }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for live {role} run capability for {agent}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
