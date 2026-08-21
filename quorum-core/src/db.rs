@@ -157,10 +157,41 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
             schema_version: SCHEMA_VERSION,
         });
     }
-    // One atomic migration. SCHEMA_SQL is `CREATE TABLE IF NOT EXISTS`, so it builds a fresh
-    // DB at the latest shape and is a no-op for existing tables — additive column changes
-    // must therefore be ALTERed in below, guarded for idempotency since SQLite has no
-    // `ADD COLUMN IF NOT EXISTS`. SCHEMA_VERSION is a compile-time constant (injection-free).
+    // Foreign-key enforcement must be OFF while migrations run: the v57 rebuild DROPs
+    // `role_assignments` while child tables (agent_runs, task_decompositions,
+    // review_collection_runs, routing_attempts) hold FK references to it, which fails under
+    // enforcement. rusqlite's bundled SQLite defaults `foreign_keys` ON, and `PRAGMA
+    // foreign_keys` is a no-op inside a transaction, so the toggle must straddle the
+    // `BEGIN IMMEDIATE` below. Capture the connection's prior state and restore it on every
+    // exit path so we never leave enforcement disabled on a live connection.
+    let fk_prior: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let outcome = migrate_txn(conn, current);
+    // Restore enforcement to the captured prior state regardless of success or failure, so a
+    // failed migration never leaves enforcement disabled on a live connection.
+    conn.pragma_update(None, "foreign_keys", fk_prior)?;
+    let result = outcome?;
+    // Safety net: the rebuild preserves ids/data via INSERT…SELECT, so no reference should
+    // dangle. Verify under re-enabled enforcement and fail loud if one does.
+    if fk_prior {
+        let mut check = conn.prepare("PRAGMA foreign_key_check")?;
+        if check.exists([])? {
+            return Err(QuorumError::Db(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                Some("migration left dangling foreign-key references".into()),
+            )));
+        }
+    }
+    Ok(result)
+}
+
+/// Run the one atomic migration transaction. Foreign-key enforcement is disabled by the
+/// caller before this runs (and restored after). SCHEMA_SQL is `CREATE TABLE IF NOT EXISTS`,
+/// so it builds a fresh DB at the latest shape and is a no-op for existing tables — additive
+/// column changes must therefore be ALTERed in below, guarded for idempotency since SQLite
+/// has no `ADD COLUMN IF NOT EXISTS`. SCHEMA_VERSION is a compile-time constant
+/// (injection-free). `BEGIN IMMEDIATE` keeps concurrent first-runs safe.
+fn migrate_txn(conn: &Connection, current: i64) -> Result<MigrateResult> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let run = || -> Result<()> {
         conn.execute_batch(SCHEMA_SQL)?;
@@ -862,10 +893,11 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         }
         // v57 widens the immutable role-assignment role check to admit the new
         // managed `arbiter` plan-review role. SQLite cannot ALTER a CHECK, so
-        // the table is rebuilt in place. Foreign keys are not enforced during
-        // migration (matching the v18 rebuilds), so the child references
-        // (agent_runs, task_decompositions, review_collection_runs,
-        // routing_attempts) keep their integer values across the rename. The
+        // the table is rebuilt in place. `migrate` disables foreign-key
+        // enforcement around this transaction, so the DROP succeeds while the
+        // child references (agent_runs, task_decompositions,
+        // review_collection_runs, routing_attempts) keep their integer values
+        // across the rename; `migrate` re-checks integrity afterward. The
         // rebuild is guarded on the stored constraint text, so it is a no-op on
         // a fresh DB (SCHEMA_SQL already created the widened table) and on any
         // re-run.
@@ -1260,8 +1292,16 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             apply_pragmas(&conn).unwrap();
+            // Faithfully mirror the runtime: rusqlite's bundled SQLite defaults
+            // foreign_keys ON, and it is that enforcement that made the v57 DROP
+            // fail on real databases. Enable it explicitly so this seed models
+            // the production connection state that triggers the bug.
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
             // A pre-v57 role_assignments with the narrow role CHECK and one
-            // historical worker row that must survive the rebuild.
+            // historical worker row that must survive the rebuild — plus a child
+            // table holding a real FK reference to that row. The v57 rebuild
+            // DROPs role_assignments; with a live child reference this fails
+            // unless enforcement is disabled around the migration.
             conn.execute_batch(
                 "CREATE TABLE role_assignments (
                      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1285,11 +1325,19 @@ mod tests {
                  );
                  CREATE INDEX IF NOT EXISTS role_assignments_task ON role_assignments(task_id);
                  CREATE INDEX IF NOT EXISTS role_assignments_pr ON role_assignments(pr_number);
+                 -- Child table referencing role_assignments(id): mirrors the FK
+                 -- children (agent_runs, task_decompositions, …) that make the
+                 -- DROP fail under enforcement.
+                 CREATE TABLE ra_child (
+                     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                     role_assignment_id INTEGER REFERENCES role_assignments(id)
+                 );
                  INSERT INTO role_assignments(
                      id,responsibility_key,task_id,role,complexity,profile_id,provider,
                      runner,model,effort,pool_key,policy_generation,created_at)
                  VALUES (9,'worker:task:9',9,'worker','M','opus','claude','claude',
                          'claude-opus-4-8','high','worker.M','generation-1',10);
+                 INSERT INTO ra_child(id,role_assignment_id) VALUES (1,9);
                  PRAGMA user_version=56;",
             )
             .unwrap();
@@ -1307,6 +1355,12 @@ mod tests {
         }
 
         let conn = open(&path).unwrap();
+        // open() leaves foreign-key enforcement in its default (ON) state.
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
@@ -1320,6 +1374,23 @@ mod tests {
                 .unwrap(),
             "worker"
         );
+        // The child row still points at the preserved parent id (no dangling
+        // reference across the DROP+RENAME).
+        assert_eq!(
+            conn.query_row(
+                "SELECT role_assignment_id FROM ra_child WHERE id=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            9
+        );
+        // Integrity is intact: no dangling foreign-key references remain.
+        assert!(!conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
         // The widened CHECK now admits an arbiter assignment.
         conn.execute(
             "INSERT INTO role_assignments(
