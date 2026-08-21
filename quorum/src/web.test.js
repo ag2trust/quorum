@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}, TextDecoder};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskRoute, journeyModel, taskDetailModel, attachRunDirs, navigableRuns, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskRoute, journeyModel, taskDetailModel, navigableRuns, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -174,16 +174,6 @@ assert.equal(taskDetail.notes.length, MAX_DETAIL_ITEMS);
 assert.equal(taskDetail.runs.length, MAX_DETAIL_ITEMS);
 assert.equal(taskDetail.journey.milestones.length, MAX_DETAIL_HISTORY_ITEMS);
 assert.equal(boundedText('x'.repeat(MAX_DETAIL_TEXT_CHARS + 1)).length, MAX_DETAIL_TEXT_CHARS);
-
-// Run summaries only acquire a tail link when they exactly match a bounded session-log
-// record. Database run ids/agent names alone must never form a guessed stream path.
-const linkedRuns = attachRunDirs(
-  [{id: 5, agent: 'A-5', spawned_at: 100}, {id: 6, agent: 'A-5', spawned_at: 101}],
-  [{dir: 'A-5-100', meta: {task_id: 42, agent: 'A-5', start_time: 100}}, {dir: 'other-101', meta: {task_id: 43, agent: 'A-5', start_time: 101}}],
-  42,
-);
-assert.equal(linkedRuns[0].dir, 'A-5-100');
-assert.equal(linkedRuns[1].dir, null);
 
 assert.equal(liveAgentTitle({name: 'A-100', task_id: 42}), 'A-100 · Task #42 · Live tail');
 assert.equal(liveAgentTitle({name: 'A-100', task_id: null}), 'A-100 · Live tail');

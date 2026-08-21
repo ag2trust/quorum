@@ -13,8 +13,8 @@
   const MAX_DETAIL_TEXT_CHARS = 2 * 1024;
   const MAX_DETAIL_BODY_CHARS = 64 * 1024;
   const bounded = (items, max = MAX_COCKPIT_ITEMS) => Array.isArray(items) ? items.slice(0, max) : [];
-  // `/api/tasks/:id` exposes durable agent-run database rows, not log directories.
-  // Only the run-list endpoint's `dir` is a valid stream navigation target.
+  // `/api/tasks/:id` includes `dir` only when the server has meta-verified the matching
+  // session log, so any stream navigation target is durable and task-specific.
   const navigableRuns = runs => bounded(runs).filter(run => typeof (run && run.dir) === 'string' && run.dir.length > 0);
   const textValue = value => value == null ? '' : String(value);
   const boundedText = (value, max = MAX_DETAIL_TEXT_CHARS) => {
@@ -68,22 +68,6 @@
       runs: bounded(source.runs, MAX_DETAIL_ITEMS), dependencies: bounded(task.dependencies, MAX_DETAIL_ITEMS),
       children: bounded(task.generated_children, MAX_DETAIL_ITEMS), generatedFrom: task.generated_from || null,
     };
-  }
-
-  // Session logs are a separate bounded listing. Only attach a stream URL when its task,
-  // agent, and start time exactly agree with the durable run row.
-  function attachRunDirs(runs, logRuns, task) {
-    const taskKey = taskId(task);
-    return bounded(runs, MAX_DETAIL_ITEMS).map(run => {
-      const direct = typeof (run && run.dir) === 'string' && run.dir ? run.dir : null;
-      if (direct || !taskKey) return {...run, dir: direct};
-      const matches = bounded(logRuns, MAX_TASK_LIST_ITEMS).filter(log => {
-        const meta = log && log.meta || {};
-        return taskId(meta.task_id) === taskKey && textValue(meta.agent) === textValue(run && run.agent)
-          && Number(meta.start_time) === Number(run && run.spawned_at) && typeof log.dir === 'string' && log.dir;
-      });
-      return {...run, dir: matches.length === 1 ? matches[0].dir : null};
-    });
   }
 
   // Row count, not character count, is the load-bearing bound: a producer shape whose rows
@@ -252,7 +236,7 @@
       ],
     };
   }
-  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_TASK_LIST_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskId, taskRoute, milestoneState, journeyModel, taskDetailModel, attachRunDirs, navigableRuns, textValue, pollState, dashboardModel};
+  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_TASK_LIST_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskId, taskRoute, milestoneState, journeyModel, taskDetailModel, navigableRuns, textValue, pollState, dashboardModel};
   if (typeof document === 'undefined') return;
 
   let openRun = null, openRunTitle = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null, tailState = {}, tailInFlight = false, tailEpoch = 0, runsEpoch = 0, currentRunsBefore = null, taskListBefore = null, taskListInFlight = false, taskDetailEpoch = 0, activeTaskId = null, stateInFlight = false, lastSuccess = null, stateFailed = false;
@@ -447,21 +431,13 @@
     put($('taskBody'), model.task.body || 'No task description is available.'); renderTaskFacts(task); renderTaskReferences(model); renderJourney(model.journey); renderConditionAndNext(model.journey); renderTaskHistory(model.journey); renderTimeline(model.timeline); renderNotes(model.notes); renderTaskRuns(model.runs);
     return model;
   }
-  async function resolveTaskRunDirs(task, runs, epoch) {
-    if (!runs.length) return;
-    try {
-      const response = await fetch('/api/runs?limit=' + MAX_TASK_LIST_ITEMS); if (!response.ok) return;
-      const payload = await response.json(); if (epoch !== taskDetailEpoch) return;
-      renderTaskRuns(attachRunDirs(runs, payload.runs || [], task));
-    } catch (_) {}
-  }
   async function openTask(requestedId, updateRoute = true) {
     const id = taskId(requestedId); if (!id) return;
     if (updateRoute && window.location.hash !== '#task-' + id) { window.location.hash = 'task-' + id; return; }
     if (activeTaskId === id && !$('task').classList.contains('hidden')) return;
     activeTaskId = id; const epoch = ++taskDetailEpoch;
     show('task'); put($('taskTitle'), 'Loading task #' + id + '…'); $('taskMeta').replaceChildren(); $('taskFields').replaceChildren(); $('taskBody').replaceChildren(); $('taskRefs').replaceChildren(); $('taskJourney').replaceChildren(); $('taskCondition').replaceChildren(); $('taskNextAction').replaceChildren(); $('taskHistory').replaceChildren(); $('taskTimeline').replaceChildren(); $('taskNotes').replaceChildren(); $('taskRuns').replaceChildren();
-    try { const response = await fetch('/api/tasks/' + encodeURIComponent(id)); if (!response.ok) throw new Error('Task request failed'); const payload = await response.json(); if (epoch !== taskDetailEpoch) return; const model = renderTaskDetail(payload); resolveTaskRunDirs(id, model.runs, epoch); }
+    try { const response = await fetch('/api/tasks/' + encodeURIComponent(id)); if (!response.ok) throw new Error('Task request failed'); const payload = await response.json(); if (epoch !== taskDetailEpoch) return; renderTaskDetail(payload); }
     catch (_) { if (epoch !== taskDetailEpoch) return; put($('taskTitle'), 'Task #' + id); put($('taskBody'), 'Task detail could not be loaded.'); }
   }
   function renderTaskList(tasks, append = false) {
