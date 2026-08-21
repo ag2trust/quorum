@@ -1542,7 +1542,7 @@ mod tests {
         let claude_dir = tempfile::tempdir().unwrap();
         let claude_bin = recording_runner(claude_dir.path());
         let claude_environment = vec![("QUORUM_ADAPTER_TEST".into(), "claude-env".into())];
-        let mut claude = RunnerProc::launch(
+        let mut claude = launch_recording_runner(
             &LaunchRequest {
                 model: "claude-sonnet-5",
                 effort: "high",
@@ -1560,8 +1560,7 @@ mod tests {
                 grok: Default::default(),
             },
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(claude.kind(), AgentKind::Claude);
         let _ = claude.next_raw_line().await;
         claude.kill_and_reap().await;
@@ -1593,7 +1592,7 @@ mod tests {
         let codex_dir = tempfile::tempdir().unwrap();
         let codex_bin = recording_runner(codex_dir.path());
         let codex_environment = vec![("QUORUM_ADAPTER_TEST".into(), "codex-env".into())];
-        let mut codex = RunnerProc::launch(
+        let mut codex = launch_recording_runner(
             &LaunchRequest {
                 model: "gpt-5.6-terra",
                 effort: "medium",
@@ -1611,8 +1610,7 @@ mod tests {
                 grok: Default::default(),
             },
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(codex.kind(), AgentKind::Codex);
         while codex.next_raw_line().await.is_some() {}
         codex.kill_and_reap().await;
@@ -1633,7 +1631,7 @@ mod tests {
         let grok_dir = tempfile::tempdir().unwrap();
         let grok_bin = recording_runner(grok_dir.path());
         let grok_environment = vec![("QUORUM_ADAPTER_TEST".into(), "grok-env".into())];
-        let mut grok = RunnerProc::launch(
+        let mut grok = launch_recording_runner(
             &LaunchRequest {
                 model: "grok-4.5",
                 effort: "high",
@@ -1651,8 +1649,7 @@ mod tests {
                 grok: Default::default(),
             },
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(grok.kind(), AgentKind::Grok);
         while grok.next_raw_line().await.is_some() {}
         grok.kill_and_reap().await;
@@ -1678,7 +1675,7 @@ mod tests {
         let mut claude_environment = managed_environment();
         claude_environment.push(("QUORUM_ADAPTER_TEST".into(), "managed-claude".into()));
         let claude_session = "00000000-0000-4000-8000-000000000042";
-        let mut claude = RunnerProc::launch(
+        let mut claude = launch_recording_runner(
             &LaunchRequest {
                 model: "claude-sonnet-5",
                 effort: "high",
@@ -1696,8 +1693,7 @@ mod tests {
                 grok: Default::default(),
             },
         )
-        .await
-        .unwrap();
+        .await;
         while claude.next_raw_line().await.is_some() {}
         claude.kill_and_reap().await;
         let claude_args = std::fs::read_to_string(claude_dir.path().join("args.log")).unwrap();
@@ -1736,7 +1732,7 @@ mod tests {
         let codex_bin = recording_runner(codex_dir.path());
         let mut codex_environment = managed_environment();
         codex_environment.push(("QUORUM_ADAPTER_TEST".into(), "managed-codex".into()));
-        let mut codex = RunnerProc::launch(
+        let mut codex = launch_recording_runner(
             &LaunchRequest {
                 model: "gpt-5.6-terra",
                 effort: "high",
@@ -1754,8 +1750,7 @@ mod tests {
                 grok: Default::default(),
             },
         )
-        .await
-        .unwrap();
+        .await;
         while codex.next_raw_line().await.is_some() {}
         codex.kill_and_reap().await;
         let codex_args = std::fs::read_to_string(codex_dir.path().join("args.log")).unwrap();
@@ -1795,7 +1790,7 @@ mod tests {
         )
         .unwrap();
         grok_environment.push(("GROK_HOME".into(), original_grok_home.display().to_string()));
-        let mut grok = RunnerProc::launch(
+        let mut grok = launch_recording_runner(
             &LaunchRequest {
                 model: "grok-4.5",
                 effort: "high",
@@ -1817,8 +1812,7 @@ mod tests {
                 },
             },
         )
-        .await
-        .unwrap();
+        .await;
         while grok.next_raw_line().await.is_some() {}
         grok.kill_and_reap().await;
         let grok_args = std::fs::read_to_string(grok_dir.path().join("args.log")).unwrap();
@@ -2065,7 +2059,7 @@ mod tests {
     async fn continuation_identity_dispatches_to_codex_resume_only_in_normal_mode() {
         let dir = tempfile::tempdir().unwrap();
         let executable = recording_runner(dir.path());
-        let mut proc = RunnerProc::launch(
+        let mut proc = launch_recording_runner(
             &LaunchRequest {
                 model: "gpt-5.6-terra",
                 effort: "high",
@@ -2083,8 +2077,7 @@ mod tests {
                 grok: Default::default(),
             },
         )
-        .await
-        .unwrap();
+        .await;
         while proc.next_raw_line().await.is_some() {}
         proc.kill_and_reap().await;
         let args = std::fs::read_to_string(dir.path().join("args.log")).unwrap();
