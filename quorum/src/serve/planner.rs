@@ -27,10 +27,6 @@ const DIAGNOSTIC_SAMPLE_LINES: usize = 2;
 const WRITABLE_PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
 pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigned worktree and repository are writable. This defense-in-depth guidance does not itself enforce that boundary.";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
-// Keep all required literal payload within one text field's budget so a plan
-// carrying every required value still has ample space under the 64 KiB response
-// and durable-proposal limits for its mandatory task structure.
-const MAX_REQUIRED_LITERAL_BYTES: usize = MAX_TEXT_BYTES;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
@@ -131,8 +127,6 @@ pub struct ProposedTask {
     #[serde(default)]
     pub non_goals: Vec<String>,
     #[serde(default)]
-    pub preserved_literals: Vec<String>,
-    #[serde(default)]
     pub prerequisites: Vec<String>,
 }
 
@@ -173,13 +167,10 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          use targeted Grep or Glob, read focused excerpts, follow observed calls at most one hop, \
          and stop once each child has a concrete delta and path set. Use at most 5 Grep/Glob calls \
          and 10 Read calls. Do not browse unrelated directories or read whole large files. \
-         Preserve every source constraint. Copy exact required text, literals, commands, schemas, \
-         labels, tags, messages, identifiers, and other verbatim source material byte-for-byte \
-         without normalization or paraphrase. Put each value in the required literal set in \
-         preserved_literals on at least one child. That set is the lexicographically sorted, \
-         distinct source-marked values of at most 8 KiB whose prefix fits an 8 KiB aggregate; \
-         do not put larger values or values beyond that set there because they exceed the bounded \
-         response and proposal capacity. Every source requirement must be represented by a child delta, criterion, \
+         Preserve every source constraint; carry each source requirement, constraint, and \
+         verbatim value forward faithfully in the child that owns it. A separate plan-review \
+         Arbiter judges that faithfulness, so preserve meaning and load-bearing detail rather \
+         than echoing byte-exact literals. Every source requirement must be represented by a child delta, criterion, \
          constraint, verification expectation, or non-goal. Do not create synthetic integration \
          work, recursive planning, no-op/regression-only tasks, or unrelated scope. Dependencies \
          must be real delivery prerequisites and may \
@@ -191,7 +182,7 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          `write` only for requested changes and `read_only_reference` only for context. Use no \
          markdown or commentary. The object must be exactly one of these closed \
          shapes: do not omit, rename, or add fields.\n\
-         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"implementation_delta\":\"<new-code-or-documentation-change>\",\"affected_paths\":[\"<repo-relative-path-or-narrow-pattern>\"],\"observable_outcome\":\"<observable-outcome>\",\"deliverables\":[{{\"kind\":\"write\",\"path\":\"<repo-relative-path>\"}},{{\"kind\":\"read_only_reference\",\"path\":\"<contextual-path>\"}}],\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"non_goals\":[\"<preserved-or-explicitly-excluded-behavior>\"],\"preserved_literals\":[\"<exact-source-literal>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
+         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"implementation_delta\":\"<new-code-or-documentation-change>\",\"affected_paths\":[\"<repo-relative-path-or-narrow-pattern>\"],\"observable_outcome\":\"<observable-outcome>\",\"deliverables\":[{{\"kind\":\"write\",\"path\":\"<repo-relative-path>\"}},{{\"kind\":\"read_only_reference\",\"path\":\"<contextual-path>\"}}],\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"non_goals\":[\"<preserved-or-explicitly-excluded-behavior>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
          BLOCKER={{\"outcome\":\"blocker\",\"category\":\"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>\",\"evidence\":[\"<evidence>\"],\"required_decision\":\"<decision>\",\"why_no_safe_split\":\"<reason>\"}}\n\
          `outcome` must be exactly `plan` or `blocker`; use PLAN only when it has 2-8 tasks. \
          PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
@@ -232,13 +223,10 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 pub async fn validate_for_source(
     tasks: &[ProposedTask],
     source_dependency_ids: &[i64],
-    source_title: &str,
-    source_body: Option<&str>,
     repo_root: &Path,
     path_resolver: &WritablePathResolver,
 ) -> Result<(), PlannerParseError> {
     validate_plan_tasks(tasks)?;
-    validate_source_literals(tasks, source_title, source_body)?;
     validate_for_source_with_resolver(
         tasks,
         source_dependency_ids,
@@ -317,35 +305,6 @@ where
     }
 }
 
-fn validate_source_literals(
-    tasks: &[ProposedTask],
-    source_title: &str,
-    source_body: Option<&str>,
-) -> Result<(), PlannerParseError> {
-    let source_text = format!("{source_title}\n{}", source_body.unwrap_or_default());
-    let preserved: HashSet<&str> = tasks
-        .iter()
-        .flat_map(|task| task.preserved_literals.iter().map(String::as_str))
-        .collect();
-    for literal in &preserved {
-        if !source_text.contains(literal) {
-            return semantic("preserved literal must match source bytes exactly");
-        }
-    }
-    for (index, literal) in required_source_literals(&source_text)
-        .into_iter()
-        .enumerate()
-    {
-        if !preserved.contains(literal.as_str()) {
-            return semantic(&format!(
-                "missing byte-exact source literal at source marker {}",
-                index + 1
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn escaping_write<T>(task: &ProposedTask, path: &str) -> Result<T, PlannerParseError> {
     const MAX_PATH_BYTES: usize = 512;
     const ELLIPSIS: &str = "…";
@@ -365,62 +324,6 @@ fn escaping_write<T>(task: &ProposedTask, path: &str) -> Result<T, PlannerParseE
     );
     debug_assert!(message.len() <= MAX_REJECTION_SUMMARY_BYTES);
     semantic(&message)
-}
-
-/// Extract source-marked literals that can be checked without asking a model
-/// to decide which spelling is authoritative. Only backtick-delimited spans
-/// (inline code and fenced code blocks) are explicit literal syntax.
-fn required_source_literals(source: &str) -> Vec<String> {
-    let mut literals = Vec::new();
-    let bytes = source.as_bytes();
-    let mut cursor = 0;
-    while let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'`') {
-        let delimiter_start = cursor + relative;
-        let delimiter_len = bytes[delimiter_start..]
-            .iter()
-            .take_while(|byte| **byte == b'`')
-            .count();
-        let content_start = delimiter_start + delimiter_len;
-        let mut search_from = content_start;
-        let mut content_end = None;
-        while let Some(relative) = bytes[search_from..].iter().position(|byte| *byte == b'`') {
-            let run_start = search_from + relative;
-            let run_len = bytes[run_start..]
-                .iter()
-                .take_while(|byte| **byte == b'`')
-                .count();
-            if run_len == delimiter_len {
-                content_end = Some(run_start);
-                break;
-            }
-            search_from = run_start + run_len;
-        }
-        let Some(content_end) = content_end else {
-            // Do not reinterpret shorter runs inside an unclosed region as a
-            // new span: that can turn a malformed load-bearing value into a
-            // misleading suffix literal.
-            break;
-        };
-        if content_end > content_start && content_end - content_start <= MAX_TEXT_BYTES {
-            literals.push(source[content_start..content_end].to_string());
-        }
-        cursor = content_end + delimiter_len;
-    }
-
-    literals.sort();
-    literals.dedup();
-
-    let mut required = Vec::new();
-    let mut required_bytes: usize = 0;
-    for literal in literals {
-        let next = required_bytes.saturating_add(literal.len());
-        if next > MAX_REQUIRED_LITERAL_BYTES {
-            break;
-        }
-        required_bytes = next;
-        required.push(literal);
-    }
-    required
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -535,7 +438,6 @@ pub(super) fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerP
             1,
         )?;
         validate_list("non-goals", &task.non_goals, 1)?;
-        validate_list("preserved literals", &task.preserved_literals, 0)?;
         if task.prerequisites.len() > MAX_LIST_ITEMS {
             return semantic("too many prerequisites");
         }
@@ -1260,7 +1162,6 @@ mod tests {
             "source_constraints": ["preserve atomicity"],
             "verification_expectations": ["focused tests pass"],
             "non_goals": ["do not change adjacent behavior"],
-            "preserved_literals": [],
             "prerequisites": prerequisites,
         })
     }
@@ -1308,7 +1209,6 @@ mod tests {
                     "source_constraints": ["preserve atomicity"],
                     "verification_expectations": ["focused tests pass"],
                     "non_goals": ["do not change decomposition storage"],
-                    "preserved_literals": [],
                     "prerequisites": ["core"]
                 }
             ]
@@ -1343,7 +1243,6 @@ mod tests {
                 "source_constraints": ["preserve atomicity"],
                 "verification_expectations": ["focused tests pass"],
                 "non_goals": ["do not change daemon behavior"],
-                "preserved_literals": [],
                 "prerequisites": []
             },
             task("other", &[])
@@ -2269,15 +2168,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            validate_for_source(
-                &[foreign],
-                &[7],
-                "source",
-                None,
-                Path::new("."),
-                &path_resolver,
-            )
-            .await,
+            validate_for_source(&[foreign], &[7], Path::new("."), &path_resolver,).await,
             Err(PlannerParseError::Semantic(_))
         ));
         let synthetic = ProposedTask {
@@ -2299,15 +2190,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            validate_for_source(
-                &[synthetic],
-                &[],
-                "source",
-                None,
-                Path::new("."),
-                &path_resolver,
-            )
-            .await,
+            validate_for_source(&[synthetic], &[], Path::new("."), &path_resolver,).await,
             Err(PlannerParseError::Semantic(_))
         ));
     }
@@ -2614,222 +2497,68 @@ mod tests {
         assert!(prompt.contains(r#""affected_paths":["<repo-relative-path-or-narrow-pattern>"]"#));
         assert!(prompt.contains(r#""deliverables":[{"kind":"write""#));
         assert!(prompt.contains(r#""non_goals":["<preserved-or-explicitly-excluded-behavior>"]"#));
-        assert!(prompt.contains(r#""preserved_literals":["<exact-source-literal>"]"#));
+        assert!(!prompt.contains("preserved_literals"));
         assert!(prompt.contains(
             r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#
         ));
         assert!(prompt.contains("`outcome` must be exactly `plan` or `blocker`"));
         assert!(prompt.contains("S = focused/local; M = bounded coherent work"));
         assert!(prompt.contains("Use at most 5 Grep/Glob calls and 10 Read calls"));
-        assert!(prompt.contains("labels, tags, messages, identifiers"));
+        assert!(prompt.contains("Arbiter judges that faithfulness"));
         assert!(prompt.contains(&format!(
             "Every PLAN task's `source_constraints` must include this worker-facing guidance: \"{WORKER_WRITABILITY_GUIDANCE}\""
         )));
         assert!(prompt.contains("The daemon adds it deterministically"));
     }
 
-    #[test]
-    fn source_validation_requires_marked_literals_byte_for_byte() {
-        let title = "Keep label \"review-ready\"";
-        let source = "Keep `type:feature`, tag \"security\", literal \"EXACT\", and message \"Merge ready\" exactly.";
-        let mut proposed = ProposedTask {
-            key: "routing".into(),
-            title: "Change routing".into(),
-            implementation_delta: "change one routing seam".into(),
-            affected_paths: vec!["src/routing.rs".into()],
-            observable_outcome: "routing works".into(),
-            deliverables: writable_deliverables("src/routing.rs"),
-            acceptance_criteria: vec!["covered".into()],
-            source_constraints: vec!["preserve literals".into()],
-            verification_expectations: vec!["tests pass".into()],
-            non_goals: vec!["no unrelated changes".into()],
-            preserved_literals: vec![
-                "type:feature".into(),
-                "security".into(),
-                "EXACT".into(),
-                "Merge ready".into(),
-                "review-ready".into(),
-            ],
-            prerequisites: vec![],
-        };
-        let companion = ProposedTask {
-            key: "verification".into(),
-            title: "Verify routing".into(),
-            implementation_delta: "add focused routing verification".into(),
-            affected_paths: vec!["tests/routing.rs".into()],
-            observable_outcome: "routing verification works".into(),
-            deliverables: writable_deliverables("tests/routing.rs"),
-            acceptance_criteria: vec!["verification is covered".into()],
-            source_constraints: vec!["preserve literals".into()],
-            verification_expectations: vec!["tests pass".into()],
-            non_goals: vec!["no unrelated changes".into()],
-            preserved_literals: vec![],
-            prerequisites: vec!["routing".into()],
-        };
-        assert!(validate_source_literals(
-            &[proposed.clone(), companion.clone()],
-            title,
-            Some(source),
+    #[tokio::test]
+    async fn literal_dense_proposal_passes_structural_validation_without_a_byte_exact_gate() {
+        // Regression for #48/#58: the byte-exact `validate_source_literals` gate
+        // is gone. `validate_for_source` no longer receives the source text and
+        // never rejects a structurally valid proposal for failing to echo any
+        // backtick-delimited span verbatim. A literal-dense source now reaches
+        // the Arbiter instead of exhausting the proposal budget here.
+        let path_resolver = WritablePathResolver::default();
+        let proposal = vec![
+            ProposedTask {
+                key: "core".into(),
+                title: "Change core seam".into(),
+                implementation_delta: "change the core implementation seam".into(),
+                affected_paths: vec!["src/core.rs".into()],
+                observable_outcome: "core works".into(),
+                deliverables: writable_deliverables("src/core.rs"),
+                acceptance_criteria: vec!["covered".into()],
+                source_constraints: vec!["preserve behavior".into()],
+                verification_expectations: vec!["tests pass".into()],
+                non_goals: vec!["no unrelated changes".into()],
+                prerequisites: vec![],
+            },
+            ProposedTask {
+                key: "verify".into(),
+                title: "Verify core seam".into(),
+                implementation_delta: "add focused core verification".into(),
+                affected_paths: vec!["tests/core.rs".into()],
+                observable_outcome: "core verification works".into(),
+                deliverables: writable_deliverables("tests/core.rs"),
+                acceptance_criteria: vec!["verification is covered".into()],
+                source_constraints: vec!["preserve behavior".into()],
+                verification_expectations: vec!["tests pass".into()],
+                non_goals: vec!["no unrelated changes".into()],
+                prerequisites: vec!["core".into()],
+            },
+        ];
+        // The proposal echoes none of the source's 14 backtick spans verbatim;
+        // under the retired gate this would have been a semantic rejection.
+        let outcome = validate_for_source_with_resolver(
+            &proposal,
+            &[],
+            Path::new("."),
+            &path_resolver,
+            WRITABLE_PATH_RESOLUTION_TIMEOUT,
+            |_repo_root, _paths| true,
         )
-        .is_ok());
-        proposed.preserved_literals[3] = "merge ready".into();
-        assert!(matches!(
-            validate_source_literals(&[proposed, companion], title, Some(source)),
-            Err(PlannerParseError::Semantic(message))
-                if message.contains("match source bytes exactly")
-        ));
-    }
-
-    #[test]
-    fn keyword_prose_without_backtick_framing_yields_empty_required_set() {
-        let source = "A stray label \"unclosed\ntag \"three\" stays unprotected.";
-        assert!(required_source_literals(source).is_empty());
-    }
-
-    #[test]
-    fn matching_backtick_runs_preserve_complete_markdown_code_literals() {
-        let source = "Keep ``value with a ` backtick`` and ````\nfence ``` content\n```` exactly.";
-        assert_eq!(
-            required_source_literals(source),
-            vec![
-                "\nfence ``` content\n".to_string(),
-                "value with a ` backtick".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn mismatched_or_unclosed_backtick_runs_do_not_preserve_suffixes() {
-        for source in [
-            "``value with a ` suffix`",
-            "``value closed by the wrong run```",
-            "````fenced content```",
-        ] {
-            assert!(required_source_literals(source).is_empty(), "{source}");
-        }
-        let bounded_source = format!("``{} `suffix`", "x".repeat(MAX_PROMPT_BYTES));
-        assert!(required_source_literals(&bounded_source).is_empty());
-    }
-
-    #[test]
-    fn source_validation_skips_marked_literals_larger_than_the_preservation_field() {
-        let literal = "x".repeat(MAX_TEXT_BYTES + 1);
-        let proposed = ProposedTask {
-            key: "routing".into(),
-            title: "Change routing".into(),
-            implementation_delta: "change one routing seam".into(),
-            affected_paths: vec!["src/routing.rs".into()],
-            observable_outcome: "routing works".into(),
-            deliverables: writable_deliverables("src/routing.rs"),
-            acceptance_criteria: vec!["covered".into()],
-            source_constraints: vec!["preserve behavior".into()],
-            verification_expectations: vec!["tests pass".into()],
-            non_goals: vec!["no unrelated changes".into()],
-            preserved_literals: vec![],
-            prerequisites: vec![],
-        };
-        let companion = ProposedTask {
-            key: "verification".into(),
-            title: "Verify routing".into(),
-            implementation_delta: "add focused routing verification".into(),
-            affected_paths: vec!["tests/routing.rs".into()],
-            observable_outcome: "routing verification works".into(),
-            deliverables: writable_deliverables("tests/routing.rs"),
-            acceptance_criteria: vec!["verification is covered".into()],
-            source_constraints: vec!["preserve behavior".into()],
-            verification_expectations: vec!["tests pass".into()],
-            non_goals: vec!["no unrelated changes".into()],
-            preserved_literals: vec![],
-            prerequisites: vec!["routing".into()],
-        };
-
-        for source in [
-            format!("Keep this inline literal exactly: `{literal}`"),
-            format!("Keep this double-delimited literal exactly: ``{literal}``"),
-            format!("Keep this fenced literal exactly:\n```\n{literal}\n```"),
-        ] {
-            assert!(required_source_literals(&source).is_empty());
-            assert!(validate_source_literals(
-                &[proposed.clone(), companion.clone()],
-                "source",
-                Some(&source),
-            )
-            .is_ok());
-        }
-    }
-
-    #[test]
-    fn source_validation_bounds_required_literals_to_the_response_and_proposal_budget() {
-        let source = (0..8)
-            .map(|index| {
-                let mut literal = format!("{index:02}");
-                literal.push_str(&"x".repeat(MAX_TEXT_BYTES - literal.len()));
-                format!("`{literal}`")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let required = required_source_literals(&source);
-        assert_eq!(required.len(), 1);
-        assert_eq!(required[0].len(), MAX_TEXT_BYTES);
-
-        let mut first = task("a", &[]);
-        first["preserved_literals"] = serde_json::json!([required[0]]);
-        let plan = serde_json::json!({
-            "outcome": "plan",
-            "tasks": [first, task("b", &["a"])]
-        });
-        assert!(plan.to_string().len() <= MAX_RESPONSE_BYTES);
-        let PlannerResponse::Plan { tasks } = parse_response(&plan.to_string()).unwrap() else {
-            panic!("plan response expected");
-        };
-        assert!(validate_source_literals(&tasks, "source", Some(&source)).is_ok());
-    }
-
-    #[test]
-    fn keyword_prose_without_backticks_does_not_produce_required_literals() {
-        for source in [
-            r#"the error message "be clear""#,
-            r#"label = "severity""#,
-            r#"tag: "important""#,
-            r#"literal "exact value""#,
-            r#"use the message "hello world" in the response"#,
-        ] {
-            assert!(
-                required_source_literals(source).is_empty(),
-                "should not require literals from keyword prose: {source}"
-            );
-        }
-
-        let source = r#"the error message "be clear" should be descriptive"#;
-        let proposed = ProposedTask {
-            key: "task".into(),
-            title: "Handle errors".into(),
-            implementation_delta: "improve error handling".into(),
-            affected_paths: vec!["src/errors.rs".into()],
-            observable_outcome: "errors are clear".into(),
-            deliverables: writable_deliverables("src/errors.rs"),
-            acceptance_criteria: vec!["covered".into()],
-            source_constraints: vec!["preserve behavior".into()],
-            verification_expectations: vec!["tests pass".into()],
-            non_goals: vec!["no unrelated changes".into()],
-            preserved_literals: vec![],
-            prerequisites: vec![],
-        };
-        let companion = ProposedTask {
-            key: "verify".into(),
-            title: "Verify errors".into(),
-            implementation_delta: "add error verification".into(),
-            affected_paths: vec!["tests/errors.rs".into()],
-            observable_outcome: "error verification works".into(),
-            deliverables: writable_deliverables("tests/errors.rs"),
-            acceptance_criteria: vec!["verification is covered".into()],
-            source_constraints: vec!["preserve behavior".into()],
-            verification_expectations: vec!["tests pass".into()],
-            non_goals: vec!["no unrelated changes".into()],
-            preserved_literals: vec![],
-            prerequisites: vec!["task".into()],
-        };
-        assert!(validate_source_literals(&[proposed, companion], "source", Some(source),).is_ok());
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
     }
 
     #[test]

@@ -5407,7 +5407,6 @@ fn proposed_classifier_tasks(
                         ),
                         "verification_expectations": task.verification_expectations,
                         "non_goals": task.non_goals,
-                        "preserved_literals": task.preserved_literals,
                     })
                     .to_string(),
                 ),
@@ -5463,7 +5462,6 @@ fn planned_children(
                     ),
                     "verification_expectations": task.verification_expectations,
                     "non_goals": task.non_goals,
-                    "preserved_literals": task.preserved_literals,
                 })
                 .to_string(),
                 labels: Some("[\"type:implementation\",\"generated:decomposition\"]".into()),
@@ -5943,8 +5941,6 @@ async fn tick_decomposition(
         match planner::validate_for_source(
             proposal,
             &snapshot.dependencies,
-            &snapshot.title,
-            snapshot.body.as_deref(),
             &config.repo_dir,
             &coordinator.writable_path_resolver,
         )
@@ -33029,7 +33025,6 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 source_constraints: vec!["atomic".into()],
                 verification_expectations: vec!["test".into()],
                 non_goals: vec!["do not change b".into()],
-                preserved_literals: vec!["EXACT_LABEL".into()],
                 prerequisites: vec![],
             },
             planner::ProposedTask {
@@ -33076,10 +33071,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             child_body["non_goals"],
             serde_json::json!(["do not change b"])
         );
-        assert_eq!(
-            child_body["preserved_literals"],
-            serde_json::json!(["EXACT_LABEL"])
-        );
+        assert!(child_body["preserved_literals"].is_null());
         assert!(child_body["source_constraints"]
             .as_array()
             .unwrap()
@@ -33277,7 +33269,6 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 source_constraints: vec!["preserve atomic activation".into()],
                 verification_expectations: vec!["focused test passes".into()],
                 non_goals: vec!["do not write outside the repository".into()],
-                preserved_literals: vec![],
                 prerequisites: vec![],
             },
             planner::ProposedTask {
@@ -33291,7 +33282,6 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 source_constraints: vec!["preserve atomic activation".into()],
                 verification_expectations: vec!["negative path is durable".into()],
                 non_goals: vec!["do not activate any child".into()],
-                preserved_literals: vec![],
                 prerequisites: vec!["permitted-first".into()],
             },
         ];
