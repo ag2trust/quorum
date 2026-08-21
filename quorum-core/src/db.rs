@@ -166,23 +166,14 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
     // exit path so we never leave enforcement disabled on a live connection.
     let fk_prior: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
     conn.pragma_update(None, "foreign_keys", false)?;
-    let outcome = migrate_txn(conn, current);
+    let outcome = migrate_txn(conn, current, fk_prior);
     // Restore enforcement to the captured prior state regardless of success or failure, so a
-    // failed migration never leaves enforcement disabled on a live connection.
+    // failed migration never leaves enforcement disabled on a live connection. The integrity
+    // guard runs INSIDE the transaction (see `migrate_txn`), not here, so a violation rolls
+    // the migration back and leaves `user_version` unadvanced rather than committing v57 and
+    // erroring only once.
     conn.pragma_update(None, "foreign_keys", fk_prior)?;
-    let result = outcome?;
-    // Safety net: the rebuild preserves ids/data via INSERT…SELECT, so no reference should
-    // dangle. Verify under re-enabled enforcement and fail loud if one does.
-    if fk_prior {
-        let mut check = conn.prepare("PRAGMA foreign_key_check")?;
-        if check.exists([])? {
-            return Err(QuorumError::Db(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
-                Some("migration left dangling foreign-key references".into()),
-            )));
-        }
-    }
-    Ok(result)
+    outcome
 }
 
 /// Run the one atomic migration transaction. Foreign-key enforcement is disabled by the
@@ -191,7 +182,12 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
 /// column changes must therefore be ALTERed in below, guarded for idempotency since SQLite
 /// has no `ADD COLUMN IF NOT EXISTS`. SCHEMA_VERSION is a compile-time constant
 /// (injection-free). `BEGIN IMMEDIATE` keeps concurrent first-runs safe.
-fn migrate_txn(conn: &Connection, current: i64) -> Result<MigrateResult> {
+///
+/// `fk_prior` is the enforcement state the caller captured: when it was ON, the closure runs
+/// `PRAGMA foreign_key_check` as the final step (while the transaction is still
+/// rollback-capable) and fails on any dangling reference, so the ROLLBACK path fires and
+/// `user_version` stays at the prior version.
+fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<MigrateResult> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let run = || -> Result<()> {
         conn.execute_batch(SCHEMA_SQL)?;
@@ -949,16 +945,39 @@ fn migrate_txn(conn: &Connection, current: i64) -> Result<MigrateResult> {
             }
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        // Integrity safety net, run while the transaction is still rollback-capable. The v57
+        // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
+        // does (or a DB carried a pre-existing dangling reference), fail here so the ROLLBACK
+        // below fires and `user_version` stays unadvanced — a later open re-attempts the
+        // migration instead of taking the `current == SCHEMA_VERSION` early return over a
+        // corrupt schema. `PRAGMA foreign_key_check` reports violations regardless of the
+        // (disabled) enforcement pragma; gated on `fk_prior` so we only enforce integrity
+        // when the connection itself would.
+        if fk_prior {
+            let mut check = conn.prepare("PRAGMA foreign_key_check")?;
+            if check.exists([])? {
+                return Err(QuorumError::Db(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                    Some("migration left dangling foreign-key references".into()),
+                )));
+            }
+        }
         Ok(())
     };
     match run() {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(MigrateResult {
+        Ok(()) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(MigrateResult {
                 migrated_from: current,
                 schema_version: SCHEMA_VERSION,
-            })
-        }
+            }),
+            Err(e) => {
+                // A failing COMMIT (e.g. post-timeout SQLITE_BUSY) can leave the transaction
+                // active; roll it back explicitly so the caller's `foreign_keys` restore is a
+                // real connection-level pragma and not a silent no-op inside a live txn.
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(map_sql_err(e))
+            }
+        },
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
@@ -1411,6 +1430,83 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn migration_integrity_check_rolls_back_and_stays_unadvanced_on_dangling_ref() {
+        // A v56 DB carrying a PRE-EXISTING dangling child reference must not silently
+        // migrate. The in-transaction foreign_key_check must fail the migration so it rolls
+        // back, `user_version` stays 56, and every subsequent open fails identically instead
+        // of taking the `current == SCHEMA_VERSION` early return over a corrupt schema.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dangling-ref-v56.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            // Narrow (pre-v57) role_assignments plus a child table whose row points at a
+            // role_assignments id that does not exist — a dangling reference seeded with
+            // enforcement briefly off (as it would be on a corrupted real DB).
+            conn.execute_batch(
+                "CREATE TABLE role_assignments (
+                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                     responsibility_key  TEXT NOT NULL UNIQUE,
+                     task_id             INTEGER,
+                     pr_number           INTEGER,
+                     role                TEXT NOT NULL CHECK(role IN
+                                             ('classifier','planner','worker','reviewer','collector')),
+                     review_stage        TEXT CHECK(review_stage IN ('r1','r2')),
+                     complexity          TEXT,
+                     profile_id          TEXT NOT NULL,
+                     provider            TEXT NOT NULL,
+                     runner              TEXT NOT NULL,
+                     model               TEXT NOT NULL,
+                     effort              TEXT NOT NULL,
+                     pool_key            TEXT NOT NULL,
+                     policy_generation   TEXT NOT NULL,
+                     created_at          INTEGER NOT NULL,
+                     CHECK((role = 'reviewer' AND review_stage IS NOT NULL) OR
+                           (role != 'reviewer' AND review_stage IS NULL))
+                 );
+                 CREATE TABLE ra_child (
+                     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                     role_assignment_id INTEGER REFERENCES role_assignments(id)
+                 );
+                 PRAGMA foreign_keys=OFF;
+                 INSERT INTO ra_child(id, role_assignment_id) VALUES (1, 999);
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA user_version=56;",
+            )
+            .unwrap();
+        }
+
+        // Helper: read the on-disk version without going through migrate().
+        let version = |p: &std::path::Path| -> i64 {
+            let raw = Connection::open(p).unwrap();
+            raw.query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap()
+        };
+
+        // First open fails loud; the migration rolled back, so the version stays 56.
+        let err1 = open(&path).unwrap_err();
+        assert!(
+            format!("{err1}").contains("dangling foreign-key references"),
+            "unexpected error: {err1}"
+        );
+        assert_eq!(version(&path), 56, "user_version must not advance past 56");
+
+        // A SECOND identical open must ALSO fail — never silently succeed by taking the
+        // `current == SCHEMA_VERSION` early return over the still-corrupt schema.
+        let err2 = open(&path).unwrap_err();
+        assert!(
+            format!("{err2}").contains("dangling foreign-key references"),
+            "second open unexpectedly did not fail the same way: {err2}"
+        );
+        assert_eq!(
+            version(&path),
+            56,
+            "user_version must still be 56 after retry"
         );
     }
 
