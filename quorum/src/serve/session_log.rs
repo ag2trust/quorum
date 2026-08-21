@@ -2,7 +2,8 @@
 //!
 //! Each agent session gets its own directory under `{log_dir}/{agent}-{start_ts}/`.
 //! `stream.jsonl` captures raw events, `transcript.md` formats assistant output for
-//! human reading, and `meta.json` summarizes the session on finalize.
+//! human reading, and `meta.json` identifies the session while it is active
+//! and summarizes it on finalize.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -81,12 +82,17 @@ impl SessionLog {
             rework_count: 0,
         };
 
-        Ok(SessionLog {
+        let log = SessionLog {
             dir,
             stream_file,
             transcript_file,
             meta,
-        })
+        };
+        // The task detail API verifies a run link against this metadata. Write
+        // it before the daemon persists the durable run so active sessions are
+        // linkable too, not only sessions that reached finalization.
+        log.write_meta()?;
+        Ok(log)
     }
 
     pub fn dir(&self) -> &Path {
@@ -139,10 +145,15 @@ impl SessionLog {
         self.meta.end_time = Some(super::now_unix());
         self.meta.verdict = verdict.map(|s| s.to_string());
 
+        let _ = self.write_meta();
+    }
+
+    fn write_meta(&self) -> io::Result<()> {
         let meta_path = self.dir.join("meta.json");
         if let Ok(json) = serde_json::to_string_pretty(&self.meta) {
-            let _ = fs::write(meta_path, json);
+            fs::write(meta_path, json)?;
         }
+        Ok(())
     }
 }
 
@@ -214,6 +225,14 @@ mod tests {
 
         assert!(log.dir().join("stream.jsonl").exists());
         assert!(log.dir().join("transcript.md").exists());
+        let active_meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(log.dir().join("meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(active_meta["agent"], "TestAgent");
+        assert_eq!(active_meta["role"], "worker");
+        assert_eq!(active_meta["task_id"], 42);
+        assert_eq!(active_meta["start_time"], 1000);
+        assert_eq!(active_meta["end_time"], serde_json::Value::Null);
 
         let event = Event::Assistant {
             message: serde_json::json!({"content": "Hello world"}),

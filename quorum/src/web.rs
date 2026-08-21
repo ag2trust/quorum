@@ -1575,13 +1575,41 @@ mod tests {
     }
 
     #[test]
-    fn task_detail_links_meta_verified_runs_beyond_the_global_run_page() {
+    fn task_detail_links_active_meta_verified_runs_beyond_the_global_run_page() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
         let mut conn = quorum_core::db::open(&state.db_path).unwrap();
         let task_id = create_test_task(&mut conn, "with retained logs", None, None);
+        drop(conn);
+
+        // The run row can be persisted after provider launch, including on a
+        // later clock tick. It must retain this captured session identity so
+        // the active (not yet finalized) log remains directly linkable.
+        let session_started_at = 100;
+        let persisted_after_launch_at = 101;
+        assert_ne!(session_started_at, persisted_after_launch_at);
+        let active_log = crate::serve::session_log::SessionLog::create(
+            &state.logs_root,
+            "Worker",
+            "worker",
+            Some(task_id),
+            "active-session",
+            "task-branch",
+            session_started_at,
+        )
+        .unwrap();
+        assert_eq!(active_log.dir(), state.logs_root.join("Worker-100"));
+
+        let conn = quorum_core::db::open(&state.db_path).unwrap();
         quorum_core::agent_runs::insert(
-            &conn, task_id, "Worker", "worker", "model", "high", "codex", 100,
+            &conn,
+            task_id,
+            "Worker",
+            "worker",
+            "model",
+            "high",
+            "codex",
+            session_started_at,
         )
         .unwrap();
         quorum_core::agent_runs::insert(
@@ -1590,16 +1618,6 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        fs::create_dir_all(&state.logs_root).unwrap();
-        let matched = state.logs_root.join("Worker-100");
-        fs::create_dir(&matched).unwrap();
-        fs::write(matched.join("stream.jsonl"), "{}\n").unwrap();
-        fs::write(
-            matched.join("meta.json"),
-            json!({"agent":"Worker", "role":"worker", "task_id":task_id, "start_time":100})
-                .to_string(),
-        )
-        .unwrap();
         let mismatched = state.logs_root.join("Impostor-101");
         fs::create_dir(&mismatched).unwrap();
         fs::write(mismatched.join("stream.jsonl"), "{}\n").unwrap();
