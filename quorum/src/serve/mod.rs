@@ -171,6 +171,9 @@ fn configured_routing_pool(
     let percentages = match role {
         "classifier" => &config.routing.classifier,
         "planner" => &config.routing.planner,
+        // Dormant: no caller resolves an Arbiter assignment yet. An unset
+        // `[routing.arbiter]` block falls back to the planner pool.
+        "arbiter" => config.routing.arbiter_pool(),
         "collector" => &config.routing.collector,
         "worker" => config
             .routing
@@ -20344,6 +20347,7 @@ mod tests {
             routing: crate::serve_config::RoutingPolicy {
                 classifier: pool.clone(),
                 planner: pool.clone(),
+                arbiter: pool.clone(),
                 collector: pool.clone(),
                 worker: (1..=5)
                     .map(|level| (level.to_string(), pool.clone()))
@@ -24264,6 +24268,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             routing: crate::serve_config::RoutingPolicy {
                 classifier: pool.clone(),
                 planner: pool.clone(),
+                arbiter: pool.clone(),
                 collector: pool.clone(),
                 worker: (1..=5)
                     .map(|level| (level.to_string(), pool.clone()))

@@ -1161,6 +1161,7 @@ mod tests {
             routing: crate::serve_config::RoutingPolicy {
                 classifier: std::collections::BTreeMap::new(),
                 planner: std::collections::BTreeMap::new(),
+                arbiter: std::collections::BTreeMap::new(),
                 collector: std::collections::BTreeMap::new(),
                 worker: std::collections::BTreeMap::new(),
                 reviewer: std::collections::BTreeMap::new(),
