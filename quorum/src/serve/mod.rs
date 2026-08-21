@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod agent_endpoint;
 pub mod approvals;
+pub mod arbiter;
 pub mod classifier;
 pub mod cleanup;
 #[allow(dead_code)]
