@@ -16783,7 +16783,7 @@ async fn provision_reviewer_reserved(
         let rid = cap_run_id.clone();
         let name = reviewer_name.clone();
         let loaded = tokio::task::spawn_blocking(move || {
-            prepare_reviewer_authority(&p, tid, &rid, &name, now_unix())
+            prepare_reviewer_authority(&p, tid, &rid, &name, session_started_at)
         })
         .await;
         match loaded {
@@ -17768,9 +17768,10 @@ async fn spawn_worker(
         let rid = cap_run_id.clone();
         let name = agent_name.clone();
         let tid = task.id;
+        let issued_at = session_started_at;
         let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&p)?;
-            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", now_unix())
+            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", issued_at)
         })
         .await
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
@@ -19978,9 +19979,10 @@ async fn spawn_remediation_worker(
         let rid = cap_run_id.clone();
         let name = agent_name.clone();
         let tid = task_id;
+        let issued_at = session_started_at;
         let _ = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&p)?;
-            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", now_unix())
+            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", issued_at)
         })
         .await;
     }
