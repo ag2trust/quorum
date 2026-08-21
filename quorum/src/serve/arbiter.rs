@@ -1,0 +1,260 @@
+//! Bounded plan-review "Arbiter" verdict schema and protocol boundary.
+//!
+//! The Arbiter is a single-shot, stateless reviewer that judges the planner's
+//! proposal before children materialize. This module carries only the closed
+//! verdict schema and its parser; the daemon coordinator wiring lands in a
+//! later implementation slice, so the runtime API is dormant for now.
+#![allow(dead_code)]
+
+use serde::Deserialize;
+
+/// Byte cap for free-text verdict fields. Mirrors the planner's per-field text
+/// budget so a verdict shares the same bounded-text discipline.
+const MAX_TEXT_BYTES: usize = 8 * 1024;
+
+/// Reuse the planner's 64 KiB whole-response ceiling so a verdict cannot grow
+/// past the durable-response envelope.
+use super::planner::MAX_RESPONSE_BYTES;
+
+/// Closed reviewer verdict. `Approve` lets the proposal materialize; `Changes`
+/// records findings the planner re-proposes against; `RejectSource` parks the
+/// source for a required human/coordinator decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArbiterVerdict {
+    Approve,
+    Changes {
+        findings: Vec<ArbiterFinding>,
+    },
+    RejectSource {
+        reason: String,
+        required_decision: String,
+    },
+}
+
+/// A single plan-review finding. `blocking` distinguishes a mandatory revision
+/// from advisory feedback; `child_key` ties the finding to a proposed child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArbiterFinding {
+    pub blocking: bool,
+    pub summary: String,
+    pub child_key: String,
+}
+
+/// Parse outcomes: a provider/protocol failure (fail closed to a re-attempt)
+/// versus a well-formed-but-invalid verdict shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArbiterParseError {
+    Provider(String),
+    Semantic(String),
+}
+
+impl std::fmt::Display for ArbiterParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(s) => write!(f, "provider failure: {s}"),
+            Self::Semantic(s) => write!(f, "semantic rejection: {s}"),
+        }
+    }
+}
+
+/// Closed wire form of the verdict. `deny_unknown_fields` and a snake_case,
+/// internally-tagged `outcome` reject any shape drift.
+#[derive(Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum WireVerdict {
+    // A struct variant (rather than a unit variant) so `deny_unknown_fields`
+    // rejects stray keys on an `approve`; internally-tagged unit variants
+    // silently ignore extra fields.
+    Approve {},
+    Changes {
+        findings: Vec<WireFinding>,
+    },
+    RejectSource {
+        reason: String,
+        required_decision: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireFinding {
+    blocking: bool,
+    summary: String,
+    child_key: String,
+}
+
+/// Parse exactly one closed verdict object.
+///
+/// Mirrors `planner::parse_response` framing: an empty/whitespace body, a
+/// wrapper, or trailing bytes after the single object is a provider failure
+/// (fail closed to a re-attempt, never a silent approve); well-formed JSON of
+/// the wrong shape or an unknown `outcome` is a semantic rejection.
+pub fn parse_verdict(text: &str) -> Result<ArbiterVerdict, ArbiterParseError> {
+    if text.len() > MAX_RESPONSE_BYTES {
+        return Err(ArbiterParseError::Provider("verdict exceeds 64 KiB".into()));
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return Err(ArbiterParseError::Provider(
+            "verdict must be exactly one JSON object without wrappers".into(),
+        ));
+    }
+    // Stage 1: reject anything that is not exactly one JSON value. `from_str`
+    // requires end-of-input after the value, so a second object or trailing
+    // bytes fail here as a provider failure.
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| ArbiterParseError::Provider(format!("verdict is not one JSON object: {e}")))?;
+    // Stage 2: a well-formed JSON value that does not match the closed shape or
+    // carries an unknown `outcome` is a semantic rejection, not a provider fault.
+    let wire: WireVerdict = serde_json::from_value(value)
+        .map_err(|e| ArbiterParseError::Semantic(format!("invalid verdict shape: {e}")))?;
+    Ok(match wire {
+        WireVerdict::Approve {} => ArbiterVerdict::Approve,
+        WireVerdict::Changes { findings } => ArbiterVerdict::Changes {
+            findings: findings
+                .into_iter()
+                .map(|f| ArbiterFinding {
+                    blocking: f.blocking,
+                    summary: truncate_utf8(&f.summary, MAX_TEXT_BYTES).to_owned(),
+                    child_key: f.child_key,
+                })
+                .collect(),
+        },
+        WireVerdict::RejectSource {
+            reason,
+            required_decision,
+        } => ArbiterVerdict::RejectSource {
+            reason: truncate_utf8(&reason, MAX_TEXT_BYTES).to_owned(),
+            required_decision: truncate_utf8(&required_decision, MAX_TEXT_BYTES).to_owned(),
+        },
+    })
+}
+
+/// True when any finding is blocking (a blocker forces a `changes` re-proposal).
+pub fn has_blocking(findings: &[ArbiterFinding]) -> bool {
+    findings.iter().any(|finding| finding.blocking)
+}
+
+/// Truncate to at most `max_bytes` on a UTF-8 char boundary. Duplicated from
+/// the planner's private helper to keep this dormant module self-contained.
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_approve() {
+        let v = parse_verdict(r#"{"outcome":"approve"}"#).unwrap();
+        assert!(matches!(v, ArbiterVerdict::Approve));
+    }
+
+    #[test]
+    fn parses_changes_with_blocking() {
+        let v = parse_verdict(
+            r#"{"outcome":"changes","findings":[{"blocking":true,"summary":"dropped constraint X","child_key":"c1"}]}"#,
+        )
+        .unwrap();
+        match v {
+            ArbiterVerdict::Changes { findings } => {
+                assert_eq!(findings.len(), 1);
+                assert!(has_blocking(&findings));
+            }
+            _ => panic!("expected changes"),
+        }
+    }
+
+    #[test]
+    fn parses_reject_source() {
+        let v = parse_verdict(
+            r#"{"outcome":"reject_source","reason":"too vague","required_decision":"clarify scope"}"#,
+        )
+        .unwrap();
+        assert!(matches!(v, ArbiterVerdict::RejectSource { .. }));
+    }
+
+    #[test]
+    fn rejects_wrapped_or_extra_json() {
+        assert!(matches!(
+            parse_verdict(r#"here is the verdict: {"outcome":"approve"}"#),
+            Err(ArbiterParseError::Provider(_))
+        ));
+        assert!(matches!(
+            parse_verdict(r#"{"outcome":"approve"}{"outcome":"approve"}"#),
+            Err(ArbiterParseError::Provider(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_outcome_and_empty() {
+        assert!(matches!(
+            parse_verdict(r#"{"outcome":"maybe"}"#),
+            Err(ArbiterParseError::Semantic(_))
+        ));
+        assert!(matches!(
+            parse_verdict(""),
+            Err(ArbiterParseError::Provider(_))
+        ));
+    }
+
+    #[test]
+    fn whitespace_only_is_provider_failure() {
+        assert!(matches!(
+            parse_verdict("   \n\t  "),
+            Err(ArbiterParseError::Provider(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_field_is_semantic_rejection() {
+        assert!(matches!(
+            parse_verdict(r#"{"outcome":"approve","extra":true}"#),
+            Err(ArbiterParseError::Semantic(_))
+        ));
+    }
+
+    #[test]
+    fn no_blocking_findings_reports_false() {
+        let v = parse_verdict(
+            r#"{"outcome":"changes","findings":[{"blocking":false,"summary":"nit","child_key":"c1"}]}"#,
+        )
+        .unwrap();
+        let ArbiterVerdict::Changes { findings } = v else {
+            panic!("expected changes");
+        };
+        assert!(!has_blocking(&findings));
+    }
+
+    #[test]
+    fn oversized_verdict_is_provider_failure() {
+        let big = format!(
+            r#"{{"outcome":"reject_source","reason":"{}","required_decision":"x"}}"#,
+            "y".repeat(MAX_RESPONSE_BYTES)
+        );
+        assert!(matches!(
+            parse_verdict(&big),
+            Err(ArbiterParseError::Provider(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_summary_is_truncated() {
+        let summary = "z".repeat(MAX_TEXT_BYTES * 2);
+        let text = format!(
+            r#"{{"outcome":"changes","findings":[{{"blocking":true,"summary":"{summary}","child_key":"c1"}}]}}"#
+        );
+        let ArbiterVerdict::Changes { findings } = parse_verdict(&text).unwrap() else {
+            panic!("expected changes");
+        };
+        assert!(findings[0].summary.len() <= MAX_TEXT_BYTES);
+    }
+}
