@@ -5420,10 +5420,7 @@ fn summarize_arbiter_findings(findings: &[arbiter::ArbiterFinding]) -> String {
 /// after the Arbiter approves. The transition is guarded on `state='validating'`
 /// so a restart that re-polls a fresh Arbiter, or a concurrent block/cancel,
 /// cannot double-advance (invariant #3: a zero-row bind is a clean no-op).
-async fn advance_validating_to_preclassifying(
-    config: &ServeConfig,
-    graph_id: i64,
-) -> Result<bool> {
+async fn advance_validating_to_preclassifying(config: &ServeConfig, graph_id: i64) -> Result<bool> {
     let path = config.db_path.clone();
     tokio::task::spawn_blocking(move || -> Result<bool> {
         let mut conn = quorum_core::db::open(&path)?;
@@ -5463,8 +5460,14 @@ async fn apply_arbiter_verdict(
 ) -> Result<bool> {
     match outcome {
         arbiter::ArbiterPoll::ProviderFailed(summary) => {
-            record_decomposition_attempt(config, graph_id, "provider", "arbiter-provider", &summary)
-                .await?;
+            record_decomposition_attempt(
+                config,
+                graph_id,
+                "provider",
+                "arbiter-provider",
+                &summary,
+            )
+            .await?;
             Ok(false)
         }
         arbiter::ArbiterPoll::Done(arbiter::ArbiterVerdict::Approve) => {
@@ -33822,13 +33825,21 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("approve.db");
         let proposal = arbiter_gate_proposal();
-        let (source, graph) = arbiter_validating_graph(&db_path, "large", Some("split me"), &proposal);
+        let (source, graph) =
+            arbiter_validating_graph(&db_path, "large", Some("split me"), &proposal);
         let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
 
-        let advanced = apply_arbiter_verdict(&config, graph, arbiter::ArbiterPoll::Done(arbiter::ArbiterVerdict::Approve))
-            .await
-            .unwrap();
-        assert!(advanced, "approve keeps the proposal for the classifier stage");
+        let advanced = apply_arbiter_verdict(
+            &config,
+            graph,
+            arbiter::ArbiterPoll::Done(arbiter::ArbiterVerdict::Approve),
+        )
+        .await
+        .unwrap();
+        assert!(
+            advanced,
+            "approve keeps the proposal for the classifier stage"
+        );
 
         let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
         assert_eq!(state, "preclassifying");
@@ -33843,7 +33854,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let again = advance_validating_to_preclassifying(&config, graph)
             .await
             .unwrap();
-        assert!(!again, "second advance from preclassifying is a clean no-op");
+        assert!(
+            !again,
+            "second advance from preclassifying is a clean no-op"
+        );
         assert_eq!(arbiter_gate_state(&db_path, graph).0, "preclassifying");
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
     }
@@ -33893,7 +33907,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(!advanced, "a blocking changes verdict does not advance");
 
         let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
-        assert_eq!(state, "planning", "the planner re-proposes against the findings");
+        assert_eq!(
+            state, "planning",
+            "the planner re-proposes against the findings"
+        );
         assert_eq!(attempts, 1);
         assert!(hold.is_none());
         assert_eq!(status, "planning");
@@ -34022,7 +34039,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
              `a`, `b`, `c`, `d`, `e`, `f`, `g`, `h`, `i` exactly.";
         assert_eq!(body.matches('`').count() / 2, 14);
         let proposal = arbiter_gate_proposal();
-        let (source, graph) = arbiter_validating_graph(&db_path, "literal dense", Some(body), &proposal);
+        let (source, graph) =
+            arbiter_validating_graph(&db_path, "literal dense", Some(body), &proposal);
 
         // Give the routing profile a resolvable Codex model so the tick reaches
         // the Arbiter frozen-view spawn (which then fails: the test repo has no
@@ -34287,7 +34305,6 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         verification_expectations: vec!["a".into()],
                         non_goals: vec!["no adjacent change".into()],
                         prerequisites: vec![],
-                        ..Default::default()
                     },
                     planner::ProposedTask {
                         key: "b".into(),
@@ -34301,7 +34318,6 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         verification_expectations: vec!["b".into()],
                         non_goals: vec!["no adjacent change".into()],
                         prerequisites: vec!["a".into()],
-                        ..Default::default()
                     },
                 ])
                 .unwrap();

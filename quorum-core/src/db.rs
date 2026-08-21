@@ -1314,12 +1314,10 @@ mod tests {
         );
         // The historical worker assignment survived the rebuild unchanged.
         assert_eq!(
-            conn.query_row(
-                "SELECT role FROM role_assignments WHERE id=9",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
+            conn.query_row("SELECT role FROM role_assignments WHERE id=9", [], |row| {
+                row.get::<_, String>(0)
+            },)
+                .unwrap(),
             "worker"
         );
         // The widened CHECK now admits an arbiter assignment.

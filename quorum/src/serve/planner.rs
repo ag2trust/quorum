@@ -2165,7 +2165,6 @@ mod tests {
             verification_expectations: vec!["tests".into()],
             non_goals: vec!["no unrelated changes".into()],
             prerequisites: vec!["source:9".into()],
-            ..Default::default()
         };
         assert!(matches!(
             validate_for_source(&[foreign], &[7], Path::new("."), &path_resolver,).await,
@@ -2187,7 +2186,6 @@ mod tests {
             verification_expectations: vec!["tests".into()],
             non_goals: vec!["no unrelated changes".into()],
             prerequisites: vec![],
-            ..Default::default()
         };
         assert!(matches!(
             validate_for_source(&[synthetic], &[], Path::new("."), &path_resolver,).await,
@@ -2224,7 +2222,6 @@ mod tests {
             verification_expectations: vec!["tests".into()],
             non_goals: vec!["do not change external references".into()],
             prerequisites: vec![],
-            ..Default::default()
         };
 
         assert_eq!(
@@ -2278,7 +2275,6 @@ mod tests {
                 verification_expectations: vec!["tests".into()],
                 non_goals: vec!["do not write external paths".into()],
                 prerequisites: vec![],
-                ..Default::default()
             };
             assert!(
                 matches!(
