@@ -189,19 +189,11 @@ fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
     let error_rows = quorum_core::stats::web_recent_errors(&conn, now)?;
     let alerts = alert_rows.iter().map(alert_value).collect::<Vec<_>>();
     let errors = error_rows.iter().map(error_value).collect::<Vec<_>>();
-    // Start with the task-core projection that repeats the dependency and graph predicates
-    // used by a claim, then apply the same persisted classification admission the daemon uses
-    // before it attempts an implementation claim. Do not substitute a recent/open task page.
-    let mut ready_all =
+    // This task-core projection applies the dependency, graph, and persisted
+    // classification admission predicates before its SQL display bound. Do not
+    // substitute a recent/open task page or filter it after the limit.
+    let ready_all =
         quorum_core::tasks::list_implementation_ready_open_limited(&conn, STATE_BAND_LIMIT as i64)?;
-    ready_all.retain(|task| {
-        !task.review_only
-            && quorum_core::tasks::classification_is_dispatchable(
-                &task.refs,
-                task.review_only,
-                task.continue_pr,
-            )
-    });
     let ready_count = ready_all.len();
     let ready = ready_all
         .into_iter()
@@ -1374,6 +1366,49 @@ mod tests {
             payload["queue_bands"]["ready"]["count"],
             json!(STATE_BAND_LIMIT)
         );
+        assert_checkpoint_released(&state.db_path);
+    }
+
+    #[test]
+    fn state_ready_band_filters_before_its_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let mut conn = quorum_core::db::open(&state.db_path).unwrap();
+        for priority in 2..=STATE_BAND_LIMIT as i64 + 1 {
+            let id = create_test_task(&mut conn, &format!("unready-{priority}"), None, None);
+            conn.execute(
+                "UPDATE tasks SET priority=?1, refs=?2 WHERE id=?3",
+                rusqlite::params![
+                    priority,
+                    r#"{"cx_est":2,"cx_size":"S","cx_ready":false,"cx_not_ready_reason":"waiting on design"}"#,
+                    id
+                ],
+            )
+            .unwrap();
+        }
+        let dispatchable =
+            create_test_task(&mut conn, "dispatchable after unready prefix", None, None);
+        conn.execute(
+            "UPDATE tasks SET refs=?1 WHERE id=?2",
+            rusqlite::params![
+                r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null}"#,
+                dispatchable
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let payload = state_payload(&state).unwrap();
+        assert_eq!(
+            payload["queue_bands"]["ready"]["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            [dispatchable]
+        );
+        assert_eq!(payload["queue_bands"]["ready"]["count"], json!(1));
         assert_checkpoint_released(&state.db_path);
     }
 
