@@ -939,20 +939,20 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                     }
                 }
                 AgentEvent::AssistantText { text } => {
-                    // Claude streams its terminal response as assistant text. Codex
-                    // started agent-message events are only provisional: use the
-                    // provider-confirmed completed event below as its sole response
-                    // candidate so narration cannot be concatenated into JSON.
+                    // Each Claude assistant event is a distinct message, so retain
+                    // only the latest one: the final message is the response
+                    // candidate. Codex started agent-message events are provisional;
+                    // its provider-confirmed completed event below remains its sole
+                    // response candidate.
                     if slot.proc.kind() == AgentKind::Claude {
-                        if slot.response_text.len().saturating_add(text.len()) > MAX_RESPONSE_BYTES
-                        {
+                        if text.len() > MAX_RESPONSE_BYTES {
                             return Some(provider_failure(
                                 slot,
                                 "planner response exceeded 64 KiB",
                                 "exact-through-last-line",
                             ));
                         }
-                        slot.response_text.push_str(&text);
+                        slot.response_text = text;
                     }
                 }
                 AgentEvent::CompletedAssistantText { text, .. } => {
@@ -1108,6 +1108,39 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn spawn_fake_claude(dir: &Path, stdout: &str) -> PlannerSlot {
+        let stdout_path = dir.join("stdout.jsonl");
+        std::fs::write(&stdout_path, stdout).unwrap();
+        let runner = executable_script(
+            dir,
+            "claude",
+            &format!("exec /bin/cat '{}'", stdout_path.display()),
+        );
+        spawn_planner(
+            AgentKind::Claude,
+            CLAUDE_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir,
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn claude_stream(events: &[serde_json::Value]) -> String {
+        let mut stream = events
+            .iter()
+            .map(|event| event.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        stream.push_str("\n{\"type\":\"result\",\"result\":\"\",\"is_error\":false}\n");
+        stream
     }
 
     #[cfg(unix)]
@@ -1598,6 +1631,70 @@ mod tests {
         assert!(matches!(
             outcome,
             PlannerPoll::Done(PlannerResponse::Plan { ref tasks }) if tasks.len() == 2
+        ));
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_planner_uses_only_the_final_assistant_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let output = claude_stream(&[
+            serde_json::json!({"type": "assistant", "message": {"content": "Let me inspect the task."}}),
+            serde_json::json!({"type": "tool_use", "name": "Read", "input": {"file_path": "src/core.rs"}}),
+            serde_json::json!({"type": "assistant", "message": {"content": "I found the relevant code."}}),
+            serde_json::json!({"type": "assistant", "message": {"content": response.to_string()}}),
+        ]);
+
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerPoll::Done(PlannerResponse::Plan { ref tasks })
+                if tasks.len() == 2 && tasks[1].prerequisites == ["core"]
+        ));
+        assert_eq!(slot.response_text, response.to_string());
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_planner_narration_only_is_a_provider_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = claude_stream(&[serde_json::json!({
+            "type": "assistant",
+            "message": {"content": "Let me inspect the task."}
+        })]);
+
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        assert!(matches!(
+            poll_to_terminal(&mut slot).await,
+            PlannerPoll::ProviderFailed(_)
+        ));
+        assert!(matches!(
+            parse_response(&slot.response_text),
+            Err(PlannerParseError::Provider(_))
+        ));
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_planner_rejects_an_oversized_final_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = claude_stream(&[serde_json::json!({
+            "type": "assistant",
+            "message": {"content": "x".repeat(MAX_RESPONSE_BYTES + 1)}
+        })]);
+
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        assert!(matches!(
+            poll_to_terminal(&mut slot).await,
+            PlannerPoll::ProviderFailed(ref message) if message.contains("response exceeded")
         ));
         slot.kill_and_reap().await;
     }
