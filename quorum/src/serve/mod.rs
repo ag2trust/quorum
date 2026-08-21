@@ -4375,6 +4375,10 @@ struct DecompositionCoordinator {
     proposal: Option<Vec<planner::ProposedTask>>,
     planner_slot: Option<planner::PlannerSlot>,
     classifier_slot: Option<classifier::ClassifierSlot>,
+    /// Live Arbiter plan-review slot. The Arbiter gates a structurally valid
+    /// proposal (state `validating`) before it advances to `preclassifying`;
+    /// it is mutually exclusive with the planner and classifier slots.
+    arbiter_slot: Option<arbiter::ArbiterSlot>,
     planner_view: Option<tempfile::TempDir>,
     writable_path_resolver: planner::WritablePathResolver,
 }
@@ -5147,8 +5151,9 @@ async fn discard_removed_decomposition(
     db_path: &Path,
     coordinator: &mut DecompositionCoordinator,
 ) -> Result<()> {
-    let had_live_provider =
-        coordinator.planner_slot.is_some() || coordinator.classifier_slot.is_some();
+    let had_live_provider = coordinator.planner_slot.is_some()
+        || coordinator.classifier_slot.is_some()
+        || coordinator.arbiter_slot.is_some();
     let graph_id = coordinator.graph_id;
     if had_live_provider && graph_id.is_none() {
         return Err(QuorumError::Io(
@@ -5156,6 +5161,9 @@ async fn discard_removed_decomposition(
         ));
     }
     if let Some(slot) = coordinator.planner_slot.take() {
+        slot.kill_and_reap().await;
+    }
+    if let Some(slot) = coordinator.arbiter_slot.take() {
         slot.kill_and_reap().await;
     }
     reap_decomposition_classifier_with_usage(db_path, coordinator).await;
@@ -5166,6 +5174,7 @@ async fn discard_removed_decomposition(
         // killed a slot but lost the DB write, the retained graph identity lets
         // this tick finish settlement without an in-memory slot.
         delete_decomposition_process_at(db_path, graph_id, "planner").await?;
+        delete_decomposition_process_at(db_path, graph_id, "arbiter").await?;
         delete_decomposition_process_at(db_path, graph_id, "classifier").await?;
     }
     Ok(())
@@ -5384,6 +5393,249 @@ async fn reject_decomposition_proposal(
     Ok(())
 }
 
+/// Cap on the number of blocking findings folded into a rework summary. Keeps
+/// the intermediate bounded before the durable summary truncation.
+const MAX_ARBITER_FINDINGS_IN_SUMMARY: usize = 8;
+
+/// Fold the Arbiter's blocking findings into one bounded rework summary the
+/// planner re-proposes against. Only blocking findings drive a rework round, so
+/// advisory findings are dropped here; the durable write path truncates the
+/// result to the decomposition attempt summary bound.
+fn summarize_arbiter_findings(findings: &[arbiter::ArbiterFinding]) -> String {
+    let blocking: Vec<serde_json::Value> = findings
+        .iter()
+        .filter(|finding| finding.blocking)
+        .take(MAX_ARBITER_FINDINGS_IN_SUMMARY)
+        .map(|finding| {
+            serde_json::json!({
+                "child_key": finding.child_key,
+                "summary": finding.summary,
+            })
+        })
+        .collect();
+    serde_json::json!({ "arbiter_changes": blocking }).to_string()
+}
+
+/// Advance a freeze-owning aggregate from `validating` to `preclassifying`
+/// after the Arbiter approves. The transition is guarded on `state='validating'`
+/// so a restart that re-polls a fresh Arbiter, or a concurrent block/cancel,
+/// cannot double-advance (invariant #3: a zero-row bind is a clean no-op).
+async fn advance_validating_to_preclassifying(
+    config: &ServeConfig,
+    graph_id: i64,
+) -> Result<bool> {
+    let path = config.db_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::decomposition::set_frozen_phase(
+            &mut conn,
+            graph_id,
+            "validating",
+            "preclassifying",
+            None,
+            now_unix(),
+        )
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("arbiter approve phase join: {error}")))?
+}
+
+/// Map one terminal Arbiter outcome onto the decomposition lifecycle. The daemon
+/// alone transitions state here; the verdict never mutates state itself
+/// (invariant #11). Returns `true` when the durable accepted proposal advanced
+/// toward materialization (Approve), so the caller retains it for the classifier
+/// stage; every other outcome returns `false` and the proposal is discarded.
+///
+/// - `Approve` (or a `Changes` verdict with no blocking finding) advances
+///   `validating` -> `preclassifying`; the unchanged classifier/materialize path
+///   then creates children.
+/// - `Changes` with a blocking finding records a `proposal` attempt coded
+///   `arbiter-changes` and returns the graph to planning (or fails the source at
+///   the 3rd attempt) so the planner re-proposes against the findings.
+/// - `RejectSource` records a `blocker` attempt coded `arbiter-reject-source`,
+///   holding the graph and failing the source for a required decision.
+/// - A provider/protocol failure or malformed verdict records a `provider`
+///   attempt coded `arbiter-provider` (fail closed; never a silent approve).
+async fn apply_arbiter_verdict(
+    config: &ServeConfig,
+    graph_id: i64,
+    outcome: arbiter::ArbiterPoll,
+) -> Result<bool> {
+    match outcome {
+        arbiter::ArbiterPoll::ProviderFailed(summary) => {
+            record_decomposition_attempt(config, graph_id, "provider", "arbiter-provider", &summary)
+                .await?;
+            Ok(false)
+        }
+        arbiter::ArbiterPoll::Done(arbiter::ArbiterVerdict::Approve) => {
+            advance_validating_to_preclassifying(config, graph_id).await
+        }
+        arbiter::ArbiterPoll::Done(arbiter::ArbiterVerdict::Changes { findings }) => {
+            if arbiter::has_blocking(&findings) {
+                let summary = summarize_arbiter_findings(&findings);
+                reject_decomposition_proposal(
+                    config,
+                    graph_id,
+                    "validating",
+                    "arbiter-changes",
+                    &summary,
+                )
+                .await?;
+                Ok(false)
+            } else {
+                // No blocking finding: nothing bars materialization, so the
+                // advisory-only verdict is treated as an approval.
+                advance_validating_to_preclassifying(config, graph_id).await
+            }
+        }
+        arbiter::ArbiterPoll::Done(arbiter::ArbiterVerdict::RejectSource {
+            reason,
+            required_decision,
+        }) => {
+            let summary = serde_json::json!({
+                "reason": reason,
+                "required_decision": required_decision,
+            })
+            .to_string();
+            record_decomposition_attempt(
+                config,
+                graph_id,
+                "blocker",
+                "arbiter-reject-source",
+                &summary,
+            )
+            .await?;
+            Ok(false)
+        }
+    }
+}
+
+/// A compact, bounded digest of the proposal's shape the daemon hands the
+/// Arbiter alongside the raw proposal JSON. `build_arbiter_prompt` truncates it
+/// to the per-field text budget, so an unusually large plan stays bounded.
+fn arbiter_structural_summary(proposal: &[planner::ProposedTask]) -> String {
+    let mut edges = Vec::new();
+    for task in proposal {
+        for prerequisite in &task.prerequisites {
+            edges.push(format!("{}<-{}", task.key, prerequisite));
+        }
+    }
+    format!(
+        "structural pre-filter passed: {} tasks; keys=[{}]; dependencies=[{}]",
+        proposal.len(),
+        proposal
+            .iter()
+            .map(|task| task.key.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        edges.join(","),
+    )
+}
+
+/// Spawn the single-shot Arbiter plan reviewer for a structurally valid
+/// proposal. The Arbiter runs in a frozen repository view (the same mechanism
+/// the planner uses) so its read-only inspection matches the plan's base. Its
+/// verdict is consumed by the arbiter-poll block on a later tick. A frozen-view
+/// or spawn failure records a bounded `provider` attempt, never a silent
+/// approval.
+async fn spawn_arbiter_review(
+    config: &ServeConfig,
+    coordinator: &mut DecompositionCoordinator,
+    snapshot: &PlanningSnapshot,
+) -> Result<()> {
+    let proposal = coordinator.proposal.as_ref().ok_or_else(|| {
+        QuorumError::Io("validating decomposition lacks its durable accepted proposal".into())
+    })?;
+    let proposal_json = serde_json::to_string(proposal).map_err(|error| {
+        QuorumError::Io(format!("arbiter proposal serialization failed: {error}"))
+    })?;
+    let structural_summary = arbiter_structural_summary(proposal);
+    let source = planner::PlanningSource {
+        task_id: snapshot.source_task_id,
+        revision: snapshot.source_revision,
+        title: &snapshot.title,
+        body: snapshot.body.as_deref(),
+        dependencies: &snapshot.dependencies,
+    };
+    let prompt = arbiter::build_arbiter_prompt(&source, &proposal_json, &structural_summary);
+
+    let assignment = assign_role(
+        config,
+        quorum_core::role_assignments::AssignmentRequest {
+            responsibility_key: format!(
+                "arbiter:graph:{}:source:{}:revision:{}:plan-revision:{}",
+                snapshot.graph_id,
+                snapshot.source_task_id,
+                snapshot.source_revision,
+                snapshot.plan_revision
+            ),
+            task_id: Some(snapshot.source_task_id),
+            pr_number: None,
+            role: "arbiter".into(),
+            review_stage: None,
+            complexity: None,
+        },
+        None,
+    )?;
+    let arbiter_kind = resolve_provider(&assignment.model)?;
+    let view = match frozen_planner_view(&config.repo_dir, &snapshot.frozen_base_sha).await {
+        Ok(view) => view,
+        Err(error) => {
+            record_decomposition_attempt(
+                config,
+                snapshot.graph_id,
+                "provider",
+                "arbiter-frozen-view",
+                &error.to_string(),
+            )
+            .await?;
+            coordinator.proposal = None;
+            return Ok(());
+        }
+    };
+    match arbiter::spawn_arbiter(
+        arbiter_kind,
+        &assignment.model,
+        &assignment.effort,
+        view.path(),
+        &prompt,
+        config.bare_agent,
+        agent_bin_for_kind(config, arbiter_kind),
+    )
+    .await
+    {
+        Ok(slot) => {
+            if let Err(error) = journal_decomposition_process(
+                config,
+                snapshot.graph_id,
+                snapshot.source_task_id,
+                "arbiter",
+                slot.pid(),
+                Some(view.path()),
+            )
+            .await
+            {
+                slot.kill_and_reap().await;
+                return Err(error);
+            }
+            coordinator.planner_view = Some(view);
+            coordinator.arbiter_slot = Some(slot);
+        }
+        Err(error) => {
+            record_decomposition_attempt(
+                config,
+                snapshot.graph_id,
+                "provider",
+                "arbiter-spawn",
+                &error.to_string(),
+            )
+            .await?;
+            coordinator.proposal = None;
+        }
+    }
+    Ok(())
+}
+
 fn proposed_classifier_tasks(
     tasks: &[planner::ProposedTask],
 ) -> Vec<quorum_core::classify::TaskForClassification> {
@@ -5558,6 +5810,34 @@ async fn tick_decomposition(
                         coordinator.proposal = Some(tasks);
                     }
                 }
+            }
+        }
+    }
+
+    // Consume the Arbiter plan-review verdict. Like the planner slot, the
+    // provider process is killed and reaped before any durable lifecycle
+    // decision; the verdict alone never mutates state (invariant #11). The
+    // durable decision is keyed on the graph's current proposal: an Approve
+    // advances `validating` -> `preclassifying` exactly once, so a restart
+    // that re-polls a fresh Arbiter cannot double-materialize.
+    if let Some(slot) = coordinator.arbiter_slot.as_mut() {
+        if let Some(outcome) = arbiter::poll_arbiter(slot).await {
+            let slot = coordinator
+                .arbiter_slot
+                .take()
+                .expect("arbiter slot exists");
+            slot.kill_and_reap().await;
+            coordinator.planner_view = None;
+            let graph_id = coordinator
+                .graph_id
+                .ok_or_else(|| QuorumError::Io("arbiter lost graph identity".into()))?;
+            delete_decomposition_process(config, graph_id, "arbiter").await?;
+            let advanced = apply_arbiter_verdict(config, graph_id, outcome).await?;
+            // Only an Approve keeps the durable accepted proposal in play for
+            // the downstream classifier stage; every other verdict returns the
+            // graph to planning/backoff/hold, so drop the in-memory proposal.
+            if !advanced {
+                coordinator.proposal = None;
             }
         }
     }
@@ -5932,7 +6212,7 @@ async fn tick_decomposition(
                 .await?
             }
         }
-    } else if snapshot.state == "validating" {
+    } else if snapshot.state == "validating" && coordinator.arbiter_slot.is_none() {
         let Some(proposal) = coordinator.proposal.as_ref() else {
             return Err(QuorumError::Io(
                 "validating decomposition lacks its durable accepted proposal".into(),
@@ -5957,25 +6237,12 @@ async fn tick_decomposition(
                 .await?;
                 coordinator.proposal = None;
             }
+            // Structural pre-filter passed. Do not advance to preclassifying
+            // yet: spawn the Arbiter plan-review gate. Its verdict (consumed by
+            // the arbiter-poll block above on a later tick) decides whether the
+            // proposal materializes, re-plans, or holds the source.
             Ok(()) => {
-                let path = config.db_path.clone();
-                let graph_id = snapshot.graph_id;
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut conn = quorum_core::db::open(&path)?;
-                    quorum_core::decomposition::set_frozen_phase(
-                        &mut conn,
-                        graph_id,
-                        "validating",
-                        "preclassifying",
-                        None,
-                        now_unix(),
-                    )?;
-                    Ok(())
-                })
-                .await
-                .map_err(|error| {
-                    QuorumError::Io(format!("preclassification phase join: {error}"))
-                })??;
+                spawn_arbiter_review(config, coordinator, &snapshot).await?;
             }
         }
     } else if snapshot.state == "preclassifying" && coordinator.classifier_slot.is_none() {
@@ -8061,6 +8328,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if let Some(slot) = decomposition_coordinator.planner_slot.take() {
                 slot.kill_and_reap().await;
             }
+            if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
+                slot.kill_and_reap().await;
+            }
             reap_decomposition_classifier_with_usage(
                 &config.db_path,
                 &mut decomposition_coordinator,
@@ -8090,6 +8360,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 reap_classifier_with_usage(&config.db_path, slot, None).await;
             }
             if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                slot.kill_and_reap().await;
+            }
+            if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
                 slot.kill_and_reap().await;
             }
             reap_decomposition_classifier_with_usage(
@@ -8123,6 +8396,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
                 if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                    slot.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
                     slot.kill_and_reap().await;
                 }
                 reap_decomposition_classifier_with_usage(
@@ -8211,6 +8487,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 if let Some(slot) = decomposition_coordinator.planner_slot.take() {
                     slot.kill_and_reap().await;
                 }
+                if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
+                    slot.kill_and_reap().await;
+                }
                 reap_decomposition_classifier_with_usage(
                     &config.db_path,
                     &mut decomposition_coordinator,
@@ -8232,6 +8511,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
                 if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                    slot.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
                     slot.kill_and_reap().await;
                 }
                 reap_decomposition_classifier_with_usage(
@@ -8346,6 +8628,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                         reap_classifier_with_usage(&config.db_path, slot, None).await;
                     }
                     if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                        slot.kill_and_reap().await;
+                    }
+                    if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
                         slot.kill_and_reap().await;
                     }
                     reap_decomposition_classifier_with_usage(
