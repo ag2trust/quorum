@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}, TextDecoder};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, navigableRuns, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskRoute, journeyModel, taskDetailModel, attachRunDirs, navigableRuns, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -122,9 +122,74 @@ assert.equal(detail.rawMode, false);
 assert.equal(detail.renderedChars, 0);
 assert.equal(Object.keys(detail.tailState).length, 0);
 
+// Task links use a browser route and load their durable detail from `/api/tasks/:id`.
+// A reload therefore keeps the task selection instead of exposing the raw JSON endpoint.
+assert.equal(taskRoute('#task-42'), '42');
+assert.equal(taskRoute('#task-0042'), null);
+assert.equal(taskRoute('#run-worker-42'), null);
+
+const adaptive = journeyModel({
+  milestones: [
+    {stage: 'Implementation', role: 'Worker', state: 'completed', activity: 'Submitted'},
+    {stage: 'First review', role: 'R1', state: 'completed', activity: 'Changes requested'},
+    {stage: 'Implementation', role: 'Worker', state: 'current', activity: 'Remediating'},
+    {stage: 'Final review', role: 'R2', state: 'future'},
+  ],
+  history: [{stage: 'Plan review', role: 'Arbiter', state: 'completed', activity: 'Changes requested'}],
+  stage: {label: 'Implementation', role: 'Worker', activity: 'Remediating'},
+  condition: 'Waiting for dependency #9',
+  next_action: {label: 'Possible next', action: 'The worker may submit work for review'},
+  attempts: {proposal_attempts: 2, arbiter_rounds: 1},
+});
+assert.deepEqual(adaptive.milestones.map(milestone => milestone.state), ['completed', 'completed', 'current', 'future']);
+assert.equal(adaptive.history[0].stage, 'Plan review');
+assert.equal(adaptive.history[0].role, 'Arbiter');
+assert.equal(adaptive.next.label, 'Possible next');
+assert.equal(adaptive.condition, 'Waiting for dependency #9');
+
+// Terminal projections retain the preceding completed milestones instead of reducing
+// failed/cancelled work to a single badge.
+const terminal = journeyModel({milestones: [
+  {stage: 'Implementation', role: 'Worker', state: 'completed', activity: 'Submitted'},
+  {stage: 'Final review', role: 'R2', state: 'completed', activity: 'Approved'},
+  {stage: 'Failed', state: 'terminal', activity: 'Task failed before completion'},
+]});
+assert.equal(terminal.milestones[0].state, 'completed');
+assert.equal(terminal.milestones.at(-1).state, 'terminal');
+
+// Detail data has browser-side caps as well as the API's SQL and serialization bounds.
+const taskDetail = taskDetailModel({
+  task: {id: 42, title: '<img src=x onerror=alert(1)>', body: 'x'.repeat(MAX_DETAIL_TEXT_CHARS + 10), labels: Array.from({length: MAX_DETAIL_ITEMS + 4}, (_, index) => `label-${index}`), dependencies: Array.from({length: MAX_DETAIL_ITEMS + 4}, (_, index) => index + 1)},
+  progress: {milestones: Array.from({length: MAX_DETAIL_HISTORY_ITEMS + 4}, () => ({stage: 'Queued', state: 'future'}))},
+  timeline: Array.from({length: MAX_DETAIL_ITEMS + 4}, () => ({body: 'event'})),
+  notes: Array.from({length: MAX_DETAIL_ITEMS + 4}, () => ({body: 'note'})),
+  runs: Array.from({length: MAX_DETAIL_ITEMS + 4}, () => ({id: 1})),
+});
+assert.equal(taskDetail.task.title, '<img src=x onerror=alert(1)>');
+assert.equal(taskDetail.task.body.length, MAX_DETAIL_TEXT_CHARS + 10);
+assert.equal(taskDetail.task.labels.length, MAX_DETAIL_ITEMS);
+assert.equal(taskDetail.dependencies.length, MAX_DETAIL_ITEMS);
+assert.equal(taskDetail.timeline.length, MAX_DETAIL_ITEMS);
+assert.equal(taskDetail.notes.length, MAX_DETAIL_ITEMS);
+assert.equal(taskDetail.runs.length, MAX_DETAIL_ITEMS);
+assert.equal(taskDetail.journey.milestones.length, MAX_DETAIL_HISTORY_ITEMS);
+assert.equal(boundedText('x'.repeat(MAX_DETAIL_TEXT_CHARS + 1)).length, MAX_DETAIL_TEXT_CHARS);
+
+// Run summaries only acquire a tail link when they exactly match a bounded session-log
+// record. Database run ids/agent names alone must never form a guessed stream path.
+const linkedRuns = attachRunDirs(
+  [{id: 5, agent: 'A-5', spawned_at: 100}, {id: 6, agent: 'A-5', spawned_at: 101}],
+  [{dir: 'A-5-100', meta: {task_id: 42, agent: 'A-5', start_time: 100}}, {dir: 'other-101', meta: {task_id: 43, agent: 'A-5', start_time: 101}}],
+  42,
+);
+assert.equal(linkedRuns[0].dir, 'A-5-100');
+assert.equal(linkedRuns[1].dir, null);
+
 assert.equal(liveAgentTitle({name: 'A-100', task_id: 42}), 'A-100 · Task #42 · Live tail');
 assert.equal(liveAgentTitle({name: 'A-100', task_id: null}), 'A-100 · Live tail');
 assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="liveAgentTable"/);
+assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="taskList"/);
+assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="taskJourney"/);
 
 // The initial dashboard promotes only task health, active work, attention, pipeline, and
 // the server's ready/claimable projection. A stale recent-task list must not replace queue_bands.ready.
