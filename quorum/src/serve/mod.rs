@@ -3249,7 +3249,7 @@ pub struct ServeConfig {
     pub limits: CostLimits,
     /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
     pub log_dir: Option<PathBuf>,
-    /// When true, the daemon drains and exits 75 when its own repo's base branch advances.
+    /// When true, the daemon drains and exits 75 when its own repo's self-update branch advances.
     pub self_update_drain: bool,
     /// Seconds to wait for in-flight agents during drain before SIGTERM.
     pub drain_timeout_secs: u64,
@@ -3264,9 +3264,12 @@ pub struct ServeConfig {
     /// The repo this daemon manages (e.g. "ag2trust/quorum"). Set via `--repo`.
     /// Injected as `QUORUM_REPO` into spawned workers/reviewers.
     pub repo: String,
-    /// Base branch name (e.g. "main" or "master") for sha-polling, worktree
-    /// provisioning, and merge targeting.
+    /// Base branch name (e.g. "main" or "master") for worktree provisioning
+    /// and merge targeting.
     pub base_branch: String,
+    /// Branch to poll for daemon build staleness. This does not affect task
+    /// worktrees, PR targeting, or merge behavior.
+    pub self_update_branch: String,
     /// When set, serve polls for this file's existence every tick and initiates
     /// shutdown when it disappears (#201: test fixture self-termination).
     pub exit_when_gone: Option<PathBuf>,
@@ -4262,11 +4265,11 @@ fn build_staleness_decision(build_sha: &str, remote_sha: &str) -> BuildStaleness
     }
 }
 
-/// Snapshot the sha of origin's base branch via a bounded `git ls-remote`.
+/// Snapshot the sha of an origin branch via a bounded `git ls-remote`.
 /// This runs outside DB work; inability to reach origin is an operational
 /// warning, not a daemon failure.
-fn poll_origin_base_sha(repo_dir: &std::path::Path, base_branch: &str) -> Result<String> {
-    let refspec = format!("refs/heads/{}", base_branch);
+fn poll_origin_branch_sha(repo_dir: &std::path::Path, branch: &str) -> Result<String> {
+    let refspec = format!("refs/heads/{}", branch);
     let mut child = std::process::Command::new("git")
         .args(["ls-remote", "origin", &refspec])
         .current_dir(repo_dir)
@@ -8918,8 +8921,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         {
             drain_state.last_sha_poll = Some(std::time::Instant::now());
             let repo_dir = config.repo_dir.clone();
-            let base_branch = config.base_branch.clone();
-            match tokio::task::spawn_blocking(move || poll_origin_base_sha(&repo_dir, &base_branch))
+            let self_update_branch = config.self_update_branch.clone();
+            match tokio::task::spawn_blocking(move || {
+                poll_origin_branch_sha(&repo_dir, &self_update_branch)
+            })
                 .await
             {
                 Ok(Ok(remote_sha)) => match running_build_sha(
@@ -8934,7 +8939,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                         if decision == BuildStalenessDecision::Behind {
                             log(&format!(
                                 "DRAIN: origin/{} is ahead of running build ({} -> {})",
-                                config.base_branch, build_sha, remote_sha
+                                config.self_update_branch, build_sha, remote_sha
                             ));
                             drain_request = Some(DrainRequest::self_update(remote_sha));
                         }
@@ -21243,6 +21248,7 @@ mod tests {
             merge_checks_poll_secs: 1,
             repo: "owner/repo".into(),
             base_branch: "main".into(),
+            self_update_branch: "main".into(),
             exit_when_gone: None,
             required_jobs: Vec::new(),
             master_ci_gate: false,
@@ -25523,6 +25529,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             merge_checks_poll_secs: 1,
             repo: "owner/repo".into(),
             base_branch: "main".into(),
+            self_update_branch: "main".into(),
             exit_when_gone: None,
             required_jobs: Vec::new(),
             master_ci_gate: false,
@@ -27712,7 +27719,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     #[test]
     fn origin_poll_failure_is_nonfatal_result() {
         let repo = tempfile::tempdir().unwrap();
-        assert!(poll_origin_base_sha(repo.path(), "main").is_err());
+        assert!(poll_origin_branch_sha(repo.path(), "main").is_err());
     }
 
     #[test]

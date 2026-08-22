@@ -28,6 +28,9 @@ make_stub_quorum() {
 #!/bin/sh
 # Reads exit codes from $QUORUM_TEST_SEQ, one per invocation
 if [ ! -f "$QUORUM_TEST_SEQ" ]; then exit 1; fi
+if [ -n "${QUORUM_TEST_ARGS:-}" ]; then
+  printf '%s\n' "$*" >> "$QUORUM_TEST_ARGS"
+fi
 code=$(head -1 "$QUORUM_TEST_SEQ")
 rest=$(tail -n +2 "$QUORUM_TEST_SEQ")
 printf '%s\n' "$rest" > "$QUORUM_TEST_SEQ"
@@ -73,17 +76,19 @@ DEVSTUB
   make_stub_quorum "$stub_bin"
 
   out_file="$TMPDIR_TEST/out_$$"
+  args_file="$TMPDIR_TEST/args_$$"
   CAPTURED_EXIT=0
 
   QUORUM_REPO_DIR="$repo_dir" \
   QUORUM_SERVE_BIN="$stub_bin" \
   QUORUM_TEST_SEQ="$seq_file" \
+  QUORUM_TEST_ARGS="$args_file" \
   "$@" \
   "$SUPERVISOR" > "$out_file" 2>&1 || CAPTURED_EXIT=$?
 
   CAPTURED_OUTPUT=$(cat "$out_file")
 
-  rm -rf "$repo_dir" "$seq_file" "$out_file"
+  rm -rf "$repo_dir" "$seq_file" "$out_file" "$args_file"
 }
 
 # === Tests ===
@@ -284,8 +289,8 @@ fi
 
 rm -rf "$repo_dir" "$seq_file" "$out_file" "$child_pid_file" "$long_stub"
 
-# --- Test 9: fast-forward merge is applied after exit 75 ---
-printf '\ntest 9: fast-forward merge applied on self-update\n'
+# --- Test 9: self-update branch controls fast-forward and daemon polling ---
+printf '\ntest 9: self-update branch controls fast-forward and daemon polling\n'
 
 repo_dir="$TMPDIR_TEST/repo_t10"
 mkdir -p "$repo_dir"
@@ -298,11 +303,12 @@ git clone --bare -q "$repo_dir" "$bare_dir" 2>/dev/null
 git -C "$repo_dir" remote add origin "$bare_dir" 2>/dev/null || true
 git -C "$repo_dir" fetch origin main -q 2>/dev/null
 
-git -C "$repo_dir" checkout -b tmp-ff -q 2>/dev/null
+git -C "$repo_dir" checkout -b self-update -q 2>/dev/null
 git -C "$repo_dir" commit --allow-empty -m "advance" -q
-git -C "$repo_dir" push origin tmp-ff:main -q 2>/dev/null
+git -C "$repo_dir" push origin self-update -q 2>/dev/null
 git -C "$repo_dir" checkout main -q 2>/dev/null
 pre_sha=$(git -C "$repo_dir" rev-parse HEAD)
+expected_sha=$(git -C "$repo_dir" rev-parse origin/self-update)
 
 seq_file="$TMPDIR_TEST/seq_t10"
 printf '75\n0\n' > "$seq_file"
@@ -321,22 +327,80 @@ CAPTURED_EXIT=0
 QUORUM_REPO_DIR="$repo_dir" \
 QUORUM_SERVE_BIN="$stub_bin" \
 QUORUM_TEST_SEQ="$seq_file" \
+QUORUM_TEST_ARGS="$TMPDIR_TEST/args_t10" \
+QUORUM_SELF_UPDATE_BRANCH=self-update \
+QUORUM_BASE_BRANCH=ignored-legacy \
 "$SUPERVISOR" > "$out_file" 2>&1 || CAPTURED_EXIT=$?
 
 CAPTURED_OUTPUT=$(cat "$out_file")
 post_sha=$(git -C "$repo_dir" rev-parse HEAD)
 
-if [ "$pre_sha" != "$post_sha" ]; then pass "HEAD advanced after fast-forward merge"
-else fail "HEAD advanced after fast-forward merge (SHA unchanged)"; fi
+if [ "$pre_sha" != "$post_sha" ] && [ "$post_sha" = "$expected_sha" ]; then pass "self-update branch fast-forwarded"
+else fail "self-update branch fast-forwarded (got $post_sha)"; fi
+
+if grep -qx 'serve --self-update-branch self-update' "$TMPDIR_TEST/args_t10"; then
+  pass "daemon staleness branch matches self-update branch"
+else fail "daemon staleness branch matches self-update branch"; fi
 
 if printf '%s' "$CAPTURED_OUTPUT" | grep -q "rebuild OK"; then
   pass "rebuild succeeded after fast-forward"
 else fail "rebuild succeeded after fast-forward"; fi
 
-rm -rf "$repo_dir" "$bare_dir" "$seq_file" "$out_file"
+rm -rf "$repo_dir" "$bare_dir" "$seq_file" "$out_file" "$TMPDIR_TEST/args_t10"
 
-# --- Test 10: fast-forward merge failure alerts and relaunches old binary ---
-printf '\ntest 10: fast-forward merge failure alerts and continues\n'
+# --- Test 10: QUORUM_BASE_BRANCH remains the legacy self-update fallback ---
+printf '\ntest 10: legacy base-branch override selects self-update branch\n'
+
+repo_dir="$TMPDIR_TEST/repo_t10"
+mkdir -p "$repo_dir"
+git -C "$repo_dir" init -q
+git -C "$repo_dir" commit --allow-empty -m "init" -q
+git -C "$repo_dir" branch -M main
+
+bare_dir="$TMPDIR_TEST/bare_t10"
+git clone --bare -q "$repo_dir" "$bare_dir" 2>/dev/null
+git -C "$repo_dir" remote add origin "$bare_dir" 2>/dev/null || true
+git -C "$repo_dir" fetch origin main -q 2>/dev/null
+
+git -C "$repo_dir" checkout -b legacy-base -q 2>/dev/null
+git -C "$repo_dir" commit --allow-empty -m "legacy advance" -q
+git -C "$repo_dir" push origin legacy-base -q 2>/dev/null
+git -C "$repo_dir" checkout main -q 2>/dev/null
+expected_sha=$(git -C "$repo_dir" rev-parse origin/legacy-base)
+
+seq_file="$TMPDIR_TEST/seq_t10"
+printf '75\n0\n' > "$seq_file"
+
+cat > "$repo_dir/dev-install.sh" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+chmod +x "$repo_dir/dev-install.sh"
+
+stub_bin="$TMPDIR_TEST/stub-quorum"
+make_stub_quorum "$stub_bin"
+
+out_file="$TMPDIR_TEST/out_t10"
+CAPTURED_EXIT=0
+QUORUM_REPO_DIR="$repo_dir" \
+QUORUM_SERVE_BIN="$stub_bin" \
+QUORUM_TEST_SEQ="$seq_file" \
+QUORUM_TEST_ARGS="$TMPDIR_TEST/args_t10" \
+QUORUM_BASE_BRANCH=legacy-base \
+"$SUPERVISOR" > "$out_file" 2>&1 || CAPTURED_EXIT=$?
+
+post_sha=$(git -C "$repo_dir" rev-parse HEAD)
+if [ "$CAPTURED_EXIT" -eq 0 ] && [ "$post_sha" = "$expected_sha" ]; then pass "legacy base branch fast-forwarded"
+else fail "legacy base branch fast-forwarded"; fi
+
+if grep -qx 'serve --self-update-branch legacy-base' "$TMPDIR_TEST/args_t10"; then
+  pass "legacy branch also configures daemon staleness"
+else fail "legacy branch also configures daemon staleness"; fi
+
+rm -rf "$repo_dir" "$bare_dir" "$seq_file" "$out_file" "$TMPDIR_TEST/args_t10"
+
+# --- Test 11: fast-forward merge failure alerts and relaunches old binary ---
+printf '\ntest 11: fast-forward merge failure alerts and continues\n'
 
 repo_dir="$TMPDIR_TEST/repo_t10b"
 mkdir -p "$repo_dir"

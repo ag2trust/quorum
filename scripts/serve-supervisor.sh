@@ -2,7 +2,7 @@
 # serve-supervisor.sh — rebuild-verify-relaunch wrapper for quorum serve.
 #
 # Runs `quorum serve "$@"` in a loop. On the self-update handoff code 75:
-#   1. git fetch origin $QUORUM_BASE_BRANCH (default: main)
+#   1. git fetch origin $SELF_UPDATE_BRANCH (default: QUORUM_BASE_BRANCH, then main)
 #   2. git merge --ff-only to advance the working tree
 #   3. ./dev-install.sh (build + verify), with a 300s timeout
 #   4. On success: relaunch new binary
@@ -22,7 +22,9 @@
 # Env overrides:
 #   QUORUM_REPO_DIR          repo to fetch from (default: script's own repo root)
 #   QUORUM_SERVE_BIN         binary to run (default: quorum, found via PATH)
-#   QUORUM_BASE_BRANCH       branch to fetch on rebuild (default: main)
+#   QUORUM_SELF_UPDATE_BRANCH branch to fetch/rebuild and pass to daemon staleness checks
+#                              (default: QUORUM_BASE_BRANCH, then main)
+#   QUORUM_BASE_BRANCH       legacy fallback for QUORUM_SELF_UPDATE_BRANCH
 #   QUORUM_THRASH_MAX        max restarts per hour (default: 6)
 #   QUORUM_THRASH_WINDOW     thrash window in seconds (default: 3600)
 #   QUORUM_BUILD_TIMEOUT     timeout for dev-install.sh in seconds (default: 300)
@@ -31,7 +33,7 @@ set -u
 
 REPO_DIR="${QUORUM_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 SERVE_BIN="${QUORUM_SERVE_BIN:-quorum}"
-BASE_BRANCH="${QUORUM_BASE_BRANCH:-main}"
+SELF_UPDATE_BRANCH="${QUORUM_SELF_UPDATE_BRANCH:-${QUORUM_BASE_BRANCH:-main}}"
 THRASH_MAX="${QUORUM_THRASH_MAX:-6}"
 THRASH_WINDOW="${QUORUM_THRASH_WINDOW:-3600}"
 BUILD_TIMEOUT="${QUORUM_BUILD_TIMEOUT:-300}"
@@ -92,7 +94,10 @@ thrash_check() {
 }
 
 while true; do
-  "$SERVE_BIN" serve "$@" &
+  # The daemon polls its configured self-update branch for build staleness.
+  # Supplying this resolved branch keeps that poll aligned with this wrapper's
+  # rebuild branch, including when callers also supplied an earlier flag.
+  "$SERVE_BIN" serve "$@" --self-update-branch "$SELF_UPDATE_BRANCH" &
   child=$!
   code=0
   wait "$child" || code=$?
@@ -106,9 +111,9 @@ while true; do
       fi
 
       printf 'SUPERVISOR: exit %s — self-update drain handoff; fetching and rebuilding\n' "$SELF_UPDATE_EXIT_CODE" >&2
-      git -C "$REPO_DIR" fetch origin "$BASE_BRANCH" 2>&1
+      git -C "$REPO_DIR" fetch origin "$SELF_UPDATE_BRANCH" 2>&1
 
-      if ! git -C "$REPO_DIR" merge --ff-only origin/"$BASE_BRANCH" 2>&1; then
+      if ! git -C "$REPO_DIR" merge --ff-only origin/"$SELF_UPDATE_BRANCH" 2>&1; then
         alert "fast-forward merge failed (dirty tree?) — relaunching OLD binary"
         continue
       fi
