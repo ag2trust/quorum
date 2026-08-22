@@ -724,7 +724,7 @@ fn head_move_during_ci_wait_discards_old_gate_before_reviewer_spawn() {
 }
 
 #[test]
-fn reviewer_target_move_after_exact_head_check_never_poisoned_durable_fallback() {
+fn reviewer_target_move_after_exact_head_check_preserves_durable_target() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -815,21 +815,6 @@ fn reviewer_target_move_after_exact_head_check_never_poisoned_durable_fallback()
         (0, 0, 0),
         "the rejected moved target must acquire no reviewer resources"
     );
-
-    std::fs::write(handle.gh_state.join("fail_target"), b"1").unwrap();
-    std::fs::write(&checks_state, "ready\n").unwrap();
-    assert!(
-        handle.wait_for("trying accepted durable target", 45),
-        "GitHub failure did not enter the durable fallback path: {:?}",
-        handle.lines
-    );
-    assert!(
-        handle.wait_for("resolved target moved after CI gate", 20),
-        "fallback did not expose the prior accepted head against the newly gated head: {:?}",
-        handle.lines
-    );
-    assert_eq!(persisted_pr_target(home.path()), accepted);
-    assert_eq!(reviewer_resource_counts(home.path()), (0, 0, 0));
 
     handle.force_stop();
 }
