@@ -207,6 +207,7 @@ declare_serve_file_config! {
     sha_poll_interval_secs: Option<u64>,
     repo: Option<String>,
     base_branch: Option<String>,
+    self_update_branch: Option<String>,
     merge_checks_timeout_secs: Option<u64>,
     merge_checks_poll_secs: Option<u64>,
     required_jobs: Option<Vec<String>>,
@@ -286,6 +287,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("sha_poll_interval_secs", ConfigKeyDisposition::Runtime),
     ("repo", ConfigKeyDisposition::Runtime),
     ("base_branch", ConfigKeyDisposition::Runtime),
+    ("self_update_branch", ConfigKeyDisposition::Runtime),
     ("merge_checks_timeout_secs", ConfigKeyDisposition::Runtime),
     ("merge_checks_poll_secs", ConfigKeyDisposition::Runtime),
     ("required_jobs", ConfigKeyDisposition::Runtime),
@@ -1137,6 +1139,7 @@ pub struct BannerData<'a> {
     pub repo_dir: &'a Sourced<String>,
     pub worktree_base: &'a Sourced<String>,
     pub base_branch: &'a Sourced<String>,
+    pub self_update_branch: &'a Sourced<String>,
     pub cap: &'a Sourced<usize>,
     pub model_profiles: &'a BTreeMap<String, ModelProfile>,
     pub routing: &'a RoutingPolicy,
@@ -1172,6 +1175,10 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!("  repo_dir:                  {}", d.repo_dir));
     lines.push(format!("  worktree_base:             {}", d.worktree_base));
     lines.push(format!("  base_branch:               {}", d.base_branch));
+    lines.push(format!(
+        "  self_update_branch:        {}",
+        d.self_update_branch
+    ));
     lines.push(format!("  cap:                       {}", d.cap));
     lines.push(format!(
         "  model_profiles:            {}",
@@ -2381,6 +2388,10 @@ worktree_base = "/tmp/wt"
                 source: Source::File,
             },
             base_branch: &Sourced {
+                value: "main".into(),
+                source: Source::Default,
+            },
+            self_update_branch: &Sourced {
                 value: "main".into(),
                 source: Source::Default,
             },

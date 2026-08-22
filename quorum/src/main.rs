@@ -79,6 +79,7 @@ primary = 100
 # no_bare_agent = true   # default: use operator's Claude login (no --bare)
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
 # base_branch = \"main\"
+# self_update_branch = \"main\" # defaults to base_branch; daemon update polling only
 
 ## Grok Build settings for managed worker roles only.
 # [grok]
@@ -1273,6 +1274,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             sha_poll_interval_secs,
             repo,
             base_branch,
+            self_update_branch,
             exit_when_gone,
             doctor_enabled,
         } => {
@@ -1391,6 +1393,19 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 file_cfg.base_branch.as_deref(),
                 "main",
             );
+            let r_self_update_branch = if let Some(branch) = self_update_branch.as_deref() {
+                Sourced {
+                    value: branch.to_string(),
+                    source: Source::Flag,
+                }
+            } else if let Some(branch) = file_cfg.self_update_branch.as_deref() {
+                Sourced {
+                    value: branch.to_string(),
+                    source: Source::File,
+                }
+            } else {
+                r_base_branch.clone()
+            };
             let r_merge_checks_timeout = resolve_val(
                 merge_checks_timeout_secs,
                 file_cfg.merge_checks_timeout_secs,
@@ -1442,6 +1457,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 repo_dir: &r_repo_dir,
                 worktree_base: &r_wt,
                 base_branch: &r_base_branch,
+                self_update_branch: &r_self_update_branch,
                 cap: &r_cap,
                 model_profiles: &model_profiles,
                 routing: &routing,
@@ -1535,6 +1551,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 merge_checks_poll_secs: r_merge_checks_poll.value,
                 repo: r_repo.value,
                 base_branch: r_base_branch.value,
+                self_update_branch: r_self_update_branch.value,
                 exit_when_gone: exit_when_gone.map(std::path::PathBuf::from),
                 required_jobs: r_required_jobs,
                 master_ci_gate: r_master_ci_gate.value,

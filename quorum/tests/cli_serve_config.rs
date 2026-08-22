@@ -138,6 +138,8 @@ repo_dir = "{repo_dir}"
 worktree_base = "{wt_base}"
 cap = 8
 max_turn_wall_secs = 2700
+base_branch = "develop"
+self_update_branch = "main"
 {ROUTING_POLICY}
 "#,
             repo_dir = repo_dir.path().to_string_lossy(),
@@ -211,10 +213,13 @@ max_turn_wall_secs = 2700
         stderr_text.contains("max_idle_secs:             2700 (file)"),
         "deprecated max_turn_wall_secs should resolve as max_idle_secs:\n{stderr_text}"
     );
-    // base_branch defaults
     assert!(
-        stderr_text.contains("main (default)"),
-        "base_branch should show 'main (default)':\n{stderr_text}"
+        stderr_text.contains("base_branch:               develop (file)"),
+        "base_branch should show its file value:\n{stderr_text}"
+    );
+    assert!(
+        stderr_text.contains("self_update_branch:        main (file)"),
+        "self_update_branch should show its independent file value:\n{stderr_text}"
     );
 
     // Clean shutdown
@@ -239,6 +244,21 @@ max_turn_wall_secs = 2700
             }
         }
     }
+}
+
+#[test]
+fn serve_accepts_self_update_branch_flag() {
+    let output = Command::new(cargo_bin())
+        .args(["serve", "--self-update-branch", "main"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument '--self-update-branch'"),
+        "self-update branch flag should parse before configuration validation: {stderr}"
+    );
 }
 
 #[test]
@@ -543,6 +563,7 @@ fn serve_config_default_path_loaded() {
             r#"
 repo_dir = "{repo_dir}"
 worktree_base = "{wt_base}"
+base_branch = "develop"
 {ROUTING_POLICY}
 "#,
             repo_dir = repo_dir.path().to_string_lossy(),
@@ -583,6 +604,14 @@ worktree_base = "{wt_base}"
     assert!(
         stderr_text.contains("model_profiles:            2"),
         "routing policy should come from auto-discovered config:\n{stderr_text}"
+    );
+    assert!(
+        stderr_text.contains("base_branch:               develop (file)"),
+        "base branch should come from auto-discovered config:\n{stderr_text}"
+    );
+    assert!(
+        stderr_text.contains("self_update_branch:        develop (file)"),
+        "self-update branch should inherit the resolved base branch when unset:\n{stderr_text}"
     );
 
     drop(sentinel);
