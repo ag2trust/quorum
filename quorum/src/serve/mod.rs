@@ -21220,7 +21220,16 @@ mod tests {
         assert_eq!(gate, PreReviewChecksGate::Waiting);
         assert!(polled);
         assert_eq!(head_sha, "head-b");
-        tokio::task::yield_now().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while (!old_abort.is_finished()
+            || executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < 2)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert!(
             old_abort.is_finished(),
             "old wait must be aborted for a new head"
@@ -21289,7 +21298,15 @@ mod tests {
         assert!(polled);
         assert_eq!(head_sha, "head-a");
         assert_eq!(waits[&TASK_ID].head_sha, "head-a");
-        tokio::task::yield_now().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while executor
+            .wait_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 1
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert_eq!(
             executor
                 .wait_calls
