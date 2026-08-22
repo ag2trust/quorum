@@ -496,8 +496,9 @@ pub enum Command {
         #[arg(long)]
         log_dir: Option<String>,
         /// Enable self-update drain mode. When the daemon merges a PR for its
-        /// own repo (or detects the base branch advancing via git ls-remote), it drains
-        /// in-flight agents and exits 75 so a supervisor can rebuild and relaunch.
+        /// own repo (or detects the configured self-update branch advancing via git
+        /// ls-remote), it drains in-flight agents and exits 75 so a supervisor can
+        /// rebuild and relaunch.
         #[arg(long)]
         self_update_drain: bool,
         /// Seconds to wait for in-flight agents to finish before force-killing
@@ -516,10 +517,14 @@ pub enum Command {
         /// and sets QUORUM_REPO for all spawned workers/reviewers.
         #[arg(long)]
         repo: Option<String>,
-        /// Base branch name for sha-polling, worktree provisioning, and merge
-        /// targeting. Use "master" for repos whose trunk is master (default: main).
+        /// Task/PR base branch for worktree provisioning, PR publication,
+        /// validation, and merge targeting (default: main).
         #[arg(long)]
         base_branch: Option<String>,
+        /// Branch to poll for daemon self-updates. Defaults to the resolved
+        /// --base-branch value when omitted.
+        #[arg(long)]
+        self_update_branch: Option<String>,
         /// Path to a sentinel file. When set, serve polls for this file's
         /// existence every tick and initiates shutdown when it disappears.
         /// Used by test fixtures to self-terminate when the parent test

@@ -1186,6 +1186,7 @@ mod tests {
             merge_checks_poll_secs: 1,
             repo: "owner/repo".into(),
             base_branch: "main".into(),
+            self_update_branch: "main".into(),
             exit_when_gone: None,
             required_jobs: Vec::new(),
             master_ci_gate: false,
