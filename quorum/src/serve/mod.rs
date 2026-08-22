@@ -16694,6 +16694,10 @@ async fn provision_reviewer_reserved(
         wt_path.display()
     ));
 
+    // This timestamp is the durable run and session-log identity. Do not take
+    // it again after spawning: a second-boundary split would make a valid log
+    // unreachable from the task detail run link.
+    let session_started_at = now_unix();
     let mut reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
@@ -16702,7 +16706,7 @@ async fn provision_reviewer_reserved(
             Some(worker.task_id),
             &session_id,
             &branch,
-            now_unix(),
+            session_started_at,
         )
         .ok()
     });
@@ -16779,7 +16783,7 @@ async fn provision_reviewer_reserved(
         let rid = cap_run_id.clone();
         let name = reviewer_name.clone();
         let loaded = tokio::task::spawn_blocking(move || {
-            prepare_reviewer_authority(&p, tid, &rid, &name, now_unix())
+            prepare_reviewer_authority(&p, tid, &rid, &name, session_started_at)
         })
         .await;
         match loaded {
@@ -16963,6 +16967,7 @@ async fn provision_reviewer_reserved(
                 let review_cap = cap_run_id.clone();
                 let review_head = head_sha.to_string();
                 let assignment_id = assignment.id;
+                let spawned_at = session_started_at;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let mut conn = quorum_core::db::open(&p)?;
                     quorum_core::decomposition_review::persist_reviewer_run_if_current(
@@ -16973,7 +16978,7 @@ async fn provision_reviewer_reserved(
                         &e,
                         &prov,
                         Some(assignment_id),
-                        now_unix(),
+                        spawned_at,
                         is_r2.then_some("r2"),
                         &review_cap,
                         pr,
@@ -17672,6 +17677,9 @@ async fn spawn_worker(
         return Ok(false);
     }
 
+    // Keep the durable agent-run timestamp and session-log directory keyed by
+    // the same captured value. The detail API verifies that identity directly.
+    let session_started_at = now_unix();
     let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
@@ -17680,7 +17688,7 @@ async fn spawn_worker(
             Some(task.id),
             &session_id,
             &remote_branch,
-            now_unix(),
+            session_started_at,
         )
         .ok()
     });
@@ -17760,9 +17768,10 @@ async fn spawn_worker(
         let rid = cap_run_id.clone();
         let name = agent_name.clone();
         let tid = task.id;
+        let issued_at = session_started_at;
         let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&p)?;
-            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", now_unix())
+            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", issued_at)
         })
         .await
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
@@ -17930,6 +17939,7 @@ async fn spawn_worker(
                 let prov = provider_str.clone();
                 let tid = task.id;
                 let assignment_id = assignment.id;
+                let spawned_at = session_started_at;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
                     quorum_core::agent_runs::insert_worker_with_assignment(
@@ -17942,7 +17952,7 @@ async fn spawn_worker(
                         &prov,
                         &prov,
                         Some(assignment_id),
-                        now_unix(),
+                        spawned_at,
                     )
                 })
                 .await
@@ -19915,6 +19925,9 @@ async fn spawn_remediation_worker(
 
     // Inspection surfaces report the PR branch this run continues, not the
     // daemon's local checkout name.
+    // Remediation runs use the same canonical timestamp for their log and
+    // durable run record as initial workers and reviewers do.
+    let session_started_at = now_unix();
     let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
@@ -19923,7 +19936,7 @@ async fn spawn_remediation_worker(
             Some(task_id),
             &session_id,
             &remote_branch,
-            now_unix(),
+            session_started_at,
         )
         .ok()
     });
@@ -19966,9 +19979,10 @@ async fn spawn_remediation_worker(
         let rid = cap_run_id.clone();
         let name = agent_name.clone();
         let tid = task_id;
+        let issued_at = session_started_at;
         let _ = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&p)?;
-            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", now_unix())
+            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", issued_at)
         })
         .await;
     }
@@ -20284,6 +20298,7 @@ async fn spawn_remediation_worker(
                 let e = remediation_effort.clone();
                 let prov = remediation_provider_str;
                 let tid = task_id;
+                let spawned_at = session_started_at;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
                     match worker_assignment {
@@ -20297,17 +20312,10 @@ async fn spawn_remediation_worker(
                             &prov,
                             &prov,
                             Some(assignment.id),
-                            now_unix(),
+                            spawned_at,
                         ),
                         None => quorum_core::agent_runs::insert(
-                            &conn,
-                            tid,
-                            &name,
-                            "worker",
-                            &m,
-                            &e,
-                            &prov,
-                            now_unix(),
+                            &conn, tid, &name, "worker", &m, &e, &prov, spawned_at,
                         ),
                     }
                 })

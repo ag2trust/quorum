@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -1040,23 +1040,26 @@ fi
     }
 
     fn done(&self, agent: &str, args: &[&str]) {
-        let mut conn = self.db();
-        let run_id = match quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
-            Some(cap) => cap.run_id,
-            None => {
-                let run_id = format!("test-{agent}-{}", std::process::id());
-                let role = if args.contains(&"--verdict") {
-                    "reviewer"
-                } else {
-                    "worker"
-                };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
-                quorum_core::capabilities::issue(&mut conn, &run_id, 1, agent, role, now).unwrap();
-                run_id
+        let role = if args.contains(&"--verdict") {
+            "reviewer"
+        } else {
+            "worker"
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let run_id = loop {
+            let conn = self.db();
+            if let Some(cap) = quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
+                if cap.role == role
+                    && quorum_core::capabilities::resolve_live_run_context(&conn, &cap.run_id, role)
+                        .is_ok()
+                {
+                    break cap.run_id;
+                }
             }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for live {role} run capability for {agent}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
         };
         let mut command = Command::new(cargo_bin("quorum"));
         let mut done_args = Vec::new();

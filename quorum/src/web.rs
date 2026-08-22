@@ -614,7 +614,7 @@ fn task_detail_payload(state: &AppState, id: i64) -> quorum_core::error::Result<
     let detail = task_detail_value(&conn, &task)?;
     let timeline = task_events(&conn, id, now)?;
     let notes = task_notes(&conn, id)?;
-    let runs = task_runs(&conn, id)?;
+    let runs = task_runs(&conn, &state.logs_root, id)?;
     drop(conn);
     Ok(Some(json!({
         "task": detail,
@@ -775,7 +775,11 @@ fn task_notes(conn: &rusqlite::Connection, task_id: i64) -> quorum_core::error::
     Ok(notes)
 }
 
-fn task_runs(conn: &rusqlite::Connection, task_id: i64) -> quorum_core::error::Result<Vec<Value>> {
+fn task_runs(
+    conn: &rusqlite::Connection,
+    logs_root: &FsPath,
+    task_id: i64,
+) -> quorum_core::error::Result<Vec<Value>> {
     let mut stmt = conn.prepare(
         "SELECT id, agent_name, role, sub_role, model, effort, provider, spawned_at, ended_at, end_reason FROM (
              SELECT id, agent_name, role, sub_role, model, effort, provider, spawned_at, ended_at, end_reason
@@ -784,21 +788,50 @@ fn task_runs(conn: &rusqlite::Connection, task_id: i64) -> quorum_core::error::R
     )?;
     let runs = stmt
         .query_map(rusqlite::params![task_id, DETAIL_RUN_LIMIT], |row| {
+        let agent = row.get::<_, String>(1)?;
+        let role = row.get::<_, String>(2)?;
+        let spawned_at = row.get::<_, i64>(7)?;
         Ok(json!({
             "id": row.get::<_, i64>(0)?,
-            "agent": bounded_text(&row.get::<_, String>(1)?, MAX_IDENTITY_CHARS),
-            "role": bounded_text(&row.get::<_, String>(2)?, MAX_IDENTITY_CHARS),
+            "agent": bounded_text(&agent, MAX_IDENTITY_CHARS),
+            "role": bounded_text(&role, MAX_IDENTITY_CHARS),
             "sub_role": row.get::<_, Option<String>>(3)?.map(|value| bounded_text(&value, MAX_IDENTITY_CHARS)),
             "model": bounded_text(&row.get::<_, String>(4)?, MAX_IDENTITY_CHARS),
             "effort": bounded_text(&row.get::<_, String>(5)?, MAX_IDENTITY_CHARS),
             "provider": row.get::<_, Option<String>>(6)?.map(|value| bounded_text(&value, MAX_IDENTITY_CHARS)),
-            "spawned_at": row.get::<_, i64>(7)?,
+            "spawned_at": spawned_at,
             "ended_at": row.get::<_, Option<i64>>(8)?,
             "end_reason": row.get::<_, Option<String>>(9)?.map(|value| bounded_text(&value, MAX_DETAIL_TEXT_CHARS)),
+            "dir": task_run_log_dir(logs_root, task_id, &agent, &role, spawned_at),
         }))
     })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(runs)
+}
+
+/// Session-log names are deterministic (`{agent}-{start_time}`), so task detail never needs
+/// to scan a global run page. The returned directory is still checked against the on-disk
+/// metadata before it becomes a tail link.
+fn task_run_log_dir(
+    logs_root: &FsPath,
+    task_id: i64,
+    agent: &str,
+    role: &str,
+    spawned_at: i64,
+) -> Option<String> {
+    let dir = format!("{agent}-{spawned_at}");
+    let path = run_dir(logs_root, &dir).ok()?;
+    if !path.join("stream.jsonl").is_file() {
+        return None;
+    }
+    let meta = fs::read_to_string(path.join("meta.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())?;
+    (meta["task_id"].as_i64() == Some(task_id)
+        && meta["agent"].as_str() == Some(agent)
+        && meta["role"].as_str() == Some(role)
+        && meta["start_time"].as_i64() == Some(spawned_at))
+    .then_some(dir)
 }
 
 #[derive(Deserialize)]
@@ -1538,6 +1571,73 @@ mod tests {
             payload["runs"].as_array().unwrap().len(),
             DETAIL_RUN_LIMIT as usize
         );
+        assert_checkpoint_released(&state.db_path);
+    }
+
+    #[test]
+    fn task_detail_links_active_meta_verified_runs_beyond_the_global_run_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let mut conn = quorum_core::db::open(&state.db_path).unwrap();
+        let task_id = create_test_task(&mut conn, "with retained logs", None, None);
+        drop(conn);
+
+        // The run row can be persisted after provider launch, including on a
+        // later clock tick. It must retain this captured session identity so
+        // the active (not yet finalized) log remains directly linkable.
+        let session_started_at = 100;
+        let persisted_after_launch_at = 101;
+        assert_ne!(session_started_at, persisted_after_launch_at);
+        let active_log = crate::serve::session_log::SessionLog::create(
+            &state.logs_root,
+            "Worker",
+            "worker",
+            Some(task_id),
+            "active-session",
+            "task-branch",
+            session_started_at,
+        )
+        .unwrap();
+        assert_eq!(active_log.dir(), state.logs_root.join("Worker-100"));
+
+        let conn = quorum_core::db::open(&state.db_path).unwrap();
+        quorum_core::agent_runs::insert(
+            &conn,
+            task_id,
+            "Worker",
+            "worker",
+            "model",
+            "high",
+            "codex",
+            session_started_at,
+        )
+        .unwrap();
+        quorum_core::agent_runs::insert(
+            &conn, task_id, "Impostor", "worker", "model", "high", "codex", 101,
+        )
+        .unwrap();
+        drop(conn);
+
+        let mismatched = state.logs_root.join("Impostor-101");
+        fs::create_dir(&mismatched).unwrap();
+        fs::write(mismatched.join("stream.jsonl"), "{}\n").unwrap();
+        fs::write(
+            mismatched.join("meta.json"),
+            json!({"agent":"Impostor", "role":"worker", "task_id":task_id + 1, "start_time":101})
+                .to_string(),
+        )
+        .unwrap();
+        // These globally newer logs would push the retained Worker session off `/api/runs`.
+        for index in 0..=MAX_LIMIT {
+            fs::create_dir(state.logs_root.join(format!("Other-{}", 1_000 + index))).unwrap();
+        }
+
+        let global = list_runs(&state.logs_root, None, MAX_LIMIT).unwrap();
+        assert!(!global.runs.iter().any(|run| run["dir"] == "Worker-100"));
+        let payload = task_detail_payload(&state, task_id).unwrap().unwrap();
+        let runs = payload["runs"].as_array().unwrap();
+        assert_eq!(runs[0]["dir"], json!("Worker-100"));
+        assert_eq!(runs[1]["dir"], Value::Null);
         assert_checkpoint_released(&state.db_path);
     }
 
