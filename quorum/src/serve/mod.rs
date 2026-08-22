@@ -131,6 +131,10 @@ const FAILED_WORKER_HANDOFF_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 /// Limit per-slot stream work so one noisy provider cannot starve other slots.
 const MAX_STREAM_LINES_PER_TICK: usize = 64;
+/// Cheap-polling pace between ticks. Applied on the success path at the end of
+/// `tick` and again on the `Continue` error path in `tick_loop`, which the
+/// success-path sleep never reaches.
+const TICK_PACING: Duration = Duration::from_millis(500);
 const CLAIM_SKIP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CLAIM_SKIP_LOG_CAPACITY: usize = 64;
 const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -757,6 +761,34 @@ fn decide_r2_requirement(
     };
 
     quorum_core::review_audits::record_r2_requirement(conn, task_id, pr_number, head_sha, required)
+}
+
+/// Split reviewer-provisioning candidates into the tasks a reviewer may be
+/// provisioned for and the generated children whose graph plan is no longer
+/// current.
+///
+/// Status alone is not reviewability: `prepare_reviewer_authority` refuses a
+/// stale or blocked graph member, and it only runs once an identity and a
+/// worktree already exist. Filtering here keeps that permanent condition from
+/// churning a worktree every tick. Tasks that are no longer `in-review` are in
+/// neither set — they are not candidates at all.
+fn partition_reviewable_targets(
+    conn: &quorum_core::Connection,
+    task_ids: &[i64],
+) -> Result<(HashSet<i64>, Vec<i64>)> {
+    let mut reviewable = HashSet::new();
+    let mut stale_graph = Vec::new();
+    for task_id in task_ids {
+        if !tasks::get(conn, *task_id)?.is_some_and(|task| task.status == "in-review") {
+            continue;
+        }
+        if quorum_core::decomposition_review::is_reviewable_graph_member(conn, *task_id)? {
+            reviewable.insert(*task_id);
+        } else {
+            stale_graph.push(*task_id);
+        }
+    }
+    Ok((reviewable, stale_graph))
 }
 
 /// Check whether provision attempts for a (task, PR, role) are exhausted.
@@ -8579,6 +8611,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut pending_reviewer_resumes: HashMap<i64, i64> = HashMap::new();
     let mut poison_tracker = PoisonTracker::new();
     let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+    let mut graph_skip_logs = ClaimSkipLogLimiter::new();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
@@ -9099,6 +9132,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut pending_reviewer_resumes,
             &mut poison_tracker,
             &mut claim_skip_logs,
+            &mut graph_skip_logs,
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -9155,7 +9189,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     }
                     return Ok(EXIT_SELF_UPDATE);
                 }
-                TickErrorAction::Continue => log(&format!("tick error: {e}")),
+                TickErrorAction::Continue => {
+                    log(&format!("tick error: {e}"));
+                    // `tick`'s pacing sleep is its last statement, so every
+                    // error path skips it. Without pacing here a persistent
+                    // failure re-enters the identical tick immediately and
+                    // burns a core until the condition clears.
+                    tokio::time::sleep(TICK_PACING).await;
+                }
             }
         }
 
@@ -9210,6 +9251,9 @@ async fn tick(
     pending_reviewer_resumes: &mut HashMap<i64, i64>,
     poison_tracker: &mut PoisonTracker,
     claim_skip_logs: &mut ClaimSkipLogLimiter,
+    // Reuses the bounded claim-skip limiter so a permanently stale graph member
+    // logs at most once per interval instead of once per tick.
+    graph_skip_logs: &mut ClaimSkipLogLimiter,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
@@ -13371,18 +13415,21 @@ async fn tick(
                 .iter()
                 .map(|(_, task_id, _)| *task_id)
                 .collect();
-            let reviewable = tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
-                let conn = quorum_core::db::open(&p)?;
-                let mut ids = HashSet::new();
-                for task_id in task_ids {
-                    if tasks::get(&conn, task_id)?.is_some_and(|task| task.status == "in-review") {
-                        ids.insert(task_id);
-                    }
+            let (reviewable, stale_graph) =
+                tokio::task::spawn_blocking(move || -> Result<(HashSet<i64>, Vec<i64>)> {
+                    let conn = quorum_core::db::open(&p)?;
+                    partition_reviewable_targets(&conn, &task_ids)
+                })
+                .await
+                .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??;
+            for task_id in stale_graph {
+                if graph_skip_logs.should_log(task_id, std::time::Instant::now()) {
+                    log(&format!(
+                        "task #{task_id}: generated child is not in the current active \
+                         graph plan — not provisioning a reviewer"
+                    ));
                 }
-                Ok(ids)
-            })
-            .await
-            .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??;
+            }
             needs_reviewer_from_workers.retain(|(_, task_id, _)| reviewable.contains(task_id));
         }
         let mut parked_workers: Vec<usize> = Vec::new();
@@ -13505,7 +13552,11 @@ async fn tick(
                         continue;
                     }
                     let counterpart: ReviewCounterpart = (&workers[*wi]).into();
-                    let provision_outcome = provision_reviewer(
+                    // One task's provisioning failure must not abort the tick:
+                    // the failure has already burned a durable strike, and
+                    // aborting here would starve every later phase and repeat
+                    // the identical failure forever.
+                    let provision_outcome = match provision_reviewer(
                         config,
                         wt_mgr,
                         name_pool,
@@ -13517,7 +13568,16 @@ async fn tick(
                         &head_sha,
                         false,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            log(&format!(
+                                "provision error for task #{task_id} PR #{pr}: {e}"
+                            ));
+                            continue;
+                        }
+                    };
                     if provision_outcome == ReviewerProvisionOutcome::Attached {
                         pre_review_checks.remove(task_id);
                     }
@@ -13875,7 +13935,10 @@ async fn tick(
                         task_id: *task_id,
                         branch: &branch,
                     };
-                    let provision_outcome = provision_reviewer(
+                    // As in phase 5: a single orphan's provisioning failure has
+                    // already burned a durable strike and must not abort the
+                    // whole tick.
+                    let provision_outcome = match provision_reviewer(
                         config,
                         wt_mgr,
                         name_pool,
@@ -13887,7 +13950,16 @@ async fn tick(
                         &head_sha,
                         true,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(e) => {
+                            log(&format!(
+                                "orphan provision error for task #{task_id} PR #{pr}: {e}"
+                            ));
+                            continue;
+                        }
+                    };
                     if provision_outcome == ReviewerProvisionOutcome::Attached {
                         pre_review_checks.remove(task_id);
                     }
@@ -14331,7 +14403,7 @@ async fn tick(
         }
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(TICK_PACING).await;
     Ok(())
 }
 
@@ -16772,6 +16844,76 @@ fn reviewer_name_exclusions(
     excluded
 }
 
+/// Record one durable provision strike for a (task, PR, role) and log the
+/// bounded budget. Every failure inside `provision_reviewer` that happens after
+/// the reviewer identity and worktree have been allocated must go through this:
+/// a strike is what makes `decide_provision` eventually return `Exhausted`, and
+/// that is the only thing that parks a task instead of re-provisioning a
+/// reviewer on every tick forever.
+async fn record_reviewer_provision_strike(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    role: &ReviewRole,
+    head_sha: &str,
+) -> i64 {
+    let role_str = role.as_str().to_string();
+    let sha = head_sha.to_string();
+    let recorded = {
+        let p = config.db_path.clone();
+        match tokio::task::spawn_blocking(move || -> Result<i64> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::provision_attempts::record_attempt(&mut conn, task_id, pr, &role_str, &sha)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(QuorumError::Io(format!("provision strike join: {error}"))),
+        }
+    };
+    let strikes = match recorded {
+        Ok(strikes) => strikes,
+        // The durable strike is the only thing that can ever reach the cap.
+        // Counting an unrecordable strike as zero fails open: the identical
+        // provision would be retried on every tick forever. Park instead.
+        Err(error) => {
+            log(&format!(
+                "FATAL: could not record {role_label} provision strike for task #{task_id} \
+                 PR #{pr}: {error} — parking to bound retries",
+                role_label = role.as_str().to_uppercase()
+            ));
+            park_task(
+                &config.db_path,
+                task_id,
+                &format!("reviewer provision strike could not be recorded for PR #{pr}"),
+                "in-review",
+            )
+            .await;
+            notify_provision_failure(
+                &config.db_path,
+                task_id,
+                "reviewer provision strike could not be recorded",
+                &format!("#{pr}"),
+            )
+            .await;
+            return MAX_REVIEWER_PROVISION_STRIKES as i64;
+        }
+    };
+    log(&format!(
+        "{role_label} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
+         for task #{task_id} PR #{pr}",
+        role_label = role.as_str().to_uppercase()
+    ));
+    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
+        log(&format!(
+            "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after \
+             {strikes} consecutive {} provision failures for PR #{pr}",
+            role.as_str().to_uppercase()
+        ));
+    }
+    strikes
+}
+
 /// Unified reviewer provisioning (#190). Replaces the separate
 /// `spawn_reviewer_for_worker` (R1) and `spawn_r2_reviewer` (R2) paths.
 /// Role, prompt, model policy, and audit recording are parameterized;
@@ -17140,37 +17282,7 @@ async fn provision_reviewer_reserved(
         }
     };
     if let Some(provision_failure) = provision_failure {
-        let task_id = worker.task_id;
-        let role_str = role.as_str().to_string();
-        let sha = head_sha.to_string();
-        let strikes = {
-            let p = config.db_path.clone();
-            tokio::task::spawn_blocking(move || -> i64 {
-                quorum_core::db::open(&p)
-                    .ok()
-                    .and_then(|mut conn| {
-                        quorum_core::provision_attempts::record_attempt(
-                            &mut conn, task_id, pr, &role_str, &sha,
-                        )
-                        .ok()
-                    })
-                    .unwrap_or(0)
-            })
-            .await
-            .unwrap_or(0)
-        };
-        log(&format!(
-            "{role_label} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
-             for task #{task_id} PR #{pr}",
-            role_label = role.as_str().to_uppercase()
-        ));
-        if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
-            log(&format!(
-                "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after \
-                 {strikes} consecutive {} provision failures for PR #{pr}",
-                role.as_str().to_uppercase()
-            ));
-        }
+        record_reviewer_provision_strike(config, worker.task_id, pr, role, head_sha).await;
         cleanup_failed_reviewer_provision(
             config,
             wt_mgr,
@@ -17239,6 +17351,7 @@ async fn provision_reviewer_reserved(
     match journal_result {
         Ok(Ok(())) => {}
         Ok(Err(error)) | Err(error) => {
+            record_reviewer_provision_strike(config, worker.task_id, pr, role, head_sha).await;
             cleanup_failed_reviewer_provision(
                 config,
                 wt_mgr,
@@ -17284,7 +17397,17 @@ async fn provision_reviewer_reserved(
         .await;
         match loaded {
             Ok(Ok(context)) => context,
+            // Authority validation runs after the reviewer name and worktree
+            // exist, so a persistent failure (stale or blocked graph plan) is a
+            // provision failure like any other: it must burn a durable strike
+            // so the task parks instead of re-provisioning every tick.
             Ok(Err(error)) => {
+                log(&format!(
+                    "{}: reviewer authority validation failed for task #{} PR #{pr}: {error}",
+                    role.as_str().to_uppercase(),
+                    worker.task_id
+                ));
+                record_reviewer_provision_strike(config, worker.task_id, pr, role, head_sha).await;
                 cleanup_failed_reviewer_provision(
                     config,
                     wt_mgr,
@@ -17300,6 +17423,13 @@ async fn provision_reviewer_reserved(
                 return Err(error);
             }
             Err(error) => {
+                let error = QuorumError::Io(format!("graph review context join: {error}"));
+                log(&format!(
+                    "{}: reviewer authority validation failed for task #{} PR #{pr}: {error}",
+                    role.as_str().to_uppercase(),
+                    worker.task_id
+                ));
+                record_reviewer_provision_strike(config, worker.task_id, pr, role, head_sha).await;
                 cleanup_failed_reviewer_provision(
                     config,
                     wt_mgr,
@@ -17312,9 +17442,7 @@ async fn provision_reviewer_reserved(
                     None,
                 )
                 .await;
-                return Err(QuorumError::Io(format!(
-                    "graph review context join: {error}"
-                )));
+                return Err(error);
             }
         }
     };
@@ -17324,9 +17452,32 @@ async fn provision_reviewer_reserved(
     let review_cycle = {
         let db_path = config.db_path.clone();
         let task_id = worker.task_id;
-        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
-            .await
-            .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
+        let loaded =
+            tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+                .await
+                .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")));
+        match loaded {
+            Ok(Ok(context)) => context,
+            // The capability is already issued and the worktree already exists,
+            // so this failure retires both and burns a strike like every other
+            // post-worktree failure.
+            Ok(Err(error)) | Err(error) => {
+                record_reviewer_provision_strike(config, worker.task_id, pr, role, head_sha).await;
+                cleanup_failed_reviewer_provision(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    &reviewer_name,
+                    &wt_path,
+                    &branch,
+                    Some(&cap_run_id),
+                    None,
+                    None,
+                )
+                .await;
+                return Err(error);
+            }
+        }
     };
     let review_cycle = (review_cycle.rework_round != 0).then_some(review_cycle);
 
@@ -17366,9 +17517,31 @@ async fn provision_reviewer_reserved(
     let task_contract = {
         let db_path = config.db_path.clone();
         let task_id = worker.task_id;
-        tokio::task::spawn_blocking(move || load_task_review_contract(&db_path, task_id))
-            .await
-            .map_err(|error| QuorumError::Io(format!("task review context join: {error}")))??
+        let loaded =
+            tokio::task::spawn_blocking(move || load_task_review_contract(&db_path, task_id))
+                .await
+                .map_err(|error| QuorumError::Io(format!("task review context join: {error}")));
+        match loaded {
+            Ok(Ok(contract)) => contract,
+            // As with the review-cycle load above: the capability and worktree
+            // already exist, so retire both and burn a strike.
+            Ok(Err(error)) | Err(error) => {
+                record_reviewer_provision_strike(config, worker.task_id, pr, role, head_sha).await;
+                cleanup_failed_reviewer_provision(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    &reviewer_name,
+                    &wt_path,
+                    &branch,
+                    Some(&cap_run_id),
+                    None,
+                    None,
+                )
+                .await;
+                return Err(error);
+            }
+        }
     };
     let prompt = format!("{prompt}\n\n{task_contract}");
 
@@ -17428,6 +17601,14 @@ async fn provision_reviewer_reserved(
                 match pid_journal {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) | Err(error) => {
+                        record_reviewer_provision_strike(
+                            config,
+                            worker.task_id,
+                            pr,
+                            role,
+                            head_sha,
+                        )
+                        .await;
                         cleanup_failed_reviewer_provision(
                             config,
                             wt_mgr,
@@ -17513,37 +17694,8 @@ async fn provision_reviewer_reserved(
                     })
                     .await
                     .ok();
-                    let task_id = worker.task_id;
-                    let role_str = role.as_str().to_string();
-                    let sha = head_sha.to_string();
-                    let strikes = {
-                        let p = config.db_path.clone();
-                        tokio::task::spawn_blocking(move || -> i64 {
-                            quorum_core::db::open(&p)
-                                .ok()
-                                .and_then(|mut conn| {
-                                    quorum_core::provision_attempts::record_attempt(
-                                        &mut conn, task_id, pr, &role_str, &sha,
-                                    )
-                                    .ok()
-                                })
-                                .unwrap_or(0)
-                        })
-                        .await
-                        .unwrap_or(0)
-                    };
-                    log(&format!(
-                        "{role_label} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
-                         for task #{task_id} PR #{pr}",
-                        role_label = role.as_str().to_uppercase()
-                    ));
-                    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
-                        log(&format!(
-                            "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after \
-                             {strikes} consecutive {} provision failures for PR #{pr}",
-                            role.as_str().to_uppercase()
-                        ));
-                    }
+                    record_reviewer_provision_strike(config, worker.task_id, pr, role, head_sha)
+                        .await;
                     return Err(e);
                 }
             };
@@ -20904,6 +21056,59 @@ mod tests {
     use super::*;
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Reviewer provisioning must not even start for a generated child whose
+    /// graph plan is no longer current: authority issuance would fail after a
+    /// worktree had already been created, once per tick, forever.
+    #[test]
+    fn reviewable_partition_separates_stale_graph_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("reviewable.db")).unwrap();
+        let mut seed = |title: &str, status: &str| {
+            let id = tasks::create(
+                &mut conn, "owner", title, None, 0, None, None, None, None, 1,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status=?2 WHERE id=?1",
+                rusqlite::params![id, status],
+            )
+            .unwrap();
+            id
+        };
+        let ordinary = seed("ordinary in-review", "in-review");
+        let stale_child = seed("stale generated child", "in-review");
+        let fresh_child = seed("current generated child", "in-review");
+        let not_in_review = seed("still open", "open");
+        let stale_source = seed("stale graph source", "decomposed");
+        let fresh_source = seed("current graph source", "decomposed");
+        conn.execute(
+            "INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,
+                 planned_source_revision,plan_revision,accepted_plan_revision,created_at,updated_at)
+             VALUES (9,?1,'blocked',0,0,1,2,2,1,1),
+                    (10,?2,'active',1,0,1,2,2,1,1)",
+            rusqlite::params![stale_source, fresh_source],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (9,?1,'stale',2,1),(10,?2,'fresh',2,1)",
+            rusqlite::params![stale_child, fresh_child],
+        )
+        .unwrap();
+
+        let (reviewable, stale_graph) = partition_reviewable_targets(
+            &conn,
+            &[ordinary, stale_child, fresh_child, not_in_review],
+        )
+        .unwrap();
+
+        assert!(reviewable.contains(&ordinary));
+        assert!(reviewable.contains(&fresh_child));
+        assert!(!reviewable.contains(&stale_child));
+        assert!(!reviewable.contains(&not_in_review));
+        assert_eq!(stale_graph, vec![stale_child]);
+    }
 
     #[tokio::test]
     async fn review_draft_consumption_is_lifecycle_inert() {
@@ -26495,6 +26700,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     let mut pending_reviewer_resumes = HashMap::new();
                     let mut poison_tracker = PoisonTracker::new();
                     let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+                    let mut graph_skip_logs = ClaimSkipLogLimiter::new();
                     let mut drain_state = DrainState::new();
                     let mut lifetime_roster = LifetimeRoster::new();
                     for reviewer in &reviewers {
@@ -26517,6 +26723,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut pending_reviewer_resumes,
                         &mut poison_tracker,
                         &mut claim_skip_logs,
+                        &mut graph_skip_logs,
                         &mut drain_state,
                         &mut lifetime_roster,
                         &mut classifier_slot,
