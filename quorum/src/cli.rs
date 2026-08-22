@@ -516,10 +516,14 @@ pub enum Command {
         /// and sets QUORUM_REPO for all spawned workers/reviewers.
         #[arg(long)]
         repo: Option<String>,
-        /// Base branch name for sha-polling, worktree provisioning, and merge
-        /// targeting. Use "master" for repos whose trunk is master (default: main).
+        /// Task/PR base branch for worktree provisioning, PR publication,
+        /// validation, and merge targeting (default: main).
         #[arg(long)]
         base_branch: Option<String>,
+        /// Branch to poll for daemon self-updates. Defaults to the resolved
+        /// --base-branch value when omitted.
+        #[arg(long)]
+        self_update_branch: Option<String>,
         /// Path to a sentinel file. When set, serve polls for this file's
         /// existence every tick and initiates shutdown when it disappears.
         /// Used by test fixtures to self-terminate when the parent test

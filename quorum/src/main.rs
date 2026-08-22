@@ -78,7 +78,8 @@ primary = 100
 # agent_bin = \"/path/to/provider-cli\"
 # no_bare_agent = true   # default: use operator's Claude login (no --bare)
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
-# base_branch = \"main\"
+# base_branch = \"main\" # task/PR base: worktrees, PRs, validation, and merges
+# self_update_branch = \"main\" # daemon update poll; defaults to resolved base_branch
 
 ## Grok Build settings for managed worker roles only.
 # [grok]
@@ -1273,6 +1274,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             sha_poll_interval_secs,
             repo,
             base_branch,
+            self_update_branch,
             exit_when_gone,
             doctor_enabled,
         } => {
@@ -1391,6 +1393,18 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 file_cfg.base_branch.as_deref(),
                 "main",
             );
+            // Self-update polling has an independent branch, but preserves
+            // existing deployments by inheriting the fully resolved task/PR base.
+            let r_self_update_branch =
+                if self_update_branch.is_some() || file_cfg.self_update_branch.is_some() {
+                    resolve_str(
+                        self_update_branch.as_deref(),
+                        file_cfg.self_update_branch.as_deref(),
+                        "main",
+                    )
+                } else {
+                    r_base_branch.clone()
+                };
             let r_merge_checks_timeout = resolve_val(
                 merge_checks_timeout_secs,
                 file_cfg.merge_checks_timeout_secs,
@@ -1442,6 +1456,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 repo_dir: &r_repo_dir,
                 worktree_base: &r_wt,
                 base_branch: &r_base_branch,
+                self_update_branch: &r_self_update_branch,
                 cap: &r_cap,
                 model_profiles: &model_profiles,
                 routing: &routing,
@@ -1535,6 +1550,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 merge_checks_poll_secs: r_merge_checks_poll.value,
                 repo: r_repo.value,
                 base_branch: r_base_branch.value,
+                self_update_branch: r_self_update_branch.value,
                 exit_when_gone: exit_when_gone.map(std::path::PathBuf::from),
                 required_jobs: r_required_jobs,
                 master_ci_gate: r_master_ci_gate.value,
