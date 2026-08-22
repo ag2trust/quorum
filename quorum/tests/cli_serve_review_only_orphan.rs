@@ -780,9 +780,17 @@ fn reviewer_run_insert_error_never_attaches_and_restart_recovers() {
         "injected persistence failure was not surfaced: {:?}",
         failed.lines
     );
+    // The failure is contained to this task: it is logged and the tick keeps
+    // going, instead of aborting the whole tick with `tick error`.
     assert!(
-        failed.wait_for("tick error", 10),
+        failed.wait_for("orphan provision error for task #1 PR #42", 10),
         "daemon did not finish fail-safe cleanup: {:?}",
+        failed.lines
+    );
+    failed.drain_pending_lines();
+    assert!(
+        !failed.lines.iter().any(|line| line.contains("tick error")),
+        "a single task's provision failure must not abort the tick: {:?}",
         failed.lines
     );
     drop(failed);
@@ -822,6 +830,186 @@ fn reviewer_run_insert_error_never_attaches_and_restart_recovers() {
         Some("Reviewer")
     );
     drop(recovered);
+}
+
+/// A generated child whose graph is no longer the current active plan fails
+/// reviewer-authority validation on every attempt. That failure happens after
+/// the reviewer identity and worktree exist, so it must burn the same durable
+/// provision budget as any other post-allocation failure and park the task
+/// instead of re-provisioning a reviewer on every tick forever.
+#[test]
+fn stale_graph_authority_failure_stops_after_provision_budget() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(id,title,body,status,created_by,created_at,updated_at)
+             VALUES (9001,'graph source','source outcome','decomposed','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,
+                 planned_source_revision,plan_revision,accepted_plan_revision,created_at,updated_at)
+             VALUES (9,9001,'completed',0,0,1,2,2,1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (9,?1,'parser',2,1)",
+            rusqlite::params![task_id],
+        )
+        .unwrap();
+    }
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 90),
+        "stale graph authority failure did not exhaust and park: {:?}",
+        handle.lines
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    handle.drain_pending_lines();
+
+    let authority_failures = handle
+        .lines
+        .iter()
+        .filter(|line| line.contains("reviewer authority validation failed"))
+        .count();
+    assert_eq!(
+        authority_failures, 3,
+        "daemon must stop re-provisioning at the durable strike cap: {:?}",
+        handle.lines
+    );
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let attempts: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(attempts), 0) FROM reviewer_provision_attempts WHERE task_id=?1",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        attempts, 3,
+        "authority failure must record provision strikes"
+    );
+    let parked = get_task(home.path(), task_id);
+    assert_eq!(parked.status, "failed", "task was not parked");
+    assert!(
+        parked
+            .refs
+            .as_deref()
+            .unwrap_or_default()
+            .contains("reviewer provision exhausted"),
+        "park reason missing from refs: {:?}",
+        parked.refs
+    );
+    assert_eq!(parked.reviewer, None);
+    drop(handle);
+}
+
+/// If the durable strike itself cannot be recorded, the retry budget can never
+/// be reached. Failing open there would re-provision a reviewer every tick
+/// forever, so the daemon must park on the first unrecordable strike.
+#[test]
+fn unrecordable_provision_strike_parks_immediately() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reviewer_run_forever
+             BEFORE INSERT ON agent_runs
+             WHEN NEW.role = 'reviewer'
+             BEGIN
+               SELECT RAISE(ABORT, 'persistent reviewer run failure');
+             END;
+             CREATE TRIGGER fail_provision_strike
+             BEFORE INSERT ON reviewer_provision_attempts
+             BEGIN
+               SELECT RAISE(ABORT, 'strike recording unavailable');
+             END;",
+        )
+        .unwrap();
+    }
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("PARKED: task #1", 90),
+        "unrecordable strike did not park the task: {:?}",
+        handle.lines
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    handle.drain_pending_lines();
+
+    let provision_failures = handle
+        .lines
+        .iter()
+        .filter(|line| line.contains("reviewer run persistence failed before attachment"))
+        .count();
+    assert_eq!(
+        provision_failures, 1,
+        "an unrecordable strike must stop provisioning at once: {:?}",
+        handle.lines
+    );
+    let parked = get_task(home.path(), task_id);
+    assert_eq!(parked.status, "failed", "task was not parked");
+    assert!(
+        parked
+            .refs
+            .as_deref()
+            .unwrap_or_default()
+            .contains("provision strike"),
+        "park reason missing from refs: {:?}",
+        parked.refs
+    );
+    drop(handle);
 }
 
 #[test]

@@ -170,6 +170,28 @@ pub fn load(conn: &Connection, task_id: i64) -> Result<Option<GraphReviewContext
     Ok(Some(context))
 }
 
+/// Whether reviewer authority can currently be issued for `task_id`.
+///
+/// An ordinary task is not a graph member and is always reviewable. A generated
+/// child is reviewable only while its membership and its graph's accepted plan
+/// are current — the same freshness predicate `load` fails loud on. Callers use
+/// this to skip provisioning *before* allocating a reviewer identity and
+/// worktree; it never widens what `load` accepts.
+pub fn is_reviewable_graph_member(conn: &Connection, task_id: i64) -> Result<bool> {
+    let reviewable: bool = conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id=?1)
+             OR EXISTS(SELECT 1 FROM task_graph_members m
+                       JOIN task_decompositions d ON d.id=m.graph_id
+                       JOIN tasks source ON source.id=d.source_task_id
+                       WHERE m.task_id=?1 AND m.active=1 AND d.active=1
+                         AND d.state='active' AND source.status='decomposed'
+                         AND d.accepted_plan_revision=m.plan_revision)",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    Ok(reviewable)
+}
+
 /// Atomically load current generated-child scope and issue its reviewer run
 /// capability. Source cancellation and reviewer authority therefore have a
 /// single SQLite serialization point. Ordinary tasks still issue normally.
@@ -418,6 +440,41 @@ mod tests {
         )
         .unwrap();
         assert!(load(&conn, 3).is_err());
+    }
+
+    #[test]
+    fn blocked_graph_child_is_not_reviewable() {
+        let conn = fixture();
+        conn.execute(
+            "UPDATE task_decompositions SET state='blocked',
+                 hold_code='generated-child-failed' WHERE id=9",
+            [],
+        )
+        .unwrap();
+        assert!(load(&conn, 3).is_err());
+        assert!(!is_reviewable_graph_member(&conn, 3).unwrap());
+    }
+
+    #[test]
+    fn ordinary_non_member_task_is_reviewable() {
+        assert!(is_reviewable_graph_member(&fixture(), 5).unwrap());
+    }
+
+    #[test]
+    fn current_generated_child_is_reviewable() {
+        assert!(is_reviewable_graph_member(&fixture(), 3).unwrap());
+    }
+
+    #[test]
+    fn stale_plan_revision_member_is_not_reviewable() {
+        let conn = fixture();
+        conn.execute(
+            "UPDATE task_graph_members SET plan_revision=1 WHERE task_id=3",
+            [],
+        )
+        .unwrap();
+        assert!(load(&conn, 3).is_err());
+        assert!(!is_reviewable_graph_member(&conn, 3).unwrap());
     }
 
     #[test]
