@@ -5076,15 +5076,16 @@ async fn record_decomposition_attempt(
         let mut conn = quorum_core::db::open(&path)?;
         if kind == "verdict" {
             // Verdict evidence is observational: it does not consume either
-            // budget or transition the graph. It must be written while the
-            // Arbiter still owns the frozen `validating` phase, before the
-            // corresponding proposal/provider/blocker outcome changes it.
+            // budget or transition the graph. A source cancellation can win
+            // after the Arbiter produces its terminal outcome but before this
+            // write, so record against any extant graph rather than coupling
+            // the evidence to the frozen `validating` lifecycle phase.
             let tx = quorum_core::db::begin_immediate(&mut conn)?;
             let row: Option<(i64, i64)> = tx
                 .query_row(
                     "SELECT planned_source_revision,operator_retry_count
                      FROM task_decompositions
-                     WHERE id=?1 AND active=0 AND freeze_active=1 AND state='validating'",
+                     WHERE id=?1",
                     [graph_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -34154,6 +34155,53 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[tokio::test]
+    async fn arbiter_verdict_records_when_source_cancellation_wins_after_terminal_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cancelled-arbiter.db");
+        let proposal = arbiter_gate_proposal();
+        let (source, graph) = arbiter_validating_graph(&db_path, "large", None, &proposal);
+        let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+
+        // The Arbiter has already produced its terminal result when source
+        // cancellation wins. The guarded lifecycle transition must remain a
+        // no-op, but the observational verdict is still durable evidence for
+        // this extant (now cancelled) graph.
+        let outcome = arbiter_done(arbiter::ArbiterVerdict::Approve);
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            quorum_core::decomposition::cancel_source_graph(
+                &mut conn,
+                "owner",
+                source,
+                Some(1),
+                5,
+            )
+            .unwrap(),
+            quorum_core::decomposition::SourceCancellation::Cancelled
+        );
+        drop(conn);
+
+        assert!(
+            !apply_arbiter_verdict(&config, graph, outcome)
+                .await
+                .unwrap(),
+            "cancellation wins the guarded validating -> preclassifying transition"
+        );
+        let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
+        assert_eq!(state, "cancelled");
+        assert_eq!(attempts, 0);
+        assert!(hold.is_none());
+        assert_eq!(status, "cancelled");
+        assert_eq!(
+            arbiter_gate_attempts(&db_path, graph),
+            vec![("verdict".to_string(), "arbiter-approve".to_string())]
+        );
+        let verdicts = arbiter_gate_verdicts(&db_path, graph);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].0, "arbiter-approve");
+    }
+
+    #[tokio::test]
     async fn arbiter_nonblocking_changes_are_treated_as_approve() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("advisory.db");
@@ -35803,7 +35851,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .unwrap();
         assert!(matches!(
             arbiter::poll_arbiter(&mut arbiter_slot).await,
-            Some(arbiter::ArbiterPoll::ProviderFailed(_))
+            Some(arbiter::ArbiterPoll::ProviderFailed { .. })
         ));
 
         for log_dir in [&planner_log_dir, &arbiter_log_dir] {
