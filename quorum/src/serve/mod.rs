@@ -34490,6 +34490,34 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .count(),
             3
         );
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            quorum_core::decomposition::retry_exhausted_planning(
+                &mut conn,
+                source,
+                "operator",
+                20,
+            )
+            .unwrap(),
+            quorum_core::decomposition::PlanningRetryOutcome::Retried {
+                graph_id: graph,
+                generation: 1,
+            },
+            "observational Arbiter verdict rows do not consume proposal retry budget"
+        );
+        let resumed: (String, i64, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.proposal_attempts,d.operator_retry_count,t.status
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            resumed,
+            ("provider-backoff".into(), 0, 1, "planning".into())
+        );
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
     }
 
