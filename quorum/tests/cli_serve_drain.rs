@@ -151,7 +151,7 @@ elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"%s","state":"OPEN"}\n' "$branch" "$sha" "$QUORUM_TEST_GH_BASE"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -166,6 +166,10 @@ fi
             env::var("PATH").unwrap_or_default()
         );
         let fake_agent = cargo_bin("fake-agent");
+        let gh_base = extra_args
+            .windows(2)
+            .find_map(|args| (args[0] == "--base-branch").then_some(args[1]))
+            .unwrap_or("main");
         let mut args: Vec<String> = vec![
             "serve",
             "--repo",
@@ -198,6 +202,7 @@ fi
             .env("PATH", path)
             .env("QUORUM_TEST_GH_STATE", &gh_state)
             .env("QUORUM_TEST_REPO", repo)
+            .env("QUORUM_TEST_GH_BASE", gh_base)
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -277,18 +282,26 @@ fi
 }
 
 fn seed_task_with_refs(home: &std::path::Path, title: &str, refs: &str) {
+    seed_task_with_base(home, title, refs, None);
+}
+
+fn seed_task_with_base(home: &std::path::Path, title: &str, refs: &str, base_branch: Option<&str>) {
+    let mut args = vec![
+        "task-create",
+        "--title",
+        title,
+        "--created-by",
+        "TestCreator",
+        "--refs",
+        refs,
+    ];
+    if let Some(base_branch) = base_branch {
+        args.extend(["--base-branch", base_branch]);
+    }
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
-        .args([
-            "task-create",
-            "--title",
-            title,
-            "--created-by",
-            "TestCreator",
-            "--refs",
-            refs,
-        ])
+        .args(args)
         .output()
         .unwrap();
     assert!(
@@ -356,7 +369,85 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     );
 }
 
-/// Self-repo merge triggers drain → roster empties → exit 75.
+fn complete_successful_merge(handle: &mut ServeHandle, home: &std::path::Path) {
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "did not spawn agent: {:?}",
+        handle.lines
+    );
+    let agent_name = handle
+        .extract_agent_name("spawning agent ")
+        .expect("could not extract agent name");
+    assert!(
+        handle.wait_for("result", 15),
+        "agent did not produce result: {:?}",
+        handle.lines
+    );
+    quorum_done(home, &["--agent", &agent_name]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle
+        .extract_agent_name("spawning reviewer ")
+        .expect("could not extract reviewer name");
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer did not produce result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home,
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "R2 reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let r2_name = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("could not extract R2 reviewer name");
+    let r2_name = r2_name.split_whitespace().next().unwrap().to_string();
+    assert!(
+        handle.wait_for("result", 15),
+        "R2 reviewer did not produce result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home,
+        &[
+            "--agent",
+            &r2_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(
+        handle.wait_for("PR #1 merged — firing MergeSucceeded", 15),
+        "PR was not merged: {:?}",
+        handle.lines
+    );
+}
+
+/// A self-repo merge into the self-update branch triggers drain → roster
+/// empties → exit 75.
 #[test]
 fn self_repo_merge_drains_and_exits_75() {
     let home = tempfile::tempdir().unwrap();
@@ -390,6 +481,8 @@ fn self_repo_merge_drains_and_exits_75() {
             "--self-update-drain",
             "--self-repo",
             "test-owner/test-repo",
+            "--self-update-branch",
+            "main",
             "--drain-timeout-secs",
             "10",
         ],
@@ -498,6 +591,75 @@ fn self_repo_merge_drains_and_exits_75() {
         status.code(),
         handle.lines
     );
+}
+
+/// A self-repo merge to a task base other than the self-update branch must
+/// leave the daemon running.
+#[test]
+fn self_repo_merge_to_non_self_update_branch_does_not_drain() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let repo = repo_dir.path().to_string_lossy().to_string();
+    Command::new("git")
+        .args(["-C", &repo, "branch", "develop"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &repo, "fetch", "origin"])
+        .status()
+        .unwrap();
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task_with_base(
+        home.path(),
+        "Develop task",
+        r#"{"repo":"test-owner/test-repo"}"#,
+        Some("develop"),
+    );
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--base-branch",
+            "develop",
+            "--self-update-drain",
+            "--self-repo",
+            "test-owner/test-repo",
+            "--self-update-branch",
+            "main",
+            "--drain-timeout-secs",
+            "5",
+        ],
+    );
+
+    complete_successful_merge(&mut handle, home.path());
+    std::thread::sleep(Duration::from_millis(600));
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+    assert!(
+        handle.child.try_wait().unwrap().is_none(),
+        "merge to develop must not request self-update exit: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle.lines.iter().any(|line| line.contains("DRAIN:")),
+        "merge to develop must not start a self-update drain: {:?}",
+        handle.lines
+    );
+    handle.stop();
 }
 
 /// Non-self-repo merge does NOT trigger drain.
@@ -615,6 +777,79 @@ fn build_sha_matching_origin_does_not_drain() {
     assert!(
         !handle.lines.iter().any(|line| line.contains("DRAIN:")),
         "current build SHA must not start a drain: {:?}",
+        handle.lines
+    );
+    handle.stop();
+}
+
+/// With task base develop and self-update branch main, staleness polling must
+/// use refs/heads/main. An advanced develop must not trigger a self-update.
+#[test]
+fn build_staleness_polls_self_update_branch_not_task_base() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let repo = repo_dir.path().to_string_lossy().to_string();
+    Command::new("git")
+        .args(["-C", &repo, "checkout", "-b", "develop"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args([
+            "-C",
+            &repo,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "advance develop",
+        ])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &repo, "checkout", "main"])
+        .status()
+        .unwrap();
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--base-branch",
+            "develop",
+            "--self-update-branch",
+            "main",
+            "--self-update-drain",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("build staleness branch=main", 15),
+        "staleness lookup did not identify self-update branch main: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle
+            .lines
+            .iter()
+            .any(|line| line.contains("decision=Current")),
+        "advanced develop must not make the main self-update build stale: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.child.try_wait().unwrap().is_none(),
+        "polling develop instead of main would request self-update exit: {:?}",
         handle.lines
     );
     handle.stop();
