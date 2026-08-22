@@ -314,6 +314,7 @@ enum PreReviewChecksState {
 struct PreReviewChecksEntry {
     pr: i64,
     head_sha: String,
+    last_head_poll: Option<std::time::Instant>,
     state: PreReviewChecksState,
     consecutive_timeouts: u8,
     timeout_alerted: bool,
@@ -6869,6 +6870,7 @@ async fn poll_pre_review_checks(
             PreReviewChecksEntry {
                 pr,
                 head_sha: head_sha.to_string(),
+                last_head_poll: Some(std::time::Instant::now()),
                 state: PreReviewChecksState::Waiting(handle),
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
@@ -6886,6 +6888,7 @@ async fn poll_pre_review_checks(
     let PreReviewChecksEntry {
         pr: entry_pr,
         head_sha: entry_head_sha,
+        last_head_poll,
         state,
         mut consecutive_timeouts,
         mut timeout_alerted,
@@ -6968,6 +6971,7 @@ async fn poll_pre_review_checks(
             PreReviewChecksEntry {
                 pr: entry_pr,
                 head_sha: entry_head_sha,
+                last_head_poll,
                 state: PreReviewChecksState::Ready,
                 consecutive_timeouts,
                 timeout_alerted,
@@ -6982,6 +6986,7 @@ async fn poll_pre_review_checks(
             PreReviewChecksEntry {
                 pr: entry_pr,
                 head_sha: entry_head_sha,
+                last_head_poll,
                 state: PreReviewChecksState::Retry,
                 consecutive_timeouts,
                 timeout_alerted,
@@ -6989,6 +6994,66 @@ async fn poll_pre_review_checks(
         );
     }
     Ok(gate)
+}
+
+async fn poll_resume_reviewer_pre_review_checks(
+    config: &ServeConfig,
+    waits: &mut HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+) -> Result<(PreReviewChecksGate, String, bool)> {
+    let should_poll = waits.get(&task_id).is_none_or(|entry| {
+        entry.pr != pr
+            || entry.last_head_poll.is_none_or(|last_poll| {
+                last_poll.elapsed() >= Duration::from_secs(config.merge_checks_poll_secs)
+            })
+    });
+    let head_sha = if should_poll {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    } else {
+        waits
+            .get(&task_id)
+            .expect("existing pre-review checks entry")
+            .head_sha
+            .clone()
+    };
+    if !should_poll && head_sha.is_empty() {
+        return Ok((PreReviewChecksGate::Waiting, head_sha, false));
+    }
+    let gate = poll_pre_review_checks(config, waits, task_id, pr, &head_sha).await?;
+    if should_poll {
+        if head_sha.is_empty() {
+            let (consecutive_timeouts, timeout_alerted) = waits
+                .remove(&task_id)
+                .map(|entry| {
+                    if let PreReviewChecksState::Waiting(handle) = entry.state {
+                        handle.abort();
+                    }
+                    (entry.consecutive_timeouts, entry.timeout_alerted)
+                })
+                .unwrap_or((0, false));
+            waits.insert(
+                task_id,
+                PreReviewChecksEntry {
+                    pr,
+                    head_sha: String::new(),
+                    last_head_poll: Some(std::time::Instant::now()),
+                    state: PreReviewChecksState::Retry,
+                    consecutive_timeouts,
+                    timeout_alerted,
+                },
+            );
+        } else if let Some(entry) = waits.get_mut(&task_id) {
+            entry.last_head_poll = Some(std::time::Instant::now());
+        }
+    }
+    Ok((gate, head_sha, should_poll))
 }
 
 async fn notify_pre_review_checks_timeout(
@@ -7220,20 +7285,15 @@ async fn resume_reviewer_after_ci(
         return Ok(true);
     };
 
-    let gated_head_sha = {
-        let repo = config.repo_dir.clone();
-        let executor = Arc::clone(&config.merge_executor);
-        tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    };
-    match poll_pre_review_checks(config, pre_review_checks, task_id, pr, &gated_head_sha).await? {
+    let (ci_gate, gated_head_sha, head_polled) =
+        poll_resume_reviewer_pre_review_checks(config, pre_review_checks, task_id, pr).await?;
+    match ci_gate {
         PreReviewChecksGate::Waiting => {
-            log(&format!(
-                "ResumeReviewer: CI pending for task #{task_id} PR #{pr}; reviewer not fed"
-            ));
+            if head_polled {
+                log(&format!(
+                    "ResumeReviewer: CI pending for task #{task_id} PR #{pr}; reviewer not fed"
+                ));
+            }
             return Ok(false);
         }
         PreReviewChecksGate::Failed { failing_checks } => {
@@ -20996,6 +21056,47 @@ mod tests {
         }
     }
 
+    struct ResumeHeadPollingExecutor {
+        heads: std::sync::Mutex<std::collections::VecDeque<Option<String>>>,
+        head_calls: std::sync::atomic::AtomicUsize,
+        wait_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl merge::MergeExecutor for ResumeHeadPollingExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn wait_for_checks(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            self.wait_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            merge::ChecksOutcome::Pending {
+                reason: "pending".into(),
+            }
+        }
+
+        fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            self.head_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.heads.lock().unwrap().pop_front().flatten()
+        }
+    }
+
     fn pre_review_checks_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
         let profile = crate::serve_config::ModelProfile {
             runner: "codex".into(),
@@ -21049,6 +21150,153 @@ mod tests {
             grok: Default::default(),
             pr_target_program: None,
         }
+    }
+
+    #[tokio::test]
+    async fn resume_reviewer_head_poll_is_throttled_and_restarts_on_new_head() {
+        const TASK_ID: i64 = 377;
+        const PR: i64 = 549;
+        const TICKS: usize = 90;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Arc::new(ResumeHeadPollingExecutor {
+            heads: std::sync::Mutex::new(
+                [
+                    Some("head-a"),
+                    Some("head-a"),
+                    Some("head-a"),
+                    Some("head-b"),
+                ]
+                .into_iter()
+                .map(|head| head.map(str::to_owned))
+                .collect(),
+            ),
+            head_calls: std::sync::atomic::AtomicUsize::new(0),
+            wait_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut config = pre_review_checks_config(dir.path().join("quorum.db"), dir.path().into());
+        config.merge_checks_poll_secs = 30;
+        config.merge_executor = executor.clone();
+        let mut waits: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+
+        for tick in 0..TICKS {
+            if tick > 0 && tick % 30 == 0 {
+                waits.get_mut(&TASK_ID).unwrap().last_head_poll =
+                    Some(std::time::Instant::now() - Duration::from_secs(30));
+            }
+            let (gate, head_sha, _) =
+                poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
+                    .await
+                    .unwrap();
+            assert_eq!(gate, PreReviewChecksGate::Waiting);
+            assert_eq!(head_sha, "head-a");
+        }
+        assert!(
+            executor
+                .head_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                <= TICKS.div_ceil(30) + 1,
+            "head SHA calls exceeded the per-interval bound"
+        );
+
+        let old_handle = tokio::spawn(std::future::pending::<merge::ChecksOutcome>());
+        let old_abort = old_handle.abort_handle();
+        waits.insert(
+            TASK_ID,
+            PreReviewChecksEntry {
+                pr: PR,
+                head_sha: "head-a".into(),
+                last_head_poll: Some(std::time::Instant::now() - Duration::from_secs(30)),
+                state: PreReviewChecksState::Waiting(old_handle),
+                consecutive_timeouts: 0,
+                timeout_alerted: false,
+            },
+        );
+
+        let (gate, head_sha, polled) =
+            poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
+                .await
+                .unwrap();
+        assert_eq!(gate, PreReviewChecksGate::Waiting);
+        assert!(polled);
+        assert_eq!(head_sha, "head-b");
+        tokio::task::yield_now().await;
+        assert!(
+            old_abort.is_finished(),
+            "old wait must be aborted for a new head"
+        );
+        assert_eq!(waits[&TASK_ID].head_sha, "head-b");
+        assert!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "the new head must start a fresh wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_reviewer_unavailable_head_is_throttled_until_it_recovers() {
+        const TASK_ID: i64 = 378;
+        const PR: i64 = 550;
+        const TICKS: usize = 90;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Arc::new(ResumeHeadPollingExecutor {
+            heads: std::sync::Mutex::new(
+                [None, None, None, Some("head-a")]
+                    .into_iter()
+                    .map(|head| head.map(str::to_owned))
+                    .collect(),
+            ),
+            head_calls: std::sync::atomic::AtomicUsize::new(0),
+            wait_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut config = pre_review_checks_config(dir.path().join("quorum.db"), dir.path().into());
+        config.merge_checks_poll_secs = 30;
+        config.merge_executor = executor.clone();
+        let mut waits: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+
+        for tick in 0..TICKS {
+            if tick > 0 && tick % 30 == 0 {
+                waits.get_mut(&TASK_ID).unwrap().last_head_poll =
+                    Some(std::time::Instant::now() - Duration::from_secs(30));
+            }
+            let (gate, head_sha, _) =
+                poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
+                    .await
+                    .unwrap();
+            assert_eq!(gate, PreReviewChecksGate::Waiting);
+            assert!(head_sha.is_empty());
+        }
+        assert_eq!(
+            executor
+                .head_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "unavailable heads must retain their poll cadence"
+        );
+        assert_eq!(waits[&TASK_ID].head_sha, "");
+        assert!(matches!(waits[&TASK_ID].state, PreReviewChecksState::Retry));
+
+        waits.get_mut(&TASK_ID).unwrap().last_head_poll =
+            Some(std::time::Instant::now() - Duration::from_secs(30));
+        let (gate, head_sha, polled) =
+            poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
+                .await
+                .unwrap();
+        assert_eq!(gate, PreReviewChecksGate::Waiting);
+        assert!(polled);
+        assert_eq!(head_sha, "head-a");
+        assert_eq!(waits[&TASK_ID].head_sha, "head-a");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a recovered head must start the normal checks wait"
+        );
     }
 
     #[test]
