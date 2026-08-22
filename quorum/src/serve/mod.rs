@@ -7023,9 +7023,33 @@ async fn poll_resume_reviewer_pre_review_checks(
             .head_sha
             .clone()
     };
+    if !should_poll && head_sha.is_empty() {
+        return Ok((PreReviewChecksGate::Waiting, head_sha, false));
+    }
     let gate = poll_pre_review_checks(config, waits, task_id, pr, &head_sha).await?;
     if should_poll {
-        if let Some(entry) = waits.get_mut(&task_id) {
+        if head_sha.is_empty() {
+            let (consecutive_timeouts, timeout_alerted) = waits
+                .remove(&task_id)
+                .map(|entry| {
+                    if let PreReviewChecksState::Waiting(handle) = entry.state {
+                        handle.abort();
+                    }
+                    (entry.consecutive_timeouts, entry.timeout_alerted)
+                })
+                .unwrap_or((0, false));
+            waits.insert(
+                task_id,
+                PreReviewChecksEntry {
+                    pr,
+                    head_sha: String::new(),
+                    last_head_poll: Some(std::time::Instant::now()),
+                    state: PreReviewChecksState::Retry,
+                    consecutive_timeouts,
+                    timeout_alerted,
+                },
+            );
+        } else if let Some(entry) = waits.get_mut(&task_id) {
             entry.last_head_poll = Some(std::time::Instant::now());
         }
     }
@@ -21033,7 +21057,7 @@ mod tests {
     }
 
     struct ResumeHeadPollingExecutor {
-        heads: std::sync::Mutex<std::collections::VecDeque<String>>,
+        heads: std::sync::Mutex<std::collections::VecDeque<Option<String>>>,
         head_calls: std::sync::atomic::AtomicUsize,
         wait_calls: std::sync::atomic::AtomicUsize,
     }
@@ -21069,7 +21093,7 @@ mod tests {
         fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
             self.head_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.heads.lock().unwrap().pop_front()
+            self.heads.lock().unwrap().pop_front().flatten()
         }
     }
 
@@ -21137,10 +21161,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = Arc::new(ResumeHeadPollingExecutor {
             heads: std::sync::Mutex::new(
-                ["head-a", "head-a", "head-a", "head-b"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect(),
+                [
+                    Some("head-a"),
+                    Some("head-a"),
+                    Some("head-a"),
+                    Some("head-b"),
+                ]
+                .into_iter()
+                .map(|head| head.map(str::to_owned))
+                .collect(),
             ),
             head_calls: std::sync::atomic::AtomicUsize::new(0),
             wait_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -21203,6 +21232,70 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst)
                 >= 2,
             "the new head must start a fresh wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_reviewer_unavailable_head_is_throttled_until_it_recovers() {
+        const TASK_ID: i64 = 378;
+        const PR: i64 = 550;
+        const TICKS: usize = 90;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Arc::new(ResumeHeadPollingExecutor {
+            heads: std::sync::Mutex::new(
+                [None, None, None, Some("head-a")]
+                    .into_iter()
+                    .map(|head| head.map(str::to_owned))
+                    .collect(),
+            ),
+            head_calls: std::sync::atomic::AtomicUsize::new(0),
+            wait_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut config = pre_review_checks_config(dir.path().join("quorum.db"), dir.path().into());
+        config.merge_checks_poll_secs = 30;
+        config.merge_executor = executor.clone();
+        let mut waits: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+
+        for tick in 0..TICKS {
+            if tick > 0 && tick % 30 == 0 {
+                waits.get_mut(&TASK_ID).unwrap().last_head_poll =
+                    Some(std::time::Instant::now() - Duration::from_secs(30));
+            }
+            let (gate, head_sha, _) =
+                poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
+                    .await
+                    .unwrap();
+            assert_eq!(gate, PreReviewChecksGate::Waiting);
+            assert!(head_sha.is_empty());
+        }
+        assert_eq!(
+            executor
+                .head_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "unavailable heads must retain their poll cadence"
+        );
+        assert_eq!(waits[&TASK_ID].head_sha, "");
+        assert!(matches!(waits[&TASK_ID].state, PreReviewChecksState::Retry));
+
+        waits.get_mut(&TASK_ID).unwrap().last_head_poll =
+            Some(std::time::Instant::now() - Duration::from_secs(30));
+        let (gate, head_sha, polled) =
+            poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
+                .await
+                .unwrap();
+        assert_eq!(gate, PreReviewChecksGate::Waiting);
+        assert!(polled);
+        assert_eq!(head_sha, "head-a");
+        assert_eq!(waits[&TASK_ID].head_sha, "head-a");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a recovered head must start the normal checks wait"
         );
     }
 
