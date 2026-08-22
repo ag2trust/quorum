@@ -644,7 +644,7 @@ fn build_sha_advance_drains_and_exits_75() {
         wt_base.path(),
         &names_file,
         "true",
-        &["--self-update-drain", "--sha-poll-interval-secs", "1"],
+        &["--self-update-drain", "--sha-poll-interval-secs", "30"],
     );
 
     assert!(
@@ -660,7 +660,7 @@ fn build_sha_advance_drains_and_exits_75() {
         .unwrap();
 
     assert!(
-        handle.wait_for("decision=Behind", 15),
+        handle.wait_for("decision=Behind", 45),
         "did not observe build SHA advancement: {:?}",
         handle.lines
     );
@@ -755,7 +755,8 @@ fn drain_timeout_force_kills_and_exits_75() {
     //
     // The fake-agent auto-completes its turn, so we rely on timing: if drain triggers
     // BEFORE the result event drains, the slot is still draining=true. With
-    // sha-poll-interval-secs=1, we advance main immediately after spawn.
+    // sha-poll-interval-secs=30, so the next build-SHA check can take up to
+    // one configured interval after we advance main.
     let mut handle = ServeHandle::start(
         home.path(),
         repo_dir.path(),
@@ -769,7 +770,7 @@ fn drain_timeout_force_kills_and_exits_75() {
             "--drain-timeout-secs",
             "3",
             "--sha-poll-interval-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -795,7 +796,7 @@ fn drain_timeout_force_kills_and_exits_75() {
     // (b) timeout after 3s if the agent is still mid-turn
     // Either way, it exits 75.
     assert!(
-        handle.wait_for("DRAIN: all agents finished", 20)
+        handle.wait_for("DRAIN: all agents finished", 45)
             || handle.wait_for("DRAIN: exiting 75", 5),
         "did not see drain exit log: {:?}",
         handle.lines
@@ -883,7 +884,7 @@ fn drain_timeout_honored_during_merge_checks() {
             "--merge-checks-timeout-secs",
             "30",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1052,7 +1053,7 @@ fn pending_checks_timeout_without_drain_enters_merge_wait() {
             "--merge-checks-timeout-secs",
             "3",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 

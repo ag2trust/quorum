@@ -522,7 +522,7 @@ fn rereview_pending_does_not_feed_then_ready_resumes_exactly_once() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     let (worker, _) = drive_to_rework(home.path(), &mut handle);
@@ -593,7 +593,7 @@ fn rereview_failed_ci_reenters_rework_without_feeding_reviewer() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     let (worker, _) = drive_to_rework(home.path(), &mut handle);
@@ -669,7 +669,7 @@ fn head_move_during_ci_wait_discards_old_gate_before_reviewer_spawn() {
             "--merge-checks-timeout-secs",
             "2",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
@@ -754,7 +754,7 @@ fn reviewer_target_move_after_exact_head_check_never_poisoned_durable_fallback()
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
@@ -877,7 +877,7 @@ fn pre_review_pending_waits_without_reviewer_then_ready_spawns() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
@@ -938,7 +938,7 @@ fn pre_review_failed_enters_rework_without_reviewer() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
@@ -1002,7 +1002,7 @@ fn pre_review_pending_survives_daemon_restart() {
         "--merge-checks-timeout-secs",
         "10",
         "--merge-checks-poll-secs",
-        "1",
+        "30",
     ];
     let mut first = ServeHandle::start(
         home.path(),
@@ -1080,7 +1080,7 @@ fn r2_rechecks_ci_before_spawning() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
@@ -1160,7 +1160,7 @@ fn checks_pass_then_merge_succeeds() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1254,7 +1254,7 @@ fn checks_fail_sends_rework() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1358,7 +1358,7 @@ fn checks_timeout_enters_merge_wait() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1499,7 +1499,7 @@ fn checks_pending_then_ready_merges_via_merge_wait() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1614,7 +1614,7 @@ fn checks_pending_then_failed_enters_rework() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1730,7 +1730,7 @@ fn checks_pending_survives_restart() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1806,7 +1806,7 @@ fn checks_pending_survives_restart() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1878,7 +1878,7 @@ fn checks_pending_then_ready_merges_after_wait() {
             "--merge-checks-timeout-secs",
             "15",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1997,7 +1997,7 @@ fn empty_checks_treated_as_pending() {
             "--merge-checks-timeout-secs",
             "15",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -2132,7 +2132,7 @@ fn policy_pending_retries_then_merges() {
             "--merge-checks-timeout-secs",
             "15",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -2260,7 +2260,7 @@ fn approved_without_pr_skips_merge() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -2372,7 +2372,7 @@ fn conflict_during_checks_wait_triggers_rework_not_cancel() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
             "--merge-mergeability-cmd",
             &mergeability_script,
         ],

@@ -960,7 +960,7 @@ fn graceful_drain_defers_merge_remediation_until_restart() {
             "--self-repo",
             "test/repo",
             "--sha-poll-interval-secs",
-            "1",
+            "30",
         ],
         &first_env,
     );
@@ -1008,7 +1008,7 @@ fn graceful_drain_defers_merge_remediation_until_restart() {
     wait_for_gate(&snapshot_gate);
     let approval_mailbox = append_reviewer_approval(home.path(), &r2, 1);
     std::fs::write(&sha_state, format!("{}\trefs/heads/main\n", "f".repeat(40))).unwrap();
-    std::thread::sleep(Duration::from_millis(1_100));
+    std::thread::sleep(Duration::from_secs(31));
     std::fs::remove_file(&snapshot_gate).unwrap();
 
     assert!(

@@ -871,7 +871,7 @@ fi
                 "--merge-checks-timeout-secs",
                 "10",
                 "--merge-checks-poll-secs",
-                "1",
+                "30",
                 "--exit-when-gone",
                 &sentinel.path().to_string_lossy(),
             ]);
@@ -1008,7 +1008,7 @@ fi
                 "--merge-checks-timeout-secs",
                 "10",
                 "--merge-checks-poll-secs",
-                "1",
+                "30",
                 "--exit-when-gone",
                 &sentinel.path().to_string_lossy(),
             ]);

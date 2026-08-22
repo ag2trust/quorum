@@ -23,6 +23,7 @@ use clap::Parser;
 use quorum_core::error::{QuorumError, Result};
 
 const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
+const MIN_EXTERNAL_POLL_INTERVAL_SECS: u64 = 30;
 
 #[derive(serde::Serialize)]
 struct TaskGetView<'a> {
@@ -98,7 +99,7 @@ primary = 100
 ## Merge
 # merge_token_file = \"/path/to/token\"
 # merge_checks_timeout_secs = 900
-# merge_checks_poll_secs = 30
+# merge_checks_poll_secs = 30 # minimum: 30 seconds
 # required_jobs = [\"ci\"]
 # master_ci_gate = false
 # master_ci_timeout_secs = 300
@@ -107,7 +108,7 @@ primary = 100
 # self_update_drain = false
 # drain_timeout_secs = 900
 # self_repo = \"owner/name\"
-# sha_poll_interval_secs = 600
+# sha_poll_interval_secs = 600 # minimum: 30 seconds
 
 ## Diagnostics
 # log_dir = \"/path/to/logs\"
@@ -223,6 +224,16 @@ fn check_nonneg(flag: &str, v: Option<i64>) -> Result<()> {
         Some(n) if n < 0 => Err(QuorumError::Usage(format!("{flag} must be >= 0"))),
         _ => Ok(()),
     }
+}
+
+/// External API polls must leave enough room for service-side rate limits.
+fn validate_external_poll_interval(name: &str, seconds: u64) -> Result<()> {
+    if seconds < MIN_EXTERNAL_POLL_INTERVAL_SECS {
+        return Err(QuorumError::Usage(format!(
+            "{name} must be at least {MIN_EXTERNAL_POLL_INTERVAL_SECS} seconds"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve run identity: explicit `--run-id` flag, then `QUORUM_RUN_ID` env var.
@@ -1374,11 +1385,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_self_repo = resolve_opt_str(self_repo.as_deref(), file_cfg.self_repo.as_deref());
             let r_sha_poll =
                 resolve_val(sha_poll_interval_secs, file_cfg.sha_poll_interval_secs, 600);
-            if r_sha_poll.value == 0 {
-                return Err(QuorumError::Usage(
-                    "sha_poll_interval_secs must be greater than zero".into(),
-                ));
-            }
+            validate_external_poll_interval("sha_poll_interval_secs", r_sha_poll.value)?;
             let r_base_branch = resolve_str(
                 base_branch.as_deref(),
                 file_cfg.base_branch.as_deref(),
@@ -1391,6 +1398,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             );
             let r_merge_checks_poll =
                 resolve_val(merge_checks_poll_secs, file_cfg.merge_checks_poll_secs, 30);
+            validate_external_poll_interval("merge_checks_poll_secs", r_merge_checks_poll.value)?;
             let r_required_jobs: Vec<String> = file_cfg.required_jobs.clone().unwrap_or_default();
             let r_master_ci_gate = resolve_bool(false, file_cfg.master_ci_gate, false);
             let r_master_ci_timeout = resolve_val(None, file_cfg.master_ci_timeout_secs, 300);
@@ -2105,7 +2113,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ttl, resolve_repo_override, wait_child_stdout};
+    use super::{
+        parse_ttl, resolve_repo_override, validate_external_poll_interval, wait_child_stdout,
+    };
 
     #[test]
     fn parse_ttl_units() {
@@ -2142,6 +2152,21 @@ mod tests {
             super::MAX_TTL_SECS
         );
         assert_eq!(parse_ttl("30d").unwrap(), 30 * 86_400);
+    }
+
+    #[test]
+    fn external_poll_intervals_require_30_second_floor() {
+        for name in ["merge_checks_poll_secs", "sha_poll_interval_secs"] {
+            let error = validate_external_poll_interval(name, 10).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert_eq!(
+                error.to_string(),
+                format!("usage: {name} must be at least 30 seconds")
+            );
+
+            assert!(validate_external_poll_interval(name, 30).is_ok());
+        }
+        assert!(validate_external_poll_interval("sha_poll_interval_secs", 600).is_ok());
     }
 
     #[test]

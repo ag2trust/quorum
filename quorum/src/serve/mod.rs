@@ -9045,7 +9045,7 @@ async fn pause_after_mailbox_snapshot_for_test() {
     if !gate.exists() || std::fs::write(&gate, b"captured").is_err() {
         return;
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
     while gate.exists() && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
