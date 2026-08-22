@@ -315,6 +315,10 @@ struct PreReviewChecksEntry {
     pr: i64,
     head_sha: String,
     last_head_poll: Option<std::time::Instant>,
+    // A ready CI result may make one post-gate head/target validation attempt.
+    // Keep failures in this entry so the serve tick cannot repeat those GitHub
+    // reads until the next scheduled head poll.
+    post_gate_validation_attempted: bool,
     state: PreReviewChecksState,
     consecutive_timeouts: u8,
     timeout_alerted: bool,
@@ -6846,6 +6850,9 @@ async fn poll_pre_review_checks(
             }
             PreReviewChecksState::Waiting(_) => {}
             PreReviewChecksState::Retry => {
+                if !pre_review_external_poll_due(config, waits, task_id, pr) {
+                    return Ok(PreReviewChecksGate::Waiting);
+                }
                 let repo = config.repo_dir.clone();
                 let executor = Arc::clone(&config.merge_executor);
                 let timeout = config.merge_checks_timeout_secs;
@@ -6871,6 +6878,7 @@ async fn poll_pre_review_checks(
                 pr,
                 head_sha: head_sha.to_string(),
                 last_head_poll: Some(std::time::Instant::now()),
+                post_gate_validation_attempted: false,
                 state: PreReviewChecksState::Waiting(handle),
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
@@ -6889,6 +6897,7 @@ async fn poll_pre_review_checks(
         pr: entry_pr,
         head_sha: entry_head_sha,
         last_head_poll,
+        post_gate_validation_attempted,
         state,
         mut consecutive_timeouts,
         mut timeout_alerted,
@@ -6972,6 +6981,7 @@ async fn poll_pre_review_checks(
                 pr: entry_pr,
                 head_sha: entry_head_sha,
                 last_head_poll,
+                post_gate_validation_attempted,
                 state: PreReviewChecksState::Ready,
                 consecutive_timeouts,
                 timeout_alerted,
@@ -6987,6 +6997,7 @@ async fn poll_pre_review_checks(
                 pr: entry_pr,
                 head_sha: entry_head_sha,
                 last_head_poll,
+                post_gate_validation_attempted,
                 state: PreReviewChecksState::Retry,
                 consecutive_timeouts,
                 timeout_alerted,
@@ -6996,18 +7007,73 @@ async fn poll_pre_review_checks(
     Ok(gate)
 }
 
+fn pre_review_external_poll_due(
+    config: &ServeConfig,
+    waits: &HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+) -> bool {
+    waits.get(&task_id).is_none_or(|entry| {
+        entry.pr != pr
+            || entry.last_head_poll.is_none_or(|last_poll| {
+                last_poll.elapsed() >= Duration::from_secs(config.merge_checks_poll_secs)
+            })
+    })
+}
+
+/// A ready CI gate gets one post-gate validation attempt. That attempt makes
+/// its own GitHub reads, so an unavailable or moved target must retain this
+/// marker rather than retrying from the 500 ms serve tick. A newly polled head
+/// opens the next scheduled attempt.
+fn take_pre_review_post_gate_validation_slot(
+    waits: &mut HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+    head_polled: bool,
+) -> bool {
+    let Some(entry) = waits.get_mut(&task_id) else {
+        return false;
+    };
+    if entry.pr != pr || !matches!(entry.state, PreReviewChecksState::Ready) {
+        return false;
+    }
+    if head_polled {
+        entry.post_gate_validation_attempted = false;
+    }
+    if entry.post_gate_validation_attempted {
+        return false;
+    }
+    entry.post_gate_validation_attempted = true;
+    true
+}
+
+/// Share one per-PR cadence for pre-review GitHub reads across normal, orphan,
+/// and resumed-reviewer reconciliation.
+async fn poll_pre_review_mergeability_if_due(
+    config: &ServeConfig,
+    waits: &HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+) -> Option<merge::MergeabilityState> {
+    if !pre_review_external_poll_due(config, waits, task_id, pr) {
+        return None;
+    }
+    let executor = Arc::clone(&config.merge_executor);
+    let repo = config.repo_dir.clone();
+    Some(
+        tokio::task::spawn_blocking(move || executor.check_mergeability(pr, &repo))
+            .await
+            .unwrap_or(merge::MergeabilityState::Mergeable),
+    )
+}
+
 async fn poll_resume_reviewer_pre_review_checks(
     config: &ServeConfig,
     waits: &mut HashMap<i64, PreReviewChecksEntry>,
     task_id: i64,
     pr: i64,
 ) -> Result<(PreReviewChecksGate, String, bool)> {
-    let should_poll = waits.get(&task_id).is_none_or(|entry| {
-        entry.pr != pr
-            || entry.last_head_poll.is_none_or(|last_poll| {
-                last_poll.elapsed() >= Duration::from_secs(config.merge_checks_poll_secs)
-            })
-    });
+    let should_poll = pre_review_external_poll_due(config, waits, task_id, pr);
     let head_sha = if should_poll {
         let repo = config.repo_dir.clone();
         let executor = Arc::clone(&config.merge_executor);
@@ -7044,6 +7110,7 @@ async fn poll_resume_reviewer_pre_review_checks(
                     pr,
                     head_sha: String::new(),
                     last_head_poll: Some(std::time::Instant::now()),
+                    post_gate_validation_attempted: false,
                     state: PreReviewChecksState::Retry,
                     consecutive_timeouts,
                     timeout_alerted,
@@ -7314,6 +7381,9 @@ async fn resume_reviewer_after_ci(
         }
         PreReviewChecksGate::Ready => {}
     }
+    if !take_pre_review_post_gate_validation_slot(pre_review_checks, task_id, pr, head_polled) {
+        return Ok(false);
+    }
 
     // Re-resolve immediately before feeding. A changed or unavailable head
     // invalidates the cached result and starts a fresh gate on the next tick.
@@ -7326,7 +7396,6 @@ async fn resume_reviewer_after_ci(
             .flatten()
     };
     if confirmed_head_sha.as_deref() != Some(gated_head_sha.as_str()) {
-        pre_review_checks.remove(&task_id);
         log(&format!(
             "ResumeReviewer: PR #{pr} head moved after CI gate \
              (gated {}, current {}); reviewer not fed",
@@ -7352,7 +7421,6 @@ async fn resume_reviewer_after_ci(
                 source: ReviewerPrTargetSource::Live,
             },
             Err(error) => {
-                pre_review_checks.remove(&task_id);
                 log(&format!(
                     "ResumeReviewer: live PR #{pr} target unavailable ({error}); reviewer not fed"
                 ));
@@ -7369,7 +7437,6 @@ async fn resume_reviewer_after_ci(
     )
     .await?
     {
-        pre_review_checks.remove(&task_id);
         log(&format!("ResumeReviewer: {reason}; reviewer not fed"));
         return Ok(false);
     }
@@ -9105,7 +9172,7 @@ async fn pause_after_mailbox_snapshot_for_test() {
     if !gate.exists() || std::fs::write(&gate, b"captured").is_err() {
         return;
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
     while gate.exists() && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -13319,33 +13386,6 @@ async fn tick(
         let mut pr_closed_workers: Vec<usize> = Vec::new();
         let mut failed_pre_review_checks: Vec<(i64, i64, String, Vec<String>)> = Vec::new();
         for (pr, task_id, wi) in &needs_reviewer_from_workers {
-            let pr_state = {
-                let exec = config.merge_executor.clone();
-                let pr_num = *pr;
-                let repo = config.repo_dir.clone();
-                tokio::task::spawn_blocking(move || exec.check_mergeability(pr_num, &repo))
-                    .await
-                    .unwrap_or(merge::MergeabilityState::Mergeable)
-            };
-            match pr_state {
-                merge::MergeabilityState::AlreadyMerged => {
-                    log(&format!(
-                        "PR #{pr} already merged — firing PrFoundMerged for task #{task_id}"
-                    ));
-                    fire_event(&db_path, "system", *task_id, &Event::PrFoundMerged).await;
-                    pr_closed_workers.push(*wi);
-                    continue;
-                }
-                merge::MergeabilityState::Closed => {
-                    log(&format!(
-                        "PR #{pr} closed without merge — firing PrFoundClosed for task #{task_id}"
-                    ));
-                    fire_event(&db_path, "system", *task_id, &Event::PrFoundClosed).await;
-                    pr_closed_workers.push(*wi);
-                    continue;
-                }
-                _ => {}
-            }
             // #75: detect cross-repo PR before burning provision strikes
             let task_refs = lookup_task_refs(&db_path, *task_id).await;
             if let Some(task_repo) =
@@ -13359,20 +13399,33 @@ async fn tick(
                 repo_mismatch_workers.push((*wi, task_repo));
                 continue;
             }
-            // #190: determine which role is needed and check durable exhaustion.
-            let head_sha = {
-                let repo = config.repo_dir.clone();
-                let executor = Arc::clone(&config.merge_executor);
-                let pr_num = *pr;
-                tokio::task::spawn_blocking(move || executor.head_sha(pr_num, &repo))
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default()
-            };
-            match poll_pre_review_checks(config, pre_review_checks, *task_id, *pr, &head_sha)
-                .await?
+            if let Some(pr_state) =
+                poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await
             {
+                match pr_state {
+                    merge::MergeabilityState::AlreadyMerged => {
+                        log(&format!(
+                            "PR #{pr} already merged — firing PrFoundMerged for task #{task_id}"
+                        ));
+                        fire_event(&db_path, "system", *task_id, &Event::PrFoundMerged).await;
+                        pr_closed_workers.push(*wi);
+                        continue;
+                    }
+                    merge::MergeabilityState::Closed => {
+                        log(&format!(
+                            "PR #{pr} closed without merge — firing PrFoundClosed for task #{task_id}"
+                        ));
+                        fire_event(&db_path, "system", *task_id, &Event::PrFoundClosed).await;
+                        pr_closed_workers.push(*wi);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            let (ci_gate, head_sha, head_polled) =
+                poll_resume_reviewer_pre_review_checks(config, pre_review_checks, *task_id, *pr)
+                    .await?;
+            match ci_gate {
                 PreReviewChecksGate::Waiting => continue,
                 PreReviewChecksGate::Failed { failing_checks } => {
                     failed_pre_review_checks.push((
@@ -13439,8 +13492,16 @@ async fn tick(
                     } else {
                         ReviewRole::R1
                     };
+                    if !take_pre_review_post_gate_validation_slot(
+                        pre_review_checks,
+                        *task_id,
+                        *pr,
+                        head_polled,
+                    ) {
+                        continue;
+                    }
                     let counterpart: ReviewCounterpart = (&workers[*wi]).into();
-                    provision_reviewer(
+                    let provision_outcome = provision_reviewer(
                         config,
                         wt_mgr,
                         name_pool,
@@ -13453,7 +13514,9 @@ async fn tick(
                         false,
                     )
                     .await?;
-                    pre_review_checks.remove(task_id);
+                    if provision_outcome == ReviewerProvisionOutcome::Attached {
+                        pre_review_checks.remove(task_id);
+                    }
                 }
                 Err(e) => {
                     log(&format!(
@@ -13583,64 +13646,62 @@ async fn tick(
             if has_worker || has_reviewer {
                 continue;
             }
-            let pr_state = {
-                let exec = config.merge_executor.clone();
-                let pr_num = *pr;
-                let repo = config.repo_dir.clone();
-                tokio::task::spawn_blocking(move || exec.check_mergeability(pr_num, &repo))
-                    .await
-                    .unwrap_or(merge::MergeabilityState::Mergeable)
-            };
-            match pr_state {
-                merge::MergeabilityState::AlreadyMerged => {
-                    log(&format!(
-                        "PR #{pr} already merged (orphan in-review) — \
-                         firing PrFoundMerged for task #{task_id}"
-                    ));
-                    fire_event(&db_path, "system", *task_id, &Event::PrFoundMerged).await;
-                    continue;
+            if let Some(pr_state) =
+                poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await
+            {
+                match pr_state {
+                    merge::MergeabilityState::AlreadyMerged => {
+                        log(&format!(
+                            "PR #{pr} already merged (orphan in-review) — \
+                             firing PrFoundMerged for task #{task_id}"
+                        ));
+                        fire_event(&db_path, "system", *task_id, &Event::PrFoundMerged).await;
+                        continue;
+                    }
+                    merge::MergeabilityState::Closed => {
+                        log(&format!(
+                            "PR #{pr} closed without merge (orphan in-review) — \
+                             firing PrFoundClosed for task #{task_id}"
+                        ));
+                        fire_event(&db_path, "system", *task_id, &Event::PrFoundClosed).await;
+                        continue;
+                    }
+                    merge::MergeabilityState::Conflicting
+                        if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) =>
+                    {
+                        continue;
+                    }
+                    _ => {}
                 }
-                merge::MergeabilityState::Closed => {
-                    log(&format!(
-                        "PR #{pr} closed without merge (orphan in-review) — \
-                         firing PrFoundClosed for task #{task_id}"
-                    ));
-                    fire_event(&db_path, "system", *task_id, &Event::PrFoundClosed).await;
-                    continue;
-                }
-                merge::MergeabilityState::Conflicting
-                    if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) =>
-                {
-                    continue;
-                }
-                _ => {}
-            }
 
-            // Merge-blocked retry: approved review-only task waiting for
-            // PR to become mergeable again.
-            if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) {
-                if let Some(reviewer_name) = reviewer.as_deref() {
-                    log(&format!(
-                        "merge-blocked task #{task_id} PR #{pr}: \
-                         PR is now mergeable — retrying merge"
-                    ));
-                    set_task_body(&db_path, *task_id, "").await;
-                    fire_event(&db_path, reviewer_name, *task_id, &Event::VerdictApprove).await;
-                } else {
-                    log(&format!(
-                        "merge-blocked task #{task_id} PR #{pr}: \
-                         no reviewer on record — cannot retry merge"
-                    ));
-                    fire_event(
-                        &db_path,
-                        "system",
-                        *task_id,
-                        &Event::AgentFailed {
-                            reason: "merge-blocked but no reviewer to re-approve".into(),
-                        },
-                    )
-                    .await;
+                // Merge-blocked retry: approved review-only task waiting for
+                // PR to become mergeable again.
+                if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) {
+                    if let Some(reviewer_name) = reviewer.as_deref() {
+                        log(&format!(
+                            "merge-blocked task #{task_id} PR #{pr}: \
+                             PR is now mergeable — retrying merge"
+                        ));
+                        set_task_body(&db_path, *task_id, "").await;
+                        fire_event(&db_path, reviewer_name, *task_id, &Event::VerdictApprove).await;
+                    } else {
+                        log(&format!(
+                            "merge-blocked task #{task_id} PR #{pr}: \
+                             no reviewer on record — cannot retry merge"
+                        ));
+                        fire_event(
+                            &db_path,
+                            "system",
+                            *task_id,
+                            &Event::AgentFailed {
+                                reason: "merge-blocked but no reviewer to re-approve".into(),
+                            },
+                        )
+                        .await;
+                    }
+                    continue;
                 }
+            } else if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) {
                 continue;
             }
 
@@ -13672,20 +13733,10 @@ async fn tick(
                 .await;
                 continue;
             }
-            // #190: determine which role is needed and check durable exhaustion.
-            let head_sha = {
-                let repo = config.repo_dir.clone();
-                let executor = Arc::clone(&config.merge_executor);
-                let pr_num = *pr;
-                tokio::task::spawn_blocking(move || executor.head_sha(pr_num, &repo))
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default()
-            };
-            match poll_pre_review_checks(config, pre_review_checks, *task_id, *pr, &head_sha)
-                .await?
-            {
+            let (ci_gate, head_sha, head_polled) =
+                poll_resume_reviewer_pre_review_checks(config, pre_review_checks, *task_id, *pr)
+                    .await?;
+            match ci_gate {
                 PreReviewChecksGate::Waiting => continue,
                 PreReviewChecksGate::Failed { failing_checks } => {
                     pre_review_checks.remove(task_id);
@@ -13776,6 +13827,14 @@ async fn tick(
                     } else {
                         ReviewRole::R1
                     };
+                    if !take_pre_review_post_gate_validation_slot(
+                        pre_review_checks,
+                        *task_id,
+                        *pr,
+                        head_polled,
+                    ) {
+                        continue;
+                    }
                     let branch =
                         if let Some(b) = orphan_worker_branch(author, *task_id, *review_only) {
                             b
@@ -13812,7 +13871,7 @@ async fn tick(
                         task_id: *task_id,
                         branch: &branch,
                     };
-                    provision_reviewer(
+                    let provision_outcome = provision_reviewer(
                         config,
                         wt_mgr,
                         name_pool,
@@ -13825,7 +13884,9 @@ async fn tick(
                         true,
                     )
                     .await?;
-                    pre_review_checks.remove(task_id);
+                    if provision_outcome == ReviewerProvisionOutcome::Attached {
+                        pre_review_checks.remove(task_id);
+                    }
                 }
                 Err(e) => {
                     log(&format!(
@@ -21056,6 +21117,52 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CadencedPreReviewChecks {
+        mergeability_calls: std::sync::atomic::AtomicUsize,
+        head_calls: std::sync::atomic::AtomicUsize,
+        wait_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl merge::MergeExecutor for CadencedPreReviewChecks {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn check_mergeability(&self, _pr: i64, _repo_dir: &Path) -> merge::MergeabilityState {
+            self.mergeability_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            merge::MergeabilityState::Mergeable
+        }
+
+        fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            self.head_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some("head-a".to_string())
+        }
+
+        fn wait_for_checks(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            self.wait_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            merge::ChecksOutcome::TimedOut
+        }
+    }
+
     struct ResumeHeadPollingExecutor {
         heads: std::sync::Mutex<std::collections::VecDeque<Option<String>>>,
         head_calls: std::sync::atomic::AtomicUsize,
@@ -21207,6 +21314,7 @@ mod tests {
                 pr: PR,
                 head_sha: "head-a".into(),
                 last_head_poll: Some(std::time::Instant::now() - Duration::from_secs(30)),
+                post_gate_validation_attempted: false,
                 state: PreReviewChecksState::Waiting(old_handle),
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
@@ -21220,7 +21328,16 @@ mod tests {
         assert_eq!(gate, PreReviewChecksGate::Waiting);
         assert!(polled);
         assert_eq!(head_sha, "head-b");
-        tokio::task::yield_now().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while (!old_abort.is_finished()
+            || executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < 2)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert!(
             old_abort.is_finished(),
             "old wait must be aborted for a new head"
@@ -21233,6 +21350,187 @@ mod tests {
                 >= 2,
             "the new head must start a fresh wait"
         );
+    }
+
+    #[tokio::test]
+    async fn pre_review_external_calls_wait_for_configured_interval() {
+        const TASK_ID: i64 = 379;
+        const PR: i64 = 551;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Arc::new(CadencedPreReviewChecks::default());
+        let mut config = pre_review_checks_config(dir.path().join("quorum.db"), dir.path().into());
+        config.merge_checks_timeout_secs = 1;
+        config.merge_checks_poll_secs = 30;
+        config.merge_executor = executor.clone();
+        let mut waits: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+
+        assert_eq!(
+            poll_pre_review_mergeability_if_due(&config, &waits, TASK_ID, PR).await,
+            Some(merge::MergeabilityState::Mergeable)
+        );
+        let (gate, head_sha, polled) =
+            poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
+                .await
+                .unwrap();
+        assert_eq!(gate, PreReviewChecksGate::Waiting);
+        assert_eq!(head_sha, "head-a");
+        assert!(polled);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while executor
+            .wait_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 1
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        while !matches!(
+            waits.get(&TASK_ID).map(|entry| &entry.state),
+            Some(PreReviewChecksState::Retry)
+        ) && std::time::Instant::now() < deadline
+        {
+            poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(matches!(
+            waits.get(&TASK_ID).map(|entry| &entry.state),
+            Some(PreReviewChecksState::Retry)
+        ));
+
+        for _ in 0..90 {
+            assert_eq!(
+                poll_pre_review_mergeability_if_due(&config, &waits, TASK_ID, PR).await,
+                None
+            );
+            let (gate, _, polled) =
+                poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
+                    .await
+                    .unwrap();
+            assert_eq!(gate, PreReviewChecksGate::Waiting);
+            assert!(!polled);
+        }
+        assert_eq!(
+            executor
+                .mergeability_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            executor
+                .head_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        waits.get_mut(&TASK_ID).unwrap().last_head_poll =
+            Some(std::time::Instant::now() - Duration::from_secs(30));
+        assert_eq!(
+            poll_pre_review_mergeability_if_due(&config, &waits, TASK_ID, PR).await,
+            Some(merge::MergeabilityState::Mergeable)
+        );
+        let (_, _, polled) =
+            poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
+                .await
+                .unwrap();
+        assert!(polled);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while executor
+            .wait_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 2
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            executor
+                .mergeability_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            executor
+                .head_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[test]
+    fn post_gate_target_validation_is_cadenced_after_unavailable_or_moved_targets() {
+        const TASK_ID: i64 = 380;
+        const PR: i64 = 552;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("quorum.db"), dir.path().into());
+        config.merge_checks_poll_secs = 30;
+        for failure in ["unavailable", "moved"] {
+            let mut waits = HashMap::new();
+            waits.insert(
+                TASK_ID,
+                PreReviewChecksEntry {
+                    pr: PR,
+                    head_sha: "head-a".into(),
+                    last_head_poll: Some(std::time::Instant::now()),
+                    post_gate_validation_attempted: false,
+                    state: PreReviewChecksState::Ready,
+                    consecutive_timeouts: 0,
+                    timeout_alerted: false,
+                },
+            );
+
+            let mut validation_attempts = 0;
+            for _ in 0..90 {
+                assert!(
+                    !pre_review_external_poll_due(&config, &waits, TASK_ID, PR),
+                    "{failure} target must not become due between scheduled polls"
+                );
+                if take_pre_review_post_gate_validation_slot(&mut waits, TASK_ID, PR, false) {
+                    // Simulate the post-gate GitHub validation returning this
+                    // failure; its cadence entry must remain for the next tick.
+                    validation_attempts += 1;
+                }
+            }
+            assert_eq!(
+                validation_attempts, 1,
+                "{failure} post-gate validation retried before a new head poll"
+            );
+
+            waits.get_mut(&TASK_ID).unwrap().last_head_poll =
+                Some(std::time::Instant::now() - Duration::from_secs(30));
+            assert!(pre_review_external_poll_due(&config, &waits, TASK_ID, PR));
+            assert!(take_pre_review_post_gate_validation_slot(
+                &mut waits, TASK_ID, PR, true,
+            ));
+            validation_attempts += 1;
+            assert_eq!(
+                validation_attempts, 2,
+                "{failure} validation must resume only with the next scheduled head poll"
+            );
+        }
     }
 
     #[tokio::test]
@@ -21289,7 +21587,15 @@ mod tests {
         assert!(polled);
         assert_eq!(head_sha, "head-a");
         assert_eq!(waits[&TASK_ID].head_sha, "head-a");
-        tokio::task::yield_now().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while executor
+            .wait_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 1
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert_eq!(
             executor
                 .wait_calls
@@ -21332,6 +21638,15 @@ mod tests {
         pr: i64,
         head_sha: &str,
     ) {
+        // Each retry is a distinct scheduled poll, not the next 500 ms tick.
+        if matches!(
+            waits.get(&task_id).map(|entry| &entry.state),
+            Some(PreReviewChecksState::Retry)
+        ) {
+            waits.get_mut(&task_id).unwrap().last_head_poll = Some(
+                std::time::Instant::now() - Duration::from_secs(config.merge_checks_poll_secs),
+            );
+        }
         let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 assert_eq!(

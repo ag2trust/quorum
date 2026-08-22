@@ -556,7 +556,7 @@ fn failed_checks_absent_worker_spawns_remediation() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -754,7 +754,7 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
         &[(
             "GIT_CONFIG_GLOBAL".to_string(),
@@ -2361,7 +2361,7 @@ fn pending_checks_no_remediation() {
             "--merge-checks-timeout-secs",
             "2",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -2483,7 +2483,7 @@ fn rework_cap_bounds_remediation_attempts() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 

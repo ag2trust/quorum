@@ -672,7 +672,7 @@ fn scenario_a_merge_wait_with_dependents() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -794,7 +794,7 @@ fn scenario_a_restart_pending_then_ready_merges() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -830,7 +830,7 @@ fn scenario_a_restart_pending_then_ready_merges() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -936,7 +936,7 @@ fn scenario_b_failed_checks_absent_worker_replacement_cycle() {
             "--merge-checks-timeout-secs",
             "2",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1083,7 +1083,7 @@ fn repeated_pending_never_increments_counters() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1160,7 +1160,7 @@ fn head_sha_change_invalidates_approvals() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1203,7 +1203,7 @@ fn head_sha_change_invalidates_approvals() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1286,7 +1286,7 @@ fn merge_conflict_absent_worker_spawns_remediation() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
             "--merge-mergeability-cmd",
             &mergeability_script,
         ],
@@ -1547,7 +1547,7 @@ fn merge_conflict_live_worker_triggers_rework_respects_cap() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
             "--merge-mergeability-cmd",
             &mergeability_script,
         ],
@@ -1799,7 +1799,7 @@ fn no_duplicate_events_under_restart() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1833,7 +1833,7 @@ fn no_duplicate_events_under_restart() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1911,7 +1911,7 @@ fn agent_runs_end_reasons_truthful() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 

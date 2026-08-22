@@ -283,6 +283,39 @@ fn serve_config_rejects_unknown_keys() {
 }
 
 #[test]
+fn serve_config_rejects_external_poll_intervals_below_30_seconds() {
+    let home = tempfile::tempdir().unwrap();
+
+    for key in ["merge_checks_poll_secs", "sha_poll_interval_secs"] {
+        let config_path = home.path().join(format!("{key}.toml"));
+        std::fs::write(&config_path, format!("{key} = 10\n{ROUTING_POLICY}")).unwrap();
+
+        let output = Command::new(cargo_bin())
+            .env("QUORUM_HOME", home.path())
+            .args([
+                "serve",
+                "--config",
+                &config_path.to_string_lossy(),
+                "--repo",
+                "test/repo",
+                "--repo-dir",
+                "/tmp/x",
+                "--worktree-base",
+                "/tmp/y",
+            ])
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(2), "{key}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("{key} must be at least 30 seconds")),
+            "{key}: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn serve_rejects_removed_fixed_routing_flags() {
     for flag in ["--agent", "--model", "--effort"] {
         let output = Command::new(cargo_bin())

@@ -865,7 +865,7 @@ fn persistent_reviewer_run_insert_error_stops_after_provision_budget() {
         &[],
     );
     assert!(
-        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 30),
+        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 90),
         "persistent failure did not exhaust and park: {:?}",
         handle.lines
     );

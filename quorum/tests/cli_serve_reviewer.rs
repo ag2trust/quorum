@@ -1388,7 +1388,7 @@ fn r2_force_push_window_never_stamps_the_unreviewed_head() {
         handle.lines
     );
     assert!(
-        handle.wait_for("R1: reviewer", 15),
+        handle.wait_for("R1: reviewer", 45),
         "fresh R1 was not provisioned for the moved head: {:?}",
         handle.lines
     );
