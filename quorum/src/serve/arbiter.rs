@@ -242,9 +242,6 @@ pub struct ArbiterSlot {
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
     codex_terminal_candidate: bool,
-    provider: AgentKind,
-    model: String,
-    effort: String,
     assistant_events: u64,
     tool_count: u64,
     session_log: Option<SessionLog>,
@@ -294,12 +291,7 @@ impl ArbiterSlot {
             response_bytes: self.response_text.len() as u64,
             assistant_events: self.assistant_events,
             tool_count: self.tool_count,
-            provider: match self.provider {
-                AgentKind::Claude => "claude",
-                AgentKind::Codex => "codex",
-                AgentKind::Grok => "grok",
-            }
-            .into(),
+            provider: self.provider.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
         }
@@ -406,9 +398,6 @@ pub async fn spawn_arbiter(
         started_at,
         stdout_bytes: 0,
         codex_terminal_candidate: false,
-        provider,
-        model: model.into(),
-        effort: effort.into(),
         assistant_events: 0,
         tool_count: 0,
         session_log: None,
