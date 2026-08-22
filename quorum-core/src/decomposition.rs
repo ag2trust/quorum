@@ -406,9 +406,13 @@ fn planning_attempt_history_is_consistent(
     let mut attempts_by_generation = vec![[0_i64; 2]; generation_count];
     let mut expected_ordinal = [1_i64; 2];
     let mut last_generation = [-1_i64; 2];
+    // Retry eligibility replays only budget-bearing attempts. Observational
+    // rows (including Arbiter verdicts) never consume either retry budget.
     let mut stmt = conn.prepare(
         "SELECT source_revision,kind,ordinal,retry_generation
-         FROM decomposition_attempts WHERE graph_id=?1 ORDER BY kind,ordinal",
+         FROM decomposition_attempts
+         WHERE graph_id=?1 AND kind IN ('proposal','provider')
+         ORDER BY kind,ordinal",
     )?;
     let mut rows = stmt.query([graph_id])?;
     while let Some(row) = rows.next()? {

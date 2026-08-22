@@ -5166,9 +5166,59 @@ async fn record_decomposition_attempt(
 ) -> Result<()> {
     let path = config.db_path.clone();
     let code = code.to_string();
-    let summary = truncate_utf8_bytes(summary, DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES).to_string();
+    let summary = if kind == "verdict" {
+        if summary.len() > DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES {
+            return Err(QuorumError::Usage(
+                "arbiter verdict summary exceeds decomposition attempt cap".into(),
+            ));
+        }
+        summary.to_string()
+    } else {
+        truncate_utf8_bytes(summary, DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES).to_string()
+    };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
+        if kind == "verdict" {
+            // Verdict evidence is observational: it does not consume either
+            // budget or transition the graph. A source cancellation can win
+            // after the Arbiter produces its terminal outcome but before this
+            // write, so record against any extant graph rather than coupling
+            // the evidence to the frozen `validating` lifecycle phase.
+            let tx = quorum_core::db::begin_immediate(&mut conn)?;
+            let row: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT planned_source_revision,operator_retry_count
+                     FROM task_decompositions
+                     WHERE id=?1",
+                    [graph_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((source_revision, retry_generation)) = row {
+                let ordinal: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(ordinal),0)+1 FROM decomposition_attempts
+                     WHERE graph_id=?1 AND source_revision=?2 AND kind='verdict'",
+                    rusqlite::params![graph_id, source_revision],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
+                         retry_generation,reason_code,summary,created_at)
+                     VALUES (?1,?2,'verdict',?3,?4,?5,?6,?7)",
+                    rusqlite::params![
+                        graph_id,
+                        source_revision,
+                        ordinal,
+                        retry_generation,
+                        code,
+                        summary,
+                        now_unix(),
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            return Ok(());
+        }
         quorum_core::decomposition::record_attempt(
             &mut conn,
             graph_id,
@@ -5505,6 +5555,103 @@ async fn reject_decomposition_proposal(
 /// the intermediate bounded before the durable summary truncation.
 const MAX_ARBITER_FINDINGS_IN_SUMMARY: usize = 8;
 
+fn shrink_arbiter_verdict_text(value: &mut String) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    *value = truncate_utf8_bytes(value, value.len() / 2).to_owned();
+    true
+}
+
+/// Render a valid JSON verdict record inside the decomposition-attempt cap.
+/// Reduce only free-text fields and then trailing findings; numeric run metrics
+/// and the required envelope keys always remain available for durable analysis.
+fn bounded_arbiter_verdict_summary(outcome: &arbiter::ArbiterPoll) -> (&'static str, String) {
+    let (reason_code, verdict, metrics, mut findings, blocking_count) = match outcome {
+        arbiter::ArbiterPoll::ProviderFailed { metrics, .. } => (
+            "arbiter-provider",
+            "provider_failed",
+            metrics,
+            Vec::new(),
+            0,
+        ),
+        arbiter::ArbiterPoll::Done { verdict, metrics } => match verdict {
+            arbiter::ArbiterVerdict::Approve => {
+                ("arbiter-approve", "approve", metrics, Vec::new(), 0)
+            }
+            arbiter::ArbiterVerdict::Changes { findings } => {
+                let blocking_count = findings.iter().filter(|finding| finding.blocking).count();
+                let findings = findings
+                    .iter()
+                    .take(MAX_ARBITER_FINDINGS_IN_SUMMARY)
+                    .map(|finding| {
+                        (
+                            if finding.blocking {
+                                "blocking".to_string()
+                            } else {
+                                "advisory".to_string()
+                            },
+                            finding.summary.clone(),
+                        )
+                    })
+                    .collect();
+                (
+                    "arbiter-changes",
+                    "changes",
+                    metrics,
+                    findings,
+                    blocking_count,
+                )
+            }
+            arbiter::ArbiterVerdict::RejectSource { .. } => (
+                "arbiter-reject-source",
+                "reject_source",
+                metrics,
+                Vec::new(),
+                0,
+            ),
+        },
+    };
+    let mut provider = metrics.provider.clone();
+    let mut model = metrics.model.clone();
+    let mut effort = metrics.effort.clone();
+    loop {
+        let summary = serde_json::json!({
+            "verdict": verdict,
+            "findings": findings.iter().map(|(severity, summary)| serde_json::json!({
+                "severity": severity,
+                "summary": summary,
+            })).collect::<Vec<_>>(),
+            "blocking_count": blocking_count,
+            "duration_ms": metrics.duration_ms,
+            "response_bytes": metrics.response_bytes,
+            "assistant_events": metrics.assistant_events,
+            "tool_count": metrics.tool_count,
+            "provider": provider,
+            "model": model,
+            "effort": effort,
+        })
+        .to_string();
+        if summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES {
+            return (reason_code, summary);
+        }
+        if let Some((_, summary)) = findings.iter_mut().max_by_key(|(_, summary)| summary.len()) {
+            if shrink_arbiter_verdict_text(summary) {
+                continue;
+            }
+            findings.pop();
+            continue;
+        }
+        if shrink_arbiter_verdict_text(&mut effort)
+            || shrink_arbiter_verdict_text(&mut model)
+            || shrink_arbiter_verdict_text(&mut provider)
+        {
+            continue;
+        }
+        unreachable!("empty Arbiter verdict envelope fits the attempt cap");
+    }
+}
+
 /// Fold the Arbiter's blocking findings into one bounded rework summary the
 /// planner re-proposes against. Only blocking findings drive a rework round, so
 /// advisory findings are dropped here; the durable write path truncates the
@@ -5551,6 +5698,10 @@ async fn advance_validating_to_preclassifying(config: &ServeConfig, graph_id: i6
 /// toward materialization (Approve), so the caller retains it for the classifier
 /// stage; every other outcome returns `false` and the proposal is discarded.
 ///
+/// Every terminal outcome additionally records one `verdict` attempt with a
+/// bounded JSON run summary; that observational row consumes no budget and
+/// never changes lifecycle state.
+///
 /// - `Approve` (or a `Changes` verdict with no blocking finding) advances
 ///   `validating` -> `preclassifying`; the unchanged classifier/materialize path
 ///   then creates children.
@@ -5566,8 +5717,11 @@ async fn apply_arbiter_verdict(
     graph_id: i64,
     outcome: arbiter::ArbiterPoll,
 ) -> Result<bool> {
+    let (reason_code, verdict_summary) = bounded_arbiter_verdict_summary(&outcome);
+    record_decomposition_attempt(config, graph_id, "verdict", reason_code, &verdict_summary)
+        .await?;
     match outcome {
-        arbiter::ArbiterPoll::ProviderFailed(summary) => {
+        arbiter::ArbiterPoll::ProviderFailed { summary, .. } => {
             record_decomposition_attempt(
                 config,
                 graph_id,
@@ -5578,10 +5732,14 @@ async fn apply_arbiter_verdict(
             .await?;
             Ok(false)
         }
-        arbiter::ArbiterPoll::Done(arbiter::ArbiterVerdict::Approve) => {
-            advance_validating_to_preclassifying(config, graph_id).await
-        }
-        arbiter::ArbiterPoll::Done(arbiter::ArbiterVerdict::Changes { findings }) => {
+        arbiter::ArbiterPoll::Done {
+            verdict: arbiter::ArbiterVerdict::Approve,
+            ..
+        } => advance_validating_to_preclassifying(config, graph_id).await,
+        arbiter::ArbiterPoll::Done {
+            verdict: arbiter::ArbiterVerdict::Changes { findings },
+            ..
+        } => {
             if arbiter::has_blocking(&findings) {
                 let summary = summarize_arbiter_findings(&findings);
                 reject_decomposition_proposal(
@@ -5599,10 +5757,14 @@ async fn apply_arbiter_verdict(
                 advance_validating_to_preclassifying(config, graph_id).await
             }
         }
-        arbiter::ArbiterPoll::Done(arbiter::ArbiterVerdict::RejectSource {
-            reason,
-            required_decision,
-        }) => {
+        arbiter::ArbiterPoll::Done {
+            verdict:
+                arbiter::ArbiterVerdict::RejectSource {
+                    reason,
+                    required_decision,
+                },
+            ..
+        } => {
             let summary = serde_json::json!({
                 "reason": reason,
                 "required_decision": required_decision,
@@ -34015,7 +34177,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut stmt = conn
             .prepare(
                 "SELECT kind,reason_code FROM decomposition_attempts
-                 WHERE graph_id=?1 ORDER BY ordinal",
+                 WHERE graph_id=?1 ORDER BY id",
             )
             .unwrap();
         let rows = stmt
@@ -34024,6 +34186,66 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         rows
+    }
+
+    fn arbiter_gate_verdicts(db_path: &Path, graph: i64) -> Vec<(String, String)> {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT reason_code,summary FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='verdict' ORDER BY ordinal",
+            )
+            .unwrap();
+        stmt.query_map([graph], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn arbiter_test_metrics() -> arbiter::ArbiterRunMetrics {
+        arbiter::ArbiterRunMetrics {
+            duration_ms: 42,
+            response_bytes: 17,
+            assistant_events: 3,
+            tool_count: 2,
+            provider: "codex".into(),
+            model: "gpt-test".into(),
+            effort: "high".into(),
+        }
+    }
+
+    fn arbiter_done(verdict: arbiter::ArbiterVerdict) -> arbiter::ArbiterPoll {
+        arbiter::ArbiterPoll::Done {
+            verdict,
+            metrics: arbiter_test_metrics(),
+        }
+    }
+
+    fn arbiter_provider_failure(summary: &str) -> arbiter::ArbiterPoll {
+        arbiter::ArbiterPoll::ProviderFailed {
+            summary: summary.into(),
+            metrics: arbiter_test_metrics(),
+        }
+    }
+
+    #[test]
+    fn arbiter_verdict_summary_is_valid_json_within_the_attempt_cap() {
+        let outcome = arbiter_done(arbiter::ArbiterVerdict::Changes {
+            findings: (0..MAX_ARBITER_FINDINGS_IN_SUMMARY)
+                .map(|index| arbiter::ArbiterFinding {
+                    blocking: index % 2 == 0,
+                    summary: "\u{0001}é".repeat(8 * 1024),
+                    child_key: format!("child-{index}"),
+                })
+                .collect(),
+        });
+        let (reason_code, summary) = bounded_arbiter_verdict_summary(&outcome);
+        assert_eq!(reason_code, "arbiter-changes");
+        assert!(summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
+        let parsed: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(parsed["verdict"], "changes");
+        assert_eq!(parsed["findings"].as_array().unwrap().len(), 8);
+        assert_eq!(parsed["blocking_count"], 4);
     }
 
     fn arbiter_gate_child_count(db_path: &Path, source: i64) -> (i64, i64) {
@@ -34049,7 +34271,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let advanced = apply_arbiter_verdict(
             &config,
             graph,
-            arbiter::ArbiterPoll::Done(arbiter::ArbiterVerdict::Approve),
+            arbiter_done(arbiter::ArbiterVerdict::Approve),
         )
         .await
         .unwrap();
@@ -34063,7 +34285,24 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(attempts, 0);
         assert!(hold.is_none());
         assert_eq!(status, "planning");
-        assert!(arbiter_gate_attempts(&db_path, graph).is_empty());
+        assert_eq!(
+            arbiter_gate_attempts(&db_path, graph),
+            vec![("verdict".to_string(), "arbiter-approve".to_string())]
+        );
+        let verdicts = arbiter_gate_verdicts(&db_path, graph);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].0, "arbiter-approve");
+        let summary: serde_json::Value = serde_json::from_str(&verdicts[0].1).unwrap();
+        assert_eq!(summary["verdict"], "approve");
+        assert_eq!(summary["findings"], serde_json::json!([]));
+        assert_eq!(summary["blocking_count"], 0);
+        assert_eq!(summary["duration_ms"], 42);
+        assert_eq!(summary["response_bytes"], 17);
+        assert_eq!(summary["assistant_events"], 3);
+        assert_eq!(summary["tool_count"], 2);
+        assert_eq!(summary["provider"], "codex");
+        assert_eq!(summary["model"], "gpt-test");
+        assert_eq!(summary["effort"], "high");
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
 
         // A restart that re-polls a fresh Arbiter cannot double-advance: the
@@ -34077,6 +34316,53 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
         assert_eq!(arbiter_gate_state(&db_path, graph).0, "preclassifying");
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn arbiter_verdict_records_when_source_cancellation_wins_after_terminal_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cancelled-arbiter.db");
+        let proposal = arbiter_gate_proposal();
+        let (source, graph) = arbiter_validating_graph(&db_path, "large", None, &proposal);
+        let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+
+        // The Arbiter has already produced its terminal result when source
+        // cancellation wins. The guarded lifecycle transition must remain a
+        // no-op, but the observational verdict is still durable evidence for
+        // this extant (now cancelled) graph.
+        let outcome = arbiter_done(arbiter::ArbiterVerdict::Approve);
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            quorum_core::decomposition::cancel_source_graph(
+                &mut conn,
+                "owner",
+                source,
+                Some(1),
+                5,
+            )
+            .unwrap(),
+            quorum_core::decomposition::SourceCancellation::Cancelled
+        );
+        drop(conn);
+
+        assert!(
+            !apply_arbiter_verdict(&config, graph, outcome)
+                .await
+                .unwrap(),
+            "cancellation wins the guarded validating -> preclassifying transition"
+        );
+        let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
+        assert_eq!(state, "cancelled");
+        assert_eq!(attempts, 0);
+        assert!(hold.is_none());
+        assert_eq!(status, "cancelled");
+        assert_eq!(
+            arbiter_gate_attempts(&db_path, graph),
+            vec![("verdict".to_string(), "arbiter-approve".to_string())]
+        );
+        let verdicts = arbiter_gate_verdicts(&db_path, graph);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].0, "arbiter-approve");
     }
 
     #[tokio::test]
@@ -34094,12 +34380,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 child_key: "core".into(),
             }],
         };
-        let advanced = apply_arbiter_verdict(&config, graph, arbiter::ArbiterPoll::Done(verdict))
+        let advanced = apply_arbiter_verdict(&config, graph, arbiter_done(verdict))
             .await
             .unwrap();
         assert!(advanced);
         assert_eq!(arbiter_gate_state(&db_path, graph).0, "preclassifying");
-        assert!(arbiter_gate_attempts(&db_path, graph).is_empty());
+        assert_eq!(
+            arbiter_gate_attempts(&db_path, graph),
+            vec![("verdict".to_string(), "arbiter-changes".to_string())]
+        );
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
     }
 
@@ -34118,7 +34407,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 child_key: "core".into(),
             }],
         };
-        let advanced = apply_arbiter_verdict(&config, graph, arbiter::ArbiterPoll::Done(verdict))
+        let advanced = apply_arbiter_verdict(&config, graph, arbiter_done(verdict))
             .await
             .unwrap();
         assert!(!advanced, "a blocking changes verdict does not advance");
@@ -34133,7 +34422,22 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(status, "planning");
         assert_eq!(
             arbiter_gate_attempts(&db_path, graph),
-            vec![("proposal".to_string(), "arbiter-changes".to_string())]
+            vec![
+                ("verdict".to_string(), "arbiter-changes".to_string()),
+                ("proposal".to_string(), "arbiter-changes".to_string()),
+            ]
+        );
+        let verdicts = arbiter_gate_verdicts(&db_path, graph);
+        assert_eq!(verdicts.len(), 1);
+        let summary: serde_json::Value = serde_json::from_str(&verdicts[0].1).unwrap();
+        assert_eq!(summary["verdict"], "changes");
+        assert_eq!(summary["blocking_count"], 1);
+        assert_eq!(
+            summary["findings"],
+            serde_json::json!([{
+                "severity": "blocking",
+                "summary": "dropped a load-bearing source constraint",
+            }])
         );
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
     }
@@ -34167,7 +34471,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     child_key: String::new(),
                 }],
             };
-            apply_arbiter_verdict(&config, graph, arbiter::ArbiterPoll::Done(verdict))
+            apply_arbiter_verdict(&config, graph, arbiter_done(verdict))
                 .await
                 .unwrap();
         }
@@ -34177,10 +34481,43 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(state, "held");
         assert_eq!(hold.as_deref(), Some("proposal-attempts-exhausted"));
         assert_eq!(status, "failed");
-        assert_eq!(arbiter_gate_attempts(&db_path, graph).len(), 3);
-        assert!(arbiter_gate_attempts(&db_path, graph)
-            .iter()
-            .all(|(kind, code)| kind == "proposal" && code == "arbiter-changes"));
+        assert_eq!(arbiter_gate_attempts(&db_path, graph).len(), 6);
+        assert_eq!(arbiter_gate_verdicts(&db_path, graph).len(), 3);
+        assert_eq!(
+            arbiter_gate_attempts(&db_path, graph)
+                .iter()
+                .filter(|(kind, _)| kind == "proposal")
+                .count(),
+            3
+        );
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            quorum_core::decomposition::retry_exhausted_planning(
+                &mut conn,
+                source,
+                "operator",
+                20,
+            )
+            .unwrap(),
+            quorum_core::decomposition::PlanningRetryOutcome::Retried {
+                graph_id: graph,
+                generation: 1,
+            },
+            "observational Arbiter verdict rows do not consume proposal retry budget"
+        );
+        let resumed: (String, i64, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.proposal_attempts,d.operator_retry_count,t.status
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            resumed,
+            ("provider-backoff".into(), 0, 1, "planning".into())
+        );
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
     }
 
@@ -34196,7 +34533,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             reason: "source is too underspecified to split safely".into(),
             required_decision: "owner must choose a storage format".into(),
         };
-        let advanced = apply_arbiter_verdict(&config, graph, arbiter::ArbiterPoll::Done(verdict))
+        let advanced = apply_arbiter_verdict(&config, graph, arbiter_done(verdict))
             .await
             .unwrap();
         assert!(!advanced);
@@ -34208,7 +34545,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(status, "failed");
         assert_eq!(
             arbiter_gate_attempts(&db_path, graph),
-            vec![("blocker".to_string(), "arbiter-reject-source".to_string())]
+            vec![
+                ("verdict".to_string(), "arbiter-reject-source".to_string()),
+                ("blocker".to_string(), "arbiter-reject-source".to_string()),
+            ]
         );
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
     }
@@ -34224,7 +34564,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let advanced = apply_arbiter_verdict(
             &config,
             graph,
-            arbiter::ArbiterPoll::ProviderFailed("malformed verdict".into()),
+            arbiter_provider_failure("malformed verdict"),
         )
         .await
         .unwrap();
@@ -34235,7 +34575,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(attempts, 0, "a provider failure charges no proposal budget");
         assert_eq!(
             arbiter_gate_attempts(&db_path, graph),
-            vec![("provider".to_string(), "arbiter-provider".to_string())]
+            vec![
+                ("verdict".to_string(), "arbiter-provider".to_string()),
+                ("provider".to_string(), "arbiter-provider".to_string()),
+            ]
         );
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
     }
@@ -35927,7 +36270,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .unwrap();
         assert!(matches!(
             arbiter::poll_arbiter(&mut arbiter_slot).await,
-            Some(arbiter::ArbiterPoll::ProviderFailed(_))
+            Some(arbiter::ArbiterPoll::ProviderFailed { .. })
         ));
 
         for log_dir in [&planner_log_dir, &arbiter_log_dir] {

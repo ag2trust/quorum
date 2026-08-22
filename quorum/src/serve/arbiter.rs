@@ -242,6 +242,8 @@ pub struct ArbiterSlot {
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
     codex_terminal_candidate: bool,
+    assistant_events: u64,
+    tool_count: u64,
     session_log: Option<SessionLog>,
 }
 
@@ -282,6 +284,32 @@ impl ArbiterSlot {
             session_log.finalize(None);
         }
     }
+
+    fn run_metrics(&self) -> ArbiterRunMetrics {
+        ArbiterRunMetrics {
+            duration_ms: self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            response_bytes: self.response_text.len() as u64,
+            assistant_events: self.assistant_events,
+            tool_count: self.tool_count,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        }
+    }
+}
+
+/// Bounded transport and provider metadata captured for one terminal Arbiter
+/// run. The daemon persists this alongside the closed verdict, including when
+/// the provider/protocol fails before it emits a valid verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArbiterRunMetrics {
+    pub duration_ms: u64,
+    pub response_bytes: u64,
+    pub assistant_events: u64,
+    pub tool_count: u64,
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
 }
 
 /// Terminal transport outcome. A valid verdict is `Done`; every other terminal
@@ -291,8 +319,14 @@ impl ArbiterSlot {
 /// fabricates a `Changes` verdict from one.
 #[derive(Debug)]
 pub enum ArbiterPoll {
-    Done(ArbiterVerdict),
-    ProviderFailed(String),
+    Done {
+        verdict: ArbiterVerdict,
+        metrics: ArbiterRunMetrics,
+    },
+    ProviderFailed {
+        summary: String,
+        metrics: ArbiterRunMetrics,
+    },
 }
 
 /// Spawn only the provider selected by the durable role assignment. There is no
@@ -364,14 +398,19 @@ pub async fn spawn_arbiter(
         started_at,
         stdout_bytes: 0,
         codex_terminal_candidate: false,
+        assistant_events: 0,
+        tool_count: 0,
         session_log: None,
     })
 }
 
 /// Build a bounded `ProviderFailed` outcome from a compact reason. The reason is
 /// truncated on a UTF-8 boundary; provider payload text never enters it.
-fn provider_failure(reason: &str) -> ArbiterPoll {
-    ArbiterPoll::ProviderFailed(truncate_utf8(reason, MAX_FAILURE_SUMMARY_BYTES).to_owned())
+fn provider_failure(slot: &ArbiterSlot, reason: &str) -> ArbiterPoll {
+    ArbiterPoll::ProviderFailed {
+        summary: truncate_utf8(reason, MAX_FAILURE_SUMMARY_BYTES).to_owned(),
+        metrics: slot.run_metrics(),
+    }
 }
 
 fn stderr_capture_was_truncated(output: &[CapturedOutput]) -> bool {
@@ -391,9 +430,12 @@ fn stderr_capture_was_truncated(output: &[CapturedOutput]) -> bool {
 /// `Changes` verdict.
 fn parsed_poll(slot: &ArbiterSlot) -> ArbiterPoll {
     match parse_verdict(&slot.response_text) {
-        Ok(verdict) => ArbiterPoll::Done(verdict),
-        Err(ArbiterParseError::Provider(error)) => provider_failure(&error),
-        Err(ArbiterParseError::Semantic(error)) => provider_failure(&error),
+        Ok(verdict) => ArbiterPoll::Done {
+            verdict,
+            metrics: slot.run_metrics(),
+        },
+        Err(ArbiterParseError::Provider(error)) => provider_failure(slot, &error),
+        Err(ArbiterParseError::Semantic(error)) => provider_failure(slot, &error),
     }
 }
 
@@ -402,7 +444,7 @@ fn parsed_poll(slot: &ArbiterSlot) -> ArbiterPoll {
 /// `poll_planner` terminal-message handling as-is.
 pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
     if slot.started_at.elapsed() >= ARBITER_TIMEOUT {
-        return Some(provider_failure("arbiter timed out"));
+        return Some(provider_failure(slot, "arbiter timed out"));
     }
     let remaining = ARBITER_TIMEOUT.saturating_sub(slot.started_at.elapsed());
     let poll_for = remaining.min(Duration::from_secs(2));
@@ -430,7 +472,7 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
                 } else {
                     format!("arbiter stdout read failed: {error}")
                 };
-                return Some(provider_failure(&reason));
+                return Some(provider_failure(slot, &reason));
             }
         };
         let events = match slot.proc.kind() {
@@ -454,22 +496,26 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
             }
         }
         if slot.stdout_bytes > MAX_STDOUT_BYTES {
-            return Some(provider_failure(&format!(
-                "arbiter stdout exceeded {} KiB",
-                MAX_STDOUT_BYTES / 1024
-            )));
+            return Some(provider_failure(
+                slot,
+                &format!("arbiter stdout exceeded {} KiB", MAX_STDOUT_BYTES / 1024),
+            ));
         }
         if slot.codex_terminal_candidate {
             return Some(provider_failure(
+                slot,
                 "arbiter provider emitted output after terminal response",
             ));
         }
         if slot.proc.kind() == AgentKind::Codex {
             if let Some(failure) = slot.proc.observed_planner_live_failure() {
-                return Some(provider_failure(&format!(
-                    "arbiter provider protocol failed ({})",
-                    failure.disposition()
-                )));
+                return Some(provider_failure(
+                    slot,
+                    &format!(
+                        "arbiter provider protocol failed ({})",
+                        failure.disposition()
+                    ),
+                ));
             }
         }
         if slot.proc.kind() == AgentKind::Claude {
@@ -478,7 +524,7 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
             }) = super::stream::parse_line(&raw)
             {
                 if is_error.unwrap_or(false) {
-                    return Some(provider_failure("arbiter provider returned an error"));
+                    return Some(provider_failure(slot, "arbiter provider returned an error"));
                 }
                 // Claude streams its terminal response as the `Result` payload:
                 // replace the buffer so only the terminal message is judged.
@@ -492,7 +538,7 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
         for event in events {
             match event {
                 AgentEvent::TurnFailed { .. } => {
-                    return Some(provider_failure("arbiter provider turn failed"));
+                    return Some(provider_failure(slot, "arbiter provider turn failed"));
                 }
                 AgentEvent::TurnCompleted { .. } => {
                     if slot.proc.kind() == AgentKind::Codex {
@@ -509,34 +555,46 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
                     // only the latest one: the final message is the response
                     // candidate. Codex started agent-message events are provisional
                     // and ignored in favor of the provider-confirmed completed event.
+                    slot.assistant_events = slot.assistant_events.saturating_add(1);
                     if slot.proc.kind() == AgentKind::Claude {
                         if text.len() > MAX_RESPONSE_BYTES {
-                            return Some(provider_failure("arbiter response exceeded 64 KiB"));
+                            return Some(provider_failure(
+                                slot,
+                                "arbiter response exceeded 64 KiB",
+                            ));
                         }
                         slot.response_text = text;
                     }
                 }
                 AgentEvent::CompletedAssistantText { text, .. } => {
+                    slot.assistant_events = slot.assistant_events.saturating_add(1);
                     if text.len() > MAX_RESPONSE_BYTES {
-                        return Some(provider_failure("arbiter response exceeded 64 KiB"));
+                        return Some(provider_failure(slot, "arbiter response exceeded 64 KiB"));
                     }
                     // Retain only the latest completed message (the #59 fix): a
                     // later completed message overwrites an earlier candidate.
                     slot.response_text = text;
                 }
+                AgentEvent::Activity {
+                    kind: super::runner::ActivityKind::ToolUse,
+                    ..
+                } => {
+                    slot.tool_count = slot.tool_count.saturating_add(1);
+                }
                 _ => {}
             }
         }
         if slot.started_at.elapsed() >= ARBITER_TIMEOUT {
-            return Some(provider_failure("arbiter timed out"));
+            return Some(provider_failure(slot, "arbiter timed out"));
         }
     }
     let status = match slot.proc.try_wait() {
         Ok(status) => status,
         Err(error) => {
-            return Some(provider_failure(&format!(
-                "arbiter process status unavailable: {error}"
-            )));
+            return Some(provider_failure(
+                slot,
+                &format!("arbiter process status unavailable: {error}"),
+            ));
         }
     };
     if slot.proc.kind() == AgentKind::Codex && slot.codex_terminal_candidate && stdout_complete {
@@ -544,26 +602,33 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
         let evidence = slot.proc.finalize_pre_authoritative_evidence().await;
         if !status.success() {
             if let Some(failure) = slot.proc.observed_strict_pre_authoritative_failure() {
-                return Some(provider_failure(&format!(
+                return Some(provider_failure(slot, &format!(
                     "arbiter provider exited unsuccessfully after terminal response ({}) at {status}: {}",
                     failure.disposition(),
                     failure.detail()
                 )));
             }
-            return Some(provider_failure(&format!(
-                "arbiter provider exited unsuccessfully after terminal response: {status}"
-            )));
+            return Some(provider_failure(
+                slot,
+                &format!(
+                    "arbiter provider exited unsuccessfully after terminal response: {status}"
+                ),
+            ));
         }
         if stderr_capture_was_truncated(&evidence) {
             return Some(provider_failure(
+                slot,
                 "arbiter stderr exceeded bounded diagnostic capture",
             ));
         }
         if let Some(failure) = slot.proc.observed_planner_terminal_failure() {
-            return Some(provider_failure(&format!(
-                "arbiter provider terminal evidence failed ({})",
-                failure.disposition()
-            )));
+            return Some(provider_failure(
+                slot,
+                &format!(
+                    "arbiter provider terminal evidence failed ({})",
+                    failure.disposition()
+                ),
+            ));
         }
         return Some(parsed_poll(slot));
     }
@@ -571,17 +636,22 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
         let evidence = slot.proc.finalize_pre_authoritative_evidence().await;
         if stderr_capture_was_truncated(&evidence) {
             return Some(provider_failure(
+                slot,
                 "arbiter stderr exceeded bounded diagnostic capture",
             ));
         }
         if let Some(failure) = slot.proc.classify_pre_authoritative_exit(status) {
-            return Some(provider_failure(&format!(
-                "arbiter provider exited without a terminal response ({}): {}",
-                failure.disposition(),
-                failure.detail()
-            )));
+            return Some(provider_failure(
+                slot,
+                &format!(
+                    "arbiter provider exited without a terminal response ({}): {}",
+                    failure.disposition(),
+                    failure.detail()
+                ),
+            ));
         }
         return Some(provider_failure(
+            slot,
             "arbiter exited without a terminal response",
         ));
     }
@@ -710,7 +780,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut slot = spawn_fake_arbiter(dir.path(), APPROVE_STREAM).await;
         match poll_to_terminal(&mut slot).await {
-            ArbiterPoll::Done(ArbiterVerdict::Approve) => {}
+            ArbiterPoll::Done {
+                verdict: ArbiterVerdict::Approve,
+                metrics,
+            } => {
+                assert_eq!(metrics.provider, "codex");
+                assert!(metrics.response_bytes > 0);
+                assert!(metrics.assistant_events > 0);
+            }
             other => panic!("expected approve, got {other:?}"),
         }
         slot.kill_and_reap().await;
@@ -762,7 +839,10 @@ mod tests {
         let mut slot = spawn_fake_claude_arbiter(dir.path(), &output).await;
         assert!(matches!(
             poll_to_terminal(&mut slot).await,
-            ArbiterPoll::Done(ArbiterVerdict::Approve)
+            ArbiterPoll::Done {
+                verdict: ArbiterVerdict::Approve,
+                ..
+            }
         ));
         assert_eq!(slot.response_text, r#"{"outcome":"approve"}"#);
         slot.kill_and_reap().await;
@@ -780,7 +860,7 @@ mod tests {
         let mut slot = spawn_fake_claude_arbiter(dir.path(), &output).await;
         assert!(matches!(
             poll_to_terminal(&mut slot).await,
-            ArbiterPoll::ProviderFailed(_)
+            ArbiterPoll::ProviderFailed { .. }
         ));
         slot.kill_and_reap().await;
     }
@@ -797,7 +877,8 @@ mod tests {
         let mut slot = spawn_fake_claude_arbiter(dir.path(), &output).await;
         assert!(matches!(
             poll_to_terminal(&mut slot).await,
-            ArbiterPoll::ProviderFailed(ref message) if message.contains("response exceeded")
+            ArbiterPoll::ProviderFailed { ref summary, .. }
+                if summary.contains("response exceeded")
         ));
         slot.kill_and_reap().await;
     }
@@ -809,7 +890,7 @@ mod tests {
         let mut slot = spawn_fake_arbiter(dir.path(), ERROR_STREAM).await;
         assert!(matches!(
             poll_to_terminal(&mut slot).await,
-            ArbiterPoll::ProviderFailed(_)
+            ArbiterPoll::ProviderFailed { .. }
         ));
         slot.kill_and_reap().await;
     }
@@ -830,7 +911,7 @@ mod tests {
         let mut slot = spawn_fake_arbiter(dir.path(), stream).await;
         assert!(matches!(
             poll_to_terminal(&mut slot).await,
-            ArbiterPoll::ProviderFailed(_)
+            ArbiterPoll::ProviderFailed { .. }
         ));
         slot.kill_and_reap().await;
     }
