@@ -4264,11 +4264,14 @@ fn build_staleness_decision(build_sha: &str, remote_sha: &str) -> BuildStaleness
     }
 }
 
-/// Snapshot the sha of origin's base branch via a bounded `git ls-remote`.
+/// Snapshot the sha of origin's self-update branch via a bounded `git ls-remote`.
 /// This runs outside DB work; inability to reach origin is an operational
 /// warning, not a daemon failure.
-fn poll_origin_base_sha(repo_dir: &std::path::Path, base_branch: &str) -> Result<String> {
-    let refspec = format!("refs/heads/{}", base_branch);
+fn poll_origin_self_update_sha(
+    repo_dir: &std::path::Path,
+    self_update_branch: &str,
+) -> Result<String> {
+    let refspec = format!("refs/heads/{}", self_update_branch);
     let mut child = std::process::Command::new("git")
         .args(["ls-remote", "origin", &refspec])
         .current_dir(repo_dir)
@@ -8922,7 +8925,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             let repo_dir = config.repo_dir.clone();
             let self_update_branch = config.self_update_branch.clone();
             match tokio::task::spawn_blocking(move || {
-                poll_origin_base_sha(&repo_dir, &self_update_branch)
+                poll_origin_self_update_sha(&repo_dir, &self_update_branch)
             })
                 .await
             {
@@ -8933,7 +8936,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     Some(build_sha) => {
                         let decision = build_staleness_decision(&build_sha, &remote_sha);
                         log(&format!(
-                            "self-update-drain: build staleness running_sha={build_sha} remote_sha={remote_sha} decision={decision:?}"
+                            "self-update-drain: build staleness branch={} running_sha={build_sha} remote_sha={remote_sha} decision={decision:?}",
+                            config.self_update_branch,
                         ));
                         if decision == BuildStalenessDecision::Behind {
                             log(&format!(
@@ -11421,7 +11425,10 @@ async fn tick(
                         spawn_post_merge_collector(config, pr_num, reviewer_task_id);
                         enqueue_interpret_job(&db_path, pr_num, reviewer_task_id, &config.repo)
                             .await;
-                        if config.self_update_drain && config.self_repo.is_some() {
+                        if config.self_update_drain
+                            && config.self_repo.is_some()
+                            && effective_base_branch == config.self_update_branch
+                        {
                             let sha = format!("post-merge-pr-{pr_num}");
                             drain_state.start_drain(&sha);
                         }
@@ -27718,7 +27725,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     #[test]
     fn origin_poll_failure_is_nonfatal_result() {
         let repo = tempfile::tempdir().unwrap();
-        assert!(poll_origin_base_sha(repo.path(), "main").is_err());
+        assert!(poll_origin_self_update_sha(repo.path(), "main").is_err());
     }
 
     #[test]
