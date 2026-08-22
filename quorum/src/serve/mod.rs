@@ -315,6 +315,10 @@ struct PreReviewChecksEntry {
     pr: i64,
     head_sha: String,
     last_head_poll: Option<std::time::Instant>,
+    // A ready CI result may make one post-gate head/target validation attempt.
+    // Keep failures in this entry so the serve tick cannot repeat those GitHub
+    // reads until the next scheduled head poll.
+    post_gate_validation_attempted: bool,
     state: PreReviewChecksState,
     consecutive_timeouts: u8,
     timeout_alerted: bool,
@@ -6874,6 +6878,7 @@ async fn poll_pre_review_checks(
                 pr,
                 head_sha: head_sha.to_string(),
                 last_head_poll: Some(std::time::Instant::now()),
+                post_gate_validation_attempted: false,
                 state: PreReviewChecksState::Waiting(handle),
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
@@ -6892,6 +6897,7 @@ async fn poll_pre_review_checks(
         pr: entry_pr,
         head_sha: entry_head_sha,
         last_head_poll,
+        post_gate_validation_attempted,
         state,
         mut consecutive_timeouts,
         mut timeout_alerted,
@@ -6975,6 +6981,7 @@ async fn poll_pre_review_checks(
                 pr: entry_pr,
                 head_sha: entry_head_sha,
                 last_head_poll,
+                post_gate_validation_attempted,
                 state: PreReviewChecksState::Ready,
                 consecutive_timeouts,
                 timeout_alerted,
@@ -6990,6 +6997,7 @@ async fn poll_pre_review_checks(
                 pr: entry_pr,
                 head_sha: entry_head_sha,
                 last_head_poll,
+                post_gate_validation_attempted,
                 state: PreReviewChecksState::Retry,
                 consecutive_timeouts,
                 timeout_alerted,
@@ -7011,6 +7019,32 @@ fn pre_review_external_poll_due(
                 last_poll.elapsed() >= Duration::from_secs(config.merge_checks_poll_secs)
             })
     })
+}
+
+/// A ready CI gate gets one post-gate validation attempt. That attempt makes
+/// its own GitHub reads, so an unavailable or moved target must retain this
+/// marker rather than retrying from the 500 ms serve tick. A newly polled head
+/// opens the next scheduled attempt.
+fn take_pre_review_post_gate_validation_slot(
+    waits: &mut HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+    head_polled: bool,
+) -> bool {
+    let Some(entry) = waits.get_mut(&task_id) else {
+        return false;
+    };
+    if entry.pr != pr || !matches!(entry.state, PreReviewChecksState::Ready) {
+        return false;
+    }
+    if head_polled {
+        entry.post_gate_validation_attempted = false;
+    }
+    if entry.post_gate_validation_attempted {
+        return false;
+    }
+    entry.post_gate_validation_attempted = true;
+    true
 }
 
 /// Share one per-PR cadence for pre-review GitHub reads across normal, orphan,
@@ -7076,6 +7110,7 @@ async fn poll_resume_reviewer_pre_review_checks(
                     pr,
                     head_sha: String::new(),
                     last_head_poll: Some(std::time::Instant::now()),
+                    post_gate_validation_attempted: false,
                     state: PreReviewChecksState::Retry,
                     consecutive_timeouts,
                     timeout_alerted,
@@ -7346,6 +7381,9 @@ async fn resume_reviewer_after_ci(
         }
         PreReviewChecksGate::Ready => {}
     }
+    if !take_pre_review_post_gate_validation_slot(pre_review_checks, task_id, pr, head_polled) {
+        return Ok(false);
+    }
 
     // Re-resolve immediately before feeding. A changed or unavailable head
     // invalidates the cached result and starts a fresh gate on the next tick.
@@ -7358,7 +7396,6 @@ async fn resume_reviewer_after_ci(
             .flatten()
     };
     if confirmed_head_sha.as_deref() != Some(gated_head_sha.as_str()) {
-        pre_review_checks.remove(&task_id);
         log(&format!(
             "ResumeReviewer: PR #{pr} head moved after CI gate \
              (gated {}, current {}); reviewer not fed",
@@ -7384,7 +7421,6 @@ async fn resume_reviewer_after_ci(
                 source: ReviewerPrTargetSource::Live,
             },
             Err(error) => {
-                pre_review_checks.remove(&task_id);
                 log(&format!(
                     "ResumeReviewer: live PR #{pr} target unavailable ({error}); reviewer not fed"
                 ));
@@ -7401,7 +7437,6 @@ async fn resume_reviewer_after_ci(
     )
     .await?
     {
-        pre_review_checks.remove(&task_id);
         log(&format!("ResumeReviewer: {reason}; reviewer not fed"));
         return Ok(false);
     }
@@ -13387,7 +13422,7 @@ async fn tick(
                     _ => {}
                 }
             }
-            let (ci_gate, head_sha, _) =
+            let (ci_gate, head_sha, head_polled) =
                 poll_resume_reviewer_pre_review_checks(config, pre_review_checks, *task_id, *pr)
                     .await?;
             match ci_gate {
@@ -13457,8 +13492,16 @@ async fn tick(
                     } else {
                         ReviewRole::R1
                     };
+                    if !take_pre_review_post_gate_validation_slot(
+                        pre_review_checks,
+                        *task_id,
+                        *pr,
+                        head_polled,
+                    ) {
+                        continue;
+                    }
                     let counterpart: ReviewCounterpart = (&workers[*wi]).into();
-                    provision_reviewer(
+                    let provision_outcome = provision_reviewer(
                         config,
                         wt_mgr,
                         name_pool,
@@ -13471,7 +13514,9 @@ async fn tick(
                         false,
                     )
                     .await?;
-                    pre_review_checks.remove(task_id);
+                    if provision_outcome == ReviewerProvisionOutcome::Attached {
+                        pre_review_checks.remove(task_id);
+                    }
                 }
                 Err(e) => {
                     log(&format!(
@@ -13688,7 +13733,7 @@ async fn tick(
                 .await;
                 continue;
             }
-            let (ci_gate, head_sha, _) =
+            let (ci_gate, head_sha, head_polled) =
                 poll_resume_reviewer_pre_review_checks(config, pre_review_checks, *task_id, *pr)
                     .await?;
             match ci_gate {
@@ -13782,6 +13827,14 @@ async fn tick(
                     } else {
                         ReviewRole::R1
                     };
+                    if !take_pre_review_post_gate_validation_slot(
+                        pre_review_checks,
+                        *task_id,
+                        *pr,
+                        head_polled,
+                    ) {
+                        continue;
+                    }
                     let branch =
                         if let Some(b) = orphan_worker_branch(author, *task_id, *review_only) {
                             b
@@ -13818,7 +13871,7 @@ async fn tick(
                         task_id: *task_id,
                         branch: &branch,
                     };
-                    provision_reviewer(
+                    let provision_outcome = provision_reviewer(
                         config,
                         wt_mgr,
                         name_pool,
@@ -13831,7 +13884,9 @@ async fn tick(
                         true,
                     )
                     .await?;
-                    pre_review_checks.remove(task_id);
+                    if provision_outcome == ReviewerProvisionOutcome::Attached {
+                        pre_review_checks.remove(task_id);
+                    }
                 }
                 Err(e) => {
                     log(&format!(
@@ -21259,6 +21314,7 @@ mod tests {
                 pr: PR,
                 head_sha: "head-a".into(),
                 last_head_poll: Some(std::time::Instant::now() - Duration::from_secs(30)),
+                post_gate_validation_attempted: false,
                 state: PreReviewChecksState::Waiting(old_handle),
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
@@ -21421,6 +21477,60 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             2
         );
+    }
+
+    #[test]
+    fn post_gate_target_validation_is_cadenced_after_unavailable_or_moved_targets() {
+        const TASK_ID: i64 = 380;
+        const PR: i64 = 552;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("quorum.db"), dir.path().into());
+        config.merge_checks_poll_secs = 30;
+        for failure in ["unavailable", "moved"] {
+            let mut waits = HashMap::new();
+            waits.insert(
+                TASK_ID,
+                PreReviewChecksEntry {
+                    pr: PR,
+                    head_sha: "head-a".into(),
+                    last_head_poll: Some(std::time::Instant::now()),
+                    post_gate_validation_attempted: false,
+                    state: PreReviewChecksState::Ready,
+                    consecutive_timeouts: 0,
+                    timeout_alerted: false,
+                },
+            );
+
+            let mut validation_attempts = 0;
+            for _ in 0..90 {
+                assert!(
+                    !pre_review_external_poll_due(&config, &waits, TASK_ID, PR),
+                    "{failure} target must not become due between scheduled polls"
+                );
+                if take_pre_review_post_gate_validation_slot(&mut waits, TASK_ID, PR, false) {
+                    // Simulate the post-gate GitHub validation returning this
+                    // failure; its cadence entry must remain for the next tick.
+                    validation_attempts += 1;
+                }
+            }
+            assert_eq!(
+                validation_attempts, 1,
+                "{failure} post-gate validation retried before a new head poll"
+            );
+
+            waits.get_mut(&TASK_ID).unwrap().last_head_poll =
+                Some(std::time::Instant::now() - Duration::from_secs(30));
+            assert!(pre_review_external_poll_due(&config, &waits, TASK_ID, PR));
+            assert!(take_pre_review_post_gate_validation_slot(
+                &mut waits, TASK_ID, PR, true,
+            ));
+            validation_attempts += 1;
+            assert_eq!(
+                validation_attempts, 2,
+                "{failure} validation must resume only with the next scheduled head poll"
+            );
+        }
     }
 
     #[tokio::test]
