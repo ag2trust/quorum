@@ -3128,6 +3128,62 @@ async fn reap_classifier_with_usage(
     record_classifier_usage(db_path, &task_ids, &provider, &model, &effort, usage).await;
 }
 
+#[derive(Clone)]
+struct DecompositionUsageContext {
+    purpose: &'static str,
+    task_id: i64,
+    provider: String,
+    model: String,
+    effort: String,
+}
+
+fn decomposition_usage_record(
+    context: DecompositionUsageContext,
+    kind: runner::AgentKind,
+    initial_usage: runner::TokenUsage,
+    output: &[runner::CapturedOutput],
+) -> UsageWriteRecord {
+    let mut usage = initial_usage;
+    for captured in output {
+        let runner::CapturedOutput::Stdout(raw) = captured else {
+            continue;
+        };
+        for event in runner::normalize_line(kind, raw) {
+            match event {
+                runner::AgentEvent::TurnCompleted {
+                    usage: Some(turn_usage),
+                    ..
+                }
+                | runner::AgentEvent::TurnFailed {
+                    usage: Some(turn_usage),
+                    ..
+                } => usage.saturating_add_assign(turn_usage),
+                _ => {}
+            }
+        }
+    }
+    UsageWriteRecord {
+        agent_run_id: None,
+        purpose: context.purpose.into(),
+        task_ids: vec![context.task_id],
+        pr_number: None,
+        provider: context.provider,
+        model: context.model,
+        effort: context.effort,
+        usage,
+    }
+}
+
+async fn reap_decomposition_provider_with_usage(
+    proc: runner::RunnerProc,
+    context: DecompositionUsageContext,
+    usage: runner::TokenUsage,
+) -> UsageWriteRecord {
+    let kind = proc.kind();
+    let output = proc.kill_and_reap().await;
+    decomposition_usage_record(context, kind, usage, &output)
+}
+
 fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry {
     JournalEntry {
         agent: slot.agent_name.clone(),
@@ -4374,13 +4430,61 @@ struct DecompositionCoordinator {
     classifier_source_task_id: Option<i64>,
     proposal: Option<Vec<planner::ProposedTask>>,
     planner_slot: Option<planner::PlannerSlot>,
+    planner_source_task_id: Option<i64>,
     classifier_slot: Option<classifier::ClassifierSlot>,
     /// Live Arbiter plan-review slot. The Arbiter gates a structurally valid
     /// proposal (state `validating`) before it advances to `preclassifying`;
     /// it is mutually exclusive with the planner and classifier slots.
     arbiter_slot: Option<arbiter::ArbiterSlot>,
+    arbiter_source_task_id: Option<i64>,
     planner_view: Option<tempfile::TempDir>,
     writable_path_resolver: planner::WritablePathResolver,
+}
+
+async fn reap_decomposition_planner_with_usage(
+    db_path: &Path,
+    coordinator: &mut DecompositionCoordinator,
+) {
+    let Some(slot) = coordinator.planner_slot.take() else {
+        return;
+    };
+    let Some(task_id) = coordinator.planner_source_task_id.take() else {
+        log("planner usage has no captured source-task attribution");
+        slot.kill_and_reap().await;
+        return;
+    };
+    let context = DecompositionUsageContext {
+        purpose: "planner",
+        task_id,
+        provider: slot.provider,
+        model: slot.model,
+        effort: slot.effort,
+    };
+    let usage = reap_decomposition_provider_with_usage(slot.proc, context, slot.usage).await;
+    record_usage_best_effort(db_path, usage).await;
+}
+
+async fn reap_decomposition_arbiter_with_usage(
+    db_path: &Path,
+    coordinator: &mut DecompositionCoordinator,
+) {
+    let Some(slot) = coordinator.arbiter_slot.take() else {
+        return;
+    };
+    let Some(task_id) = coordinator.arbiter_source_task_id.take() else {
+        log("arbiter usage has no captured source-task attribution");
+        slot.kill_and_reap().await;
+        return;
+    };
+    let context = DecompositionUsageContext {
+        purpose: "arbiter",
+        task_id,
+        provider: slot.provider,
+        model: slot.model,
+        effort: slot.effort,
+    };
+    let usage = reap_decomposition_provider_with_usage(slot.proc, context, slot.usage).await;
+    record_usage_best_effort(db_path, usage).await;
 }
 
 async fn reap_decomposition_classifier_with_usage(
@@ -5160,12 +5264,8 @@ async fn discard_removed_decomposition(
             "live decomposition provider lost graph identity".into(),
         ));
     }
-    if let Some(slot) = coordinator.planner_slot.take() {
-        slot.kill_and_reap().await;
-    }
-    if let Some(slot) = coordinator.arbiter_slot.take() {
-        slot.kill_and_reap().await;
-    }
+    reap_decomposition_planner_with_usage(db_path, coordinator).await;
+    reap_decomposition_arbiter_with_usage(db_path, coordinator).await;
     reap_decomposition_classifier_with_usage(db_path, coordinator).await;
     coordinator.planner_view = None;
     coordinator.proposal = None;
@@ -5622,6 +5722,7 @@ async fn spawn_arbiter_review(
                 return Err(error);
             }
             coordinator.planner_view = Some(view);
+            coordinator.arbiter_source_task_id = Some(snapshot.source_task_id);
             coordinator.arbiter_slot = Some(slot);
         }
         Err(error) => {
@@ -5753,7 +5854,27 @@ async fn tick_decomposition(
                 .planner_slot
                 .take()
                 .expect("planner slot exists");
-            slot.kill_and_reap().await;
+            let usage = match coordinator.planner_source_task_id.take() {
+                Some(task_id) => Some(
+                    reap_decomposition_provider_with_usage(
+                        slot.proc,
+                        DecompositionUsageContext {
+                            purpose: "planner",
+                            task_id,
+                            provider: slot.provider,
+                            model: slot.model,
+                            effort: slot.effort,
+                        },
+                        slot.usage,
+                    )
+                    .await,
+                ),
+                None => {
+                    log("planner usage has no captured source-task attribution");
+                    slot.kill_and_reap().await;
+                    None
+                }
+            };
             coordinator.planner_view = None;
             let graph_id = coordinator
                 .graph_id
@@ -5814,6 +5935,11 @@ async fn tick_decomposition(
                     }
                 }
             }
+            // Telemetry runs after the durable proposal/lifecycle decision and
+            // cannot change it.
+            if let Some(usage) = usage {
+                record_usage_best_effort(&config.db_path, usage).await;
+            }
         }
     }
 
@@ -5829,7 +5955,27 @@ async fn tick_decomposition(
                 .arbiter_slot
                 .take()
                 .expect("arbiter slot exists");
-            slot.kill_and_reap().await;
+            let usage = match coordinator.arbiter_source_task_id.take() {
+                Some(task_id) => Some(
+                    reap_decomposition_provider_with_usage(
+                        slot.proc,
+                        DecompositionUsageContext {
+                            purpose: "arbiter",
+                            task_id,
+                            provider: slot.provider,
+                            model: slot.model,
+                            effort: slot.effort,
+                        },
+                        slot.usage,
+                    )
+                    .await,
+                ),
+                None => {
+                    log("arbiter usage has no captured source-task attribution");
+                    slot.kill_and_reap().await;
+                    None
+                }
+            };
             coordinator.planner_view = None;
             let graph_id = coordinator
                 .graph_id
@@ -5841,6 +5987,11 @@ async fn tick_decomposition(
             // graph to planning/backoff/hold, so drop the in-memory proposal.
             if !advanced {
                 coordinator.proposal = None;
+            }
+            // Telemetry runs after the durable verdict decision and cannot
+            // change it.
+            if let Some(usage) = usage {
+                record_usage_best_effort(&config.db_path, usage).await;
             }
         }
     }
@@ -6202,6 +6353,7 @@ async fn tick_decomposition(
                     return Err(error);
                 }
                 coordinator.planner_view = Some(view);
+                coordinator.planner_source_task_id = Some(snapshot.source_task_id);
                 coordinator.planner_slot = Some(slot);
             }
             Err(error) => {
@@ -8328,12 +8480,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if let Some(slot) = classifier_slot.take() {
                 reap_classifier_with_usage(&config.db_path, slot, None).await;
             }
-            if let Some(slot) = decomposition_coordinator.planner_slot.take() {
-                slot.kill_and_reap().await;
-            }
-            if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
-                slot.kill_and_reap().await;
-            }
+            reap_decomposition_planner_with_usage(&config.db_path, &mut decomposition_coordinator)
+                .await;
+            reap_decomposition_arbiter_with_usage(&config.db_path, &mut decomposition_coordinator)
+                .await;
             reap_decomposition_classifier_with_usage(
                 &config.db_path,
                 &mut decomposition_coordinator,
@@ -8362,12 +8512,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if let Some(slot) = classifier_slot.take() {
                 reap_classifier_with_usage(&config.db_path, slot, None).await;
             }
-            if let Some(slot) = decomposition_coordinator.planner_slot.take() {
-                slot.kill_and_reap().await;
-            }
-            if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
-                slot.kill_and_reap().await;
-            }
+            reap_decomposition_planner_with_usage(&config.db_path, &mut decomposition_coordinator)
+                .await;
+            reap_decomposition_arbiter_with_usage(&config.db_path, &mut decomposition_coordinator)
+                .await;
             reap_decomposition_classifier_with_usage(
                 &config.db_path,
                 &mut decomposition_coordinator,
@@ -8398,12 +8546,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 if let Some(slot) = classifier_slot.take() {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
-                if let Some(slot) = decomposition_coordinator.planner_slot.take() {
-                    slot.kill_and_reap().await;
-                }
-                if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
-                    slot.kill_and_reap().await;
-                }
+                reap_decomposition_planner_with_usage(
+                    &config.db_path,
+                    &mut decomposition_coordinator,
+                )
+                .await;
+                reap_decomposition_arbiter_with_usage(
+                    &config.db_path,
+                    &mut decomposition_coordinator,
+                )
+                .await;
                 reap_decomposition_classifier_with_usage(
                     &config.db_path,
                     &mut decomposition_coordinator,
@@ -8487,12 +8639,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 if let Some(slot) = classifier_slot.take() {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
-                if let Some(slot) = decomposition_coordinator.planner_slot.take() {
-                    slot.kill_and_reap().await;
-                }
-                if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
-                    slot.kill_and_reap().await;
-                }
+                reap_decomposition_planner_with_usage(
+                    &config.db_path,
+                    &mut decomposition_coordinator,
+                )
+                .await;
+                reap_decomposition_arbiter_with_usage(
+                    &config.db_path,
+                    &mut decomposition_coordinator,
+                )
+                .await;
                 reap_decomposition_classifier_with_usage(
                     &config.db_path,
                     &mut decomposition_coordinator,
@@ -8513,12 +8669,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 if let Some(slot) = classifier_slot.take() {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
-                if let Some(slot) = decomposition_coordinator.planner_slot.take() {
-                    slot.kill_and_reap().await;
-                }
-                if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
-                    slot.kill_and_reap().await;
-                }
+                reap_decomposition_planner_with_usage(
+                    &config.db_path,
+                    &mut decomposition_coordinator,
+                )
+                .await;
+                reap_decomposition_arbiter_with_usage(
+                    &config.db_path,
+                    &mut decomposition_coordinator,
+                )
+                .await;
                 reap_decomposition_classifier_with_usage(
                     &config.db_path,
                     &mut decomposition_coordinator,
@@ -8630,12 +8790,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     if let Some(slot) = classifier_slot.take() {
                         reap_classifier_with_usage(&config.db_path, slot, None).await;
                     }
-                    if let Some(slot) = decomposition_coordinator.planner_slot.take() {
-                        slot.kill_and_reap().await;
-                    }
-                    if let Some(slot) = decomposition_coordinator.arbiter_slot.take() {
-                        slot.kill_and_reap().await;
-                    }
+                    reap_decomposition_planner_with_usage(
+                        &config.db_path,
+                        &mut decomposition_coordinator,
+                    )
+                    .await;
+                    reap_decomposition_arbiter_with_usage(
+                        &config.db_path,
+                        &mut decomposition_coordinator,
+                    )
+                    .await;
                     reap_decomposition_classifier_with_usage(
                         &config.db_path,
                         &mut decomposition_coordinator,
@@ -34676,8 +34840,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             classifier_source_task_id: Some(1),
             proposal: Some(vec![]),
             planner_slot: Some(planner_slot),
+            planner_source_task_id: None,
             classifier_slot: Some(classifier_slot),
             arbiter_slot: None,
+            arbiter_source_task_id: None,
             planner_view: None,
             writable_path_resolver: planner::WritablePathResolver::default(),
         };
@@ -34768,6 +34934,83 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(runs[0].usage.cached_input_tokens, 80);
         assert_eq!(runs[0].usage.cache_write_input_tokens, 10);
         assert_eq!(runs[0].usage.output_tokens, 5);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decomposition_slot_exit_records_planner_and_arbiter_usage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("decomposition-role-usage.db");
+        let emitted = dir.path().join("emitted");
+        let runner = dir.path().join("claude");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\n\
+                 IFS= read -r _turn\n\
+                 printf '%s\\n' '{{\"type\":\"result\",\"result\":\"done\",\"is_error\":false,\"usage\":{{\"input_tokens\":100,\"cache_read_input_tokens\":80,\"cache_creation_input_tokens\":10,\"output_tokens\":5}}}}'\n\
+                 touch '{}'\n\
+                 sleep 30\n",
+                emitted.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let planner_slot = planner::spawn_planner(
+            runner::AgentKind::Claude,
+            planner::CLAUDE_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let arbiter_slot = arbiter::spawn_arbiter(
+            runner::AgentKind::Claude,
+            planner::CLAUDE_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !emitted.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider fixture did not emit terminal usage");
+
+        let mut coordinator = DecompositionCoordinator {
+            planner_slot: Some(planner_slot),
+            planner_source_task_id: Some(42),
+            arbiter_slot: Some(arbiter_slot),
+            arbiter_source_task_id: Some(42),
+            ..Default::default()
+        };
+        reap_decomposition_planner_with_usage(&db_path, &mut coordinator).await;
+        reap_decomposition_arbiter_with_usage(&db_path, &mut coordinator).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let runs = quorum_core::token_usage::for_task(&conn, 42).unwrap();
+        assert_eq!(runs.len(), 2);
+        for (purpose, run) in [("planner", &runs[0]), ("arbiter", &runs[1])] {
+            assert_eq!(run.purpose, purpose);
+            assert_eq!(run.provider, "claude");
+            assert_eq!(run.model, planner::CLAUDE_PLANNER_MODEL);
+            assert_eq!(run.effort, planner::PLANNER_EFFORT);
+            assert_eq!(run.usage.uncached_input_tokens, 20);
+            assert_eq!(run.usage.cached_input_tokens, 80);
+            assert_eq!(run.usage.cache_write_input_tokens, 10);
+            assert_eq!(run.usage.output_tokens, 5);
+        }
     }
 
     #[tokio::test]
