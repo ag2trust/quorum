@@ -2181,10 +2181,18 @@ children; *changes* with at least one blocking finding records a normal `proposa
 summary is the Arbiter's findings and returns the graph to `planning` so the planner re-proposes
 against those findings; *reject_source* holds the graph and fails the source for a required
 owner decision, materializing no children; and a malformed, absent, or provider/protocol-failed
-verdict records a `provider` attempt (fail closed — never a silent approval). A *changes* verdict
-consumes the existing three-per-revision proposal budget; a provider failure consumes the separate
-provider budget. The gate is keyed on the guarded `validating -> preclassifying` transition, so a
-daemon restart that re-spawns and re-polls a fresh Arbiter cannot double-materialize.
+verdict records a `provider` attempt (fail closed — never a silent approval). Every terminal
+Arbiter outcome also writes exactly one additional `decomposition_attempts` row with
+`kind='verdict'`: its reason code is `arbiter-approve`, `arbiter-changes`,
+`arbiter-reject-source`, or `arbiter-provider`, and its bounded JSON summary contains the verdict,
+findings (`severity` and `summary`), blocking count, duration, response bytes, assistant-event
+and tool counts, plus provider, model, and effort. This observational verdict row neither changes
+lifecycle nor consumes a budget; only `proposal` and `provider` attempts count toward their
+existing limits. Its JSON stays valid while being reduced to the existing 2 KiB attempt-summary
+cap. A *changes* verdict consumes the existing three-per-revision proposal budget; a provider
+failure consumes the separate provider budget. The gate is keyed on the guarded `validating ->
+preclassifying` transition, so a daemon restart that re-spawns and re-polls a fresh Arbiter cannot
+double-materialize.
 
 Each proposed child also carries a bounded structured deliverables manifest that distinguishes
 requested writes from read-only contextual references. Deterministic validation rejects a write
