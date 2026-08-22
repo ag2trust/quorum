@@ -272,10 +272,11 @@ impl ArbiterSlot {
     }
 
     pub async fn kill_and_reap(mut self) {
+        let output = self.proc.kill_and_reap().await;
+        super::persist_terminal_output(&mut self.session_log, output);
         if let Some(session_log) = self.session_log.as_mut() {
             session_log.finalize(None);
         }
-        let _ = self.proc.kill_and_reap().await;
     }
 }
 
@@ -694,6 +695,38 @@ mod tests {
             other => panic!("expected approve, got {other:?}"),
         }
         slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_poll_reap_persists_buffered_provider_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = r#"{"type":"turn.failed","error":{"message":"provider failed"}}"#;
+        let mut slot = spawn_fake_arbiter(dir.path(), &format!("{raw}\n")).await;
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-arbiter-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            while slot.proc.try_wait().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("arbiter provider did not exit");
+
+        slot.kill_and_reap().await;
+        assert_eq!(
+            std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap(),
+            format!("{raw}\n")
+        );
     }
 
     #[cfg(unix)]
