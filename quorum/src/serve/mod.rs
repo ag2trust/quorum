@@ -5084,6 +5084,11 @@ fn decomposition_process_name(graph_id: i64, role: &str) -> String {
     format!("decomposition-{role}-{graph_id}")
 }
 
+struct DecompositionProcessSession<'a> {
+    id: &'a str,
+    log_dir: Option<&'a Path>,
+}
+
 async fn journal_decomposition_process(
     config: &ServeConfig,
     graph_id: i64,
@@ -5091,6 +5096,7 @@ async fn journal_decomposition_process(
     role: &str,
     pid: Option<i32>,
     frozen_view: Option<&Path>,
+    session: DecompositionProcessSession<'_>,
 ) -> Result<()> {
     let path = config.db_path.clone();
     let role = role.to_string();
@@ -5098,14 +5104,16 @@ async fn journal_decomposition_process(
         agent: decomposition_process_name(graph_id, &role),
         role: role.clone(),
         task_id: Some(source_task_id),
-        session_id: agent::new_session_id(),
+        session_id: session.id.to_string(),
         worktree: frozen_view.map(|path| path.to_string_lossy().into_owned()),
         branch: None,
         phase: role,
         cost_tokens: 0,
         agent_state: None,
         cost_usd: 0.0,
-        log_dir: None,
+        log_dir: session
+            .log_dir
+            .map(|path| path.to_string_lossy().into_owned()),
         pid,
         pr: None,
         rework_count: 0,
@@ -5607,7 +5615,19 @@ async fn spawn_arbiter_review(
     )
     .await
     {
-        Ok(slot) => {
+        Ok(mut slot) => {
+            let session_id = agent::new_session_id();
+            let session_started_at = now_unix();
+            if let Some(log_dir) = config.log_dir.as_ref() {
+                let _ = slot.start_session_log(
+                    log_dir,
+                    &decomposition_process_name(snapshot.graph_id, "arbiter"),
+                    snapshot.source_task_id,
+                    &session_id,
+                    &snapshot.frozen_base_sha,
+                    session_started_at,
+                );
+            }
             if let Err(error) = journal_decomposition_process(
                 config,
                 snapshot.graph_id,
@@ -5615,6 +5635,10 @@ async fn spawn_arbiter_review(
                 "arbiter",
                 slot.pid(),
                 Some(view.path()),
+                DecompositionProcessSession {
+                    id: &session_id,
+                    log_dir: slot.log_dir(),
+                },
             )
             .await
             {
@@ -6187,7 +6211,19 @@ async fn tick_decomposition(
         )
         .await
         {
-            Ok(slot) => {
+            Ok(mut slot) => {
+                let session_id = agent::new_session_id();
+                let session_started_at = now_unix();
+                if let Some(log_dir) = config.log_dir.as_ref() {
+                    let _ = slot.start_session_log(
+                        log_dir,
+                        &decomposition_process_name(snapshot.graph_id, "planner"),
+                        snapshot.source_task_id,
+                        &session_id,
+                        &snapshot.frozen_base_sha,
+                        session_started_at,
+                    );
+                }
                 if let Err(error) = journal_decomposition_process(
                     config,
                     snapshot.graph_id,
@@ -6195,6 +6231,10 @@ async fn tick_decomposition(
                     "planner",
                     slot.pid(),
                     Some(view.path()),
+                    DecompositionProcessSession {
+                        id: &session_id,
+                        log_dir: slot.log_dir(),
+                    },
                 )
                 .await
                 {
@@ -6278,6 +6318,7 @@ async fn tick_decomposition(
         .await
         {
             Ok(slot) => {
+                let session_id = agent::new_session_id();
                 if let Err(error) = journal_decomposition_process(
                     config,
                     snapshot.graph_id,
@@ -6285,6 +6326,10 @@ async fn tick_decomposition(
                     "classifier",
                     slot.proc.pid(),
                     coordinator.planner_view.as_ref().map(|view| view.path()),
+                    DecompositionProcessSession {
+                        id: &session_id,
+                        log_dir: None,
+                    },
                 )
                 .await
                 {
@@ -35383,5 +35428,139 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             1,
             "a DB failure during the guard must retain the name"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decomposition_slots_publish_raw_stream_log_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("quorum.db");
+        let log_root = dir.path().join("logs");
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.log_dir = Some(log_root.clone());
+
+        let stream = dir.path().join("stream.jsonl");
+        std::fs::write(&stream, "{\"type\":\"turn.failed\"}\n").unwrap();
+        let runner = dir.path().join("codex");
+        std::fs::write(
+            &runner,
+            format!("#!/bin/sh\nexec /bin/cat '{}'\n", stream.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let graph_id = 17;
+        let source_task_id = 42;
+        let started_at = now_unix();
+
+        let mut planner_slot = planner::spawn_planner(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            true,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let planner_name = decomposition_process_name(graph_id, "planner");
+        planner_slot
+            .start_session_log(
+                &log_root,
+                &planner_name,
+                source_task_id,
+                "planner-session",
+                "frozen-base",
+                started_at,
+            )
+            .unwrap();
+        let planner_log_dir = planner_slot.log_dir().unwrap().to_path_buf();
+        journal_decomposition_process(
+            &config,
+            graph_id,
+            source_task_id,
+            "planner",
+            planner_slot.pid(),
+            Some(dir.path()),
+            DecompositionProcessSession {
+                id: "planner-session",
+                log_dir: planner_slot.log_dir(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            planner::poll_planner(&mut planner_slot).await,
+            Some(planner::PlannerPoll::ProviderFailed(_))
+        ));
+
+        let mut arbiter_slot = arbiter::spawn_arbiter(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            true,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let arbiter_name = decomposition_process_name(graph_id, "arbiter");
+        arbiter_slot
+            .start_session_log(
+                &log_root,
+                &arbiter_name,
+                source_task_id,
+                "arbiter-session",
+                "frozen-base",
+                started_at,
+            )
+            .unwrap();
+        let arbiter_log_dir = arbiter_slot.log_dir().unwrap().to_path_buf();
+        journal_decomposition_process(
+            &config,
+            graph_id,
+            source_task_id,
+            "arbiter",
+            arbiter_slot.pid(),
+            Some(dir.path()),
+            DecompositionProcessSession {
+                id: "arbiter-session",
+                log_dir: arbiter_slot.log_dir(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            arbiter::poll_arbiter(&mut arbiter_slot).await,
+            Some(arbiter::ArbiterPoll::ProviderFailed(_))
+        ));
+
+        for log_dir in [&planner_log_dir, &arbiter_log_dir] {
+            let raw_stream = std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap();
+            assert!(raw_stream.contains(r#"{"type":"turn.failed"}"#));
+        }
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let status =
+            quorum_core::stats::stats(&conn, now_unix(), quorum_core::agents::ONLINE_WINDOW_SECS)
+                .unwrap();
+        for (agent, log_dir) in [
+            (&planner_name, &planner_log_dir),
+            (&arbiter_name, &arbiter_log_dir),
+        ] {
+            let slot = status
+                .daemon_agents
+                .iter()
+                .find(|slot| slot.agent == *agent)
+                .unwrap();
+            assert_eq!(slot.log_dir.as_deref(), log_dir.to_str());
+        }
+
+        planner_slot.kill_and_reap().await;
+        arbiter_slot.kill_and_reap().await;
     }
 }
