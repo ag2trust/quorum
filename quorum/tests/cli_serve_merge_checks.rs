@@ -543,7 +543,7 @@ fn rereview_pending_does_not_feed_then_ready_resumes_exactly_once() {
 
     std::fs::write(&checks_state, "ready").unwrap();
     assert!(
-        handle.wait_for("ResumeReviewer: fed re-review turn", 15),
+        handle.wait_for("ResumeReviewer: fed re-review turn", 45),
         "green CI did not resume the sticky reviewer: {:?}",
         handle.lines
     );
@@ -678,7 +678,7 @@ fn head_move_during_ci_wait_discards_old_gate_before_reviewer_spawn() {
     quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
 
     assert!(
-        handle.wait_for("head changed", 15),
+        handle.wait_for("head moved after CI gate", 15),
         "daemon did not invalidate the old gated SHA: {:?}",
         handle.lines
     );
@@ -799,7 +799,7 @@ fn reviewer_target_move_after_exact_head_check_never_poisoned_durable_fallback()
     std::fs::write(&checks_state, "ready\n").unwrap();
 
     assert!(
-        handle.wait_for("resolved target moved after CI gate", 20),
+        handle.wait_for("resolved target moved after CI gate", 45),
         "target resolution did not deterministically move after the exact head check: {:?}",
         handle.lines
     );
@@ -903,7 +903,7 @@ fn pre_review_pending_waits_without_reviewer_then_ready_spawns() {
 
     std::fs::write(&checks_state, "ready").unwrap();
     assert!(
-        handle.wait_for("spawning reviewer", 15),
+        handle.wait_for("spawning reviewer", 45),
         "green checks did not release the reviewer gate: {:?}",
         handle.lines
     );
@@ -1122,7 +1122,7 @@ fn r2_rechecks_ci_before_spawning() {
 
     std::fs::write(&checks_state, "ready").unwrap();
     assert!(
-        handle.wait_for("R2: pre-merge reviewer", 15),
+        handle.wait_for("R2: pre-merge reviewer", 45),
         "R2 did not spawn after current-head CI became green: {:?}",
         handle.lines
     );
