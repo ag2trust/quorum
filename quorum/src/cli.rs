@@ -496,8 +496,9 @@ pub enum Command {
         #[arg(long)]
         log_dir: Option<String>,
         /// Enable self-update drain mode. When the daemon merges a PR for its
-        /// own repo (or detects the base branch advancing via git ls-remote), it drains
-        /// in-flight agents and exits 75 so a supervisor can rebuild and relaunch.
+        /// own repo (or detects the configured self-update branch advancing via git
+        /// ls-remote), it drains in-flight agents and exits 75 so a supervisor can
+        /// rebuild and relaunch.
         #[arg(long)]
         self_update_drain: bool,
         /// Seconds to wait for in-flight agents to finish before force-killing
