@@ -262,6 +262,20 @@ pub struct PipelineTask {
     pub status: String,
     pub pr: Option<i64>,
     pub blocked: bool,
+    /// The newest durable Arbiter verdict for this decomposed source, if one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arbiter: Option<ArbiterVerdict>,
+}
+
+/// Compact projection of the Arbiter's terminal verdict evidence.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ArbiterVerdict {
+    pub verdict: Option<String>,
+    pub reason_code: String,
+    pub at: i64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub duration_ms: Option<i64>,
 }
 
 /// Bounded child projection for the repository's current decomposition graph.
@@ -2481,9 +2495,48 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
             status,
             pr,
             blocked: false,
+            arbiter: arbiter_verdict(conn, id)?,
         });
     }
     Ok(result)
+}
+
+/// Read the newest verdict evidence for a decomposition source. Verdict rows are
+/// observational, so select them by insertion order rather than their per-kind ordinal.
+pub fn arbiter_verdict(conn: &Connection, source_task_id: i64) -> Result<Option<ArbiterVerdict>> {
+    let row: Option<(String, i64, String)> = conn
+        .query_row(
+            "SELECT a.reason_code,a.created_at,a.summary
+             FROM task_decompositions d
+             JOIN decomposition_attempts a ON a.graph_id=d.id
+             WHERE d.source_task_id=?1 AND a.kind='verdict'
+             ORDER BY a.id DESC LIMIT 1",
+            [source_task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(reason_code, at, summary)| {
+        let summary: serde_json::Value = serde_json::from_str(&summary).unwrap_or_default();
+        ArbiterVerdict {
+            verdict: summary
+                .get("verdict")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            reason_code,
+            at,
+            provider: summary
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            model: summary
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            duration_ms: summary
+                .get("duration_ms")
+                .and_then(serde_json::Value::as_i64),
+        }
+    }))
 }
 
 /// The schema guarantees at most one active graph/freeze. A held planning result is

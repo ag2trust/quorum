@@ -24,6 +24,14 @@ use quorum_core::error::{QuorumError, Result};
 
 const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
 
+#[derive(serde::Serialize)]
+struct TaskGetView<'a> {
+    #[serde(flatten)]
+    task: &'a quorum_core::tasks::TaskDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arbiter: Option<quorum_core::stats::ArbiterVerdict>,
+}
+
 const DEFAULT_SERVE_TOML: &str = "\
 # quorum serve config — edit repository paths and routing percentages as needed.
 
@@ -629,7 +637,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             match quorum_core::tasks::get_with_notes(&conn, task_id)? {
                 Some(t) => {
-                    output::emit(&t);
+                    output::emit(&TaskGetView {
+                        task: &t,
+                        arbiter: quorum_core::stats::arbiter_verdict(&conn, task_id)?,
+                    });
                     Ok(0)
                 }
                 None => {
