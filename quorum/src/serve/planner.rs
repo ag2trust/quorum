@@ -560,6 +560,10 @@ fn reject_cycles(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> {
 
 pub struct PlannerSlot {
     pub proc: RunnerProc,
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+    pub usage: super::runner::TokenUsage,
     pub response_text: String,
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
@@ -784,6 +788,10 @@ async fn spawn_planner_with_timeout(
         };
     Ok(PlannerSlot {
         proc,
+        provider: provider.to_string(),
+        model: model.into(),
+        effort: effort.into(),
+        usage: super::runner::TokenUsage::default(),
         response_text: String::new(),
         started_at,
         stdout_bytes: 0,
@@ -913,6 +921,17 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
         }
         slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
         slot.diagnostics.observe_line(slot.proc.kind(), &raw);
+        for event in super::runner::normalize_line(slot.proc.kind(), &raw) {
+            match event {
+                AgentEvent::TurnCompleted {
+                    usage: Some(usage), ..
+                }
+                | AgentEvent::TurnFailed {
+                    usage: Some(usage), ..
+                } => slot.usage.saturating_add_assign(usage),
+                _ => {}
+            }
+        }
         if slot.stdout_bytes > MAX_STDOUT_BYTES {
             return Some(provider_failure(
                 slot,
