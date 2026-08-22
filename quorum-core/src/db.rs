@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 57;
+pub const SCHEMA_VERSION: i64 = 58;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -162,8 +162,11 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
     // review_collection_runs, routing_attempts) hold FK references to it, which fails under
     // enforcement. rusqlite's bundled SQLite defaults `foreign_keys` ON, and `PRAGMA
     // foreign_keys` is a no-op inside a transaction, so the toggle must straddle the
-    // `BEGIN IMMEDIATE` below. Capture the connection's prior state and restore it on every
-    // exit path so we never leave enforcement disabled on a live connection.
+    // `BEGIN IMMEDIATE` below. The v58 rebuilds (`decomposition_attempts`,
+    // `token_usage_runs`) have no external FK children today, but reuse the same straddle
+    // so future references would migrate safely. Capture the connection's prior state and
+    // restore it on every exit path so we never leave enforcement disabled on a live
+    // connection.
     let fk_prior: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
     conn.pragma_update(None, "foreign_keys", false)?;
     let outcome = migrate_txn(conn, current, fk_prior);
@@ -944,6 +947,86 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 conn.pragma_update(None, "legacy_alter_table", false)?;
             }
         }
+        // v58 widens two immutable CHECK constraints: decomposition_attempts.kind admits
+        // 'verdict' alongside ('proposal','provider','blocker','recovery'), and
+        // token_usage_runs.purpose admits 'planner' and 'arbiter' alongside
+        // ('worker','reviewer','classifier','collector'). SQLite cannot ALTER a CHECK, so each
+        // table is rebuilt in place following the v57 role_assignments precedent. Each rebuild
+        // is guarded on stored constraint text so it is a no-op on a fresh DB (SCHEMA_SQL
+        // already created the widened tables) and on any re-run. Foreign-key enforcement is
+        // disabled by the outer `migrate` straddle so DROPs succeed even where later work adds
+        // FK children; the in-transaction `PRAGMA foreign_key_check` above rolls back if any
+        // reference ends up dangling.
+        if current < 58 {
+            let kind_admits_verdict: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(sql LIKE '%''verdict''%'), 1) FROM sqlite_master
+                 WHERE type='table' AND name='decomposition_attempts'",
+                [],
+                |row| row.get(0),
+            )?;
+            if kind_admits_verdict == 0 {
+                conn.execute_batch(
+                    "CREATE TABLE decomposition_attempts_new (
+                         id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                         graph_id         INTEGER NOT NULL REFERENCES task_decompositions(id),
+                         source_revision  INTEGER NOT NULL,
+                         kind             TEXT NOT NULL CHECK(kind IN
+                                              ('proposal','provider','blocker','recovery','verdict')),
+                         ordinal          INTEGER NOT NULL,
+                         retry_generation INTEGER NOT NULL DEFAULT 0
+                                              CHECK(retry_generation BETWEEN 0 AND 2),
+                         reason_code      TEXT NOT NULL,
+                         summary          TEXT NOT NULL,
+                         created_at       INTEGER NOT NULL,
+                         UNIQUE (graph_id, source_revision, kind, ordinal)
+                     );
+                     INSERT INTO decomposition_attempts_new
+                         SELECT id,graph_id,source_revision,kind,ordinal,retry_generation,
+                                reason_code,summary,created_at
+                         FROM decomposition_attempts;
+                     DROP TABLE decomposition_attempts;
+                     ALTER TABLE decomposition_attempts_new RENAME TO decomposition_attempts;",
+                )?;
+            }
+            let purpose_admits_planner: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(sql LIKE '%''planner''%'), 1) FROM sqlite_master
+                 WHERE type='table' AND name='token_usage_runs'",
+                [],
+                |row| row.get(0),
+            )?;
+            if purpose_admits_planner == 0 {
+                conn.execute_batch(
+                    "CREATE TABLE token_usage_runs_new (
+                         id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                         agent_run_id             INTEGER UNIQUE,
+                         purpose                  TEXT NOT NULL CHECK(purpose IN
+                                                      ('worker','reviewer','classifier','collector','planner','arbiter')),
+                         pr_number                INTEGER,
+                         provider                 TEXT NOT NULL,
+                         model                    TEXT NOT NULL,
+                         effort                   TEXT NOT NULL,
+                         uncached_input_tokens    INTEGER NOT NULL DEFAULT 0,
+                         cached_input_tokens      INTEGER NOT NULL DEFAULT 0,
+                         cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+                         output_tokens            INTEGER NOT NULL DEFAULT 0,
+                         reasoning_tokens         INTEGER NOT NULL DEFAULT 0,
+                         recorded_at              INTEGER NOT NULL
+                     );
+                     INSERT INTO token_usage_runs_new
+                         SELECT id,agent_run_id,purpose,pr_number,provider,model,effort,
+                                uncached_input_tokens,cached_input_tokens,
+                                cache_write_input_tokens,output_tokens,reasoning_tokens,
+                                recorded_at
+                         FROM token_usage_runs;
+                     DROP TABLE token_usage_runs;
+                     ALTER TABLE token_usage_runs_new RENAME TO token_usage_runs;
+                     CREATE INDEX IF NOT EXISTS token_usage_runs_pr
+                         ON token_usage_runs(pr_number);
+                     CREATE INDEX IF NOT EXISTS token_usage_runs_recorded
+                         ON token_usage_runs(recorded_at);",
+                )?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1430,6 +1513,166 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn migrates_v57_widens_decomposition_attempts_and_token_usage_runs_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v57-widen-checks.db");
+        {
+            // Open fresh at the latest shape, then seed the two tables in a narrow
+            // (pre-v58) form so we can verify the rebuild widens both CHECKs. Mirrors
+            // the pattern in `populated_v53_to_v54_preserves_history_and_adds_empty_usage_tables`.
+            let conn = open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'src','failed','owner',1,1);
+                 INSERT INTO task_decompositions(
+                     id,source_task_id,state,planned_source_revision,created_at,updated_at)
+                 VALUES (10,1,'held',1,1,1);
+                 -- Rebuild decomposition_attempts with the narrow v57 CHECK, preserving
+                 -- the FK to task_decompositions so foreign_key_check still has a live
+                 -- child reference to validate after the v58 rebuild. FKs are ON here,
+                 -- so we DROP the child first (there are no rows yet), then recreate.
+                 DROP TABLE decomposition_attempts;
+                 CREATE TABLE decomposition_attempts (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     graph_id         INTEGER NOT NULL REFERENCES task_decompositions(id),
+                     source_revision  INTEGER NOT NULL,
+                     kind             TEXT NOT NULL CHECK(kind IN
+                                          ('proposal','provider','blocker','recovery')),
+                     ordinal          INTEGER NOT NULL,
+                     retry_generation INTEGER NOT NULL DEFAULT 0
+                                          CHECK(retry_generation BETWEEN 0 AND 2),
+                     reason_code      TEXT NOT NULL,
+                     summary          TEXT NOT NULL,
+                     created_at       INTEGER NOT NULL,
+                     UNIQUE (graph_id, source_revision, kind, ordinal)
+                 );
+                 INSERT INTO decomposition_attempts(
+                     id,graph_id,source_revision,kind,ordinal,retry_generation,
+                     reason_code,summary,created_at)
+                 VALUES (7,10,1,'provider',1,0,'provider','preserved',1);
+                 DROP TABLE token_usage_run_tasks;
+                 DROP TABLE token_usage_runs;
+                 CREATE TABLE token_usage_runs (
+                     id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     agent_run_id             INTEGER UNIQUE,
+                     purpose                  TEXT NOT NULL CHECK(purpose IN
+                                                  ('worker','reviewer','classifier','collector')),
+                     pr_number                INTEGER,
+                     provider                 TEXT NOT NULL,
+                     model                    TEXT NOT NULL,
+                     effort                   TEXT NOT NULL,
+                     uncached_input_tokens    INTEGER NOT NULL DEFAULT 0,
+                     cached_input_tokens      INTEGER NOT NULL DEFAULT 0,
+                     cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+                     output_tokens            INTEGER NOT NULL DEFAULT 0,
+                     reasoning_tokens         INTEGER NOT NULL DEFAULT 0,
+                     recorded_at              INTEGER NOT NULL
+                 );
+                 INSERT INTO token_usage_runs(
+                     id,agent_run_id,purpose,pr_number,provider,model,effort,recorded_at)
+                 VALUES (5,NULL,'worker',NULL,'claude','claude-opus-4-8','high',1);
+                 PRAGMA user_version=57;",
+            )
+            .unwrap();
+            // The narrow constraints really reject the widened values.
+            assert!(conn
+                .execute(
+                    "INSERT INTO decomposition_attempts(
+                         graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+                     VALUES (10,1,'verdict',2,'r','pre-widening',1)",
+                    [],
+                )
+                .is_err());
+            assert!(conn
+                .execute(
+                    "INSERT INTO token_usage_runs(
+                         purpose,provider,model,effort,recorded_at)
+                     VALUES ('planner','codex','gpt-5.6-sol','high',1)",
+                    [],
+                )
+                .is_err());
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // Historical rows survived the rebuilds unchanged, and the child FK reference
+        // (decomposition_attempts.graph_id → task_decompositions.id) still resolves.
+        assert_eq!(
+            conn.query_row(
+                "SELECT id,graph_id,kind,summary FROM decomposition_attempts",
+                [],
+                |row| Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                )),
+            )
+            .unwrap(),
+            (7, 10, "provider".into(), "preserved".into())
+        );
+        assert_eq!(
+            conn.query_row("SELECT id,purpose FROM token_usage_runs", [], |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?
+            )),)
+                .unwrap(),
+            (5, "worker".into())
+        );
+        // Integrity intact: no dangling FK references after the rebuild.
+        assert!(!conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        // The widened CHECKs now admit the new values.
+        conn.execute(
+            "INSERT INTO decomposition_attempts(
+                 graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+             VALUES (10,1,'verdict',1,'r','post-widening',2)",
+            [],
+        )
+        .unwrap();
+        for purpose in ["planner", "arbiter"] {
+            conn.execute(
+                "INSERT INTO token_usage_runs(
+                     purpose,provider,model,effort,recorded_at)
+                 VALUES (?1,'codex','gpt-5.6-sol','high',2)",
+                [purpose],
+            )
+            .unwrap();
+        }
+
+        // Idempotent across reopen: no double rebuild, no row loss.
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM decomposition_attempts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM token_usage_runs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
         );
     }
 
