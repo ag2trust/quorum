@@ -9,6 +9,7 @@
 use super::agent::{self, AgentProc, AgentSpec};
 use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, CapturedOutput, RunnerProc};
+use super::session_log::SessionLog;
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
@@ -242,6 +243,7 @@ pub struct ArbiterSlot {
     effort: String,
     assistant_events: u64,
     tool_count: u64,
+    session_log: Option<SessionLog>,
 }
 
 impl ArbiterSlot {
@@ -249,8 +251,37 @@ impl ArbiterSlot {
         self.proc.pid()
     }
 
-    pub async fn kill_and_reap(self) {
-        let _ = self.proc.kill_and_reap().await;
+    pub fn start_session_log(
+        &mut self,
+        log_dir: &Path,
+        agent: &str,
+        task_id: i64,
+        session_id: &str,
+        branch: &str,
+        started_at: i64,
+    ) -> std::io::Result<()> {
+        self.session_log = Some(SessionLog::create(
+            log_dir,
+            agent,
+            "arbiter",
+            Some(task_id),
+            session_id,
+            branch,
+            started_at,
+        )?);
+        Ok(())
+    }
+
+    pub fn log_dir(&self) -> Option<&Path> {
+        self.session_log.as_ref().map(|log| log.dir())
+    }
+
+    pub async fn kill_and_reap(mut self) {
+        let output = self.proc.kill_and_reap().await;
+        super::persist_terminal_output(&mut self.session_log, output);
+        if let Some(session_log) = self.session_log.as_mut() {
+            session_log.finalize(None);
+        }
     }
 
     fn run_metrics(&self) -> ArbiterRunMetrics {
@@ -372,6 +403,7 @@ pub async fn spawn_arbiter(
         effort: effort.into(),
         assistant_events: 0,
         tool_count: 0,
+        session_log: None,
     })
 }
 
@@ -446,6 +478,14 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
                 return Some(provider_failure(slot, &reason));
             }
         };
+        let events = match slot.proc.kind() {
+            AgentKind::Claude => super::runner::normalize_claude_line(&raw),
+            AgentKind::Codex => super::runner::normalize_codex_line(&raw),
+            AgentKind::Grok => super::runner::normalize_grok_line(&raw),
+        };
+        if let Some(session_log) = slot.session_log.as_mut() {
+            session_log.log_raw_and_normalized(&raw, &events);
+        }
         slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
         if slot.stdout_bytes > MAX_STDOUT_BYTES {
             return Some(provider_failure(
@@ -487,11 +527,7 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
                 return Some(parsed_poll(slot));
             }
         }
-        for event in match slot.proc.kind() {
-            AgentKind::Claude => super::runner::normalize_claude_line(&raw),
-            AgentKind::Codex => super::runner::normalize_codex_line(&raw),
-            AgentKind::Grok => super::runner::normalize_grok_line(&raw),
-        } {
+        for event in events {
             match event {
                 AgentEvent::TurnFailed { .. } => {
                     return Some(provider_failure(slot, "arbiter provider turn failed"));
@@ -747,6 +783,38 @@ mod tests {
             other => panic!("expected approve, got {other:?}"),
         }
         slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_poll_reap_persists_buffered_provider_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = r#"{"type":"turn.failed","error":{"message":"provider failed"}}"#;
+        let mut slot = spawn_fake_arbiter(dir.path(), &format!("{raw}\n")).await;
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-arbiter-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            while slot.proc.try_wait().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("arbiter provider did not exit");
+
+        slot.kill_and_reap().await;
+        assert_eq!(
+            std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap(),
+            format!("{raw}\n")
+        );
     }
 
     #[cfg(unix)]
