@@ -7,6 +7,7 @@
 use super::agent::{self, AgentProc, AgentSpec};
 use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, CapturedOutput, RunnerFailure, RunnerProc};
+use super::session_log::SessionLog;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -564,6 +565,7 @@ pub struct PlannerSlot {
     stdout_bytes: usize,
     codex_terminal_candidate: bool,
     diagnostics: PlannerDiagnostics,
+    session_log: Option<SessionLog>,
 }
 
 #[derive(Default)]
@@ -658,7 +660,35 @@ impl PlannerSlot {
         self.proc.pid()
     }
 
-    pub async fn kill_and_reap(self) {
+    pub fn start_session_log(
+        &mut self,
+        log_dir: &Path,
+        agent: &str,
+        task_id: i64,
+        session_id: &str,
+        branch: &str,
+        started_at: i64,
+    ) -> std::io::Result<()> {
+        self.session_log = Some(SessionLog::create(
+            log_dir,
+            agent,
+            "planner",
+            Some(task_id),
+            session_id,
+            branch,
+            started_at,
+        )?);
+        Ok(())
+    }
+
+    pub fn log_dir(&self) -> Option<&Path> {
+        self.session_log.as_ref().map(|log| log.dir())
+    }
+
+    pub async fn kill_and_reap(mut self) {
+        if let Some(session_log) = self.session_log.as_mut() {
+            session_log.finalize(None);
+        }
         let _ = self.proc.kill_and_reap().await;
     }
 }
@@ -758,6 +788,7 @@ async fn spawn_planner_with_timeout(
         stdout_bytes: 0,
         codex_terminal_candidate: false,
         diagnostics: PlannerDiagnostics::default(),
+        session_log: None,
     })
 }
 
@@ -871,6 +902,14 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                 ));
             }
         };
+        let events = match slot.proc.kind() {
+            AgentKind::Claude => super::runner::normalize_claude_line(&raw),
+            AgentKind::Codex => super::runner::normalize_codex_line(&raw),
+            AgentKind::Grok => super::runner::normalize_grok_line(&raw),
+        };
+        if let Some(session_log) = slot.session_log.as_mut() {
+            session_log.log_raw_and_normalized(&raw, &events);
+        }
         slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
         slot.diagnostics.observe_line(slot.proc.kind(), &raw);
         if slot.stdout_bytes > MAX_STDOUT_BYTES {
@@ -918,11 +957,7 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                 return Some(parsed_poll(slot));
             }
         }
-        for event in match slot.proc.kind() {
-            AgentKind::Claude => super::runner::normalize_claude_line(&raw),
-            AgentKind::Codex => super::runner::normalize_codex_line(&raw),
-            AgentKind::Grok => super::runner::normalize_grok_line(&raw),
-        } {
+        for event in events {
             match event {
                 AgentEvent::TurnFailed { .. } => {
                     return Some(provider_failure(

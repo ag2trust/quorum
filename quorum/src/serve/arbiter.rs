@@ -9,6 +9,7 @@
 use super::agent::{self, AgentProc, AgentSpec};
 use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, CapturedOutput, RunnerProc};
+use super::session_log::SessionLog;
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
@@ -237,6 +238,7 @@ pub struct ArbiterSlot {
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
     codex_terminal_candidate: bool,
+    session_log: Option<SessionLog>,
 }
 
 impl ArbiterSlot {
@@ -244,7 +246,35 @@ impl ArbiterSlot {
         self.proc.pid()
     }
 
-    pub async fn kill_and_reap(self) {
+    pub fn start_session_log(
+        &mut self,
+        log_dir: &Path,
+        agent: &str,
+        task_id: i64,
+        session_id: &str,
+        branch: &str,
+        started_at: i64,
+    ) -> std::io::Result<()> {
+        self.session_log = Some(SessionLog::create(
+            log_dir,
+            agent,
+            "arbiter",
+            Some(task_id),
+            session_id,
+            branch,
+            started_at,
+        )?);
+        Ok(())
+    }
+
+    pub fn log_dir(&self) -> Option<&Path> {
+        self.session_log.as_ref().map(|log| log.dir())
+    }
+
+    pub async fn kill_and_reap(mut self) {
+        if let Some(session_log) = self.session_log.as_mut() {
+            session_log.finalize(None);
+        }
         let _ = self.proc.kill_and_reap().await;
     }
 }
@@ -325,6 +355,7 @@ pub async fn spawn_arbiter(
         started_at,
         stdout_bytes: 0,
         codex_terminal_candidate: false,
+        session_log: None,
     })
 }
 
@@ -393,6 +424,14 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
                 return Some(provider_failure(&reason));
             }
         };
+        let events = match slot.proc.kind() {
+            AgentKind::Claude => super::runner::normalize_claude_line(&raw),
+            AgentKind::Codex => super::runner::normalize_codex_line(&raw),
+            AgentKind::Grok => super::runner::normalize_grok_line(&raw),
+        };
+        if let Some(session_log) = slot.session_log.as_mut() {
+            session_log.log_raw_and_normalized(&raw, &events);
+        }
         slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
         if slot.stdout_bytes > MAX_STDOUT_BYTES {
             return Some(provider_failure(&format!(
@@ -430,11 +469,7 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
                 return Some(parsed_poll(slot));
             }
         }
-        for event in match slot.proc.kind() {
-            AgentKind::Claude => super::runner::normalize_claude_line(&raw),
-            AgentKind::Codex => super::runner::normalize_codex_line(&raw),
-            AgentKind::Grok => super::runner::normalize_grok_line(&raw),
-        } {
+        for event in events {
             match event {
                 AgentEvent::TurnFailed { .. } => {
                     return Some(provider_failure("arbiter provider turn failed"));
