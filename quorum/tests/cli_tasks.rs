@@ -21,6 +21,168 @@ fn quorum(home: &std::path::Path) -> Command {
     c
 }
 
+#[test]
+fn status_and_task_get_project_latest_arbiter_verdicts() {
+    let home = tempfile::tempdir().unwrap();
+    for title in ["approved", "changes", "provider failure", "no verdict"] {
+        quorum(home.path())
+            .args(["task-create", "--created-by", "owner", "--title", title])
+            .assert()
+            .success();
+    }
+
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let cases = [
+        (
+            1,
+            "arbiter-approve",
+            serde_json::json!({
+                "verdict": "approve",
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "duration_ms": 101,
+            }),
+            401,
+        ),
+        (
+            2,
+            "arbiter-changes",
+            serde_json::json!({
+                "verdict": "changes",
+                "provider": "claude",
+                "model": "claude-opus-4-6",
+                "duration_ms": 202,
+            }),
+            402,
+        ),
+        (
+            3,
+            "arbiter-provider",
+            serde_json::json!({
+                "verdict": "provider_failed",
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "duration_ms": 303,
+            }),
+            403,
+        ),
+    ];
+    for (task_id, reason_code, summary, at) in cases {
+        conn.execute(
+            "UPDATE tasks SET status='decomposed' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,planned_source_revision,created_at,updated_at
+             ) VALUES (?1,'active',?2,1,100,100)",
+            rusqlite::params![task_id, i64::from(task_id == 1)],
+        )
+        .unwrap();
+        let graph_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO decomposition_attempts(
+                 graph_id,source_revision,kind,ordinal,reason_code,summary,created_at
+             ) VALUES (?1,1,'verdict',1,'arbiter-provider',?2,1)",
+            rusqlite::params![graph_id, r#"{"verdict":"stale"}"#],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO decomposition_attempts(
+                 graph_id,source_revision,kind,ordinal,reason_code,summary,created_at
+             ) VALUES (?1,1,'verdict',2,?2,?3,?4)",
+            rusqlite::params![graph_id, reason_code, summary.to_string(), at],
+        )
+        .unwrap();
+    }
+    conn.execute("UPDATE tasks SET status='decomposed' WHERE id=4", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO task_decompositions(
+             source_task_id,state,active,planned_source_revision,created_at,updated_at
+         ) VALUES (4,'active',0,1,100,100)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let status = quorum(home.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    for (task_id, reason_code, verdict, provider, model, duration_ms, at) in [
+        (
+            1,
+            "arbiter-approve",
+            "approve",
+            "codex",
+            "gpt-5.6-sol",
+            101,
+            401,
+        ),
+        (
+            2,
+            "arbiter-changes",
+            "changes",
+            "claude",
+            "claude-opus-4-6",
+            202,
+            402,
+        ),
+        (
+            3,
+            "arbiter-provider",
+            "provider_failed",
+            "codex",
+            "gpt-5.6-terra",
+            303,
+            403,
+        ),
+    ] {
+        let pipeline = status["pipeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == task_id)
+            .unwrap();
+        let expected = serde_json::json!({
+            "verdict": verdict,
+            "reason_code": reason_code,
+            "at": at,
+            "provider": provider,
+            "model": model,
+            "duration_ms": duration_ms,
+        });
+        assert_eq!(pipeline["arbiter"], expected);
+
+        let task = quorum(home.path())
+            .args(["task-get", "--task-id", &task_id.to_string()])
+            .output()
+            .unwrap();
+        assert!(task.status.success());
+        let task: serde_json::Value = serde_json::from_slice(&task.stdout).unwrap();
+        assert_eq!(task["arbiter"], expected);
+    }
+    let no_verdict = status["pipeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == 4)
+        .unwrap();
+    assert!(no_verdict.get("arbiter").is_none());
+    let task = quorum(home.path())
+        .args(["task-get", "--task-id", "4"])
+        .output()
+        .unwrap();
+    assert!(task.status.success());
+    let task: serde_json::Value = serde_json::from_slice(&task.stdout).unwrap();
+    assert!(task.get("arbiter").is_none());
+}
+
 // -- removed CLI entry points (#161) -------------------------------------------------
 
 #[test]

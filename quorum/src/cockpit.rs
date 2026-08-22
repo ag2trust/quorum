@@ -1040,6 +1040,7 @@ mod tests {
             status: "done".into(),
             pr: Some(42),
             blocked: false,
+            arbiter: None,
         };
         let (icon, label) = pipeline_state(&done, &sty);
         assert_eq!(icon, "[merged]");
@@ -1054,6 +1055,7 @@ mod tests {
             status: "working".into(),
             pr: Some(99),
             blocked: false,
+            arbiter: None,
         };
         let (icon, _) = pipeline_state(&pending, &sty);
         assert_eq!(icon, "[working]");
