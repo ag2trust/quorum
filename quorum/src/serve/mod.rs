@@ -34938,79 +34938,227 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn decomposition_slot_exit_records_planner_and_arbiter_usage() {
+    async fn decomposition_tick_records_planner_and_arbiter_usage_after_lifecycle() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("decomposition-role-usage.db");
-        let emitted = dir.path().join("emitted");
-        let runner = dir.path().join("claude");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("tests")).unwrap();
+        std::fs::write(repo_dir.join("src/core.rs"), "pub fn core() {}\n").unwrap();
+        std::fs::write(repo_dir.join("tests/core.rs"), "#[test] fn core() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "frozen"]);
+        let frozen_base_sha = git(&["rev-parse", "HEAD"]);
+
+        let proposal = arbiter_gate_proposal();
+        let planner_response = serde_json::json!({"outcome":"plan","tasks":proposal});
+        let planner_output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{"type":"agent_message","id":"planner-response","text":planner_response.to_string()}
+            }),
+            serde_json::json!({
+                "type":"turn.completed",
+                "usage":{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3}
+            })
+        );
+        let arbiter_output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{"type":"agent_message","id":"arbiter-response","text":r#"{"outcome":"approve"}"#}
+            }),
+            serde_json::json!({
+                "type":"turn.completed",
+                "usage":{"input_tokens":70,"cached_input_tokens":50,"cache_write_input_tokens":7,"output_tokens":4,"reasoning_output_tokens":2}
+            })
+        );
+        let planner_output_path = dir.path().join("planner.jsonl");
+        let arbiter_output_path = dir.path().join("arbiter.jsonl");
+        std::fs::write(&planner_output_path, planner_output).unwrap();
+        std::fs::write(&arbiter_output_path, arbiter_output).unwrap();
+        let planner_runner = dir.path().join("planner-codex");
+        let arbiter_runner = dir.path().join("arbiter-codex");
         std::fs::write(
-            &runner,
+            &planner_runner,
             format!(
-                "#!/bin/sh\n\
-                 IFS= read -r _turn\n\
-                 printf '%s\\n' '{{\"type\":\"result\",\"result\":\"done\",\"is_error\":false,\"usage\":{{\"input_tokens\":100,\"cache_read_input_tokens\":80,\"cache_creation_input_tokens\":10,\"output_tokens\":5}}}}'\n\
-                 touch '{}'\n\
-                 sleep 30\n",
-                emitted.display()
+                "#!/bin/sh\nexec /bin/cat '{}'\n",
+                planner_output_path.display()
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let planner_slot = planner::spawn_planner(
-            runner::AgentKind::Claude,
-            planner::CLAUDE_PLANNER_MODEL,
-            planner::PLANNER_EFFORT,
-            dir.path(),
-            "bounded prompt",
-            false,
-            runner.to_str(),
+        std::fs::write(
+            &arbiter_runner,
+            format!(
+                "#!/bin/sh\nexec /bin/cat '{}'\n",
+                arbiter_output_path.display()
+            ),
         )
-        .await
         .unwrap();
-        let arbiter_slot = arbiter::spawn_arbiter(
-            runner::AgentKind::Claude,
-            planner::CLAUDE_PLANNER_MODEL,
-            planner::PLANNER_EFFORT,
-            dir.path(),
-            "bounded prompt",
-            false,
-            runner.to_str(),
-        )
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !emitted.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("provider fixture did not emit terminal usage");
+        for runner in [&planner_runner, &arbiter_runner] {
+            std::fs::set_permissions(runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
+        let (source_task_id, graph_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source_task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "split source",
+                Some("split this safely"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph_id = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "gpt-5.6-sol",
+                    frozen_base_sha: &frozen_base_sha,
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph_id,
+                "freeze-requested",
+                "draining",
+                None,
+                3,
+            )
+            .unwrap();
+            assert!(
+                quorum_core::decomposition::bind_frozen_base_and_enter_planning(
+                    &mut conn,
+                    graph_id,
+                    &frozen_base_sha,
+                    4,
+                )
+                .unwrap()
+            );
+            (source_task_id, graph_id)
+        };
+        let planner_slot = planner::spawn_planner(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            &repo_dir,
+            "bounded prompt",
+            false,
+            planner_runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let mut config = pre_review_checks_config(db_path.clone(), repo_dir);
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "test".to_string(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: planner::CODEX_PLANNER_MODEL.into(),
+                effort: planner::PLANNER_EFFORT.into(),
+            },
+        )]);
+        config.agent_bin = Some(arbiter_runner.to_string_lossy().into_owned());
         let mut coordinator = DecompositionCoordinator {
+            graph_id: Some(graph_id),
             planner_slot: Some(planner_slot),
-            planner_source_task_id: Some(42),
-            arbiter_slot: Some(arbiter_slot),
-            arbiter_source_task_id: Some(42),
+            planner_source_task_id: Some(source_task_id),
             ..Default::default()
         };
-        reap_decomposition_planner_with_usage(&db_path, &mut coordinator).await;
-        reap_decomposition_arbiter_with_usage(&db_path, &mut coordinator).await;
+
+        tick_decomposition(
+            &config,
+            &mut coordinator,
+            &[],
+            &[],
+            DecompositionLiveWork::default(),
+        )
+        .await
+        .unwrap();
 
         let conn = quorum_core::db::open(&db_path).unwrap();
-        let runs = quorum_core::token_usage::for_task(&conn, 42).unwrap();
-        assert_eq!(runs.len(), 2);
-        for (purpose, run) in [("planner", &runs[0]), ("arbiter", &runs[1])] {
-            assert_eq!(run.purpose, purpose);
-            assert_eq!(run.provider, "claude");
-            assert_eq!(run.model, planner::CLAUDE_PLANNER_MODEL);
-            assert_eq!(run.effort, planner::PLANNER_EFFORT);
-            assert_eq!(run.usage.uncached_input_tokens, 20);
-            assert_eq!(run.usage.cached_input_tokens, 80);
-            assert_eq!(run.usage.cache_write_input_tokens, 10);
-            assert_eq!(run.usage.output_tokens, 5);
+        let planner_run = quorum_core::token_usage::for_task(&conn, source_task_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.purpose == "planner")
+            .expect("planner usage is recorded after the planner lifecycle write");
+        assert_eq!(planner_run.provider, "codex");
+        assert_eq!(planner_run.model, planner::CODEX_PLANNER_MODEL);
+        assert_eq!(planner_run.effort, planner::PLANNER_EFFORT);
+        assert_eq!(planner_run.usage.uncached_input_tokens, 20);
+        assert_eq!(planner_run.usage.cached_input_tokens, 80);
+        assert_eq!(planner_run.usage.cache_write_input_tokens, 10);
+        assert_eq!(planner_run.usage.output_tokens, 5);
+        assert_eq!(
+            load_planning_snapshot(&conn).unwrap().unwrap().state,
+            "validating",
+            "planner usage is visible only after its durable proposal acceptance"
+        );
+        drop(conn);
+        assert!(coordinator.arbiter_slot.is_some());
+
+        for _ in 0..3 {
+            tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap();
+            if coordinator.arbiter_slot.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
+        assert!(
+            coordinator.arbiter_slot.is_none(),
+            "Arbiter fixture did not reach its approve terminal path"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let arbiter_run = quorum_core::token_usage::for_task(&conn, source_task_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.purpose == "arbiter")
+            .expect("arbiter usage is recorded after the Arbiter lifecycle write");
+        assert_eq!(arbiter_run.provider, "codex");
+        assert_eq!(arbiter_run.model, planner::CODEX_PLANNER_MODEL);
+        assert_eq!(arbiter_run.effort, planner::PLANNER_EFFORT);
+        assert_eq!(arbiter_run.usage.uncached_input_tokens, 20);
+        assert_eq!(arbiter_run.usage.cached_input_tokens, 50);
+        assert_eq!(arbiter_run.usage.cache_write_input_tokens, 7);
+        assert_eq!(arbiter_run.usage.output_tokens, 4);
+        assert_eq!(
+            load_planning_snapshot(&conn).unwrap().unwrap().state,
+            "preclassifying",
+            "Arbiter usage is visible only after durable approval"
+        );
     }
 
     #[tokio::test]
