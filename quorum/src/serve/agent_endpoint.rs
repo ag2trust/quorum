@@ -29,6 +29,12 @@ use tokio::task::{JoinHandle, JoinSet};
 /// Four-byte big-endian length prefix followed by at most one JSON document.
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// Bound on one submitted plan document. Deliberately below
+/// `MAX_REQUEST_BYTES` so a plan at the limit still fits its request frame:
+/// the bound is the operative one, rejecting the payload as `invalid_plan`
+/// against the run's rejection budget instead of letting the frame reader
+/// answer `request_too_large` with nothing counted.
+pub const MAX_PLAN_SUBMISSION_BYTES: usize = 60 * 1024;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 32;
@@ -240,6 +246,20 @@ pub fn locator(db_path: &Path) -> PathBuf {
         .join(SOCKET_FILE)
 }
 
+/// Filesystem authority the plan validator needs.
+///
+/// `WritablePathResolver` is a *process-local single-slot admission gate*
+/// (`planner.rs`): at most one dedicated OS resolver thread runs at a time and
+/// an occupied slot fails later resolutions closed until the stalled
+/// filesystem call really returns. That bound only holds if the whole process
+/// shares one instance, so the daemon constructs it once and hands the same
+/// clone to this endpoint and to the decomposition coordinator.
+#[derive(Clone)]
+struct PlanValidation {
+    repo_dir: PathBuf,
+    path_resolver: super::planner::WritablePathResolver,
+}
+
 pub struct AgentEndpoint {
     locator: PathBuf,
     artifact_dir: PathBuf,
@@ -248,7 +268,12 @@ pub struct AgentEndpoint {
 }
 
 impl AgentEndpoint {
-    pub async fn start(db_path: &Path, repository: &str, repo_dir: &Path) -> Result<Self> {
+    pub async fn start(
+        db_path: &Path,
+        repository: &str,
+        repo_dir: &Path,
+        path_resolver: super::planner::WritablePathResolver,
+    ) -> Result<Self> {
         let locator = locator(db_path);
         let artifact_dir = locator
             .parent()
@@ -279,12 +304,15 @@ impl AgentEndpoint {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let db_path = db_path.to_path_buf();
         let repository = repository.to_string();
-        let repo_dir = repo_dir.to_path_buf();
+        let plan_validation = PlanValidation {
+            repo_dir: repo_dir.to_path_buf(),
+            path_resolver,
+        };
         let task = tokio::spawn(run_listener(
             listener,
             db_path,
             repository,
-            repo_dir,
+            plan_validation,
             shutdown_rx,
         ));
         super::log("agent endpoint ready");
@@ -364,7 +392,7 @@ async fn run_listener(
     listener: UnixListener,
     db_path: PathBuf,
     repository: String,
-    repo_dir: PathBuf,
+    plan_validation: PlanValidation,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut connections = JoinSet::new();
@@ -378,7 +406,7 @@ async fn run_listener(
                             stream,
                             db_path.clone(),
                             repository.clone(),
-                            repo_dir.clone(),
+                            plan_validation.clone(),
                         ));
                     }
                     Err(_) => super::log("agent endpoint accept failed"),
@@ -397,10 +425,10 @@ async fn serve_connection(
     mut stream: UnixStream,
     db_path: PathBuf,
     repository: String,
-    repo_dir: PathBuf,
+    plan_validation: PlanValidation,
 ) {
     let response = match read_request(&mut stream).await {
-        Ok(request) => match process_request(db_path, repository, repo_dir, request).await {
+        Ok(request) => match process_request(db_path, repository, plan_validation, request).await {
             Ok(response) => response,
             Err(error) => {
                 if error.is_abnormal() {
@@ -465,16 +493,23 @@ async fn write_response(stream: &mut UnixStream, response: &Response) -> std::io
 async fn process_request(
     db_path: PathBuf,
     repository: String,
-    repo_dir: PathBuf,
+    plan_validation: PlanValidation,
     request: Request,
 ) -> std::result::Result<Response, EndpointFailure> {
-    process_request_with_timeout(db_path, repository, repo_dir, request, PROCESS_TIMEOUT).await
+    process_request_with_timeout(
+        db_path,
+        repository,
+        plan_validation,
+        request,
+        PROCESS_TIMEOUT,
+    )
+    .await
 }
 
 async fn process_request_with_timeout(
     db_path: PathBuf,
     repository: String,
-    repo_dir: PathBuf,
+    plan_validation: PlanValidation,
     request: Request,
     process_timeout: Duration,
 ) -> std::result::Result<Response, EndpointFailure> {
@@ -499,7 +534,14 @@ async fn process_request_with_timeout(
     // branch validates with no write transaction open and records afterwards.
     let request = match request.operation {
         Operation::SubmitPlan { response } => {
-            return submit_plan(db_path, repo_dir, request.capability, response).await;
+            return submit_plan(
+                db_path,
+                plan_validation,
+                request.capability,
+                response,
+                process_timeout,
+            )
+            .await;
         }
         operation => Request {
             version: request.version,
@@ -695,6 +737,14 @@ struct PlanSubmissionContext {
     source_dependency_ids: Vec<i64>,
 }
 
+/// One plan submission that survived the read-and-validate phase.
+enum PreparedPlan {
+    /// The plan is valid; `serialized` is what gets recorded.
+    Valid { graph_id: i64, serialized: String },
+    /// The plan was rejected; `message` is the validator's own text.
+    Invalid { graph_id: i64, message: String },
+}
+
 /// Accept one planner plan submission.
 ///
 /// Ordering is load-bearing. Authority, the once-only guard, and the rejection
@@ -705,51 +755,98 @@ struct PlanSubmissionContext {
 /// run whose plan already stands reports `already_submitted` rather than a
 /// budget failure it can do nothing about.
 ///
-/// This path does not use the cancellation state machine that guards the
-/// blocking operations: `spawn_blocking` work cannot be aborted, so a cancelled
-/// wait could report a timeout for a commit that already landed. Each step is
-/// bounded instead — `busy_timeout` on every connection, and
-/// `validate_for_source`'s own resolution timeout.
+/// Bounding differs from the other operations by exactly one step. The
+/// read-and-validate phase writes nothing, so abandoning it is safe and it
+/// carries the same `PROCESS_TIMEOUT` deadline every operation has. The
+/// recording phase is deliberately **not** deadlined: `spawn_blocking` work
+/// cannot be aborted, so a cancelled wait could report a timeout for a commit
+/// that already landed. It is bounded only by `busy_timeout` on its
+/// connection, so a submission can outlive the client's own read timeout. That
+/// is safe but can mislead: acceptance is one atomic guarded write, so a client
+/// that gives up must treat the outcome as unknown and re-check, never as
+/// "failed, resubmit" — a corrected resubmission would receive
+/// `already_submitted` while the first plan stands.
 async fn submit_plan(
     db_path: PathBuf,
-    repo_dir: PathBuf,
+    plan_validation: PlanValidation,
     capability: String,
     response: serde_json::Value,
+    process_timeout: Duration,
 ) -> std::result::Result<Response, EndpointFailure> {
+    let prepared = tokio::time::timeout(
+        process_timeout,
+        prepare_and_validate_plan(
+            db_path.clone(),
+            plan_validation,
+            capability.clone(),
+            response,
+        ),
+    )
+    .await
+    .map_err(|_| EndpointFailure::new("timeout", "request processing timed out"))??;
+
+    match prepared {
+        PreparedPlan::Invalid { graph_id, message } => {
+            in_blocking(move || record_plan_rejection(&db_path, &capability, graph_id)).await?;
+            Err(EndpointFailure::detailed("invalid_plan", message))
+        }
+        PreparedPlan::Valid {
+            graph_id,
+            serialized,
+        } => {
+            let outcome = in_blocking(move || {
+                record_plan_acceptance(&db_path, &capability, graph_id, &serialized)
+            })
+            .await?;
+            match outcome {
+                SubmitOutcome::Accepted => {
+                    Ok(Response::success(ResponseResult::PlanAccepted { graph_id }))
+                }
+                SubmitOutcome::AlreadySubmitted => Err(EndpointFailure::new(
+                    "already_submitted",
+                    "a plan was already accepted for this run",
+                )),
+                SubmitOutcome::BudgetExhausted => Err(EndpointFailure::new(
+                    "submit_budget_exhausted",
+                    "plan submission budget is exhausted",
+                )),
+            }
+        }
+    }
+}
+
+/// The whole non-writing phase: the short authority read, then full plan
+/// validation. Nothing here writes, so the caller may abandon it on a deadline.
+async fn prepare_and_validate_plan(
+    db_path: PathBuf,
+    plan_validation: PlanValidation,
+    capability: String,
+    response: serde_json::Value,
+) -> std::result::Result<PreparedPlan, EndpointFailure> {
     let context = {
-        let db_path = db_path.clone();
         let capability = capability.clone();
         in_blocking(move || prepare_plan_submission(&db_path, &capability)).await?
     };
-
     let serialized = serde_json::to_string(&response)
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
-    if let Err(message) =
-        validate_plan_submission(&serialized, &repo_dir, &context.source_dependency_ids).await
-    {
-        let graph_id = context.graph_id;
-        let rejection_db = db_path.clone();
-        let rejection_capability = capability.clone();
-        in_blocking(move || record_plan_rejection(&rejection_db, &rejection_capability, graph_id))
-            .await?;
-        return Err(EndpointFailure::detailed("invalid_plan", message));
-    }
-
-    let graph_id = context.graph_id;
-    let outcome =
-        in_blocking(move || record_plan_acceptance(&db_path, &capability, graph_id, &serialized))
-            .await?;
-    match outcome {
-        SubmitOutcome::Accepted => Ok(Response::success(ResponseResult::PlanAccepted { graph_id })),
-        SubmitOutcome::AlreadySubmitted => Err(EndpointFailure::new(
-            "already_submitted",
-            "a plan was already accepted for this run",
-        )),
-        SubmitOutcome::BudgetExhausted => Err(EndpointFailure::new(
-            "submit_budget_exhausted",
-            "plan submission budget is exhausted",
-        )),
-    }
+    Ok(
+        match validate_plan_submission(
+            &serialized,
+            &plan_validation,
+            &context.source_dependency_ids,
+        )
+        .await
+        {
+            Err(message) => PreparedPlan::Invalid {
+                graph_id: context.graph_id,
+                message,
+            },
+            Ok(()) => PreparedPlan::Valid {
+                graph_id: context.graph_id,
+                serialized,
+            },
+        },
+    )
 }
 
 /// Run one bounded blocking database step. `spawn_blocking` work is not
@@ -826,14 +923,11 @@ fn source_dependency_ids(
 /// planner can correct the plan and resubmit within its turn.
 async fn validate_plan_submission(
     serialized: &str,
-    repo_dir: &Path,
+    plan_validation: &PlanValidation,
     source_dependency_ids: &[i64],
 ) -> std::result::Result<(), String> {
-    if serialized.len() > super::planner::MAX_RESPONSE_BYTES {
-        return Err(format!(
-            "plan exceeds {} bytes",
-            super::planner::MAX_RESPONSE_BYTES
-        ));
+    if serialized.len() > MAX_PLAN_SUBMISSION_BYTES {
+        return Err(format!("plan exceeds {MAX_PLAN_SUBMISSION_BYTES} bytes"));
     }
     let response: super::planner::PlannerResponse =
         serde_json::from_str(serialized).map_err(|error| format!("invalid plan: {error}"))?;
@@ -842,8 +936,8 @@ async fn validate_plan_submission(
         super::planner::validate_for_source(
             tasks,
             source_dependency_ids,
-            repo_dir,
-            &super::planner::WritablePathResolver::default(),
+            &plan_validation.repo_dir,
+            &plan_validation.path_resolver,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -1045,7 +1139,7 @@ mod tests {
     struct PlannerFixture {
         _dir: tempfile::TempDir,
         db_path: PathBuf,
-        repo_dir: PathBuf,
+        plan_validation: PlanValidation,
     }
 
     impl PlannerFixture {
@@ -1086,7 +1180,10 @@ mod tests {
             Self {
                 _dir: dir,
                 db_path,
-                repo_dir,
+                plan_validation: PlanValidation {
+                    repo_dir,
+                    path_resolver: super::super::planner::WritablePathResolver::default(),
+                },
             }
         }
 
@@ -1098,7 +1195,7 @@ mod tests {
             process_request_with_timeout(
                 self.db_path.clone(),
                 "test/repo".into(),
-                self.repo_dir.clone(),
+                self.plan_validation.clone(),
                 Request {
                     version: PROTOCOL_VERSION,
                     capability: capability.into(),
@@ -1238,19 +1335,54 @@ mod tests {
         );
     }
 
+    /// The plan byte bound must be the operative one, and it must be the
+    /// reason this payload is refused.
+    ///
+    /// Every individually length-checked field stays well inside its own
+    /// limit: the padding is 8 extra `affected_paths` entries of 7,600 bytes
+    /// each — under `validate_text`'s 8 KiB per-item bound and under
+    /// `validate_list`'s 32-item bound — so only the size of the whole
+    /// document is out of range. Delete the byte bound and this plan validates
+    /// and is accepted, which is what makes the test fail when the behavior
+    /// breaks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_plan_rejects_oversized_payload() {
         let fixture = PlannerFixture::new();
         let mut plan = valid_plan();
-        plan["tasks"][0]["observable_outcome"] =
-            json!("x".repeat(super::super::planner::MAX_RESPONSE_BYTES + 1));
+        let padding = "p".repeat(7_600);
+        let paths = plan["tasks"][0]["affected_paths"].as_array_mut().unwrap();
+        for index in 0..8 {
+            paths.push(json!(format!("src/pad-{index}-{padding}.rs")));
+        }
+
+        let serialized = serde_json::to_string(&plan).unwrap();
+        assert!(
+            serialized.len() > MAX_PLAN_SUBMISSION_BYTES,
+            "payload must exceed the plan bound: {}",
+            serialized.len()
+        );
+        // The bound is reachable over the wire: a plan just past it still fits
+        // inside a request frame, so the endpoint answers `invalid_plan` and
+        // counts a rejection instead of the frame reader answering
+        // `request_too_large` with nothing counted.
+        let framed = serde_json::to_vec(&serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "capability": "planner-cap",
+            "operation": {"type": "submit_plan", "response": plan},
+        }))
+        .unwrap();
+        assert!(
+            framed.len() <= MAX_REQUEST_BYTES,
+            "oversized plan must still fit its request frame: {}",
+            framed.len()
+        );
 
         let error = fixture.submit_plan("planner-cap", plan).await.unwrap_err();
         assert_eq!(error.code, "invalid_plan");
-        assert!(
-            error.message.contains("exceeds"),
-            "unexpected message: {}",
-            error.message
+        assert_eq!(
+            error.message,
+            format!("plan exceeds {MAX_PLAN_SUBMISSION_BYTES} bytes"),
+            "the byte bound, not a per-field limit, must reject this plan"
         );
         let (stored, rejections) = fixture.submission_row();
         assert_eq!(stored, None);
@@ -1320,6 +1452,9 @@ mod tests {
             "invalid_operation",
             "forbidden_operation",
             "operation_unavailable",
+            "invalid_plan",
+            "already_submitted",
+            "submit_budget_exhausted",
         ] {
             assert!(!EndpointFailure::new(code, "expected rejection").is_abnormal());
         }
@@ -1389,7 +1524,10 @@ mod tests {
         let error = process_request_with_timeout(
             db_path.clone(),
             "test/repo".into(),
-            dir.path().to_path_buf(),
+            PlanValidation {
+                repo_dir: dir.path().to_path_buf(),
+                path_resolver: super::super::planner::WritablePathResolver::default(),
+            },
             Request {
                 version: PROTOCOL_VERSION,
                 capability: "timeout-cap".into(),

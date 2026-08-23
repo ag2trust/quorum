@@ -2069,9 +2069,13 @@ mod tests {
             );
             drop(conn);
 
-            let exit = super::super::tick_loop(&fixture.config, daemon_pid)
-                .await
-                .expect("frozen restart must converge through the startup coordinator");
+            let exit = super::super::tick_loop(
+                &fixture.config,
+                daemon_pid,
+                crate::serve::planner::WritablePathResolver::default(),
+            )
+            .await
+            .expect("frozen restart must converge through the startup coordinator");
             assert_eq!(exit, 1, "missing sentinel terminates the test daemon");
 
             let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
@@ -2148,7 +2152,11 @@ mod tests {
 
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(3),
-            super::super::tick_loop(&fixture.config, daemon_pid),
+            super::super::tick_loop(
+                &fixture.config,
+                daemon_pid,
+                crate::serve::planner::WritablePathResolver::default(),
+            ),
         )
         .await
         .expect("persistent startup disposition error must not retry")
@@ -2237,9 +2245,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let error = super::super::tick_loop(&fixture.config, daemon_pid)
-            .await
-            .expect_err("worker B's durable disposition error must abort startup");
+        let error = super::super::tick_loop(
+            &fixture.config,
+            daemon_pid,
+            crate::serve::planner::WritablePathResolver::default(),
+        )
+        .await
+        .expect_err("worker B's durable disposition error must abort startup");
         assert_eq!(error.exit_code(), 3);
 
         let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
@@ -2312,9 +2324,13 @@ exec sleep 30
         )
         .unwrap();
         drop(conn);
-        let error = super::super::tick_loop(&fixture.config, daemon_pid)
-            .await
-            .expect_err("post-launch journal failure must abort startup");
+        let error = super::super::tick_loop(
+            &fixture.config,
+            daemon_pid,
+            crate::serve::planner::WritablePathResolver::default(),
+        )
+        .await
+        .expect_err("post-launch journal failure must abort startup");
         assert_eq!(error.exit_code(), 3);
         assert!(
             error.to_string().contains("journal handoff failed"),
@@ -2427,7 +2443,11 @@ exec sleep 30
 
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            super::super::tick_loop(&fixture.config, daemon_pid),
+            super::super::tick_loop(
+                &fixture.config,
+                daemon_pid,
+                crate::serve::planner::WritablePathResolver::default(),
+            ),
         )
         .await
         .expect("unterminated provider output must not prevent fatal handoff settlement")

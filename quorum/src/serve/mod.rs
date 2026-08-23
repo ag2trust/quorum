@@ -3422,10 +3422,20 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
         .map_err(|e| QuorumError::Io(format!("failed to create tokio runtime: {e}")))?;
 
     let result = rt.block_on(async {
-        let endpoint =
-            agent_endpoint::AgentEndpoint::start(&config.db_path, &config.repo, &config.repo_dir)
-                .await?;
-        let result = tick_loop(&config, daemon_pid).await;
+        // One writable-path resolver for the whole process. Its admission gate
+        // is a single-slot bound — a stalled filesystem call must reject later
+        // resolutions rather than spawn another resolver thread — so the
+        // endpoint and the decomposition coordinator share this instance
+        // instead of each holding their own.
+        let writable_path_resolver = planner::WritablePathResolver::default();
+        let endpoint = agent_endpoint::AgentEndpoint::start(
+            &config.db_path,
+            &config.repo,
+            &config.repo_dir,
+            writable_path_resolver.clone(),
+        )
+        .await?;
+        let result = tick_loop(&config, daemon_pid, writable_path_resolver).await;
         endpoint.shutdown().await;
         result
     });
@@ -8595,7 +8605,11 @@ async fn reconcile_merged_continuations(
     }
 }
 
-async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
+async fn tick_loop(
+    config: &ServeConfig,
+    daemon_pid: i64,
+    writable_path_resolver: planner::WritablePathResolver,
+) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -8660,7 +8674,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut last_publication_ref_reconcile: Option<std::time::Instant> = None;
     let mut publication_ref_reconcile_cursor: Option<i64> = None;
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
-    let mut decomposition_coordinator = DecompositionCoordinator::default();
+    let mut decomposition_coordinator = DecompositionCoordinator {
+        writable_path_resolver,
+        ..DecompositionCoordinator::default()
+    };
     let mut classifier_consec_errors: u32 = 0;
     let mut classifier_backoff_until: Option<std::time::Instant> = None;
     let mut doctor_slot: Option<doctor::DoctorSlot> = None;

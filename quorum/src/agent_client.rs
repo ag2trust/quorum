@@ -371,9 +371,14 @@ mod tests {
     async fn submit_plan_round_trips_over_the_endpoint_socket() {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, repo_dir) = planner_fixture(dir.path());
-        let endpoint = AgentEndpoint::start(&db_path, "test/repo", &repo_dir)
-            .await
-            .unwrap();
+        let endpoint = AgentEndpoint::start(
+            &db_path,
+            "test/repo",
+            &repo_dir,
+            crate::serve::planner::WritablePathResolver::default(),
+        )
+        .await
+        .unwrap();
         let socket = locator(&db_path);
 
         let undersized = json!({
