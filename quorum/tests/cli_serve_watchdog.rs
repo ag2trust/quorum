@@ -600,6 +600,15 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
         "worker"
     };
     let run_id = resolve_run_id(home, agent, role);
+    quorum_done_with_run_id(home, &run_id, args);
+}
+
+fn quorum_done_with_run_id(home: &std::path::Path, run_id: &str, args: &[&str]) {
+    let role = if args.contains(&"--verdict") {
+        "reviewer"
+    } else {
+        "worker"
+    };
     let mut cmd_args = vec!["done"];
     if role == "worker" {
         let mut index = 0;
@@ -618,7 +627,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
         .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
-        .env("QUORUM_RUN_ID", &run_id)
+        .env("QUORUM_RUN_ID", run_id)
         .args(&cmd_args)
         .output()
         .unwrap();
@@ -816,7 +825,7 @@ fn worker_submission_before_terminal_overage_is_cleanup_only() {
     );
     let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
     let worker_run_id = resolve_run_id(home.path(), &worker_name, "worker");
-    quorum_done(home.path(), &["--agent", &worker_name]);
+    quorum_done_with_run_id(home.path(), &worker_run_id, &["--agent", &worker_name]);
     assert!(
         handle.wait_for("PR #1 ready for review", 15),
         "submission did not reach in-review before terminal usage. Lines: {:?}",

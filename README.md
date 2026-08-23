@@ -248,6 +248,31 @@ and budget settings. This repo uses `scripts/serve-supervisor.sh` so Quorum can
 rebuild and restart after updating itself. Only one daemon can manage a
 repository database at a time.
 
+### Branch responsibilities for operators
+
+`base_branch` and `self_update_branch` are independent settings. Set
+`base_branch` for managed task and PR work: it supplies the worktree base and
+the PR validation and merge target. Set `self_update_branch` for Quorum's own
+build-staleness poll and supervised rebuild source. For example, a repository
+can send task PRs to `develop` while rebuilding its daemon from `main`:
+
+```toml
+base_branch = "develop"
+self_update_branch = "main"
+```
+
+For compatibility, if neither `--self-update-branch` nor
+`self_update_branch` in the serve config is set, the self-update branch is the
+fully resolved `base_branch` (including any `--base-branch` override). Thus a
+config that only sets `base_branch = "develop"` also polls `develop` for
+self-updates; set `self_update_branch` explicitly to decouple the two.
+
+When using `scripts/serve-supervisor.sh`, `QUORUM_SELF_UPDATE_BRANCH` selects
+both the branch it fetches and the branch passed to daemon staleness checks. If
+it is unset, the supervisor accepts `QUORUM_BASE_BRANCH` as its legacy
+fallback; if both are unset, it uses `main`. A caller-supplied
+`--self-update-branch` takes precedence over both environment variables.
+
 ## Give it work
 
 There are three task entry modes.
