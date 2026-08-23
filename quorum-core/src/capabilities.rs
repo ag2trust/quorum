@@ -292,6 +292,69 @@ pub fn resolve_live_run_context(
     })
 }
 
+/// Identity and target derived from daemon-owned state for one live planner run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlannerRunContext {
+    pub run_id: String,
+    pub task_id: i64,
+    pub agent: String,
+    pub graph_id: i64,
+    pub source_revision: i64,
+}
+
+/// Resolve authoritative context for a capability-backed `SubmitPlan`
+/// operation. The capability must exist, be unrevoked, and carry
+/// `role='planner'`. The `task_decompositions` row for the capability's task
+/// must be the live frozen-planning graph (`freeze_active=1, active=0`) whose
+/// `planner_session_id` matches this run — the session id recorded by
+/// `decomposition::set_frozen_phase` at spawn. This function performs no
+/// writes and is suitable for use inside a caller-owned transaction that
+/// later admits an operation.
+pub fn resolve_planner_context(conn: &Connection, run_id: &str) -> Result<PlannerRunContext> {
+    let capability = conn
+        .query_row(
+            "SELECT run_id, task_id, agent, role, created_at, revoked_at
+             FROM run_capabilities WHERE run_id=?1",
+            [run_id],
+            |row| {
+                Ok(RunCapability {
+                    run_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent: row.get(2)?,
+                    role: row.get(3)?,
+                    created_at: row.get(4)?,
+                    revoked_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("unknown capability"))?;
+    if capability.revoked_at.is_some() {
+        return Err(authority_error("capability is revoked"));
+    }
+    if capability.role != "planner" {
+        return Err(authority_error("operation role does not match capability"));
+    }
+
+    let graph = conn
+        .query_row(
+            "SELECT id, planned_source_revision FROM task_decompositions
+             WHERE source_task_id=?1 AND freeze_active=1 AND active=0 AND planner_session_id=?2",
+            params![capability.task_id, capability.run_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("planner run is not the live planner for its graph"))?;
+
+    Ok(PlannerRunContext {
+        run_id: capability.run_id,
+        task_id: capability.task_id,
+        agent: capability.agent,
+        graph_id: graph.0,
+        source_revision: graph.1,
+    })
+}
+
 /// Issue a new run capability. The daemon calls this at spawn time.
 pub fn issue(
     conn: &mut Connection,
@@ -925,5 +988,170 @@ mod tests {
         assert!(active_for_agent_task(&c, "W", 10, "worker")
             .unwrap()
             .is_none());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_graph(
+        conn: &Connection,
+        graph_id: i64,
+        source_task_id: i64,
+        active: i64,
+        freeze_active: i64,
+        planner_session_id: Option<&str>,
+        planned_source_revision: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 id,source_task_id,state,active,freeze_active,
+                 planner_session_id,planned_source_revision,created_at,updated_at
+             ) VALUES (?1,?2,'planning',?3,?4,?5,?6,1,1)",
+            params![
+                graph_id,
+                source_task_id,
+                active,
+                freeze_active,
+                planner_session_id,
+                planned_source_revision
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_frozen_graph(
+        conn: &Connection,
+        graph_id: i64,
+        source_task_id: i64,
+        planner_session_id: Option<&str>,
+        planned_source_revision: i64,
+    ) {
+        insert_graph(
+            conn,
+            graph_id,
+            source_task_id,
+            0,
+            1,
+            planner_session_id,
+            planned_source_revision,
+        );
+    }
+
+    #[test]
+    fn planner_context_resolves_live_planner() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        insert_frozen_graph(&c, 5, 1, Some("planner-run"), 2);
+
+        let context = resolve_planner_context(&c, "planner-run").unwrap();
+        assert_eq!(
+            context,
+            PlannerRunContext {
+                run_id: "planner-run".into(),
+                task_id: 1,
+                agent: "Planner".into(),
+                graph_id: 5,
+                source_revision: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_worker_role() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        insert_live_worker(&mut c, 1, "Worker", "worker-run");
+        insert_frozen_graph(&c, 5, 1, Some("worker-run"), 2);
+
+        let err = resolve_planner_context(&c, "worker-run").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("operation role does not match capability"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_stale_session() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        insert_frozen_graph(&c, 5, 1, Some("other"), 2);
+
+        let err = resolve_planner_context(&c, "planner-run").unwrap_err();
+        assert!(
+            err.to_string().contains("not the live planner"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_active_graph() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        // active=1 alongside freeze_active=1 is not a state task_decompositions'
+        // invariants allow to persist (freeze_active clears once a graph activates),
+        // but it isolates the resolver's `AND active=0` clause: this row keeps
+        // freeze_active=1 and the matching planner_session_id, so only the `active=0`
+        // guard stands between it and a match. Deleting `AND active=0` from the
+        // resolver's query would make this row resolve successfully.
+        insert_graph(&c, 5, 1, 1, 1, Some("planner-run"), 2);
+
+        let err = resolve_planner_context(&c, "planner-run").unwrap_err();
+        assert!(
+            err.to_string().contains("not the live planner"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_unfrozen_graph() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        // active=0 and freeze_active=0 is the graph's rest state before a freeze is
+        // requested. This row keeps active=0 and the matching planner_session_id, so
+        // only the `AND freeze_active=1` guard stands between it and a match. Deleting
+        // `AND freeze_active=1` from the resolver's query would make this row resolve
+        // successfully.
+        insert_graph(&c, 5, 1, 0, 0, Some("planner-run"), 2);
+
+        let err = resolve_planner_context(&c, "planner-run").unwrap_err();
+        assert!(
+            err.to_string().contains("not the live planner"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_revoked() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        insert_frozen_graph(&c, 5, 1, Some("planner-run"), 2);
+        revoke(&mut c, "planner-run", 20).unwrap();
+
+        let err = resolve_planner_context(&c, "planner-run").unwrap_err();
+        assert!(
+            err.to_string().contains("revoked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn live_run_context_rejects_planner_role() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        insert_frozen_graph(&c, 5, 1, Some("planner-run"), 2);
+
+        for operation_role in ["worker", "reviewer"] {
+            let err = resolve_live_run_context(&c, "planner-run", operation_role).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("operation role does not match capability"),
+                "unexpected error for operation_role={operation_role}: {err}"
+            );
+        }
     }
 }
