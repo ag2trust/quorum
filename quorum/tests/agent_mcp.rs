@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -562,6 +562,216 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
         "MCP shell calls must not perform lifecycle or GitHub work"
     );
     daemon.stop();
+}
+
+/// The validator text a rejected plan must reach the planner with, unaltered.
+/// It deliberately carries quoting and punctuation that any reformatting of the
+/// endpoint's message would disturb.
+const PLANNER_REJECTION: &str =
+    r#"plan must contain between 2 and 8 tasks; "only" is the single task in this response"#;
+
+/// A length-prefixed JSON stand-in for the daemon endpoint.
+///
+/// A planner capability authorizes `submit_plan` only while its graph is the
+/// live frozen planning graph, which a running daemon's own planner scheduler
+/// would immediately claim and re-key. The real endpoint's wire contract for
+/// this operation is covered end-to-end by `agent_client`'s round-trip test, so
+/// the MCP shell's proxying is driven against this fake instead.
+struct FakeEndpoint {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+    submitted: Arc<Mutex<Vec<Value>>>,
+}
+
+impl FakeEndpoint {
+    fn start() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoint.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&submitted);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let Some(request) = read_frame(&mut stream) else {
+                    continue;
+                };
+                write_frame(&mut stream, &fake_response(&request, &recorder));
+            }
+        });
+        Self {
+            _dir: dir,
+            path,
+            submitted,
+        }
+    }
+
+    fn submitted(&self) -> Vec<Value> {
+        self.submitted.lock().unwrap().clone()
+    }
+}
+
+fn read_frame(stream: &mut std::os::unix::net::UnixStream) -> Option<Value> {
+    let mut prefix = [0_u8; 4];
+    stream.read_exact(&mut prefix).ok()?;
+    let mut body = vec![0; u32::from_be_bytes(prefix) as usize];
+    stream.read_exact(&mut body).ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
+fn write_frame(stream: &mut std::os::unix::net::UnixStream, value: &Value) {
+    let body = serde_json::to_vec(value).unwrap();
+    let _ = stream.write_all(&(body.len() as u32).to_be_bytes());
+    let _ = stream.write_all(&body);
+    let _ = stream.flush();
+}
+
+fn fake_response(request: &Value, submitted: &Mutex<Vec<Value>>) -> Value {
+    assert_eq!(request["version"], 1, "{request:#}");
+    assert_eq!(request["capability"], "planner-cap", "{request:#}");
+    match request["operation"]["type"].as_str().unwrap() {
+        "inventory" => json!({
+            "version": 1,
+            "ok": true,
+            "result": {
+                "type": "inventory",
+                "repository": "test/repo",
+                "task_id": 1,
+                "role": "planner",
+                "pr": null,
+                "review_revision": null,
+                "phase": "planner",
+                "operations": []
+            }
+        }),
+        "submit_plan" => {
+            let response = request["operation"]["response"].clone();
+            submitted.lock().unwrap().push(response.clone());
+            if response["tasks"].as_array().map_or(0, Vec::len) >= 2 {
+                json!({"version":1,"ok":true,"result":{"type":"plan_accepted","graph_id":5}})
+            } else {
+                json!({
+                    "version": 1,
+                    "ok": false,
+                    "error": {"code": "invalid_plan", "message": PLANNER_REJECTION}
+                })
+            }
+        }
+        other => panic!("unexpected endpoint operation {other}"),
+    }
+}
+
+fn plan_task(key: &str) -> Value {
+    json!({
+        "key": key,
+        "title": format!("implement {key}"),
+        "implementation_delta": format!("edit src/{key}.rs"),
+        "affected_paths": [format!("src/{key}.rs")],
+        "observable_outcome": "the new behavior is observable",
+        "deliverables": [{"kind": "write", "path": format!("src/{key}.rs")}],
+        "acceptance_criteria": ["the new behavior is covered by a test"],
+        "source_constraints": ["do not change unrelated modules"],
+        "verification_expectations": ["cargo test passes"],
+        "non_goals": ["no unrelated refactors"],
+        "prerequisites": [],
+    })
+}
+
+fn planner_shell(endpoint: &FakeEndpoint) -> McpProcess {
+    let mut planner = McpProcess::start(&endpoint.path, "planner-cap", "Planner");
+    planner.initialize();
+    planner
+}
+
+fn tool_text(response: &Value) -> &str {
+    response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool result had no text content: {response:#}"))
+}
+
+#[test]
+fn tools_list_exposes_submit_plan() {
+    let endpoint = FakeEndpoint::start();
+    let mut planner = planner_shell(&endpoint);
+
+    let listed = planner.request(2, "tools/list", json!({}));
+    assert_eq!(tool_names(&listed), vec!["submit_plan"]);
+    let advertised = tool(&listed, "submit_plan");
+    let schema = &advertised["inputSchema"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["required"], json!(["response"]));
+    assert_eq!(schema["properties"]["response"]["type"], "object");
+
+    // The closed shapes are the planner prompt's own, and the retry rule is
+    // load-bearing: acceptance is one atomic write, so a corrected resubmission
+    // after a transport failure would silently lose to the first plan.
+    let description = advertised["description"].as_str().unwrap();
+    assert!(
+        description.contains(
+            r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>""#
+        ),
+        "tool description omits the BLOCKER shape: {description}"
+    );
+    assert!(
+        description.contains(r#"PLAN={"outcome":"plan","tasks":"#),
+        "tool description omits the PLAN shape: {description}"
+    );
+    assert!(
+        description.contains(
+            "If this call times out or the transport fails, call it again — `already_submitted` \
+             means your first plan stands; never resubmit a corrected plan after a transport \
+             failure."
+        ),
+        "tool description omits the resubmission rule: {description}"
+    );
+
+    assert!(planner.finish().is_empty());
+}
+
+#[test]
+fn submit_plan_proxies_and_returns_endpoint_error_verbatim() {
+    let endpoint = FakeEndpoint::start();
+    let mut planner = planner_shell(&endpoint);
+
+    let rejected = planner.request(
+        2,
+        "tools/call",
+        json!({
+            "name": "submit_plan",
+            "arguments": {"response": {"outcome": "plan", "tasks": [plan_task("only")]}}
+        }),
+    );
+    assert_eq!(rejected["result"]["isError"], true, "{rejected:#}");
+    assert_eq!(
+        serde_json::from_str::<Value>(tool_text(&rejected)).unwrap(),
+        json!({"code": "invalid_plan", "message": PLANNER_REJECTION}),
+        "{rejected:#}"
+    );
+
+    assert!(planner.finish().is_empty());
+}
+
+#[test]
+fn submit_plan_success_returns_graph_id() {
+    let endpoint = FakeEndpoint::start();
+    let mut planner = planner_shell(&endpoint);
+    let plan = json!({"outcome": "plan", "tasks": [plan_task("first"), plan_task("second")]});
+
+    let accepted = planner.request(
+        2,
+        "tools/call",
+        json!({"name": "submit_plan", "arguments": {"response": plan.clone()}}),
+    );
+    assert_ne!(accepted["result"]["isError"], true, "{accepted:#}");
+    assert_eq!(
+        serde_json::from_str::<Value>(tool_text(&accepted)).unwrap(),
+        json!({"accepted": true, "graph_id": 5}),
+        "{accepted:#}"
+    );
+    // The shell relays the plan unchanged; it never inspects or rewrites it.
+    assert_eq!(endpoint.submitted(), vec![plan]);
+
+    assert!(planner.finish().is_empty());
 }
 
 #[test]

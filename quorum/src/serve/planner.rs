@@ -140,6 +140,19 @@ pub struct PlanningSource<'a> {
     pub dependencies: &'a [i64],
 }
 
+/// The two closed response shapes a planner may produce.
+///
+/// The planner prompt and the `submit_plan` MCP tool description must state the
+/// same shapes; both render this one text so the two surfaces cannot drift.
+pub const RESPONSE_SHAPES: &str = concat!(
+    "The object must be exactly one of these closed shapes: do not omit, rename, or add fields.\n",
+    r#"PLAN={"outcome":"plan","tasks":[{"key":"<lowercase-ascii-key>","title":"<title>","implementation_delta":"<new-code-or-documentation-change>","affected_paths":["<repo-relative-path-or-narrow-pattern>"],"observable_outcome":"<observable-outcome>","deliverables":[{"kind":"write","path":"<repo-relative-path>"},{"kind":"read_only_reference","path":"<contextual-path>"}],"acceptance_criteria":["<criterion>"],"source_constraints":["<constraint>"],"verification_expectations":["<verification>"],"non_goals":["<preserved-or-explicitly-excluded-behavior>"],"prerequisites":["<task-key-or-source:positive-id>"]}]}"#,
+    "\n",
+    r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#,
+    "\n",
+    "`outcome` must be exactly `plan` or `blocker`; use PLAN only when it has 2-8 tasks.",
+);
+
 /// Build one bounded, closed-book planner turn. Retry context is deliberately
 /// limited to structured rejection summaries; provider transcripts and prior
 /// continuation identities never enter a later attempt.
@@ -181,11 +194,7 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          guidance rather than an enforcement claim. Return exactly one valid JSON object. For \
          each task, declare every file-level deliverable in `deliverables`: use \
          `write` only for requested changes and `read_only_reference` only for context. Use no \
-         markdown or commentary. The object must be exactly one of these closed \
-         shapes: do not omit, rename, or add fields.\n\
-         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"implementation_delta\":\"<new-code-or-documentation-change>\",\"affected_paths\":[\"<repo-relative-path-or-narrow-pattern>\"],\"observable_outcome\":\"<observable-outcome>\",\"deliverables\":[{{\"kind\":\"write\",\"path\":\"<repo-relative-path>\"}},{{\"kind\":\"read_only_reference\",\"path\":\"<contextual-path>\"}}],\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"non_goals\":[\"<preserved-or-explicitly-excluded-behavior>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
-         BLOCKER={{\"outcome\":\"blocker\",\"category\":\"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>\",\"evidence\":[\"<evidence>\"],\"required_decision\":\"<decision>\",\"why_no_safe_split\":\"<reason>\"}}\n\
-         `outcome` must be exactly `plan` or `blocker`; use PLAN only when it has 2-8 tasks. \
+         markdown or commentary. {RESPONSE_SHAPES} \
          PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
          to {MAX_REJECTION_SUMMARY_BYTES} bytes. On retry, use only those summaries to correct \
          the cited semantic defect; do not discuss them or request more context.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"

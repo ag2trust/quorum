@@ -47,9 +47,6 @@ enum Operation<'a> {
     React {
         state: &'a str,
     },
-    // Reached only through `submit_plan`; the MCP tool that calls it lands in
-    // the next slice of this batch.
-    #[allow(dead_code)]
     SubmitPlan {
         response: &'a serde_json::Value,
     },
@@ -69,16 +66,9 @@ struct Response {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ResponseResult {
-    TaskNote {
-        note_id: i64,
-    },
-    Mailbox {
-        mailbox_id: i64,
-    },
-    #[allow(dead_code)]
-    PlanAccepted {
-        graph_id: i64,
-    },
+    TaskNote { note_id: i64 },
+    Mailbox { mailbox_id: i64 },
+    PlanAccepted { graph_id: i64 },
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,7 +118,6 @@ pub fn react(capability: &str, state: &str) -> Result<i64> {
 /// turn, so the code and message are relayed verbatim rather than flattened
 /// into a client-side error string.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SubmitPlanOutcome {
     Accepted { graph_id: i64 },
     Rejected { code: String, message: String },
@@ -137,9 +126,8 @@ pub enum SubmitPlanOutcome {
 /// Submit a plan through a `planner` run capability. The endpoint owns every
 /// validation decision; this client neither inspects nor rewrites the plan.
 ///
-/// Exercised by its round-trip test today; the `submit_plan` MCP tool that
-/// calls it in production lands in the next slice of this batch.
-#[allow(dead_code)]
+/// The endpoint is supplied explicitly because the caller is the `submit_plan`
+/// MCP tool, which already holds the daemon-injected locator for its run.
 pub fn submit_plan(
     endpoint: &Path,
     capability: &str,
@@ -284,7 +272,7 @@ fn endpoint_rejection<T>(code: String) -> Result<T> {
 }
 
 /// The daemon-injected endpoint locator for this managed run.
-pub fn endpoint() -> Result<PathBuf> {
+fn endpoint() -> Result<PathBuf> {
     let value = std::env::var_os(ENDPOINT_ENV).ok_or_else(|| {
         QuorumError::Io("managed completion requires QUORUM_AGENT_ENDPOINT".into())
     })?;

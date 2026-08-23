@@ -157,9 +157,35 @@ enum ResponseResult {
         role: String,
         pr: Option<i64>,
         review_revision: Option<String>,
-        phase: LiveRunPhase,
+        phase: InventoryPhase,
         operations: Vec<ProtocolOperation>,
     },
+}
+
+/// The run phase an inventory advertises.
+///
+/// It mirrors `LiveRunPhase` and adds the planner, whose entire tool surface is
+/// `submit_plan`. Keeping it distinct from `LiveRunPhase` means no
+/// `ProtocolOperation` gate can ever be asked about a planner: authority for
+/// every GitHub and lifecycle operation still comes from
+/// `resolve_live_run_context`, which rejects the planner role outright.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum InventoryPhase {
+    InitialWorker,
+    ReworkWorker,
+    Reviewer,
+    Planner,
+}
+
+impl From<LiveRunPhase> for InventoryPhase {
+    fn from(phase: LiveRunPhase) -> Self {
+        match phase {
+            LiveRunPhase::InitialWorker => Self::InitialWorker,
+            LiveRunPhase::ReworkWorker => Self::ReworkWorker,
+            LiveRunPhase::Reviewer => Self::Reviewer,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -684,21 +710,38 @@ fn process_request_blocking(
                 "request processing failed",
             ));
         }
+        // A live planner holds no `ProtocolOperation` authority at all, so its
+        // inventory exists only so the MCP shell can advertise `submit_plan`
+        // and nothing else. A capability that is not the live planner's falls
+        // through to the live-run resolver, which answers `unauthorized`.
         Operation::Inventory => {
-            let context = resolve_any_role(&tx, &request.capability)?;
-            let operations = ALL_PROTOCOL_OPERATIONS
-                .into_iter()
-                .filter(|operation| operation.allowed_in(context.phase))
-                .collect();
-            Response::success(ResponseResult::Inventory {
-                repository: repository.to_string(),
-                task_id: context.task_id,
-                role: context.role,
-                pr: context.pr,
-                review_revision: context.review_revision,
-                phase: context.phase,
-                operations,
-            })
+            match quorum_core::capabilities::resolve_planner_context(&tx, &request.capability) {
+                Ok(context) => Response::success(ResponseResult::Inventory {
+                    repository: repository.to_string(),
+                    task_id: context.task_id,
+                    role: "planner".into(),
+                    pr: None,
+                    review_revision: None,
+                    phase: InventoryPhase::Planner,
+                    operations: Vec::new(),
+                }),
+                Err(_) => {
+                    let context = resolve_any_role(&tx, &request.capability)?;
+                    let operations = ALL_PROTOCOL_OPERATIONS
+                        .into_iter()
+                        .filter(|operation| operation.allowed_in(context.phase))
+                        .collect();
+                    Response::success(ResponseResult::Inventory {
+                        repository: repository.to_string(),
+                        task_id: context.task_id,
+                        role: context.role,
+                        pr: context.pr,
+                        review_revision: context.review_revision,
+                        phase: context.phase.into(),
+                        operations,
+                    })
+                }
+            }
         }
         Operation::Protocol { operation } => {
             let context = resolve_any_role(&tx, &request.capability)?;
@@ -1428,7 +1471,6 @@ mod tests {
             Operation::Protocol {
                 operation: ProtocolOperation::PullRequestRead,
             },
-            Operation::Inventory,
         ] {
             let error = fixture.call("planner-cap", operation).await.unwrap_err();
             assert_eq!(error.code, "unauthorized");
@@ -1438,6 +1480,44 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM mailbox", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mailbox_count, 0);
+    }
+
+    /// The planner's inventory is what lets its MCP shell advertise
+    /// `submit_plan`. It must carry no protocol operation and no PR target: the
+    /// planner's authority stops at the one plan submission.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn planner_inventory_advertises_no_protocol_operations() {
+        let fixture = PlannerFixture::new();
+        let value = result_value(
+            &fixture
+                .call("planner-cap", Operation::Inventory)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["result"]["type"], "inventory");
+        assert_eq!(value["result"]["role"], "planner");
+        assert_eq!(value["result"]["phase"], "planner");
+        assert_eq!(value["result"]["task_id"], 1);
+        assert_eq!(value["result"]["pr"], serde_json::Value::Null);
+        assert_eq!(value["result"]["review_revision"], serde_json::Value::Null);
+        assert_eq!(value["result"]["operations"], json!([]));
+    }
+
+    /// A revoked planner is not the live planner, so its inventory falls
+    /// through to the live-run resolver rather than advertising a tool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoked_planner_inventory_is_unauthorized() {
+        let fixture = PlannerFixture::new();
+        let mut conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        quorum_core::capabilities::revoke(&mut conn, "planner-cap", 20).unwrap();
+        drop(conn);
+
+        let error = fixture
+            .call("planner-cap", Operation::Inventory)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "unauthorized");
     }
 
     #[test]
