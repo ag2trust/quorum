@@ -1085,15 +1085,36 @@ mod tests {
     }
 
     #[test]
-    fn planner_context_rejects_activated_graph() {
+    fn planner_context_rejects_active_graph() {
         let (_d, mut c) = open_tmp();
         insert_authority_task(&c, 1, "working", None, None, None, None);
         issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
-        // Graph has moved past planning: active=1, freeze_active=0 is the normal end
-        // state once a plan is accepted. A planner capability issued during freeze must
-        // not still authorize submissions against the now-activated graph, even though
-        // `planner_session_id` still matches the run that froze it.
-        insert_graph(&c, 5, 1, 1, 0, Some("planner-run"), 2);
+        // active=1 alongside freeze_active=1 is not a state task_decompositions'
+        // invariants allow to persist (freeze_active clears once a graph activates),
+        // but it isolates the resolver's `AND active=0` clause: this row keeps
+        // freeze_active=1 and the matching planner_session_id, so only the `active=0`
+        // guard stands between it and a match. Deleting `AND active=0` from the
+        // resolver's query would make this row resolve successfully.
+        insert_graph(&c, 5, 1, 1, 1, Some("planner-run"), 2);
+
+        let err = resolve_planner_context(&c, "planner-run").unwrap_err();
+        assert!(
+            err.to_string().contains("not the live planner"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_unfrozen_graph() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        // active=0 and freeze_active=0 is the graph's rest state before a freeze is
+        // requested. This row keeps active=0 and the matching planner_session_id, so
+        // only the `AND freeze_active=1` guard stands between it and a match. Deleting
+        // `AND freeze_active=1` from the resolver's query would make this row resolve
+        // successfully.
+        insert_graph(&c, 5, 1, 0, 0, Some("planner-run"), 2);
 
         let err = resolve_planner_context(&c, "planner-run").unwrap_err();
         assert!(
