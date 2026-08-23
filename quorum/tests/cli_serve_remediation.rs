@@ -324,6 +324,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -342,6 +354,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -543,7 +556,7 @@ fn failed_checks_absent_worker_spawns_remediation() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -640,6 +653,8 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
+    let global_git_config = home.path().join("gitconfig");
+    std::fs::write(&global_git_config, "[push]\n\tdefault = current\n").unwrap();
     // Outside wt_base so daemon GC never touches it.
     let external_wt = tempfile::tempdir().unwrap();
 
@@ -727,7 +742,7 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
     .trim()
     .to_string();
 
-    let mut handle = ServeHandle::start(
+    let mut handle = ServeHandle::start_with_env(
         home.path(),
         repo_dir.path(),
         wt_base.path(),
@@ -739,8 +754,12 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
+        &[(
+            "GIT_CONFIG_GLOBAL".to_string(),
+            global_git_config.to_string_lossy().into_owned(),
+        )],
     );
 
     assert!(
@@ -782,10 +801,35 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
         let out = Command::new("git")
             .arg("-C")
             .arg(&wt_path)
+            .env("GIT_CONFIG_GLOBAL", &global_git_config)
             .args(args)
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let git_config = |key: &str| -> Vec<(String, String)> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&wt_path)
+            .env("GIT_CONFIG_GLOBAL", &global_git_config)
+            .args(["config", "--show-scope", "--get-all", key])
+            .output()
+            .unwrap();
+        assert!(
+            matches!(out.status.code(), Some(0 | 1)),
+            "git config failed for {key}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (scope, value) = line
+                    .split_once('\t')
+                    .unwrap_or_else(|| panic!("git config omitted scope for {key}: {line}"));
+                (scope.to_string(), value.to_string())
+            })
+            .collect()
     };
     let local_branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
     assert_eq!(
@@ -798,15 +842,25 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
         format!("refs/heads/{pr_branch}"),
         "plain `git push` must target the PR branch"
     );
-    assert_eq!(
-        git(&["config", "--get", "push.default"]),
-        "",
-        "remediation workers must not receive agent-side push defaults"
+    let push_defaults = git_config("push.default");
+    assert!(
+        push_defaults
+            .iter()
+            .any(|(scope, value)| scope == "global" && value == "current"),
+        "regression setup must expose the caller's global push default"
     );
-    assert_eq!(
-        git(&["config", "--get", "remote.origin.push"]),
-        "",
-        "remediation workers must not receive agent-side push refspecs"
+    assert!(
+        !push_defaults
+            .iter()
+            .any(|(scope, _)| scope == "local" || scope == "worktree"),
+        "remediation workers must not receive repository-local push defaults"
+    );
+    let push_refspecs = git_config("remote.origin.push");
+    assert!(
+        !push_refspecs
+            .iter()
+            .any(|(scope, _)| scope == "local" || scope == "worktree"),
+        "remediation workers must not receive repository-local push refspecs"
     );
     for ancestor in [&published_pr_head, &base_head] {
         assert!(
@@ -1744,6 +1798,9 @@ fn cancellation_after_remediation_claim_prevents_provisioning() {
     let cancelled = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env_remove("QUORUM_AGENT")
+        .env_remove("QUORUM_RUN_ID")
+        .env_remove("QUORUM_AGENT_ENDPOINT")
         .args([
             "task-update",
             "--task-id",
@@ -2304,7 +2361,7 @@ fn pending_checks_no_remediation() {
             "--merge-checks-timeout-secs",
             "2",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -2426,7 +2483,7 @@ fn rework_cap_bounds_remediation_attempts() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 

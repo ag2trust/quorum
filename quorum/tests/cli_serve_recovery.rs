@@ -357,6 +357,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -387,6 +399,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -1335,7 +1348,14 @@ fn recovery_respawned_agent_dies_detected_by_tick_loop() {
     ));
 
     let bad_agent = env.home.path().join("exit-agent.sh");
-    std::fs::write(&bad_agent, "#!/bin/sh\nexit 0\n").unwrap();
+    // Consume the initial stream-json turn before exiting. Exiting before the
+    // daemon finishes that write races provisioning on fast Linux runners and
+    // tests the spawn-failure poison budget instead of post-spawn death.
+    std::fs::write(
+        &bad_agent,
+        "#!/bin/sh\nIFS= read -r _turn\nsleep 1\nexit 0\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

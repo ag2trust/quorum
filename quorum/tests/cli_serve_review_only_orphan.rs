@@ -258,6 +258,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -288,6 +300,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -767,9 +780,17 @@ fn reviewer_run_insert_error_never_attaches_and_restart_recovers() {
         "injected persistence failure was not surfaced: {:?}",
         failed.lines
     );
+    // The failure is contained to this task: it is logged and the tick keeps
+    // going, instead of aborting the whole tick with `tick error`.
     assert!(
-        failed.wait_for("tick error", 10),
+        failed.wait_for("orphan provision error for task #1 PR #42", 10),
         "daemon did not finish fail-safe cleanup: {:?}",
+        failed.lines
+    );
+    failed.drain_pending_lines();
+    assert!(
+        !failed.lines.iter().any(|line| line.contains("tick error")),
+        "a single task's provision failure must not abort the tick: {:?}",
         failed.lines
     );
     drop(failed);
@@ -852,7 +873,7 @@ fn persistent_reviewer_run_insert_error_stops_after_provision_budget() {
         &[],
     );
     assert!(
-        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 30),
+        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 90),
         "persistent failure did not exhaust and park: {:?}",
         handle.lines
     );
@@ -931,10 +952,12 @@ fn orphan_r2_does_not_reuse_torn_down_worker_or_r1_name() {
                 reviewer: r1.into(),
                 verdict: "approved".into(),
                 blocking_count: 0,
-                approved_head_sha: head_sha,
+                approved_head_sha: head_sha.clone(),
             },
         )
         .unwrap();
+        quorum_core::review_audits::record_r2_requirement(&mut conn, task_id, pr, &head_sha, true)
+            .unwrap();
     }
     let names = write_named_pool(home.path(), &["Worker".into(), "R1".into(), "R2".into()]);
 

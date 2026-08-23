@@ -268,7 +268,7 @@ pub(super) fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&st
     let example = crate::graph_blocker::Feedback {
         category: category.into(),
         affected_task: 1,
-        violated_assigned_boundary: "<exact assigned boundary violated>".into(),
+        violated_assigned_boundary: "<exact safety or authority boundary violated>".into(),
         evidence: vec!["<concrete diff or repository evidence>".into()],
     };
     let payload = serde_json::to_string(&example).expect("static graph-blocker example serializes");
@@ -279,13 +279,18 @@ pub(super) fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&st
          Review this child against its assigned requirements. Do not absorb, require, or move \
          unrelated sibling scope into this PR. A sibling is relevant only when it is listed above \
          as a direct prerequisite; inspect no transitive or unrelated sibling assignment as scope.\n\
-         Use ordinary `--verdict changes` only for BLOCKING defects within this child's \
-         implementation. FOLLOW-UP findings follow the contract above and never trigger a \
-         graph-blocker verdict. Use the \
-         distinct `--verdict graph-blocker` only when concrete diff/repository evidence proves the \
-         decomposition boundary itself is invalid (for example the assigned outcome necessarily \
-         requires forbidden sibling scope). The only supported category is `{category}`. Signal it \
-         with this exact closed payload shape:\n\
+         Use ordinary `--verdict changes` for BLOCKING defects within this child's implementation. \
+         If the change is otherwise correct and safe but requires a bounded edit outside the \
+         child's `write` deliverables, including a `read_only_reference` path, issue a BLOCKING \
+         `--verdict changes`. Its feedback must name the specific out-of-scope edit the correct fix \
+         requires and explicitly authorize the rework worker to make that minimal, justified edit \
+         in the named file(s), treating the assigned file list as advisory for this remediation. \
+         FOLLOW-UP findings follow the contract above and never trigger a graph-blocker verdict. \
+         Reserve the distinct `--verdict graph-blocker` for genuine safety or authority boundary \
+         violations: a change that would grant authority, break restricted-role or phase isolation, \
+         escape the managed repository, or expose secrets. Do not use graph-blocker merely because \
+         a correct, safe fix crosses the declared file scope. The only supported category is \
+         `{category}`. Signal it with this exact closed payload shape:\n\
          `quorum submit --agent {reviewer} --pr {pr} --verdict graph-blocker --feedback-json '{payload}'`\n\
          Replace affected_task with this context's task_id and replace both placeholders with \
          concrete bounded evidence. Do not invent categories or extra fields.\n"
@@ -981,7 +986,10 @@ mod tests {
                     "Worker-1",
                     "high",
                     Some(context),
-                    ReviewCycleContext::from_persisted_rework_round(1),
+                    ReviewCycleContext::from_persisted_rework_round(
+                        1,
+                        quorum_core::lifecycle::REWORK_CAP,
+                    ),
                 ),
                 true,
             ),
@@ -1121,7 +1129,10 @@ mod tests {
                     "Worker-1",
                     "high",
                     Some(context),
-                    ReviewCycleContext::from_persisted_rework_round(1),
+                    ReviewCycleContext::from_persisted_rework_round(
+                        1,
+                        quorum_core::lifecycle::REWORK_CAP,
+                    ),
                 ),
             ),
         ];
@@ -1445,9 +1456,10 @@ mod tests {
             );
         }
 
-        let context = ReviewCycleContext::from_persisted_rework_round(i64::from(
+        let context = ReviewCycleContext::from_persisted_rework_round(
+            i64::from(quorum_core::lifecycle::REWORK_CAP),
             quorum_core::lifecycle::REWORK_CAP,
-        ));
+        );
         for kind in [AgentKind::Claude, AgentKind::Codex] {
             let r1 = build_review_prompt_for_kind_with_context_and_cycle(
                 kind,
@@ -2114,7 +2126,10 @@ mod tests {
                 "W",
                 "high",
                 Some(context),
-                ReviewCycleContext::from_persisted_rework_round(1),
+                ReviewCycleContext::from_persisted_rework_round(
+                    1,
+                    quorum_core::lifecycle::REWORK_CAP,
+                ),
             ),
         ];
         for prompt in prompts {
@@ -2132,6 +2147,22 @@ mod tests {
         let graph_contract = graph_review_contract("R1", 42, Some(context));
         assert!(graph_contract.contains(&format!("\n    {context}\n")));
         assert!(!graph_contract.contains("```json"));
+        assert!(graph_contract.contains(
+            "Reserve the distinct `--verdict graph-blocker` for genuine safety or authority boundary"
+        ));
+        assert!(graph_contract.contains(
+            "grant authority, break restricted-role or phase isolation, escape the managed repository, or expose secrets"
+        ));
+        assert!(graph_contract.contains(
+            "otherwise correct and safe but requires a bounded edit outside the child's `write` deliverables"
+        ));
+        assert!(graph_contract.contains("including a `read_only_reference` path"));
+        assert!(graph_contract.contains("issue a BLOCKING `--verdict changes`"));
+        assert!(graph_contract.contains(
+            "name the specific out-of-scope edit the correct fix requires and explicitly authorize the rework worker"
+        ));
+        assert!(graph_contract
+            .contains("treating the assigned file list as advisory for this remediation"));
 
         let ordinary = build_review_prompt_for_kind(AgentKind::Claude, &r1_spec, "high");
         assert!(!ordinary.contains("Generated-child review boundary"));
@@ -2158,7 +2189,10 @@ mod tests {
                 "W",
                 "high",
                 None,
-                ReviewCycleContext::from_persisted_rework_round(1),
+                ReviewCycleContext::from_persisted_rework_round(
+                    1,
+                    quorum_core::lifecycle::REWORK_CAP
+                ),
             )
         );
     }

@@ -1810,6 +1810,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_provision_uses_each_requested_remote_target() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let d = repo_dir.path().to_string_lossy().to_string();
+        StdCommand::new("git")
+            .args(["-C", &d, "remote", "add", "origin", &d])
+            .status()
+            .unwrap();
+
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "develop"])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "develop target"])
+            .status()
+            .unwrap();
+        let develop_head = git_rev_parse(repo_dir.path(), "develop");
+        let main_head = git_rev_parse(repo_dir.path(), "main");
+        assert_ne!(develop_head, main_head);
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap();
+        let fetched = StdCommand::new("git")
+            .args(["-C", &d, "fetch", "origin", "main", "develop"])
+            .output()
+            .unwrap();
+        assert!(fetched.status.success());
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mgr = WorktreeManager::new();
+        for (target, expected) in [("main", main_head), ("develop", develop_head)] {
+            let path = workspace.path().join(format!("{target}-worktree"));
+            mgr.provision(
+                repo_dir.path(),
+                &format!("daemon/{target}-t1"),
+                &path,
+                &format!("origin/{target}"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(git_rev_parse(&path, "HEAD"), expected);
+            mgr.remove(repo_dir.path(), &path).await.unwrap();
+        }
+
+        let missing = mgr
+            .provision(
+                repo_dir.path(),
+                "daemon/missing-t1",
+                &workspace.path().join("missing-worktree"),
+                "origin/missing-target",
+            )
+            .await
+            .expect_err("a missing remote target must reject initial provisioning");
+        assert!(missing.contains("git worktree add failed"));
+    }
+
+    #[tokio::test]
     async fn provision_remove_delete_branch_then_reprovision() {
         let repo_dir = tempfile::tempdir().unwrap();
         init_git_repo(repo_dir.path());

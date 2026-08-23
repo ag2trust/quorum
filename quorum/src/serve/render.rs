@@ -16,9 +16,7 @@ pub fn render_event(event: &Event) -> Option<String> {
             total_cost_usd,
             ..
         } => {
-            let tokens = usage
-                .as_ref()
-                .map_or(0, |u| u.input_tokens + u.output_tokens);
+            let tokens = usage.as_ref().map_or(0, |u| u.live_total_tokens());
             let cost_str = total_cost_usd
                 .map(|c| format!(" · ${c:.4}"))
                 .unwrap_or_default();
@@ -125,7 +123,7 @@ fn tool_snippet(name: &str, input: &serde_json::Value) -> Option<String> {
 pub fn render_agent_event(event: &AgentEvent) -> Option<String> {
     match event {
         AgentEvent::ThreadStarted { .. } => None,
-        AgentEvent::AssistantText { text } => {
+        AgentEvent::AssistantText { text } | AgentEvent::CompletedAssistantText { text, .. } => {
             if text.is_empty() {
                 None
             } else {
@@ -134,7 +132,7 @@ pub fn render_agent_event(event: &AgentEvent) -> Option<String> {
         }
         AgentEvent::Activity { summary, .. } => Some(format!("> {summary}")),
         AgentEvent::TurnCompleted { usage, cost_usd } => {
-            let tokens = usage.map_or(0, |u| u.input_tokens + u.output_tokens);
+            let tokens = usage.map_or(0, |u| u.live_total_tokens());
             let cost_str = cost_usd.map(|c| format!(" · ${c:.4}")).unwrap_or_default();
             Some(format!("---\n*Turn complete: {tokens} tokens{cost_str}*\n"))
         }
@@ -248,6 +246,8 @@ mod tests {
             result: json!({}),
             usage: Some(super::super::stream::Usage {
                 input_tokens: 200,
+                cache_read_input_tokens: 900,
+                cache_creation_input_tokens: 50,
                 output_tokens: 100,
             }),
             total_cost_usd: Some(0.05),
@@ -257,6 +257,7 @@ mod tests {
         };
         let rendered = render_event(&event).unwrap();
         assert!(rendered.contains("300 tokens"));
+        assert!(!rendered.contains("1250 tokens"));
         assert!(rendered.contains("$0.0500"));
     }
 
@@ -324,6 +325,7 @@ mod tests {
             usage: Some(super::super::runner::TokenUsage {
                 input_tokens: 200,
                 output_tokens: 100,
+                ..Default::default()
             }),
             cost_usd: Some(0.05),
         };

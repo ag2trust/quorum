@@ -1,6 +1,6 @@
 //! Daemon classifier phase — spawns a headless agent to batch-classify tasks.
 
-use super::runner::{AdapterConfig, AgentEvent, LaunchMode, LaunchRequest, RunnerProc};
+use super::runner::{AdapterConfig, AgentEvent, AgentKind, LaunchMode, LaunchRequest, RunnerProc};
 use quorum_core::classify::{self, ClassifierResponse, TaskClassification, TaskForClassification};
 use std::time::Duration;
 
@@ -15,7 +15,9 @@ const MAX_CLASSIFIER_LINES_PER_POLL: usize = 64;
 #[allow(dead_code)]
 pub struct ClassifierSlot {
     pub proc: RunnerProc,
+    pub provider: String,
     pub model: String,
+    pub effort: String,
     pub pending_task_ids: Vec<i64>,
     /// Internally-derived identity of each exact input sent to this provider
     /// turn.  Never accept a model-supplied revision/fingerprint.
@@ -25,14 +27,33 @@ pub struct ClassifierSlot {
     pub isolation_dir: Option<tempfile::TempDir>,
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
+    pub usage: super::runner::TokenUsage,
 }
 
 impl ClassifierSlot {
     /// Terminate and reap the provider before dropping the isolated workspace.
     /// Claude's stream-json process is persistent after a Result event, so
     /// dropping the slot alone would leave the child alive in a deleted cwd.
-    pub async fn kill_and_reap(self) {
-        let _terminal_output = self.proc.kill_and_reap().await;
+    pub async fn kill_and_reap(mut self) -> super::runner::TokenUsage {
+        let kind = self.proc.kind();
+        let terminal_output = self.proc.kill_and_reap().await;
+        for captured in terminal_output {
+            let super::runner::CapturedOutput::Stdout(raw_line) = captured else {
+                continue;
+            };
+            for event in super::runner::normalize_line(kind, &raw_line) {
+                match event {
+                    AgentEvent::TurnCompleted {
+                        usage: Some(usage), ..
+                    }
+                    | AgentEvent::TurnFailed {
+                        usage: Some(usage), ..
+                    } => self.usage.saturating_add_assign(usage),
+                    _ => {}
+                }
+            }
+        }
+        self.usage
     }
 }
 
@@ -127,13 +148,18 @@ async fn spawn_classifier_configured_with_timeout(
     .await?;
     Ok(ClassifierSlot {
         proc,
+        provider: AgentKind::for_model(model)
+            .map(|kind| kind.to_string())
+            .unwrap_or_else(|_| "unknown".to_string()),
         model: model.to_string(),
+        effort: effort.to_string(),
         pending_task_ids,
         pending_inputs,
         response_text: String::new(),
         isolation_dir: Some(dir),
         started_at,
         stdout_bytes: 0,
+        usage: super::runner::TokenUsage::default(),
     })
 }
 
@@ -198,6 +224,21 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
             ));
         }
         let line = slot.proc.normalize_line(&raw);
+        // A terminal provider record can carry both the final response and
+        // its usage. Preserve the usage before applying response disposition:
+        // the raw line has already been consumed, so reap cannot recover it
+        // if an oversized response returns early here.
+        for event in &line.events {
+            match event {
+                AgentEvent::TurnCompleted {
+                    usage: Some(usage), ..
+                }
+                | AgentEvent::TurnFailed {
+                    usage: Some(usage), ..
+                } => slot.usage.saturating_add_assign(*usage),
+                _ => {}
+            }
+        }
         if let Some(text) = line.terminal_text.as_ref().filter(|text| !text.is_empty()) {
             if text.len() > MAX_CLASSIFIER_RESPONSE_BYTES {
                 return Some(ClassifierResult::Error(
@@ -229,6 +270,14 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
                         ));
                     }
                     slot.response_text.push_str(&text);
+                }
+                AgentEvent::CompletedAssistantText { text, .. } => {
+                    if text.len() > MAX_CLASSIFIER_RESPONSE_BYTES {
+                        return Some(ClassifierResult::Error(
+                            "classifier response exceeded 64 KiB".into(),
+                        ));
+                    }
+                    slot.response_text = text;
                 }
                 _ => {}
             }
@@ -491,6 +540,54 @@ mod tests {
 
         let result = drain_classifier_until_terminal(&mut slot).await;
         assert_classifier_failure_reaped(slot, pid, result, "response exceeded").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_claude_terminal_response_retains_split_usage() {
+        let response = "x".repeat(MAX_CLASSIFIER_RESPONSE_BYTES + 1);
+        let line = serde_json::json!({
+            "type": "result",
+            "result": response,
+            "is_error": false,
+            "usage": {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 80,
+                "cache_creation_input_tokens": 5,
+                "output_tokens": 7
+            }
+        })
+        .to_string();
+        let script = format!("#!/bin/sh\nIFS= read -r _turn\nprintf '%s\\n' '{}'\n", line);
+        let (_temp, mut slot, pid) = spawn_scripted_classifier(&script, CLASSIFIER_MODEL).await;
+
+        let result = drain_classifier_until_terminal(&mut slot).await;
+        assert!(
+            matches!(result, Some(ClassifierResult::Error(ref error)) if error.contains("response exceeded")),
+            "oversized terminal response must still be rejected"
+        );
+        let expected = super::super::runner::TokenUsage {
+            input_tokens: 100,
+            uncached_input_tokens: 20,
+            cached_input_tokens: 80,
+            cache_write_input_tokens: 5,
+            output_tokens: 7,
+            reasoning_tokens: 0,
+        };
+        assert_eq!(
+            slot.usage, expected,
+            "the consumed terminal line must retain its normalized usage"
+        );
+        assert_eq!(
+            slot.kill_and_reap().await,
+            expected,
+            "reap must neither lose nor double-count the consumed terminal usage"
+        );
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "classifier was not reaped"
+        );
     }
 
     #[cfg(unix)]

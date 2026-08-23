@@ -39,15 +39,23 @@ jobs:
 
   test:
     name: test
+    needs: [fmt, clippy, shell-tests]
     runs-on: ubuntu-latest
-    env:
-      RUST_TEST_THREADS: 4
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Keeps the real-process helper canaries in the standard threaded suite.
-      - run: cargo test --workspace --all-features --features quorum-core/test-support
+      # Compile once, then keep the existing four-thread budget split across
+      # two independently supervised test binaries. The prerequisite jobs keep
+      # this expensive gate from running after an early mechanical failure.
+      - run: >-
+          scripts/preflight/timing.sh
+          --skip-fmt
+          --skip-clippy
+          --test-jobs 2
+          --test-threads 2
+          --test-timeout-secs 150
+          --out target/ci-test-timing
 
   shell-tests:
     name: shell-tests

@@ -10,10 +10,20 @@ use std::time::{Duration, Instant};
 pub struct MergeContext {
     pub reviewer_name: String,
     pub review_task_id: i64,
+    /// Immutable task target. The production executor revalidates the live
+    /// PR base against this value before every approval/merge attempt.
+    pub expected_base_branch: String,
+    /// Exact immutable PR head approved by the managed review. The production
+    /// executor revalidates this SHA before formal approval and asks GitHub to
+    /// reject the merge if the head changes before the irreversible call.
+    pub expected_head_sha: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeFailureKind {
+    /// The PR head moved after managed approval. This is stale review
+    /// authority, not a worker-fixable merge conflict.
+    StaleAuthority,
     /// Worker can fix (merge conflict, branch behind base).
     Retryable,
     /// Merge prerequisites not yet met (checks/approval still propagating).
@@ -25,9 +35,20 @@ pub enum MergeFailureKind {
 
 pub fn classify_merge_failure(message: &str) -> MergeFailureKind {
     let lower = message.to_lowercase();
+    let stale_authority_patterns = [
+        "head sha does not match",
+        "head commit does not match",
+        "head branch was modified",
+        "does not match the expected head",
+        "expected head commit",
+    ];
+    for pat in &stale_authority_patterns {
+        if lower.contains(pat) {
+            return MergeFailureKind::StaleAuthority;
+        }
+    }
     let retryable_patterns = [
         "merge conflict",
-        "head branch was modified",
         "branch is behind",
         "not up to date",
         "out of date",
@@ -491,6 +512,61 @@ impl GhMergeExecutor {
         }
     }
 
+    fn live_base_branch(&self, pr: i64, repo_dir: &Path) -> std::result::Result<String, String> {
+        let pr_str = pr.to_string();
+        let mut cmd =
+            self.build_gh_cmd(&["pr", "view", &pr_str, "--json", "baseRefName"], repo_dir);
+        let output = cmd
+            .output()
+            .map_err(|error| format!("failed to run gh: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "gh pr view failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        parse_pr_base_branch(&output.stdout)
+            .ok_or_else(|| "gh pr view returned no baseRefName".to_string())
+    }
+
+    fn live_head_sha(&self, pr: i64, repo_dir: &Path) -> std::result::Result<String, String> {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(&["pr", "view", &pr_str, "--json", "headRefOid"], repo_dir);
+        let output = cmd
+            .output()
+            .map_err(|error| format!("failed to run gh: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "gh pr view failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        parse_pr_head_sha(&output.stdout)
+            .ok_or_else(|| "gh pr view returned no headRefOid".to_string())
+    }
+
+    fn reject_base_drift(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        expected_base_branch: &str,
+    ) -> Option<MergeResult> {
+        base_validation_result(
+            pr,
+            self.live_base_branch(pr, repo_dir),
+            expected_base_branch,
+        )
+    }
+
+    fn reject_head_drift(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        expected_head_sha: &str,
+    ) -> Option<MergeResult> {
+        head_validation_result(pr, self.live_head_sha(pr, repo_dir), expected_head_sha)
+    }
+
     /// Fetch `reviews` + `headRefOid` in one `gh` call. Returns `None` on any
     /// query failure so the caller can fail-open (post the approval).
     fn fetch_reviews_and_head(&self, pr: i64, repo_dir: &Path) -> Option<(String, String)> {
@@ -561,6 +637,87 @@ impl GhMergeExecutor {
     }
 }
 
+fn base_validation_result(
+    pr: i64,
+    actual_base_branch: std::result::Result<String, String>,
+    expected_base_branch: &str,
+) -> Option<MergeResult> {
+    match actual_base_branch {
+        Ok(actual) if actual == expected_base_branch => None,
+        Ok(actual) => Some(MergeResult {
+            success: false,
+            message: format!(
+                "PR #{pr} base drifted to {actual}, expected {expected_base_branch}; \
+                 approval and merge not attempted"
+            ),
+            failure_kind: Some(MergeFailureKind::PolicyBlocked),
+        }),
+        Err(error) => Some(MergeResult {
+            success: false,
+            message: format!(
+                "PR #{pr} base could not be validated against {expected_base_branch}: \
+                 {error}; approval and merge not attempted"
+            ),
+            failure_kind: Some(MergeFailureKind::PolicyBlocked),
+        }),
+    }
+}
+
+fn head_validation_result(
+    pr: i64,
+    actual_head_sha: std::result::Result<String, String>,
+    expected_head_sha: &str,
+) -> Option<MergeResult> {
+    match actual_head_sha {
+        Ok(actual) if !expected_head_sha.is_empty() && actual == expected_head_sha => None,
+        Ok(actual) => Some(MergeResult {
+            success: false,
+            message: format!(
+                "PR #{pr} head drifted to {actual}, expected {expected_head_sha}; \
+                 approval and merge not attempted"
+            ),
+            failure_kind: Some(MergeFailureKind::StaleAuthority),
+        }),
+        Err(error) => Some(MergeResult {
+            success: false,
+            message: format!(
+                "PR #{pr} head could not be validated against {expected_head_sha}: \
+                 {error}; approval and merge not attempted"
+            ),
+            failure_kind: Some(MergeFailureKind::PolicyBlocked),
+        }),
+    }
+}
+
+fn parse_pr_base_branch(output: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(output)
+        .ok()?
+        .get("baseRefName")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn parse_pr_head_sha(output: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(output)
+        .ok()?
+        .get("headRefOid")?
+        .as_str()
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_owned)
+}
+
+fn merge_command_args<'a>(pr: &'a str, expected_head_sha: &'a str) -> [&'a str; 7] {
+    [
+        "pr",
+        "merge",
+        pr,
+        "--merge",
+        "--delete-branch",
+        "--match-head-commit",
+        expected_head_sha,
+    ]
+}
+
 /// Return true iff the `reviews` array (from `gh pr view --json reviews`)
 /// contains an APPROVED review whose `commit.oid` matches `head_sha`. Any
 /// parse failure returns false (fail-open — caller posts the approval).
@@ -608,6 +765,15 @@ impl MergeExecutor for GhMergeExecutor {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult {
         let pr_str = pr.to_string();
 
+        // Validate before any mutation (including undrafting). `baseRefName`
+        // can change without moving the reviewed head SHA.
+        if let Some(rejected) = self.reject_base_drift(pr, repo_dir, &ctx.expected_base_branch) {
+            return rejected;
+        }
+        if let Some(rejected) = self.reject_head_drift(pr, repo_dir, &ctx.expected_head_sha) {
+            return rejected;
+        }
+
         // A worker that opened its PR as a draft hard-blocks the merge:
         // `gh pr merge` (GraphQL mergePullRequest) refuses drafts, that failure
         // classifies as PolicyBlocked, and the daemon cancels the task —
@@ -650,6 +816,16 @@ impl MergeExecutor for GhMergeExecutor {
             .map(|(reviews_json, head)| head_has_approval(&reviews_json, &head))
             .unwrap_or(false);
 
+        // Recheck after draft/check/review queries and immediately before the
+        // formal approval. Every policy retry enters merge() again and repeats
+        // this fail-closed validation.
+        if let Some(rejected) = self.reject_base_drift(pr, repo_dir, &ctx.expected_base_branch) {
+            return rejected;
+        }
+        if let Some(rejected) = self.reject_head_drift(pr, repo_dir, &ctx.expected_head_sha) {
+            return rejected;
+        }
+
         if !already_approved {
             let approve_body = format!(
                 "Formal approval — per {} review verdict (task #{}). \
@@ -677,8 +853,17 @@ impl MergeExecutor for GhMergeExecutor {
             }
         }
 
+        // Approval and merge are separate GitHub calls. Close the remaining
+        // retarget window before invoking the irreversible merge operation.
+        if let Some(rejected) = self.reject_base_drift(pr, repo_dir, &ctx.expected_base_branch) {
+            return rejected;
+        }
+        if let Some(rejected) = self.reject_head_drift(pr, repo_dir, &ctx.expected_head_sha) {
+            return rejected;
+        }
+
         let result = self.run_gh(
-            &["pr", "merge", &pr_str, "--merge", "--delete-branch"],
+            &merge_command_args(&pr_str, &ctx.expected_head_sha),
             repo_dir,
         );
 
@@ -1008,7 +1193,66 @@ mod tests {
         MergeContext {
             reviewer_name: "Rev-1".into(),
             review_task_id: 99,
+            expected_base_branch: "main".into(),
+            expected_head_sha: "abc123".into(),
         }
+    }
+
+    #[test]
+    fn merge_base_validation_rejects_retarget_and_lookup_failure() {
+        assert!(base_validation_result(42, Ok("develop".into()), "develop").is_none());
+
+        for rejected in [
+            base_validation_result(42, Ok("main".into()), "develop").unwrap(),
+            base_validation_result(42, Err("network unavailable".into()), "develop").unwrap(),
+        ] {
+            assert!(!rejected.success);
+            assert_eq!(rejected.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+            assert!(
+                rejected.message.contains("expected develop")
+                    || rejected.message.contains("validated against develop")
+            );
+        }
+    }
+
+    #[test]
+    fn merge_head_validation_rejects_drift_and_lookup_failure() {
+        assert!(head_validation_result(42, Ok("approved".into()), "approved").is_none());
+
+        let drifted = head_validation_result(42, Ok("moved".into()), "approved").unwrap();
+        assert!(!drifted.success);
+        assert_eq!(drifted.failure_kind, Some(MergeFailureKind::StaleAuthority));
+        assert!(drifted.message.contains("approval and merge not attempted"));
+
+        let unknown = head_validation_result(42, Err("network".into()), "approved").unwrap();
+        assert!(!unknown.success);
+        assert_eq!(unknown.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+    }
+
+    #[test]
+    fn production_merge_command_pins_the_approved_head() {
+        assert_eq!(
+            merge_command_args("42", "approved-sha"),
+            [
+                "pr",
+                "merge",
+                "42",
+                "--merge",
+                "--delete-branch",
+                "--match-head-commit",
+                "approved-sha",
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_base_query_requires_base_ref_name() {
+        assert_eq!(
+            parse_pr_base_branch(br#"{"baseRefName":"develop"}"#).as_deref(),
+            Some("develop")
+        );
+        assert!(parse_pr_base_branch(br#"{}"#).is_none());
+        assert!(parse_pr_base_branch(b"not-json").is_none());
     }
 
     #[test]
@@ -1100,6 +1344,8 @@ mod tests {
         let ctx = MergeContext {
             reviewer_name: "TestReviewer".into(),
             review_task_id: 42,
+            expected_base_branch: "main".into(),
+            expected_head_sha: "abc123".into(),
         };
 
         let approve_body = format!(
@@ -1113,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn approve_failure_short_circuits_merge() {
+    fn base_validation_failure_short_circuits_approval_and_merge() {
         let ctx = test_ctx();
         let exec = GhMergeExecutor {
             token_file: Some(std::path::PathBuf::from("/nonexistent/token")),
@@ -1123,9 +1369,9 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
         assert!(
-            result.message.contains("approve failed")
-                || result.message.contains("failed to run gh"),
-            "expected approve-failure message, got: {}",
+            result.message.contains("base could not be validated")
+                && result.message.contains("approval and merge not attempted"),
+            "expected pre-approval base-validation failure, got: {}",
             result.message
         );
     }
@@ -1147,10 +1393,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_retryable_head_modified() {
+    fn classify_head_modified_as_stale_authority() {
         assert_eq!(
             classify_merge_failure("Head branch was modified. Review and try the merge again."),
-            MergeFailureKind::Retryable,
+            MergeFailureKind::StaleAuthority,
+        );
+    }
+
+    #[test]
+    fn classify_expected_head_mismatch_as_stale_authority() {
+        assert_eq!(
+            classify_merge_failure("pull request head SHA does not match expected head commit"),
+            MergeFailureKind::StaleAuthority,
         );
     }
 

@@ -11,6 +11,7 @@ pub struct ReviewLaunch {
     pub cap_run_id: String,
     pub pr: i64,
     pub head_sha: String,
+    pub review_role: String,
 }
 
 /// Bind the immutable daemon-captured review target to the exact persisted
@@ -92,7 +93,8 @@ pub fn review_launch_for_capability(
 ) -> Result<Option<ReviewLaunch>> {
     Ok(conn
         .query_row(
-            "SELECT id,task_id,agent_name,review_cap_run_id,review_pr,review_head_sha
+            "SELECT id,task_id,agent_name,review_cap_run_id,review_pr,review_head_sha,
+                    CASE WHEN sub_role='r2' THEN 'r2' ELSE 'r1' END
          FROM agent_runs WHERE review_cap_run_id=?1 AND role='reviewer' AND ended_at IS NULL",
             [cap_run_id],
             |row| {
@@ -103,10 +105,48 @@ pub fn review_launch_for_capability(
                     cap_run_id: row.get(3)?,
                     pr: row.get(4)?,
                     head_sha: row.get(5)?,
+                    review_role: row.get(6)?,
                 })
             },
         )
         .optional()?)
+}
+
+/// Resolve immutable launch authority when startup has only the exact
+/// reviewer/task/PR identity from a stranded mailbox signal. Ambiguous open
+/// runs fail closed instead of choosing whichever launch happened most
+/// recently.
+pub fn review_launch_for_reviewer(
+    conn: &Connection,
+    task_id: i64,
+    agent_name: &str,
+    pr: i64,
+) -> Result<Option<ReviewLaunch>> {
+    let mut stmt = conn.prepare(
+        "SELECT id,task_id,agent_name,review_cap_run_id,review_pr,review_head_sha,
+                CASE WHEN sub_role='r2' THEN 'r2' ELSE 'r1' END
+         FROM agent_runs
+         WHERE task_id=?1 AND agent_name=?2 AND role='reviewer' AND review_pr=?3
+           AND ended_at IS NULL
+         ORDER BY id DESC LIMIT 2",
+    )?;
+    let rows = stmt.query_map(params![task_id, agent_name, pr], |row| {
+        Ok(ReviewLaunch {
+            agent_run_id: row.get(0)?,
+            task_id: row.get(1)?,
+            agent_name: row.get(2)?,
+            cap_run_id: row.get(3)?,
+            pr: row.get(4)?,
+            head_sha: row.get(5)?,
+            review_role: row.get(6)?,
+        })
+    })?;
+    let launches = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(if launches.len() == 1 {
+        launches.into_iter().next()
+    } else {
+        None
+    })
 }
 use serde::Serialize;
 
@@ -433,6 +473,7 @@ mod tests {
                 cap_run_id: "cap-7".into(),
                 pr: 71,
                 head_sha: sha.into(),
+                review_role: "r1".into(),
             })
         );
         assert_eq!(review_launch_for_capability(&c, "other").unwrap(), None);
@@ -462,9 +503,38 @@ mod tests {
         .unwrap();
         let launch = review_launch_for_capability(&c, "cap-9").unwrap().unwrap();
         assert_eq!(launch.agent_run_id, run);
+        assert_eq!(launch.review_role, "r2");
         assert_eq!(
             (launch.task_id, launch.pr, launch.head_sha.as_str()),
             (9, 79, sha)
+        );
+        assert_eq!(
+            review_launch_for_reviewer(&c, 9, "R2", 79)
+                .unwrap()
+                .unwrap()
+                .agent_run_id,
+            run
+        );
+        insert_reviewer_with_launch(
+            &c,
+            9,
+            "R2",
+            "model",
+            "high",
+            "codex",
+            None,
+            11,
+            Some("r2"),
+            "cap-10",
+            79,
+            sha,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            review_launch_for_reviewer(&c, 9, "R2", 79).unwrap(),
+            None,
+            "ambiguous stranded reviewer launches must fail closed"
         );
         assert!(insert_reviewer_with_launch(
             &c, 10, "bad", "model", "high", "codex", None, 11, None, "", 79, sha,

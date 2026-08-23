@@ -8,6 +8,11 @@ This file is the small, always-loaded operating contract. Do **not** read the fu
 spec by default. Read feature-specific design or history only when the task affects it; use
 the routing table at the end of this guide.
 
+Interactive and coordinator sessions never start, restart, supervise, stop, signal, or
+otherwise control `quorum serve`. Daemon process ownership belongs to a separately
+designated operator session or external supervisor. Coordinators may use short-lived CLI
+commands for inspection, task intake, and supported recovery operations.
+
 ## Product priorities
 
 Optimize in this order:
@@ -103,9 +108,9 @@ same PR and provide concurrency/runtime evidence appropriate to the invariant.
   any blocker requires a changes verdict with feedback. Reviewers post findings/comments;
   the daemon owns formal approval/request-changes and merge.
 
-### Required verification before submission
+### Required verification before submission or a direct PR
 
-Run the full project gate before `quorum submit`:
+Run the full project gate before `quorum submit` or pushing a directly authored PR:
 
 ```bash
 rtk proxy ./preflight.sh
@@ -116,8 +121,9 @@ formatting, transcripts, links, headings, or evidence tokens; the daemon owns CI
 Never bypass the pre-push hook. For doc-only changes this gate still applies.
 
 After pulling merged source, run `./dev-install.sh` to rebuild, install, verify required
-commands, and check schema compatibility. Use `scripts/serve-supervisor.sh` for supervised
-serve/self-update operation.
+commands, and check schema compatibility. A separately designated daemon operator uses
+`scripts/serve-supervisor.sh` for supervised serve/self-update operation; interactive and
+coordinator sessions never invoke that script or `quorum serve`.
 
 ## Daemon and async checklist
 
@@ -141,6 +147,12 @@ Interactive sessions default to coordinator mode: investigate, reproduce, diagno
 and design. Exploratory wording does not authorize implementation or external mutations.
 Implement directly only after an explicit instruction such as “implement it here.”
 
+Interactive coordinators never operate the daemon process, even when managed work appears
+stuck or a configuration change requires a restart. They may inspect `quorum status`, task
+state, logs, and durable evidence, then report the required operator action. Do not invoke
+`quorum serve`, `scripts/serve-supervisor.sh`, or send process signals to a daemon from an
+interactive/coordinator session.
+
 Use Quorum only for execution-ready tasks with observed/expected behavior, evidence,
 affected paths, proposed remediation, constraints, and verification. Do not dispatch
 open-ended production investigation or feature design.
@@ -161,7 +173,8 @@ not foundation context.
 | Task lifecycle/recovery/merge | `quorum-core/src/lifecycle.rs`, relevant `quorum/src/serve/` module, then the matching design section |
 | SQLite, claims, expiry, migration, WAL | Relevant `quorum-core/src/` module and matching design section |
 | Reviewer/R1/R2/rework prompts | `quorum/src/serve/reviewer.rs` and the review-responsibility design section |
-| Provider spawning, auth, continuation | `quorum/src/serve/agent.rs`, `codex_agent.rs`, `runner.rs`, and nearby contract tests |
+| Provider spawning, auth, continuation | `quorum/src/serve/agent.rs`, `codex_agent.rs`, `grok_agent.rs`, `runner.rs`, and nearby contract tests |
+| Managed run endpoint and MCP authority | `quorum/src/agent_client.rs`, `agent_mcp.rs`, `quorum/src/serve/agent_endpoint.rs`, and the endpoint contract tests |
 | Collector/review analytics | `quorum/src/serve/collector.rs`, `quorum-core/src/review_findings.rs` |
 | Historical audits | Specific file under `docs/audits/`; do not load the directory wholesale |
 

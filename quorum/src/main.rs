@@ -4,6 +4,8 @@
 //! exits with a stable code: 0 success · 1 clean "didn't get it"/not-holder · 2 usage/bad
 //! input · 3 internal/DB/migration error.
 
+mod agent_client;
+mod agent_mcp;
 mod cheatsheet;
 mod cli;
 mod cockpit;
@@ -21,6 +23,15 @@ use clap::Parser;
 use quorum_core::error::{QuorumError, Result};
 
 const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
+const MIN_EXTERNAL_POLL_INTERVAL_SECS: u64 = 30;
+
+#[derive(serde::Serialize)]
+struct TaskGetView<'a> {
+    #[serde(flatten)]
+    task: &'a quorum_core::tasks::TaskDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arbiter: Option<quorum_core::stats::ArbiterVerdict>,
+}
 
 const DEFAULT_SERVE_TOML: &str = "\
 # quorum serve config — edit repository paths and routing percentages as needed.
@@ -67,17 +78,19 @@ primary = 100
 # agent_bin = \"/path/to/provider-cli\"
 # no_bare_agent = true   # default: use operator's Claude login (no --bare)
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
-# base_branch = \"main\"
+# base_branch = \"main\" # task/PR base: worktrees, PRs, validation, and merges
+# self_update_branch = \"main\" # daemon update poll; defaults to resolved base_branch
 
-## Grok Build transport validation only; managed Grok roles are not enabled.
+## Grok Build settings for managed worker roles only.
 # [grok]
-# sandbox = \"workspace\"                 # off|workspace
+# sandbox = \"off\"                        # off|workspace (default: off)
 # permission_mode = \"bypassPermissions\"
 # max_turns = 64                         # 1..=256
 
 ## Token / cost / wall-clock limits (unlimited when absent)
 # max_turn_tokens = 200000
 # max_task_tokens = 1000000
+# token_limit_basis = \"raw\" # raw (default) | uncached
 # max_turn_cost_usd = 5.0
 # max_task_cost_usd = 50.0
 # max_idle_secs = 900
@@ -87,7 +100,7 @@ primary = 100
 ## Merge
 # merge_token_file = \"/path/to/token\"
 # merge_checks_timeout_secs = 900
-# merge_checks_poll_secs = 30
+# merge_checks_poll_secs = 30 # minimum: 30 seconds
 # required_jobs = [\"ci\"]
 # master_ci_gate = false
 # master_ci_timeout_secs = 300
@@ -96,7 +109,7 @@ primary = 100
 # self_update_drain = false
 # drain_timeout_secs = 900
 # self_repo = \"owner/name\"
-# sha_poll_interval_secs = 600
+# sha_poll_interval_secs = 600 # minimum: 30 seconds
 
 ## Diagnostics
 # log_dir = \"/path/to/logs\"
@@ -106,6 +119,10 @@ primary = 100
 ## r2_enabled = true                 # false disables sampling, not the R2 gate
 ## r2_target_per_stratum = 0         # guaranteed coverage before probability
 ## r2_steady_state_p = 1.0           # 1.0 preserves mandatory R2 by default
+
+## Rework ceiling: max changes-to-rework rounds before a task fails. Stamped
+## onto each task at adoption; unset keeps the compiled default (7).
+# max_rework = 7
 ";
 
 fn run() -> Result<i32> {
@@ -115,11 +132,19 @@ fn run() -> Result<i32> {
     // Best-effort: log genuinely abnormal failures (exit 3) — never normal lost-race (1) or
     // usage errors (2).
     if let Err(ref e) = result {
-        if e.exit_code() == 3 {
+        if e.exit_code() == 3 && source != "agent-mcp" && !managed_endpoint_command(source) {
             best_effort_errlog(source, &e.to_string());
         }
     }
     result
+}
+
+/// Managed endpoint calls deliberately lack repository authority. In
+/// particular, an endpoint failure must not be followed by an error-log write
+/// that opens the provider's private Quorum database.
+fn managed_endpoint_command(source: &str) -> bool {
+    matches!(source, "task-update" | "react" | "submit")
+        && std::env::var_os("QUORUM_RUN_ID").is_some()
 }
 
 fn command_source(cmd: &cli::Command) -> &'static str {
@@ -145,7 +170,9 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Sweep => "sweep",
         cli::Command::Message { .. } => "message",
         cli::Command::React { .. } => "react",
+        cli::Command::AgentMcp => "agent-mcp",
         cli::Command::Submit { .. } => "submit",
+        cli::Command::ReviewDraft { .. } => "review-draft",
         cli::Command::Serve { .. } => "serve",
         cli::Command::SessionRegister { .. } => "session-register",
         cli::Command::Activity { .. } => "activity",
@@ -198,6 +225,16 @@ fn check_nonneg(flag: &str, v: Option<i64>) -> Result<()> {
         Some(n) if n < 0 => Err(QuorumError::Usage(format!("{flag} must be >= 0"))),
         _ => Ok(()),
     }
+}
+
+/// External API polls must leave enough room for service-side rate limits.
+fn validate_external_poll_interval(name: &str, seconds: u64) -> Result<()> {
+    if seconds < MIN_EXTERNAL_POLL_INTERVAL_SECS {
+        return Err(QuorumError::Usage(format!(
+            "{name} must be at least {MIN_EXTERNAL_POLL_INTERVAL_SECS} seconds"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve run identity: explicit `--run-id` flag, then `QUORUM_RUN_ID` env var.
@@ -471,6 +508,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             depends_on,
             review_pr,
             continue_pr,
+            base_branch,
             body_file,
             repo,
         } => {
@@ -478,8 +516,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             quorum_core::tasks::validate_creator_labels(labels.as_deref())?;
             quorum_core::tasks::validate_creator_refs(refs.as_deref())?;
             let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let target_branch =
+                base_branch.unwrap_or(serve_config::task_create_base_branch(&resolved_repo)?);
+            quorum_core::tasks::validate_target_branch(&target_branch)?;
             let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
-            let id = quorum_core::tasks::create_with_continue_pr(
+            let id = quorum_core::tasks::create_with_continue_pr_and_target_branch(
                 &mut conn,
                 &created_by,
                 &title,
@@ -490,6 +531,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 depends_on.as_deref(),
                 review_pr,
                 continue_pr,
+                Some(&target_branch),
                 now,
             )?;
             output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
@@ -518,6 +560,30 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                      --body-stdin/--body-file/--note-stdin/--note-file/--depends-on"
                         .into(),
                 ));
+            }
+            // A run identity always takes the scoped path. In particular, a
+            // provider must not regain caller-selected task/agent writes by
+            // inheriting QUORUM_HOME or by losing its endpoint setting.
+            let managed_run = std::env::var_os("QUORUM_RUN_ID").is_some();
+            if managed_run {
+                if has_field_update || note.is_none() {
+                    return Err(QuorumError::Usage(
+                        "daemon-managed task-update supports only --note-stdin or --note-file"
+                            .into(),
+                    ));
+                }
+                let run_id = resolve_run_id(None, "task-update")?;
+                // Retain prompt-compatible flags as identity constraints; the
+                // endpoint derives the authoritative task and agent from the
+                // run capability and rejects a mismatch before writing.
+                let note_id = agent_client::append_note(agent_client::AppendNote {
+                    capability: &run_id,
+                    task_id,
+                    agent: &agent,
+                    note: note.as_deref().unwrap(),
+                })?;
+                output::emit(&serde_json::json!({ "ok": true, "note_id": note_id }));
+                return Ok(0);
             }
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let task = if has_field_update {
@@ -583,7 +649,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             match quorum_core::tasks::get_with_notes(&conn, task_id)? {
                 Some(t) => {
-                    output::emit(&t);
+                    output::emit(&TaskGetView {
+                        task: &t,
+                        arbiter: quorum_core::stats::arbiter_verdict(&conn, task_id)?,
+                    });
                     Ok(0)
                 }
                 None => {
@@ -910,24 +979,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 }
             }
             let rid = resolve_run_id(run_id, "react")?;
-            let db = paths::db_path()?;
-            let conn = quorum_core::db::open(&db)?;
-            quorum_core::capabilities::validate(&conn, &rid, &agent, "worker", Some(task_id))
-                .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
-            let mut conn = conn;
-            let row = quorum_core::mailbox::MailboxRow {
-                agent,
-                kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
-                task_id: Some(task_id),
-                pr: None,
-                verdict: None,
-                feedback: None,
-                note: Some(state),
-                to_agent: None,
-                payload: None,
-            };
-            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            // Retain the legacy intent flags, but never trust them as target
+            // authority: the endpoint derives agent and task from `rid`.
+            let _ = (agent, task_id);
+            let id = agent_client::react(&rid, &state)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
+        cli::Command::AgentMcp => {
+            agent_mcp::run()?;
             Ok(0)
         }
         cli::Command::Submit {
@@ -986,39 +1046,47 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let rid = resolve_run_id(run_id, "submit")?;
+            if let Some(raw) = feedback_json.as_deref() {
+                graph_blocker::parse_feedback(raw).map_err(QuorumError::Usage)?;
+            }
+            // The endpoint derives agent, task, PR, role, and revision from the
+            // capability. These parsed compatibility flags are not authority.
+            let _ = (agent, pr);
+            let id = agent_client::submit(agent_client::Submit {
+                capability: &rid,
+                summary: summary.as_deref(),
+                verdict: verdict.as_deref(),
+                feedback: feedback.as_deref(),
+                feedback_json: feedback_json.as_deref(),
+                blocking,
+            })?;
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
+        cli::Command::ReviewDraft {
+            agent,
+            pr,
+            blocking,
+            feedback_file,
+            run_id,
+        } => {
+            let feedback = input::read_text(input::TextSource::File(feedback_file))?;
+            verdict::validate_review_draft(blocking, &feedback).map_err(QuorumError::Usage)?;
+            let rid = resolve_run_id(run_id, "review-draft")?;
             let db = paths::db_path()?;
             let mut conn = quorum_core::db::open(&db)?;
-            let expected_role = if verdict.is_some() {
-                "reviewer"
-            } else {
-                "worker"
-            };
-            let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, expected_role, None)
+            let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, "reviewer", None)
                 .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
-            let kind = quorum_core::mailbox::MailboxKind::Done;
-            let payload = if let Some(raw) = feedback_json {
-                let graph_feedback =
-                    graph_blocker::parse_feedback(&raw).map_err(QuorumError::Usage)?;
-                if graph_feedback.affected_task != cap.task_id {
-                    return Err(QuorumError::Usage(format!(
-                        "graph-blocker affected_task {} does not match reviewer task {}",
-                        graph_feedback.affected_task, cap.task_id
-                    )));
-                }
-                Some(graph_blocker::encode(rid, graph_feedback).map_err(QuorumError::Usage)?)
-            } else {
-                verdict::attestation_payload(blocking)
-            };
             let row = quorum_core::mailbox::MailboxRow {
                 agent,
-                kind,
+                kind: quorum_core::mailbox::MailboxKind::ReviewDraft,
                 task_id: Some(cap.task_id),
-                pr,
-                verdict,
-                feedback,
-                note: summary,
+                pr: Some(pr),
+                verdict: None,
+                feedback: Some(feedback),
+                note: None,
                 to_agent: None,
-                payload,
+                payload: verdict::attestation_payload(Some(blocking)),
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
@@ -1075,13 +1143,48 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     output::emit(&quorum_core::tasks::TaskCompact::from(&task));
                     Ok(0)
                 }
-                None => {
-                    output::emit(&serde_json::json!({
-                        "ok": false,
-                        "reason": "task is not daemon-parked or provider-blocked",
-                    }));
-                    Ok(1)
-                }
+                None => match quorum_core::decomposition::retry_exhausted_planning(
+                    &mut conn, task_id, &by, now,
+                )? {
+                    quorum_core::decomposition::PlanningRetryOutcome::Retried {
+                        graph_id,
+                        generation,
+                    } => {
+                        let task = quorum_core::tasks::get(&conn, task_id)?.ok_or_else(|| {
+                            QuorumError::Io(format!(
+                                "retried decomposition source #{task_id} disappeared"
+                            ))
+                        })?;
+                        output::emit(&serde_json::json!({
+                            "ok": true,
+                            "outcome": "decomposition-planning-retried",
+                            "graph_id": graph_id,
+                            "retry_generation": generation,
+                            "task": quorum_core::tasks::TaskCompact::from(&task),
+                        }));
+                        Ok(0)
+                    }
+                    quorum_core::decomposition::PlanningRetryOutcome::RetryCapExhausted {
+                        retry_count,
+                    } => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "outcome": "decomposition-planning-retry-rejected",
+                            "reason": "operator retry cap exhausted; inspect the planning failures and rescope or close the source",
+                            "retry_count": retry_count,
+                            "retry_cap": quorum_core::decomposition::MAX_OPERATOR_RETRIES,
+                        }));
+                        Ok(1)
+                    }
+                    quorum_core::decomposition::PlanningRetryOutcome::NotEligible => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "outcome": "task-retry-rejected",
+                            "reason": "task is not daemon-parked, provider-blocked, or an eligible exhausted decomposition source",
+                        }));
+                        Ok(1)
+                    }
+                },
             }
         }
         cli::Command::DecompositionAdoptRecovery {
@@ -1171,6 +1274,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             sha_poll_interval_secs,
             repo,
             base_branch,
+            self_update_branch,
             exit_when_gone,
             doctor_enabled,
         } => {
@@ -1251,6 +1355,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_no_bare = resolve_bool(no_bare_agent, file_cfg.no_bare_agent, true);
             let r_max_turn_tokens = resolve_opt(max_turn_tokens, file_cfg.max_turn_tokens);
             let r_max_task_tokens = resolve_opt(max_task_tokens, file_cfg.max_task_tokens);
+            let r_token_limit_basis =
+                resolve_token_limit_basis(file_cfg.token_limit_basis.as_deref())?;
+            validate_token_ceilings(r_max_turn_tokens.value, r_max_task_tokens.value)?;
             let r_max_turn_cost = resolve_opt(max_turn_cost_usd, file_cfg.max_turn_cost_usd);
             let r_max_task_cost = resolve_opt(max_task_cost_usd, file_cfg.max_task_cost_usd);
             serve_config::validate_routed_cost_limits(
@@ -1280,16 +1387,24 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_self_repo = resolve_opt_str(self_repo.as_deref(), file_cfg.self_repo.as_deref());
             let r_sha_poll =
                 resolve_val(sha_poll_interval_secs, file_cfg.sha_poll_interval_secs, 600);
-            if r_sha_poll.value == 0 {
-                return Err(QuorumError::Usage(
-                    "sha_poll_interval_secs must be greater than zero".into(),
-                ));
-            }
+            validate_external_poll_interval("sha_poll_interval_secs", r_sha_poll.value)?;
             let r_base_branch = resolve_str(
                 base_branch.as_deref(),
                 file_cfg.base_branch.as_deref(),
                 "main",
             );
+            // Self-update polling has an independent branch, but preserves
+            // existing deployments by inheriting the fully resolved task/PR base.
+            let r_self_update_branch =
+                if self_update_branch.is_some() || file_cfg.self_update_branch.is_some() {
+                    resolve_str(
+                        self_update_branch.as_deref(),
+                        file_cfg.self_update_branch.as_deref(),
+                        "main",
+                    )
+                } else {
+                    r_base_branch.clone()
+                };
             let r_merge_checks_timeout = resolve_val(
                 merge_checks_timeout_secs,
                 file_cfg.merge_checks_timeout_secs,
@@ -1297,6 +1412,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             );
             let r_merge_checks_poll =
                 resolve_val(merge_checks_poll_secs, file_cfg.merge_checks_poll_secs, 30);
+            validate_external_poll_interval("merge_checks_poll_secs", r_merge_checks_poll.value)?;
             let r_required_jobs: Vec<String> = file_cfg.required_jobs.clone().unwrap_or_default();
             let r_master_ci_gate = resolve_bool(false, file_cfg.master_ci_gate, false);
             let r_master_ci_timeout = resolve_val(None, file_cfg.master_ci_timeout_secs, 300);
@@ -1307,6 +1423,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_r2_target_per_stratum = file_cfg.r2_target_per_stratum.unwrap_or(0);
             let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(1.0);
             serve_config::validate_r2_sampling(r_r2_target_per_stratum, r_r2_steady_state_p)?;
+
+            // Rework ceiling: unset preserves the compiled default. Stamped onto
+            // each task at adoption, immutable thereafter.
+            let r_max_rework = file_cfg
+                .max_rework
+                .unwrap_or(quorum_core::lifecycle::REWORK_CAP);
+            serve_config::validate_max_rework(r_max_rework)?;
 
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
@@ -1324,6 +1447,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 .as_ref()
                 .and_then(|c| c.sandbox.clone())
                 .unwrap_or_else(|| "danger-full-access".to_string());
+            let grok = serve_config::resolve_grok_adapter(file_cfg.grok.as_ref())?;
 
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
@@ -1332,6 +1456,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 repo_dir: &r_repo_dir,
                 worktree_base: &r_wt,
                 base_branch: &r_base_branch,
+                self_update_branch: &r_self_update_branch,
                 cap: &r_cap,
                 model_profiles: &model_profiles,
                 routing: &routing,
@@ -1344,6 +1469,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 idle_timeout_secs: &r_idle_timeout,
                 max_turn_tokens: &r_max_turn_tokens,
                 max_task_tokens: &r_max_task_tokens,
+                token_limit_basis: &r_token_limit_basis,
                 max_turn_cost_usd: &r_max_turn_cost,
                 max_task_cost_usd: &r_max_task_cost,
                 merge_checks_timeout_secs: &r_merge_checks_timeout,
@@ -1399,6 +1525,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 names_file: r_names.value.map(std::path::PathBuf::from),
                 agent_bin: r_agent_bin.value,
                 codex_sandbox,
+                grok,
                 pr_target_program: None,
                 model_profiles,
                 routing,
@@ -1407,6 +1534,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 limits: serve::CostLimits {
                     max_turn_tokens: r_max_turn_tokens.value,
                     max_task_tokens: r_max_task_tokens.value,
+                    token_limit_basis: r_token_limit_basis.value,
                     max_turn_cost_usd: r_max_turn_cost.value,
                     max_task_cost_usd: r_max_task_cost.value,
                     max_idle_secs: r_max_idle.value,
@@ -1422,6 +1550,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 merge_checks_poll_secs: r_merge_checks_poll.value,
                 repo: r_repo.value,
                 base_branch: r_base_branch.value,
+                self_update_branch: r_self_update_branch.value,
                 exit_when_gone: exit_when_gone.map(std::path::PathBuf::from),
                 required_jobs: r_required_jobs,
                 master_ci_gate: r_master_ci_gate.value,
@@ -1431,6 +1560,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r2_enabled: r_r2_enabled,
                 r2_target_per_stratum: r_r2_target_per_stratum,
                 r2_steady_state_p: r_r2_steady_state_p,
+                max_rework: r_max_rework,
             };
             Ok(serve::run_serve(config)?)
         }
@@ -1517,6 +1647,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::Classify {
             backfill,
+            config: config_flag,
             agent_bin,
             no_bare_agent,
         } => {
@@ -1526,6 +1657,36 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let db = paths::db_path()?;
+            // Backfill is a supported classification writer, so a task it makes
+            // dispatchable must receive the durable adoption-time cap before
+            // claim — otherwise lifecycle/R2/reviewer consumers fall back to the
+            // compiled default despite a configured `max_rework`.
+            //
+            // When the operator passes `--config <path>`, resolve from that
+            // exact file so the stamped cap matches the daemon started with
+            // the same `--config`. When absent, resolve from the same
+            // per-repo default path the daemon uses. Explicit-config missing
+            // must fail exit 2 (same policy as `serve --config`) so backfill
+            // cannot silently diverge from an intended non-default policy;
+            // an absent default file falls back to `REWORK_CAP`, matching
+            // `serve` without a config.
+            let max_rework = if let Some(ref p) = config_flag {
+                let path = std::path::Path::new(p);
+                if !path.exists() {
+                    return Err(QuorumError::Usage(format!(
+                        "classify --config: file not found: {}",
+                        path.display()
+                    )));
+                }
+                serve_config::resolve_max_rework_at(path)?
+            } else {
+                let repo_slug = paths::try_resolve_repo().ok_or_else(|| {
+                    QuorumError::Usage(
+                        "classify --backfill: cannot resolve the current repository".into(),
+                    )
+                })?;
+                serve_config::resolve_max_rework(&repo_slug)?
+            };
             let mut total_stored = 0;
             let mut total_tasks = 0;
             let rt = tokio::runtime::Runtime::new()
@@ -1603,7 +1764,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
                 let stored = {
                     let mut conn = quorum_core::db::open(&db)?;
-                    quorum_core::classify::store_classifications_for_inputs(
+                    quorum_core::classify::store_classifications_and_stamp_rework_cap(
                         &mut conn,
                         &results,
                         &pending_inputs,
@@ -1611,6 +1772,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                             serve::classifier::CLASSIFIER_MODEL,
                         ),
                         quorum_core::clock::now(),
+                        max_rework,
                     )?
                 };
                 total_stored += stored;
@@ -1967,7 +2129,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ttl, resolve_repo_override, wait_child_stdout};
+    use super::{
+        parse_ttl, resolve_repo_override, validate_external_poll_interval, wait_child_stdout,
+    };
 
     #[test]
     fn parse_ttl_units() {
@@ -2004,6 +2168,21 @@ mod tests {
             super::MAX_TTL_SECS
         );
         assert_eq!(parse_ttl("30d").unwrap(), 30 * 86_400);
+    }
+
+    #[test]
+    fn external_poll_intervals_require_30_second_floor() {
+        for name in ["merge_checks_poll_secs", "sha_poll_interval_secs"] {
+            let error = validate_external_poll_interval(name, 10).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert_eq!(
+                error.to_string(),
+                format!("usage: {name} must be at least 30 seconds")
+            );
+
+            assert!(validate_external_poll_interval(name, 30).is_ok());
+        }
+        assert!(validate_external_poll_interval("sha_poll_interval_secs", 600).is_ok());
     }
 
     #[test]

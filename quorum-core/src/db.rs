@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 52;
+pub const SCHEMA_VERSION: i64 = 60;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -157,10 +157,40 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
             schema_version: SCHEMA_VERSION,
         });
     }
-    // One atomic migration. SCHEMA_SQL is `CREATE TABLE IF NOT EXISTS`, so it builds a fresh
-    // DB at the latest shape and is a no-op for existing tables — additive column changes
-    // must therefore be ALTERed in below, guarded for idempotency since SQLite has no
-    // `ADD COLUMN IF NOT EXISTS`. SCHEMA_VERSION is a compile-time constant (injection-free).
+    // Foreign-key enforcement must be OFF while migrations run: the v57 rebuild DROPs
+    // `role_assignments` while child tables (agent_runs, task_decompositions,
+    // review_collection_runs, routing_attempts) hold FK references to it, which fails under
+    // enforcement. rusqlite's bundled SQLite defaults `foreign_keys` ON, and `PRAGMA
+    // foreign_keys` is a no-op inside a transaction, so the toggle must straddle the
+    // `BEGIN IMMEDIATE` below. The v58 rebuilds (`decomposition_attempts`,
+    // `token_usage_runs`) have no external FK children today, but reuse the same straddle
+    // so future references would migrate safely. Capture the connection's prior state and
+    // restore it on every exit path so we never leave enforcement disabled on a live
+    // connection.
+    let fk_prior: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let outcome = migrate_txn(conn, current, fk_prior);
+    // Restore enforcement to the captured prior state regardless of success or failure, so a
+    // failed migration never leaves enforcement disabled on a live connection. The integrity
+    // guard runs INSIDE the transaction (see `migrate_txn`), not here, so a violation rolls
+    // the migration back and leaves `user_version` unadvanced rather than committing v57 and
+    // erroring only once.
+    conn.pragma_update(None, "foreign_keys", fk_prior)?;
+    outcome
+}
+
+/// Run the one atomic migration transaction. Foreign-key enforcement is disabled by the
+/// caller before this runs (and restored after). SCHEMA_SQL is `CREATE TABLE IF NOT EXISTS`,
+/// so it builds a fresh DB at the latest shape and is a no-op for existing tables — additive
+/// column changes must therefore be ALTERed in below, guarded for idempotency since SQLite
+/// has no `ADD COLUMN IF NOT EXISTS`. SCHEMA_VERSION is a compile-time constant
+/// (injection-free). `BEGIN IMMEDIATE` keeps concurrent first-runs safe.
+///
+/// `fk_prior` is the enforcement state the caller captured: when it was ON, the closure runs
+/// `PRAGMA foreign_key_check` as the final step (while the transaction is still
+/// rollback-capable) and fails on any dangling reference, so the ROLLBACK path fires and
+/// `user_version` stays at the prior version.
+fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<MigrateResult> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let run = || -> Result<()> {
         conn.execute_batch(SCHEMA_SQL)?;
@@ -824,17 +854,250 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                 conn.execute("ALTER TABLE journal ADD COLUMN local_branch TEXT", [])?;
             }
         }
+        // v53 = authoritative nullable target-branch on tasks. Resolved to
+        // the daemon-configured base before first execution; immutable once
+        // populated. NULL preserves every historical task without reinterpreting.
+        if current < 53 && !column_exists(conn, "tasks", "target_branch")? {
+            conn.execute("ALTER TABLE tasks ADD COLUMN target_branch TEXT", [])?;
+        }
+        // v54 = durable, per-invocation token usage. Both new tables are
+        // created idempotently by SCHEMA_SQL; historic agent runs remain
+        // untouched and no usage is fabricated during migration.
+        // v55 makes exhausted decomposition planning explicitly and boundedly
+        // operator-retryable. Existing attempts belong to generation zero.
+        if current < 55 {
+            if !column_exists(conn, "task_decompositions", "operator_retry_count")? {
+                conn.execute(
+                    "ALTER TABLE task_decompositions
+                     ADD COLUMN operator_retry_count INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "decomposition_attempts", "retry_generation")? {
+                conn.execute(
+                    "ALTER TABLE decomposition_attempts
+                     ADD COLUMN retry_generation INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+        }
+        // v56 = nullable per-task rework ceiling. Existing rows stay NULL and
+        // fall back to the compiled REWORK_CAP, preserving historic behaviour;
+        // the daemon stamps the configured value onto tasks at adoption,
+        // immutable once populated. Renumbered from v55 during the merge with
+        // main's independently shipped v55 (decomposition operator retries)
+        // so both additive migrations converge without reinterpreting history.
+        if current < 56 && !column_exists(conn, "tasks", "rework_cap")? {
+            conn.execute("ALTER TABLE tasks ADD COLUMN rework_cap INTEGER", [])?;
+        }
+        // v57 widens the immutable role-assignment role check to admit the new
+        // managed `arbiter` plan-review role. SQLite cannot ALTER a CHECK, so
+        // the table is rebuilt in place. `migrate` disables foreign-key
+        // enforcement around this transaction, so the DROP succeeds while the
+        // child references (agent_runs, task_decompositions,
+        // review_collection_runs, routing_attempts) keep their integer values
+        // across the rename; `migrate` re-checks integrity afterward. The
+        // rebuild is guarded on the stored constraint text, so it is a no-op on
+        // a fresh DB (SCHEMA_SQL already created the widened table) and on any
+        // re-run.
+        if current < 57 {
+            let role_check_admits_arbiter: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(sql LIKE '%''arbiter''%'), 1) FROM sqlite_master
+                 WHERE type='table' AND name='role_assignments'",
+                [],
+                |row| row.get(0),
+            )?;
+            if role_check_admits_arbiter == 0 {
+                // `routing_attempts_assignment_guard` (created by SCHEMA_SQL
+                // above) references role_assignments by name. legacy_alter_table
+                // keeps the DROP+RENAME from re-parsing that trigger body while
+                // the table is transiently absent; foreign keys are already off.
+                conn.pragma_update(None, "legacy_alter_table", true)?;
+                conn.execute_batch(
+                    "CREATE TABLE role_assignments_new (
+                         id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                         responsibility_key  TEXT NOT NULL UNIQUE,
+                         task_id             INTEGER,
+                         pr_number           INTEGER,
+                         role                TEXT NOT NULL CHECK(role IN
+                                                 ('classifier','planner','arbiter','worker','reviewer','collector')),
+                         review_stage        TEXT CHECK(review_stage IN ('r1','r2')),
+                         complexity          TEXT,
+                         profile_id          TEXT NOT NULL,
+                         provider            TEXT NOT NULL,
+                         runner              TEXT NOT NULL,
+                         model               TEXT NOT NULL,
+                         effort              TEXT NOT NULL,
+                         pool_key            TEXT NOT NULL,
+                         policy_generation   TEXT NOT NULL,
+                         created_at          INTEGER NOT NULL,
+                         CHECK((role = 'reviewer' AND review_stage IS NOT NULL) OR
+                               (role != 'reviewer' AND review_stage IS NULL))
+                     );
+                     INSERT INTO role_assignments_new
+                         SELECT id,responsibility_key,task_id,pr_number,role,review_stage,
+                                complexity,profile_id,provider,runner,model,effort,pool_key,
+                                policy_generation,created_at
+                         FROM role_assignments;
+                     DROP TABLE role_assignments;
+                     ALTER TABLE role_assignments_new RENAME TO role_assignments;
+                     CREATE INDEX IF NOT EXISTS role_assignments_task ON role_assignments(task_id);
+                     CREATE INDEX IF NOT EXISTS role_assignments_pr ON role_assignments(pr_number);",
+                )?;
+                conn.pragma_update(None, "legacy_alter_table", false)?;
+            }
+        }
+        // v58 widens two immutable CHECK constraints: decomposition_attempts.kind admits
+        // 'verdict' alongside ('proposal','provider','blocker','recovery'), and
+        // token_usage_runs.purpose admits 'planner' and 'arbiter' alongside
+        // ('worker','reviewer','classifier','collector'). SQLite cannot ALTER a CHECK, so each
+        // table is rebuilt in place following the v57 role_assignments precedent. Each rebuild
+        // is guarded on stored constraint text so it is a no-op on a fresh DB (SCHEMA_SQL
+        // already created the widened tables) and on any re-run. Foreign-key enforcement is
+        // disabled by the outer `migrate` straddle so DROPs succeed even where later work adds
+        // FK children; the in-transaction `PRAGMA foreign_key_check` above rolls back if any
+        // reference ends up dangling.
+        if current < 58 {
+            let kind_admits_verdict: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(sql LIKE '%''verdict''%'), 1) FROM sqlite_master
+                 WHERE type='table' AND name='decomposition_attempts'",
+                [],
+                |row| row.get(0),
+            )?;
+            if kind_admits_verdict == 0 {
+                conn.execute_batch(
+                    "CREATE TABLE decomposition_attempts_new (
+                         id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                         graph_id         INTEGER NOT NULL REFERENCES task_decompositions(id),
+                         source_revision  INTEGER NOT NULL,
+                         kind             TEXT NOT NULL CHECK(kind IN
+                                              ('proposal','provider','blocker','recovery','verdict')),
+                         ordinal          INTEGER NOT NULL,
+                         retry_generation INTEGER NOT NULL DEFAULT 0
+                                              CHECK(retry_generation BETWEEN 0 AND 2),
+                         reason_code      TEXT NOT NULL,
+                         summary          TEXT NOT NULL,
+                         created_at       INTEGER NOT NULL,
+                         UNIQUE (graph_id, source_revision, kind, ordinal)
+                     );
+                     INSERT INTO decomposition_attempts_new
+                         SELECT id,graph_id,source_revision,kind,ordinal,retry_generation,
+                                reason_code,summary,created_at
+                         FROM decomposition_attempts;
+                     DROP TABLE decomposition_attempts;
+                     ALTER TABLE decomposition_attempts_new RENAME TO decomposition_attempts;",
+                )?;
+            }
+            let purpose_admits_planner: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(sql LIKE '%''planner''%'), 1) FROM sqlite_master
+                 WHERE type='table' AND name='token_usage_runs'",
+                [],
+                |row| row.get(0),
+            )?;
+            if purpose_admits_planner == 0 {
+                conn.execute_batch(
+                    "CREATE TABLE token_usage_runs_new (
+                         id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                         agent_run_id             INTEGER UNIQUE,
+                         purpose                  TEXT NOT NULL CHECK(purpose IN
+                                                      ('worker','reviewer','classifier','collector','planner','arbiter')),
+                         pr_number                INTEGER,
+                         provider                 TEXT NOT NULL,
+                         model                    TEXT NOT NULL,
+                         effort                   TEXT NOT NULL,
+                         uncached_input_tokens    INTEGER NOT NULL DEFAULT 0,
+                         cached_input_tokens      INTEGER NOT NULL DEFAULT 0,
+                         cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+                         output_tokens            INTEGER NOT NULL DEFAULT 0,
+                         reasoning_tokens         INTEGER NOT NULL DEFAULT 0,
+                         recorded_at              INTEGER NOT NULL
+                     );
+                     INSERT INTO token_usage_runs_new
+                         SELECT id,agent_run_id,purpose,pr_number,provider,model,effort,
+                                uncached_input_tokens,cached_input_tokens,
+                                cache_write_input_tokens,output_tokens,reasoning_tokens,
+                                recorded_at
+                         FROM token_usage_runs;
+                     DROP TABLE token_usage_runs;
+                     ALTER TABLE token_usage_runs_new RENAME TO token_usage_runs;
+                     CREATE INDEX IF NOT EXISTS token_usage_runs_pr
+                         ON token_usage_runs(pr_number);
+                     CREATE INDEX IF NOT EXISTS token_usage_runs_recorded
+                         ON token_usage_runs(recorded_at);",
+                )?;
+            }
+        }
+        // v59 = planner `submit_plan` MCP tool storage (`planner_submissions`). Net-new
+        // table — the `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL (which runs above) handles
+        // fresh DBs and upgrades alike; no ALTER needed.
+        // v60 widens run_capabilities.role to admit 'planner' alongside
+        // ('worker','reviewer'), so the daemon can issue a planner-scoped run capability
+        // ahead of a `submit_plan` MCP call. SQLite cannot ALTER a CHECK, so the table is
+        // rebuilt in place following the v57/v58 precedent. Guarded on stored constraint
+        // text so it is a no-op on a fresh DB (SCHEMA_SQL already creates the widened
+        // table) and on any re-run. No table holds a foreign key into run_capabilities, so
+        // the rebuild has no dangling-reference risk.
+        if current < 60 {
+            let role_admits_planner: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(sql LIKE '%''planner''%'), 1) FROM sqlite_master
+                 WHERE type='table' AND name='run_capabilities'",
+                [],
+                |row| row.get(0),
+            )?;
+            if role_admits_planner == 0 {
+                conn.execute_batch(
+                    "CREATE TABLE run_capabilities_new (
+                         run_id      TEXT PRIMARY KEY,
+                         task_id     INTEGER NOT NULL,
+                         agent       TEXT NOT NULL,
+                         role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','planner')),
+                         created_at  INTEGER NOT NULL,
+                         revoked_at  INTEGER
+                     );
+                     INSERT INTO run_capabilities_new
+                         SELECT run_id,task_id,agent,role,created_at,revoked_at
+                         FROM run_capabilities;
+                     DROP TABLE run_capabilities;
+                     ALTER TABLE run_capabilities_new RENAME TO run_capabilities;
+                     CREATE INDEX IF NOT EXISTS run_capabilities_agent
+                         ON run_capabilities(agent) WHERE revoked_at IS NULL;",
+                )?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        // Integrity safety net, run while the transaction is still rollback-capable. The v57
+        // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
+        // does (or a DB carried a pre-existing dangling reference), fail here so the ROLLBACK
+        // below fires and `user_version` stays unadvanced — a later open re-attempts the
+        // migration instead of taking the `current == SCHEMA_VERSION` early return over a
+        // corrupt schema. `PRAGMA foreign_key_check` reports violations regardless of the
+        // (disabled) enforcement pragma; gated on `fk_prior` so we only enforce integrity
+        // when the connection itself would.
+        if fk_prior {
+            let mut check = conn.prepare("PRAGMA foreign_key_check")?;
+            if check.exists([])? {
+                return Err(QuorumError::Db(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                    Some("migration left dangling foreign-key references".into()),
+                )));
+            }
+        }
         Ok(())
     };
     match run() {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(MigrateResult {
+        Ok(()) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(MigrateResult {
                 migrated_from: current,
                 schema_version: SCHEMA_VERSION,
-            })
-        }
+            }),
+            Err(e) => {
+                // A failing COMMIT (e.g. post-timeout SQLITE_BUSY) can leave the transaction
+                // active; roll it back explicitly so the caller's `foreign_keys` restore is a
+                // real connection-level pragma and not a silent no-op inside a live txn.
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(map_sql_err(e))
+            }
+        },
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
@@ -887,6 +1150,8 @@ mod tests {
             "journal",
             "daemon_lock",
             "agent_runs",
+            "token_usage_runs",
+            "token_usage_run_tasks",
             "role_assignments",
             "routing_cursors",
             "routing_attempts",
@@ -915,6 +1180,123 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrates_v54_adds_decomposition_retry_generations_without_rewriting_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v54.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('source','failed','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                     source_task_id,state,planned_source_revision,provider_failures,
+                     hold_code,created_at,updated_at)
+                 VALUES (1,'held',1,3,'provider-attempts-exhausted',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO decomposition_attempts(
+                     graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+                 VALUES (1,1,'provider',1,'provider','preserved',1)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE task_decompositions DROP COLUMN operator_retry_count;
+                 ALTER TABLE decomposition_attempts DROP COLUMN retry_generation;
+                 PRAGMA user_version=54;",
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        let values: (i64, i64, String) = conn
+            .query_row(
+                "SELECT d.operator_retry_count,a.retry_generation,a.summary
+                 FROM task_decompositions d
+                 JOIN decomposition_attempts a ON a.graph_id=d.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (0, 0, "preserved".into()));
+    }
+
+    #[test]
+    fn populated_v53_to_v54_preserves_history_and_adds_empty_usage_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("populated-v53.db");
+        {
+            let mut conn = open(&path).unwrap();
+            let task_id = crate::tasks::create(
+                &mut conn,
+                "owner",
+                "historic task",
+                Some("historic body"),
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            let run_id = crate::agent_runs::insert(
+                &conn, task_id, "Historic", "worker", "gpt", "high", "codex", 11,
+            )
+            .unwrap();
+            crate::agent_runs::close(&conn, run_id, 12, "done").unwrap();
+            conn.execute_batch(
+                "DROP TABLE token_usage_run_tasks;
+                 DROP TABLE token_usage_runs;
+                 PRAGMA user_version=53;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT title || ':' || body FROM tasks WHERE id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "historic task:historic body"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT end_reason FROM agent_runs WHERE task_id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "done"
+        );
+        for table in ["token_usage_runs", "token_usage_run_tasks"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0),)
+                    .unwrap(),
+                0,
+                "migration must not fabricate historical usage in {table}"
+            );
+        }
     }
 
     #[test]
@@ -1039,6 +1421,571 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn migrates_v56_widens_role_assignment_check_to_admit_arbiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arbiter-role-v56.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            // Faithfully mirror the runtime: rusqlite's bundled SQLite defaults
+            // foreign_keys ON, and it is that enforcement that made the v57 DROP
+            // fail on real databases. Enable it explicitly so this seed models
+            // the production connection state that triggers the bug.
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            // A pre-v57 role_assignments with the narrow role CHECK and one
+            // historical worker row that must survive the rebuild — plus a child
+            // table holding a real FK reference to that row. The v57 rebuild
+            // DROPs role_assignments; with a live child reference this fails
+            // unless enforcement is disabled around the migration.
+            conn.execute_batch(
+                "CREATE TABLE role_assignments (
+                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                     responsibility_key  TEXT NOT NULL UNIQUE,
+                     task_id             INTEGER,
+                     pr_number           INTEGER,
+                     role                TEXT NOT NULL CHECK(role IN
+                                             ('classifier','planner','worker','reviewer','collector')),
+                     review_stage        TEXT CHECK(review_stage IN ('r1','r2')),
+                     complexity          TEXT,
+                     profile_id          TEXT NOT NULL,
+                     provider            TEXT NOT NULL,
+                     runner              TEXT NOT NULL,
+                     model               TEXT NOT NULL,
+                     effort              TEXT NOT NULL,
+                     pool_key            TEXT NOT NULL,
+                     policy_generation   TEXT NOT NULL,
+                     created_at          INTEGER NOT NULL,
+                     CHECK((role = 'reviewer' AND review_stage IS NOT NULL) OR
+                           (role != 'reviewer' AND review_stage IS NULL))
+                 );
+                 CREATE INDEX IF NOT EXISTS role_assignments_task ON role_assignments(task_id);
+                 CREATE INDEX IF NOT EXISTS role_assignments_pr ON role_assignments(pr_number);
+                 -- Child table referencing role_assignments(id): mirrors the FK
+                 -- children (agent_runs, task_decompositions, …) that make the
+                 -- DROP fail under enforcement.
+                 CREATE TABLE ra_child (
+                     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                     role_assignment_id INTEGER REFERENCES role_assignments(id)
+                 );
+                 INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,role,complexity,profile_id,provider,
+                     runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (9,'worker:task:9',9,'worker','M','opus','claude','claude',
+                         'claude-opus-4-8','high','worker.M','generation-1',10);
+                 INSERT INTO ra_child(id,role_assignment_id) VALUES (1,9);
+                 PRAGMA user_version=56;",
+            )
+            .unwrap();
+            // The narrow constraint really rejects an arbiter row.
+            assert!(conn
+                .execute(
+                    "INSERT INTO role_assignments(
+                         responsibility_key,role,profile_id,provider,runner,model,effort,
+                         pool_key,policy_generation,created_at)
+                     VALUES ('arbiter:pre',?1,'p','codex','codex','gpt-5.6-sol','high',
+                             'arbiter','g',1)",
+                    ["arbiter"],
+                )
+                .is_err());
+        }
+
+        let conn = open(&path).unwrap();
+        // open() leaves foreign-key enforcement in its default (ON) state.
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // The historical worker assignment survived the rebuild unchanged.
+        assert_eq!(
+            conn.query_row("SELECT role FROM role_assignments WHERE id=9", [], |row| {
+                row.get::<_, String>(0)
+            },)
+                .unwrap(),
+            "worker"
+        );
+        // The child row still points at the preserved parent id (no dangling
+        // reference across the DROP+RENAME).
+        assert_eq!(
+            conn.query_row(
+                "SELECT role_assignment_id FROM ra_child WHERE id=1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            9
+        );
+        // Integrity is intact: no dangling foreign-key references remain.
+        assert!(!conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        // The widened CHECK now admits an arbiter assignment.
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES ('arbiter:graph:1',?1,'p','codex','codex','gpt-5.6-sol','high',
+                     'arbiter','g',2)",
+            ["arbiter"],
+        )
+        .unwrap();
+
+        // Migration is idempotent across reopen (no double rebuild, rows kept).
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM role_assignments", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn migrates_v57_widens_decomposition_attempts_and_token_usage_runs_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v57-widen-checks.db");
+        {
+            // Open fresh at the latest shape, then seed the two tables in a narrow
+            // (pre-v58) form so we can verify the rebuild widens both CHECKs. Mirrors
+            // the pattern in `populated_v53_to_v54_preserves_history_and_adds_empty_usage_tables`.
+            let conn = open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'src','failed','owner',1,1);
+                 INSERT INTO task_decompositions(
+                     id,source_task_id,state,planned_source_revision,created_at,updated_at)
+                 VALUES (10,1,'held',1,1,1);
+                 -- Rebuild decomposition_attempts with the narrow v57 CHECK, preserving
+                 -- the FK to task_decompositions so foreign_key_check still has a live
+                 -- child reference to validate after the v58 rebuild. FKs are ON here,
+                 -- so we DROP the child first (there are no rows yet), then recreate.
+                 DROP TABLE decomposition_attempts;
+                 CREATE TABLE decomposition_attempts (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     graph_id         INTEGER NOT NULL REFERENCES task_decompositions(id),
+                     source_revision  INTEGER NOT NULL,
+                     kind             TEXT NOT NULL CHECK(kind IN
+                                          ('proposal','provider','blocker','recovery')),
+                     ordinal          INTEGER NOT NULL,
+                     retry_generation INTEGER NOT NULL DEFAULT 0
+                                          CHECK(retry_generation BETWEEN 0 AND 2),
+                     reason_code      TEXT NOT NULL,
+                     summary          TEXT NOT NULL,
+                     created_at       INTEGER NOT NULL,
+                     UNIQUE (graph_id, source_revision, kind, ordinal)
+                 );
+                 INSERT INTO decomposition_attempts(
+                     id,graph_id,source_revision,kind,ordinal,retry_generation,
+                     reason_code,summary,created_at)
+                 VALUES (7,10,1,'provider',1,0,'provider','preserved',1);
+                 DROP TABLE token_usage_run_tasks;
+                 DROP TABLE token_usage_runs;
+                 CREATE TABLE token_usage_runs (
+                     id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     agent_run_id             INTEGER UNIQUE,
+                     purpose                  TEXT NOT NULL CHECK(purpose IN
+                                                  ('worker','reviewer','classifier','collector')),
+                     pr_number                INTEGER,
+                     provider                 TEXT NOT NULL,
+                     model                    TEXT NOT NULL,
+                     effort                   TEXT NOT NULL,
+                     uncached_input_tokens    INTEGER NOT NULL DEFAULT 0,
+                     cached_input_tokens      INTEGER NOT NULL DEFAULT 0,
+                     cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+                     output_tokens            INTEGER NOT NULL DEFAULT 0,
+                     reasoning_tokens         INTEGER NOT NULL DEFAULT 0,
+                     recorded_at              INTEGER NOT NULL
+                 );
+                 INSERT INTO token_usage_runs(
+                     id,agent_run_id,purpose,pr_number,provider,model,effort,recorded_at)
+                 VALUES (5,NULL,'worker',NULL,'claude','claude-opus-4-8','high',1);
+                 PRAGMA user_version=57;",
+            )
+            .unwrap();
+            // The narrow constraints really reject the widened values.
+            assert!(conn
+                .execute(
+                    "INSERT INTO decomposition_attempts(
+                         graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+                     VALUES (10,1,'verdict',2,'r','pre-widening',1)",
+                    [],
+                )
+                .is_err());
+            assert!(conn
+                .execute(
+                    "INSERT INTO token_usage_runs(
+                         purpose,provider,model,effort,recorded_at)
+                     VALUES ('planner','codex','gpt-5.6-sol','high',1)",
+                    [],
+                )
+                .is_err());
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // Historical rows survived the rebuilds unchanged, and the child FK reference
+        // (decomposition_attempts.graph_id → task_decompositions.id) still resolves.
+        assert_eq!(
+            conn.query_row(
+                "SELECT id,graph_id,kind,summary FROM decomposition_attempts",
+                [],
+                |row| Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                )),
+            )
+            .unwrap(),
+            (7, 10, "provider".into(), "preserved".into())
+        );
+        assert_eq!(
+            conn.query_row("SELECT id,purpose FROM token_usage_runs", [], |row| Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?
+            )),)
+                .unwrap(),
+            (5, "worker".into())
+        );
+        // Integrity intact: no dangling FK references after the rebuild.
+        assert!(!conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        // The widened CHECKs now admit the new values.
+        conn.execute(
+            "INSERT INTO decomposition_attempts(
+                 graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+             VALUES (10,1,'verdict',1,'r','post-widening',2)",
+            [],
+        )
+        .unwrap();
+        for purpose in ["planner", "arbiter"] {
+            conn.execute(
+                "INSERT INTO token_usage_runs(
+                     purpose,provider,model,effort,recorded_at)
+                 VALUES (?1,'codex','gpt-5.6-sol','high',2)",
+                [purpose],
+            )
+            .unwrap();
+        }
+
+        // Idempotent across reopen: no double rebuild, no row loss.
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM decomposition_attempts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM token_usage_runs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn migrates_v58_to_v59_adds_planner_submissions_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v58-planner-submissions.db");
+        {
+            // Open fresh at the latest shape (SCHEMA_SQL already creates
+            // `planner_submissions` unconditionally), then drop it and stamp
+            // user_version=58 to simulate a pre-v59 DB missing the table.
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE planner_submissions;
+                 PRAGMA user_version=58;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='planner_submissions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+
+        // Idempotency that actually re-enters `migrate_txn` (not the
+        // `current == SCHEMA_VERSION` early return above): re-stamp
+        // user_version=58 WITHOUT dropping the table this time, so migrate
+        // reruns SCHEMA_SQL and the v59 step over a DB that already has
+        // `planner_submissions`. Seed a row first so a non-idempotent v59
+        // step (e.g. a bare `CREATE TABLE` instead of `IF NOT EXISTS`) fails
+        // loud, and the row's survival proves the rerun doesn't
+        // destructively rebuild the table.
+        conn.execute(
+            "INSERT INTO planner_submissions(run_id, graph_id) VALUES ('idempotent-check', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA user_version=58;").unwrap();
+        drop(conn);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name='planner_submissions'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT graph_id FROM planner_submissions WHERE run_id='idempotent-check'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn migrates_v60_widens_run_capabilities_role_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v60-widen-run-capabilities.db");
+        {
+            // Open fresh at the latest shape, then rebuild run_capabilities in the narrow
+            // (pre-v60) form so we can verify the rebuild widens the CHECK and preserves
+            // existing rows. Mirrors `migrates_v57_widens_decomposition_attempts_and_token_usage_runs_checks`
+            // and, for the FK straddle, `migrates_v56_widens_role_assignment_check_to_admit_arbiter`.
+            let conn = open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'src','working','owner',1,1);
+                 DROP TABLE run_capabilities;
+                 CREATE TABLE run_capabilities (
+                     run_id      TEXT PRIMARY KEY,
+                     task_id     INTEGER NOT NULL,
+                     agent       TEXT NOT NULL,
+                     role        TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+                     created_at  INTEGER NOT NULL,
+                     revoked_at  INTEGER
+                 );
+                 INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                 VALUES ('worker-run',1,'Worker','worker',1);
+                 -- Child table referencing run_capabilities(run_id): mirrors the real FK
+                 -- children pattern (ra_child, decomposition_attempts, …) that makes the
+                 -- DROP fail under enforcement unless the outer migrate() straddle
+                 -- disables foreign_keys around the rebuild.
+                 CREATE TABLE rc_child (
+                     id     INTEGER PRIMARY KEY,
+                     run_id TEXT REFERENCES run_capabilities(run_id)
+                 );
+                 INSERT INTO rc_child(id,run_id) VALUES (1,'worker-run');
+                 PRAGMA user_version=58;",
+            )
+            .unwrap();
+            // The narrow constraint really rejects 'planner'.
+            assert!(conn
+                .execute(
+                    "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                     VALUES ('planner-run',1,'Planner','planner',1)",
+                    [],
+                )
+                .is_err());
+        }
+
+        let conn = open(&path).unwrap();
+        // open() leaves foreign-key enforcement in its default (ON) state.
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // Historical row survived the rebuild unchanged.
+        assert_eq!(
+            conn.query_row(
+                "SELECT run_id,task_id,agent,role FROM run_capabilities",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                )),
+            )
+            .unwrap(),
+            ("worker-run".into(), 1, "Worker".into(), "worker".into())
+        );
+        // The child row still points at the preserved parent (no dangling reference
+        // across the DROP+RENAME).
+        assert_eq!(
+            conn.query_row("SELECT run_id FROM rc_child WHERE id=1", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "worker-run"
+        );
+        // Integrity is intact: no dangling foreign-key references remain.
+        assert!(!conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        // The recreated index survived the rebuild (DROP TABLE destroys it; the
+        // migration's CREATE INDEX IF NOT EXISTS must recreate it).
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='index' AND name='run_capabilities_agent'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        // The widened CHECK now admits 'planner'.
+        conn.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+             VALUES ('planner-run',1,'Planner','planner',2)",
+            [],
+        )
+        .unwrap();
+
+        // Idempotent across reopen: no double rebuild, no row loss.
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM run_capabilities", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn migration_integrity_check_rolls_back_and_stays_unadvanced_on_dangling_ref() {
+        // A v56 DB carrying a PRE-EXISTING dangling child reference must not silently
+        // migrate. The in-transaction foreign_key_check must fail the migration so it rolls
+        // back, `user_version` stays 56, and every subsequent open fails identically instead
+        // of taking the `current == SCHEMA_VERSION` early return over a corrupt schema.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dangling-ref-v56.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            // Narrow (pre-v57) role_assignments plus a child table whose row points at a
+            // role_assignments id that does not exist — a dangling reference seeded with
+            // enforcement briefly off (as it would be on a corrupted real DB).
+            conn.execute_batch(
+                "CREATE TABLE role_assignments (
+                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                     responsibility_key  TEXT NOT NULL UNIQUE,
+                     task_id             INTEGER,
+                     pr_number           INTEGER,
+                     role                TEXT NOT NULL CHECK(role IN
+                                             ('classifier','planner','worker','reviewer','collector')),
+                     review_stage        TEXT CHECK(review_stage IN ('r1','r2')),
+                     complexity          TEXT,
+                     profile_id          TEXT NOT NULL,
+                     provider            TEXT NOT NULL,
+                     runner              TEXT NOT NULL,
+                     model               TEXT NOT NULL,
+                     effort              TEXT NOT NULL,
+                     pool_key            TEXT NOT NULL,
+                     policy_generation   TEXT NOT NULL,
+                     created_at          INTEGER NOT NULL,
+                     CHECK((role = 'reviewer' AND review_stage IS NOT NULL) OR
+                           (role != 'reviewer' AND review_stage IS NULL))
+                 );
+                 CREATE TABLE ra_child (
+                     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                     role_assignment_id INTEGER REFERENCES role_assignments(id)
+                 );
+                 PRAGMA foreign_keys=OFF;
+                 INSERT INTO ra_child(id, role_assignment_id) VALUES (1, 999);
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA user_version=56;",
+            )
+            .unwrap();
+        }
+
+        // Helper: read the on-disk version without going through migrate().
+        let version = |p: &std::path::Path| -> i64 {
+            let raw = Connection::open(p).unwrap();
+            raw.query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap()
+        };
+
+        // First open fails loud; the migration rolled back, so the version stays 56.
+        let err1 = open(&path).unwrap_err();
+        assert!(
+            format!("{err1}").contains("dangling foreign-key references"),
+            "unexpected error: {err1}"
+        );
+        assert_eq!(version(&path), 56, "user_version must not advance past 56");
+
+        // A SECOND identical open must ALSO fail — never silently succeed by taking the
+        // `current == SCHEMA_VERSION` early return over the still-corrupt schema.
+        let err2 = open(&path).unwrap_err();
+        assert!(
+            format!("{err2}").contains("dangling foreign-key references"),
+            "second open unexpectedly did not fail the same way: {err2}"
+        );
+        assert_eq!(
+            version(&path),
+            56,
+            "user_version must still be 56 after retry"
         );
     }
 

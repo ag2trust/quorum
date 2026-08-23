@@ -6,10 +6,11 @@
 
 use super::agent::{self, AgentProc, AgentSpec};
 use super::codex_agent::{CodexProc, CodexSpec};
-use super::runner::{AgentEvent, AgentKind, RunnerProc};
+use super::runner::{AgentEvent, AgentKind, CapturedOutput, RunnerFailure, RunnerProc};
+use super::session_log::SessionLog;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,16 +19,14 @@ pub const CODEX_PLANNER_MODEL: &str = "gpt-5.6-sol";
 pub const CLAUDE_PLANNER_MODEL: &str = "claude-opus-4-6";
 pub const PLANNER_EFFORT: &str = "high";
 pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
-pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
-pub const MAX_STDOUT_BYTES: usize = 128 * 1024;
+pub const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
+const MAX_FAILURE_SUMMARY_BYTES: usize = 2048;
+const MAX_FAILURE_REASON_BYTES: usize = 256;
+const DIAGNOSTIC_SAMPLE_LINES: usize = 2;
 const WRITABLE_PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
 pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigned worktree and repository are writable. This defense-in-depth guidance does not itself enforce that boundary.";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
-// Keep all required literal payload within one text field's budget so a plan
-// carrying every required value still has ample space under the 64 KiB response
-// and durable-proposal limits for its mandatory task structure.
-const MAX_REQUIRED_LITERAL_BYTES: usize = MAX_TEXT_BYTES;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
@@ -128,8 +127,6 @@ pub struct ProposedTask {
     #[serde(default)]
     pub non_goals: Vec<String>,
     #[serde(default)]
-    pub preserved_literals: Vec<String>,
-    #[serde(default)]
     pub prerequisites: Vec<String>,
 }
 
@@ -141,6 +138,19 @@ pub struct PlanningSource<'a> {
     pub body: Option<&'a str>,
     pub dependencies: &'a [i64],
 }
+
+/// The two closed response shapes a planner may produce.
+///
+/// The planner prompt and the `submit_plan` MCP tool description must state the
+/// same shapes; both render this one text so the two surfaces cannot drift.
+pub const RESPONSE_SHAPES: &str = concat!(
+    "The object must be exactly one of these closed shapes: do not omit, rename, or add fields.\n",
+    r#"PLAN={"outcome":"plan","tasks":[{"key":"<lowercase-ascii-key>","title":"<title>","implementation_delta":"<new-code-or-documentation-change>","affected_paths":["<repo-relative-path-or-narrow-pattern>"],"observable_outcome":"<observable-outcome>","deliverables":[{"kind":"write","path":"<repo-relative-path>"},{"kind":"read_only_reference","path":"<contextual-path>"}],"acceptance_criteria":["<criterion>"],"source_constraints":["<constraint>"],"verification_expectations":["<verification>"],"non_goals":["<preserved-or-explicitly-excluded-behavior>"],"prerequisites":["<task-key-or-source:positive-id>"]}]}"#,
+    "\n",
+    r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#,
+    "\n",
+    "`outcome` must be exactly `plan` or `blocker`; use PLAN only when it has 2-8 tasks.",
+);
 
 /// Build one bounded, closed-book planner turn. Retry context is deliberately
 /// limited to structured rejection summaries; provider transcripts and prior
@@ -170,27 +180,25 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          use targeted Grep or Glob, read focused excerpts, follow observed calls at most one hop, \
          and stop once each child has a concrete delta and path set. Use at most 5 Grep/Glob calls \
          and 10 Read calls. Do not browse unrelated directories or read whole large files. \
-         Preserve every source constraint. Copy exact required text, literals, commands, schemas, \
-         labels, tags, messages, identifiers, and other verbatim source material byte-for-byte \
-         without normalization or paraphrase. Put each value in the required literal set in \
-         preserved_literals on at least one child. That set is the lexicographically sorted, \
-         distinct source-marked values of at most 8 KiB whose prefix fits an 8 KiB aggregate; \
-         do not put larger values or values beyond that set there because they exceed the bounded \
-         response and proposal capacity. Every source requirement must be represented by a child delta, criterion, \
+         Preserve every source constraint; carry each source requirement, constraint, and \
+         verbatim value forward faithfully in the child that owns it. A separate plan-review \
+         Arbiter judges that faithfulness, so preserve meaning and load-bearing detail rather \
+         than echoing byte-exact literals. Every source requirement must be represented by a child delta, criterion, \
          constraint, verification expectation, or non-goal. Do not create synthetic integration \
          work, recursive planning, no-op/regression-only tasks, or unrelated scope. Dependencies \
          must be real delivery prerequisites and may \
          reference another task key or source:<dependency-id>. Every PLAN task's \
          `source_constraints` must include this worker-facing guidance: \
          \"{WORKER_WRITABILITY_GUIDANCE}\". The daemon adds it deterministically, so it is \
-         guidance rather than an enforcement claim. Return exactly one valid JSON object. For \
+         guidance rather than an enforcement claim. For \
          each task, declare every file-level deliverable in `deliverables`: use \
-         `write` only for requested changes and `read_only_reference` only for context. Use no \
-         markdown or commentary. The object must be exactly one of these closed \
-         shapes: do not omit, rename, or add fields.\n\
-         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"implementation_delta\":\"<new-code-or-documentation-change>\",\"affected_paths\":[\"<repo-relative-path-or-narrow-pattern>\"],\"observable_outcome\":\"<observable-outcome>\",\"deliverables\":[{{\"kind\":\"write\",\"path\":\"<repo-relative-path>\"}},{{\"kind\":\"read_only_reference\",\"path\":\"<contextual-path>\"}}],\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"non_goals\":[\"<preserved-or-explicitly-excluded-behavior>\"],\"preserved_literals\":[\"<exact-source-literal>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
-         BLOCKER={{\"outcome\":\"blocker\",\"category\":\"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>\",\"evidence\":[\"<evidence>\"],\"required_decision\":\"<decision>\",\"why_no_safe_split\":\"<reason>\"}}\n\
-         `outcome` must be exactly `plan` or `blocker`; use PLAN only when it has 2-8 tasks. \
+         `write` only for requested changes and `read_only_reference` only for context. \
+         Report by calling the `submit_plan` tool exactly once with the PLAN or BLOCKER \
+         object as its `response` argument. The tool answers with the daemon's own \
+         validation errors: fix the reported defect and call `submit_plan` again in the same \
+         turn. `already_submitted` means your first plan was accepted and stands, so stop. \
+         Never print the plan as text: written output is not read, and a turn that ends \
+         without an accepted `submit_plan` call is a failed attempt. {RESPONSE_SHAPES} \
          PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
          to {MAX_REJECTION_SUMMARY_BYTES} bytes. On retry, use only those summaries to correct \
          the cited semantic defect; do not discuss them or request more context.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
@@ -225,17 +233,14 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 }
 
 /// Recheck proposal dependencies against the authoritative source snapshot.
-/// Shape/cycle/text validation has already run in `parse_response`.
+/// Shape/cycle/text validation runs first, in `validate_semantics`.
 pub async fn validate_for_source(
     tasks: &[ProposedTask],
     source_dependency_ids: &[i64],
-    source_title: &str,
-    source_body: Option<&str>,
     repo_root: &Path,
     path_resolver: &WritablePathResolver,
 ) -> Result<(), PlannerParseError> {
     validate_plan_tasks(tasks)?;
-    validate_source_literals(tasks, source_title, source_body)?;
     validate_for_source_with_resolver(
         tasks,
         source_dependency_ids,
@@ -314,35 +319,6 @@ where
     }
 }
 
-fn validate_source_literals(
-    tasks: &[ProposedTask],
-    source_title: &str,
-    source_body: Option<&str>,
-) -> Result<(), PlannerParseError> {
-    let source_text = format!("{source_title}\n{}", source_body.unwrap_or_default());
-    let preserved: HashSet<&str> = tasks
-        .iter()
-        .flat_map(|task| task.preserved_literals.iter().map(String::as_str))
-        .collect();
-    for literal in &preserved {
-        if !source_text.contains(literal) {
-            return semantic("preserved literal must match source bytes exactly");
-        }
-    }
-    for (index, literal) in required_source_literals(&source_text)
-        .into_iter()
-        .enumerate()
-    {
-        if !preserved.contains(literal.as_str()) {
-            return semantic(&format!(
-                "missing byte-exact source literal at source marker {}",
-                index + 1
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn escaping_write<T>(task: &ProposedTask, path: &str) -> Result<T, PlannerParseError> {
     const MAX_PATH_BYTES: usize = 512;
     const ELLIPSIS: &str = "…";
@@ -364,104 +340,6 @@ fn escaping_write<T>(task: &ProposedTask, path: &str) -> Result<T, PlannerParseE
     semantic(&message)
 }
 
-/// Extract source-marked literals that can be checked without asking a model
-/// to decide which spelling is authoritative. Markdown inline/fenced code is
-/// explicit literal syntax. Quoted values immediately associated with the
-/// words literal, label, tag, or message receive the same protection.
-fn required_source_literals(source: &str) -> Vec<String> {
-    let mut literals = Vec::new();
-    let bytes = source.as_bytes();
-    let mut cursor = 0;
-    while let Some(relative) = bytes[cursor..].iter().position(|byte| *byte == b'`') {
-        let delimiter_start = cursor + relative;
-        let delimiter_len = bytes[delimiter_start..]
-            .iter()
-            .take_while(|byte| **byte == b'`')
-            .count();
-        let content_start = delimiter_start + delimiter_len;
-        let mut search_from = content_start;
-        let mut content_end = None;
-        while let Some(relative) = bytes[search_from..].iter().position(|byte| *byte == b'`') {
-            let run_start = search_from + relative;
-            let run_len = bytes[run_start..]
-                .iter()
-                .take_while(|byte| **byte == b'`')
-                .count();
-            if run_len == delimiter_len {
-                content_end = Some(run_start);
-                break;
-            }
-            search_from = run_start + run_len;
-        }
-        let Some(content_end) = content_end else {
-            // Do not reinterpret shorter runs inside an unclosed region as a
-            // new span: that can turn a malformed load-bearing value into a
-            // misleading suffix literal.
-            break;
-        };
-        if content_end > content_start && content_end - content_start <= MAX_TEXT_BYTES {
-            literals.push(source[content_start..content_end].to_string());
-        }
-        cursor = content_end + delimiter_len;
-    }
-
-    let lower = source.to_ascii_lowercase();
-    for keyword in ["literal", "label", "tag", "message"] {
-        let mut search_from = 0;
-        while let Some(relative) = lower[search_from..].find(keyword) {
-            let after_keyword = search_from + relative + keyword.len();
-            let bytes = source.as_bytes();
-            let mut open = after_keyword;
-            if bytes.get(open) == Some(&b'"') {
-                open += 1;
-            }
-            while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
-                open += 1;
-            }
-            if matches!(bytes.get(open), Some(b':') | Some(b'=')) {
-                open += 1;
-                while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
-                    open += 1;
-                }
-            }
-            if bytes.get(open) != Some(&b'"') || open.saturating_sub(after_keyword) > 24 {
-                search_from = after_keyword;
-                continue;
-            }
-            let value_start = open + 1;
-            let Some(close_relative) = source[value_start..].find('"') else {
-                break;
-            };
-            let value_end = value_start + close_relative;
-            // A quoted label/tag/message never spans lines; a newline before the
-            // closing quote means the opening quote was unpaired. Skip it so a
-            // stray quote cannot manufacture an unsatisfiable required literal.
-            if source[value_start..value_end].contains('\n') {
-                search_from = value_start;
-                continue;
-            }
-            if value_end > value_start && value_end - value_start <= MAX_TEXT_BYTES {
-                literals.push(source[value_start..value_end].to_string());
-            }
-            search_from = value_end + 1;
-        }
-    }
-    literals.sort();
-    literals.dedup();
-
-    let mut required = Vec::new();
-    let mut required_bytes: usize = 0;
-    for literal in literals {
-        let next = required_bytes.saturating_add(literal.len());
-        if next > MAX_REQUIRED_LITERAL_BYTES {
-            break;
-        }
-        required_bytes = next;
-        required.push(literal);
-    }
-    required
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannerParseError {
     Provider(String),
@@ -477,22 +355,18 @@ impl std::fmt::Display for PlannerParseError {
     }
 }
 
-pub fn parse_response(text: &str) -> Result<PlannerResponse, PlannerParseError> {
-    if text.len() > MAX_RESPONSE_BYTES {
-        return Err(PlannerParseError::Provider(
-            "response exceeds 64 KiB".into(),
-        ));
-    }
-    let trimmed = text.trim();
-    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
-        return Err(PlannerParseError::Provider(
-            "response must be exactly one JSON object without wrappers".into(),
-        ));
-    }
-    let response: PlannerResponse = serde_json::from_str(trimmed)
-        .map_err(|e| PlannerParseError::Provider(format!("invalid closed JSON: {e}")))?;
-    validate_semantics(&response)?;
-    Ok(response)
+/// Rehydrate one durably accepted `submit_plan` submission.
+///
+/// The endpoint already applied `validate_semantics` and `validate_for_source`
+/// before storing the response, so this only decodes the stored bytes; it is
+/// the same closed-type deserialization `rehydrate_accepted_proposal` performs
+/// for a durable proposal. Provider text is never a source here.
+pub(super) fn rehydrate_submitted_response(
+    text: &str,
+) -> Result<PlannerResponse, PlannerParseError> {
+    serde_json::from_str(text).map_err(|error| {
+        PlannerParseError::Provider(format!("invalid accepted plan submission: {error}"))
+    })
 }
 
 /// Rehydrate the durable task-list form accepted by the planner coordinator.
@@ -518,7 +392,7 @@ pub(super) fn rehydrate_accepted_proposal(
     Ok(tasks)
 }
 
-fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseError> {
+pub(crate) fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseError> {
     match response {
         PlannerResponse::Blocker {
             category,
@@ -574,7 +448,6 @@ pub(super) fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerP
             1,
         )?;
         validate_list("non-goals", &task.non_goals, 1)?;
-        validate_list("preserved literals", &task.preserved_literals, 0)?;
         if task.prerequisites.len() > MAX_LIST_ITEMS {
             return semantic("too many prerequisites");
         }
@@ -696,10 +569,102 @@ fn reject_cycles(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> {
 
 pub struct PlannerSlot {
     pub proc: RunnerProc,
-    pub response_text: String,
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+    pub usage: super::runner::TokenUsage,
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
     codex_terminal_candidate: bool,
+    diagnostics: PlannerDiagnostics,
+    session_log: Option<SessionLog>,
+}
+
+#[derive(Default)]
+struct PlannerDiagnostics {
+    lines: u64,
+    event_types: BTreeMap<&'static str, u64>,
+    beginning: Vec<String>,
+    end: VecDeque<String>,
+    terminal_response_seen: bool,
+    read_boundary_truncated: bool,
+}
+
+impl PlannerDiagnostics {
+    fn observe_line(&mut self, provider: AgentKind, raw: &str) {
+        self.lines = self.lines.saturating_add(1);
+        let event_type = safe_event_type(provider, raw);
+        *self.event_types.entry(event_type).or_default() += 1;
+        self.terminal_response_seen |=
+            matches!(event_type, "result" | "turn.completed" | "turn.failed");
+
+        // Samples deliberately retain only a structural description. Provider
+        // payload strings (including tool output and assistant text) can contain
+        // inherited credentials, so they never enter a durable diagnostic.
+        let sample = format!("line={} event={event_type} bytes={}", self.lines, raw.len());
+        if self.beginning.len() < DIAGNOSTIC_SAMPLE_LINES {
+            self.beginning.push(sample.clone());
+        }
+        if self.end.len() == DIAGNOSTIC_SAMPLE_LINES {
+            self.end.pop_front();
+        }
+        self.end.push_back(sample);
+    }
+
+    fn note_read_boundary_truncation(&mut self) {
+        self.read_boundary_truncated = true;
+    }
+}
+
+fn safe_event_type(provider: AgentKind, raw: &str) -> &'static str {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return if raw.trim().is_empty() {
+            "blank"
+        } else {
+            "malformed-json"
+        };
+    };
+    let event_type = value.get("type").and_then(serde_json::Value::as_str);
+    match (provider, event_type) {
+        (AgentKind::Codex, Some("thread.started")) => "thread.started",
+        (AgentKind::Codex, Some("turn.started")) => "turn.started",
+        (AgentKind::Codex, Some("turn.completed")) => "turn.completed",
+        (AgentKind::Codex, Some("turn.failed")) => "turn.failed",
+        (AgentKind::Codex, Some("error")) => "error",
+        (AgentKind::Codex, Some("item.started" | "item.completed")) => {
+            match (
+                event_type,
+                value
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                (Some("item.started"), Some("agent_message")) => "item.started/agent_message",
+                (Some("item.started"), Some("command_execution")) => {
+                    "item.started/command_execution"
+                }
+                (Some("item.started"), Some("file_change")) => "item.started/file_change",
+                (Some("item.started"), Some("mcp_call")) => "item.started/mcp_call",
+                (Some("item.started"), Some("error")) => "item.started/error",
+                (Some("item.completed"), Some("agent_message")) => "item.completed/agent_message",
+                (Some("item.completed"), Some("command_execution")) => {
+                    "item.completed/command_execution"
+                }
+                (Some("item.completed"), Some("file_change")) => "item.completed/file_change",
+                (Some("item.completed"), Some("mcp_call")) => "item.completed/mcp_call",
+                (Some("item.completed"), Some("error")) => "item.completed/error",
+                (Some("item.started"), _) => "item.started/other",
+                _ => "item.completed/other",
+            }
+        }
+        (AgentKind::Claude, Some("assistant")) => "assistant",
+        (AgentKind::Claude, Some("tool_use")) => "tool_use",
+        (AgentKind::Claude, Some("result")) => "result",
+        (AgentKind::Claude, Some("system")) => "system",
+        (AgentKind::Grok, Some("end")) => "end",
+        (_, Some(_)) => "other-json-event",
+        (_, None) => "json-without-type",
+    }
 }
 
 impl PlannerSlot {
@@ -707,19 +672,144 @@ impl PlannerSlot {
         self.proc.pid()
     }
 
-    pub async fn kill_and_reap(self) {
-        let _ = self.proc.kill_and_reap().await;
+    pub fn start_session_log(
+        &mut self,
+        log_dir: &Path,
+        agent: &str,
+        task_id: i64,
+        session_id: &str,
+        branch: &str,
+        started_at: i64,
+    ) -> std::io::Result<()> {
+        self.session_log = Some(SessionLog::create(
+            log_dir,
+            agent,
+            "planner",
+            Some(task_id),
+            session_id,
+            branch,
+            started_at,
+        )?);
+        Ok(())
+    }
+
+    pub fn log_dir(&self) -> Option<&Path> {
+        self.session_log.as_ref().map(|log| log.dir())
+    }
+
+    pub async fn kill_and_reap(mut self) {
+        let output = self.proc.kill_and_reap().await;
+        super::persist_terminal_output(&mut self.session_log, output);
+        if let Some(session_log) = self.session_log.as_mut() {
+            session_log.finalize(None);
+        }
     }
 }
 
+/// How one planner provider process ended its turn.
+///
+/// This is deliberately not an outcome. The provider reports only whether it
+/// reached a clean terminal state; the plan itself comes from the durable
+/// `submit_plan` submission, which [`planner_outcome`] pairs with this report.
+pub enum PlannerTurnEnd {
+    /// The turn reached its terminal provider state with no provider-level
+    /// defect. It says nothing about whether a plan was submitted.
+    Complete,
+    /// Bounded operator diagnostic for a provider-level failure.
+    Failed(String),
+}
+
+/// The durable outcome of one planner attempt.
 pub enum PlannerPoll {
     Done(PlannerResponse),
     ProviderFailed(String),
+    /// Retained for the Arbiter proposal-rejection path (design §4). Semantic
+    /// defects in a submitted plan are now returned to the planner in-turn by
+    /// the endpoint, so the planner attempt itself never produces this.
     SemanticRejected(String),
+}
+
+/// Resolve one planner attempt from its durable `submit_plan` submission.
+///
+/// `submitted` is `planner_submissions::accepted_response` for this run. A
+/// submission is authoritative however the process then ended: it was accepted
+/// by the daemon's own endpoint after full validation, so a provider that
+/// crashed or timed out after submitting still delivered a plan. Provider
+/// stdout is operator diagnostics only and is never consulted for the plan.
+pub fn planner_outcome(
+    slot: &PlannerSlot,
+    end: PlannerTurnEnd,
+    submitted: Option<&str>,
+) -> PlannerPoll {
+    if let Some(response) = submitted {
+        return match rehydrate_submitted_response(response) {
+            Ok(response) => PlannerPoll::Done(response),
+            Err(error) => PlannerPoll::ProviderFailed(provider_failure_summary(
+                slot,
+                &error.to_string(),
+                "exact",
+            )),
+        };
+    }
+    PlannerPoll::ProviderFailed(match end {
+        PlannerTurnEnd::Failed(summary) => summary,
+        PlannerTurnEnd::Complete => {
+            provider_failure_summary(slot, "planner exited without submit_plan", "exact")
+        }
+    })
+}
+
+/// The managed run envelope of one planner turn. Present only once the daemon
+/// has issued the run's `planner` capability; the four names it produces are
+/// exactly `runner::AGENT_MCP_ENV_VARS`, which is what the stdio `submit_plan`
+/// MCP child reads to reach the daemon endpoint.
+#[derive(Debug, Clone)]
+pub struct PlannerRunEnvelope {
+    pub run_id: String,
+    pub agent: String,
+    /// Repository slug (`owner/repo`), matching `QUORUM_REPO` everywhere else.
+    pub repo: String,
+    /// Agent endpoint socket path.
+    pub endpoint: PathBuf,
+}
+
+impl PlannerRunEnvelope {
+    /// Fail loudly rather than spawn a planner whose tool cannot authenticate:
+    /// an empty name would reach `agent-mcp` as a usage error only after the
+    /// provider had already burned its turn.
+    fn environment(&self) -> std::io::Result<Vec<(String, String)>> {
+        let environment = vec![
+            ("QUORUM_REPO".to_string(), self.repo.clone()),
+            ("QUORUM_AGENT".to_string(), self.agent.clone()),
+            ("QUORUM_RUN_ID".to_string(), self.run_id.clone()),
+            (
+                "QUORUM_AGENT_ENDPOINT".to_string(),
+                self.endpoint.display().to_string(),
+            ),
+        ];
+        if let Some((name, _)) = environment.iter().find(|(_, value)| value.is_empty()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("planner run envelope is missing {name}"),
+            ));
+        }
+        Ok(environment)
+    }
 }
 
 /// Spawn only the provider selected by the durable role assignment. There is
 /// no fallback or model substitution.
+///
+/// `run` is `Some` once the caller has issued this run's `planner` capability:
+/// the envelope is placed in the planner process environment and the
+/// `submit_plan` MCP server is attached. `None` keeps the historical tool-less
+/// planner surface.
+///
+/// One attempt has exactly one identity: when an envelope is present its
+/// `run_id` — minted by `agent::new_session_id()` and already bound to both the
+/// run capability and `task_decompositions.planner_session_id` — is also the
+/// provider session id, so no second id is minted here.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_planner(
     provider: AgentKind,
     model: &str,
@@ -728,6 +818,7 @@ pub async fn spawn_planner(
     prompt: &str,
     bare: bool,
     provider_bin: Option<&str>,
+    run: Option<&PlannerRunEnvelope>,
 ) -> std::io::Result<PlannerSlot> {
     spawn_planner_with_timeout(
         provider,
@@ -737,6 +828,7 @@ pub async fn spawn_planner(
         prompt,
         bare,
         provider_bin,
+        run,
         PLANNER_TIMEOUT,
     )
     .await
@@ -751,6 +843,7 @@ async fn spawn_planner_with_timeout(
     prompt: &str,
     bare: bool,
     provider_bin: Option<&str>,
+    run: Option<&PlannerRunEnvelope>,
     turn_timeout: Duration,
 ) -> std::io::Result<PlannerSlot> {
     if prompt.len() > MAX_PROMPT_BYTES {
@@ -759,6 +852,11 @@ async fn spawn_planner_with_timeout(
             "planner prompt exceeds 128 KiB",
         ));
     }
+    let env_vars = match run {
+        Some(envelope) => envelope.environment()?,
+        None => Vec::new(),
+    };
+    let agent_mcp = run.map(|_| crate::serve::runner::AGENT_MCP_SERVER);
     let started_at = tokio::time::Instant::now();
     let deadline = started_at + turn_timeout;
     let proc =
@@ -770,9 +868,9 @@ async fn spawn_planner_with_timeout(
                     sandbox: "read-only".into(),
                     worktree: repo.to_path_buf(),
                     prompt: prompt.into(),
-                    env_vars: vec![],
+                    env_vars,
                 };
-                RunnerProc::Codex(CodexProc::spawn_planner(&spec, provider_bin)?)
+                RunnerProc::Codex(CodexProc::spawn_planner(&spec, provider_bin, agent_mcp)?)
             }
             AgentKind::Grok => return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -783,13 +881,15 @@ async fn spawn_planner_with_timeout(
                     kind: AgentKind::Claude,
                     model: model.into(),
                     effort: effort.into(),
-                    session_id: agent::new_session_id(),
+                    session_id: run
+                        .map(|envelope| envelope.run_id.clone())
+                        .unwrap_or_else(agent::new_session_id),
                     worktree: repo.to_path_buf(),
                     bare,
                     allowed_tools: "Read,Glob,Grep".into(),
-                    env_vars: vec![],
+                    env_vars,
                 };
-                let mut proc = AgentProc::spawn_planner(&spec, provider_bin)?;
+                let mut proc = AgentProc::spawn_planner(&spec, provider_bin, agent_mcp)?;
                 if let Err(error) = proc
                     .feed_turn_until(&agent::user_turn(prompt), deadline)
                     .await
@@ -802,18 +902,99 @@ async fn spawn_planner_with_timeout(
         };
     Ok(PlannerSlot {
         proc,
-        response_text: String::new(),
+        provider: provider.to_string(),
+        model: model.into(),
+        effort: effort.into(),
+        usage: super::runner::TokenUsage::default(),
         started_at,
         stdout_bytes: 0,
         codex_terminal_candidate: false,
+        diagnostics: PlannerDiagnostics::default(),
+        session_log: None,
     })
 }
 
-/// Drain a bounded amount of output. Timeout and output violations are
-/// provider failures; the caller must kill and reap the returned terminal slot.
-pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
+fn provider_failure(slot: &PlannerSlot, reason: &str, byte_count_kind: &str) -> PlannerTurnEnd {
+    PlannerTurnEnd::Failed(provider_failure_summary(slot, reason, byte_count_kind))
+}
+
+/// Build the bounded, payload-free operator diagnostic for one failure. The
+/// samples describe stream structure only; provider payload strings never
+/// enter it.
+fn provider_failure_summary(slot: &PlannerSlot, reason: &str, byte_count_kind: &str) -> String {
+    let bounded_reason = truncate_utf8(reason, MAX_FAILURE_REASON_BYTES);
+    let reason_truncated = bounded_reason.len() != reason.len();
+    let beginning = &slot.diagnostics.beginning;
+    let end = slot.diagnostics.end.iter().collect::<Vec<_>>();
+    let samples_truncated = slot.diagnostics.read_boundary_truncated
+        || slot.diagnostics.lines as usize > DIAGNOSTIC_SAMPLE_LINES.saturating_mul(2);
+    let diagnostic = serde_json::json!({
+        "failure": bounded_reason,
+        "failure_reason_truncated": reason_truncated,
+        "planner_diagnostic": {
+            "provider": match slot.proc.kind() {
+                AgentKind::Claude => "claude",
+                AgentKind::Codex => "codex",
+                AgentKind::Grok => "grok",
+            },
+            "stdout_bytes_observed": slot.stdout_bytes,
+            "stdout_byte_count_kind": byte_count_kind,
+            "stdout_lines": slot.diagnostics.lines,
+            "event_types": slot.diagnostics.event_types,
+            "terminal_response_seen": slot.diagnostics.terminal_response_seen,
+            "samples": {
+                "beginning": beginning,
+                "end": end,
+                "payloads_redacted": true,
+                "truncated": samples_truncated,
+                "read_boundary_truncated": slot.diagnostics.read_boundary_truncated,
+            }
+        }
+    });
+    let mut summary = serde_json::to_string(&diagnostic).expect("planner diagnostic serializes");
+    if summary.len() > MAX_FAILURE_SUMMARY_BYTES {
+        const SUFFIX: &str = "... [planner diagnostic truncated]";
+        let prefix = truncate_utf8(
+            &summary,
+            MAX_FAILURE_SUMMARY_BYTES.saturating_sub(SUFFIX.len()),
+        );
+        summary = format!("{prefix}{SUFFIX}");
+    }
+    summary
+}
+
+fn planner_exit_failure(slot: &PlannerSlot, failure: RunnerFailure) -> PlannerTurnEnd {
+    provider_failure(
+        slot,
+        &format!(
+            "planner provider exited without a terminal response ({}): {}",
+            failure.disposition(),
+            failure.detail()
+        ),
+        "exact",
+    )
+}
+
+fn stderr_capture_was_truncated(output: &[CapturedOutput]) -> bool {
+    output.iter().any(|line| {
+        matches!(
+            line,
+            CapturedOutput::StderrTruncated { .. } | CapturedOutput::StderrBytesTruncated { .. }
+        )
+    })
+}
+
+/// Drain a bounded amount of output and report how the turn ended. Timeout and
+/// output violations are provider failures; the caller must kill and reap the
+/// returned terminal slot.
+///
+/// Assistant text is observed only as a structural diagnostic sample. This
+/// function cannot produce a plan: the plan comes from the run's durable
+/// `submit_plan` submission, which the caller pairs with this report through
+/// [`planner_outcome`].
+pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerTurnEnd> {
     if slot.started_at.elapsed() >= PLANNER_TIMEOUT {
-        return Some(PlannerPoll::ProviderFailed("planner timed out".into()));
+        return Some(provider_failure(slot, "planner timed out", "lower-bound"));
     }
     let remaining = PLANNER_TIMEOUT.saturating_sub(slot.started_at.elapsed());
     let poll_for = remaining.min(Duration::from_secs(2));
@@ -834,121 +1015,189 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                 stdout_complete = true;
                 break;
             }
-            Ok(Err(_)) => {
-                return Some(PlannerPoll::ProviderFailed(format!(
-                    "planner stdout exceeded {} KiB",
-                    MAX_STDOUT_BYTES / 1024
-                )));
+            Ok(Err(error)) => {
+                slot.diagnostics.note_read_boundary_truncation();
+                let exceeded = error.to_string().contains("exceeded");
+                if exceeded {
+                    slot.stdout_bytes = MAX_STDOUT_BYTES.saturating_add(1);
+                }
+                let reason = if exceeded {
+                    format!("planner stdout exceeded {} KiB", MAX_STDOUT_BYTES / 1024)
+                } else {
+                    format!("planner stdout read failed: {error}")
+                };
+                return Some(provider_failure(
+                    slot,
+                    &reason,
+                    if exceeded {
+                        "lower-bound"
+                    } else {
+                        "completed-lines-only"
+                    },
+                ));
             }
         };
-        slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
-        if slot.stdout_bytes > MAX_STDOUT_BYTES {
-            return Some(PlannerPoll::ProviderFailed(format!(
-                "planner stdout exceeded {} KiB",
-                MAX_STDOUT_BYTES / 1024
-            )));
-        }
-        if slot.codex_terminal_candidate {
-            return Some(PlannerPoll::ProviderFailed(
-                "planner provider emitted output after terminal response".into(),
-            ));
-        }
-        if slot.proc.kind() == AgentKind::Codex {
-            if let Some(failure) = slot.proc.observed_pre_authoritative_failure() {
-                return Some(PlannerPoll::ProviderFailed(format!(
-                    "planner provider protocol failed: {}",
-                    failure.detail()
-                )));
-            }
-        }
-        if slot.proc.kind() == AgentKind::Claude {
-            if let Some(super::stream::Event::Result {
-                result, is_error, ..
-            }) = super::stream::parse_line(&raw)
-            {
-                if is_error.unwrap_or(false) {
-                    return Some(PlannerPoll::ProviderFailed(
-                        "planner provider returned an error".into(),
-                    ));
-                }
-                let text = super::stream::result_text(&result);
-                if !text.is_empty() {
-                    slot.response_text = text;
-                }
-                return Some(parsed_poll(&slot.response_text));
-            }
-        }
-        for event in match slot.proc.kind() {
+        let events = match slot.proc.kind() {
             AgentKind::Claude => super::runner::normalize_claude_line(&raw),
             AgentKind::Codex => super::runner::normalize_codex_line(&raw),
             AgentKind::Grok => super::runner::normalize_grok_line(&raw),
-        } {
+        };
+        if let Some(session_log) = slot.session_log.as_mut() {
+            session_log.log_raw_and_normalized(&raw, &events);
+        }
+        slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
+        slot.diagnostics.observe_line(slot.proc.kind(), &raw);
+        for event in super::runner::normalize_line(slot.proc.kind(), &raw) {
+            match event {
+                AgentEvent::TurnCompleted {
+                    usage: Some(usage), ..
+                }
+                | AgentEvent::TurnFailed {
+                    usage: Some(usage), ..
+                } => slot.usage.saturating_add_assign(usage),
+                _ => {}
+            }
+        }
+        if slot.stdout_bytes > MAX_STDOUT_BYTES {
+            return Some(provider_failure(
+                slot,
+                &format!("planner stdout exceeded {} KiB", MAX_STDOUT_BYTES / 1024),
+                "exact-through-last-line",
+            ));
+        }
+        if slot.codex_terminal_candidate {
+            return Some(provider_failure(
+                slot,
+                "planner provider emitted output after terminal response",
+                "exact-through-last-line",
+            ));
+        }
+        if slot.proc.kind() == AgentKind::Codex {
+            if let Some(failure) = slot.proc.observed_planner_live_failure() {
+                return Some(provider_failure(
+                    slot,
+                    &format!(
+                        "planner provider protocol failed ({})",
+                        failure.disposition()
+                    ),
+                    "exact-through-last-line",
+                ));
+            }
+        }
+        if slot.proc.kind() == AgentKind::Claude {
+            // The result event ends the turn. Its `result` text is deliberately
+            // not bound: the plan is whatever this run submitted through
+            // `submit_plan`, and the transcript is diagnostics only.
+            if let Some(super::stream::Event::Result { is_error, .. }) =
+                super::stream::parse_line(&raw)
+            {
+                if is_error.unwrap_or(false) {
+                    return Some(provider_failure(
+                        slot,
+                        "planner provider returned an error",
+                        "exact-through-last-line",
+                    ));
+                }
+                return Some(PlannerTurnEnd::Complete);
+            }
+        }
+        for event in events {
             match event {
                 AgentEvent::TurnFailed { .. } => {
-                    return Some(PlannerPoll::ProviderFailed(
-                        "planner provider turn failed".into(),
+                    return Some(provider_failure(
+                        slot,
+                        "planner provider turn failed",
+                        "exact-through-last-line",
                     ));
                 }
                 AgentEvent::TurnCompleted { .. } => {
+                    // Codex's terminal event is provisional: its clean exit and
+                    // final stderr/protocol evidence are checked below before the
+                    // turn counts as complete.
                     if slot.proc.kind() == AgentKind::Codex {
                         slot.codex_terminal_candidate = true;
                     } else {
-                        return Some(parsed_poll(&slot.response_text));
+                        return Some(PlannerTurnEnd::Complete);
                     }
-                }
-                AgentEvent::AssistantText { text } => {
-                    if slot.response_text.len().saturating_add(text.len()) > MAX_RESPONSE_BYTES {
-                        return Some(PlannerPoll::ProviderFailed(
-                            "planner response exceeded 64 KiB".into(),
-                        ));
-                    }
-                    slot.response_text.push_str(&text);
                 }
                 _ => {}
             }
         }
         if slot.started_at.elapsed() >= PLANNER_TIMEOUT {
-            return Some(PlannerPoll::ProviderFailed("planner timed out".into()));
+            return Some(provider_failure(slot, "planner timed out", "lower-bound"));
         }
     }
     let status = match slot.proc.try_wait() {
         Ok(status) => status,
         Err(error) => {
-            return Some(PlannerPoll::ProviderFailed(format!(
-                "planner process status unavailable: {error}"
-            )));
+            return Some(provider_failure(
+                slot,
+                &format!("planner process status unavailable: {error}"),
+                "completed-lines-only",
+            ));
         }
     };
     if slot.proc.kind() == AgentKind::Codex && slot.codex_terminal_candidate && stdout_complete {
         let status = status?;
-        let _ = slot.proc.finalize_pre_authoritative_evidence().await;
+        let evidence = slot.proc.finalize_pre_authoritative_evidence().await;
         if !status.success() {
-            return Some(PlannerPoll::ProviderFailed(format!(
-                "planner provider exited unsuccessfully after terminal response: {status}"
-            )));
+            if let Some(failure) = slot.proc.observed_strict_pre_authoritative_failure() {
+                return Some(provider_failure(
+                    slot,
+                    &format!(
+                        "planner provider exited unsuccessfully after terminal response ({}) at {status}: {}",
+                        failure.disposition(),
+                        failure.detail()
+                    ),
+                    "exact",
+                ));
+            }
+            return Some(provider_failure(
+                slot,
+                &format!(
+                    "planner provider exited unsuccessfully after terminal response: {status}"
+                ),
+                "exact",
+            ));
         }
-        if let Some(failure) = slot.proc.observed_strict_pre_authoritative_failure() {
-            return Some(PlannerPoll::ProviderFailed(format!(
-                "planner provider terminal evidence failed: {}",
-                failure.detail()
-            )));
+        if stderr_capture_was_truncated(&evidence) {
+            return Some(provider_failure(
+                slot,
+                "planner stderr exceeded bounded diagnostic capture",
+                "exact",
+            ));
         }
-        return Some(parsed_poll(&slot.response_text));
+        if let Some(failure) = slot.proc.observed_planner_terminal_failure() {
+            return Some(provider_failure(
+                slot,
+                &format!(
+                    "planner provider terminal evidence failed ({})",
+                    failure.disposition()
+                ),
+                "exact",
+            ));
+        }
+        return Some(PlannerTurnEnd::Complete);
     }
-    if status.is_some() {
-        return Some(PlannerPoll::ProviderFailed(
-            "planner exited without a terminal response".into(),
+    if let Some(status) = status {
+        let evidence = slot.proc.finalize_pre_authoritative_evidence().await;
+        if stderr_capture_was_truncated(&evidence) {
+            return Some(provider_failure(
+                slot,
+                "planner stderr exceeded bounded diagnostic capture",
+                "exact",
+            ));
+        }
+        if let Some(failure) = slot.proc.classify_pre_authoritative_exit(status) {
+            return Some(planner_exit_failure(slot, failure));
+        }
+        return Some(provider_failure(
+            slot,
+            "planner exited without a terminal response",
+            "exact",
         ));
     }
     None
-}
-
-fn parsed_poll(text: &str) -> PlannerPoll {
-    match parse_response(text) {
-        Ok(response) => PlannerPoll::Done(response),
-        Err(PlannerParseError::Provider(error)) => PlannerPoll::ProviderFailed(error),
-        Err(PlannerParseError::Semantic(error)) => PlannerPoll::SemanticRejected(error),
-    }
 }
 
 #[cfg(test)]
@@ -970,8 +1219,125 @@ mod tests {
         runner
     }
 
+    /// The exact validation a submitted plan receives: closed deserialization
+    /// followed by `validate_semantics`. The endpoint applies these two steps
+    /// to every `submit_plan` call, and they are the only validation a plan
+    /// now passes through — no text parser remains.
+    fn validate_submitted(text: &str) -> Result<PlannerResponse, PlannerParseError> {
+        let response = rehydrate_submitted_response(text)?;
+        validate_semantics(&response)?;
+        Ok(response)
+    }
+
+    /// The envelope produces exactly the names the stdio MCP child reads, in
+    /// the order `runner::AGENT_MCP_ENV_VARS` pins.
+    #[test]
+    fn planner_run_envelope_produces_the_agent_mcp_env_vars() {
+        let envelope = PlannerRunEnvelope {
+            run_id: "run-capability".into(),
+            agent: "Planner-test".into(),
+            repo: "owner/repo".into(),
+            endpoint: PathBuf::from("/tmp/quorum-agent.sock"),
+        };
+        let environment = envelope.environment().expect("complete envelope");
+        let names: Vec<&str> = environment.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, crate::serve::runner::AGENT_MCP_ENV_VARS);
+        assert_eq!(
+            environment
+                .iter()
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "owner/repo",
+                "Planner-test",
+                "run-capability",
+                "/tmp/quorum-agent.sock"
+            ]
+        );
+    }
+
+    /// An incomplete envelope must fail before the provider spawns: an empty
+    /// name would only surface as an `agent-mcp` usage error after the planner
+    /// had already burned its turn.
+    #[test]
+    fn planner_run_envelope_rejects_an_incomplete_name() {
+        for missing in ["run_id", "agent", "repo"] {
+            let mut envelope = PlannerRunEnvelope {
+                run_id: "run-capability".into(),
+                agent: "Planner-test".into(),
+                repo: "owner/repo".into(),
+                endpoint: PathBuf::from("/tmp/quorum-agent.sock"),
+            };
+            match missing {
+                "run_id" => envelope.run_id.clear(),
+                "agent" => envelope.agent.clear(),
+                _ => envelope.repo.clear(),
+            }
+            let error = envelope
+                .environment()
+                .expect_err("incomplete envelope must be refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    /// End-to-end spawn wiring: an envelope must reach the planner process
+    /// environment and bring the MCP override with it.
     #[cfg(unix)]
-    async fn poll_to_terminal(slot: &mut PlannerSlot) -> PlannerPoll {
+    #[tokio::test]
+    async fn spawn_planner_with_envelope_carries_run_env_and_mcp_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("observed");
+        let runner = executable_script(
+            dir.path(),
+            "codex",
+            &format!(
+                "printf 'run=%s\\nrepo=%s\\nendpoint=%s\\nargs=%s\\n' \
+                 \"$QUORUM_RUN_ID\" \"$QUORUM_REPO\" \"$QUORUM_AGENT_ENDPOINT\" \"$*\" > '{0}.tmp'\n\
+                 mv '{0}.tmp' '{0}'",
+                capture.display()
+            ),
+        );
+        let envelope = PlannerRunEnvelope {
+            run_id: "run-capability".into(),
+            agent: "Planner-test".into(),
+            repo: "owner/repo".into(),
+            endpoint: PathBuf::from("/tmp/quorum-agent.sock"),
+        };
+
+        let slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+            Some(&envelope),
+        )
+        .await
+        .unwrap();
+        for _ in 0..200 {
+            if capture.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let observed = std::fs::read_to_string(&capture)
+            .expect("planner process did not report its run envelope");
+        slot.kill_and_reap().await;
+
+        assert!(observed.contains("run=run-capability\n"), "{observed}");
+        assert!(observed.contains("repo=owner/repo\n"), "{observed}");
+        assert!(
+            observed.contains("endpoint=/tmp/quorum-agent.sock\n"),
+            "{observed}"
+        );
+        assert!(observed.contains("mcp_servers.github="), "{observed}");
+        assert!(observed.contains("-s read-only"), "{observed}");
+    }
+
+    #[cfg(unix)]
+    async fn poll_to_terminal(slot: &mut PlannerSlot) -> PlannerTurnEnd {
         tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
             loop {
                 if let Some(outcome) = poll_planner(slot).await {
@@ -1001,9 +1367,117 @@ mod tests {
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn spawn_fake_claude(dir: &Path, stdout: &str) -> PlannerSlot {
+        let stdout_path = dir.join("stdout.jsonl");
+        std::fs::write(&stdout_path, stdout).unwrap();
+        let runner = executable_script(
+            dir,
+            "claude",
+            &format!("exec /bin/cat '{}'", stdout_path.display()),
+        );
+        spawn_planner(
+            AgentKind::Claude,
+            CLAUDE_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir,
+            "bounded prompt",
+            false,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn claude_stream(events: &[serde_json::Value]) -> String {
+        let mut stream = events
+            .iter()
+            .map(|event| event.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        stream.push_str("\n{\"type\":\"result\",\"result\":\"\",\"is_error\":false}\n");
+        stream
+    }
+
+    #[cfg(unix)]
+    async fn spawn_fake_codex_with_stderr(dir: &Path, stdout: &str, stderr: &str) -> PlannerSlot {
+        let stdout_path = dir.join("stdout.jsonl");
+        let stderr_path = dir.join("stderr.txt");
+        std::fs::write(&stdout_path, stdout).unwrap();
+        std::fs::write(&stderr_path, stderr).unwrap();
+        let runner = executable_script(
+            dir,
+            "codex",
+            &format!(
+                "/bin/cat '{}' >&2\nexec /bin/cat '{}'",
+                stderr_path.display(),
+                stdout_path.display()
+            ),
+        );
+        spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir,
+            "bounded prompt",
+            false,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_poll_reap_persists_buffered_provider_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = r#"{"type":"turn.failed","error":{"message":"provider failed"}}"#;
+        let mut slot = spawn_fake_codex(dir.path(), &format!("{raw}\n")).await;
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-planner-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            while slot.proc.try_wait().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("planner provider did not exit");
+
+        slot.kill_and_reap().await;
+        assert_eq!(
+            std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap(),
+            format!("{raw}\n")
+        );
+    }
+
+    fn failure_json(outcome: &PlannerTurnEnd) -> serde_json::Value {
+        let PlannerTurnEnd::Failed(summary) = outcome else {
+            panic!("expected provider failure");
+        };
+        assert!(
+            summary.len() <= MAX_FAILURE_SUMMARY_BYTES,
+            "durable planner diagnostic was {} bytes",
+            summary.len()
+        );
+        serde_json::from_str(summary).expect("planner failure remains inspectable JSON")
     }
 
     fn task(key: &str, prerequisites: &[&str]) -> serde_json::Value {
@@ -1018,7 +1492,6 @@ mod tests {
             "source_constraints": ["preserve atomicity"],
             "verification_expectations": ["focused tests pass"],
             "non_goals": ["do not change adjacent behavior"],
-            "preserved_literals": [],
             "prerequisites": prerequisites,
         })
     }
@@ -1033,7 +1506,7 @@ mod tests {
     fn accepts_closed_plan_and_blocker() {
         let plan = serde_json::json!({"outcome":"plan","tasks":[task("core", &[]), task("daemon", &["core", "source:7"])]});
         assert!(matches!(
-            parse_response(&plan.to_string()),
+            validate_submitted(&plan.to_string()),
             Ok(PlannerResponse::Plan { .. })
         ));
         let blocker = serde_json::json!({
@@ -1041,7 +1514,7 @@ mod tests {
             "required_decision":"choose one outcome", "why_no_safe_split":"both children would mutate the same contract"
         });
         assert!(matches!(
-            parse_response(&blocker.to_string()),
+            validate_submitted(&blocker.to_string()),
             Ok(PlannerResponse::Blocker { .. })
         ));
     }
@@ -1066,12 +1539,11 @@ mod tests {
                     "source_constraints": ["preserve atomicity"],
                     "verification_expectations": ["focused tests pass"],
                     "non_goals": ["do not change decomposition storage"],
-                    "preserved_literals": [],
                     "prerequisites": ["core"]
                 }
             ]
         });
-        let PlannerResponse::Plan { tasks } = parse_response(&plan.to_string()).unwrap() else {
+        let PlannerResponse::Plan { tasks } = validate_submitted(&plan.to_string()).unwrap() else {
             panic!("expected plan");
         };
         assert_eq!(
@@ -1101,7 +1573,6 @@ mod tests {
                 "source_constraints": ["preserve atomicity"],
                 "verification_expectations": ["focused tests pass"],
                 "non_goals": ["do not change daemon behavior"],
-                "preserved_literals": [],
                 "prerequisites": []
             },
             task("other", &[])
@@ -1125,7 +1596,7 @@ mod tests {
             r#"{"outcome":"plan"} trailing"#.into(),
         ] {
             assert!(matches!(
-                parse_response(&value),
+                validate_submitted(&value),
                 Err(PlannerParseError::Provider(_))
             ));
         }
@@ -1135,13 +1606,13 @@ mod tests {
     fn invalid_blocker_and_invalid_graph_are_semantic_rejections() {
         let blocker = r#"{"outcome":"blocker","category":"magic","evidence":[],"required_decision":"x","why_no_safe_split":"y"}"#;
         assert!(matches!(
-            parse_response(blocker),
+            validate_submitted(blocker),
             Err(PlannerParseError::Semantic(_))
         ));
         let cycle =
             serde_json::json!({"outcome":"plan","tasks":[task("a", &["b"]),task("b", &["a"])]});
         assert!(matches!(
-            parse_response(&cycle.to_string()),
+            validate_submitted(&cycle.to_string()),
             Err(PlannerParseError::Semantic(_))
         ));
     }
@@ -1156,7 +1627,7 @@ mod tests {
                 "tasks": [first, task("b", &["a"])]
             });
             assert!(matches!(
-                parse_response(&plan.to_string()),
+                validate_submitted(&plan.to_string()),
                 Err(PlannerParseError::Semantic(_))
             ));
         }
@@ -1201,7 +1672,7 @@ mod tests {
             "tasks": [maximum, task("other", &[])],
         });
         assert_eq!(
-            parse_response(&plan.to_string()),
+            validate_submitted(&plan.to_string()),
             Err(PlannerParseError::Semantic(
                 "source constraints at maximum size must include worker writability guidance"
                     .into(),
@@ -1229,12 +1700,12 @@ mod tests {
     #[test]
     fn polling_result_preserves_independent_failure_budgets() {
         assert!(matches!(
-            parsed_poll("not json"),
-            PlannerPoll::ProviderFailed(_)
+            validate_submitted("not json"),
+            Err(PlannerParseError::Provider(_))
         ));
         assert!(matches!(
-            parsed_poll(r#"{"outcome":"plan","tasks":[]}"#),
-            PlannerPoll::SemanticRejected(_)
+            validate_submitted(r#"{"outcome":"plan","tasks":[]}"#),
+            Err(PlannerParseError::Semantic(_))
         ));
     }
 
@@ -1256,6 +1727,7 @@ mod tests {
             &prompt,
             false,
             Some("provider-must-not-run"),
+            None,
         )
         .await
         .err()
@@ -1290,6 +1762,7 @@ mod tests {
             &prompt,
             false,
             runner.to_str(),
+            None,
             TEST_STDIN_FEED_TIMEOUT,
         )
         .await
@@ -1328,6 +1801,7 @@ mod tests {
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap();
@@ -1343,8 +1817,21 @@ mod tests {
         .expect("oversized unterminated line must fail promptly");
         assert!(matches!(
             outcome,
-            PlannerPoll::ProviderFailed(ref message) if message.contains("stdout exceeded")
+            PlannerTurnEnd::Failed(ref message) if message.contains("stdout exceeded")
         ));
+        let diagnostic = failure_json(&outcome);
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["stdout_bytes_observed"],
+            MAX_STDOUT_BYTES + 1
+        );
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["stdout_byte_count_kind"],
+            "lower-bound"
+        );
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["samples"]["read_boundary_truncated"],
+            true
+        );
 
         slot.kill_and_reap().await;
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
@@ -1386,18 +1873,15 @@ mod tests {
             "exact bounded prompt",
             false,
             fake.to_str(),
+            None,
         )
         .await
         .unwrap();
         let outcome = poll_to_terminal(&mut slot).await;
-        assert!(matches!(
-            outcome,
-            PlannerPoll::Done(PlannerResponse::Plan { ref tasks })
-                if tasks.len() == 2 && tasks[1].prerequisites == ["core"]
-        ));
+        assert!(matches!(outcome, PlannerTurnEnd::Complete));
         assert!(
             slot.proc.try_wait().unwrap().is_some(),
-            "Codex plan authority preceded provider exit"
+            "Codex terminal evidence preceded provider exit"
         );
         slot.kill_and_reap().await;
 
@@ -1410,6 +1894,311 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["-c", "model_reasoning_effort=xhigh"]));
         assert_eq!(args.last(), Some(&"exact bounded prompt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_survives_exploration_stdout_before_terminal_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let exploration = serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "id": "tool-1",
+                "aggregated_output": "x".repeat(1024),
+            }
+        });
+        let mut output = format!("{}\n", exploration).repeat(210);
+        assert!(output.len() > 200 * 1024);
+        output.push_str(&format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type": "turn.completed"})
+        ));
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(outcome, PlannerTurnEnd::Complete));
+        slot.kill_and_reap().await;
+    }
+
+    /// The regression this cutover exists for, inverted: a provider that prints
+    /// a flawless plan and exits cleanly has still not reported one. Text is
+    /// never an outcome, and the failure keeps the payload out of durable
+    /// evidence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn perfect_json_text_without_submit_plan_is_a_provider_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        // Deserializing this text would produce a valid plan; nothing does.
+        assert!(matches!(
+            validate_submitted(&response.to_string()),
+            Ok(PlannerResponse::Plan { .. })
+        ));
+        let output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type": "turn.completed"})
+        );
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(turn_end, PlannerTurnEnd::Complete));
+        let outcome = planner_outcome(&slot, turn_end, None);
+        let PlannerPoll::ProviderFailed(summary) = outcome else {
+            panic!("a turn without an accepted submission must not produce a plan");
+        };
+        assert!(summary.contains("without submit_plan"), "{summary}");
+        assert!(
+            !summary.contains("observable_outcome"),
+            "durable failure retained provider payload text"
+        );
+        let diagnostic: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["terminal_response_seen"],
+            true
+        );
+        slot.kill_and_reap().await;
+    }
+
+    /// The durable submission is the outcome, and it stands however the process
+    /// then ended: it was accepted by the daemon's own endpoint after full
+    /// validation, so a provider that died after submitting still delivered a
+    /// plan.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_accepted_submission_is_the_only_source_of_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let submitted = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        })
+        .to_string();
+        // Text that contradicts the submission is never consulted.
+        let output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": "narration only"}
+            }),
+            serde_json::json!({"type": "turn.completed"})
+        );
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            planner_outcome(&slot, turn_end, Some(&submitted)),
+            PlannerPoll::Done(PlannerResponse::Plan { ref tasks })
+                if tasks.len() == 2 && tasks[1].prerequisites == ["core"]
+        ));
+        assert!(matches!(
+            planner_outcome(
+                &slot,
+                PlannerTurnEnd::Failed("planner timed out".into()),
+                Some(&submitted),
+            ),
+            PlannerPoll::Done(PlannerResponse::Plan { .. })
+        ));
+        assert!(matches!(
+            planner_outcome(&slot, PlannerTurnEnd::Failed("planner timed out".into()), None),
+            PlannerPoll::ProviderFailed(ref summary) if summary == "planner timed out"
+        ));
+        slot.kill_and_reap().await;
+    }
+
+    /// Claude's terminal branch, which used to select the final assistant
+    /// message: a full narration transcript now ends the turn cleanly and
+    /// carries no plan, so the attempt fails on the missing submission alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_terminal_result_completes_the_turn_without_reading_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let output = claude_stream(&[
+            serde_json::json!({"type": "assistant", "message": {"content": "Let me inspect the task."}}),
+            serde_json::json!({"type": "tool_use", "name": "Read", "input": {"file_path": "src/core.rs"}}),
+            // The final assistant message is a complete, valid plan. It is not
+            // an outcome: only an accepted `submit_plan` call is.
+            serde_json::json!({"type": "assistant", "message": {"content": response.to_string()}}),
+        ]);
+
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(turn_end, PlannerTurnEnd::Complete));
+        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&slot, turn_end, None) else {
+            panic!("Claude assistant text must not produce a plan");
+        };
+        assert!(summary.contains("without submit_plan"), "{summary}");
+        assert!(
+            !summary.contains("observable_outcome"),
+            "durable failure retained provider payload text"
+        );
+        slot.kill_and_reap().await;
+    }
+
+    /// An errored terminal result is still a provider failure: the turn never
+    /// reached a clean end, so its own diagnostic is what the attempt reports.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_errored_terminal_result_fails_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type": "assistant", "message": {"content": "Let me inspect the task."}}),
+            serde_json::json!({"type": "result", "result": "", "is_error": true}),
+        );
+
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        assert!(matches!(
+            poll_to_terminal(&mut slot).await,
+            PlannerTurnEnd::Failed(ref summary) if summary.contains("provider returned an error")
+        ));
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_accepts_changed_unclassified_stderr_before_clean_terminal() {
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let stdout = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({"type":"thread.started","thread_id":"fixture-thread"}),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type":"turn.completed"}),
+        );
+        for stderr in [
+            "Reading additional input from stdin...\n",
+            "Codex changed its informational input notice.\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut slot = spawn_fake_codex_with_stderr(dir.path(), &stdout, stderr).await;
+            let outcome = poll_to_terminal(&mut slot).await;
+            assert!(matches!(outcome, PlannerTurnEnd::Complete));
+            slot.kill_and_reap().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_unclassified_stderr_still_fails_without_clean_terminal() {
+        let stderr = "Codex changed its informational input notice.\n";
+        let cases = [
+            (
+                "turn-failed",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"provider failed\"}}\n",
+                "planner provider protocol failed (unclassified)",
+            ),
+            (
+                "error-event",
+                "{\"type\":\"error\",\"message\":\"provider failed\"}\n",
+                "planner provider protocol failed (unclassified)",
+            ),
+            (
+                "malformed",
+                "not-json\n",
+                "planner provider protocol failed",
+            ),
+            (
+                "early-eof",
+                "{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}\n",
+                "Codex stderr did not match a bounded provider signal",
+            ),
+        ];
+        for (name, stdout, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut slot = spawn_fake_codex_with_stderr(dir.path(), stdout, stderr).await;
+            let outcome = poll_to_terminal(&mut slot).await;
+            let diagnostic = failure_json(&outcome);
+            assert!(
+                diagnostic["failure"].as_str().unwrap().contains(expected),
+                "{name} discarded its authoritative bounded failure evidence: {diagnostic}",
+            );
+            slot.kill_and_reap().await;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout.jsonl");
+        let stderr_path = dir.path().join("stderr.txt");
+        std::fs::write(
+            &stdout_path,
+            "{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}\n",
+        )
+        .unwrap();
+        std::fs::write(&stderr_path, stderr).unwrap();
+        let runner = executable_script(
+            dir.path(),
+            "codex",
+            &format!(
+                "/bin/cat '{}' >&2\n/bin/cat '{}'\nexit 7",
+                stderr_path.display(),
+                stdout_path.display()
+            ),
+        );
+        let mut slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let outcome = poll_to_terminal(&mut slot).await;
+        let diagnostic = failure_json(&outcome);
+        assert!(diagnostic["failure"]
+            .as_str()
+            .unwrap()
+            .contains("Codex stderr did not match a bounded provider signal"));
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_rejects_truncated_stderr_after_terminal() {
+        let response = serde_json::json!({"outcome":"plan","tasks":[task("core", &[])]});
+        let stdout = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
+            }),
+            serde_json::json!({"type":"turn.completed"}),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let stderr = "x".repeat(16 * 1024 + 1);
+        let mut slot = spawn_fake_codex_with_stderr(dir.path(), &stdout, &stderr).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerTurnEnd::Failed(ref summary) if summary.contains("stderr exceeded bounded")
+        ));
+        slot.kill_and_reap().await;
     }
 
     #[cfg(unix)]
@@ -1430,12 +2219,16 @@ mod tests {
         let cases = [
             ("nonzero-exit", "exit 7"),
             (
+                "nonzero-exit-with-informational-stderr",
+                "printf '%s\\n' 'Codex changed its informational input notice.' >&2; exit 7",
+            ),
+            (
                 "trailing-stdout",
                 "printf '%s\\n' '{\"type\":\"error\",\"message\":\"fatal trailing error\"}'",
             ),
             (
                 "trailing-stderr",
-                "printf '%s\\n' 'fatal trailing error' >&2",
+                "printf '%s\\n' 'error: unexpected argument --future' >&2",
             ),
         ];
         for (name, trailer) in cases {
@@ -1455,14 +2248,32 @@ mod tests {
                 "bounded prompt",
                 false,
                 runner.to_str(),
+                None,
             )
             .await
             .unwrap();
             let outcome = poll_to_terminal(&mut slot).await;
             assert!(
-                matches!(outcome, PlannerPoll::ProviderFailed(_)),
+                matches!(outcome, PlannerTurnEnd::Failed(_)),
                 "{name} acquired planner authority"
             );
+            if name == "trailing-stderr" {
+                let diagnostic = failure_json(&outcome);
+                assert!(diagnostic["failure"]
+                    .as_str()
+                    .unwrap()
+                    .contains("non-failover"));
+            }
+            if name == "nonzero-exit-with-informational-stderr" {
+                let diagnostic = failure_json(&outcome);
+                let failure = diagnostic["failure"].as_str().unwrap();
+                assert!(failure.contains("unclassified"));
+                assert!(failure.contains("Codex stderr did not match a bounded provider signal"));
+                assert!(
+                    !failure.contains("Codex changed its informational input notice."),
+                    "durable failure retained raw provider stderr"
+                );
+            }
             slot.kill_and_reap().await;
         }
     }
@@ -1486,8 +2297,20 @@ mod tests {
             let mut slot = spawn_fake_codex(dir.path(), stdout).await;
             let outcome = poll_to_terminal(&mut slot).await;
             assert!(
-                matches!(outcome, PlannerPoll::ProviderFailed(_)),
+                matches!(outcome, PlannerTurnEnd::Failed(_)),
                 "{name} stream created planner authority"
+            );
+            let diagnostic = failure_json(&outcome);
+            assert_eq!(diagnostic["planner_diagnostic"]["provider"], "codex");
+            assert_eq!(
+                diagnostic["planner_diagnostic"]["samples"]["payloads_redacted"],
+                true
+            );
+            assert!(
+                !diagnostic
+                    .to_string()
+                    .contains("provider-credential-must-not-persist"),
+                "{name} persisted provider payload text"
             );
             slot.kill_and_reap().await;
         }
@@ -1495,22 +2318,99 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn codex_response_and_stdout_bounds_fail_and_reap_without_a_plan() {
+    async fn repeated_protocol_events_retain_bounded_head_tail_and_counts() {
         let dir = tempfile::tempdir().unwrap();
-        let oversized_text = "x".repeat(MAX_RESPONSE_BYTES + 1);
+        let output = "{\"type\":\"turn.started\"}\n".repeat(8_000);
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let pid = slot.pid().unwrap();
+        let outcome = poll_to_terminal(&mut slot).await;
+        let diagnostic = failure_json(&outcome);
+        let planner = &diagnostic["planner_diagnostic"];
+        assert!(planner["event_types"]["turn.started"].as_u64().unwrap() > 1_000);
+        assert_eq!(planner["terminal_response_seen"], false);
+        assert_eq!(planner["samples"]["truncated"], true);
+        assert_eq!(
+            planner["samples"]["beginning"].as_array().unwrap().len(),
+            DIAGNOSTIC_SAMPLE_LINES
+        );
+        assert_eq!(
+            planner["samples"]["end"].as_array().unwrap().len(),
+            DIAGNOSTIC_SAMPLE_LINES
+        );
+        assert!(planner["samples"]["beginning"][0]
+            .as_str()
+            .unwrap()
+            .contains("event=turn.started"));
+        slot.kill_and_reap().await;
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_utf8_read_failure_retains_text_safe_bounded_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = executable_script(dir.path(), "codex", "printf '\\377\\n'");
+        let mut slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let outcome = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            outcome,
+            PlannerTurnEnd::Failed(ref summary) if summary.contains("stdout read failed")
+        ));
+        let diagnostic = failure_json(&outcome);
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["stdout_byte_count_kind"],
+            "completed-lines-only"
+        );
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["samples"]["read_boundary_truncated"],
+            true
+        );
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_unterminated_and_stdout_bounds_fail_and_reap_without_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        // A single large assistant message is no longer measured against a
+        // response bound — nothing reads it. Only the stream's own terminal
+        // contract and the stdout ceiling bound the turn.
+        let unterminated_text = "x".repeat(64 * 1024 + 1);
         let output = format!(
             "{}\n",
             serde_json::json!({
                 "type": "item.completed",
-                "item": {"type": "agent_message", "id": "message-1", "text": oversized_text}
+                "item": {"type": "agent_message", "id": "message-1", "text": unterminated_text}
             })
         );
         let mut slot = spawn_fake_codex(dir.path(), &output).await;
         let outcome = poll_to_terminal(&mut slot).await;
         assert!(matches!(
             outcome,
-            PlannerPoll::ProviderFailed(ref message) if message.contains("response exceeded")
+            PlannerTurnEnd::Failed(ref message)
+                if message.contains("exited without a terminal response")
         ));
+        let response_diagnostic = failure_json(&outcome);
+        assert_eq!(
+            response_diagnostic["planner_diagnostic"]["event_types"]
+                ["item.completed/agent_message"],
+            1
+        );
+        assert_eq!(
+            response_diagnostic["planner_diagnostic"]["terminal_response_seen"],
+            false
+        );
         slot.kill_and_reap().await;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1523,6 +2423,7 @@ mod tests {
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap();
@@ -1530,8 +2431,13 @@ mod tests {
         let outcome = poll_to_terminal(&mut slot).await;
         assert!(matches!(
             outcome,
-            PlannerPoll::ProviderFailed(ref message) if message.contains("stdout exceeded")
+            PlannerTurnEnd::Failed(ref message) if message.contains("stdout exceeded")
         ));
+        let stdout_diagnostic = failure_json(&outcome);
+        assert_eq!(
+            stdout_diagnostic["planner_diagnostic"]["stdout_bytes_observed"],
+            MAX_STDOUT_BYTES + 1
+        );
         slot.kill_and_reap().await;
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
     }
@@ -1550,16 +2456,28 @@ mod tests {
                 "bounded prompt",
                 false,
                 runner.to_str(),
+                None,
             )
             .await
             .unwrap();
             let pid = slot.pid().unwrap();
             if timed_out {
                 slot.started_at = tokio::time::Instant::now() - PLANNER_TIMEOUT;
+                let outcome = poll_planner(&mut slot).await.expect("timeout is terminal");
                 assert!(matches!(
-                    poll_planner(&mut slot).await,
-                    Some(PlannerPoll::ProviderFailed(ref message)) if message.contains("timed out")
+                    outcome,
+                    PlannerTurnEnd::Failed(ref message) if message.contains("timed out")
                 ));
+                let diagnostic = failure_json(&outcome);
+                assert_eq!(diagnostic["planner_diagnostic"]["stdout_bytes_observed"], 0);
+                assert_eq!(
+                    diagnostic["planner_diagnostic"]["stdout_byte_count_kind"],
+                    "lower-bound"
+                );
+                assert_eq!(
+                    diagnostic["planner_diagnostic"]["terminal_response_seen"],
+                    false
+                );
             }
             slot.kill_and_reap().await;
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
@@ -1585,18 +2503,9 @@ mod tests {
             verification_expectations: vec!["tests".into()],
             non_goals: vec!["no unrelated changes".into()],
             prerequisites: vec!["source:9".into()],
-            ..Default::default()
         };
         assert!(matches!(
-            validate_for_source(
-                &[foreign],
-                &[7],
-                "source",
-                None,
-                Path::new("."),
-                &path_resolver,
-            )
-            .await,
+            validate_for_source(&[foreign], &[7], Path::new("."), &path_resolver,).await,
             Err(PlannerParseError::Semantic(_))
         ));
         let synthetic = ProposedTask {
@@ -1615,18 +2524,9 @@ mod tests {
             verification_expectations: vec!["tests".into()],
             non_goals: vec!["no unrelated changes".into()],
             prerequisites: vec![],
-            ..Default::default()
         };
         assert!(matches!(
-            validate_for_source(
-                &[synthetic],
-                &[],
-                "source",
-                None,
-                Path::new("."),
-                &path_resolver,
-            )
-            .await,
+            validate_for_source(&[synthetic], &[], Path::new("."), &path_resolver,).await,
             Err(PlannerParseError::Semantic(_))
         ));
     }
@@ -1660,7 +2560,6 @@ mod tests {
             verification_expectations: vec!["tests".into()],
             non_goals: vec!["do not change external references".into()],
             prerequisites: vec![],
-            ..Default::default()
         };
 
         assert_eq!(
@@ -1714,7 +2613,6 @@ mod tests {
                 verification_expectations: vec!["tests".into()],
                 non_goals: vec!["do not write external paths".into()],
                 prerequisites: vec![],
-                ..Default::default()
             };
             assert!(
                 matches!(
@@ -1933,176 +2831,96 @@ mod tests {
         assert!(prompt.contains(r#""affected_paths":["<repo-relative-path-or-narrow-pattern>"]"#));
         assert!(prompt.contains(r#""deliverables":[{"kind":"write""#));
         assert!(prompt.contains(r#""non_goals":["<preserved-or-explicitly-excluded-behavior>"]"#));
-        assert!(prompt.contains(r#""preserved_literals":["<exact-source-literal>"]"#));
+        assert!(!prompt.contains("preserved_literals"));
         assert!(prompt.contains(
             r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#
         ));
         assert!(prompt.contains("`outcome` must be exactly `plan` or `blocker`"));
         assert!(prompt.contains("S = focused/local; M = bounded coherent work"));
         assert!(prompt.contains("Use at most 5 Grep/Glob calls and 10 Read calls"));
-        assert!(prompt.contains("labels, tags, messages, identifiers"));
+        assert!(prompt.contains("Arbiter judges that faithfulness"));
         assert!(prompt.contains(&format!(
             "Every PLAN task's `source_constraints` must include this worker-facing guidance: \"{WORKER_WRITABILITY_GUIDANCE}\""
         )));
         assert!(prompt.contains("The daemon adds it deterministically"));
     }
 
+    /// The prompt must send the plan through the tool, not the transcript. The
+    /// old "one JSON object" instruction is the failure mode this batch removed:
+    /// conversational providers prefixed prose and lost a whole attempt.
     #[test]
-    fn source_validation_requires_marked_literals_byte_for_byte() {
-        let title = "Keep label \"review-ready\"";
-        let source = "Keep `type:feature`, tag \"security\", literal \"EXACT\", and message \"Merge ready\" exactly.";
-        let mut proposed = ProposedTask {
-            key: "routing".into(),
-            title: "Change routing".into(),
-            implementation_delta: "change one routing seam".into(),
-            affected_paths: vec!["src/routing.rs".into()],
-            observable_outcome: "routing works".into(),
-            deliverables: writable_deliverables("src/routing.rs"),
-            acceptance_criteria: vec!["covered".into()],
-            source_constraints: vec!["preserve literals".into()],
-            verification_expectations: vec!["tests pass".into()],
-            non_goals: vec!["no unrelated changes".into()],
-            preserved_literals: vec![
-                "type:feature".into(),
-                "security".into(),
-                "EXACT".into(),
-                "Merge ready".into(),
-                "review-ready".into(),
-            ],
-            prerequisites: vec![],
+    fn planner_prompt_instructs_the_submit_plan_tool_and_forbids_a_text_plan() {
+        let dependencies = vec![3, 4];
+        let source = PlanningSource {
+            task_id: 7,
+            revision: 2,
+            title: "large outcome",
+            body: Some("preserve atomicity"),
+            dependencies: &dependencies,
         };
-        let companion = ProposedTask {
-            key: "verification".into(),
-            title: "Verify routing".into(),
-            implementation_delta: "add focused routing verification".into(),
-            affected_paths: vec!["tests/routing.rs".into()],
-            observable_outcome: "routing verification works".into(),
-            deliverables: writable_deliverables("tests/routing.rs"),
-            acceptance_criteria: vec!["verification is covered".into()],
-            source_constraints: vec!["preserve literals".into()],
-            verification_expectations: vec!["tests pass".into()],
-            non_goals: vec!["no unrelated changes".into()],
-            preserved_literals: vec![],
-            prerequisites: vec!["routing".into()],
-        };
-        assert!(validate_source_literals(
-            &[proposed.clone(), companion.clone()],
-            title,
-            Some(source),
-        )
-        .is_ok());
-        proposed.preserved_literals[3] = "merge ready".into();
-        assert!(matches!(
-            validate_source_literals(&[proposed, companion], title, Some(source)),
-            Err(PlannerParseError::Semantic(message))
-                if message.contains("match source bytes exactly")
+        let prompt = build_prompt(&source, &[]);
+        assert!(!prompt.contains("Return exactly one valid JSON object"));
+        assert!(!prompt.contains("Use no markdown or commentary"));
+        assert!(prompt.contains(
+            "Report by calling the `submit_plan` tool exactly once with the PLAN or BLOCKER \
+             object as its `response` argument"
         ));
+        assert!(prompt
+            .contains("fix the reported defect and call `submit_plan` again in the same turn"));
+        assert!(prompt.contains("`already_submitted` means your first plan was accepted"));
+        assert!(prompt.contains("Never print the plan as text"));
+        // The closed shapes stay in the prompt as well as the tool schema.
+        assert!(prompt.contains(RESPONSE_SHAPES));
     }
 
-    #[test]
-    fn unpaired_quote_does_not_manufacture_required_literal() {
-        let source = "A stray label \"unclosed\ntag \"three\" stays protected.";
-        let literals = required_source_literals(source);
-        assert_eq!(literals, vec!["three".to_string()]);
-    }
-
-    #[test]
-    fn matching_backtick_runs_preserve_complete_markdown_code_literals() {
-        let source = "Keep ``value with a ` backtick`` and ````\nfence ``` content\n```` exactly.";
-        assert_eq!(
-            required_source_literals(source),
-            vec![
-                "\nfence ``` content\n".to_string(),
-                "value with a ` backtick".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn mismatched_or_unclosed_backtick_runs_do_not_preserve_suffixes() {
-        for source in [
-            "``value with a ` suffix`",
-            "``value closed by the wrong run```",
-            "````fenced content```",
-        ] {
-            assert!(required_source_literals(source).is_empty(), "{source}");
-        }
-        let bounded_source = format!("``{} `suffix`", "x".repeat(MAX_PROMPT_BYTES));
-        assert!(required_source_literals(&bounded_source).is_empty());
-    }
-
-    #[test]
-    fn source_validation_skips_marked_literals_larger_than_the_preservation_field() {
-        let literal = "x".repeat(MAX_TEXT_BYTES + 1);
-        let proposed = ProposedTask {
-            key: "routing".into(),
-            title: "Change routing".into(),
-            implementation_delta: "change one routing seam".into(),
-            affected_paths: vec!["src/routing.rs".into()],
-            observable_outcome: "routing works".into(),
-            deliverables: writable_deliverables("src/routing.rs"),
-            acceptance_criteria: vec!["covered".into()],
-            source_constraints: vec!["preserve behavior".into()],
-            verification_expectations: vec!["tests pass".into()],
-            non_goals: vec!["no unrelated changes".into()],
-            preserved_literals: vec![],
-            prerequisites: vec![],
-        };
-        let companion = ProposedTask {
-            key: "verification".into(),
-            title: "Verify routing".into(),
-            implementation_delta: "add focused routing verification".into(),
-            affected_paths: vec!["tests/routing.rs".into()],
-            observable_outcome: "routing verification works".into(),
-            deliverables: writable_deliverables("tests/routing.rs"),
-            acceptance_criteria: vec!["verification is covered".into()],
-            source_constraints: vec!["preserve behavior".into()],
-            verification_expectations: vec!["tests pass".into()],
-            non_goals: vec!["no unrelated changes".into()],
-            preserved_literals: vec![],
-            prerequisites: vec!["routing".into()],
-        };
-
-        for source in [
-            format!("Keep this inline literal exactly: `{literal}`"),
-            format!("Keep this double-delimited literal exactly: ``{literal}``"),
-            format!("Keep this fenced literal exactly:\n```\n{literal}\n```"),
-        ] {
-            assert!(required_source_literals(&source).is_empty());
-            assert!(validate_source_literals(
-                &[proposed.clone(), companion.clone()],
-                "source",
-                Some(&source),
-            )
-            .is_ok());
-        }
-    }
-
-    #[test]
-    fn source_validation_bounds_required_literals_to_the_response_and_proposal_budget() {
-        let source = (0..8)
-            .map(|index| {
-                let mut literal = format!("{index:02}");
-                literal.push_str(&"x".repeat(MAX_TEXT_BYTES - literal.len()));
-                format!("literal \"{literal}\"")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let required = required_source_literals(&source);
-        assert_eq!(required.len(), 1);
-        assert_eq!(required[0].len(), MAX_TEXT_BYTES);
-
-        let mut first = task("a", &[]);
-        first["preserved_literals"] = serde_json::json!([required[0]]);
-        let plan = serde_json::json!({
-            "outcome": "plan",
-            "tasks": [first, task("b", &["a"])]
-        });
-        assert!(plan.to_string().len() <= MAX_RESPONSE_BYTES);
-        let PlannerResponse::Plan { tasks } = parse_response(&plan.to_string()).unwrap() else {
-            panic!("plan response expected");
-        };
-        assert!(validate_source_literals(&tasks, "source", Some(&source)).is_ok());
+    #[tokio::test]
+    async fn literal_dense_proposal_passes_structural_validation_without_a_byte_exact_gate() {
+        // Regression for #48/#58: the byte-exact `validate_source_literals` gate
+        // is gone. `validate_for_source` no longer receives the source text and
+        // never rejects a structurally valid proposal for failing to echo any
+        // backtick-delimited span verbatim. A literal-dense source now reaches
+        // the Arbiter instead of exhausting the proposal budget here.
+        let path_resolver = WritablePathResolver::default();
+        let proposal = vec![
+            ProposedTask {
+                key: "core".into(),
+                title: "Change core seam".into(),
+                implementation_delta: "change the core implementation seam".into(),
+                affected_paths: vec!["src/core.rs".into()],
+                observable_outcome: "core works".into(),
+                deliverables: writable_deliverables("src/core.rs"),
+                acceptance_criteria: vec!["covered".into()],
+                source_constraints: vec!["preserve behavior".into()],
+                verification_expectations: vec!["tests pass".into()],
+                non_goals: vec!["no unrelated changes".into()],
+                prerequisites: vec![],
+            },
+            ProposedTask {
+                key: "verify".into(),
+                title: "Verify core seam".into(),
+                implementation_delta: "add focused core verification".into(),
+                affected_paths: vec!["tests/core.rs".into()],
+                observable_outcome: "core verification works".into(),
+                deliverables: writable_deliverables("tests/core.rs"),
+                acceptance_criteria: vec!["verification is covered".into()],
+                source_constraints: vec!["preserve behavior".into()],
+                verification_expectations: vec!["tests pass".into()],
+                non_goals: vec!["no unrelated changes".into()],
+                prerequisites: vec!["core".into()],
+            },
+        ];
+        // The proposal echoes none of the source's 14 backtick spans verbatim;
+        // under the retired gate this would have been a semantic rejection.
+        let outcome = validate_for_source_with_resolver(
+            &proposal,
+            &[],
+            Path::new("."),
+            &path_resolver,
+            WRITABLE_PATH_RESOLUTION_TIMEOUT,
+            |_repo_root, _paths| true,
+        )
+        .await;
+        assert!(outcome.is_ok(), "{outcome:?}");
     }
 
     #[test]

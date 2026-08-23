@@ -757,6 +757,7 @@ mod tests {
             routing: crate::serve_config::RoutingPolicy {
                 classifier: pool.clone(),
                 planner: pool.clone(),
+                arbiter: pool.clone(),
                 collector: pool.clone(),
                 worker: (1..=5)
                     .map(|level| (level.to_string(), pool.clone()))
@@ -785,6 +786,7 @@ mod tests {
             merge_checks_poll_secs: 1,
             repo: "owner/repo".into(),
             base_branch: "main".into(),
+            self_update_branch: "main".into(),
             exit_when_gone: None,
             required_jobs: Vec::new(),
             master_ci_gate: false,
@@ -794,7 +796,9 @@ mod tests {
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
+            max_rework: quorum_core::lifecycle::REWORK_CAP,
             codex_sandbox: "danger-full-access".into(),
+            grok: Default::default(),
             pr_target_program: None,
         }
     }

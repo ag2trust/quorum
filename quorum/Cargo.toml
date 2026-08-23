@@ -24,6 +24,7 @@ uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 tempfile = "3"
 rusqlite = { version = "0.31", features = ["bundled"] }
+rmcp = { version = "=3.0.1", default-features = false, features = ["server", "transport-io"] }
 
 [dev-dependencies]
 assert_cmd = "2"

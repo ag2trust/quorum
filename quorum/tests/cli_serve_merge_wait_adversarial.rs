@@ -353,6 +353,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -371,6 +383,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -659,7 +672,7 @@ fn scenario_a_merge_wait_with_dependents() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -781,7 +794,7 @@ fn scenario_a_restart_pending_then_ready_merges() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -817,7 +830,7 @@ fn scenario_a_restart_pending_then_ready_merges() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -923,7 +936,7 @@ fn scenario_b_failed_checks_absent_worker_replacement_cycle() {
             "--merge-checks-timeout-secs",
             "2",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1070,7 +1083,7 @@ fn repeated_pending_never_increments_counters() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1147,7 +1160,7 @@ fn head_sha_change_invalidates_approvals() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1190,7 +1203,7 @@ fn head_sha_change_invalidates_approvals() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1273,7 +1286,7 @@ fn merge_conflict_absent_worker_spawns_remediation() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
             "--merge-mergeability-cmd",
             &mergeability_script,
         ],
@@ -1534,7 +1547,7 @@ fn merge_conflict_live_worker_triggers_rework_respects_cap() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
             "--merge-mergeability-cmd",
             &mergeability_script,
         ],
@@ -1786,7 +1799,7 @@ fn no_duplicate_events_under_restart() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1820,7 +1833,7 @@ fn no_duplicate_events_under_restart() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1898,7 +1911,7 @@ fn agent_runs_end_reasons_truthful() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 

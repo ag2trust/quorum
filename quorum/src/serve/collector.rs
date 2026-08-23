@@ -69,6 +69,12 @@ const MAX_FETCHED_EVIDENCE_RECORDS: usize =
 const MAX_FETCHED_EVIDENCE_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FETCHED_EVIDENCE_ARRAY_DEPTH: usize = 2;
 
+/// Parse failures are durable operator-facing telemetry, not a place to retain
+/// unbounded model-derived text. The fixed shape fields always fit, while a
+/// long validation reason is safely shortened at a UTF-8 boundary.
+const MAX_PARSE_FAILURE_ERROR_BYTES: usize = 2 * 1024;
+const PARSE_FAILURE_REASON_TRUNCATION: &str = "... [reason truncated]";
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCollectorResponse {
@@ -227,6 +233,70 @@ fn extract_collector_json(text: &str) -> Option<&str> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollectorResponseShape {
+    trimmed_starts_with_object: bool,
+    json_fence_present: bool,
+    code_fence_present: bool,
+    json_extracted: bool,
+}
+
+fn collector_response_shape(text: &str) -> CollectorResponseShape {
+    let trimmed = text.trim();
+    CollectorResponseShape {
+        trimmed_starts_with_object: trimmed.starts_with('{'),
+        json_fence_present: trimmed.contains("```json"),
+        code_fence_present: trimmed.contains("```"),
+        json_extracted: extract_collector_json(text).is_some(),
+    }
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn bounded_parse_failure_reason(reason: &str, max_bytes: usize) -> String {
+    let safe_reason = reason.replace('\0', "�");
+    if safe_reason.len() <= max_bytes {
+        return safe_reason;
+    }
+    if max_bytes <= PARSE_FAILURE_REASON_TRUNCATION.len() {
+        return truncate_utf8_bytes(&safe_reason, max_bytes).to_string();
+    }
+
+    let prefix_len = max_bytes - PARSE_FAILURE_REASON_TRUNCATION.len();
+    format!(
+        "{}{}",
+        truncate_utf8_bytes(&safe_reason, prefix_len),
+        PARSE_FAILURE_REASON_TRUNCATION
+    )
+}
+
+fn format_parse_failure(pr_number: i64, response_text: &str, parse_error: &QuorumError) -> String {
+    let shape = collector_response_shape(response_text);
+    let prefix = format!(
+        "collector response parse failed for PR #{pr_number} — response len {}; reason: ",
+        response_text.len()
+    );
+    let suffix = format!(
+        "; shape: trimmed_starts_with_object={}, json_fence_present={}, \
+         code_fence_present={}, json_extracted={}",
+        shape.trimmed_starts_with_object,
+        shape.json_fence_present,
+        shape.code_fence_present,
+        shape.json_extracted,
+    );
+    let reason_limit = MAX_PARSE_FAILURE_ERROR_BYTES.saturating_sub(prefix.len() + suffix.len());
+    format!(
+        "{prefix}{}{suffix}",
+        bounded_parse_failure_reason(&parse_error.to_string(), reason_limit)
+    )
 }
 
 fn validate_finding(
@@ -680,6 +750,11 @@ pub struct CollectionOutcome {
     pub error: Option<String>,
 }
 
+struct ClassifierTurnOutcome {
+    response: Result<String>,
+    usage: super::runner::TokenUsage,
+}
+
 /// Full pipeline: fetch inputs, spawn classifier, parse + store. On any failure
 /// the run record is stamped `failed` with the error text — never returns without
 /// having written the run row.
@@ -708,8 +783,17 @@ pub async fn run_collection_with_inputs(
     attempted_at: i64,
 ) -> Result<CollectionOutcome> {
     // 2) Spawn classifier + await bounded turn.
-    let response_text = match spawn_and_run_classifier(request, &inputs).await {
-        Ok(t) => t,
+    let turn = match spawn_and_run_classifier(request, &inputs).await {
+        Ok(turn) => turn,
+        Err(e) => {
+            let err_text = format!("collector classifier failed: {e}");
+            record_failure(request, &err_text, attempted_at).await;
+            return Err(QuorumError::Io(err_text));
+        }
+    };
+    record_token_usage(request, turn.usage).await;
+    let response_text = match turn.response {
+        Ok(response) => response,
         Err(e) => {
             let err_text = format!("collector classifier failed: {e}");
             record_failure(request, &err_text, attempted_at).await;
@@ -726,14 +810,8 @@ pub async fn run_collection_with_inputs(
         COLLECTOR_VERSION,
     ) {
         Ok(response) => response,
-        Err(_) => {
-            let err_text = format!(
-                "collector response parse failed for PR #{} — response len {}",
-                request.pr_number,
-                response_text.len()
-            );
-            record_failure(request, &err_text, attempted_at).await;
-            return Err(QuorumError::Io(err_text));
+        Err(error) => {
+            return Err(record_parse_failure(request, &response_text, &error, attempted_at).await);
         }
     };
     let findings = validated.findings;
@@ -800,6 +878,17 @@ pub async fn run_collection_with_inputs(
     }
 }
 
+async fn record_parse_failure(
+    request: &CollectionRequest,
+    response_text: &str,
+    parse_error: &QuorumError,
+    attempted_at: i64,
+) -> QuorumError {
+    let error_text = format_parse_failure(request.pr_number, response_text, parse_error);
+    record_failure(request, &error_text, attempted_at).await;
+    QuorumError::Io(error_text)
+}
+
 /// Record a failed run + log to `errors`. Best-effort: a follow-up failure here
 /// must not shadow the original error the caller is about to report.
 async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: i64) {
@@ -840,6 +929,43 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
         record_result
     })
     .await;
+}
+
+/// Token telemetry is best-effort and intentionally independent from collector
+/// findings and lifecycle records.
+async fn record_token_usage(request: &CollectionRequest, usage: super::runner::TokenUsage) {
+    let db_path = request.db_path.clone();
+    let task_ids: Vec<i64> = request.task_id.into_iter().collect();
+    let pr_number = request.pr_number;
+    let provider = request.collector_provider.clone();
+    let model = request.collector_model.clone();
+    let effort = request.collector_effort.clone();
+    match tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        let usage = super::runner::try_durable_token_usage(usage)
+            .map_err(|error| QuorumError::Io(format!("invalid token telemetry: {error}")))?;
+        quorum_core::token_usage::record(
+            &mut conn,
+            None,
+            "collector",
+            &task_ids,
+            Some(pr_number),
+            &provider,
+            &model,
+            &effort,
+            usage,
+            clock::now(),
+        )?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("quorum collector: token usage write failed (ignored): {error}")
+        }
+        Err(error) => eprintln!("quorum collector: token usage join failed (ignored): {error}"),
+    }
 }
 
 /// Deterministically fetch every input the classifier will read. Failures at
@@ -1122,7 +1248,7 @@ async fn run_gh_raw(
 async fn spawn_and_run_classifier(
     request: &CollectionRequest,
     inputs: &CollectorInputs,
-) -> Result<String> {
+) -> Result<ClassifierTurnOutcome> {
     let prompt = review_findings::build_collector_prompt(inputs);
     let mut proc = RunnerProc::launch(
         &LaunchRequest {
@@ -1147,6 +1273,7 @@ async fn spawn_and_run_classifier(
 
     let deadline = tokio::time::Instant::now() + CLASSIFIER_TIMEOUT;
     let mut response_text = String::new();
+    let mut usage_total = super::runner::TokenUsage::default();
     let outcome: Result<String> = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -1165,10 +1292,17 @@ async fn spawn_and_run_classifier(
                 for event in line.events {
                     match event {
                         AgentEvent::AssistantText { text } => response_text.push_str(&text),
-                        AgentEvent::TurnCompleted { .. } => {
+                        AgentEvent::CompletedAssistantText { text, .. } => response_text = text,
+                        AgentEvent::TurnCompleted { usage, .. } => {
+                            if let Some(usage) = usage {
+                                usage_total.saturating_add_assign(usage);
+                            }
                             terminal = Some(Ok(response_text.clone()))
                         }
-                        AgentEvent::TurnFailed { message, .. } => {
+                        AgentEvent::TurnFailed { message, usage, .. } => {
+                            if let Some(usage) = usage {
+                                usage_total.saturating_add_assign(usage);
+                            }
                             let message = line.terminal_text.as_deref().unwrap_or(&message);
                             terminal = Some(Err(QuorumError::Io(format!(
                                 "classifier returned an error: {message}"
@@ -1199,8 +1333,41 @@ async fn spawn_and_run_classifier(
         }
     };
 
-    proc.kill_and_reap().await;
-    outcome
+    // Reaping can drain a terminal event raced by the timeout. It remains
+    // lifecycle-inert, but its usage is still durable telemetry.
+    let kind = proc.kind();
+    let terminal = proc.kill_and_reap().await;
+    Ok(finalize_classifier_turn(
+        kind,
+        terminal,
+        outcome,
+        usage_total,
+    ))
+}
+
+fn finalize_classifier_turn(
+    kind: AgentKind,
+    terminal: Vec<super::runner::CapturedOutput>,
+    response: Result<String>,
+    mut usage: super::runner::TokenUsage,
+) -> ClassifierTurnOutcome {
+    for captured in terminal {
+        let super::runner::CapturedOutput::Stdout(raw_line) = captured else {
+            continue;
+        };
+        for event in super::runner::normalize_line(kind, &raw_line) {
+            match event {
+                AgentEvent::TurnCompleted {
+                    usage: Some(value), ..
+                }
+                | AgentEvent::TurnFailed {
+                    usage: Some(value), ..
+                } => usage.saturating_add_assign(value),
+                _ => {}
+            }
+        }
+    }
+    ClassifierTurnOutcome { response, usage }
 }
 
 /// Spawn a detached collection task from the daemon merge branch. Never awaits.
@@ -1290,6 +1457,76 @@ mod tests {
         s.push_str(&"b".repeat(100));
         let out = truncate(&s); // must not panic
         assert!(out.contains("truncated"));
+    }
+
+    #[test]
+    fn timeout_boundary_reap_retains_terminal_usage() {
+        let outcome = finalize_classifier_turn(
+            AgentKind::Claude,
+            vec![super::super::runner::CapturedOutput::Stdout(
+                r#"{"type":"result","result":"late","is_error":false,"usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":10,"output_tokens":5}}"#
+                    .into(),
+            )],
+            Err(QuorumError::Io("classifier timeout for PR #464".into())),
+            super::super::runner::TokenUsage::default(),
+        );
+
+        assert!(matches!(
+            outcome.response,
+            Err(QuorumError::Io(ref message)) if message.contains("timeout")
+        ));
+        assert_eq!(
+            outcome.usage,
+            super::super::runner::TokenUsage {
+                input_tokens: 100,
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 0,
+            },
+            "terminal usage raced by the timeout must survive final reap"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflowing_collector_usage_is_ignored_without_a_negative_row() {
+        let (_dir, db_path) = tmp_conn();
+        let request = CollectionRequest::new(
+            464,
+            None,
+            None,
+            db_path.clone(),
+            std::env::current_dir().unwrap(),
+            None,
+            true,
+        )
+        .with_collector(
+            "codex",
+            "codex",
+            "gpt-5.6-terra",
+            "medium",
+            "danger-full-access",
+        );
+
+        record_token_usage(
+            &request,
+            super::super::runner::TokenUsage {
+                output_tokens: u64::MAX,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let conn = db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_usage_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+            "collector overflow must fail inside the best-effort boundary"
+        );
     }
 
     #[tokio::test]
@@ -1557,6 +1794,87 @@ mod tests {
         inputs: &CollectorInputs,
     ) -> Result<ValidatedCollectorResponse> {
         parse_and_validate_response(response, inputs, Some(7), "collector-model", "v-test")
+    }
+
+    async fn assert_parse_failure_is_recorded(
+        response_text: &str,
+        reason_substring: &str,
+        expected_shape: &str,
+    ) {
+        let (_dir, db_path) = tmp_conn();
+        let request = CollectionRequest::new(
+            52,
+            Some(7),
+            None,
+            db_path.clone(),
+            std::env::current_dir().unwrap(),
+            None,
+            true,
+        );
+        let parse_error = parse_fixture(response_text, &parser_inputs(&[10], &[])).unwrap_err();
+        assert!(parse_error.to_string().contains(reason_substring));
+
+        let returned = record_parse_failure(&request, response_text, &parse_error, 1000).await;
+        assert!(returned.to_string().contains(reason_substring));
+
+        let conn = db::open(&db_path).unwrap();
+        let run = review_findings::get_run(&conn, 52).unwrap().unwrap();
+        let error = run.error.as_deref().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.findings_count, 0);
+        assert!(error.contains(reason_substring));
+        assert!(error.contains(&format!("response len {}", response_text.len())));
+        assert!(
+            error.contains(expected_shape),
+            "unexpected failure detail: {error}"
+        );
+
+        let logged: String = conn
+            .query_row(
+                "SELECT detail FROM errors WHERE source='review-collector'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(logged, error);
+        assert!(review_findings::list_for_pr(&conn, 52).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_failure_records_non_json_reason_and_shape() {
+        assert_parse_failure_is_recorded(
+            "I could not produce the requested response.",
+            "collector response is not a JSON object",
+            "trimmed_starts_with_object=false, json_fence_present=false, \
+             code_fence_present=false, json_extracted=false",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parse_failure_records_invalid_json_reason_and_shape() {
+        assert_parse_failure_is_recorded(
+            r#"{"findings":[],"followup_artifacts":[]"#,
+            "invalid collector response:",
+            "trimmed_starts_with_object=true, json_fence_present=false, \
+             code_fence_present=false, json_extracted=true",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parse_failure_records_validation_reason_and_fenced_shape() {
+        let response_text = format!(
+            "```json\n{}\n```",
+            response(vec![finding("invalid-kind", 10)], vec![])
+        );
+        assert_parse_failure_is_recorded(
+            &response_text,
+            "invalid collector finding kind: invalid-kind",
+            "trimmed_starts_with_object=false, json_fence_present=true, \
+             code_fence_present=true, json_extracted=true",
+        )
+        .await;
     }
 
     #[test]

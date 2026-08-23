@@ -10,10 +10,22 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
+}
+
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
 }
 
 fn init_git_repo(dir: &std::path::Path) {
@@ -179,6 +191,37 @@ fn runner_hold_pipe() -> (File, File) {
     unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
 }
 
+fn linux_proc_stat_state(stat: &str) -> Option<u8> {
+    // The command name is parenthesized and may itself contain `)`, so parse
+    // from the final delimiter before the one-byte process state.
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.as_bytes().first().copied())
+}
+
+fn process_has_finished_execution(pid: libc::pid_t) -> bool {
+    if unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                // The preflight test supervisor is a child subreaper. An
+                // exited provider can therefore remain here as its zombie
+                // until the test binary exits and the supervisor reaps it.
+                return matches!(linux_proc_stat_state(&stat), Some(b'Z' | b'X'));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => {}
+        }
+    }
+
+    false
+}
+
 struct ServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
@@ -274,6 +317,7 @@ enum ParkedRemoteState {
 struct ParkedPublicationFixture {
     pr: i64,
     remote_state: ParkedRemoteState,
+    target_branch: &'static str,
 }
 
 impl Case {
@@ -354,6 +398,24 @@ impl Case {
             Some(ParkedPublicationFixture {
                 pr: 10,
                 remote_state,
+                target_branch: "main",
+            }),
+            None,
+        )
+    }
+
+    fn start_targeted_parked_publication() -> Self {
+        Self::start_with_pr_assignment(
+            "codex",
+            "gpt-5.6-terra",
+            None,
+            None,
+            None,
+            None,
+            Some(ParkedPublicationFixture {
+                pr: 10,
+                remote_state: ParkedRemoteState::ExpectedHead,
+                target_branch: "develop",
             }),
             None,
         )
@@ -415,6 +477,9 @@ impl Case {
             let pr_string = pr.to_string();
             create.args(["--continue-pr", &pr_string]);
         }
+        if let Some(fixture) = parked_publication {
+            create.args(["--base-branch", fixture.target_branch]);
+        }
         assert!(create.status().unwrap().success());
         let db_path = home.path().join("repos/test__repo/quorum.db");
         let mut conn = quorum_core::db::open(&db_path).unwrap();
@@ -463,6 +528,23 @@ impl Case {
                 .status()
                 .unwrap()
                 .success());
+            if fixture.target_branch != "main" {
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "branch", fixture.target_branch])
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "fetch", "origin"])
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "checkout", fixture.target_branch])
+                    .status()
+                    .unwrap()
+                    .success());
+            }
             let head_ref = format!("parked-pr-{}", fixture.pr);
             assert!(Command::new("git")
                 .args(["-C", &repo_path, "checkout", "-b", &head_ref])
@@ -582,6 +664,7 @@ impl Case {
                     "local_sha": stale_delivery,
                     "pr": fixture.pr,
                     "stage": "intent",
+                    "target_branch": fixture.target_branch,
                     "expected_remote_sha": expected_sha,
                 }
             });
@@ -687,6 +770,11 @@ impl Case {
                 format!("parked-pr-{}", fixture.pr),
             )
             .unwrap();
+            std::fs::write(
+                gh_state.join(format!("base-{}", fixture.pr)),
+                fixture.target_branch,
+            )
+            .unwrap();
         }
         let gh_path = gh_shim.path().join("gh");
         std::fs::write(
@@ -783,7 +871,7 @@ fi
                 "--merge-checks-timeout-secs",
                 "10",
                 "--merge-checks-poll-secs",
-                "1",
+                "30",
                 "--exit-when-gone",
                 &sentinel.path().to_string_lossy(),
             ]);
@@ -920,7 +1008,7 @@ fi
                 "--merge-checks-timeout-secs",
                 "10",
                 "--merge-checks-poll-secs",
-                "1",
+                "30",
                 "--exit-when-gone",
                 &sentinel.path().to_string_lossy(),
             ]);
@@ -952,23 +1040,26 @@ fi
     }
 
     fn done(&self, agent: &str, args: &[&str]) {
-        let mut conn = self.db();
-        let run_id = match quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
-            Some(cap) => cap.run_id,
-            None => {
-                let run_id = format!("test-{agent}-{}", std::process::id());
-                let role = if args.contains(&"--verdict") {
-                    "reviewer"
-                } else {
-                    "worker"
-                };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
-                quorum_core::capabilities::issue(&mut conn, &run_id, 1, agent, role, now).unwrap();
-                run_id
+        let role = if args.contains(&"--verdict") {
+            "reviewer"
+        } else {
+            "worker"
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let run_id = loop {
+            let conn = self.db();
+            if let Some(cap) = quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
+                if cap.role == role
+                    && quorum_core::capabilities::resolve_live_run_context(&conn, &cap.run_id, role)
+                        .is_ok()
+                {
+                    break cap.run_id;
+                }
             }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for live {role} run capability for {agent}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
         };
         let mut command = Command::new(cargo_bin("quorum"));
         let mut done_args = Vec::new();
@@ -985,6 +1076,7 @@ fi
         command
             .env("QUORUM_HOME", self.home.path())
             .env("QUORUM_REPO", "test/repo")
+            .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(self.home.path()))
             .env("QUORUM_RUN_ID", run_id)
             .args(["done", "--agent", agent])
             .args(done_args);
@@ -994,6 +1086,36 @@ fi
             "done failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Append a Done row for recovery tests that intentionally signal while
+    /// the endpoint is unavailable or the pre-restart capability is revoked.
+    fn append_done(&self, agent: &str, args: &[&str]) {
+        let value = |flag| {
+            args.iter()
+                .zip(args.iter().skip(1))
+                .find(|(key, _)| **key == flag)
+                .map(|(_, value)| *value)
+        };
+        let blocking =
+            value("--blocking").map(|raw| raw.parse::<u32>().expect("--blocking must be a number"));
+        let verdict = value("--verdict");
+        let row = quorum_core::mailbox::MailboxRow {
+            agent: agent.to_string(),
+            kind: quorum_core::mailbox::MailboxKind::Done,
+            task_id: Some(1),
+            pr: verdict
+                .is_some()
+                .then(|| value("--pr"))
+                .flatten()
+                .map(|raw| raw.parse::<i64>().expect("--pr must be a number")),
+            verdict: verdict.map(str::to_string),
+            feedback: value("--feedback").map(str::to_string),
+            note: None,
+            to_agent: None,
+            payload: blocking.map(|count| format!(r#"{{"blocking":{count}}}"#)),
+        };
+        quorum_core::mailbox::append(&mut self.db(), &row).unwrap();
     }
 
     fn retry_parked(&self) {
@@ -1237,6 +1359,37 @@ fn parked_rework_publication_retry_recovers_already_published_source() {
     assert_parked_rework_retry_publishes_from(ParkedRemoteState::PublishedSource);
 }
 
+#[cfg(unix)]
+#[test]
+fn targeted_parked_rework_retry_uses_task_target_before_worker_provisioning() {
+    let mut case = Case::start_targeted_parked_publication();
+    case.handle.wait_for("worktree provisioned");
+    case.handle.wait_for("turn");
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    assert_eq!(task.target_branch.as_deref(), Some("develop"));
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_rework_retry_requested"], true);
+    assert!(refs.get("daemon_parked").is_none());
+    let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+    assert_eq!(target.head_ref, "parked-pr-10");
+    let journal_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM journal WHERE task_id=1 AND role='worker'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        journal_rows, 1,
+        "targeted retry must reach worker provisioning"
+    );
+    drop(conn);
+    case.handle.stop_mut();
+}
+
 #[test]
 fn parked_rework_publication_retry_parks_when_remote_head_moved() {
     let mut case = Case::start_parked_publication(ParkedRemoteState::UnrelatedHead);
@@ -1445,14 +1598,20 @@ fn dropping_serve_handle_releases_sticky_codex_runner() {
         "sticky Codex runner cleanup after ServeHandle drop",
         Duration::from_secs(5),
         || {
-            if unsafe { libc::kill(runner_pid, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
+            if process_has_finished_execution(runner_pid) {
                 WaitState::Ready(())
             } else {
-                WaitState::Pending(format!("runner PID {runner_pid} is still alive"))
+                WaitState::Pending(format!("runner PID {runner_pid} is still executing"))
             }
         },
+    );
+}
+
+#[test]
+fn linux_proc_stat_state_uses_the_final_command_delimiter() {
+    assert_eq!(
+        linux_proc_stat_state("12477 (fake) runner) Z 1 2 3"),
+        Some(b'Z')
     );
 }
 
@@ -1503,7 +1662,7 @@ fn restart_recovery_retains_journal_pr_when_worker_omits_pr() {
     // Crash before the worker signal is observed. Startup must recover the
     // exact journal identity even though the durable mailbox row has no PR.
     case.handle.crash_mut();
-    case.done(&worker, &[]);
+    case.append_done(&worker, &[]);
     case.restart_after_stop("codex", "gpt-5.6-terra", None);
     case.handle.wait_for("startup worker recovery: folded");
 
@@ -1879,7 +2038,7 @@ fn changed_worker_routing_remediation_resumes_original_worker_layout() {
     case.handle
         .wait_for(&format!("worker {original_worker} result"));
     let original_thread = format!("thread-{original_worker}");
-    case.done(&original_worker, &["--pr", "1"]);
+    case.append_done(&original_worker, &["--pr", "1"]);
 
     case.handle.wait_for("spawning reviewer ");
     let reviewer = case.handle.agent_after("spawning reviewer ");
@@ -1904,7 +2063,7 @@ fn changed_worker_routing_remediation_resumes_original_worker_layout() {
         "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
     ));
     case.handle.wait_for(&format!("reviewer {reviewer} result"));
-    case.done(
+    case.append_done(
         &reviewer,
         &[
             "--pr",
@@ -1958,7 +2117,7 @@ fn changed_worker_routing_remediation_resumes_original_worker_layout() {
     );
     drop(conn);
 
-    case.done(&remediation, &["--pr", "1"]);
+    case.append_done(&remediation, &["--pr", "1"]);
     case.handle.wait_for("lifecycle: task #1 -> in-review");
     case.handle.stop();
 }

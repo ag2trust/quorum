@@ -138,6 +138,8 @@ repo_dir = "{repo_dir}"
 worktree_base = "{wt_base}"
 cap = 8
 max_turn_wall_secs = 2700
+base_branch = "develop"
+self_update_branch = "main"
 {ROUTING_POLICY}
 "#,
             repo_dir = repo_dir.path().to_string_lossy(),
@@ -211,10 +213,14 @@ max_turn_wall_secs = 2700
         stderr_text.contains("max_idle_secs:             2700 (file)"),
         "deprecated max_turn_wall_secs should resolve as max_idle_secs:\n{stderr_text}"
     );
-    // base_branch defaults
+    // Task/PR and self-update branches resolve independently from the file.
     assert!(
-        stderr_text.contains("main (default)"),
-        "base_branch should show 'main (default)':\n{stderr_text}"
+        stderr_text.contains("base_branch:               develop (file)"),
+        "base_branch should show 'develop (file)':\n{stderr_text}"
+    );
+    assert!(
+        stderr_text.contains("self_update_branch:        main (file)"),
+        "self_update_branch should show 'main (file)':\n{stderr_text}"
     );
 
     // Clean shutdown
@@ -239,6 +245,21 @@ max_turn_wall_secs = 2700
             }
         }
     }
+}
+
+#[test]
+fn serve_accepts_self_update_branch_flag() {
+    let output = Command::new(cargo_bin())
+        .args(["serve", "--self-update-branch", "main"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument '--self-update-branch'"),
+        "self-update branch flag should parse before configuration validation: {stderr}"
+    );
 }
 
 #[test]
@@ -280,6 +301,39 @@ fn serve_config_rejects_unknown_keys() {
         stderr.contains("typo_key"),
         "error should name the unknown key: {stderr}"
     );
+}
+
+#[test]
+fn serve_config_rejects_external_poll_intervals_below_30_seconds() {
+    let home = tempfile::tempdir().unwrap();
+
+    for key in ["merge_checks_poll_secs", "sha_poll_interval_secs"] {
+        let config_path = home.path().join(format!("{key}.toml"));
+        std::fs::write(&config_path, format!("{key} = 10\n{ROUTING_POLICY}")).unwrap();
+
+        let output = Command::new(cargo_bin())
+            .env("QUORUM_HOME", home.path())
+            .args([
+                "serve",
+                "--config",
+                &config_path.to_string_lossy(),
+                "--repo",
+                "test/repo",
+                "--repo-dir",
+                "/tmp/x",
+                "--worktree-base",
+                "/tmp/y",
+            ])
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(2), "{key}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("{key} must be at least 30 seconds")),
+            "{key}: {output:?}"
+        );
+    }
 }
 
 #[test]
@@ -510,6 +564,7 @@ fn serve_config_default_path_loaded() {
             r#"
 repo_dir = "{repo_dir}"
 worktree_base = "{wt_base}"
+base_branch = "develop"
 {ROUTING_POLICY}
 "#,
             repo_dir = repo_dir.path().to_string_lossy(),
@@ -550,6 +605,14 @@ worktree_base = "{wt_base}"
     assert!(
         stderr_text.contains("model_profiles:            2"),
         "routing policy should come from auto-discovered config:\n{stderr_text}"
+    );
+    assert!(
+        stderr_text.contains("base_branch:               develop (file)"),
+        "base_branch should come from the config file:\n{stderr_text}"
+    );
+    assert!(
+        stderr_text.contains("self_update_branch:        develop (file)"),
+        "self_update_branch should inherit the resolved base_branch when omitted:\n{stderr_text}"
     );
 
     drop(sentinel);

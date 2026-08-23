@@ -100,6 +100,118 @@ fail() { printf '\nPREFLIGHT: FAIL (%s)\n' "$1"; exit 1; }
 TIMING_DIR=target/preflight-timing
 TIMING_ARTIFACT="$TIMING_DIR/timing.json"
 TIMING_SUMMARY="$TIMING_DIR/summary.txt"
+GREEN_CACHE="$TIMING_DIR/last-green.json"
+
+# Gates 2-4 are expensive but purely a function of the working tree.  Keep
+# their cache deliberately local to target/: the branch-base gate still runs
+# on every full invocation because origin/main can advance independently.
+#
+# The fingerprint includes tracked state plus both ordinary and ignored
+# untracked inputs.  target/ is the one intentional exception: it contains
+# Cargo's generated outputs and this cache itself, neither of which is an
+# author input to the gates.  If anything about collection is uncertain, the
+# caller treats it as a cache miss and runs the gates.
+working_tree_fingerprint() {
+  python3 - <<'PY'
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+
+def git(*args):
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    return subprocess.check_output(
+        ["git", *args], stderr=subprocess.DEVNULL, env=environment
+    )
+
+def add(hasher, label, value):
+    hasher.update(label)
+    hasher.update(len(value).to_bytes(8, "big"))
+    hasher.update(value)
+
+try:
+    head = git("rev-parse", "--verify", "HEAD^{commit}")
+    status = git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    diff = git(
+        "-c", "core.quotepath=false",
+        "-c", "diff.autoRefreshIndex=false",
+        "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD",
+    )
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z")
+    ignored = git("ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+
+    paths = set(untracked.split(b"\0")[:-1]) | set(ignored.split(b"\0")[:-1])
+    hasher = hashlib.sha256()
+    add(hasher, b"HEAD\0", head)
+    add(hasher, b"STATUS\0", status)
+    add(hasher, b"DIFF\0", diff)
+    for path in sorted(path for path in paths if path != b"target" and not path.startswith(b"target/")):
+        metadata = os.lstat(path)
+        add(hasher, b"PATH\0", path)
+        add(hasher, b"MODE\0", str(stat.S_IMODE(metadata.st_mode)).encode())
+        if stat.S_ISREG(metadata.st_mode):
+            with open(path, "rb") as source:
+                add(hasher, b"FILE\0", source.read())
+        elif stat.S_ISLNK(metadata.st_mode):
+            add(hasher, b"LINK\0", os.readlink(path))
+        else:
+            raise RuntimeError(f"unsupported untracked input: {path!r}")
+except BaseException as error:
+    print(f"preflight.sh: cannot fingerprint working tree: {error}", file=sys.stderr)
+    sys.exit(1)
+
+print(hasher.hexdigest())
+PY
+}
+
+has_green_cache() {
+  python3 - "$GREEN_CACHE" "$1" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        cached = json.load(source)
+    if (
+        not isinstance(cached, dict)
+        or set(cached) != {"exit", "fingerprint"}
+        or type(cached["exit"]) is not int
+        or cached["exit"] != 0
+        or type(cached["fingerprint"]) is not str
+        or cached["fingerprint"] != sys.argv[2]
+    ):
+        raise ValueError("cache entry is not an exact green fingerprint")
+except BaseException:
+    sys.exit(1)
+PY
+}
+
+write_green_cache() {
+  python3 - "$GREEN_CACHE" "$1" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+cache = sys.argv[1]
+directory = os.path.dirname(cache)
+os.makedirs(directory, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=".last-green.", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        json.dump({"exit": 0, "fingerprint": sys.argv[2]}, output, sort_keys=True)
+        output.write("\n")
+    os.replace(temporary, cache)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
 
 monotonic_now() {
   python3 -c 'import time; print(time.monotonic())'
@@ -160,6 +272,88 @@ for gate in json.load(open(sys.argv[1])).get("gates", []):
 PY
 }
 
+test_execution_summary() {
+  python3 - "$TIMING_ARTIFACT" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+binaries = data.get("test_binaries")
+if not isinstance(binaries, list):
+    raise ValueError("timing artifact has no test-binaries list")
+
+cached = sum(binary.get("cached") is True for binary in binaries)
+executed = sum(
+    binary.get("cached") is not True and "execute_exit_code" in binary
+    for binary in binaries
+    if isinstance(binary, dict)
+)
+print(f"{executed} test binaries executed, {cached} cached")
+PY
+}
+
+# Print the number of changed files only when every change is inert.  This is
+# intentionally byte-oriented: Git paths need not be valid UTF-8, and a
+# malformed status or diff query must leave the caller on the full-gate path.
+inert_diff_file_count() {
+  python3 - "$1" <<'PY'
+import subprocess
+import sys
+
+base = sys.argv[1]
+
+try:
+    committed = subprocess.check_output(
+        ["git", "-c", "diff.renames=false", "diff", "--name-only", "-z", f"{base}...HEAD"],
+        stderr=subprocess.DEVNULL,
+    ).split(b"\0")[:-1]
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all", "-z"],
+        stderr=subprocess.DEVNULL,
+    ).split(b"\0")
+except BaseException:
+    sys.exit(1)
+
+paths = set(committed)
+index = 0
+try:
+    while index < len(status) - 1:
+        record = status[index]
+        index += 1
+        if len(record) < 4 or record[2:3] != b" ":
+            raise ValueError("malformed porcelain record")
+        paths.add(record[3:])
+        # In -z porcelain output, a rename/copy's source path is the next
+        # record. Both sides must be inert before the Cargo gates may skip.
+        if record[:1] in (b"R", b"C") or record[1:2] in (b"R", b"C"):
+            paths.add(status[index])
+            index += 1
+except (IndexError, ValueError):
+    sys.exit(1)
+
+def inert(path):
+    # Build inputs always run the full gates, even under an otherwise inert
+    # directory or behind a root-document prefix.
+    basename = path.rpartition(b"/")[2]
+    if path.endswith(b".rs") or basename in (b"Cargo.toml", b"Cargo.lock"):
+        return False
+    return (
+        path.startswith(b"docs/")
+        or path.startswith(b".github/")
+        or (b"/" not in path and (
+            path.endswith(b".md")
+        ))
+        or (b"/" not in path and (
+            path.startswith(b"LICENSE") or path.startswith(b"README")
+        ))
+    )
+
+if not paths or not all(inert(path) for path in paths):
+    sys.exit(1)
+print(len(paths))
+PY
+}
+
 # --- Gate 1: branch base ------------------------------------------------------
 printf '=== preflight 1/4: branch base ===\n'
 if [ "$QUICK" -eq 0 ]; then
@@ -175,6 +369,7 @@ git rev-parse --verify --quiet origin/main >/dev/null \
   || fail "origin/main not found — missing remote-tracking ref; gate cannot run"
 BASE_REF=origin/main
 INTEGRATION=0
+INERT_DIFF_BASE=
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 TIP=HEAD
 if [ "$PROPOSED_SET" -eq 1 ]; then
@@ -287,6 +482,12 @@ else
   fi
   printf 'branch base OK (%s session(s) ahead of %s)\n' "$N_SESSIONS" "$BASE_REF"
 fi
+if [ "$INTEGRATION" -eq 0 ] && [ -z "$CONTINUATION_FROM" ] \
+  && [ -z "$CONFIGURED_CONTINUATION_FROM" ]; then
+  # Continuations and integrations compare compound histories; keep their
+  # existing full-suite behavior rather than trying to infer a safe diff base.
+  INERT_DIFF_BASE=$BASE_REF
+fi
 fi
 
 # --- Gate 2: cargo fmt --------------------------------------------------------
@@ -300,6 +501,7 @@ fi
 
 # --- Gates 2-4: timing collector ---------------------------------------------
 TEST_THREADS="${RUST_TEST_THREADS:-4}"
+TEST_JOBS="${PREFLIGHT_TEST_JOBS:-2}"
 BRANCH_BASE_DURATION=$(python3 - "$BRANCH_BASE_STARTED" <<'PY'
 import sys
 import time
@@ -307,8 +509,29 @@ print(time.monotonic() - float(sys.argv[1]))
 PY
 ) || fail "finish branch-base timer"
 
+FULL_GATE_FINGERPRINT=
+if FULL_GATE_FINGERPRINT=$(working_tree_fingerprint); then
+  if has_green_cache "$FULL_GATE_FINGERPRINT"; then
+    printf '\nPREFLIGHT: PASS (cached — tree unchanged since last green run)\n'
+    exit 0
+  fi
+else
+  printf 'preflight.sh: fingerprint unavailable; running full gates\n' >&2
+fi
+
+if [ -n "$INERT_DIFF_BASE" ] \
+  && INERT_DIFF_FILE_COUNT=$(inert_diff_file_count "$INERT_DIFF_BASE"); then
+  printf '=== preflight 2/4: cargo fmt --all -- --check ===\n'
+  cargo fmt --all -- --check || fail "cargo fmt"
+  printf 'PREFLIGHT: skipping clippy + test — diff is docs/config-only (%s files)\n' \
+    "$INERT_DIFF_FILE_COUNT"
+  printf '\nPREFLIGHT: PASS (fmt green; clippy + test skipped)\n'
+  exit 0
+fi
+
 printf '=== preflight 2-4: timing collector (fmt, clippy, compile/no-run, test execution) ===\n'
-if scripts/preflight/timing.sh --test-threads "$TEST_THREADS"; then
+if scripts/preflight/timing.sh \
+  --test-jobs "$TEST_JOBS" --test-threads "$TEST_THREADS"; then
   record_branch_base_timing "$BRANCH_BASE_DURATION" \
     || fail "publish branch-base timing"
 else
@@ -335,4 +558,19 @@ else
   esac
 fi
 
-printf '\nPREFLIGHT: PASS (all 4 gates green)\n'
+if [ -n "$FULL_GATE_FINGERPRINT" ]; then
+  if FINAL_FINGERPRINT=$(working_tree_fingerprint); then
+    if [ "$FINAL_FINGERPRINT" = "$FULL_GATE_FINGERPRINT" ]; then
+      write_green_cache "$FINAL_FINGERPRINT" \
+        || printf 'preflight.sh: could not write green cache; next run will be full\n' >&2
+    else
+      printf 'preflight.sh: tree changed while gates ran; green cache not written\n' >&2
+    fi
+  else
+    printf 'preflight.sh: could not fingerprint green tree; cache not written\n' >&2
+  fi
+fi
+
+TEST_EXECUTION_SUMMARY=$(test_execution_summary) \
+  || fail "read test execution counts"
+printf '\nPREFLIGHT: PASS (all 4 gates green; %s)\n' "$TEST_EXECUTION_SUMMARY"

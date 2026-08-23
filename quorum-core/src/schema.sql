@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 51). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 59). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -111,7 +111,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- v47: daemon-owned terminal provenance. NULL deliberately preserves legacy/unknown
     -- completions without guessing whether a retained refs.pr actually merged.
     completion_provenance TEXT
-        CHECK (completion_provenance IS NULL OR completion_provenance IN ('merged','manual'))
+        CHECK (completion_provenance IS NULL OR completion_provenance IN ('merged','manual')),
+    -- v53: authoritative nullable target branch. Resolved to the daemon-configured
+    -- base before first execution; immutable once populated.
+    target_branch TEXT,
+    -- v56: nullable per-task rework ceiling. Stamped from the daemon's
+    -- `max_rework` config at first ownership; immutable once populated. NULL
+    -- means unstamped and falls back to the compiled REWORK_CAP, preserving
+    -- historic behaviour for existing rows.
+    rework_cap INTEGER
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 -- Bounded REVIEWING projection: each status is read newest-first, then at most two
@@ -180,6 +188,8 @@ CREATE TABLE IF NOT EXISTS task_decompositions (
     plan_revision           INTEGER NOT NULL DEFAULT 1,
     proposal_attempts       INTEGER NOT NULL DEFAULT 0,
     provider_failures       INTEGER NOT NULL DEFAULT 0,
+    operator_retry_count    INTEGER NOT NULL DEFAULT 0
+                                  CHECK(operator_retry_count BETWEEN 0 AND 2),
     planner_provider        TEXT,
     planner_model           TEXT,
     planner_session_id      TEXT,
@@ -221,8 +231,9 @@ CREATE TABLE IF NOT EXISTS decomposition_attempts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     graph_id         INTEGER NOT NULL REFERENCES task_decompositions(id),
     source_revision  INTEGER NOT NULL,
-    kind             TEXT NOT NULL CHECK(kind IN ('proposal','provider','blocker','recovery')),
+    kind             TEXT NOT NULL CHECK(kind IN ('proposal','provider','blocker','recovery','verdict')),
     ordinal          INTEGER NOT NULL,
+    retry_generation INTEGER NOT NULL DEFAULT 0 CHECK(retry_generation BETWEEN 0 AND 2),
     reason_code      TEXT NOT NULL,
     summary          TEXT NOT NULL,
     created_at       INTEGER NOT NULL,
@@ -457,7 +468,7 @@ CREATE TABLE IF NOT EXISTS role_assignments (
     task_id             INTEGER,
     pr_number           INTEGER,
     role                TEXT NOT NULL CHECK(role IN
-                            ('classifier','planner','worker','reviewer','collector')),
+                            ('classifier','planner','arbiter','worker','reviewer','collector')),
     review_stage        TEXT CHECK(review_stage IN ('r1','r2')),
     complexity          TEXT,
     profile_id          TEXT NOT NULL,
@@ -569,6 +580,39 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     role_assignment_id INTEGER REFERENCES role_assignments(id)
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
+
+-- Durable token telemetry for every model invocation. Managed worker/reviewer
+-- rows point at agent_runs; daemon classifier and post-merge collector rows do
+-- not need a synthetic agent identity. Task attribution is many-to-many because
+-- one classifier invocation may classify a batch of tasks. Sweep retains these
+-- rows for 30 days, including after their task row is reclaimed, then deletes
+-- mappings before runs because v1 intentionally has no foreign keys.
+CREATE TABLE IF NOT EXISTS token_usage_runs (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_run_id             INTEGER UNIQUE,
+    purpose                  TEXT NOT NULL CHECK(purpose IN ('worker','reviewer','classifier','collector','planner','arbiter')),
+    pr_number                INTEGER,
+    provider                 TEXT NOT NULL,
+    model                    TEXT NOT NULL,
+    effort                   TEXT NOT NULL,
+    uncached_input_tokens    INTEGER NOT NULL DEFAULT 0,
+    cached_input_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens            INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens         INTEGER NOT NULL DEFAULT 0,
+    recorded_at              INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS token_usage_runs_pr ON token_usage_runs(pr_number);
+CREATE INDEX IF NOT EXISTS token_usage_runs_recorded
+    ON token_usage_runs(recorded_at);
+
+CREATE TABLE IF NOT EXISTS token_usage_run_tasks (
+    run_id  INTEGER NOT NULL,
+    task_id INTEGER NOT NULL,
+    PRIMARY KEY (run_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS token_usage_run_tasks_task
+    ON token_usage_run_tasks(task_id);
 
 -- `activity_events`: one row per Claude PostToolUse hook firing. `agent_name`
 -- is resolved at insert time (NULL if the session isn't registered).
@@ -898,7 +942,9 @@ CREATE TABLE IF NOT EXISTS run_capabilities (
     run_id      TEXT PRIMARY KEY,
     task_id     INTEGER NOT NULL,
     agent       TEXT NOT NULL,
-    role        TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    -- v60 widened this to admit 'planner': a run capability issued to a planning-graph
+    -- planner ahead of a `submit_plan` MCP call. See the v60 migration in db.rs.
+    role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','planner')),
     created_at  INTEGER NOT NULL,
     revoked_at  INTEGER
 );
@@ -914,4 +960,16 @@ CREATE INDEX IF NOT EXISTS run_capabilities_agent ON run_capabilities(agent) WHE
 CREATE TABLE IF NOT EXISTS perf_watermark (
     id        INTEGER PRIMARY KEY CHECK (id = 1),
     watermark INTEGER NOT NULL
+);
+
+-- v59: planner `submit_plan` MCP tool storage. A row is created on the first
+-- `SubmitPlan` call for a planner run; `response_json` is set once (guarded
+-- UPDATE ... WHERE response_json IS NULL) so the first accepted submission
+-- stands. `rejections` bounds retries at MAX_PLAN_SUBMIT_REJECTIONS.
+CREATE TABLE IF NOT EXISTS planner_submissions (
+    run_id        TEXT PRIMARY KEY,
+    graph_id      INTEGER NOT NULL,
+    response_json TEXT,
+    rejections    INTEGER NOT NULL DEFAULT 0,
+    accepted_at   INTEGER
 );

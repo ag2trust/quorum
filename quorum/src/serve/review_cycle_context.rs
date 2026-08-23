@@ -4,8 +4,6 @@
 //! changes-to-rework transitions. It is not a review ordinal: the initial
 //! review happens before any such transition.
 
-use quorum_core::lifecycle::REWORK_CAP;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReviewCycleContext {
     /// The raw persisted count, retained so unexpected database values remain
@@ -19,8 +17,10 @@ pub struct ReviewCycleContext {
 }
 
 impl ReviewCycleContext {
-    pub fn from_persisted_rework_round(rework_round: i64) -> Self {
-        let rework_cap = REWORK_CAP;
+    /// Build from the persisted rework round and the task's effective rework
+    /// ceiling (stamped per task; callers pass `REWORK_CAP` when no per-task
+    /// value applies).
+    pub fn from_persisted_rework_round(rework_round: i64, rework_cap: u32) -> Self {
         Self {
             rework_round,
             rework_cap,
@@ -54,6 +54,7 @@ impl ReviewCycleContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quorum_core::lifecycle::REWORK_CAP;
 
     #[test]
     fn final_opportunity_uses_the_lifecycle_cap_at_all_boundaries() {
@@ -64,7 +65,7 @@ mod tests {
             (i64::from(REWORK_CAP) + 1, true),
             (-1, false),
         ] {
-            let context = ReviewCycleContext::from_persisted_rework_round(round);
+            let context = ReviewCycleContext::from_persisted_rework_round(round, REWORK_CAP);
             assert_eq!(context.rework_round, round);
             assert_eq!(context.rework_cap, REWORK_CAP);
             assert_eq!(context.final_opportunity, final_opportunity);
@@ -72,11 +73,26 @@ mod tests {
     }
 
     #[test]
+    fn final_opportunity_tracks_the_per_task_cap() {
+        // A task stamped with a higher cap is not on its final opportunity at the
+        // compiled default, only at its own cap — proving the passed cap is used.
+        let below = ReviewCycleContext::from_persisted_rework_round(i64::from(REWORK_CAP), 10);
+        assert_eq!(below.rework_cap, 10);
+        assert!(!below.final_opportunity);
+
+        let at_cap = ReviewCycleContext::from_persisted_rework_round(10, 10);
+        assert!(at_cap.final_opportunity);
+    }
+
+    #[test]
     fn prompt_contract_describes_transitions_not_review_ordinals() {
-        let initial = ReviewCycleContext::from_persisted_rework_round(0).prompt_contract();
-        let final_round = ReviewCycleContext::from_persisted_rework_round(i64::from(REWORK_CAP))
-            .prompt_contract();
-        let invalid = ReviewCycleContext::from_persisted_rework_round(-1).prompt_contract();
+        let initial =
+            ReviewCycleContext::from_persisted_rework_round(0, REWORK_CAP).prompt_contract();
+        let final_round =
+            ReviewCycleContext::from_persisted_rework_round(i64::from(REWORK_CAP), REWORK_CAP)
+                .prompt_contract();
+        let invalid =
+            ReviewCycleContext::from_persisted_rework_round(-1, REWORK_CAP).prompt_contract();
 
         assert!(initial.contains("0 completed changes-to-rework transitions"));
         assert!(initial.contains("not the final"));

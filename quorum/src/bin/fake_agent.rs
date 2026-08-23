@@ -23,8 +23,10 @@
 //!   then succeeds on subsequent turns. Used to test the daemon's error-refeed logic.
 
 use std::io::{self, BufRead, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
+
+const SUBMIT_ATTEMPTS: u32 = 3;
 
 fn emit_assistant(text: &str) {
     let msg = serde_json::json!({
@@ -163,6 +165,18 @@ fn quorum_bin_path() -> std::path::PathBuf {
     exe.parent().expect("exe has no parent dir").join("quorum")
 }
 
+fn retry_submit(mut submit: impl FnMut() -> bool, mut wait: impl FnMut(Duration)) -> bool {
+    for attempt in 1..=SUBMIT_ATTEMPTS {
+        if submit() {
+            return true;
+        }
+        if attempt < SUBMIT_ATTEMPTS {
+            wait(Duration::from_millis(250 * u64::from(attempt)));
+        }
+    }
+    false
+}
+
 fn run_quorum_submit() {
     let agent = match std::env::var("QUORUM_AGENT") {
         Ok(a) => a,
@@ -172,19 +186,21 @@ fn run_quorum_submit() {
         }
     };
     let bin = quorum_bin_path();
-    let status = Command::new(&bin)
-        .args(["submit", "--agent", &agent])
-        .status();
-    match status {
-        Ok(s) if s.success() => {
-            eprintln!("fake-agent: quorum submit succeeded for {agent}");
-        }
-        Ok(s) => {
-            eprintln!("fake-agent: quorum submit exited {s} for {agent}");
-        }
-        Err(e) => {
-            eprintln!("fake-agent: quorum submit failed to run: {e}");
-        }
+    let submitted = retry_submit(
+        || {
+            Command::new(&bin)
+                .args(["submit", "--agent", &agent])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        },
+        std::thread::sleep,
+    );
+    if submitted {
+        eprintln!("fake-agent: quorum submit succeeded for {agent}");
+    } else {
+        eprintln!("fake-agent: quorum submit failed after {SUBMIT_ATTEMPTS} attempts");
     }
 }
 
@@ -295,10 +311,34 @@ fn main() {
         cumulative_cost += (input_tokens + output_tokens) as f64 * cost_per_token;
 
         let is_error = error_result_count > 0 && turn <= error_result_count;
-        emit_result(turn, cumulative_cost, is_error);
-
         if side_effects && turn == 1 {
             run_quorum_submit();
         }
+        emit_result(turn, cumulative_cost, is_error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_side_effect_retries_with_bounded_backoff() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let submitted = retry_submit(
+            || {
+                attempts += 1;
+                attempts == SUBMIT_ATTEMPTS
+            },
+            |duration| waits.push(duration),
+        );
+
+        assert!(submitted);
+        assert_eq!(attempts, SUBMIT_ATTEMPTS);
+        assert_eq!(
+            waits,
+            [Duration::from_millis(250), Duration::from_millis(500)]
+        );
     }
 }

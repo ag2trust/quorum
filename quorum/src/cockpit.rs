@@ -543,9 +543,20 @@ fn render_decomposition(
     );
     let _ = writeln!(
         w,
-        "      attempts proposal={}/3 provider={}/3",
-        graph.proposal_attempts, graph.provider_failures
+        "      attempts proposal={}/3 provider={}/3 operator-retries={}/{}",
+        graph.proposal_attempts,
+        graph.provider_failures,
+        graph.operator_retry_count,
+        graph.operator_retry_cap,
     );
+    if let Some(code) = &graph.hold_code {
+        let disposition = if graph.retryable_planning_hold {
+            "retryable with task-retry"
+        } else {
+            "not retryable"
+        };
+        let _ = writeln!(w, "      planning-hold: {code} ({disposition})");
+    }
     if let Some(hold) = &graph.dispatch_hold {
         let _ = writeln!(
             w,
@@ -809,6 +820,10 @@ mod tests {
             ),
             proposal_attempts: 2,
             provider_failures: 1,
+            hold_code: Some("graph-blocked".into()),
+            retryable_planning_hold: false,
+            operator_retry_count: 0,
+            operator_retry_cap: 2,
             planner_provider: Some("codex".into()),
             planner_model: Some("gpt-5.6-sol".into()),
             accepted_plan_revision: Some(3),
@@ -831,7 +846,8 @@ mod tests {
         assert!(output.contains("DECOMPOSITION"));
         assert!(output.contains("source #40"));
         assert!(output.contains("children=1/2"));
-        assert!(output.contains("proposal=2/3 provider=1/3"));
+        assert!(output.contains("proposal=2/3 provider=1/3 operator-retries=0/2"));
+        assert!(output.contains("planning-hold: graph-blocked (not retryable)"));
         assert!(output.contains("hold: implementation dispatch held: graph state=blocked"));
         assert!(output.contains("#42") && output.contains("deps #41"));
         assert!(output.contains("blocker: child failed review"));
@@ -1024,6 +1040,7 @@ mod tests {
             status: "done".into(),
             pr: Some(42),
             blocked: false,
+            arbiter: None,
         };
         let (icon, label) = pipeline_state(&done, &sty);
         assert_eq!(icon, "[merged]");
@@ -1038,6 +1055,7 @@ mod tests {
             status: "working".into(),
             pr: Some(99),
             blocked: false,
+            arbiter: None,
         };
         let (icon, _) = pipeline_state(&pending, &sty);
         assert_eq!(icon, "[working]");

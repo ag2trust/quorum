@@ -9,8 +9,9 @@
 //! merges the PR (both R1+R2 approved for same head), returns it to review
 //! (head moved or missing verdict), or refuses it (self-review / not attested).
 //!
-//! Merge is authorized only when R1=approved AND R2=approved, both attest
-//! blocking=0, and both reviewed the current head SHA.
+//! Merge is authorized only when R1 is approved, the daemon-owned sampled-R2
+//! decision is present for the exact task/PR/head, every role it requires is
+//! approved with blocking=0 for that head, and no retained row is rejected.
 //!
 //! Deleted on the terminal transition (merge / demote / reject) so the table
 //! only ever holds live verdict records.

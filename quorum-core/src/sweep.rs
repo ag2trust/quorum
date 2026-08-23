@@ -11,6 +11,10 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 /// Done tasks are reclaimed this long after entering `done`. Default; Phase 6 config overrides.
 pub const DONE_TASK_TTL_SECS: i64 = 7 * 24 * 3600;
 
+/// Durable token telemetry outlives task reclamation and is physically swept
+/// after a bounded retention window.
+pub const TOKEN_USAGE_RETENTION_SECS: i64 = 30 * 24 * 3600;
+
 /// Max rows reclaimed per table by an opportunistic sweep-on-write.
 pub const SWEEP_LIMIT: usize = 100;
 
@@ -171,6 +175,64 @@ fn delete_bounded(conn: &Connection, table: &str, now: i64, limit: usize) -> Res
          (SELECT rowid FROM {table} WHERE expires_at <= ?1 LIMIT ?2)"
     );
     conn.execute(&sql, params![now, limit as i64])?;
+    Ok(())
+}
+
+pub(crate) fn sweep_token_usage_on_write(conn: &Connection, now: i64) -> Result<()> {
+    delete_token_usage_bounded(conn, now, SWEEP_LIMIT)
+}
+
+fn delete_token_usage_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
+    let cutoff = now.saturating_sub(TOKEN_USAGE_RETENTION_SECS);
+    conn.execute(
+        "DELETE FROM token_usage_run_tasks WHERE run_id IN (
+             SELECT r.id FROM token_usage_runs r
+             WHERE r.recorded_at <= ?1
+               AND (r.agent_run_id IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM agent_runs a
+                   WHERE a.id=r.agent_run_id AND a.ended_at IS NULL
+               ))
+             ORDER BY r.id LIMIT ?2
+         )",
+        params![cutoff, limit as i64],
+    )?;
+    conn.execute(
+        "DELETE FROM token_usage_runs WHERE id IN (
+             SELECT r.id FROM token_usage_runs r
+             WHERE r.recorded_at <= ?1
+               AND (r.agent_run_id IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM agent_runs a
+                   WHERE a.id=r.agent_run_id AND a.ended_at IS NULL
+               ))
+             ORDER BY r.id LIMIT ?2
+         )",
+        params![cutoff, limit as i64],
+    )?;
+    Ok(())
+}
+
+fn delete_all_expired_token_usage(conn: &Connection, now: i64) -> Result<()> {
+    let cutoff = now.saturating_sub(TOKEN_USAGE_RETENTION_SECS);
+    conn.execute(
+        "DELETE FROM token_usage_run_tasks WHERE run_id IN (
+             SELECT r.id FROM token_usage_runs r
+             WHERE r.recorded_at <= ?1
+               AND (r.agent_run_id IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM agent_runs a
+                   WHERE a.id=r.agent_run_id AND a.ended_at IS NULL
+               ))
+         )",
+        params![cutoff],
+    )?;
+    conn.execute(
+        "DELETE FROM token_usage_runs AS r
+         WHERE r.recorded_at <= ?1
+           AND (r.agent_run_id IS NULL OR NOT EXISTS (
+               SELECT 1 FROM agent_runs a
+               WHERE a.id=r.agent_run_id AND a.ended_at IS NULL
+           ))",
+        params![cutoff],
+    )?;
     Ok(())
 }
 
@@ -547,6 +609,7 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // alongside the rest. Both are stats-only — losing rows past TTL is by design.
     delete_bounded(conn, "agent_sessions", now, limit)?;
     delete_bounded(conn, "activity_events", now, limit)?;
+    delete_token_usage_bounded(conn, now, limit)?;
     crate::task_messages::expire_stale_deliveries(conn, now, limit)?;
     delete_bounded(conn, "task_messages", now, limit)?;
     delete_reclaimable_task_rows_bounded(conn, now, limit)?;
@@ -589,6 +652,7 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
         "DELETE FROM activity_events WHERE expires_at <= ?1",
         params![now],
     )?;
+    delete_all_expired_token_usage(&tx, now)?;
     crate::task_messages::expire_stale_deliveries(&tx, now, usize::MAX)?;
     tx.execute(
         "DELETE FROM task_messages WHERE expires_at <= ?1",
@@ -712,6 +776,99 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(bodies, vec!["live".to_string()]);
+    }
+
+    #[test]
+    fn usage_outlives_task_reclamation_then_full_sweep_drains_populated_history() {
+        let (_d, mut c) = open_tmp();
+        let task_id = reclaimable_task(&mut c, "historic telemetry");
+        for ordinal in 0..=(SWEEP_LIMIT as i64) {
+            crate::token_usage::record(
+                &mut c,
+                None,
+                "classifier",
+                &[task_id],
+                None,
+                "codex",
+                "gpt",
+                "medium",
+                crate::token_usage::TokenUsage {
+                    uncached_input_tokens: ordinal,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
+        }
+
+        sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM tasks WHERE id=?1", [task_id], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+            "the completed task should be reclaimed after seven days"
+        );
+        assert_eq!(
+            crate::token_usage::for_task(&c, task_id).unwrap().len(),
+            SWEEP_LIMIT + 1,
+            "usage mappings must remain queryable through the longer retention window"
+        );
+
+        sweep_all(&c, TOKEN_USAGE_RETENTION_SECS + 1).unwrap();
+        for table in ["token_usage_run_tasks", "token_usage_runs"] {
+            assert_eq!(
+                c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "full sweep must drain all expired rows from {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_managed_usage_snapshot_is_not_expired_before_recovery_can_reload_it() {
+        let (_d, mut c) = open_tmp();
+        let task_id = crate::tasks::create(
+            &mut c, "owner", "dormant", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let run_id =
+            crate::agent_runs::insert(&c, task_id, "Dormant", "worker", "gpt", "high", "codex", 1)
+                .unwrap();
+        crate::token_usage::record(
+            &mut c,
+            Some(run_id),
+            "worker",
+            &[task_id],
+            Some(464),
+            "codex",
+            "gpt",
+            "high",
+            crate::token_usage::TokenUsage {
+                cached_input_tokens: 900,
+                output_tokens: 20,
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+
+        let after_retention = TOKEN_USAGE_RETENTION_SECS + 1;
+        sweep_all(&c, after_retention).unwrap();
+        assert!(crate::token_usage::usage_for_agent_run(&c, run_id)
+            .unwrap()
+            .is_some());
+
+        crate::agent_runs::close(&c, run_id, after_retention, "done").unwrap();
+        sweep_all(&c, after_retention).unwrap();
+        assert!(crate::token_usage::usage_for_agent_run(&c, run_id)
+            .unwrap()
+            .is_none());
     }
 
     fn reclaimable_task(c: &mut Connection, title: &str) -> i64 {
