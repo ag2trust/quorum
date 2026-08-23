@@ -76,21 +76,36 @@ pub fn record_accepted(
 
 /// Record a rejected plan submission for `run_id`. Runs inside the caller's
 /// transaction. Creates the row if missing; increments `rejections`. Returns
-/// the new count.
+/// the resulting count.
+///
+/// The increment is guarded by `response_json IS NULL`: validation runs outside
+/// the write transaction, so a call whose plan was rejected can commit after
+/// another connection accepted a plan for the same run. Counting that rejection
+/// would make the stored counter describe a run that is already settled, so the
+/// guard leaves an accepted row untouched and reports its existing count.
 pub fn record_rejection(tx: &Transaction, run_id: &str, graph_id: i64) -> Result<i64> {
     tx.execute(
         "INSERT OR IGNORE INTO planner_submissions(run_id, graph_id) VALUES (?1, ?2)",
         params![run_id, graph_id],
     )?;
-    let rejections: i64 = tx.query_row(
-        "UPDATE planner_submissions
-         SET rejections = rejections + 1
-         WHERE run_id = ?1
-         RETURNING rejections",
-        params![run_id],
-        |row| row.get(0),
-    )?;
-    Ok(rejections)
+    let incremented: Option<i64> = tx
+        .query_row(
+            "UPDATE planner_submissions
+             SET rejections = rejections + 1
+             WHERE run_id = ?1 AND response_json IS NULL
+             RETURNING rejections",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match incremented {
+        Some(rejections) => Ok(rejections),
+        None => Ok(tx.query_row(
+            "SELECT rejections FROM planner_submissions WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?),
+    }
 }
 
 /// Read-only. `true` when the run's rejection count has reached
@@ -229,6 +244,26 @@ mod tests {
         tx.commit().unwrap();
 
         assert_eq!(accepted_response(&c, "run-2").unwrap(), None);
+    }
+
+    /// The rejection counter is a record of an unsettled run: once a plan is
+    /// accepted, a late rejection committing behind it must not bump the count.
+    #[test]
+    fn rejections_are_not_counted_after_acceptance() {
+        let (_d, mut c) = open_tmp();
+        let tx = c.transaction().unwrap();
+        record_rejection(&tx, "run-5", 50).unwrap();
+        record_accepted(&tx, "run-5", 50, "{\"kind\":\"plan\"}", 600).unwrap();
+        tx.commit().unwrap();
+
+        let tx = c.transaction().unwrap();
+        let count = record_rejection(&tx, "run-5", 50).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            accepted_response(&c, "run-5").unwrap(),
+            Some("{\"kind\":\"plan\"}".to_string())
+        );
     }
 
     #[test]

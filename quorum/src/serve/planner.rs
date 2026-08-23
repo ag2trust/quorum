@@ -383,7 +383,7 @@ pub(super) fn rehydrate_accepted_proposal(
     Ok(tasks)
 }
 
-fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseError> {
+pub(crate) fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseError> {
     match response {
         PlannerResponse::Blocker {
             category,

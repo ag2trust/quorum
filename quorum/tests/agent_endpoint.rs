@@ -478,6 +478,33 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
         "rejected calls wrote notes"
     );
 
+    // The planner tool's wire shape must reach the endpoint's SubmitPlan
+    // operation over the real socket: an unknown capability is rejected by the
+    // planner authority resolver, not discarded as a malformed request. A
+    // worker capability is refused the same way, so the planner door stays
+    // closed to every other managed role.
+    for (capability, label) in [("missing", "unknown"), ("worker-cap", "worker")] {
+        let denied = exchange(
+            &endpoint,
+            &request(
+                capability,
+                json!({"type":"submit_plan","response":{"outcome":"plan","tasks":[]}}),
+            ),
+        );
+        assert_eq!(denied["ok"], false, "{label} capability: {denied}");
+        assert_eq!(
+            denied["error"]["code"], "unauthorized",
+            "{label} capability"
+        );
+    }
+    let plan_submissions: i64 = quorum_core::db::open(&db)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM planner_submissions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(plan_submissions, 0);
+
     let reaction = exchange(
         &endpoint,
         &request("worker-cap", json!({"type":"react","state":"note"})),
