@@ -3422,7 +3422,9 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
         .map_err(|e| QuorumError::Io(format!("failed to create tokio runtime: {e}")))?;
 
     let result = rt.block_on(async {
-        let endpoint = agent_endpoint::AgentEndpoint::start(&config.db_path, &config.repo).await?;
+        let endpoint =
+            agent_endpoint::AgentEndpoint::start(&config.db_path, &config.repo, &config.repo_dir)
+                .await?;
         let result = tick_loop(&config, daemon_pid).await;
         endpoint.shutdown().await;
         result

@@ -8,7 +8,7 @@ use quorum_core::error::{QuorumError, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const ENDPOINT_ENV: &str = "QUORUM_AGENT_ENDPOINT";
@@ -47,6 +47,12 @@ enum Operation<'a> {
     React {
         state: &'a str,
     },
+    // Reached only through `submit_plan`; the MCP tool that calls it lands in
+    // the next slice of this batch.
+    #[allow(dead_code)]
+    SubmitPlan {
+        response: &'a serde_json::Value,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,8 +69,16 @@ struct Response {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ResponseResult {
-    TaskNote { note_id: i64 },
-    Mailbox { mailbox_id: i64 },
+    TaskNote {
+        note_id: i64,
+    },
+    Mailbox {
+        mailbox_id: i64,
+    },
+    #[allow(dead_code)]
+    PlanAccepted {
+        graph_id: i64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +121,44 @@ pub fn react(capability: &str, state: &str) -> Result<i64> {
     mailbox_id(exchange(capability, Operation::React { state })?)
 }
 
+/// Outcome of one planner plan submission.
+///
+/// A rejection is a value, not an error: the planner is expected to read the
+/// endpoint's own validator text and resubmit a corrected plan within the same
+/// turn, so the code and message are relayed verbatim rather than flattened
+/// into a client-side error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SubmitPlanOutcome {
+    Accepted { graph_id: i64 },
+    Rejected { code: String, message: String },
+}
+
+/// Submit a plan through a `planner` run capability. The endpoint owns every
+/// validation decision; this client neither inspects nor rewrites the plan.
+///
+/// Exercised by its round-trip test today; the `submit_plan` MCP tool that
+/// calls it in production lands in the next slice of this batch.
+#[allow(dead_code)]
+pub fn submit_plan(
+    endpoint: &Path,
+    capability: &str,
+    response: &serde_json::Value,
+) -> Result<SubmitPlanOutcome> {
+    match exchange_at(endpoint, capability, Operation::SubmitPlan { response })? {
+        Ok(ResponseResult::PlanAccepted { graph_id }) if graph_id > 0 => {
+            Ok(SubmitPlanOutcome::Accepted { graph_id })
+        }
+        Ok(_) => Err(QuorumError::Io(
+            "agent endpoint returned malformed response".into(),
+        )),
+        Err(error) => Ok(SubmitPlanOutcome::Rejected {
+            code: error.code,
+            message: error.message,
+        }),
+    }
+}
+
 /// Append a capability-scoped progress note. The daemon derives authority from
 /// the capability and verifies the prompt-compatible identity flags before it
 /// appends the bounded note text.
@@ -131,7 +183,21 @@ pub fn append_note(request: AppendNote<'_>) -> Result<i64> {
 }
 
 fn exchange(capability: &str, operation: Operation<'_>) -> Result<ResponseResult> {
-    let endpoint = endpoint()?;
+    match exchange_at(&endpoint()?, capability, operation)? {
+        Ok(result) => Ok(result),
+        Err(error) => endpoint_rejection(error.code),
+    }
+}
+
+/// Round-trip one operation against an explicit endpoint. An endpoint
+/// rejection is returned as a value so callers that must relay the daemon's
+/// own message can do so verbatim; transport and framing faults stay errors.
+#[allow(clippy::type_complexity)]
+fn exchange_at(
+    endpoint: &Path,
+    capability: &str,
+    operation: Operation<'_>,
+) -> Result<std::result::Result<ResponseResult, ResponseError>> {
     let request = Request {
         version: PROTOCOL_VERSION,
         capability,
@@ -146,7 +212,7 @@ fn exchange(capability: &str, operation: Operation<'_>) -> Result<ResponseResult
         ));
     }
 
-    let mut stream = UnixStream::connect(&endpoint).map_err(endpoint_io)?;
+    let mut stream = UnixStream::connect(endpoint).map_err(endpoint_io)?;
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .map_err(endpoint_io)?;
@@ -176,9 +242,9 @@ fn exchange(capability: &str, operation: Operation<'_>) -> Result<ResponseResult
         ));
     }
     match (response.ok, response.result, response.error) {
-        (true, Some(result), None) => Ok(result),
+        (true, Some(result), None) => Ok(Ok(result)),
         (false, None, Some(error)) if !error.code.is_empty() && !error.message.is_empty() => {
-            endpoint_rejection(error.code)
+            Ok(Err(error))
         }
         _ => Err(QuorumError::Io(
             "agent endpoint returned malformed response".into(),
@@ -217,7 +283,8 @@ fn endpoint_rejection<T>(code: String) -> Result<T> {
     }
 }
 
-fn endpoint() -> Result<PathBuf> {
+/// The daemon-injected endpoint locator for this managed run.
+pub fn endpoint() -> Result<PathBuf> {
     let value = std::env::var_os(ENDPOINT_ENV).ok_or_else(|| {
         QuorumError::Io("managed completion requires QUORUM_AGENT_ENDPOINT".into())
     })?;
@@ -239,4 +306,128 @@ fn endpoint_io(error: std::io::Error) -> QuorumError {
         "request failed"
     };
     QuorumError::Io(format!("agent endpoint {detail}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve::agent_endpoint::{locator, AgentEndpoint};
+    use serde_json::json;
+
+    /// A frozen planning graph whose live planner run holds `planner-cap`.
+    /// The repo root exists on disk so writable-path resolution can
+    /// canonicalize it, and the source task declares dependency 7.
+    fn planner_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+        let db_path = dir.join("quorum.db");
+        let repo_dir = dir.join("repo");
+        std::fs::create_dir(&repo_dir).unwrap();
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks
+             (id,title,status,assignee,created_by,created_at,updated_at,depends_on)
+             VALUES (1,'planner source','open','Planner','test',10,10,'[7]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+             VALUES ('planner-cap',1,'Planner','planner',10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions
+             (id,source_task_id,state,active,freeze_active,planner_session_id,
+              planned_source_revision,created_at,updated_at)
+             VALUES (5,1,'planning',0,1,'planner-cap',3,10,10)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        (db_path, repo_dir)
+    }
+
+    fn plan_task(key: &str, path: &str, prerequisites: Vec<&str>) -> serde_json::Value {
+        json!({
+            "key": key,
+            "title": format!("implement {key}"),
+            "implementation_delta": format!("edit {path}"),
+            "affected_paths": [path],
+            "observable_outcome": format!("{path} exposes the new behavior"),
+            "deliverables": [{"kind": "write", "path": path}],
+            "acceptance_criteria": ["the new behavior is covered by a test"],
+            "source_constraints": ["do not change unrelated modules"],
+            "verification_expectations": ["cargo test passes"],
+            "non_goals": ["no unrelated refactors"],
+            "prerequisites": prerequisites,
+        })
+    }
+
+    /// End-to-end over the real Unix socket: the client's request framing and
+    /// serde tagging must be what the daemon endpoint accepts, an accepted
+    /// plan must come back as `Accepted`, and a rejected one must relay the
+    /// endpoint's own validator text verbatim so the planner can correct it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_plan_round_trips_over_the_endpoint_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, repo_dir) = planner_fixture(dir.path());
+        let endpoint = AgentEndpoint::start(&db_path, "test/repo", &repo_dir)
+            .await
+            .unwrap();
+        let socket = locator(&db_path);
+
+        let undersized = json!({
+            "outcome": "plan",
+            "tasks": [plan_task("only", "src/only.rs", vec![])],
+        });
+        let rejected = {
+            let socket = socket.clone();
+            tokio::task::spawn_blocking(move || {
+                submit_plan(&socket, "planner-cap", &undersized).unwrap()
+            })
+            .await
+            .unwrap()
+        };
+        match rejected {
+            SubmitPlanOutcome::Rejected { code, message } => {
+                assert_eq!(code, "invalid_plan");
+                assert!(
+                    message.contains("plan must contain between 2 and 8 tasks"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+
+        let plan = json!({
+            "outcome": "plan",
+            "tasks": [
+                plan_task("first", "src/first.rs", vec!["source:7"]),
+                plan_task("second", "src/second.rs", vec!["first"]),
+            ],
+        });
+        let expected = plan.clone();
+        let accepted = {
+            let socket = socket.clone();
+            tokio::task::spawn_blocking(move || submit_plan(&socket, "planner-cap", &plan).unwrap())
+                .await
+                .unwrap()
+        };
+        assert_eq!(accepted, SubmitPlanOutcome::Accepted { graph_id: 5 });
+
+        let stored: String = quorum_core::db::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT response_json FROM planner_submissions WHERE run_id='planner-cap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored).unwrap(),
+            expected
+        );
+
+        endpoint.shutdown().await;
+    }
 }

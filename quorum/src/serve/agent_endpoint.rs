@@ -8,8 +8,10 @@
 use quorum_core::capabilities::{LiveRunContext, LiveRunPhase};
 use quorum_core::db::begin_immediate;
 use quorum_core::error::{QuorumError, Result};
+use quorum_core::planner_submissions::{self, SubmitOutcome};
 use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -67,6 +69,12 @@ enum Operation {
     },
     React {
         state: String,
+    },
+    /// Planner-only plan delivery. Authority comes from a `planner` run
+    /// capability; every other operation rejects that role, and this one
+    /// rejects every other role.
+    SubmitPlan {
+        response: serde_json::Value,
     },
     Inventory,
     Protocol {
@@ -134,6 +142,9 @@ enum ResponseResult {
     Mailbox {
         mailbox_id: i64,
     },
+    PlanAccepted {
+        graph_id: i64,
+    },
     Inventory {
         repository: String,
         task_id: i64,
@@ -148,7 +159,7 @@ enum ResponseResult {
 #[derive(Debug, Serialize)]
 struct ResponseError {
     code: &'static str,
-    message: &'static str,
+    message: Cow<'static, str>,
 }
 
 impl Response {
@@ -161,7 +172,7 @@ impl Response {
         }
     }
 
-    fn failure(code: &'static str, message: &'static str) -> Self {
+    fn failure(code: &'static str, message: Cow<'static, str>) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             ok: false,
@@ -171,14 +182,28 @@ impl Response {
     }
 }
 
+#[derive(Debug)]
 struct EndpointFailure {
     code: &'static str,
-    message: &'static str,
+    /// Owned so a validator's own rejection text reaches the agent verbatim.
+    /// Every non-validating failure keeps a fixed, borrowed message.
+    message: Cow<'static, str>,
 }
 
 impl EndpointFailure {
     const fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
+        Self {
+            code,
+            message: Cow::Borrowed(message),
+        }
+    }
+
+    /// A failure whose message is produced at call time, not a fixed constant.
+    fn detailed(code: &'static str, message: String) -> Self {
+        Self {
+            code,
+            message: Cow::Owned(message),
+        }
     }
 
     /// Only daemon-side faults warrant an operator-visible log entry.
@@ -193,7 +218,10 @@ impl EndpointFailure {
             | "timeout"
             | "invalid_operation"
             | "forbidden_operation"
-            | "operation_unavailable" => false,
+            | "operation_unavailable"
+            | "invalid_plan"
+            | "already_submitted"
+            | "submit_budget_exhausted" => false,
             _ => true,
         }
     }
@@ -220,7 +248,7 @@ pub struct AgentEndpoint {
 }
 
 impl AgentEndpoint {
-    pub async fn start(db_path: &Path, repository: &str) -> Result<Self> {
+    pub async fn start(db_path: &Path, repository: &str, repo_dir: &Path) -> Result<Self> {
         let locator = locator(db_path);
         let artifact_dir = locator
             .parent()
@@ -251,7 +279,14 @@ impl AgentEndpoint {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let db_path = db_path.to_path_buf();
         let repository = repository.to_string();
-        let task = tokio::spawn(run_listener(listener, db_path, repository, shutdown_rx));
+        let repo_dir = repo_dir.to_path_buf();
+        let task = tokio::spawn(run_listener(
+            listener,
+            db_path,
+            repository,
+            repo_dir,
+            shutdown_rx,
+        ));
         super::log("agent endpoint ready");
         Ok(Self {
             locator,
@@ -329,6 +364,7 @@ async fn run_listener(
     listener: UnixListener,
     db_path: PathBuf,
     repository: String,
+    repo_dir: PathBuf,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut connections = JoinSet::new();
@@ -342,6 +378,7 @@ async fn run_listener(
                             stream,
                             db_path.clone(),
                             repository.clone(),
+                            repo_dir.clone(),
                         ));
                     }
                     Err(_) => super::log("agent endpoint accept failed"),
@@ -356,9 +393,14 @@ async fn run_listener(
     while connections.join_next().await.is_some() {}
 }
 
-async fn serve_connection(mut stream: UnixStream, db_path: PathBuf, repository: String) {
+async fn serve_connection(
+    mut stream: UnixStream,
+    db_path: PathBuf,
+    repository: String,
+    repo_dir: PathBuf,
+) {
     let response = match read_request(&mut stream).await {
-        Ok(request) => match process_request(db_path, repository, request).await {
+        Ok(request) => match process_request(db_path, repository, repo_dir, request).await {
             Ok(response) => response,
             Err(error) => {
                 if error.is_abnormal() {
@@ -423,14 +465,16 @@ async fn write_response(stream: &mut UnixStream, response: &Response) -> std::io
 async fn process_request(
     db_path: PathBuf,
     repository: String,
+    repo_dir: PathBuf,
     request: Request,
 ) -> std::result::Result<Response, EndpointFailure> {
-    process_request_with_timeout(db_path, repository, request, PROCESS_TIMEOUT).await
+    process_request_with_timeout(db_path, repository, repo_dir, request, PROCESS_TIMEOUT).await
 }
 
 async fn process_request_with_timeout(
     db_path: PathBuf,
     repository: String,
+    repo_dir: PathBuf,
     request: Request,
     process_timeout: Duration,
 ) -> std::result::Result<Response, EndpointFailure> {
@@ -449,6 +493,20 @@ async fn process_request_with_timeout(
             "run authority rejected",
         ));
     }
+
+    // Plan validation is async and touches the filesystem, so it cannot run on
+    // the shared blocking path that opens `BEGIN IMMEDIATE` up front. This
+    // branch validates with no write transaction open and records afterwards.
+    let request = match request.operation {
+        Operation::SubmitPlan { response } => {
+            return submit_plan(db_path, repo_dir, request.capability, response).await;
+        }
+        operation => Request {
+            version: request.version,
+            capability: request.capability,
+            operation,
+        },
+    };
 
     let state = Arc::new(AtomicU8::new(PROCESSING));
     let deadline = Instant::now() + process_timeout;
@@ -577,6 +635,13 @@ fn process_request_blocking(
             )?;
             Response::success(ResponseResult::Mailbox { mailbox_id })
         }
+        // Routed to `submit_plan` before this write transaction opened.
+        Operation::SubmitPlan { .. } => {
+            return Err(EndpointFailure::new(
+                "internal",
+                "request processing failed",
+            ));
+        }
         Operation::Inventory => {
             let context = resolve_any_role(&tx, &request.capability)?;
             let operations = ALL_PROTOCOL_OPERATIONS
@@ -622,6 +687,217 @@ fn process_request_blocking(
     }
     state.store(COMPLETE, Ordering::Release);
     Ok(response)
+}
+
+/// Authoritative facts a plan submission needs before it can be validated.
+struct PlanSubmissionContext {
+    graph_id: i64,
+    source_dependency_ids: Vec<i64>,
+}
+
+/// Accept one planner plan submission.
+///
+/// Ordering is load-bearing. Authority, the once-only guard, and the rejection
+/// budget are answered from a short read before any work is done; validation
+/// then runs with no transaction open because `validate_for_source` is async
+/// and canonicalizes filesystem paths; only the outcome is recorded inside
+/// `BEGIN IMMEDIATE`. The already-accepted check precedes the budget check so a
+/// run whose plan already stands reports `already_submitted` rather than a
+/// budget failure it can do nothing about.
+///
+/// This path does not use the cancellation state machine that guards the
+/// blocking operations: `spawn_blocking` work cannot be aborted, so a cancelled
+/// wait could report a timeout for a commit that already landed. Each step is
+/// bounded instead — `busy_timeout` on every connection, and
+/// `validate_for_source`'s own resolution timeout.
+async fn submit_plan(
+    db_path: PathBuf,
+    repo_dir: PathBuf,
+    capability: String,
+    response: serde_json::Value,
+) -> std::result::Result<Response, EndpointFailure> {
+    let context = {
+        let db_path = db_path.clone();
+        let capability = capability.clone();
+        in_blocking(move || prepare_plan_submission(&db_path, &capability)).await?
+    };
+
+    let serialized = serde_json::to_string(&response)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    if let Err(message) =
+        validate_plan_submission(&serialized, &repo_dir, &context.source_dependency_ids).await
+    {
+        let graph_id = context.graph_id;
+        let rejection_db = db_path.clone();
+        let rejection_capability = capability.clone();
+        in_blocking(move || record_plan_rejection(&rejection_db, &rejection_capability, graph_id))
+            .await?;
+        return Err(EndpointFailure::detailed("invalid_plan", message));
+    }
+
+    let graph_id = context.graph_id;
+    let outcome =
+        in_blocking(move || record_plan_acceptance(&db_path, &capability, graph_id, &serialized))
+            .await?;
+    match outcome {
+        SubmitOutcome::Accepted => Ok(Response::success(ResponseResult::PlanAccepted { graph_id })),
+        SubmitOutcome::AlreadySubmitted => Err(EndpointFailure::new(
+            "already_submitted",
+            "a plan was already accepted for this run",
+        )),
+        SubmitOutcome::BudgetExhausted => Err(EndpointFailure::new(
+            "submit_budget_exhausted",
+            "plan submission budget is exhausted",
+        )),
+    }
+}
+
+/// Run one bounded blocking database step. `spawn_blocking` work is not
+/// abortable, so joining it always reports the step's real outcome.
+async fn in_blocking<T, F>(work: F) -> std::result::Result<T, EndpointFailure>
+where
+    F: FnOnce() -> std::result::Result<T, EndpointFailure> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?
+}
+
+/// Short read: authority, the once-only guard, the rejection budget, and the
+/// source dependency set the plan is validated against.
+fn prepare_plan_submission(
+    db_path: &Path,
+    capability: &str,
+) -> std::result::Result<PlanSubmissionContext, EndpointFailure> {
+    let conn = quorum_core::db::open(db_path)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    let context = quorum_core::capabilities::resolve_planner_context(&conn, capability)
+        .map_err(|_| EndpointFailure::new("unauthorized", "run authority rejected"))?;
+    if planner_submissions::accepted_response(&conn, capability)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?
+        .is_some()
+    {
+        return Err(EndpointFailure::new(
+            "already_submitted",
+            "a plan was already accepted for this run",
+        ));
+    }
+    if planner_submissions::budget_exhausted(&conn, capability)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?
+    {
+        return Err(EndpointFailure::new(
+            "submit_budget_exhausted",
+            "plan submission budget is exhausted",
+        ));
+    }
+    let source_dependency_ids = source_dependency_ids(&conn, context.task_id)?;
+    Ok(PlanSubmissionContext {
+        graph_id: context.graph_id,
+        source_dependency_ids,
+    })
+}
+
+/// The planning source's declared dependencies, in the same form the
+/// coordinator loads before its own `validate_for_source` call.
+fn source_dependency_ids(
+    conn: &rusqlite::Connection,
+    task_id: i64,
+) -> std::result::Result<Vec<i64>, EndpointFailure> {
+    use rusqlite::OptionalExtension;
+    let depends_on: Option<String> = conn
+        .query_row(
+            "SELECT depends_on FROM tasks WHERE id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?
+        .flatten();
+    depends_on
+        .as_deref()
+        .map(serde_json::from_str::<Vec<i64>>)
+        .transpose()
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))
+        .map(Option::unwrap_or_default)
+}
+
+/// Full plan validation. The error string is the validator's own text so the
+/// planner can correct the plan and resubmit within its turn.
+async fn validate_plan_submission(
+    serialized: &str,
+    repo_dir: &Path,
+    source_dependency_ids: &[i64],
+) -> std::result::Result<(), String> {
+    if serialized.len() > super::planner::MAX_RESPONSE_BYTES {
+        return Err(format!(
+            "plan exceeds {} bytes",
+            super::planner::MAX_RESPONSE_BYTES
+        ));
+    }
+    let response: super::planner::PlannerResponse =
+        serde_json::from_str(serialized).map_err(|error| format!("invalid plan: {error}"))?;
+    super::planner::validate_semantics(&response).map_err(|error| error.to_string())?;
+    if let super::planner::PlannerResponse::Plan { tasks } = &response {
+        super::planner::validate_for_source(
+            tasks,
+            source_dependency_ids,
+            repo_dir,
+            &super::planner::WritablePathResolver::default(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn record_plan_rejection(
+    db_path: &Path,
+    capability: &str,
+    graph_id: i64,
+) -> std::result::Result<(), EndpointFailure> {
+    let mut conn = quorum_core::db::open(db_path)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    let tx = begin_immediate(&mut conn)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    planner_submissions::record_rejection(&tx, capability, graph_id)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    tx.commit()
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))
+}
+
+/// Record an accepted plan. Authority is re-resolved inside the write
+/// transaction because validation ran outside it and the graph may have moved
+/// on; the guarded acceptance in `record_accepted` decides the outcome.
+fn record_plan_acceptance(
+    db_path: &Path,
+    capability: &str,
+    graph_id: i64,
+    serialized: &str,
+) -> std::result::Result<SubmitOutcome, EndpointFailure> {
+    let mut conn = quorum_core::db::open(db_path)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    let tx = begin_immediate(&mut conn)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    let context = quorum_core::capabilities::resolve_planner_context(&tx, capability)
+        .map_err(|_| EndpointFailure::new("unauthorized", "run authority rejected"))?;
+    if context.graph_id != graph_id {
+        return Err(EndpointFailure::new(
+            "unauthorized",
+            "run authority rejected",
+        ));
+    }
+    let outcome = planner_submissions::record_accepted(
+        &tx,
+        capability,
+        graph_id,
+        serialized,
+        quorum_core::clock::now(),
+    )
+    .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    tx.commit()
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    Ok(outcome)
 }
 
 fn resolve(
@@ -759,7 +1035,278 @@ fn insert_mailbox(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::mpsc;
+
+    /// A frozen planning graph whose live planner run holds `planner-cap`,
+    /// plus a repo root that exists on disk so writable-path resolution can
+    /// canonicalize it. The source task declares dependency 7 so the plan may
+    /// legitimately carry a `source:7` prerequisite.
+    struct PlannerFixture {
+        _dir: tempfile::TempDir,
+        db_path: PathBuf,
+        repo_dir: PathBuf,
+    }
+
+    impl PlannerFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("quorum.db");
+            let repo_dir = dir.path().join("repo");
+            std::fs::create_dir(&repo_dir).unwrap();
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks
+                 (id,title,status,assignee,created_by,created_at,updated_at,depends_on)
+                 VALUES (1,'planner source','open','Planner','test',10,10,'[7]')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                 VALUES ('planner-cap',1,'Planner','planner',10)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                 VALUES ('worker-cap',1,'Worker','worker',10)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions
+                 (id,source_task_id,state,active,freeze_active,planner_session_id,
+                  planned_source_revision,created_at,updated_at)
+                 VALUES (5,1,'planning',0,1,'planner-cap',3,10,10)",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            Self {
+                _dir: dir,
+                db_path,
+                repo_dir,
+            }
+        }
+
+        async fn call(
+            &self,
+            capability: &str,
+            operation: Operation,
+        ) -> std::result::Result<Response, EndpointFailure> {
+            process_request_with_timeout(
+                self.db_path.clone(),
+                "test/repo".into(),
+                self.repo_dir.clone(),
+                Request {
+                    version: PROTOCOL_VERSION,
+                    capability: capability.into(),
+                    operation,
+                },
+                PROCESS_TIMEOUT,
+            )
+            .await
+        }
+
+        async fn submit_plan(
+            &self,
+            capability: &str,
+            response: serde_json::Value,
+        ) -> std::result::Result<Response, EndpointFailure> {
+            self.call(capability, Operation::SubmitPlan { response })
+                .await
+        }
+
+        fn submission_row(&self) -> (Option<String>, i64) {
+            quorum_core::db::open(&self.db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT response_json,rejections FROM planner_submissions WHERE run_id=?1",
+                    ["planner-cap"],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        }
+    }
+
+    fn plan_task(key: &str, path: &str, prerequisites: Vec<&str>) -> serde_json::Value {
+        json!({
+            "key": key,
+            "title": format!("implement {key}"),
+            "implementation_delta": format!("edit {path}"),
+            "affected_paths": [path],
+            "observable_outcome": format!("{path} exposes the new behavior"),
+            "deliverables": [{"kind": "write", "path": path}],
+            "acceptance_criteria": ["the new behavior is covered by a test"],
+            "source_constraints": ["do not change unrelated modules"],
+            "verification_expectations": ["cargo test passes"],
+            "non_goals": ["no unrelated refactors"],
+            "prerequisites": prerequisites,
+        })
+    }
+
+    fn valid_plan() -> serde_json::Value {
+        json!({
+            "outcome": "plan",
+            "tasks": [
+                plan_task("first", "src/first.rs", vec!["source:7"]),
+                plan_task("second", "src/second.rs", vec!["first"]),
+            ],
+        })
+    }
+
+    /// One task is below `validate_plan_tasks`' two-task minimum.
+    fn undersized_plan() -> serde_json::Value {
+        json!({"outcome": "plan", "tasks": [plan_task("only", "src/only.rs", vec![])]})
+    }
+
+    fn result_value(response: &Response) -> serde_json::Value {
+        serde_json::to_value(response).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_plan_accepts_valid_plan_once() {
+        let fixture = PlannerFixture::new();
+        let plan = valid_plan();
+
+        let accepted = fixture
+            .submit_plan("planner-cap", plan.clone())
+            .await
+            .unwrap();
+        let value = result_value(&accepted);
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["result"]["type"], "plan_accepted");
+        assert_eq!(value["result"]["graph_id"], 5);
+
+        let (stored, rejections) = fixture.submission_row();
+        assert_eq!(rejections, 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored.unwrap()).unwrap(),
+            plan
+        );
+
+        // A second valid submission never overwrites the accepted plan.
+        let error = fixture.submit_plan("planner-cap", plan).await.unwrap_err();
+        assert_eq!(error.code, "already_submitted");
+        assert_eq!(fixture.submission_row().1, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_plan_returns_validator_message_and_counts_rejection() {
+        let fixture = PlannerFixture::new();
+        let error = fixture
+            .submit_plan("planner-cap", undersized_plan())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_plan");
+        assert!(
+            error
+                .message
+                .contains("plan must contain between 2 and 8 tasks"),
+            "unexpected message: {}",
+            error.message
+        );
+        let (stored, rejections) = fixture.submission_row();
+        assert_eq!(stored, None);
+        assert_eq!(rejections, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_plan_exhausts_rejection_budget() {
+        let fixture = PlannerFixture::new();
+        for expected in 1..=quorum_core::planner_submissions::MAX_PLAN_SUBMIT_REJECTIONS {
+            let error = fixture
+                .submit_plan("planner-cap", undersized_plan())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_plan", "rejection {expected}");
+            assert_eq!(fixture.submission_row().1, expected);
+        }
+
+        // The budget refuses even a plan that would otherwise be accepted.
+        let error = fixture
+            .submit_plan("planner-cap", valid_plan())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "submit_budget_exhausted");
+        let (stored, rejections) = fixture.submission_row();
+        assert_eq!(stored, None);
+        assert_eq!(
+            rejections,
+            quorum_core::planner_submissions::MAX_PLAN_SUBMIT_REJECTIONS
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_plan_rejects_oversized_payload() {
+        let fixture = PlannerFixture::new();
+        let mut plan = valid_plan();
+        plan["tasks"][0]["observable_outcome"] =
+            json!("x".repeat(super::super::planner::MAX_RESPONSE_BYTES + 1));
+
+        let error = fixture.submit_plan("planner-cap", plan).await.unwrap_err();
+        assert_eq!(error.code, "invalid_plan");
+        assert!(
+            error.message.contains("exceeds"),
+            "unexpected message: {}",
+            error.message
+        );
+        let (stored, rejections) = fixture.submission_row();
+        assert_eq!(stored, None);
+        assert_eq!(rejections, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_plan_rejects_worker_capability() {
+        let fixture = PlannerFixture::new();
+        let error = fixture
+            .submit_plan("worker-cap", valid_plan())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "unauthorized");
+        let recorded: i64 = quorum_core::db::open(&fixture.db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM planner_submissions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn planner_capability_rejected_on_other_operations() {
+        let fixture = PlannerFixture::new();
+        for operation in [
+            Operation::Submit {
+                summary: Some("planner should not submit".into()),
+                verdict: None,
+                feedback: None,
+                feedback_json: None,
+                blocking: None,
+            },
+            Operation::React {
+                state: "blocked".into(),
+            },
+            Operation::AppendNote {
+                task_id: 1,
+                agent: "Planner".into(),
+                note: "planner should not append".into(),
+            },
+            Operation::Protocol {
+                operation: ProtocolOperation::PullRequestRead,
+            },
+            Operation::Inventory,
+        ] {
+            let error = fixture.call("planner-cap", operation).await.unwrap_err();
+            assert_eq!(error.code, "unauthorized");
+        }
+        let mailbox_count: i64 = quorum_core::db::open(&fixture.db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM mailbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mailbox_count, 0);
+    }
 
     #[test]
     fn only_abnormal_endpoint_failures_are_logged() {
@@ -842,6 +1389,7 @@ mod tests {
         let error = process_request_with_timeout(
             db_path.clone(),
             "test/repo".into(),
+            dir.path().to_path_buf(),
             Request {
                 version: PROTOCOL_VERSION,
                 capability: "timeout-cap".into(),
