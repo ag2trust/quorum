@@ -1791,12 +1791,12 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v59_widens_run_capabilities_role_check() {
+    fn migrates_v60_widens_run_capabilities_role_check() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v59-widen-run-capabilities.db");
+        let path = dir.path().join("v60-widen-run-capabilities.db");
         {
             // Open fresh at the latest shape, then rebuild run_capabilities in the narrow
-            // (pre-v59) form so we can verify the rebuild widens the CHECK and preserves
+            // (pre-v60) form so we can verify the rebuild widens the CHECK and preserves
             // existing rows. Mirrors `migrates_v57_widens_decomposition_attempts_and_token_usage_runs_checks`
             // and, for the FK straddle, `migrates_v56_widens_role_assignment_check_to_admit_arbiter`.
             let conn = open(&path).unwrap();
