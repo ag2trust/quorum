@@ -131,6 +131,10 @@ const FAILED_WORKER_HANDOFF_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 /// Limit per-slot stream work so one noisy provider cannot starve other slots.
 const MAX_STREAM_LINES_PER_TICK: usize = 64;
+/// Cheap-polling pace between ticks. Applied on the success path at the end of
+/// `tick` and again on the `Continue` error path in `tick_loop`, which the
+/// success-path sleep never reaches.
+const TICK_PACING: Duration = Duration::from_millis(500);
 const CLAIM_SKIP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CLAIM_SKIP_LOG_CAPACITY: usize = 64;
 const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -358,6 +362,42 @@ impl PoisonTracker {
     #[cfg(test)]
     fn strikes(&self, task_id: i64) -> u32 {
         self.strikes.get(&task_id).copied().unwrap_or(0)
+    }
+}
+
+/// Consecutive provision strikes that could **not** be written durably, per
+/// (task, PR).
+///
+/// The durable budget in `reviewer_provision_attempts` cannot bound the one
+/// failure that prevents its own accounting: if the strike insert keeps
+/// failing, `decide_provision` keeps reading zero attempts and re-provisions
+/// forever. This is the backstop for exactly that case — in-memory only, reset
+/// by a restart and cleared by the first strike that does record, so a
+/// transient write-lock holder cannot accumulate toward a park.
+struct UnrecordableStrikes {
+    counts: HashMap<(i64, i64), u32>,
+}
+
+impl UnrecordableStrikes {
+    fn new() -> Self {
+        Self {
+            counts: HashMap::new(),
+        }
+    }
+
+    fn record(&mut self, task_id: i64, pr: i64) -> u32 {
+        let count = self.counts.entry((task_id, pr)).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    fn clear(&mut self, task_id: i64, pr: i64) {
+        self.counts.remove(&(task_id, pr));
+    }
+
+    #[cfg(test)]
+    fn count(&self, task_id: i64, pr: i64) -> u32 {
+        self.counts.get(&(task_id, pr)).copied().unwrap_or(0)
     }
 }
 
@@ -757,6 +797,34 @@ fn decide_r2_requirement(
     };
 
     quorum_core::review_audits::record_r2_requirement(conn, task_id, pr_number, head_sha, required)
+}
+
+/// Whether reviewer authority can still be issued for `task_id` right now.
+///
+/// A generated child whose graph plan is no longer current is **held**: not
+/// provisioned, not struck, and not parked. Its PR keeps being polled for
+/// merge/close, and it stays `in-review` until an operator unblocks or cancels
+/// the graph. Every reviewer-provisioning path applies this identically, so a
+/// daemon restart cannot turn a held child into a parked one.
+async fn reviewer_graph_authority_current(db_path: &Path, task_id: i64) -> Result<bool> {
+    let path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let conn = quorum_core::db::open(&path)?;
+        quorum_core::decomposition_review::is_reviewable_graph_member(&conn, task_id)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("graph authority check join: {error}")))?
+}
+
+/// Rate-limited "held" notice; a permanently held child would otherwise log
+/// once per tick forever.
+fn log_graph_hold(graph_skip_logs: &mut ClaimSkipLogLimiter, task_id: i64, pr: i64) {
+    if graph_skip_logs.should_log(task_id, std::time::Instant::now()) {
+        log(&format!(
+            "task #{task_id} PR #{pr}: generated child is not in the current active graph \
+             plan — holding in-review, not provisioning a reviewer"
+        ));
+    }
 }
 
 /// Check whether provision attempts for a (task, PR, role) are exhausted.
@@ -8579,6 +8647,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut pending_reviewer_resumes: HashMap<i64, i64> = HashMap::new();
     let mut poison_tracker = PoisonTracker::new();
     let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+    let mut graph_skip_logs = ClaimSkipLogLimiter::new();
+    let mut unrecordable_strikes = UnrecordableStrikes::new();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
@@ -9099,6 +9169,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut pending_reviewer_resumes,
             &mut poison_tracker,
             &mut claim_skip_logs,
+            &mut graph_skip_logs,
+            &mut unrecordable_strikes,
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -9155,7 +9227,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     }
                     return Ok(EXIT_SELF_UPDATE);
                 }
-                TickErrorAction::Continue => log(&format!("tick error: {e}")),
+                TickErrorAction::Continue => {
+                    log(&format!("tick error: {e}"));
+                    // `tick`'s pacing sleep is its last statement, so every
+                    // error path skips it. Without pacing here a persistent
+                    // failure re-enters the identical tick immediately and
+                    // burns a core until the condition clears.
+                    tokio::time::sleep(TICK_PACING).await;
+                }
             }
         }
 
@@ -9210,6 +9289,11 @@ async fn tick(
     pending_reviewer_resumes: &mut HashMap<i64, i64>,
     poison_tracker: &mut PoisonTracker,
     claim_skip_logs: &mut ClaimSkipLogLimiter,
+    // Reuses the bounded claim-skip limiter so a permanently stale graph member
+    // logs at most once per interval instead of once per tick.
+    graph_skip_logs: &mut ClaimSkipLogLimiter,
+    // In-memory backstop for strikes that cannot be written durably.
+    unrecordable: &mut UnrecordableStrikes,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
@@ -9828,7 +9912,22 @@ async fn tick(
                                     &head_sha,
                                 )
                                 .await?;
+                                let graph_authority_current = reviewer_graph_authority_current(
+                                    &config.db_path,
+                                    reviewer_task_id,
+                                )
+                                .await?;
                                 let (r2_added, r1_end_reason) = match &ci_gate {
+                                    // Same hold as phase 5 and the orphan loop.
+                                    PreReviewChecksGate::Ready if !graph_authority_current => {
+                                        log_graph_hold(graph_skip_logs, reviewer_task_id, pr_num);
+                                        log(&format!(
+                                            "R2 GATE: PR #{pr_num} — generated child is not in \
+                                             the current active graph plan; R1 approval stored, \
+                                             R2 held"
+                                        ));
+                                        (false, "r2-graph-held")
+                                    }
                                     PreReviewChecksGate::Ready => {
                                         let reviewer_count_before = reviewers.len();
                                         let r2_provision = provision_reviewer(
@@ -9837,6 +9936,7 @@ async fn tick(
                                             name_pool,
                                             reviewers,
                                             lifetime_roster,
+                                            unrecordable,
                                             pr_num,
                                             worker_cp,
                                             &role,
@@ -13426,6 +13526,13 @@ async fn tick(
                     _ => {}
                 }
             }
+            // Held after the merge/close poll above, so a held child's PR still
+            // reconciles, and before any provisioning work, so no identity,
+            // worktree, strike, or park is ever spent on it.
+            if !reviewer_graph_authority_current(&db_path, *task_id).await? {
+                log_graph_hold(graph_skip_logs, *task_id, *pr);
+                continue;
+            }
             let (ci_gate, head_sha, head_polled) =
                 poll_resume_reviewer_pre_review_checks(config, pre_review_checks, *task_id, *pr)
                     .await?;
@@ -13505,19 +13612,41 @@ async fn tick(
                         continue;
                     }
                     let counterpart: ReviewCounterpart = (&workers[*wi]).into();
-                    let provision_outcome = provision_reviewer(
+                    // Post-worktree failures burn a durable strike inside
+                    // `provision_reviewer`; the cheap pre-allocation exits
+                    // (assignment mismatch, name already in use, mailbox
+                    // cleanup, PR-target resolution, reservation release) do
+                    // not, and are bounded only by tick pacing today.
+                    let provision_outcome = match provision_reviewer(
                         config,
                         wt_mgr,
                         name_pool,
                         reviewers,
                         lifetime_roster,
+                        unrecordable,
                         *pr,
                         counterpart,
                         &role,
                         &head_sha,
                         false,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(outcome) => outcome,
+                        // One task's provisioning failure must not abort the
+                        // tick — but only for the transient class. A
+                        // `SchemaTooNew` here still has to reach `tick_loop`,
+                        // which exits 75 so the supervisor rebuilds.
+                        Err(e) => match classify_tick_error(&e) {
+                            TickErrorAction::Continue => {
+                                log(&format!(
+                                    "provision error for task #{task_id} PR #{pr}: {e}"
+                                ));
+                                continue;
+                            }
+                            TickErrorAction::ExitSelfUpdate => return Err(e),
+                        },
+                    };
                     if provision_outcome == ReviewerProvisionOutcome::Attached {
                         pre_review_checks.remove(task_id);
                     }
@@ -13737,6 +13866,12 @@ async fn tick(
                 .await;
                 continue;
             }
+            // Same hold as phase 5 — a restart must not turn a held child into a
+            // parked one just because no worker slot survived.
+            if !reviewer_graph_authority_current(&db_path, *task_id).await? {
+                log_graph_hold(graph_skip_logs, *task_id, *pr);
+                continue;
+            }
             let (ci_gate, head_sha, head_polled) =
                 poll_resume_reviewer_pre_review_checks(config, pre_review_checks, *task_id, *pr)
                     .await?;
@@ -13875,19 +14010,36 @@ async fn tick(
                         task_id: *task_id,
                         branch: &branch,
                     };
-                    let provision_outcome = provision_reviewer(
+                    // As in phase 5 — post-worktree failures are struck,
+                    // pre-allocation exits are not.
+                    let provision_outcome = match provision_reviewer(
                         config,
                         wt_mgr,
                         name_pool,
                         reviewers,
                         lifetime_roster,
+                        unrecordable,
                         *pr,
                         counterpart,
                         &role,
                         &head_sha,
                         true,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(outcome) => outcome,
+                        // As in phase 5: transient failures stay contained,
+                        // schema mismatches still exit for self-update.
+                        Err(e) => match classify_tick_error(&e) {
+                            TickErrorAction::Continue => {
+                                log(&format!(
+                                    "orphan provision error for task #{task_id} PR #{pr}: {e}"
+                                ));
+                                continue;
+                            }
+                            TickErrorAction::ExitSelfUpdate => return Err(e),
+                        },
+                    };
                     if provision_outcome == ReviewerProvisionOutcome::Attached {
                         pre_review_checks.remove(task_id);
                     }
@@ -14331,7 +14483,7 @@ async fn tick(
         }
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(TICK_PACING).await;
     Ok(())
 }
 
@@ -16772,6 +16924,144 @@ fn reviewer_name_exclusions(
     excluded
 }
 
+/// Record one durable provision strike for a (task, PR, role) and report the
+/// new count. Every failure inside `provision_reviewer_reserved` that happens
+/// after the reviewer identity and worktree exist must go through this: the
+/// durable strike is what makes `decide_provision` return `Exhausted`, which is
+/// what parks the task instead of re-provisioning a reviewer every tick.
+///
+/// A strike that cannot be written is returned as an error, not swallowed and
+/// not treated as a lifecycle event: per invariant 3 a post-timeout `SQLITE_BUSY`
+/// is abnormal and loud, and parking here would let one DB hiccup on a generated
+/// child block its whole graph through `block_graph_if_child_failed`. Repeated
+/// unrecordable strikes are bounded by the in-memory backstop instead.
+async fn record_reviewer_provision_strike(
+    config: &ServeConfig,
+    unrecordable: &mut UnrecordableStrikes,
+    task_id: i64,
+    pr: i64,
+    role: &ReviewRole,
+    head_sha: &str,
+) -> Result<i64> {
+    let role_str = role.as_str().to_string();
+    let sha = head_sha.to_string();
+    let recorded = {
+        let p = config.db_path.clone();
+        match tokio::task::spawn_blocking(move || -> Result<i64> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::provision_attempts::record_attempt(&mut conn, task_id, pr, &role_str, &sha)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(QuorumError::Io(format!("provision strike join: {error}"))),
+        }
+    };
+    let strikes = match recorded {
+        Ok(strikes) => {
+            unrecordable.clear(task_id, pr);
+            strikes
+        }
+        Err(error) => {
+            let consecutive = unrecordable.record(task_id, pr);
+            log(&format!(
+                "{role_label}: could not record provision strike for task #{task_id} PR #{pr}: \
+                 {error} (in-memory backstop {consecutive}/{MAX_REVIEWER_PROVISION_STRIKES}, \
+                 not durable, reset on daemon restart)",
+                role_label = role.as_str().to_uppercase()
+            ));
+            if consecutive >= MAX_REVIEWER_PROVISION_STRIKES {
+                let parked = park_task(
+                    &config.db_path,
+                    task_id,
+                    &format!(
+                        "reviewer provision strikes for PR #{pr} could not be recorded \
+                         {consecutive} times"
+                    ),
+                    "in-review",
+                )
+                .await;
+                if parked {
+                    unrecordable.clear(task_id, pr);
+                    notify_provision_failure(
+                        &config.db_path,
+                        task_id,
+                        "reviewer provision strikes could not be recorded",
+                        &format!("#{pr}"),
+                    )
+                    .await;
+                } else {
+                    log(&format!(
+                        "task #{task_id}: in-memory provision backstop could not park it \
+                         (already terminal, or the database is still unavailable)"
+                    ));
+                }
+            }
+            return Err(error);
+        }
+    };
+    log(&format!(
+        "{role_label} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
+         for task #{task_id} PR #{pr}",
+        role_label = role.as_str().to_uppercase()
+    ));
+    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
+        log(&format!(
+            "{} provision budget exhausted for task #{task_id} PR #{pr} after {strikes} \
+             consecutive failures; decide_provision will park it",
+            role.as_str().to_uppercase()
+        ));
+    }
+    Ok(strikes)
+}
+
+/// Everything one post-worktree provisioning failure has to retire.
+struct FailedProvisionScope<'a> {
+    reviewer_name: &'a str,
+    worktree: &'a Path,
+    branch: &'a str,
+    capability_run_id: Option<&'a str>,
+    agent_run_id: Option<i64>,
+    process: Option<runner::RunnerProc>,
+}
+
+/// Burn the durable strike and retire everything the failed provision
+/// allocated, in that order.
+///
+/// Pairing the two in one funnel is the point: an arm that cleans up without
+/// striking retries the identical provision on the next tick forever, and that
+/// is precisely the bug that reached production. Cleanup runs even when the
+/// strike could not be recorded; the strike error is returned so the caller
+/// stays loud.
+#[allow(clippy::too_many_arguments)]
+async fn fail_post_worktree_provision(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    unrecordable: &mut UnrecordableStrikes,
+    scope: FailedProvisionScope<'_>,
+    task_id: i64,
+    pr: i64,
+    role: &ReviewRole,
+    head_sha: &str,
+) -> Result<()> {
+    let strike =
+        record_reviewer_provision_strike(config, unrecordable, task_id, pr, role, head_sha).await;
+    cleanup_failed_reviewer_provision(
+        config,
+        wt_mgr,
+        name_pool,
+        scope.reviewer_name,
+        scope.worktree,
+        scope.branch,
+        scope.capability_run_id,
+        scope.agent_run_id,
+        scope.process,
+    )
+    .await;
+    strike.map(|_| ())
+}
+
 /// Unified reviewer provisioning (#190). Replaces the separate
 /// `spawn_reviewer_for_worker` (R1) and `spawn_r2_reviewer` (R2) paths.
 /// Role, prompt, model policy, and audit recording are parameterized;
@@ -16784,6 +17074,7 @@ async fn provision_reviewer(
     name_pool: &mut Pool,
     reviewers: &mut Vec<SlotState>,
     lifetime_roster: &mut LifetimeRoster,
+    unrecordable: &mut UnrecordableStrikes,
     pr: i64,
     worker: ReviewCounterpart<'_>,
     role: &ReviewRole,
@@ -16824,6 +17115,7 @@ async fn provision_reviewer(
         name_pool,
         reviewers,
         lifetime_roster,
+        unrecordable,
         pr,
         worker,
         role,
@@ -16854,6 +17146,7 @@ async fn provision_reviewer_reserved(
     name_pool: &mut Pool,
     reviewers: &mut Vec<SlotState>,
     lifetime_roster: &mut LifetimeRoster,
+    unrecordable: &mut UnrecordableStrikes,
     pr: i64,
     worker: ReviewCounterpart<'_>,
     role: &ReviewRole,
@@ -17140,49 +17433,25 @@ async fn provision_reviewer_reserved(
         }
     };
     if let Some(provision_failure) = provision_failure {
-        let task_id = worker.task_id;
-        let role_str = role.as_str().to_string();
-        let sha = head_sha.to_string();
-        let strikes = {
-            let p = config.db_path.clone();
-            tokio::task::spawn_blocking(move || -> i64 {
-                quorum_core::db::open(&p)
-                    .ok()
-                    .and_then(|mut conn| {
-                        quorum_core::provision_attempts::record_attempt(
-                            &mut conn, task_id, pr, &role_str, &sha,
-                        )
-                        .ok()
-                    })
-                    .unwrap_or(0)
-            })
-            .await
-            .unwrap_or(0)
-        };
-        log(&format!(
-            "{role_label} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
-             for task #{task_id} PR #{pr}",
-            role_label = role.as_str().to_uppercase()
-        ));
-        if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
-            log(&format!(
-                "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after \
-                 {strikes} consecutive {} provision failures for PR #{pr}",
-                role.as_str().to_uppercase()
-            ));
-        }
-        cleanup_failed_reviewer_provision(
+        fail_post_worktree_provision(
             config,
             wt_mgr,
             name_pool,
-            &reviewer_name,
-            &wt_path,
-            &branch,
-            None,
-            None,
-            None,
+            unrecordable,
+            FailedProvisionScope {
+                reviewer_name: &reviewer_name,
+                worktree: &wt_path,
+                branch: &branch,
+                capability_run_id: None,
+                agent_run_id: None,
+                process: None,
+            },
+            worker.task_id,
+            pr,
+            role,
+            head_sha,
         )
-        .await;
+        .await?;
         return Ok(ReviewerProvisionOutcome::Failed(provision_failure));
     }
     log(&format!(
@@ -17239,18 +17508,25 @@ async fn provision_reviewer_reserved(
     match journal_result {
         Ok(Ok(())) => {}
         Ok(Err(error)) | Err(error) => {
-            cleanup_failed_reviewer_provision(
+            fail_post_worktree_provision(
                 config,
                 wt_mgr,
                 name_pool,
-                &reviewer_name,
-                &wt_path,
-                &branch,
-                None,
-                None,
-                None,
+                unrecordable,
+                FailedProvisionScope {
+                    reviewer_name: &reviewer_name,
+                    worktree: &wt_path,
+                    branch: &branch,
+                    capability_run_id: None,
+                    agent_run_id: None,
+                    process: None,
+                },
+                worker.task_id,
+                pr,
+                role,
+                head_sha,
             )
-            .await;
+            .await?;
             return Err(error);
         }
     }
@@ -17284,37 +17560,64 @@ async fn provision_reviewer_reserved(
         .await;
         match loaded {
             Ok(Ok(context)) => context,
+            // Authority validation runs after the reviewer name and worktree
+            // exist, so a persistent failure (stale or blocked graph plan) is a
+            // provision failure like any other: it must burn a durable strike
+            // so the task parks instead of re-provisioning every tick.
             Ok(Err(error)) => {
-                cleanup_failed_reviewer_provision(
+                log(&format!(
+                    "{}: reviewer authority validation failed for task #{} PR #{pr}: {error}",
+                    role.as_str().to_uppercase(),
+                    worker.task_id
+                ));
+                fail_post_worktree_provision(
                     config,
                     wt_mgr,
                     name_pool,
-                    &reviewer_name,
-                    &wt_path,
-                    &branch,
-                    None,
-                    None,
-                    None,
+                    unrecordable,
+                    FailedProvisionScope {
+                        reviewer_name: &reviewer_name,
+                        worktree: &wt_path,
+                        branch: &branch,
+                        capability_run_id: None,
+                        agent_run_id: None,
+                        process: None,
+                    },
+                    worker.task_id,
+                    pr,
+                    role,
+                    head_sha,
                 )
-                .await;
+                .await?;
                 return Err(error);
             }
             Err(error) => {
-                cleanup_failed_reviewer_provision(
+                let error = QuorumError::Io(format!("graph review context join: {error}"));
+                log(&format!(
+                    "{}: reviewer authority validation failed for task #{} PR #{pr}: {error}",
+                    role.as_str().to_uppercase(),
+                    worker.task_id
+                ));
+                fail_post_worktree_provision(
                     config,
                     wt_mgr,
                     name_pool,
-                    &reviewer_name,
-                    &wt_path,
-                    &branch,
-                    None,
-                    None,
-                    None,
+                    unrecordable,
+                    FailedProvisionScope {
+                        reviewer_name: &reviewer_name,
+                        worktree: &wt_path,
+                        branch: &branch,
+                        capability_run_id: None,
+                        agent_run_id: None,
+                        process: None,
+                    },
+                    worker.task_id,
+                    pr,
+                    role,
+                    head_sha,
                 )
-                .await;
-                return Err(QuorumError::Io(format!(
-                    "graph review context join: {error}"
-                )));
+                .await?;
+                return Err(error);
             }
         }
     };
@@ -17324,9 +17627,38 @@ async fn provision_reviewer_reserved(
     let review_cycle = {
         let db_path = config.db_path.clone();
         let task_id = worker.task_id;
-        tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
-            .await
-            .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
+        let loaded =
+            tokio::task::spawn_blocking(move || load_review_cycle_context(&db_path, task_id))
+                .await
+                .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")));
+        match loaded {
+            Ok(Ok(context)) => context,
+            // The capability is already issued and the worktree already exists,
+            // so this failure retires both and burns a strike like every other
+            // post-worktree failure.
+            Ok(Err(error)) | Err(error) => {
+                fail_post_worktree_provision(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    unrecordable,
+                    FailedProvisionScope {
+                        reviewer_name: &reviewer_name,
+                        worktree: &wt_path,
+                        branch: &branch,
+                        capability_run_id: Some(&cap_run_id),
+                        agent_run_id: None,
+                        process: None,
+                    },
+                    worker.task_id,
+                    pr,
+                    role,
+                    head_sha,
+                )
+                .await?;
+                return Err(error);
+            }
+        }
     };
     let review_cycle = (review_cycle.rework_round != 0).then_some(review_cycle);
 
@@ -17366,9 +17698,37 @@ async fn provision_reviewer_reserved(
     let task_contract = {
         let db_path = config.db_path.clone();
         let task_id = worker.task_id;
-        tokio::task::spawn_blocking(move || load_task_review_contract(&db_path, task_id))
-            .await
-            .map_err(|error| QuorumError::Io(format!("task review context join: {error}")))??
+        let loaded =
+            tokio::task::spawn_blocking(move || load_task_review_contract(&db_path, task_id))
+                .await
+                .map_err(|error| QuorumError::Io(format!("task review context join: {error}")));
+        match loaded {
+            Ok(Ok(contract)) => contract,
+            // As with the review-cycle load above: the capability and worktree
+            // already exist, so retire both and burn a strike.
+            Ok(Err(error)) | Err(error) => {
+                fail_post_worktree_provision(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    unrecordable,
+                    FailedProvisionScope {
+                        reviewer_name: &reviewer_name,
+                        worktree: &wt_path,
+                        branch: &branch,
+                        capability_run_id: Some(&cap_run_id),
+                        agent_run_id: None,
+                        process: None,
+                    },
+                    worker.task_id,
+                    pr,
+                    role,
+                    head_sha,
+                )
+                .await?;
+                return Err(error);
+            }
+        }
     };
     let prompt = format!("{prompt}\n\n{task_contract}");
 
@@ -17428,18 +17788,25 @@ async fn provision_reviewer_reserved(
                 match pid_journal {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) | Err(error) => {
-                        cleanup_failed_reviewer_provision(
+                        fail_post_worktree_provision(
                             config,
                             wt_mgr,
                             name_pool,
-                            &reviewer_name,
-                            &wt_path,
-                            &branch,
-                            Some(&cap_run_id),
-                            None,
-                            Some(proc),
+                            unrecordable,
+                            FailedProvisionScope {
+                                reviewer_name: &reviewer_name,
+                                worktree: &wt_path,
+                                branch: &branch,
+                                capability_run_id: Some(&cap_run_id),
+                                agent_run_id: None,
+                                process: Some(proc),
+                            },
+                            worker.task_id,
+                            pr,
+                            role,
+                            head_sha,
                         )
-                        .await;
+                        .await?;
                         return Err(error);
                     }
                 }
@@ -17494,73 +17861,28 @@ async fn provision_reviewer_reserved(
                         "{}: reviewer run persistence failed before attachment: {e}",
                         role.as_str().to_uppercase()
                     ));
-                    let _terminal_output = proc.kill_and_reap().await;
-                    name_pool.release(&reviewer_name);
-                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    let p = config.db_path.clone();
-                    let rn = reviewer_name.clone();
-                    let failed_cap_run_id = cap_run_id.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut conn) = quorum_core::db::open(&p) {
-                            let _ = journal::delete(&mut conn, &rn);
-                            let _ = quorum_core::capabilities::revoke(
-                                &mut conn,
-                                &failed_cap_run_id,
-                                now_unix(),
-                            );
-                        }
-                    })
-                    .await
-                    .ok();
-                    let task_id = worker.task_id;
-                    let role_str = role.as_str().to_string();
-                    let sha = head_sha.to_string();
-                    let strikes = {
-                        let p = config.db_path.clone();
-                        tokio::task::spawn_blocking(move || -> i64 {
-                            quorum_core::db::open(&p)
-                                .ok()
-                                .and_then(|mut conn| {
-                                    quorum_core::provision_attempts::record_attempt(
-                                        &mut conn, task_id, pr, &role_str, &sha,
-                                    )
-                                    .ok()
-                                })
-                                .unwrap_or(0)
-                        })
-                        .await
-                        .unwrap_or(0)
-                    };
-                    log(&format!(
-                        "{role_label} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
-                         for task #{task_id} PR #{pr}",
-                        role_label = role.as_str().to_uppercase()
-                    ));
-                    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
-                        log(&format!(
-                            "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after \
-                             {strikes} consecutive {} provision failures for PR #{pr}",
-                            role.as_str().to_uppercase()
-                        ));
-                    }
+                    fail_post_worktree_provision(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        unrecordable,
+                        FailedProvisionScope {
+                            reviewer_name: &reviewer_name,
+                            worktree: &wt_path,
+                            branch: &branch,
+                            capability_run_id: Some(&cap_run_id),
+                            agent_run_id: None,
+                            process: Some(proc),
+                        },
+                        worker.task_id,
+                        pr,
+                        role,
+                        head_sha,
+                    )
+                    .await?;
                     return Err(e);
                 }
             };
-
-            // Provisioning is successful only after the reviewer run is
-            // durable. Clearing after worktree creation would reset strikes
-            // for a persistent run-insert failure on every daemon tick.
-            let p = config.db_path.clone();
-            let tid = worker.task_id;
-            let role_str = role.as_str().to_string();
-            tokio::task::spawn_blocking(move || {
-                if let Ok(mut conn) = quorum_core::db::open(&p) {
-                    let _ = quorum_core::provision_attempts::clear(&mut conn, tid, pr, &role_str);
-                }
-            })
-            .await
-            .ok();
 
             if let Err(e) = fire_event_result(
                 &config.db_path,
@@ -17576,25 +17898,30 @@ async fn provision_reviewer_reserved(
                     "{}: ReviewerAttached was rejected after provisioning: {e}",
                     role.as_str().to_uppercase()
                 ));
+                // The terminal output belongs to the run-close record below, so
+                // this arm reaps the process itself and hands the funnel none.
                 let terminal_output = proc.kill_and_reap().await;
-                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                name_pool.release(&reviewer_name);
-                let p = config.db_path.clone();
-                let rn = reviewer_name.clone();
-                let failed_cap_run_id = cap_run_id.clone();
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(mut conn) = quorum_core::db::open(&p) {
-                        let _ = journal::delete(&mut conn, &rn);
-                        let _ = quorum_core::capabilities::revoke(
-                            &mut conn,
-                            &failed_cap_run_id,
-                            now_unix(),
-                        );
-                    }
-                })
-                .await
-                .ok();
+                // Strikes are cleared only after a successful attach, so this
+                // failure still has its own budget to burn.
+                let strike = fail_post_worktree_provision(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    unrecordable,
+                    FailedProvisionScope {
+                        reviewer_name: &reviewer_name,
+                        worktree: &wt_path,
+                        branch: &branch,
+                        capability_run_id: Some(&cap_run_id),
+                        agent_run_id: None,
+                        process: None,
+                    },
+                    worker.task_id,
+                    pr,
+                    role,
+                    head_sha,
+                )
+                .await;
                 close_attachment_failed_reviewer_run(
                     &config.db_path,
                     reviewer_run_id,
@@ -17609,10 +17936,25 @@ async fn provision_reviewer_reserved(
                 )
                 .await;
                 persist_terminal_output(&mut reviewer_session_log, terminal_output);
+                strike?;
                 return Err(QuorumError::Io(format!(
                     "reviewer attachment failed after provisioning: {e}"
                 )));
             }
+
+            // Only a completed attachment clears the budget. Clearing before the
+            // lifecycle transition let a persistently rejected `ReviewerAttached`
+            // wipe every earlier strike and re-provision forever.
+            let p = config.db_path.clone();
+            let tid = worker.task_id;
+            let role_str = role.as_str().to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut conn) = quorum_core::db::open(&p) {
+                    let _ = quorum_core::provision_attempts::clear(&mut conn, tid, pr, &role_str);
+                }
+            })
+            .await
+            .ok();
 
             // R2: stash metadata for audit recording when the reviewer finishes.
             if let ReviewRole::R2 {
@@ -17711,24 +18053,30 @@ async fn provision_reviewer_reserved(
                 role.as_str().to_uppercase()
             );
             log(&reason);
-            name_pool.release(&reviewer_name);
-            wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-            wt_mgr.delete_branch(task_repo_dir, &branch).await;
-            let p = config.db_path.clone();
-            let rn = reviewer_name.clone();
-            let failed_cap_run_id = cap_run_id.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Ok(mut conn) = quorum_core::db::open(&p) {
-                    let _ = journal::delete(&mut conn, &rn);
-                    let _ = quorum_core::capabilities::revoke(
-                        &mut conn,
-                        &failed_cap_run_id,
-                        now_unix(),
-                    );
-                }
-            })
-            .await
-            .ok();
+            // The worktree, branch, journal row and capability were all created
+            // before the provider CLI was even reached, and callers treat
+            // `Failed` as "phase 5 retries next tick" with no strike of their
+            // own. A deterministic spawn failure (missing binary, bad path,
+            // auth) must therefore burn the budget like any other failure here.
+            fail_post_worktree_provision(
+                config,
+                wt_mgr,
+                name_pool,
+                unrecordable,
+                FailedProvisionScope {
+                    reviewer_name: &reviewer_name,
+                    worktree: &wt_path,
+                    branch: &branch,
+                    capability_run_id: Some(&cap_run_id),
+                    agent_run_id: None,
+                    process: None,
+                },
+                worker.task_id,
+                pr,
+                role,
+                head_sha,
+            )
+            .await?;
             return Ok(ReviewerProvisionOutcome::Failed(reason));
         }
     }
@@ -20904,6 +21252,31 @@ mod tests {
     use super::*;
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// The backstop counts only *consecutive* unrecordable strikes: one strike
+    /// that does record clears it, so a transient write-lock holder can never
+    /// accumulate three and park a task.
+    #[test]
+    fn unrecordable_strikes_count_consecutively_per_task_and_pr() {
+        let mut strikes = UnrecordableStrikes::new();
+        assert_eq!(strikes.record(7, 42), 1);
+        assert_eq!(strikes.record(7, 42), 2);
+        assert_eq!(strikes.record(7, 99), 1, "a different PR counts separately");
+        assert_eq!(
+            strikes.record(8, 42),
+            1,
+            "a different task counts separately"
+        );
+
+        strikes.clear(7, 42);
+        assert_eq!(strikes.count(7, 42), 0);
+        assert_eq!(
+            strikes.record(7, 42),
+            1,
+            "counting restarts after a success"
+        );
+        assert_eq!(strikes.count(7, 99), 1, "clearing one key leaves others");
+    }
 
     #[tokio::test]
     async fn review_draft_consumption_is_lifecycle_inert() {
@@ -26495,6 +26868,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     let mut pending_reviewer_resumes = HashMap::new();
                     let mut poison_tracker = PoisonTracker::new();
                     let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+                    let mut graph_skip_logs = ClaimSkipLogLimiter::new();
+                    let mut unrecordable_strikes = UnrecordableStrikes::new();
                     let mut drain_state = DrainState::new();
                     let mut lifetime_roster = LifetimeRoster::new();
                     for reviewer in &reviewers {
@@ -26517,6 +26892,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut pending_reviewer_resumes,
                         &mut poison_tracker,
                         &mut claim_skip_logs,
+                        &mut graph_skip_logs,
+                        &mut unrecordable_strikes,
                         &mut drain_state,
                         &mut lifetime_roster,
                         &mut classifier_slot,

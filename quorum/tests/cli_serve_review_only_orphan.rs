@@ -780,9 +780,17 @@ fn reviewer_run_insert_error_never_attaches_and_restart_recovers() {
         "injected persistence failure was not surfaced: {:?}",
         failed.lines
     );
+    // The failure is contained to this task: it is logged and the tick keeps
+    // going, instead of aborting the whole tick with `tick error`.
     assert!(
-        failed.wait_for("tick error", 10),
+        failed.wait_for("orphan provision error for task #1 PR #42", 10),
         "daemon did not finish fail-safe cleanup: {:?}",
+        failed.lines
+    );
+    failed.drain_pending_lines();
+    assert!(
+        !failed.lines.iter().any(|line| line.contains("tick error")),
+        "a single task's provision failure must not abort the tick: {:?}",
         failed.lines
     );
     drop(failed);
