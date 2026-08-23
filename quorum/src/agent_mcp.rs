@@ -5,6 +5,7 @@
 //! run capability. Tool arguments deliberately stop at this shell until the
 //! durable operation slices implement their closed endpoint schemas.
 
+use crate::agent_client::SubmitPlanOutcome;
 use quorum_core::error::{QuorumError, Result};
 use rmcp::{
     model::{
@@ -219,6 +220,62 @@ impl ProtocolOperation {
     }
 }
 
+/// The planner's single tool. It is not a `ProtocolOperation`: it performs no
+/// GitHub work and is proxied straight to the daemon endpoint's `SubmitPlan`.
+const SUBMIT_PLAN: &str = "submit_plan";
+
+fn submit_plan_tool() -> Tool {
+    let description = format!(
+        "Submit this planning run's response to the daemon. Call it exactly once with the PLAN \
+         or BLOCKER object as `response`. The daemon validates the plan and answers in this \
+         turn, so a rejection can be corrected and submitted again immediately; the plan is \
+         never reported as text. {shapes} If this call times out or the transport fails, call \
+         it again — `already_submitted` means your first plan stands; never resubmit a \
+         corrected plan after a transport failure. `request_too_large` means the plan itself \
+         must be shrunk; it is not a transport failure.",
+        shapes = crate::serve::planner::RESPONSE_SHAPES,
+    );
+    let schema = json!({
+        "type": "object",
+        "required": ["response"],
+        "properties": {
+            "response": {
+                "type": "object",
+                "description": "Exactly the PLAN or BLOCKER object: {\"outcome\":\"plan\",\"tasks\":[...]} or {\"outcome\":\"blocker\",...}. Unknown fields are rejected."
+            }
+        }
+    });
+    Tool::new(
+        SUBMIT_PLAN,
+        description,
+        Arc::new(
+            schema
+                .as_object()
+                .expect("static tool schema is an object")
+                .clone(),
+        ),
+    )
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(false)
+            .idempotent(false)
+            // The daemon endpoint is the only world this tool touches.
+            .open_world(false),
+    )
+}
+
+/// One tool result, always a single JSON text block so the planner reads the
+/// daemon's own verdict rather than prose.
+fn json_result(value: Value, is_error: bool) -> CallToolResult {
+    let content = vec![ContentBlock::text(value.to_string())];
+    if is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    }
+}
+
 fn bounded_string(min: usize, max: usize) -> Value {
     json!({"type":"string","minLength":min,"maxLength":max})
 }
@@ -325,6 +382,7 @@ enum RunPhase {
     InitialWorker,
     ReworkWorker,
     Reviewer,
+    Planner,
 }
 
 #[derive(Debug)]
@@ -369,6 +427,7 @@ impl GithubServer {
         }
         let expected = expected_inventory(phase);
         let target_valid = match phase {
+            RunPhase::Planner => role == "planner" && pr.is_none() && review_revision.is_none(),
             RunPhase::InitialWorker => {
                 role == "worker" && pr.is_none() && review_revision.is_none()
             }
@@ -442,11 +501,89 @@ impl GithubServer {
         }
     }
 
+    /// Proxy one plan submission to the daemon endpoint.
+    ///
+    /// The endpoint owns every validation decision, so its own rejection code
+    /// and message are relayed verbatim and the planner corrects the cited
+    /// defect within the same turn. Acceptance is one atomic guarded write, so
+    /// a transport failure leaves the outcome unknown rather than failed; the
+    /// tool description tells the planner to repeat the identical call, which
+    /// answers `already_submitted` when the first plan already landed.
+    ///
+    /// A plan too large for one endpoint request is refused by the client
+    /// before it connects, so nothing was submitted and repeating the identical
+    /// call cannot succeed. That case is reported as `request_too_large` — the
+    /// one failure whose remedy is a smaller plan rather than a retry.
+    async fn submit_plan(&self, arguments: Option<Map<String, Value>>) -> CallToolResult {
+        let Some(response) = arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("response"))
+            .filter(|response| response.is_object())
+            .cloned()
+        else {
+            return json_result(
+                json!({
+                    "code": "invalid_arguments",
+                    "message": "submit_plan requires a `response` object"
+                }),
+                true,
+            );
+        };
+        let endpoint = self.endpoint.clone();
+        let capability = self.capability.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::agent_client::submit_plan(&endpoint, &capability, &response)
+        })
+        .await
+        {
+            Ok(Ok(SubmitPlanOutcome::Accepted { graph_id })) => {
+                json_result(json!({"accepted": true, "graph_id": graph_id}), false)
+            }
+            Ok(Ok(SubmitPlanOutcome::Rejected { code, message })) => {
+                json_result(json!({"code": code, "message": message}), true)
+            }
+            // The client rejects an oversized frame before it connects, so the
+            // plan never reached the daemon and a retry would fail identically.
+            Ok(Err(QuorumError::Usage(_))) => json_result(
+                json!({
+                    "code": "request_too_large",
+                    "message": "the plan does not fit one endpoint request; submit a smaller plan"
+                }),
+                true,
+            ),
+            Ok(Err(_)) | Err(_) => json_result(
+                json!({
+                    "code": "transport",
+                    "message": "the agent endpoint did not answer; call submit_plan again to \
+                                learn whether the plan was accepted"
+                }),
+                true,
+            ),
+        }
+    }
+
     fn record_advertised_phase(&self, phase: RunPhase) {
         *self
             .advertised_phase
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(phase);
+    }
+
+    /// Whether `submit_plan` belongs to the inventory this client last received.
+    ///
+    /// The tool is advertised to a planner only, so a run that has been told
+    /// any other phase must see the name as unknown, exactly like any tool
+    /// outside its inventory. A run that has not listed tools yet is not
+    /// refused here: the endpoint authorizes the call itself, and a cache this
+    /// shell has never filled must not take away a planner's only door.
+    fn planner_tool_advertised(&self) -> bool {
+        matches!(
+            *self
+                .advertised_phase
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            None | Some(RunPhase::Planner)
+        )
     }
 
     fn phase_changed_since_advertisement(&self, phase: RunPhase) -> bool {
@@ -460,6 +597,9 @@ impl GithubServer {
 fn expected_inventory(phase: RunPhase) -> Vec<ProtocolOperation> {
     use ProtocolOperation::*;
     match phase {
+        // The planner's only tool is `submit_plan`, which is not a
+        // `ProtocolOperation`: it performs no GitHub work.
+        RunPhase::Planner => Vec::new(),
         RunPhase::InitialWorker => vec![DeliveryReportWrite],
         RunPhase::ReworkWorker => vec![
             PullRequestRead,
@@ -524,11 +664,15 @@ impl ServerHandler for GithubServer {
     ) -> std::result::Result<ListToolsResult, McpError> {
         let inventory = self.inventory().await?;
         self.record_advertised_phase(inventory.phase);
-        let tools = inventory
+        let planner = inventory.phase == RunPhase::Planner;
+        let mut tools: Vec<Tool> = inventory
             .operations
             .into_iter()
             .map(ProtocolOperation::tool)
             .collect();
+        if planner {
+            tools.push(submit_plan_tool());
+        }
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -537,6 +681,9 @@ impl ServerHandler for GithubServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
+        if request.name == SUBMIT_PLAN && self.planner_tool_advertised() {
+            return Ok(self.submit_plan(request.arguments).await.into());
+        }
         let operation = ProtocolOperation::from_name(&request.name)
             .ok_or_else(|| McpError::new(ErrorCode::METHOD_NOT_FOUND, "unknown tool", None))?;
         match self
