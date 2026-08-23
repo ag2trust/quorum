@@ -78,8 +78,8 @@ primary = 100
 # agent_bin = \"/path/to/provider-cli\"
 # no_bare_agent = true   # default: use operator's Claude login (no --bare)
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
-# base_branch = \"main\"
-# self_update_branch = \"main\" # defaults to base_branch; daemon update polling only
+# base_branch = \"main\" # task/PR base: worktrees, PRs, validation, and merges
+# self_update_branch = \"main\" # daemon update poll; defaults to resolved base_branch
 
 ## Grok Build settings for managed worker roles only.
 # [grok]
@@ -1393,19 +1393,18 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 file_cfg.base_branch.as_deref(),
                 "main",
             );
-            let r_self_update_branch = if let Some(branch) = self_update_branch.as_deref() {
-                Sourced {
-                    value: branch.to_string(),
-                    source: Source::Flag,
-                }
-            } else if let Some(branch) = file_cfg.self_update_branch.as_deref() {
-                Sourced {
-                    value: branch.to_string(),
-                    source: Source::File,
-                }
-            } else {
-                r_base_branch.clone()
-            };
+            // Self-update polling has an independent branch, but preserves
+            // existing deployments by inheriting the fully resolved task/PR base.
+            let r_self_update_branch =
+                if self_update_branch.is_some() || file_cfg.self_update_branch.is_some() {
+                    resolve_str(
+                        self_update_branch.as_deref(),
+                        file_cfg.self_update_branch.as_deref(),
+                        "main",
+                    )
+                } else {
+                    r_base_branch.clone()
+                };
             let r_merge_checks_timeout = resolve_val(
                 merge_checks_timeout_secs,
                 file_cfg.merge_checks_timeout_secs,

@@ -213,13 +213,14 @@ self_update_branch = "main"
         stderr_text.contains("max_idle_secs:             2700 (file)"),
         "deprecated max_turn_wall_secs should resolve as max_idle_secs:\n{stderr_text}"
     );
+    // Task/PR and self-update branches resolve independently from the file.
     assert!(
         stderr_text.contains("base_branch:               develop (file)"),
-        "base_branch should show its file value:\n{stderr_text}"
+        "base_branch should show 'develop (file)':\n{stderr_text}"
     );
     assert!(
         stderr_text.contains("self_update_branch:        main (file)"),
-        "self_update_branch should show its independent file value:\n{stderr_text}"
+        "self_update_branch should show 'main (file)':\n{stderr_text}"
     );
 
     // Clean shutdown
@@ -607,11 +608,11 @@ base_branch = "develop"
     );
     assert!(
         stderr_text.contains("base_branch:               develop (file)"),
-        "base branch should come from auto-discovered config:\n{stderr_text}"
+        "base_branch should come from the config file:\n{stderr_text}"
     );
     assert!(
         stderr_text.contains("self_update_branch:        develop (file)"),
-        "self-update branch should inherit the resolved base branch when unset:\n{stderr_text}"
+        "self_update_branch should inherit the resolved base_branch when omitted:\n{stderr_text}"
     );
 
     drop(sentinel);

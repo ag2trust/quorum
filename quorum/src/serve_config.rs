@@ -2470,6 +2470,10 @@ worktree_base = "/tmp/wt"
         );
         assert!(b.contains("8 (file)"), "cap should show file source: {b}");
         assert!(
+            b.contains("self_update_branch:        main (default)"),
+            "self-update branch should be shown with its source: {b}"
+        );
+        assert!(
             b.contains("token_limit_basis:         raw (default)"),
             "raw token basis should be shown: {b}"
         );
