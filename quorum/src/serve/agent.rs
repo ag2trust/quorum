@@ -335,9 +335,24 @@ impl AgentProc {
     /// Spawn a read-only planning turn. Unlike the closed-book classifier,
     /// the planner may inspect the frozen repository, but cannot invoke Bash,
     /// write files, load customizations, or persist a provider session.
+    ///
+    /// `agent_mcp` is `Some` only for a planner carrying a complete managed run
+    /// envelope. It adds exactly one tool — `submit_plan` — and the planner
+    /// keeps its read-only `--tools` surface.
+    ///
+    /// The tool surface narrows what the planner reaches for; it is not what
+    /// bounds the capability now in its environment. A `planner` capability is
+    /// honored by `SubmitPlan` alone — `resolve_live_run_context`
+    /// (`quorum-core/src/capabilities.rs:113-116,140`) admits only the `worker`
+    /// and `reviewer` roles — under a once-only guard and a bounded rejection
+    /// budget.
     #[allow(dead_code)] // consumed by the pending daemon decomposition coordinator
-    pub fn spawn_planner(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, RestrictedMode::Planner, None)
+    pub fn spawn_planner(
+        spec: &AgentSpec,
+        agent_bin: Option<&str>,
+        agent_mcp: Option<AgentMcpServer>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::Planner, agent_mcp)
     }
 
     fn spawn_configured(
@@ -388,15 +403,23 @@ impl AgentProc {
         // cannot edit files, run git/gh, or signal `quorum submit` — it stalls
         // forever in awaiting-review (observed second live run). Restricted
         // classifier spawns pass an empty list in addition to `--tools ""`.
+        //
+        // A planner never receives the server-wide wildcard: its MCP surface is
+        // exactly `submit_plan`, so any other managed tool the server advertises
+        // stays auto-denied.
+        let mcp_allowed_tool = match restricted {
+            RestrictedMode::Planner => crate::serve::runner::PLANNER_MCP_ALLOWED_TOOL,
+            _ => AGENT_MCP_ALLOWED_TOOL,
+        };
         let allowed_tools = match agent_mcp {
-            Some(_) if spec.allowed_tools.is_empty() => AGENT_MCP_ALLOWED_TOOL.to_string(),
+            Some(_) if spec.allowed_tools.is_empty() => mcp_allowed_tool.to_string(),
             Some(_)
                 if !spec
                     .allowed_tools
                     .split(',')
-                    .any(|tool| tool == AGENT_MCP_ALLOWED_TOOL) =>
+                    .any(|tool| tool == mcp_allowed_tool) =>
             {
-                format!("{},{}", spec.allowed_tools, AGENT_MCP_ALLOWED_TOOL)
+                format!("{},{}", spec.allowed_tools, mcp_allowed_tool)
             }
             _ => spec.allowed_tools.clone(),
         };
@@ -415,7 +438,12 @@ impl AgentProc {
         if agent_mcp.is_some() {
             strip_managed_mcp_authority(&mut cmd);
         }
-        if restricted == RestrictedMode::Planner {
+        // A planner without an MCP server holds no endpoint authority at all,
+        // so every coordination name is removed. A planner with one must keep
+        // its run envelope: `claude_mcp_config` carries no `env` block, so the
+        // stdio MCP child inherits these names from this process. GitHub and
+        // daemon-home authority is still stripped above.
+        if restricted == RestrictedMode::Planner && agent_mcp.is_none() {
             strip_coordination_env(&mut cmd);
         }
 
@@ -1101,7 +1129,7 @@ mod tests {
         spec.allowed_tools = "Read,Glob,Grep".into();
         spec.env_vars = no_auth_env(tmp.path());
 
-        let mut proc = AgentProc::spawn_planner(&spec, None).expect("spawn planner claude");
+        let mut proc = AgentProc::spawn_planner(&spec, None, None).expect("spawn planner claude");
         proc.feed_turn(&user_turn("return an empty JSON object"))
             .await
             .expect("feed planner turn");
@@ -1115,41 +1143,215 @@ mod tests {
         );
     }
 
+    fn planner_spec(worktree: &std::path::Path) -> AgentSpec {
+        let mut spec = classifier_spec(worktree, false);
+        spec.model = "claude-opus-4-6".into();
+        spec.effort = "high".into();
+        spec.allowed_tools = "Read,Glob,Grep".into();
+        spec
+    }
+
+    /// Capture the exact argv a planner spawn hands the Claude CLI. The fake
+    /// binary renames its capture into place so a partially written file can
+    /// never be read as the complete argument surface.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn planner_launch_passes_no_provider_budget() {
+    async fn capture_planner_args(
+        dir: &std::path::Path,
+        spec: &AgentSpec,
+        agent_mcp: Option<AgentMcpServer>,
+    ) -> Vec<String> {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = tempfile::tempdir().unwrap();
-        let args_path = tmp.path().join("args");
-        let fake = tmp.path().join("claude");
+        let args_path = dir.join("planner-args");
+        let fake = dir.join("claude");
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nwhile IFS= read -r _line; do :; done\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\n\
+                 while IFS= read -r _line; do :; done\n",
                 args_path.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut spec = classifier_spec(tmp.path(), false);
-        spec.model = "claude-opus-4-6".into();
-        spec.effort = "high".into();
-        spec.allowed_tools = "Read,Glob,Grep".into();
 
-        let proc = AgentProc::spawn_planner(&spec, fake.to_str()).unwrap();
-        for _ in 0..100 {
+        let proc = AgentProc::spawn_planner(spec, fake.to_str(), agent_mcp).unwrap();
+        for _ in 0..200 {
             if args_path.exists() {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        let args = std::fs::read_to_string(&args_path)
+        let captured = std::fs::read_to_string(&args_path)
             .expect("fake planner did not capture its bounded argument surface");
-        let args: Vec<&str> = args.lines().collect();
-        // Owner decision: no provider spend ceiling on planning turns for now.
-        assert!(!args.contains(&"--max-budget-usd"));
         let _ = proc.kill_and_reap().await;
+        captured.lines().map(str::to_string).collect()
+    }
+
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> &'a str {
+        let index = args
+            .iter()
+            .position(|arg| arg == flag)
+            .unwrap_or_else(|| panic!("{flag} missing from planner arguments {args:?}"));
+        args.get(index + 1)
+            .unwrap_or_else(|| panic!("{flag} carried no value in {args:?}"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_launch_passes_no_provider_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = planner_spec(tmp.path());
+        let args = capture_planner_args(tmp.path(), &spec, None).await;
+        // Owner decision: no provider spend ceiling on planning turns for now.
+        assert!(!args.iter().any(|arg| arg == "--max-budget-usd"));
+    }
+
+    /// The planner's MCP surface is exactly one tool. The server-wide wildcard
+    /// workers and reviewers carry would hand the planner every managed
+    /// GitHub and lifecycle operation the endpoint advertises.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_planner_with_mcp_allows_only_submit_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = planner_spec(tmp.path());
+        let args = capture_planner_args(
+            tmp.path(),
+            &spec,
+            Some(crate::serve::runner::AGENT_MCP_SERVER),
+        )
+        .await;
+
+        assert!(
+            args.iter().any(|arg| arg == "--strict-mcp-config"),
+            "{args:?}"
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(flag_value(&args, "--mcp-config")).expect("mcp config is JSON");
+        assert_eq!(config["mcpServers"]["github"]["command"], "quorum");
+        assert_eq!(
+            config["mcpServers"]["github"]["args"],
+            serde_json::json!(["agent-mcp"])
+        );
+
+        let allowed = flag_value(&args, "--allowedTools");
+        assert!(
+            allowed
+                .split(',')
+                .any(|tool| tool == "mcp__github__submit_plan"),
+            "planner allowlist {allowed} omits submit_plan"
+        );
+        assert!(
+            !allowed.contains("mcp__github__*"),
+            "planner allowlist {allowed} carries the server-wide wildcard"
+        );
+        // The read-only inspection surface must survive: dontAsk auto-denies
+        // every tool outside --allowedTools.
+        for tool in ["Read", "Glob", "Grep"] {
+            assert!(
+                allowed.split(',').any(|allowed| allowed == tool),
+                "planner allowlist {allowed} dropped {tool}"
+            );
+        }
+        assert_eq!(flag_value(&args, "--tools"), "Read,Glob,Grep");
+    }
+
+    /// `None` must leave the historical planner surface byte-identical: no MCP
+    /// flags and no MCP tool anywhere in the allowlist.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_planner_without_envelope_has_no_mcp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = planner_spec(tmp.path());
+        let args = capture_planner_args(tmp.path(), &spec, None).await;
+
+        for absent in ["--mcp-config", "--strict-mcp-config"] {
+            assert!(
+                !args.iter().any(|arg| arg == absent),
+                "tool-less planner carries {absent}: {args:?}"
+            );
+        }
+        assert!(
+            !args.iter().any(|arg| arg.contains("mcp__")),
+            "tool-less planner carries an MCP tool: {args:?}"
+        );
+        assert_eq!(flag_value(&args, "--allowedTools"), "Read,Glob,Grep");
+        assert_eq!(flag_value(&args, "--tools"), "Read,Glob,Grep");
+    }
+
+    /// The stdio MCP child inherits the planner process environment, so the run
+    /// envelope must survive exactly when the tool is attached — and never when
+    /// it is not. GitHub credentials never survive either way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_planner_run_envelope_survives_only_with_mcp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let capture = tmp.path().join("env");
+        let fake = tmp.path().join("claude");
+        std::fs::write(
+            &fake,
+            format!(
+                r#"#!/bin/sh
+printf '{{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%s"}}\n' \
+  "$QUORUM_REPO" "$QUORUM_AGENT" "$QUORUM_RUN_ID" "$QUORUM_AGENT_ENDPOINT" \
+  "$QUORUM_HOME" "$GH_TOKEN" > '{0}.tmp'
+mv '{0}.tmp' '{0}'
+while IFS= read -r _line; do :; done
+"#,
+                capture.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let envelope = vec![
+            ("QUORUM_REPO".to_string(), "owner/repo".to_string()),
+            ("QUORUM_AGENT".to_string(), "Planner-test".to_string()),
+            ("QUORUM_RUN_ID".to_string(), "run-capability".to_string()),
+            (
+                "QUORUM_AGENT_ENDPOINT".to_string(),
+                "/tmp/quorum-planner.sock".to_string(),
+            ),
+            ("QUORUM_HOME".to_string(), "home-authority".to_string()),
+            ("GH_TOKEN".to_string(), "gh-authority".to_string()),
+        ];
+
+        for (agent_mcp, expect_envelope) in [
+            (Some(crate::serve::runner::AGENT_MCP_SERVER), true),
+            (None, false),
+        ] {
+            let _ = std::fs::remove_file(&capture);
+            let mut spec = planner_spec(tmp.path());
+            spec.env_vars = envelope.clone();
+            let proc = AgentProc::spawn_planner(&spec, fake.to_str(), agent_mcp).unwrap();
+            for _ in 0..200 {
+                if capture.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            let observed: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&capture).expect("planner did not report its environment"),
+            )
+            .unwrap();
+            let _ = proc.kill_and_reap().await;
+
+            if expect_envelope {
+                assert_eq!(observed["repo"], "owner/repo");
+                assert_eq!(observed["agent"], "Planner-test");
+                assert_eq!(observed["run"], "run-capability");
+                assert_eq!(observed["endpoint"], "/tmp/quorum-planner.sock");
+            } else {
+                for name in ["repo", "agent", "run"] {
+                    assert_eq!(observed[name], "", "{name} reached a tool-less planner");
+                }
+            }
+            // Never reachable in either shape.
+            assert_eq!(observed["home"], "");
+            assert_eq!(observed["gh"], "");
+        }
     }
 
     /// Negative control pinning the #297 failure mode: a non-UUID session id

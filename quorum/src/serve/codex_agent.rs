@@ -142,7 +142,24 @@ pub fn restricted_exec_args(spec: &CodexSpec) -> Vec<String> {
 /// Planner-specific Codex arguments. This pins the provider's mechanism-level
 /// read-only sandbox and never includes the worker escape hatch.
 pub fn planner_exec_args(spec: &CodexSpec) -> Vec<String> {
-    vec![
+    planner_exec_args_configured(spec, None)
+}
+
+/// The planner argument shape with an optional `submit_plan` MCP server.
+/// `-s read-only` and every other pinned isolation flag are unchanged by its
+/// presence.
+///
+/// `-s read-only` sandboxes model-generated shell commands; it does not remove
+/// the shell, so this argument shape is not what stops a Codex planner from
+/// using its run envelope directly. That containment is the endpoint's: a
+/// `planner` capability is honored by `SubmitPlan` alone
+/// (`quorum-core/src/capabilities.rs:113-116,140,313-335`), under a once-only
+/// guard and a bounded rejection budget.
+fn planner_exec_args_configured(
+    spec: &CodexSpec,
+    agent_mcp: Option<AgentMcpServer>,
+) -> Vec<String> {
+    let mut args = vec![
         "exec".into(),
         "--json".into(),
         "--model".into(),
@@ -157,8 +174,10 @@ pub fn planner_exec_args(spec: &CodexSpec) -> Vec<String> {
         "--ephemeral".into(),
         "--ignore-user-config".into(),
         "--ignore-rules".into(),
-        spec.prompt.clone(),
-    ]
+    ];
+    append_agent_mcp_override(&mut args, agent_mcp);
+    args.push(spec.prompt.clone());
+    args
 }
 
 // ---------------------------------------------------------------------------
@@ -320,14 +339,30 @@ impl CodexProc {
 
     /// Read-only, single-turn planner boundary. Kept separate from worker
     /// spawning so future worker flags cannot silently weaken planning.
-    pub fn spawn_planner(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
+    ///
+    /// `agent_mcp` is `Some` only for a planner carrying a complete managed run
+    /// envelope; it adds the `submit_plan` tool and nothing else. The read-only
+    /// sandbox and every other isolation flag are unaffected.
+    pub fn spawn_planner(
+        spec: &CodexSpec,
+        codex_bin: Option<&str>,
+        agent_mcp: Option<AgentMcpServer>,
+    ) -> std::io::Result<Self> {
         let bin = codex_bin.unwrap_or("codex");
         let mut cmd = Command::new(bin);
-        cmd.args(planner_exec_args(spec));
+        cmd.args(planner_exec_args_configured(spec, agent_mcp));
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
-        strip_planner_coordination_env(&mut cmd);
+        // A planner without an MCP server holds no endpoint authority, so every
+        // coordination name is removed. A planner with one must keep its run
+        // envelope: Codex copies exactly `AGENT_MCP_ENV_VARS` out of this
+        // process environment into the stdio MCP child.
+        if agent_mcp.is_some() {
+            strip_planner_mcp_ambient_authority(&mut cmd);
+        } else {
+            strip_planner_coordination_env(&mut cmd);
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -749,6 +784,15 @@ fn strip_planner_coordination_env(cmd: &mut Command) {
     }
 }
 
+/// Ambient authority removed from an MCP-carrying planner. The managed run
+/// envelope survives because the stdio MCP child needs it; the database home
+/// and every GitHub credential do not reach the provider or its child.
+fn strip_planner_mcp_ambient_authority(cmd: &mut Command) {
+    for name in ["QUORUM_HOME", "GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"] {
+        cmd.env_remove(name);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -974,6 +1018,117 @@ mod tests {
         }
     }
 
+    /// The `submit_plan` server is additive: it must not relax the planner's
+    /// own read-only sandbox or reintroduce any bypass flag.
+    #[test]
+    fn codex_planner_with_mcp_keeps_read_only_sandbox() {
+        let mut spec = test_spec();
+        spec.model = "gpt-5.6-sol".into();
+        let args =
+            planner_exec_args_configured(&spec, Some(crate::serve::runner::AGENT_MCP_SERVER));
+
+        let sandbox = args
+            .iter()
+            .position(|arg| arg == "-s")
+            .expect("planner sandbox flag missing");
+        assert_eq!(args[sandbox + 1], "read-only");
+        assert!(
+            args.iter().any(|arg| arg
+                == r#"mcp_servers.github={command="quorum",args=["agent-mcp"],env_vars=["QUORUM_REPO","QUORUM_AGENT","QUORUM_RUN_ID","QUORUM_AGENT_ENDPOINT"]}"#),
+            "{args:?}"
+        );
+        assert_eq!(args.last().unwrap(), "say hello");
+        for forbidden in [
+            "--approve-for-me",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
+            "--add-dir",
+            "workspace-write",
+            "danger-full-access",
+        ] {
+            assert!(
+                !args.iter().any(|arg| arg == forbidden),
+                "MCP-carrying planner contains forbidden argument {forbidden}"
+            );
+        }
+        // Every isolation flag of the tool-less shape is still present.
+        for pinned in [
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
+        ] {
+            assert!(args.iter().any(|arg| arg == pinned), "{args:?}");
+        }
+    }
+
+    /// Codex copies exactly `AGENT_MCP_ENV_VARS` from this process into the
+    /// stdio MCP child, so an MCP-carrying planner keeps its run envelope while
+    /// a tool-less planner keeps carrying none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_run_envelope_survives_only_with_mcp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_codex = tmp.path().join("fake-codex");
+        std::fs::write(
+            &fake_codex,
+            r#"#!/bin/sh
+printf '{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%s","openai":"%s"}\n' "$QUORUM_REPO" "$QUORUM_AGENT" "$QUORUM_RUN_ID" "$QUORUM_AGENT_ENDPOINT" "$QUORUM_HOME" "$GH_TOKEN" "$OPENAI_API_KEY"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        for (agent_mcp, expect_envelope) in [
+            (Some(crate::serve::runner::AGENT_MCP_SERVER), true),
+            (None, false),
+        ] {
+            let spec = CodexSpec {
+                worktree: tmp.path().to_path_buf(),
+                env_vars: vec![
+                    ("QUORUM_REPO".into(), "owner/repo".into()),
+                    ("QUORUM_AGENT".into(), "Planner-test".into()),
+                    ("QUORUM_RUN_ID".into(), "run-capability".into()),
+                    (
+                        "QUORUM_AGENT_ENDPOINT".into(),
+                        "/tmp/quorum-planner.sock".into(),
+                    ),
+                    ("QUORUM_HOME".into(), "home-authority".into()),
+                    ("GH_TOKEN".into(), "gh-authority".into()),
+                    ("OPENAI_API_KEY".into(), "provider-auth".into()),
+                ],
+                ..test_spec()
+            };
+            let mut proc = CodexProc::spawn_planner(&spec, fake_codex.to_str(), agent_mcp).unwrap();
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(5), proc.next_raw_line())
+                    .await
+                    .expect("fake Codex did not emit its environment")
+                    .expect("fake Codex exited without emitting its environment");
+            let _ = proc.kill_and_reap().await;
+            let observed: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+            if expect_envelope {
+                assert_eq!(observed["repo"], "owner/repo");
+                assert_eq!(observed["agent"], "Planner-test");
+                assert_eq!(observed["run"], "run-capability");
+                assert_eq!(observed["endpoint"], "/tmp/quorum-planner.sock");
+            } else {
+                for name in ["repo", "agent", "run"] {
+                    assert_eq!(observed[name], "", "{name} reached a tool-less planner");
+                }
+            }
+            assert_eq!(observed["home"], "");
+            assert_eq!(observed["gh"], "");
+            // Provider authentication is untouched in both shapes.
+            assert_eq!(observed["openai"], "provider-auth");
+        }
+    }
+
     // ── Pinned resume argument shape ─────────────────────────────────────
 
     #[test]
@@ -1073,7 +1228,7 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
             ],
             ..test_spec()
         };
-        let mut proc = CodexProc::spawn_planner(&spec, fake_codex.to_str()).unwrap();
+        let mut proc = CodexProc::spawn_planner(&spec, fake_codex.to_str(), None).unwrap();
         let line = tokio::time::timeout(std::time::Duration::from_secs(5), proc.next_raw_line())
             .await
             .expect("fake Codex did not emit its environment")
@@ -1327,6 +1482,138 @@ while IFS= read -r request; do :; done
         );
     }
 
+    /// Real-binary reachability check for the planner's `submit_plan` door.
+    ///
+    /// `-s read-only` is the planner's mechanism-level isolation. `submit_plan`
+    /// is useless if that sandbox also stops the stdio MCP child from reaching
+    /// the daemon's Unix socket, and a fake provider cannot answer that — only
+    /// the installed `codex` binary can. This launches the real planner shape
+    /// with the MCP override pointed at a stand-in `quorum` that connects to a
+    /// temporary Unix socket, and asserts the connect succeeds.
+    ///
+    /// `#[ignore]` by default: it needs the real binary plus `python3`, and it
+    /// runs a provider process. If the sandbox ever blocks the connect, record
+    /// the finding — do NOT loosen the sandbox.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "real codex binary; run with --ignored"]
+    async fn codex_planner_sandbox_allows_mcp_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        if !codex_available() {
+            eprintln!("skipped: no codex binary on PATH");
+            return;
+        }
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipped: no python3 to drive the socket probe");
+            return;
+        }
+
+        // Short path: macOS caps `sun_path` at 104 bytes, well under a
+        // `/var/folders` temp directory plus a file name.
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/quorum-planner-mcp-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind probe socket");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_in_thread = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    return;
+                }
+                accepted_in_thread.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("connected");
+        let probe_log = tmp.path().join("probe.log");
+        let fake_quorum = tmp.path().join("quorum");
+        std::fs::write(
+            &fake_quorum,
+            format!(
+                r#"#!/bin/sh
+python3 - <<'PROBE' >> '{log}' 2>&1
+import socket
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect({socket:?})
+sock.sendall(b"probe")
+open({marker:?}, "w").write("connected")
+print("connect-ok")
+PROBE
+if [ $? -ne 0 ]; then printf 'connect-failed\n' >> '{log}'; fi
+while IFS= read -r _line; do :; done
+"#,
+                log = probe_log.display(),
+                socket = socket.display().to_string(),
+                marker = marker.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_quorum).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_quorum, permissions).unwrap();
+
+        let codex_home = tmp.path().join("codex-home");
+        std::fs::create_dir(&codex_home).unwrap();
+        let mut environment = managed_mcp_env(&codex_home, tmp.path());
+        environment.push(("QUORUM_AGENT_ENDPOINT".into(), socket.display().to_string()));
+        let spec = CodexSpec {
+            model: "gpt-5.6-sol".into(),
+            effort: "high".into(),
+            sandbox: "read-only".into(),
+            worktree: tmp.path().to_path_buf(),
+            prompt: "call submit_plan".into(),
+            env_vars: environment,
+        };
+
+        let proc =
+            CodexProc::spawn_planner(&spec, None, Some(crate::serve::runner::AGENT_MCP_SERVER))
+                .expect("spawn real planner codex with the submit_plan MCP override");
+        let connected = tokio::time::timeout(std::time::Duration::from_secs(45), async {
+            loop {
+                if marker.exists() {
+                    return true;
+                }
+                if std::fs::read_to_string(&probe_log)
+                    .unwrap_or_default()
+                    .contains("connect-failed")
+                {
+                    return false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        let _ = proc.kill_and_reap().await;
+        let log = std::fs::read_to_string(&probe_log).unwrap_or_default();
+        let _ = std::fs::remove_file(&socket);
+
+        assert_eq!(
+            connected,
+            Ok(true),
+            "the codex read-only planner sandbox blocked the MCP child's Unix \
+             socket connect (probe log: {log}). Record this finding — do not \
+             loosen the sandbox."
+        );
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 1,
+            "no connection reached the listener (probe log: {log})"
+        );
+    }
+
     /// Positive zero-token contract for the planner-specific launch shape.
     /// An emitted JSONL event proves the installed CLI accepted every pinned
     /// isolation flag before the blank authentication environment stops work.
@@ -1346,7 +1633,7 @@ while IFS= read -r request; do :; done
             prompt: "return an empty JSON object".into(),
             env_vars: no_auth_env(codex_home.path()),
         };
-        let mut proc = CodexProc::spawn_planner(&spec, None).expect("spawn planner codex");
+        let mut proc = CodexProc::spawn_planner(&spec, None, None).expect("spawn planner codex");
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
             .await
             .expect("planner codex produced no event within 60s");
@@ -1379,7 +1666,7 @@ while IFS= read -r request; do :; done
             prompt: "return an empty JSON object".into(),
             env_vars: no_auth_env(codex_home.path()),
         };
-        let mut proc = CodexProc::spawn_planner(&spec, None).expect("spawn planner codex");
+        let mut proc = CodexProc::spawn_planner(&spec, None, None).expect("spawn planner codex");
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_raw_line())
             .await
             .expect("planner codex produced no JSONL event within 60s");

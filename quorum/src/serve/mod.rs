@@ -6611,6 +6611,9 @@ async fn tick_decomposition(
             &prompt,
             config.bare_agent,
             agent_bin_for_kind(config, planner_kind),
+            // The planner run capability is not issued here yet; until it is,
+            // the planner spawns with no MCP server and no run envelope.
+            None,
         )
         .await
         {
@@ -36136,6 +36139,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap();
@@ -36430,6 +36434,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "bounded prompt",
             false,
             planner_runner.to_str(),
+            None,
         )
         .await
         .unwrap();
@@ -37169,6 +37174,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "bounded prompt",
             true,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap();

@@ -590,6 +590,24 @@ pub const AGENT_MCP_SERVER: AgentMcpServer = AgentMcpServer {
     env_vars: AGENT_MCP_ENV_VARS,
 };
 
+/// The single MCP tool a decomposition planner may call. Workers and reviewers
+/// hold the whole managed inventory, so this allowlist names one tool exactly
+/// instead of the server-wide wildcard.
+///
+/// The allowlist is a narrowing, not the containment. A planner capability is
+/// contained by the endpoint: `resolve_live_run_context`
+/// (`quorum-core/src/capabilities.rs:113-116,140`) accepts only the `worker`
+/// and `reviewer` operation roles and requires an exact role match, so a
+/// `planner` capability satisfies no GitHub or lifecycle operation;
+/// `resolve_planner_context` (`:313`, role check `:335`) is the only resolver
+/// that accepts it, and `SubmitPlan` is bounded further by the once-only guard
+/// and `MAX_PLAN_SUBMIT_REJECTIONS`
+/// (`quorum-core/src/planner_submissions.rs:16`).
+///
+/// `github` is the server name registered by the provider adapters
+/// (`agent::claude_mcp_config`, `mcp_servers.github` for Codex).
+pub const PLANNER_MCP_ALLOWED_TOOL: &str = "mcp__github__submit_plan";
+
 impl LaunchRequest<'_> {
     /// Restricted/internal turns lack this complete capability envelope. The
     /// run capability is the discriminator rather than `Normal` alone because
