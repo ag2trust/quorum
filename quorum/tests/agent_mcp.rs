@@ -448,6 +448,16 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
     assert_eq!(unknown["error"]["code"], -32601);
     assert_eq!(unknown["error"]["message"], "unknown tool");
 
+    // `submit_plan` is advertised to a planner only, so to any other run the
+    // name is outside its inventory and never reaches the endpoint.
+    let not_a_planner = worker.request(
+        9,
+        "tools/call",
+        json!({"name":"submit_plan","arguments":{"response":{"outcome":"blocker"}}}),
+    );
+    assert_eq!(not_a_planner["error"]["code"], -32601);
+    assert_eq!(not_a_planner["error"]["message"], "unknown tool");
+
     let resources = worker.request(6, "resources/list", json!({}));
     assert_eq!(resources["error"]["code"], -32601);
     let prompts = worker.request(7, "prompts/list", json!({}));
@@ -677,9 +687,16 @@ fn plan_task(key: &str) -> Value {
     })
 }
 
+/// A planner shell that has completed discovery, as every MCP client does
+/// before its first call: `submit_plan` is routed only for a run whose last
+/// advertised inventory was a planner's.
 fn planner_shell(endpoint: &FakeEndpoint) -> McpProcess {
     let mut planner = McpProcess::start(&endpoint.path, "planner-cap", "Planner");
     planner.initialize();
+    assert_eq!(
+        tool_names(&planner.request(2, "tools/list", json!({}))),
+        vec!["submit_plan"]
+    );
     planner
 }
 
@@ -692,7 +709,8 @@ fn tool_text(response: &Value) -> &str {
 #[test]
 fn tools_list_exposes_submit_plan() {
     let endpoint = FakeEndpoint::start();
-    let mut planner = planner_shell(&endpoint);
+    let mut planner = McpProcess::start(&endpoint.path, "planner-cap", "Planner");
+    planner.initialize();
 
     let listed = planner.request(2, "tools/list", json!({}));
     assert_eq!(tool_names(&listed), vec!["submit_plan"]);
@@ -734,7 +752,7 @@ fn submit_plan_proxies_and_returns_endpoint_error_verbatim() {
     let mut planner = planner_shell(&endpoint);
 
     let rejected = planner.request(
-        2,
+        3,
         "tools/call",
         json!({
             "name": "submit_plan",
@@ -758,7 +776,7 @@ fn submit_plan_success_returns_graph_id() {
     let plan = json!({"outcome": "plan", "tasks": [plan_task("first"), plan_task("second")]});
 
     let accepted = planner.request(
-        2,
+        3,
         "tools/call",
         json!({"name": "submit_plan", "arguments": {"response": plan.clone()}}),
     );
@@ -770,6 +788,45 @@ fn submit_plan_success_returns_graph_id() {
     );
     // The shell relays the plan unchanged; it never inspects or rewrites it.
     assert_eq!(endpoint.submitted(), vec![plan]);
+
+    assert!(planner.finish().is_empty());
+}
+
+/// A plan too large for one endpoint request is refused before the client
+/// connects, so nothing was submitted and repeating the identical call could
+/// only fail again. It must therefore never be reported as a transport failure,
+/// whose documented remedy is exactly that retry.
+#[test]
+fn submit_plan_reports_an_oversized_plan_as_request_too_large() {
+    let endpoint = FakeEndpoint::start();
+    let mut planner = planner_shell(&endpoint);
+    let mut first = plan_task("first");
+    first["implementation_delta"] = json!("x".repeat(70 * 1024));
+
+    let oversized = planner.request(
+        3,
+        "tools/call",
+        json!({
+            "name": "submit_plan",
+            "arguments": {
+                "response": {"outcome": "plan", "tasks": [first, plan_task("second")]}
+            }
+        }),
+    );
+    assert_eq!(oversized["result"]["isError"], true, "{oversized:#}");
+    assert_eq!(
+        serde_json::from_str::<Value>(tool_text(&oversized)).unwrap(),
+        json!({
+            "code": "request_too_large",
+            "message": "the plan does not fit one endpoint request; submit a smaller plan"
+        }),
+        "{oversized:#}"
+    );
+    assert!(
+        endpoint.submitted().is_empty(),
+        "an oversized plan must never reach the endpoint: {:?}",
+        endpoint.submitted()
+    );
 
     assert!(planner.finish().is_empty());
 }

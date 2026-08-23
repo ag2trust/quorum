@@ -231,7 +231,8 @@ fn submit_plan_tool() -> Tool {
          turn, so a rejection can be corrected and submitted again immediately; the plan is \
          never reported as text. {shapes} If this call times out or the transport fails, call \
          it again — `already_submitted` means your first plan stands; never resubmit a \
-         corrected plan after a transport failure.",
+         corrected plan after a transport failure. `request_too_large` means the plan itself \
+         must be shrunk; it is not a transport failure.",
         shapes = crate::serve::planner::RESPONSE_SHAPES,
     );
     let schema = json!({
@@ -508,6 +509,11 @@ impl GithubServer {
     /// a transport failure leaves the outcome unknown rather than failed; the
     /// tool description tells the planner to repeat the identical call, which
     /// answers `already_submitted` when the first plan already landed.
+    ///
+    /// A plan too large for one endpoint request is refused by the client
+    /// before it connects, so nothing was submitted and repeating the identical
+    /// call cannot succeed. That case is reported as `request_too_large` — the
+    /// one failure whose remedy is a smaller plan rather than a retry.
     async fn submit_plan(&self, arguments: Option<Map<String, Value>>) -> CallToolResult {
         let Some(response) = arguments
             .as_ref()
@@ -536,6 +542,15 @@ impl GithubServer {
             Ok(Ok(SubmitPlanOutcome::Rejected { code, message })) => {
                 json_result(json!({"code": code, "message": message}), true)
             }
+            // The client rejects an oversized frame before it connects, so the
+            // plan never reached the daemon and a retry would fail identically.
+            Ok(Err(QuorumError::Usage(_))) => json_result(
+                json!({
+                    "code": "request_too_large",
+                    "message": "the plan does not fit one endpoint request; submit a smaller plan"
+                }),
+                true,
+            ),
             Ok(Err(_)) | Err(_) => json_result(
                 json!({
                     "code": "transport",
@@ -552,6 +567,23 @@ impl GithubServer {
             .advertised_phase
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(phase);
+    }
+
+    /// Whether `submit_plan` belongs to the inventory this client last received.
+    ///
+    /// The tool is advertised to a planner only, so a run that has been told
+    /// any other phase must see the name as unknown, exactly like any tool
+    /// outside its inventory. A run that has not listed tools yet is not
+    /// refused here: the endpoint authorizes the call itself, and a cache this
+    /// shell has never filled must not take away a planner's only door.
+    fn planner_tool_advertised(&self) -> bool {
+        matches!(
+            *self
+                .advertised_phase
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            None | Some(RunPhase::Planner)
+        )
     }
 
     fn phase_changed_since_advertisement(&self, phase: RunPhase) -> bool {
@@ -649,7 +681,7 @@ impl ServerHandler for GithubServer {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
-        if request.name == SUBMIT_PLAN {
+        if request.name == SUBMIT_PLAN && self.planner_tool_advertised() {
             return Ok(self.submit_plan(request.arguments).await.into());
         }
         let operation = ProtocolOperation::from_name(&request.name)
