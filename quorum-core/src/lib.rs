@@ -32,6 +32,7 @@ pub mod mailbox;
 pub mod model_tiers;
 pub mod perf;
 pub mod pinned;
+pub mod planner_submissions;
 pub mod pr_targets;
 pub mod provision_attempts;
 pub mod review_audits;

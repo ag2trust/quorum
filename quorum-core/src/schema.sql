@@ -959,3 +959,15 @@ CREATE TABLE IF NOT EXISTS perf_watermark (
     id        INTEGER PRIMARY KEY CHECK (id = 1),
     watermark INTEGER NOT NULL
 );
+
+-- v59: planner `submit_plan` MCP tool storage. A row is created on the first
+-- `SubmitPlan` call for a planner run; `response_json` is set once (guarded
+-- UPDATE ... WHERE response_json IS NULL) so the first accepted submission
+-- stands. `rejections` bounds retries at MAX_PLAN_SUBMIT_REJECTIONS.
+CREATE TABLE IF NOT EXISTS planner_submissions (
+    run_id        TEXT PRIMARY KEY,
+    graph_id      INTEGER NOT NULL,
+    response_json TEXT,
+    rejections    INTEGER NOT NULL DEFAULT 0,
+    accepted_at   INTEGER
+);
