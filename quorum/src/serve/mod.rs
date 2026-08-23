@@ -36963,6 +36963,192 @@ exec /bin/cat '{stdout}'
         endpoint.shutdown().await;
     }
 
+    /// The deliberate consequence of "a submission is the outcome however the
+    /// process ended", pinned on its sharpest case: the run submitted a blocker
+    /// and then died badly. The blocker parks the source — it is not downgraded
+    /// to a retryable provider failure because the transport misbehaved after
+    /// the daemon had already accepted the answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_submitted_blocker_holds_the_source_even_when_the_turn_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("planner-blocker.db");
+        // Exits immediately with no terminal event: a genuine provider failure.
+        let runner = dir.path().join("planner-codex");
+        std::fs::write(&runner, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (source_task_id, graph_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source_task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "split source",
+                Some("split this safely"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph_id = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "gpt-5.6-sol",
+                    frozen_base_sha: "0".repeat(40).as_str(),
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph_id,
+                "freeze-requested",
+                "planning",
+                None,
+                3,
+            )
+            .unwrap());
+            (source_task_id, graph_id)
+        };
+
+        let blocker = serde_json::json!({
+            "outcome": "blocker",
+            "category": "missing_decision",
+            "evidence": ["two incompatible outcomes are requested"],
+            "required_decision": "choose one outcome",
+            "why_no_safe_split": "both children would mutate the same contract",
+        });
+        let planner_run_id = agent::new_session_id();
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            assert!(quorum_core::decomposition::issue_planner_run(
+                &mut conn,
+                graph_id,
+                source_task_id,
+                &planner_run_id,
+                &decomposition_process_name(graph_id, "planner"),
+                4,
+            )
+            .unwrap());
+            let tx = quorum_core::db::begin_immediate(&mut conn).unwrap();
+            assert_eq!(
+                quorum_core::planner_submissions::record_accepted(
+                    &tx,
+                    &planner_run_id,
+                    graph_id,
+                    &blocker.to_string(),
+                    5,
+                )
+                .unwrap(),
+                quorum_core::planner_submissions::SubmitOutcome::Accepted
+            );
+            tx.commit().unwrap();
+        }
+
+        let planner_slot = planner::spawn_planner(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "test".to_string(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: planner::CODEX_PLANNER_MODEL.into(),
+                effort: planner::PLANNER_EFFORT.into(),
+            },
+        )]);
+        config.agent_bin = Some(runner.to_string_lossy().into_owned());
+        let mut coordinator = DecompositionCoordinator {
+            graph_id: Some(graph_id),
+            planner_slot: Some(planner_slot),
+            planner_source_task_id: Some(source_task_id),
+            planner_run_id: Some(planner_run_id.clone()),
+            ..Default::default()
+        };
+
+        for _ in 0..200 {
+            tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap();
+            if coordinator.planner_slot.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            coordinator.planner_slot.is_none(),
+            "the failed planner turn never reached a terminal outcome"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state,freeze_active,hold_code FROM task_decompositions WHERE id=?1",
+                [graph_id],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?
+                )),
+            )
+            .unwrap(),
+            ("held".to_string(), 0, "missing_decision".to_string())
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM tasks WHERE id=?1",
+                [source_task_id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT kind,reason_code FROM decomposition_attempts WHERE graph_id=?1",
+                [graph_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            ("blocker".to_string(), "missing_decision".to_string()),
+            "the blocker was recorded, not a retryable provider failure"
+        );
+        assert!(
+            conn.query_row(
+                "SELECT revoked_at IS NOT NULL FROM run_capabilities WHERE run_id=?1",
+                [&planner_run_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap(),
+            "a finished planner attempt must not keep submit_plan authority"
+        );
+        assert!(coordinator.proposal.is_none());
+    }
+
     #[tokio::test]
     async fn planner_view_is_exactly_frozen_and_rejects_head_drift() {
         let repo = tempfile::tempdir().unwrap();

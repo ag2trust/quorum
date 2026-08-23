@@ -19,7 +19,6 @@ pub const CODEX_PLANNER_MODEL: &str = "gpt-5.6-sol";
 pub const CLAUDE_PLANNER_MODEL: &str = "claude-opus-4-6";
 pub const PLANNER_EFFORT: &str = "high";
 pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
-pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_FAILURE_SUMMARY_BYTES: usize = 2048;
@@ -2021,6 +2020,59 @@ mod tests {
         slot.kill_and_reap().await;
     }
 
+    /// Claude's terminal branch, which used to select the final assistant
+    /// message: a full narration transcript now ends the turn cleanly and
+    /// carries no plan, so the attempt fails on the missing submission alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_terminal_result_completes_the_turn_without_reading_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        });
+        let output = claude_stream(&[
+            serde_json::json!({"type": "assistant", "message": {"content": "Let me inspect the task."}}),
+            serde_json::json!({"type": "tool_use", "name": "Read", "input": {"file_path": "src/core.rs"}}),
+            // The final assistant message is a complete, valid plan. It is not
+            // an outcome: only an accepted `submit_plan` call is.
+            serde_json::json!({"type": "assistant", "message": {"content": response.to_string()}}),
+        ]);
+
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(turn_end, PlannerTurnEnd::Complete));
+        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&slot, turn_end, None) else {
+            panic!("Claude assistant text must not produce a plan");
+        };
+        assert!(summary.contains("without submit_plan"), "{summary}");
+        assert!(
+            !summary.contains("observable_outcome"),
+            "durable failure retained provider payload text"
+        );
+        slot.kill_and_reap().await;
+    }
+
+    /// An errored terminal result is still a provider failure: the turn never
+    /// reached a clean end, so its own diagnostic is what the attempt reports.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_errored_terminal_result_fails_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type": "assistant", "message": {"content": "Let me inspect the task."}}),
+            serde_json::json!({"type": "result", "result": "", "is_error": true}),
+        );
+
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        assert!(matches!(
+            poll_to_terminal(&mut slot).await,
+            PlannerTurnEnd::Failed(ref summary) if summary.contains("provider returned an error")
+        ));
+        slot.kill_and_reap().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn codex_planner_accepts_changed_unclassified_stderr_before_clean_terminal() {
@@ -2329,12 +2381,12 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn codex_untermianted_and_stdout_bounds_fail_and_reap_without_a_plan() {
+    async fn codex_unterminated_and_stdout_bounds_fail_and_reap_without_a_plan() {
         let dir = tempfile::tempdir().unwrap();
         // A single large assistant message is no longer measured against a
         // response bound — nothing reads it. Only the stream's own terminal
         // contract and the stdout ceiling bound the turn.
-        let unterminated_text = "x".repeat(MAX_RESPONSE_BYTES + 1);
+        let unterminated_text = "x".repeat(64 * 1024 + 1);
         let output = format!(
             "{}\n",
             serde_json::json!({
