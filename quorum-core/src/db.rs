@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 58;
+pub const SCHEMA_VERSION: i64 = 59;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -163,10 +163,10 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
     // enforcement. rusqlite's bundled SQLite defaults `foreign_keys` ON, and `PRAGMA
     // foreign_keys` is a no-op inside a transaction, so the toggle must straddle the
     // `BEGIN IMMEDIATE` below. The v58 rebuilds (`decomposition_attempts`,
-    // `token_usage_runs`) have no external FK children today, but reuse the same straddle
-    // so future references would migrate safely. Capture the connection's prior state and
-    // restore it on every exit path so we never leave enforcement disabled on a live
-    // connection.
+    // `token_usage_runs`) and the v59 rebuild (`run_capabilities`) have no external FK
+    // children today, but reuse the same straddle so future references would migrate
+    // safely. Capture the connection's prior state and restore it on every exit path so
+    // we never leave enforcement disabled on a live connection.
     let fk_prior: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
     conn.pragma_update(None, "foreign_keys", false)?;
     let outcome = migrate_txn(conn, current, fk_prior);
@@ -1027,6 +1027,40 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 )?;
             }
         }
+        // v59 widens run_capabilities.role to admit 'planner' alongside
+        // ('worker','reviewer'), so the daemon can issue a planner-scoped run capability
+        // ahead of a `submit_plan` MCP call. SQLite cannot ALTER a CHECK, so the table is
+        // rebuilt in place following the v57/v58 precedent. Guarded on stored constraint
+        // text so it is a no-op on a fresh DB (SCHEMA_SQL already creates the widened
+        // table) and on any re-run. No table holds a foreign key into run_capabilities, so
+        // the rebuild has no dangling-reference risk.
+        if current < 59 {
+            let role_admits_planner: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(sql LIKE '%''planner''%'), 1) FROM sqlite_master
+                 WHERE type='table' AND name='run_capabilities'",
+                [],
+                |row| row.get(0),
+            )?;
+            if role_admits_planner == 0 {
+                conn.execute_batch(
+                    "CREATE TABLE run_capabilities_new (
+                         run_id      TEXT PRIMARY KEY,
+                         task_id     INTEGER NOT NULL,
+                         agent       TEXT NOT NULL,
+                         role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','planner')),
+                         created_at  INTEGER NOT NULL,
+                         revoked_at  INTEGER
+                     );
+                     INSERT INTO run_capabilities_new
+                         SELECT run_id,task_id,agent,role,created_at,revoked_at
+                         FROM run_capabilities;
+                     DROP TABLE run_capabilities;
+                     ALTER TABLE run_capabilities_new RENAME TO run_capabilities;
+                     CREATE INDEX IF NOT EXISTS run_capabilities_agent
+                         ON run_capabilities(agent) WHERE revoked_at IS NULL;",
+                )?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1673,6 +1707,84 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             3
+        );
+    }
+
+    #[test]
+    fn migrates_v59_widens_run_capabilities_role_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v59-widen-run-capabilities.db");
+        {
+            // Open fresh at the latest shape, then rebuild run_capabilities in the narrow
+            // (pre-v59) form so we can verify the rebuild widens the CHECK and preserves
+            // existing rows. Mirrors `migrates_v57_widens_decomposition_attempts_and_token_usage_runs_checks`.
+            let conn = open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'src','working','owner',1,1);
+                 DROP TABLE run_capabilities;
+                 CREATE TABLE run_capabilities (
+                     run_id      TEXT PRIMARY KEY,
+                     task_id     INTEGER NOT NULL,
+                     agent       TEXT NOT NULL,
+                     role        TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+                     created_at  INTEGER NOT NULL,
+                     revoked_at  INTEGER
+                 );
+                 INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                 VALUES ('worker-run',1,'Worker','worker',1);
+                 PRAGMA user_version=58;",
+            )
+            .unwrap();
+            // The narrow constraint really rejects 'planner'.
+            assert!(conn
+                .execute(
+                    "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                     VALUES ('planner-run',1,'Planner','planner',1)",
+                    [],
+                )
+                .is_err());
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // Historical row survived the rebuild unchanged.
+        assert_eq!(
+            conn.query_row(
+                "SELECT run_id,task_id,agent,role FROM run_capabilities",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                )),
+            )
+            .unwrap(),
+            ("worker-run".into(), 1, "Worker".into(), "worker".into())
+        );
+        // The widened CHECK now admits 'planner'.
+        conn.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+             VALUES ('planner-run',1,'Planner','planner',2)",
+            [],
+        )
+        .unwrap();
+
+        // Idempotent across reopen: no double rebuild, no row loss.
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT count(*) FROM run_capabilities", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
         );
     }
 

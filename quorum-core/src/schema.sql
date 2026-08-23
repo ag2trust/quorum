@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 58). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 59). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -942,7 +942,9 @@ CREATE TABLE IF NOT EXISTS run_capabilities (
     run_id      TEXT PRIMARY KEY,
     task_id     INTEGER NOT NULL,
     agent       TEXT NOT NULL,
-    role        TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    -- v59 widened this to admit 'planner': a run capability issued to a planning-graph
+    -- planner ahead of a `submit_plan` MCP call. See the v59 migration in db.rs.
+    role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','planner')),
     created_at  INTEGER NOT NULL,
     revoked_at  INTEGER
 );
