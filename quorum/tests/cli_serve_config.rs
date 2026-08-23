@@ -248,6 +248,21 @@ self_update_branch = "main"
 }
 
 #[test]
+fn serve_accepts_self_update_branch_flag() {
+    let output = Command::new(cargo_bin())
+        .args(["serve", "--self-update-branch", "main"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unexpected argument '--self-update-branch'"),
+        "self-update branch flag should parse before configuration validation: {stderr}"
+    );
+}
+
+#[test]
 fn serve_config_rejects_unknown_keys() {
     let home = tempfile::tempdir().unwrap();
 
