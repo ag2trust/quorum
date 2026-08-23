@@ -2768,19 +2768,40 @@ stopping individual agents) is **out of scope for v2** — drain covers the
 
 `quorum serve` never patches itself in place. It exits with a reserved code,
 `EXIT_SELF_UPDATE = 75`, and `scripts/serve-supervisor.sh` (or an equivalent
-supervisor) treats that code as an upgrade signal: fetch `origin/<base>`,
-fast-forward merge, rebuild via `./dev-install.sh`, and relaunch. Any other
-exit code propagates and stops the supervisor loop — a crash is not an
-upgrade signal.
+supervisor) treats that code as an upgrade signal: fetch
+`origin/<self_update_branch>`, fast-forward merge, rebuild via
+`./dev-install.sh`, and relaunch. Any other exit code propagates and stops the
+supervisor loop — a crash is not an upgrade signal.
+
+`base_branch` and `self_update_branch` have separate responsibilities.
+`base_branch` selects the task/PR base used for worktree provisioning, PR
+publication and validation, and merge targeting. `self_update_branch` selects
+only the daemon build-staleness poll and the supervisor's fetch/rebuild source.
+For example, `base_branch = "develop"` with `self_update_branch = "main"`
+creates and merges task PRs against `develop` while rebuilding the daemon from
+`main`.
+
+For backward compatibility, when both the `--self-update-branch` CLI flag and
+the `self_update_branch` config key are omitted, the self-update branch is the
+fully resolved `base_branch`; a config that only sets `base_branch =
+"develop"` therefore polls `develop`. An explicit CLI
+`--self-update-branch` or config `self_update_branch` decouples the two.
+
+The bundled supervisor resolves its rebuild branch from
+`QUORUM_SELF_UPDATE_BRANCH`; it passes that branch to daemon staleness checks
+as well as fetching it after exit 75. `QUORUM_BASE_BRANCH` remains a legacy
+fallback only when `QUORUM_SELF_UPDATE_BRANCH` is unset, and `main` is used
+when neither is set. A caller-supplied `--self-update-branch` takes precedence
+over either environment variable.
 
 `EXIT_SELF_UPDATE` has three supported triggers:
 
 1. **Build staleness.** With `--self-update-drain`, the tick loop periodically
    (`sha_poll_interval_secs`, default 600 seconds) runs bounded
-   `git ls-remote origin <base_branch>` outside DB work. When the remote base
-   SHA does not match the running build SHA, it requests a self-update drain.
-   An unavailable remote or an unidentifiable build SHA is logged and leaves
-   the daemon serving.
+   `git ls-remote origin <self_update_branch>` outside DB work. When the
+   remote self-update SHA does not match the running build SHA, it requests a
+   self-update drain. An unavailable remote or an unidentifiable build SHA is
+   logged and leaves the daemon serving.
 2. **Schema too new.** A tick reporting `QuorumError::SchemaTooNew` means the
    on-disk DB is newer than the binary can read. The daemon cannot safely
    perform DB-backed cleanup, so it force-kills its in-flight
@@ -2799,11 +2820,12 @@ Restart recovery then applies the normal durable lifecycle rules. This is
 deliberately not a guarantee that every task reaches a terminal state before
 handoff.
 
-The supervisor handles exit 75 by fetching `origin/<base>`, fast-forwarding
-the checkout, running `./dev-install.sh` (with its bounded build timeout), and
-relaunching. A failed fast-forward or build alerts and relaunches the existing
-binary; its restart-thrash guard is bounded. Other daemon exit codes propagate
-and stop the supervisor, so a crash is never treated as an upgrade signal.
+The supervisor handles exit 75 by fetching `origin/<self_update_branch>`,
+fast-forwarding the checkout, running `./dev-install.sh` (with its bounded
+build timeout), and relaunching. A failed fast-forward or build alerts and
+relaunches the existing binary; its restart-thrash guard is bounded. Other
+daemon exit codes propagate and stop the supervisor, so a crash is never
+treated as an upgrade signal.
 
 ### Run identity and capability enforcement
 
