@@ -32,10 +32,16 @@ later spec.
 - `agent_endpoint.rs` gains `Operation::SubmitPlan { response: serde_json::Value }`.
 - Authority: `resolve_planner_context` (section 3). The planner run is issued a
   `run_capabilities` row with `role='planner'` before spawn (pattern:
-  `quorum-core/src/decomposition_review.rs:225-240`). A planner capability is accepted
-  by `SubmitPlan` only; `Protocol`, `AppendNote`, `Submit`, `React` reject it.
+  `quorum-core/src/decomposition_review.rs:225-240`). Of the mutating operations a
+  planner capability is accepted by `SubmitPlan` only; `AppendNote`, `Submit`, and
+  `React` reject it. It is also accepted by `Inventory`, which answers
+  `phase: planner` with an empty `operations` list — that is how `tools/list`
+  advertises `submit_plan` and nothing else.
 - Validation, all at call time (before the write transaction, see section 3):
-  1. byte bound `MAX_RESPONSE_BYTES` (existing);
+  1. byte bound `MAX_PLAN_SUBMISSION_BYTES = 60 KiB`, deliberately below the 64 KiB
+     request-frame cap so an oversize plan is answered `invalid_plan` and counts
+     against the rejection budget instead of being cut off by the frame reader as
+     an uncounted `request_too_large`;
   2. `serde_json` into `PlannerResponse` (deny unknown fields, existing type);
   3. `validate_semantics` and `validate_for_source` (existing functions, moved to a
      location callable from the endpoint; the planning source is loaded from
@@ -93,14 +99,19 @@ later spec.
   `{ run_id, task_id, graph_id, source_revision }`: capability exists, not revoked,
   `role='planner'`, and `task_decompositions` has a row with `source_task_id=task_id`,
   `freeze_active=1`, `active=0`, `planner_session_id=run_id` (the session id recorded
-  by `decomposition::set_frozen_phase` at spawn). `resolve_live_run_context` keeps rejecting
-  `planner` for every other operation, so no `LiveRunPhase::Planner` is needed.
+  at spawn). `resolve_live_run_context` keeps rejecting `planner` for every other
+  operation, so no `LiveRunPhase::Planner` is needed.
 - `validate_for_source` is async and touches the filesystem; the endpoint validates
   before `BEGIN IMMEDIATE` and only records inside the transaction. The rejection
   counter and once-only guard are checked inside the transaction.
-- `spawn_planner` in `planner.rs` mints the run id via `agent::new_session_id()`,
-  issues the `planner` capability, then spawns. Capability issuance and spawn follow
-  the reviewer provisioning pattern (issue → spawn → persist).
+- The coordinator, not `planner.rs`, provisions the run: the `serve/mod.rs` planner
+  spawn site mints one id via `agent::new_session_id()` and calls
+  `decomposition::issue_planner_run`, which writes the `planner` capability and the
+  graph's `planner_session_id` in one `BEGIN IMMEDIATE` transaction before the spawn
+  (a lost race writes neither). That same id is the envelope's `QUORUM_RUN_ID`, the
+  journalled session id, and the provider session id, so `spawn_planner` mints none.
+  Provisioning follows the reviewer pattern (issue → spawn → persist), and the
+  capability is revoked when the attempt ends.
 
 ### 4. Outcome consumption
 
@@ -126,8 +137,9 @@ as text. Shape definitions stay in the prompt as well as the tool schema.
 ## Security
 
 No new capability reaches the planner process beyond one tool. The planner
-capability is honored by `SubmitPlan` only; every GitHub and lifecycle operation
-rejects it. Rejected-call and byte bounds prevent endpoint hammering.
+capability is honored by `SubmitPlan` and by the read-only `Inventory` query that
+advertises it (`phase: planner`, empty `operations`); every GitHub and lifecycle
+operation rejects it. Rejected-call and byte bounds prevent endpoint hammering.
 
 ## Testing
 

@@ -2537,9 +2537,11 @@ worker for task #5 cannot submit or append a note on behalf of task #7.
 The daemon-owned local endpoint accepts only bounded, framed JSON operations:
 `submit`, `react`, `append_note`, and `submit_plan`. `append_note` accepts one
 non-empty, NUL-free note plus the prompt-compatible task and agent identity
-flags. `submit_plan` is honored for a `planner` capability alone — every other
-operation rejects that role, and a worker or reviewer capability cannot submit a
-plan. The
+flags. Of those, a `planner` capability is honored by `submit_plan` alone; it is
+also honored by the inventory query, which answers phase `planner` with an empty
+operation list so the MCP shell advertises `submit_plan` and nothing else. Every
+other operation rejects that role, and a worker or reviewer capability cannot
+submit a plan. The
 live run capability remains authoritative, and the endpoint rejects a flag
 that does not agree with its derived task or agent. It does not expose task
 field mutation, refs, dependencies, status, SQL, or arbitrary task updates. A
