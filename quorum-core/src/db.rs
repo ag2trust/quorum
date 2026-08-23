@@ -1717,7 +1717,8 @@ mod tests {
         {
             // Open fresh at the latest shape, then rebuild run_capabilities in the narrow
             // (pre-v59) form so we can verify the rebuild widens the CHECK and preserves
-            // existing rows. Mirrors `migrates_v57_widens_decomposition_attempts_and_token_usage_runs_checks`.
+            // existing rows. Mirrors `migrates_v57_widens_decomposition_attempts_and_token_usage_runs_checks`
+            // and, for the FK straddle, `migrates_v56_widens_role_assignment_check_to_admit_arbiter`.
             let conn = open(&path).unwrap();
             conn.pragma_update(None, "foreign_keys", true).unwrap();
             conn.execute_batch(
@@ -1734,6 +1735,15 @@ mod tests {
                  );
                  INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
                  VALUES ('worker-run',1,'Worker','worker',1);
+                 -- Child table referencing run_capabilities(run_id): mirrors the real FK
+                 -- children pattern (ra_child, decomposition_attempts, …) that makes the
+                 -- DROP fail under enforcement unless the outer migrate() straddle
+                 -- disables foreign_keys around the rebuild.
+                 CREATE TABLE rc_child (
+                     id     INTEGER PRIMARY KEY,
+                     run_id TEXT REFERENCES run_capabilities(run_id)
+                 );
+                 INSERT INTO rc_child(id,run_id) VALUES (1,'worker-run');
                  PRAGMA user_version=58;",
             )
             .unwrap();
@@ -1748,6 +1758,12 @@ mod tests {
         }
 
         let conn = open(&path).unwrap();
+        // open() leaves foreign-key enforcement in its default (ON) state.
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
@@ -1767,6 +1783,34 @@ mod tests {
             )
             .unwrap(),
             ("worker-run".into(), 1, "Worker".into(), "worker".into())
+        );
+        // The child row still points at the preserved parent (no dangling reference
+        // across the DROP+RENAME).
+        assert_eq!(
+            conn.query_row("SELECT run_id FROM rc_child WHERE id=1", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "worker-run"
+        );
+        // Integrity is intact: no dangling foreign-key references remain.
+        assert!(!conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
+        // The recreated index survived the rebuild (DROP TABLE destroys it; the
+        // migration's CREATE INDEX IF NOT EXISTS must recreate it).
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='index' AND name='run_capabilities_agent'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
         );
         // The widened CHECK now admits 'planner'.
         conn.execute(

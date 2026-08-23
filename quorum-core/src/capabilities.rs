@@ -990,10 +990,13 @@ mod tests {
             .is_none());
     }
 
-    fn insert_frozen_graph(
+    #[allow(clippy::too_many_arguments)]
+    fn insert_graph(
         conn: &Connection,
         graph_id: i64,
         source_task_id: i64,
+        active: i64,
+        freeze_active: i64,
         planner_session_id: Option<&str>,
         planned_source_revision: i64,
     ) {
@@ -1001,15 +1004,35 @@ mod tests {
             "INSERT INTO task_decompositions(
                  id,source_task_id,state,active,freeze_active,
                  planner_session_id,planned_source_revision,created_at,updated_at
-             ) VALUES (?1,?2,'planning',0,1,?3,?4,1,1)",
+             ) VALUES (?1,?2,'planning',?3,?4,?5,?6,1,1)",
             params![
                 graph_id,
                 source_task_id,
+                active,
+                freeze_active,
                 planner_session_id,
                 planned_source_revision
             ],
         )
         .unwrap();
+    }
+
+    fn insert_frozen_graph(
+        conn: &Connection,
+        graph_id: i64,
+        source_task_id: i64,
+        planner_session_id: Option<&str>,
+        planned_source_revision: i64,
+    ) {
+        insert_graph(
+            conn,
+            graph_id,
+            source_task_id,
+            0,
+            1,
+            planner_session_id,
+            planned_source_revision,
+        );
     }
 
     #[test]
@@ -1062,6 +1085,24 @@ mod tests {
     }
 
     #[test]
+    fn planner_context_rejects_activated_graph() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        // Graph has moved past planning: active=1, freeze_active=0 is the normal end
+        // state once a plan is accepted. A planner capability issued during freeze must
+        // not still authorize submissions against the now-activated graph, even though
+        // `planner_session_id` still matches the run that froze it.
+        insert_graph(&c, 5, 1, 1, 0, Some("planner-run"), 2);
+
+        let err = resolve_planner_context(&c, "planner-run").unwrap_err();
+        assert!(
+            err.to_string().contains("not the live planner"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn planner_context_rejects_revoked() {
         let (_d, mut c) = open_tmp();
         insert_authority_task(&c, 1, "working", None, None, None, None);
@@ -1083,6 +1124,13 @@ mod tests {
         issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
         insert_frozen_graph(&c, 5, 1, Some("planner-run"), 2);
 
-        assert!(resolve_live_run_context(&c, "planner-run", "worker").is_err());
+        for operation_role in ["worker", "reviewer"] {
+            let err = resolve_live_run_context(&c, "planner-run", operation_role).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("operation role does not match capability"),
+                "unexpected error for operation_role={operation_role}: {err}"
+            );
+        }
     }
 }
