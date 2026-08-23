@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 58;
+pub const SCHEMA_VERSION: i64 = 59;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1027,6 +1027,9 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 )?;
             }
         }
+        // v59 = planner `submit_plan` MCP tool storage (`planner_submissions`). Net-new
+        // table — the `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL (which runs above) handles
+        // fresh DBs and upgrades alike; no ALTER needed.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1673,6 +1676,83 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             3
+        );
+    }
+
+    #[test]
+    fn migrates_v58_to_v59_adds_planner_submissions_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v58-planner-submissions.db");
+        {
+            // Open fresh at the latest shape (SCHEMA_SQL already creates
+            // `planner_submissions` unconditionally), then drop it and stamp
+            // user_version=58 to simulate a pre-v59 DB missing the table.
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE planner_submissions;
+                 PRAGMA user_version=58;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            59
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='planner_submissions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+
+        // Idempotency that actually re-enters `migrate_txn` (not the
+        // `current == SCHEMA_VERSION` early return above): re-stamp
+        // user_version=58 WITHOUT dropping the table this time, so migrate
+        // reruns SCHEMA_SQL and the v59 step over a DB that already has
+        // `planner_submissions`. Seed a row first so a non-idempotent v59
+        // step (e.g. a bare `CREATE TABLE` instead of `IF NOT EXISTS`) fails
+        // loud, and the row's survival proves the rerun doesn't
+        // destructively rebuild the table.
+        conn.execute(
+            "INSERT INTO planner_submissions(run_id, graph_id) VALUES ('idempotent-check', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA user_version=58;").unwrap();
+        drop(conn);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name='planner_submissions'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT graph_id FROM planner_submissions WHERE run_id='idempotent-check'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
         );
     }
 
