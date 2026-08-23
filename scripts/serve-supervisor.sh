@@ -25,6 +25,8 @@
 #   QUORUM_SELF_UPDATE_BRANCH branch to fetch/rebuild and pass to daemon staleness checks
 #                              (default: QUORUM_BASE_BRANCH, then main)
 #   QUORUM_BASE_BRANCH       legacy fallback for QUORUM_SELF_UPDATE_BRANCH
+#   --self-update-branch     caller-supplied daemon branch takes precedence over
+#                            both environment controls and is forwarded unchanged
 #   QUORUM_THRASH_MAX        max restarts per hour (default: 6)
 #   QUORUM_THRASH_WINDOW     thrash window in seconds (default: 3600)
 #   QUORUM_BUILD_TIMEOUT     timeout for dev-install.sh in seconds (default: 300)
@@ -34,6 +36,39 @@ set -u
 REPO_DIR="${QUORUM_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 SERVE_BIN="${QUORUM_SERVE_BIN:-quorum}"
 SELF_UPDATE_BRANCH="${QUORUM_SELF_UPDATE_BRANCH:-${QUORUM_BASE_BRANCH:-main}}"
+CALLER_SELF_UPDATE_BRANCH=""
+EXPECT_SELF_UPDATE_BRANCH_VALUE=0
+for arg in "$@"; do
+  if [ "$EXPECT_SELF_UPDATE_BRANCH_VALUE" -eq 1 ]; then
+    if [ -z "$arg" ] || [ -n "$CALLER_SELF_UPDATE_BRANCH" ]; then
+      printf 'serve-supervisor.sh: --self-update-branch requires one non-empty value\n' >&2
+      exit 2
+    fi
+    CALLER_SELF_UPDATE_BRANCH="$arg"
+    EXPECT_SELF_UPDATE_BRANCH_VALUE=0
+    continue
+  fi
+  case "$arg" in
+    --self-update-branch)
+      EXPECT_SELF_UPDATE_BRANCH_VALUE=1
+      ;;
+    --self-update-branch=*)
+      branch=${arg#*=}
+      if [ -z "$branch" ] || [ -n "$CALLER_SELF_UPDATE_BRANCH" ]; then
+        printf 'serve-supervisor.sh: --self-update-branch requires one non-empty value\n' >&2
+        exit 2
+      fi
+      CALLER_SELF_UPDATE_BRANCH="$branch"
+      ;;
+  esac
+done
+if [ "$EXPECT_SELF_UPDATE_BRANCH_VALUE" -eq 1 ]; then
+  printf 'serve-supervisor.sh: --self-update-branch requires one non-empty value\n' >&2
+  exit 2
+fi
+if [ -n "$CALLER_SELF_UPDATE_BRANCH" ]; then
+  SELF_UPDATE_BRANCH="$CALLER_SELF_UPDATE_BRANCH"
+fi
 THRASH_MAX="${QUORUM_THRASH_MAX:-6}"
 THRASH_WINDOW="${QUORUM_THRASH_WINDOW:-3600}"
 BUILD_TIMEOUT="${QUORUM_BUILD_TIMEOUT:-300}"
@@ -96,8 +131,13 @@ thrash_check() {
 while true; do
   # The daemon polls its configured self-update branch for build staleness.
   # Supplying this resolved branch keeps that poll aligned with this wrapper's
-  # rebuild branch, including when callers also supplied an earlier flag.
-  "$SERVE_BIN" serve "$@" --self-update-branch "$SELF_UPDATE_BRANCH" &
+  # rebuild branch. A caller-provided flag already supplies that exact branch,
+  # so do not append a duplicate rejected by the daemon CLI.
+  if [ -n "$CALLER_SELF_UPDATE_BRANCH" ]; then
+    "$SERVE_BIN" serve "$@" &
+  else
+    "$SERVE_BIN" serve "$@" --self-update-branch "$SELF_UPDATE_BRANCH" &
+  fi
   child=$!
   code=0
   wait "$child" || code=$?

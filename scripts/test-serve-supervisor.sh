@@ -15,6 +15,7 @@ SUPERVISOR="$SCRIPT_DIR/serve-supervisor.sh"
 PASS=0
 FAIL=0
 TESTS=0
+SUPERVISOR_ARGS=""
 
 pass() { PASS=$((PASS + 1)); TESTS=$((TESTS + 1)); printf '  PASS: %s\n' "$1"; }
 fail() { FAIL=$((FAIL + 1)); TESTS=$((TESTS + 1)); printf '  FAIL: %s\n' "$1"; }
@@ -84,9 +85,10 @@ DEVSTUB
   QUORUM_TEST_SEQ="$seq_file" \
   QUORUM_TEST_ARGS="$args_file" \
   "$@" \
-  "$SUPERVISOR" > "$out_file" 2>&1 || CAPTURED_EXIT=$?
+  "$SUPERVISOR" $SUPERVISOR_ARGS > "$out_file" 2>&1 || CAPTURED_EXIT=$?
 
   CAPTURED_OUTPUT=$(cat "$out_file")
+  CAPTURED_ARGS=$(cat "$args_file")
 
   rm -rf "$repo_dir" "$seq_file" "$out_file" "$args_file"
 }
@@ -399,8 +401,23 @@ else fail "legacy branch also configures daemon staleness"; fi
 
 rm -rf "$repo_dir" "$bare_dir" "$seq_file" "$out_file" "$TMPDIR_TEST/args_t10"
 
-# --- Test 11: fast-forward merge failure alerts and relaunches old binary ---
-printf '\ntest 11: fast-forward merge failure alerts and continues\n'
+# --- Test 11: a caller-supplied branch is forwarded exactly once ---
+printf '\ntest 11: caller-supplied self-update branch\n'
+
+SUPERVISOR_ARGS='--self-update-branch caller-update'
+capture_supervisor "0" "0" env QUORUM_SELF_UPDATE_BRANCH=ignored-env
+SUPERVISOR_ARGS=""
+
+if [ "$CAPTURED_EXIT" -eq 0 ]; then
+  pass "caller-supplied self-update branch launches without exit 2"
+else fail "caller-supplied self-update branch launches without exit 2 (got exit $CAPTURED_EXIT)"; fi
+
+if [ "$CAPTURED_ARGS" = 'serve --self-update-branch caller-update' ]; then
+  pass "caller-supplied self-update branch is forwarded exactly once"
+else fail "caller-supplied self-update branch is forwarded exactly once (got $CAPTURED_ARGS)"; fi
+
+# --- Test 12: fast-forward merge failure alerts and relaunches old binary ---
+printf '\ntest 12: fast-forward merge failure alerts and continues\n'
 
 repo_dir="$TMPDIR_TEST/repo_t10b"
 mkdir -p "$repo_dir"
