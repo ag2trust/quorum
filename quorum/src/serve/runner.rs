@@ -590,6 +590,14 @@ pub const AGENT_MCP_SERVER: AgentMcpServer = AgentMcpServer {
     env_vars: AGENT_MCP_ENV_VARS,
 };
 
+/// The single MCP tool a decomposition planner may call. Workers and reviewers
+/// hold the whole managed inventory; a planner's only door out of its read-only
+/// sandbox is `submit_plan`, so its allowlist names that tool exactly instead of
+/// the server-wide wildcard. `github` is the server name registered by the
+/// provider adapters (`agent::claude_mcp_config`, `mcp_servers.github` for
+/// Codex).
+pub const PLANNER_MCP_ALLOWED_TOOL: &str = "mcp__github__submit_plan";
+
 impl LaunchRequest<'_> {
     /// Restricted/internal turns lack this complete capability envelope. The
     /// run capability is the discriminator rather than `Normal` alone because

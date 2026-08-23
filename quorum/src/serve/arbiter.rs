@@ -360,7 +360,7 @@ pub async fn spawn_arbiter(
                     prompt: prompt.into(),
                     env_vars: vec![],
                 };
-                RunnerProc::Codex(CodexProc::spawn_planner(&spec, provider_bin)?)
+                RunnerProc::Codex(CodexProc::spawn_planner(&spec, provider_bin, None)?)
             }
             AgentKind::Grok => return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -377,7 +377,7 @@ pub async fn spawn_arbiter(
                     allowed_tools: "Read,Glob,Grep".into(),
                     env_vars: vec![],
                 };
-                let mut proc = AgentProc::spawn_planner(&spec, provider_bin)?;
+                let mut proc = AgentProc::spawn_planner(&spec, provider_bin, None)?;
                 if let Err(error) = proc
                     .feed_turn_until(&agent::user_turn(prompt), deadline)
                     .await

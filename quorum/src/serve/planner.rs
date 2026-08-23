@@ -10,7 +10,7 @@ use super::runner::{AgentEvent, AgentKind, CapturedOutput, RunnerFailure, Runner
 use super::session_log::SessionLog;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -713,8 +713,52 @@ pub enum PlannerPoll {
     SemanticRejected(String),
 }
 
+/// The managed run envelope of one planner turn. Present only once the daemon
+/// has issued the run's `planner` capability; the four names it produces are
+/// exactly `runner::AGENT_MCP_ENV_VARS`, which is what the stdio `submit_plan`
+/// MCP child reads to reach the daemon endpoint.
+#[derive(Debug, Clone)]
+pub struct PlannerRunEnvelope {
+    pub run_id: String,
+    pub agent: String,
+    /// Repository slug (`owner/repo`), matching `QUORUM_REPO` everywhere else.
+    pub repo: String,
+    /// Agent endpoint socket path.
+    pub endpoint: PathBuf,
+}
+
+impl PlannerRunEnvelope {
+    /// Fail loudly rather than spawn a planner whose tool cannot authenticate:
+    /// an empty name would reach `agent-mcp` as a usage error only after the
+    /// provider had already burned its turn.
+    fn environment(&self) -> std::io::Result<Vec<(String, String)>> {
+        let environment = vec![
+            ("QUORUM_REPO".to_string(), self.repo.clone()),
+            ("QUORUM_AGENT".to_string(), self.agent.clone()),
+            ("QUORUM_RUN_ID".to_string(), self.run_id.clone()),
+            (
+                "QUORUM_AGENT_ENDPOINT".to_string(),
+                self.endpoint.display().to_string(),
+            ),
+        ];
+        if let Some((name, _)) = environment.iter().find(|(_, value)| value.is_empty()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("planner run envelope is missing {name}"),
+            ));
+        }
+        Ok(environment)
+    }
+}
+
 /// Spawn only the provider selected by the durable role assignment. There is
 /// no fallback or model substitution.
+///
+/// `run` is `Some` once the caller has issued this run's `planner` capability:
+/// the envelope is placed in the planner process environment and the
+/// `submit_plan` MCP server is attached. `None` keeps the historical tool-less
+/// planner surface.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_planner(
     provider: AgentKind,
     model: &str,
@@ -723,6 +767,7 @@ pub async fn spawn_planner(
     prompt: &str,
     bare: bool,
     provider_bin: Option<&str>,
+    run: Option<&PlannerRunEnvelope>,
 ) -> std::io::Result<PlannerSlot> {
     spawn_planner_with_timeout(
         provider,
@@ -732,6 +777,7 @@ pub async fn spawn_planner(
         prompt,
         bare,
         provider_bin,
+        run,
         PLANNER_TIMEOUT,
     )
     .await
@@ -746,6 +792,7 @@ async fn spawn_planner_with_timeout(
     prompt: &str,
     bare: bool,
     provider_bin: Option<&str>,
+    run: Option<&PlannerRunEnvelope>,
     turn_timeout: Duration,
 ) -> std::io::Result<PlannerSlot> {
     if prompt.len() > MAX_PROMPT_BYTES {
@@ -754,6 +801,11 @@ async fn spawn_planner_with_timeout(
             "planner prompt exceeds 128 KiB",
         ));
     }
+    let env_vars = match run {
+        Some(envelope) => envelope.environment()?,
+        None => Vec::new(),
+    };
+    let agent_mcp = run.map(|_| crate::serve::runner::AGENT_MCP_SERVER);
     let started_at = tokio::time::Instant::now();
     let deadline = started_at + turn_timeout;
     let proc =
@@ -765,9 +817,9 @@ async fn spawn_planner_with_timeout(
                     sandbox: "read-only".into(),
                     worktree: repo.to_path_buf(),
                     prompt: prompt.into(),
-                    env_vars: vec![],
+                    env_vars,
                 };
-                RunnerProc::Codex(CodexProc::spawn_planner(&spec, provider_bin)?)
+                RunnerProc::Codex(CodexProc::spawn_planner(&spec, provider_bin, agent_mcp)?)
             }
             AgentKind::Grok => return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -782,9 +834,9 @@ async fn spawn_planner_with_timeout(
                     worktree: repo.to_path_buf(),
                     bare,
                     allowed_tools: "Read,Glob,Grep".into(),
-                    env_vars: vec![],
+                    env_vars,
                 };
-                let mut proc = AgentProc::spawn_planner(&spec, provider_bin)?;
+                let mut proc = AgentProc::spawn_planner(&spec, provider_bin, agent_mcp)?;
                 if let Err(error) = proc
                     .feed_turn_until(&agent::user_turn(prompt), deadline)
                     .await
@@ -1138,6 +1190,113 @@ mod tests {
         runner
     }
 
+    /// The envelope produces exactly the names the stdio MCP child reads, in
+    /// the order `runner::AGENT_MCP_ENV_VARS` pins.
+    #[test]
+    fn planner_run_envelope_produces_the_agent_mcp_env_vars() {
+        let envelope = PlannerRunEnvelope {
+            run_id: "run-capability".into(),
+            agent: "Planner-test".into(),
+            repo: "owner/repo".into(),
+            endpoint: PathBuf::from("/tmp/quorum-agent.sock"),
+        };
+        let environment = envelope.environment().expect("complete envelope");
+        let names: Vec<&str> = environment.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, crate::serve::runner::AGENT_MCP_ENV_VARS);
+        assert_eq!(
+            environment
+                .iter()
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "owner/repo",
+                "Planner-test",
+                "run-capability",
+                "/tmp/quorum-agent.sock"
+            ]
+        );
+    }
+
+    /// An incomplete envelope must fail before the provider spawns: an empty
+    /// name would only surface as an `agent-mcp` usage error after the planner
+    /// had already burned its turn.
+    #[test]
+    fn planner_run_envelope_rejects_an_incomplete_name() {
+        for missing in ["run_id", "agent", "repo"] {
+            let mut envelope = PlannerRunEnvelope {
+                run_id: "run-capability".into(),
+                agent: "Planner-test".into(),
+                repo: "owner/repo".into(),
+                endpoint: PathBuf::from("/tmp/quorum-agent.sock"),
+            };
+            match missing {
+                "run_id" => envelope.run_id.clear(),
+                "agent" => envelope.agent.clear(),
+                _ => envelope.repo.clear(),
+            }
+            let error = envelope
+                .environment()
+                .expect_err("incomplete envelope must be refused");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    /// End-to-end spawn wiring: an envelope must reach the planner process
+    /// environment and bring the MCP override with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_planner_with_envelope_carries_run_env_and_mcp_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("observed");
+        let runner = executable_script(
+            dir.path(),
+            "codex",
+            &format!(
+                "printf 'run=%s\\nrepo=%s\\nendpoint=%s\\nargs=%s\\n' \
+                 \"$QUORUM_RUN_ID\" \"$QUORUM_REPO\" \"$QUORUM_AGENT_ENDPOINT\" \"$*\" > '{0}.tmp'\n\
+                 mv '{0}.tmp' '{0}'",
+                capture.display()
+            ),
+        );
+        let envelope = PlannerRunEnvelope {
+            run_id: "run-capability".into(),
+            agent: "Planner-test".into(),
+            repo: "owner/repo".into(),
+            endpoint: PathBuf::from("/tmp/quorum-agent.sock"),
+        };
+
+        let slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+            Some(&envelope),
+        )
+        .await
+        .unwrap();
+        for _ in 0..200 {
+            if capture.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let observed = std::fs::read_to_string(&capture)
+            .expect("planner process did not report its run envelope");
+        slot.kill_and_reap().await;
+
+        assert!(observed.contains("run=run-capability\n"), "{observed}");
+        assert!(observed.contains("repo=owner/repo\n"), "{observed}");
+        assert!(
+            observed.contains("endpoint=/tmp/quorum-agent.sock\n"),
+            "{observed}"
+        );
+        assert!(observed.contains("mcp_servers.github="), "{observed}");
+        assert!(observed.contains("-s read-only"), "{observed}");
+    }
+
     #[cfg(unix)]
     async fn poll_to_terminal(slot: &mut PlannerSlot) -> PlannerPoll {
         tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
@@ -1169,6 +1328,7 @@ mod tests {
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap()
@@ -1191,6 +1351,7 @@ mod tests {
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap()
@@ -1230,6 +1391,7 @@ mod tests {
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap()
@@ -1526,6 +1688,7 @@ mod tests {
             &prompt,
             false,
             Some("provider-must-not-run"),
+            None,
         )
         .await
         .err()
@@ -1560,6 +1723,7 @@ mod tests {
             &prompt,
             false,
             runner.to_str(),
+            None,
             TEST_STDIN_FEED_TIMEOUT,
         )
         .await
@@ -1598,6 +1762,7 @@ mod tests {
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap();
@@ -1669,6 +1834,7 @@ mod tests {
             "exact bounded prompt",
             false,
             fake.to_str(),
+            None,
         )
         .await
         .unwrap();
@@ -2011,6 +2177,7 @@ mod tests {
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap();
@@ -2093,6 +2260,7 @@ mod tests {
                 "bounded prompt",
                 false,
                 runner.to_str(),
+                None,
             )
             .await
             .unwrap();
@@ -2220,6 +2388,7 @@ mod tests {
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap();
@@ -2280,6 +2449,7 @@ mod tests {
             "bounded prompt",
             false,
             runner.to_str(),
+            None,
         )
         .await
         .unwrap();
@@ -2312,6 +2482,7 @@ mod tests {
                 "bounded prompt",
                 false,
                 runner.to_str(),
+                None,
             )
             .await
             .unwrap();
