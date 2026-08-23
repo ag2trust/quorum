@@ -138,6 +138,17 @@ mod tests {
         assert_eq!(outcome, SubmitOutcome::Accepted);
         tx.commit().unwrap();
 
+        // graph_id and accepted_at are stored, not just response_json.
+        let (graph_id, accepted_at): (i64, i64) = c
+            .query_row(
+                "SELECT graph_id, accepted_at FROM planner_submissions WHERE run_id = ?1",
+                ["run-1"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(graph_id, 10);
+        assert_eq!(accepted_at, 100);
+
         let tx = c.transaction().unwrap();
         let outcome = record_accepted(&tx, "run-1", 10, "{\"kind\":\"different\"}", 200).unwrap();
         assert_eq!(outcome, SubmitOutcome::AlreadySubmitted);
@@ -145,6 +156,53 @@ mod tests {
 
         let stored = accepted_response(&c, "run-1").unwrap();
         assert_eq!(stored, Some("{\"kind\":\"plan\"}".to_string()));
+
+        // accepted_at is not overwritten by the rejected second call.
+        let accepted_at_after: i64 = c
+            .query_row(
+                "SELECT accepted_at FROM planner_submissions WHERE run_id = ?1",
+                ["run-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accepted_at_after, 100);
+    }
+
+    /// Guards the `record_accepted` budget comparison itself (`rejections >=
+    /// MAX_PLAN_SUBMIT_REJECTIONS`), independent of `budget_exhausted`'s own
+    /// 4-vs-5 boundary test. Mutating the threshold to anything in `1..=5`
+    /// (e.g. `>= 1`, `> 0`) must fail one of these two cases: a run with
+    /// exactly one rejection, and a run with exactly four (one below
+    /// exhaustion), both still accept a valid submission.
+    #[test]
+    fn accepts_below_rejection_threshold() {
+        let (_d, mut c) = open_tmp();
+
+        let tx = c.transaction().unwrap();
+        record_rejection(&tx, "run-3", 30).unwrap();
+        tx.commit().unwrap();
+        let tx = c.transaction().unwrap();
+        let outcome = record_accepted(&tx, "run-3", 30, "{\"kind\":\"plan\"}", 400).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(outcome, SubmitOutcome::Accepted);
+        assert_eq!(
+            accepted_response(&c, "run-3").unwrap(),
+            Some("{\"kind\":\"plan\"}".to_string())
+        );
+
+        for _ in 0..4 {
+            let tx = c.transaction().unwrap();
+            record_rejection(&tx, "run-4", 40).unwrap();
+            tx.commit().unwrap();
+        }
+        let tx = c.transaction().unwrap();
+        let outcome = record_accepted(&tx, "run-4", 40, "{\"kind\":\"plan\"}", 500).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(outcome, SubmitOutcome::Accepted);
+        assert_eq!(
+            accepted_response(&c, "run-4").unwrap(),
+            Some("{\"kind\":\"plan\"}".to_string())
+        );
     }
 
     #[test]

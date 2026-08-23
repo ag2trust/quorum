@@ -1711,14 +1711,48 @@ mod tests {
             1
         );
 
-        // Idempotent: re-running migrate (via reopen) does not error.
+        // Idempotency that actually re-enters `migrate_txn` (not the
+        // `current == SCHEMA_VERSION` early return above): re-stamp
+        // user_version=58 WITHOUT dropping the table this time, so migrate
+        // reruns SCHEMA_SQL and the v59 step over a DB that already has
+        // `planner_submissions`. Seed a row first so a non-idempotent v59
+        // step (e.g. a bare `CREATE TABLE` instead of `IF NOT EXISTS`) fails
+        // loud, and the row's survival proves the rerun doesn't
+        // destructively rebuild the table.
+        conn.execute(
+            "INSERT INTO planner_submissions(run_id, graph_id) VALUES ('idempotent-check', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA user_version=58;").unwrap();
         drop(conn);
+
         let reopened = open(&path).unwrap();
         assert_eq!(
             reopened
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             SCHEMA_VERSION
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name='planner_submissions'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT graph_id FROM planner_submissions WHERE run_id='idempotent-check'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
         );
     }
 
