@@ -365,12 +365,27 @@ pub fn issue(
     now: i64,
 ) -> Result<()> {
     let tx = begin_immediate(conn)?;
+    issue_tx(&tx, run_id, task_id, agent, role, now)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Issue a run capability inside a caller-owned transaction, so issuance can
+/// share one serialization point with the daemon-owned state that authorizes
+/// it (see `decomposition::issue_planner_run`).
+pub fn issue_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    task_id: i64,
+    agent: &str,
+    role: &str,
+    now: i64,
+) -> Result<()> {
     tx.execute(
         "INSERT INTO run_capabilities (run_id, task_id, agent, role, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![run_id, task_id, agent, role, now],
     )?;
-    tx.commit()?;
     Ok(())
 }
 

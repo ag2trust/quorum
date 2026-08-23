@@ -191,10 +191,15 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          reference another task key or source:<dependency-id>. Every PLAN task's \
          `source_constraints` must include this worker-facing guidance: \
          \"{WORKER_WRITABILITY_GUIDANCE}\". The daemon adds it deterministically, so it is \
-         guidance rather than an enforcement claim. Return exactly one valid JSON object. For \
+         guidance rather than an enforcement claim. For \
          each task, declare every file-level deliverable in `deliverables`: use \
-         `write` only for requested changes and `read_only_reference` only for context. Use no \
-         markdown or commentary. {RESPONSE_SHAPES} \
+         `write` only for requested changes and `read_only_reference` only for context. \
+         Report by calling the `submit_plan` tool exactly once with the PLAN or BLOCKER \
+         object as its `response` argument. The tool answers with the daemon's own \
+         validation errors: fix the reported defect and call `submit_plan` again in the same \
+         turn. `already_submitted` means your first plan was accepted and stands, so stop. \
+         Never print the plan as text: written output is not read, and a turn that ends \
+         without an accepted `submit_plan` call is a failed attempt. {RESPONSE_SHAPES} \
          PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
          to {MAX_REJECTION_SUMMARY_BYTES} bytes. On retry, use only those summaries to correct \
          the cited semantic defect; do not discuss them or request more context.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
@@ -229,7 +234,7 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
 }
 
 /// Recheck proposal dependencies against the authoritative source snapshot.
-/// Shape/cycle/text validation has already run in `parse_response`.
+/// Shape/cycle/text validation runs first, in `validate_semantics`.
 pub async fn validate_for_source(
     tasks: &[ProposedTask],
     source_dependency_ids: &[i64],
@@ -351,22 +356,18 @@ impl std::fmt::Display for PlannerParseError {
     }
 }
 
-pub fn parse_response(text: &str) -> Result<PlannerResponse, PlannerParseError> {
-    if text.len() > MAX_RESPONSE_BYTES {
-        return Err(PlannerParseError::Provider(
-            "response exceeds 64 KiB".into(),
-        ));
-    }
-    let trimmed = text.trim();
-    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
-        return Err(PlannerParseError::Provider(
-            "response must be exactly one JSON object without wrappers".into(),
-        ));
-    }
-    let response: PlannerResponse = serde_json::from_str(trimmed)
-        .map_err(|e| PlannerParseError::Provider(format!("invalid closed JSON: {e}")))?;
-    validate_semantics(&response)?;
-    Ok(response)
+/// Rehydrate one durably accepted `submit_plan` submission.
+///
+/// The endpoint already applied `validate_semantics` and `validate_for_source`
+/// before storing the response, so this only decodes the stored bytes; it is
+/// the same closed-type deserialization `rehydrate_accepted_proposal` performs
+/// for a durable proposal. Provider text is never a source here.
+pub(super) fn rehydrate_submitted_response(
+    text: &str,
+) -> Result<PlannerResponse, PlannerParseError> {
+    serde_json::from_str(text).map_err(|error| {
+        PlannerParseError::Provider(format!("invalid accepted plan submission: {error}"))
+    })
 }
 
 /// Rehydrate the durable task-list form accepted by the planner coordinator.
@@ -573,7 +574,6 @@ pub struct PlannerSlot {
     pub model: String,
     pub effort: String,
     pub usage: super::runner::TokenUsage,
-    pub response_text: String,
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
     codex_terminal_candidate: bool,
@@ -707,10 +707,57 @@ impl PlannerSlot {
     }
 }
 
+/// How one planner provider process ended its turn.
+///
+/// This is deliberately not an outcome. The provider reports only whether it
+/// reached a clean terminal state; the plan itself comes from the durable
+/// `submit_plan` submission, which [`planner_outcome`] pairs with this report.
+pub enum PlannerTurnEnd {
+    /// The turn reached its terminal provider state with no provider-level
+    /// defect. It says nothing about whether a plan was submitted.
+    Complete,
+    /// Bounded operator diagnostic for a provider-level failure.
+    Failed(String),
+}
+
+/// The durable outcome of one planner attempt.
 pub enum PlannerPoll {
     Done(PlannerResponse),
     ProviderFailed(String),
+    /// Retained for the Arbiter proposal-rejection path (design §4). Semantic
+    /// defects in a submitted plan are now returned to the planner in-turn by
+    /// the endpoint, so the planner attempt itself never produces this.
     SemanticRejected(String),
+}
+
+/// Resolve one planner attempt from its durable `submit_plan` submission.
+///
+/// `submitted` is `planner_submissions::accepted_response` for this run. A
+/// submission is authoritative however the process then ended: it was accepted
+/// by the daemon's own endpoint after full validation, so a provider that
+/// crashed or timed out after submitting still delivered a plan. Provider
+/// stdout is operator diagnostics only and is never consulted for the plan.
+pub fn planner_outcome(
+    slot: &PlannerSlot,
+    end: PlannerTurnEnd,
+    submitted: Option<&str>,
+) -> PlannerPoll {
+    if let Some(response) = submitted {
+        return match rehydrate_submitted_response(response) {
+            Ok(response) => PlannerPoll::Done(response),
+            Err(error) => PlannerPoll::ProviderFailed(provider_failure_summary(
+                slot,
+                &error.to_string(),
+                "exact",
+            )),
+        };
+    }
+    PlannerPoll::ProviderFailed(match end {
+        PlannerTurnEnd::Failed(summary) => summary,
+        PlannerTurnEnd::Complete => {
+            provider_failure_summary(slot, "planner exited without submit_plan", "exact")
+        }
+    })
 }
 
 /// The managed run envelope of one planner turn. Present only once the daemon
@@ -758,6 +805,11 @@ impl PlannerRunEnvelope {
 /// the envelope is placed in the planner process environment and the
 /// `submit_plan` MCP server is attached. `None` keeps the historical tool-less
 /// planner surface.
+///
+/// One attempt has exactly one identity: when an envelope is present its
+/// `run_id` — minted by `agent::new_session_id()` and already bound to both the
+/// run capability and `task_decompositions.planner_session_id` — is also the
+/// provider session id, so no second id is minted here.
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_planner(
     provider: AgentKind,
@@ -830,7 +882,9 @@ async fn spawn_planner_with_timeout(
                     kind: AgentKind::Claude,
                     model: model.into(),
                     effort: effort.into(),
-                    session_id: agent::new_session_id(),
+                    session_id: run
+                        .map(|envelope| envelope.run_id.clone())
+                        .unwrap_or_else(agent::new_session_id),
                     worktree: repo.to_path_buf(),
                     bare,
                     allowed_tools: "Read,Glob,Grep".into(),
@@ -853,7 +907,6 @@ async fn spawn_planner_with_timeout(
         model: model.into(),
         effort: effort.into(),
         usage: super::runner::TokenUsage::default(),
-        response_text: String::new(),
         started_at,
         stdout_bytes: 0,
         codex_terminal_candidate: false,
@@ -862,7 +915,14 @@ async fn spawn_planner_with_timeout(
     })
 }
 
-fn provider_failure(slot: &PlannerSlot, reason: &str, byte_count_kind: &str) -> PlannerPoll {
+fn provider_failure(slot: &PlannerSlot, reason: &str, byte_count_kind: &str) -> PlannerTurnEnd {
+    PlannerTurnEnd::Failed(provider_failure_summary(slot, reason, byte_count_kind))
+}
+
+/// Build the bounded, payload-free operator diagnostic for one failure. The
+/// samples describe stream structure only; provider payload strings never
+/// enter it.
+fn provider_failure_summary(slot: &PlannerSlot, reason: &str, byte_count_kind: &str) -> String {
     let bounded_reason = truncate_utf8(reason, MAX_FAILURE_REASON_BYTES);
     let reason_truncated = bounded_reason.len() != reason.len();
     let beginning = &slot.diagnostics.beginning;
@@ -901,10 +961,10 @@ fn provider_failure(slot: &PlannerSlot, reason: &str, byte_count_kind: &str) -> 
         );
         summary = format!("{prefix}{SUFFIX}");
     }
-    PlannerPoll::ProviderFailed(summary)
+    summary
 }
 
-fn planner_exit_failure(slot: &PlannerSlot, failure: RunnerFailure) -> PlannerPoll {
+fn planner_exit_failure(slot: &PlannerSlot, failure: RunnerFailure) -> PlannerTurnEnd {
     provider_failure(
         slot,
         &format!(
@@ -925,9 +985,15 @@ fn stderr_capture_was_truncated(output: &[CapturedOutput]) -> bool {
     })
 }
 
-/// Drain a bounded amount of output. Timeout and output violations are
-/// provider failures; the caller must kill and reap the returned terminal slot.
-pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
+/// Drain a bounded amount of output and report how the turn ended. Timeout and
+/// output violations are provider failures; the caller must kill and reap the
+/// returned terminal slot.
+///
+/// Assistant text is observed only as a structural diagnostic sample. This
+/// function cannot produce a plan: the plan comes from the run's durable
+/// `submit_plan` submission, which the caller pairs with this report through
+/// [`planner_outcome`].
+pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerTurnEnd> {
     if slot.started_at.elapsed() >= PLANNER_TIMEOUT {
         return Some(provider_failure(slot, "planner timed out", "lower-bound"));
     }
@@ -1020,9 +1086,11 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
             }
         }
         if slot.proc.kind() == AgentKind::Claude {
-            if let Some(super::stream::Event::Result {
-                result, is_error, ..
-            }) = super::stream::parse_line(&raw)
+            // The result event ends the turn. Its `result` text is deliberately
+            // not bound: the plan is whatever this run submitted through
+            // `submit_plan`, and the transcript is diagnostics only.
+            if let Some(super::stream::Event::Result { is_error, .. }) =
+                super::stream::parse_line(&raw)
             {
                 if is_error.unwrap_or(false) {
                     return Some(provider_failure(
@@ -1031,11 +1099,7 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                         "exact-through-last-line",
                     ));
                 }
-                let text = super::stream::result_text(&result);
-                if !text.is_empty() {
-                    slot.response_text = text;
-                }
-                return Some(parsed_poll(slot));
+                return Some(PlannerTurnEnd::Complete);
             }
         }
         for event in events {
@@ -1048,38 +1112,14 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                     ));
                 }
                 AgentEvent::TurnCompleted { .. } => {
+                    // Codex's terminal event is provisional: its clean exit and
+                    // final stderr/protocol evidence are checked below before the
+                    // turn counts as complete.
                     if slot.proc.kind() == AgentKind::Codex {
                         slot.codex_terminal_candidate = true;
                     } else {
-                        return Some(parsed_poll(slot));
+                        return Some(PlannerTurnEnd::Complete);
                     }
-                }
-                AgentEvent::AssistantText { text } => {
-                    // Each Claude assistant event is a distinct message, so retain
-                    // only the latest one: the final message is the response
-                    // candidate. Codex started agent-message events are provisional;
-                    // its provider-confirmed completed event below remains its sole
-                    // response candidate.
-                    if slot.proc.kind() == AgentKind::Claude {
-                        if text.len() > MAX_RESPONSE_BYTES {
-                            return Some(provider_failure(
-                                slot,
-                                "planner response exceeded 64 KiB",
-                                "exact-through-last-line",
-                            ));
-                        }
-                        slot.response_text = text;
-                    }
-                }
-                AgentEvent::CompletedAssistantText { text, .. } => {
-                    if text.len() > MAX_RESPONSE_BYTES {
-                        return Some(provider_failure(
-                            slot,
-                            "planner response exceeded 64 KiB",
-                            "exact-through-last-line",
-                        ));
-                    }
-                    slot.response_text = text;
                 }
                 _ => {}
             }
@@ -1138,7 +1178,7 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
                 "exact",
             ));
         }
-        return Some(parsed_poll(slot));
+        return Some(PlannerTurnEnd::Complete);
     }
     if let Some(status) = status {
         let evidence = slot.proc.finalize_pre_authoritative_evidence().await;
@@ -1161,16 +1201,6 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
     None
 }
 
-fn parsed_poll(slot: &PlannerSlot) -> PlannerPoll {
-    match parse_response(&slot.response_text) {
-        Ok(response) => PlannerPoll::Done(response),
-        Err(PlannerParseError::Provider(error)) => {
-            provider_failure(slot, &error, "exact-through-terminal")
-        }
-        Err(PlannerParseError::Semantic(error)) => PlannerPoll::SemanticRejected(error),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1188,6 +1218,16 @@ mod tests {
         std::fs::write(&runner, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
         runner
+    }
+
+    /// The exact validation a submitted plan receives: closed deserialization
+    /// followed by `validate_semantics`. The endpoint applies these two steps
+    /// to every `submit_plan` call, and they are the only validation a plan
+    /// now passes through — no text parser remains.
+    fn validate_submitted(text: &str) -> Result<PlannerResponse, PlannerParseError> {
+        let response = rehydrate_submitted_response(text)?;
+        validate_semantics(&response)?;
+        Ok(response)
     }
 
     /// The envelope produces exactly the names the stdio MCP child reads, in
@@ -1298,7 +1338,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn poll_to_terminal(slot: &mut PlannerSlot) -> PlannerPoll {
+    async fn poll_to_terminal(slot: &mut PlannerSlot) -> PlannerTurnEnd {
         tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
             loop {
                 if let Some(outcome) = poll_planner(slot).await {
@@ -1429,8 +1469,8 @@ mod tests {
         );
     }
 
-    fn failure_json(outcome: &PlannerPoll) -> serde_json::Value {
-        let PlannerPoll::ProviderFailed(summary) = outcome else {
+    fn failure_json(outcome: &PlannerTurnEnd) -> serde_json::Value {
+        let PlannerTurnEnd::Failed(summary) = outcome else {
             panic!("expected provider failure");
         };
         assert!(
@@ -1467,7 +1507,7 @@ mod tests {
     fn accepts_closed_plan_and_blocker() {
         let plan = serde_json::json!({"outcome":"plan","tasks":[task("core", &[]), task("daemon", &["core", "source:7"])]});
         assert!(matches!(
-            parse_response(&plan.to_string()),
+            validate_submitted(&plan.to_string()),
             Ok(PlannerResponse::Plan { .. })
         ));
         let blocker = serde_json::json!({
@@ -1475,7 +1515,7 @@ mod tests {
             "required_decision":"choose one outcome", "why_no_safe_split":"both children would mutate the same contract"
         });
         assert!(matches!(
-            parse_response(&blocker.to_string()),
+            validate_submitted(&blocker.to_string()),
             Ok(PlannerResponse::Blocker { .. })
         ));
     }
@@ -1504,7 +1544,7 @@ mod tests {
                 }
             ]
         });
-        let PlannerResponse::Plan { tasks } = parse_response(&plan.to_string()).unwrap() else {
+        let PlannerResponse::Plan { tasks } = validate_submitted(&plan.to_string()).unwrap() else {
             panic!("expected plan");
         };
         assert_eq!(
@@ -1557,7 +1597,7 @@ mod tests {
             r#"{"outcome":"plan"} trailing"#.into(),
         ] {
             assert!(matches!(
-                parse_response(&value),
+                validate_submitted(&value),
                 Err(PlannerParseError::Provider(_))
             ));
         }
@@ -1567,13 +1607,13 @@ mod tests {
     fn invalid_blocker_and_invalid_graph_are_semantic_rejections() {
         let blocker = r#"{"outcome":"blocker","category":"magic","evidence":[],"required_decision":"x","why_no_safe_split":"y"}"#;
         assert!(matches!(
-            parse_response(blocker),
+            validate_submitted(blocker),
             Err(PlannerParseError::Semantic(_))
         ));
         let cycle =
             serde_json::json!({"outcome":"plan","tasks":[task("a", &["b"]),task("b", &["a"])]});
         assert!(matches!(
-            parse_response(&cycle.to_string()),
+            validate_submitted(&cycle.to_string()),
             Err(PlannerParseError::Semantic(_))
         ));
     }
@@ -1588,7 +1628,7 @@ mod tests {
                 "tasks": [first, task("b", &["a"])]
             });
             assert!(matches!(
-                parse_response(&plan.to_string()),
+                validate_submitted(&plan.to_string()),
                 Err(PlannerParseError::Semantic(_))
             ));
         }
@@ -1633,7 +1673,7 @@ mod tests {
             "tasks": [maximum, task("other", &[])],
         });
         assert_eq!(
-            parse_response(&plan.to_string()),
+            validate_submitted(&plan.to_string()),
             Err(PlannerParseError::Semantic(
                 "source constraints at maximum size must include worker writability guidance"
                     .into(),
@@ -1661,11 +1701,11 @@ mod tests {
     #[test]
     fn polling_result_preserves_independent_failure_budgets() {
         assert!(matches!(
-            parse_response("not json"),
+            validate_submitted("not json"),
             Err(PlannerParseError::Provider(_))
         ));
         assert!(matches!(
-            parse_response(r#"{"outcome":"plan","tasks":[]}"#),
+            validate_submitted(r#"{"outcome":"plan","tasks":[]}"#),
             Err(PlannerParseError::Semantic(_))
         ));
     }
@@ -1778,7 +1818,7 @@ mod tests {
         .expect("oversized unterminated line must fail promptly");
         assert!(matches!(
             outcome,
-            PlannerPoll::ProviderFailed(ref message) if message.contains("stdout exceeded")
+            PlannerTurnEnd::Failed(ref message) if message.contains("stdout exceeded")
         ));
         let diagnostic = failure_json(&outcome);
         assert_eq!(
@@ -1839,14 +1879,10 @@ mod tests {
         .await
         .unwrap();
         let outcome = poll_to_terminal(&mut slot).await;
-        assert!(matches!(
-            outcome,
-            PlannerPoll::Done(PlannerResponse::Plan { ref tasks })
-                if tasks.len() == 2 && tasks[1].prerequisites == ["core"]
-        ));
+        assert!(matches!(outcome, PlannerTurnEnd::Complete));
         assert!(
             slot.proc.try_wait().unwrap().is_some(),
-            "Codex plan authority preceded provider exit"
+            "Codex terminal evidence preceded provider exit"
         );
         slot.kill_and_reap().await;
 
@@ -1890,195 +1926,98 @@ mod tests {
 
         let mut slot = spawn_fake_codex(dir.path(), &output).await;
         let outcome = poll_to_terminal(&mut slot).await;
-        assert!(matches!(
-            outcome,
-            PlannerPoll::Done(PlannerResponse::Plan { ref tasks }) if tasks.len() == 2
-        ));
+        assert!(matches!(outcome, PlannerTurnEnd::Complete));
         slot.kill_and_reap().await;
     }
 
+    /// The regression this cutover exists for, inverted: a provider that prints
+    /// a flawless plan and exits cleanly has still not reported one. Text is
+    /// never an outcome, and the failure keeps the payload out of durable
+    /// evidence.
     #[cfg(unix)]
     #[tokio::test]
-    async fn claude_planner_uses_only_the_final_assistant_message() {
+    async fn perfect_json_text_without_submit_plan_is_a_provider_failure() {
         let dir = tempfile::tempdir().unwrap();
         let response = serde_json::json!({
             "outcome": "plan",
             "tasks": [task("core", &[]), task("daemon", &["core"])]
         });
-        let output = claude_stream(&[
-            serde_json::json!({"type": "assistant", "message": {"content": "Let me inspect the task."}}),
-            serde_json::json!({"type": "tool_use", "name": "Read", "input": {"file_path": "src/core.rs"}}),
-            serde_json::json!({"type": "assistant", "message": {"content": "I found the relevant code."}}),
-            serde_json::json!({"type": "assistant", "message": {"content": response.to_string()}}),
-        ]);
-
-        let mut slot = spawn_fake_claude(dir.path(), &output).await;
-        let outcome = poll_to_terminal(&mut slot).await;
+        // Deserializing this text would produce a valid plan; nothing does.
         assert!(matches!(
-            outcome,
-            PlannerPoll::Done(PlannerResponse::Plan { ref tasks })
-                if tasks.len() == 2 && tasks[1].prerequisites == ["core"]
+            validate_submitted(&response.to_string()),
+            Ok(PlannerResponse::Plan { .. })
         ));
-        assert_eq!(slot.response_text, response.to_string());
-        slot.kill_and_reap().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn claude_planner_narration_only_is_a_provider_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = claude_stream(&[serde_json::json!({
-            "type": "assistant",
-            "message": {"content": "Let me inspect the task."}
-        })]);
-
-        let mut slot = spawn_fake_claude(dir.path(), &output).await;
-        assert!(matches!(
-            poll_to_terminal(&mut slot).await,
-            PlannerPoll::ProviderFailed(_)
-        ));
-        assert!(matches!(
-            parse_response(&slot.response_text),
-            Err(PlannerParseError::Provider(_))
-        ));
-        slot.kill_and_reap().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn claude_planner_rejects_an_oversized_final_message() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = claude_stream(&[serde_json::json!({
-            "type": "assistant",
-            "message": {"content": "x".repeat(MAX_RESPONSE_BYTES + 1)}
-        })]);
-
-        let mut slot = spawn_fake_claude(dir.path(), &output).await;
-        assert!(matches!(
-            poll_to_terminal(&mut slot).await,
-            PlannerPoll::ProviderFailed(ref message) if message.contains("response exceeded")
-        ));
-        slot.kill_and_reap().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn codex_planner_uses_only_the_latest_completed_agent_message() {
-        let dir = tempfile::tempdir().unwrap();
-        let response = serde_json::json!({
-            "outcome": "plan",
-            "tasks": [task("core", &[]), task("daemon", &["core"])]
-        });
-        let output = format!(
-            "{}\n{}\n{}\n{}\n{}\n",
-            serde_json::json!({
-                "type": "item.completed",
-                "item": {"type": "agent_message", "id": "message-1", "text": "intermediate narration"}
-            }),
-            serde_json::json!({
-                "type": "item.completed",
-                "item": {"type": "command_execution", "id": "tool-1", "aggregated_output": "tool output"}
-            }),
-            serde_json::json!({
-                "type": "item.completed",
-                "item": {"type": "agent_message", "id": "message-2", "text": response.to_string()}
-            }),
-            // This provisional output arrives after the completed response. It
-            // must not be appended to the terminal candidate.
-            serde_json::json!({
-                "type": "item.started",
-                "item": {"type": "agent_message", "id": "message-3", "text": "more narration"}
-            }),
-            serde_json::json!({"type": "turn.completed"}),
-        );
-
-        let mut slot = spawn_fake_codex(dir.path(), &output).await;
-        let outcome = poll_to_terminal(&mut slot).await;
-        assert!(matches!(
-            outcome,
-            PlannerPoll::Done(PlannerResponse::Plan { ref tasks }) if tasks.len() == 2
-        ));
-        assert_eq!(slot.response_text, response.to_string());
-        slot.kill_and_reap().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn codex_planner_does_not_fall_back_from_malformed_latest_completed_message() {
-        let dir = tempfile::tempdir().unwrap();
-        let valid = serde_json::json!({
-            "outcome": "plan",
-            "tasks": [task("core", &[]), task("daemon", &["core"])]
-        });
-        let output = format!(
-            "{}\n{}\n{}\n",
-            serde_json::json!({
-                "type": "item.completed",
-                "item": {"type": "agent_message", "id": "message-1", "text": valid.to_string()}
-            }),
-            serde_json::json!({
-                "type": "item.completed",
-                "item": {"type": "agent_message", "id": "message-2", "text": "not a JSON response"}
-            }),
-            serde_json::json!({"type": "turn.completed"}),
-        );
-
-        let mut slot = spawn_fake_codex(dir.path(), &output).await;
-        let outcome = poll_to_terminal(&mut slot).await;
-        assert!(matches!(outcome, PlannerPoll::ProviderFailed(_)));
-        assert_eq!(slot.response_text, "not a JSON response");
-        slot.kill_and_reap().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn codex_planner_does_not_fall_back_from_empty_latest_completed_message() {
-        let dir = tempfile::tempdir().unwrap();
-        let valid = serde_json::json!({
-            "outcome": "plan",
-            "tasks": [task("core", &[]), task("daemon", &["core"])]
-        });
-        let output = format!(
-            "{}\n{}\n{}\n",
-            serde_json::json!({
-                "type": "item.completed",
-                "item": {"type": "agent_message", "id": "message-1", "text": valid.to_string()}
-            }),
-            serde_json::json!({
-                "type": "item.completed",
-                "item": {"type": "agent_message", "id": "message-2", "text": ""}
-            }),
-            serde_json::json!({"type": "turn.completed"}),
-        );
-
-        let mut slot = spawn_fake_codex(dir.path(), &output).await;
-        let outcome = poll_to_terminal(&mut slot).await;
-        assert!(matches!(outcome, PlannerPoll::ProviderFailed(_)));
-        assert!(slot.response_text.is_empty());
-        slot.kill_and_reap().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn codex_planner_requires_a_completed_agent_message() {
-        let dir = tempfile::tempdir().unwrap();
-        let valid = serde_json::json!({
-            "outcome": "plan",
-            "tasks": [task("core", &[]), task("daemon", &["core"])]
-        });
         let output = format!(
             "{}\n{}\n",
             serde_json::json!({
-                "type": "item.started",
-                "item": {"type": "agent_message", "id": "message-1", "text": valid.to_string()}
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": response.to_string()}
             }),
-            serde_json::json!({"type": "turn.completed"}),
+            serde_json::json!({"type": "turn.completed"})
         );
 
         let mut slot = spawn_fake_codex(dir.path(), &output).await;
-        let outcome = poll_to_terminal(&mut slot).await;
-        assert!(matches!(outcome, PlannerPoll::ProviderFailed(_)));
-        assert!(slot.response_text.is_empty());
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(turn_end, PlannerTurnEnd::Complete));
+        let outcome = planner_outcome(&slot, turn_end, None);
+        let PlannerPoll::ProviderFailed(summary) = outcome else {
+            panic!("a turn without an accepted submission must not produce a plan");
+        };
+        assert!(summary.contains("without submit_plan"), "{summary}");
+        assert!(
+            !summary.contains("observable_outcome"),
+            "durable failure retained provider payload text"
+        );
+        let diagnostic: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(
+            diagnostic["planner_diagnostic"]["terminal_response_seen"],
+            true
+        );
+        slot.kill_and_reap().await;
+    }
+
+    /// The durable submission is the outcome, and it stands however the process
+    /// then ended: it was accepted by the daemon's own endpoint after full
+    /// validation, so a provider that died after submitting still delivered a
+    /// plan.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_accepted_submission_is_the_only_source_of_a_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let submitted = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        })
+        .to_string();
+        // Text that contradicts the submission is never consulted.
+        let output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "id": "message-1", "text": "narration only"}
+            }),
+            serde_json::json!({"type": "turn.completed"})
+        );
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            planner_outcome(&slot, turn_end, Some(&submitted)),
+            PlannerPoll::Done(PlannerResponse::Plan { ref tasks })
+                if tasks.len() == 2 && tasks[1].prerequisites == ["core"]
+        ));
+        assert!(matches!(
+            planner_outcome(
+                &slot,
+                PlannerTurnEnd::Failed("planner timed out".into()),
+                Some(&submitted),
+            ),
+            PlannerPoll::Done(PlannerResponse::Plan { .. })
+        ));
+        assert!(matches!(
+            planner_outcome(&slot, PlannerTurnEnd::Failed("planner timed out".into()), None),
+            PlannerPoll::ProviderFailed(ref summary) if summary == "planner timed out"
+        ));
         slot.kill_and_reap().await;
     }
 
@@ -2105,10 +2044,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut slot = spawn_fake_codex_with_stderr(dir.path(), &stdout, stderr).await;
             let outcome = poll_to_terminal(&mut slot).await;
-            assert!(matches!(
-                outcome,
-                PlannerPoll::Done(PlannerResponse::Plan { ref tasks }) if tasks.len() == 2
-            ));
+            assert!(matches!(outcome, PlannerTurnEnd::Complete));
             slot.kill_and_reap().await;
         }
     }
@@ -2208,7 +2144,7 @@ mod tests {
         let outcome = poll_to_terminal(&mut slot).await;
         assert!(matches!(
             outcome,
-            PlannerPoll::ProviderFailed(ref summary) if summary.contains("stderr exceeded bounded")
+            PlannerTurnEnd::Failed(ref summary) if summary.contains("stderr exceeded bounded")
         ));
         slot.kill_and_reap().await;
     }
@@ -2266,7 +2202,7 @@ mod tests {
             .unwrap();
             let outcome = poll_to_terminal(&mut slot).await;
             assert!(
-                matches!(outcome, PlannerPoll::ProviderFailed(_)),
+                matches!(outcome, PlannerTurnEnd::Failed(_)),
                 "{name} acquired planner authority"
             );
             if name == "trailing-stderr" {
@@ -2303,17 +2239,13 @@ mod tests {
                 "missing-terminal",
                 "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"id\":\"m1\",\"text\":\"{}\"}}\n",
             ),
-            (
-                "malformed-terminal",
-                "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"id\":\"m1\",\"text\":\"provider-credential-must-not-persist\"}}\n{\"type\":\"turn.completed\"}\n",
-            ),
         ];
         for (name, stdout) in cases {
             let dir = tempfile::tempdir().unwrap();
             let mut slot = spawn_fake_codex(dir.path(), stdout).await;
             let outcome = poll_to_terminal(&mut slot).await;
             assert!(
-                matches!(outcome, PlannerPoll::ProviderFailed(_)),
+                matches!(outcome, PlannerTurnEnd::Failed(_)),
                 "{name} stream created planner authority"
             );
             let diagnostic = failure_json(&outcome);
@@ -2328,20 +2260,6 @@ mod tests {
                     .contains("provider-credential-must-not-persist"),
                 "{name} persisted provider payload text"
             );
-            if name == "malformed-terminal" {
-                assert_eq!(
-                    diagnostic["planner_diagnostic"]["terminal_response_seen"],
-                    true
-                );
-                assert_eq!(
-                    diagnostic["planner_diagnostic"]["event_types"]["item.completed/agent_message"],
-                    1
-                );
-                assert_eq!(
-                    diagnostic["planner_diagnostic"]["event_types"]["turn.completed"],
-                    1
-                );
-            }
             slot.kill_and_reap().await;
         }
     }
@@ -2395,7 +2313,7 @@ mod tests {
         let outcome = poll_to_terminal(&mut slot).await;
         assert!(matches!(
             outcome,
-            PlannerPoll::ProviderFailed(ref summary) if summary.contains("stdout read failed")
+            PlannerTurnEnd::Failed(ref summary) if summary.contains("stdout read failed")
         ));
         let diagnostic = failure_json(&outcome);
         assert_eq!(
@@ -2411,21 +2329,25 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn codex_response_and_stdout_bounds_fail_and_reap_without_a_plan() {
+    async fn codex_untermianted_and_stdout_bounds_fail_and_reap_without_a_plan() {
         let dir = tempfile::tempdir().unwrap();
-        let oversized_text = "x".repeat(MAX_RESPONSE_BYTES + 1);
+        // A single large assistant message is no longer measured against a
+        // response bound — nothing reads it. Only the stream's own terminal
+        // contract and the stdout ceiling bound the turn.
+        let unterminated_text = "x".repeat(MAX_RESPONSE_BYTES + 1);
         let output = format!(
             "{}\n",
             serde_json::json!({
                 "type": "item.completed",
-                "item": {"type": "agent_message", "id": "message-1", "text": oversized_text}
+                "item": {"type": "agent_message", "id": "message-1", "text": unterminated_text}
             })
         );
         let mut slot = spawn_fake_codex(dir.path(), &output).await;
         let outcome = poll_to_terminal(&mut slot).await;
         assert!(matches!(
             outcome,
-            PlannerPoll::ProviderFailed(ref message) if message.contains("response exceeded")
+            PlannerTurnEnd::Failed(ref message)
+                if message.contains("exited without a terminal response")
         ));
         let response_diagnostic = failure_json(&outcome);
         assert_eq!(
@@ -2457,7 +2379,7 @@ mod tests {
         let outcome = poll_to_terminal(&mut slot).await;
         assert!(matches!(
             outcome,
-            PlannerPoll::ProviderFailed(ref message) if message.contains("stdout exceeded")
+            PlannerTurnEnd::Failed(ref message) if message.contains("stdout exceeded")
         ));
         let stdout_diagnostic = failure_json(&outcome);
         assert_eq!(
@@ -2492,7 +2414,7 @@ mod tests {
                 let outcome = poll_planner(&mut slot).await.expect("timeout is terminal");
                 assert!(matches!(
                     outcome,
-                    PlannerPoll::ProviderFailed(ref message) if message.contains("timed out")
+                    PlannerTurnEnd::Failed(ref message) if message.contains("timed out")
                 ));
                 let diagnostic = failure_json(&outcome);
                 assert_eq!(diagnostic["planner_diagnostic"]["stdout_bytes_observed"], 0);
@@ -2869,6 +2791,34 @@ mod tests {
             "Every PLAN task's `source_constraints` must include this worker-facing guidance: \"{WORKER_WRITABILITY_GUIDANCE}\""
         )));
         assert!(prompt.contains("The daemon adds it deterministically"));
+    }
+
+    /// The prompt must send the plan through the tool, not the transcript. The
+    /// old "one JSON object" instruction is the failure mode this batch removed:
+    /// conversational providers prefixed prose and lost a whole attempt.
+    #[test]
+    fn planner_prompt_instructs_the_submit_plan_tool_and_forbids_a_text_plan() {
+        let dependencies = vec![3, 4];
+        let source = PlanningSource {
+            task_id: 7,
+            revision: 2,
+            title: "large outcome",
+            body: Some("preserve atomicity"),
+            dependencies: &dependencies,
+        };
+        let prompt = build_prompt(&source, &[]);
+        assert!(!prompt.contains("Return exactly one valid JSON object"));
+        assert!(!prompt.contains("Use no markdown or commentary"));
+        assert!(prompt.contains(
+            "Report by calling the `submit_plan` tool exactly once with the PLAN or BLOCKER \
+             object as its `response` argument"
+        ));
+        assert!(prompt
+            .contains("fix the reported defect and call `submit_plan` again in the same turn"));
+        assert!(prompt.contains("`already_submitted` means your first plan was accepted"));
+        assert!(prompt.contains("Never print the plan as text"));
+        // The closed shapes stay in the prompt as well as the tool schema.
+        assert!(prompt.contains(RESPONSE_SHAPES));
     }
 
     #[tokio::test]

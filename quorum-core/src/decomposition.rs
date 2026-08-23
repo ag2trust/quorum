@@ -1097,6 +1097,22 @@ pub fn set_frozen_phase(
     planner_session_id: Option<&str>,
     now: i64,
 ) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = set_frozen_phase_tx(&tx, graph_id, expected, next, planner_session_id, now)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed)
+}
+
+/// The guarded phase write itself, inside a caller-owned transaction, so one
+/// caller may serialize it with the authority record that depends on it.
+fn set_frozen_phase_tx(
+    tx: &Transaction<'_>,
+    graph_id: i64,
+    expected: &str,
+    next: &str,
+    planner_session_id: Option<&str>,
+    now: i64,
+) -> Result<bool> {
     const PHASES: &[&str] = &[
         "freeze-requested",
         "draining",
@@ -1107,14 +1123,65 @@ pub fn set_frozen_phase(
     if !PHASES.contains(&expected) || !PHASES.contains(&next) {
         return Err(QuorumError::Usage("invalid frozen planning phase".into()));
     }
-    let tx = begin_immediate(conn)?;
     let changed = tx.execute(
         "UPDATE task_decompositions SET state=?3,planner_session_id=?4,updated_at=?5
          WHERE id=?1 AND state=?2 AND freeze_active=1 AND active=0",
         params![graph_id, expected, next, planner_session_id, now],
     )?;
-    tx.commit().map_err(map_sql_err)?;
     Ok(changed == 1)
+}
+
+/// Record one planner attempt's run identity on its graph and issue that run's
+/// `planner` capability in a single `BEGIN IMMEDIATE` transaction, before the
+/// provider spawns.
+///
+/// `capabilities::resolve_planner_context` admits a `SubmitPlan` only when the
+/// capability's run id is also the graph's `planner_session_id`. Writing both
+/// records in one transaction is what makes that pairing atomic: a lost race
+/// leaves neither, so a capability can never exist without the live planner
+/// session that authorizes it.
+///
+/// Returns `false` for that expected lost race (invariant #3) — the graph left
+/// `planning`, lost its freeze, or is not the named source's graph. The caller
+/// must not spawn.
+pub fn issue_planner_run(
+    conn: &mut Connection,
+    graph_id: i64,
+    source_task_id: i64,
+    run_id: &str,
+    agent: &str,
+    now: i64,
+) -> Result<bool> {
+    if run_id.is_empty()
+        || run_id.contains('\0')
+        || agent.is_empty()
+        || agent.contains('\0')
+        || source_task_id <= 0
+    {
+        return Err(QuorumError::BadInput(
+            "invalid planner capability identity".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    // The phase write alone does not prove the caller named this graph's own
+    // source task, and the capability carries that task id: a mismatch would
+    // issue authority the planner resolver could never honor.
+    let owns_source: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_decompositions
+         WHERE id=?1 AND source_task_id=?2 AND state='planning'
+           AND freeze_active=1 AND active=0)",
+        params![graph_id, source_task_id],
+        |row| row.get(0),
+    )?;
+    if !owns_source {
+        return Ok(false);
+    }
+    if !set_frozen_phase_tx(&tx, graph_id, "planning", "planning", Some(run_id), now)? {
+        return Ok(false);
+    }
+    crate::capabilities::issue_tx(&tx, run_id, source_task_id, agent, "planner", now)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
 }
 
 /// Reject a durable accepted proposal and atomically return its freeze-owning
@@ -2795,6 +2862,79 @@ mod tests {
             set_frozen_phase(conn, graph, "freeze-requested", "preclassifying", None, 2).unwrap()
         );
         graph
+    }
+
+    /// Issuance is what makes a planner run addressable by the endpoint: the
+    /// capability and the graph's live planner session are written together, so
+    /// `resolve_planner_context` can accept a `SubmitPlan` only from the run the
+    /// daemon actually spawned.
+    #[test]
+    fn planner_run_issuance_binds_the_capability_to_the_live_planner_session() {
+        let mut conn = setup();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 3).unwrap()
+        );
+
+        assert!(
+            issue_planner_run(&mut conn, graph, 1, "run-a", "decomposition-planner-1", 4).unwrap()
+        );
+        let context = crate::capabilities::resolve_planner_context(&conn, "run-a").unwrap();
+        assert_eq!((context.graph_id, context.task_id), (graph, 1));
+        assert_eq!(
+            conn.query_row(
+                "SELECT planner_session_id FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "run-a"
+        );
+
+        // A second attempt replaces the live session, so the previous run's
+        // capability can no longer resolve even before it is revoked.
+        assert!(
+            issue_planner_run(&mut conn, graph, 1, "run-b", "decomposition-planner-1", 5).unwrap()
+        );
+        assert!(crate::capabilities::resolve_planner_context(&conn, "run-a").is_err());
+        assert!(crate::capabilities::resolve_planner_context(&conn, "run-b").is_ok());
+
+        // Naming another task's id would issue authority the resolver could
+        // never honor, and a graph that left planning is an expected lost race:
+        // neither writes anything.
+        assert!(
+            !issue_planner_run(&mut conn, graph, 2, "run-c", "decomposition-planner-1", 6).unwrap()
+        );
+        assert!(
+            set_frozen_phase(&mut conn, graph, "planning", "validating", Some("run-b"), 7).unwrap()
+        );
+        assert!(
+            !issue_planner_run(&mut conn, graph, 1, "run-d", "decomposition-planner-1", 8).unwrap()
+        );
+        for refused in ["run-c", "run-d"] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM run_capabilities WHERE run_id=?1",
+                    [refused],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+                "{refused} was issued without a live planner session"
+            );
+        }
     }
 
     fn exhaust_planning(conn: &mut Connection, graph: i64, kind: &str, start: i64) {
