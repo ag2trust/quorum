@@ -170,6 +170,23 @@ pub fn load(conn: &Connection, task_id: i64) -> Result<Option<GraphReviewContext
     Ok(Some(context))
 }
 
+/// The single definition of "this task may carry reviewer authority right now":
+/// either it is not a graph member at all, or its membership and its graph's
+/// accepted plan are both current. Kept in one place because the same predicate
+/// gates the reviewability check, the pre-spawn authority check, and the guarded
+/// run insert; three hand-copied variants are three chances to drift apart.
+fn current_member_predicate(task: &str) -> String {
+    format!(
+        "(NOT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id={task})
+          OR EXISTS(SELECT 1 FROM task_graph_members m
+                    JOIN task_decompositions d ON d.id=m.graph_id
+                    JOIN tasks source ON source.id=d.source_task_id
+                    WHERE m.task_id={task} AND m.active=1 AND d.active=1
+                      AND d.state='active' AND source.status='decomposed'
+                      AND d.accepted_plan_revision=m.plan_revision))"
+    )
+}
+
 /// Whether reviewer authority can currently be issued for `task_id`.
 ///
 /// An ordinary task is not a graph member and is always reviewable. A generated
@@ -179,13 +196,7 @@ pub fn load(conn: &Connection, task_id: i64) -> Result<Option<GraphReviewContext
 /// worktree; it never widens what `load` accepts.
 pub fn is_reviewable_graph_member(conn: &Connection, task_id: i64) -> Result<bool> {
     let reviewable: bool = conn.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id=?1)
-             OR EXISTS(SELECT 1 FROM task_graph_members m
-                       JOIN task_decompositions d ON d.id=m.graph_id
-                       JOIN tasks source ON source.id=d.source_task_id
-                       WHERE m.task_id=?1 AND m.active=1 AND d.active=1
-                         AND d.state='active' AND source.status='decomposed'
-                         AND d.accepted_plan_revision=m.plan_revision)",
+        &format!("SELECT {}", current_member_predicate("?1")),
         [task_id],
         |row| row.get(0),
     )?;
@@ -255,18 +266,15 @@ pub fn persist_reviewer_run_if_current(
     }
     let tx = begin_immediate(conn)?;
     let authority_current: bool = tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM run_capabilities c
-             WHERE c.run_id=?3 AND c.task_id=?1 AND c.agent=?2
-               AND c.role='reviewer' AND c.revoked_at IS NULL
-               AND (NOT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id=?1)
-                    OR EXISTS(SELECT 1 FROM task_graph_members m
-                              JOIN task_decompositions d ON d.id=m.graph_id
-                              JOIN tasks source ON source.id=d.source_task_id
-                              WHERE m.task_id=?1 AND m.active=1 AND d.active=1
-                                AND d.state='active' AND source.status='decomposed'
-                                AND d.accepted_plan_revision=m.plan_revision))
-         )",
+        &format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM run_capabilities c
+                 WHERE c.run_id=?3 AND c.task_id=?1 AND c.agent=?2
+                   AND c.role='reviewer' AND c.revoked_at IS NULL
+                   AND {}
+             )",
+            current_member_predicate("?1")
+        ),
         params![task_id, agent, cap_run_id],
         |row| row.get(0),
     )?;
@@ -302,7 +310,8 @@ pub fn persist_reviewer_run_if_current(
         &tx,
         "reviewer run",
         &context,
-        "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+        &format!(
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
              role_assignment_id,spawned_at,sub_role,review_cap_run_id,review_pr,review_head_sha)
          SELECT :task_id,:agent,'reviewer',:model,:effort,:provider,
                 :quorum_assignment_id,:spawned_at,:sub_role,:cap_run_id,:pr,:head_sha
@@ -318,13 +327,9 @@ pub fn persist_reviewer_run_if_current(
            AND EXISTS(SELECT 1 FROM run_capabilities c
                       WHERE c.run_id=:cap_run_id AND c.task_id=:task_id AND c.agent=:agent
                         AND c.role='reviewer' AND c.revoked_at IS NULL)
-           AND (NOT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id=:task_id)
-                OR EXISTS(SELECT 1 FROM task_graph_members m
-                          JOIN task_decompositions d ON d.id=m.graph_id
-                          JOIN tasks source ON source.id=d.source_task_id
-                          WHERE m.task_id=:task_id AND m.active=1 AND d.active=1
-                            AND d.state='active' AND source.status='decomposed'
-                            AND d.accepted_plan_revision=m.plan_revision))",
+           AND {member_predicate}",
+            member_predicate = current_member_predicate(":task_id")
+        ),
         &parameters,
     )?;
     let id = tx.last_insert_rowid();
