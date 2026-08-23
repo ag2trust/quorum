@@ -2135,20 +2135,32 @@ read-only repository view and bounded source context but no network, database, c
 command, or delivery authority. Planning is source-directed: repository inspection starts from
 paths and symbols named by the source, follows observed calls by at most one hop, and has bounded
 search/read guidance. The provider process has a 600-second wall-clock limit, a 128 KiB prompt
-limit, a 64 KiB response limit, and a 16 MiB cumulative streamed-stdout backstop; no provider
-spend ceiling is set. The response remains structurally bounded to 8 KiB per text field and 32
-list items. A separate
-planner spawn boundary enforces those restrictions and accepts only one bounded, closed plan or
-blocker response; a provider whose transport cannot be separated from model-generated network or
-filesystem access is refused fail-closed. The view is an archive of the recorded frozen base SHA,
+limit, a submitted-plan limit inside the endpoint's bounded frame, and a 16 MiB cumulative
+streamed-stdout backstop; no provider spend ceiling is set. The response remains structurally
+bounded to 8 KiB per text field and 32 list items. A separate planner spawn boundary enforces
+those restrictions and accepts only one bounded, closed plan or blocker response; a provider whose
+transport cannot be separated from model-generated network or filesystem access is refused
+fail-closed. The view is an archive of the recorded frozen base SHA,
 and source drift is rejected before launch. A valid concrete blocker parks the source immediately
 with no second opinion.
+
+The planner reports its plan by calling the daemon-owned `submit_plan` tool exactly once, over
+the same authorized agent endpoint workers and reviewers submit through; its transcript is never
+parsed. One identity covers the whole attempt: the daemon mints one run id and, in a single
+transaction before the spawn, issues that run's `planner` capability and records the same id as
+the graph's live planner session. A submission is accepted only when the capability, the graph's
+planner session, and the submitting run all agree. The endpoint validates the plan at call time
+and returns its own validation message, so the planner corrects the cited defect and resubmits
+within the same turn; rejected calls are bounded per run, the first accepted submission stands,
+and the capability is revoked when the attempt ends. On process exit the coordinator reads what
+was durably accepted: a submission is the outcome however the process then ended, and a turn that
+ends with none is a provider failure — printing a perfect plan as text delivers nothing.
 
 Codex planning is supported only through its hardened planner-specific boundary: the CLI runs
 read-only without coordination authority, and a bounded JSONL terminal response remains only a
 candidate until stdout reaches EOF, final diagnostics are bounded and complete, and the process
-exits successfully. Any contradictory or incomplete terminal evidence fails without plan
-authority. Grok planning remains refused because Grok is enabled only for managed workers.
+exits successfully. Any contradictory or incomplete terminal evidence fails the turn. Grok
+planning remains refused because Grok is enabled only for managed workers.
 
 A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Each child
 names its concrete implementation delta, affected paths, and non-goals, and carries every
@@ -2523,8 +2535,13 @@ and note-only `task-update`) verify `QUORUM_RUN_ID` against `agent_runs` — a
 worker for task #5 cannot submit or append a note on behalf of task #7.
 
 The daemon-owned local endpoint accepts only bounded, framed JSON operations:
-`submit`, `react`, and `append_note`. `append_note` accepts one non-empty,
-NUL-free note plus the prompt-compatible task and agent identity flags. The
+`submit`, `react`, `append_note`, and `submit_plan`. `append_note` accepts one
+non-empty, NUL-free note plus the prompt-compatible task and agent identity
+flags. Of those, a `planner` capability is honored by `submit_plan` alone; it is
+also honored by the inventory query, which answers phase `planner` with an empty
+operation list so the MCP shell advertises `submit_plan` and nothing else. Every
+other operation rejects that role, and a worker or reviewer capability cannot
+submit a plan. The
 live run capability remains authoritative, and the endpoint rejects a flag
 that does not agree with its derived task or agent. It does not expose task
 field mutation, refs, dependencies, status, SQL, or arbitrary task updates. A

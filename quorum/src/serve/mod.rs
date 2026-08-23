@@ -4521,6 +4521,11 @@ struct DecompositionCoordinator {
     proposal: Option<Vec<planner::ProposedTask>>,
     planner_slot: Option<planner::PlannerSlot>,
     planner_source_task_id: Option<i64>,
+    /// The live planner attempt's single identity: its run capability, its
+    /// `QUORUM_RUN_ID`, the graph's `planner_session_id`, and its provider
+    /// session id are all this value. Present only while a planner attempt
+    /// holds unrevoked `submit_plan` authority.
+    planner_run_id: Option<String>,
     classifier_slot: Option<classifier::ClassifierSlot>,
     /// Live Arbiter plan-review slot. The Arbiter gates a structurally valid
     /// proposal (state `validating`) before it advances to `preclassifying`;
@@ -4531,10 +4536,43 @@ struct DecompositionCoordinator {
     writable_path_resolver: planner::WritablePathResolver,
 }
 
+/// Close one planner run's `submit_plan` authority and read whatever it
+/// durably submitted.
+///
+/// Revocation commits first: after it, no further submission can be accepted
+/// for this run, so the response read next is the attempt's complete and final
+/// answer and a leaked token cannot submit later. The read is a short one
+/// (invariant #6) and holds no transaction.
+async fn retire_planner_run(db_path: &Path, run_id: String) -> Result<Option<String>> {
+    let path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::capabilities::revoke(&mut conn, &run_id, now_unix())?;
+        quorum_core::planner_submissions::accepted_response(&conn, &run_id)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("planner run retirement join: {error}")))?
+}
+
+/// Retire a planner run whose submission no longer matters — the attempt is
+/// being killed, not consumed. Best-effort like the reviewer identity cleanup:
+/// a failure here must not block teardown, and the graph's next attempt
+/// replaces `planner_session_id` regardless.
+async fn revoke_planner_run(db_path: &Path, run_id: String) {
+    if let Err(error) = retire_planner_run(db_path, run_id).await {
+        log(&format!(
+            "planner capability revocation failed, capability remains until its session id is replaced: {error}"
+        ));
+    }
+}
+
 async fn reap_decomposition_planner_with_usage(
     db_path: &Path,
     coordinator: &mut DecompositionCoordinator,
 ) {
+    if let Some(run_id) = coordinator.planner_run_id.take() {
+        revoke_planner_run(db_path, run_id).await;
+    }
     let Some(slot) = coordinator.planner_slot.take() else {
         return;
     };
@@ -6125,7 +6163,25 @@ async fn tick_decomposition(
     // First consume terminal provider output. Provider processes are always
     // killed and reaped before durable retry/materialization decisions.
     if let Some(slot) = coordinator.planner_slot.as_mut() {
-        if let Some(outcome) = planner::poll_planner(slot).await {
+        if let Some(turn_end) = planner::poll_planner(slot).await {
+            // The attempt's outcome is exactly what the daemon endpoint durably
+            // accepted through `submit_plan`; provider text is never consulted
+            // (design section 4). Retiring the run first closes its submit door,
+            // so the outcome cannot change after it is read.
+            let submitted = match coordinator.planner_run_id.clone() {
+                Some(run_id) => {
+                    // Keep the id until retirement commits: a failed revocation
+                    // must stay retryable rather than orphan the capability.
+                    let submitted = retire_planner_run(&config.db_path, run_id).await?;
+                    coordinator.planner_run_id = None;
+                    submitted
+                }
+                None => {
+                    log("planner attempt has no captured run capability");
+                    None
+                }
+            };
+            let outcome = planner::planner_outcome(slot, turn_end, submitted.as_deref());
             let slot = coordinator
                 .planner_slot
                 .take()
@@ -6603,6 +6659,46 @@ async fn tick_decomposition(
             }
         };
         let planner_kind = resolve_provider(&assignment.model)?;
+        // One attempt, one identity. This id is the run capability, the
+        // `QUORUM_RUN_ID` the `submit_plan` tool authenticates with, the graph's
+        // `planner_session_id` the endpoint resolver requires, the journalled
+        // session id, and the provider session id. Issuance and the session-id
+        // write share one transaction and both precede the spawn, so the tool
+        // can never reach the endpoint ahead of its own authority.
+        let session_id = agent::new_session_id();
+        let planner_agent = decomposition_process_name(snapshot.graph_id, "planner");
+        let issued = {
+            let path = config.db_path.clone();
+            let run_id = session_id.clone();
+            let agent_name = planner_agent.clone();
+            let graph_id = snapshot.graph_id;
+            let source_task_id = snapshot.source_task_id;
+            tokio::task::spawn_blocking(move || -> Result<bool> {
+                let mut conn = quorum_core::db::open(&path)?;
+                quorum_core::decomposition::issue_planner_run(
+                    &mut conn,
+                    graph_id,
+                    source_task_id,
+                    &run_id,
+                    &agent_name,
+                    now_unix(),
+                )
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("planner capability join: {error}")))??
+        };
+        if !issued {
+            // Expected lost race (invariant #3): the graph left planning or lost
+            // its freeze while the frozen view was built. Nothing was written;
+            // the next tick re-reads the new state.
+            return Ok(false);
+        }
+        let run = planner::PlannerRunEnvelope {
+            run_id: session_id.clone(),
+            agent: planner_agent,
+            repo: config.repo.clone(),
+            endpoint: agent_endpoint::locator(&config.db_path),
+        };
         match planner::spawn_planner(
             planner_kind,
             &assignment.model,
@@ -6611,14 +6707,11 @@ async fn tick_decomposition(
             &prompt,
             config.bare_agent,
             agent_bin_for_kind(config, planner_kind),
-            // The planner run capability is not issued here yet; until it is,
-            // the planner spawns with no MCP server and no run envelope.
-            None,
+            Some(&run),
         )
         .await
         {
             Ok(mut slot) => {
-                let session_id = agent::new_session_id();
                 let session_started_at = now_unix();
                 if let Some(log_dir) = config.log_dir.as_ref() {
                     let _ = slot.start_session_log(
@@ -6645,13 +6738,16 @@ async fn tick_decomposition(
                 .await
                 {
                     slot.kill_and_reap().await;
+                    revoke_planner_run(&config.db_path, session_id).await;
                     return Err(error);
                 }
                 coordinator.planner_view = Some(view);
                 coordinator.planner_source_task_id = Some(snapshot.source_task_id);
+                coordinator.planner_run_id = Some(session_id);
                 coordinator.planner_slot = Some(slot);
             }
             Err(error) => {
+                revoke_planner_run(&config.db_path, session_id).await;
                 record_decomposition_attempt(
                     config,
                     snapshot.graph_id,
@@ -36205,6 +36301,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             proposal: Some(vec![]),
             planner_slot: Some(planner_slot),
             planner_source_task_id: None,
+            planner_run_id: None,
             classifier_slot: Some(classifier_slot),
             arbiter_slot: None,
             arbiter_source_task_id: None,
@@ -36330,11 +36427,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         let proposal = arbiter_gate_proposal();
         let planner_response = serde_json::json!({"outcome":"plan","tasks":proposal});
+        // The transcript carries narration only: the plan reaches the
+        // coordinator through the durable `submit_plan` submission below.
         let planner_output = format!(
             "{}\n{}\n",
             serde_json::json!({
                 "type":"item.completed",
-                "item":{"type":"agent_message","id":"planner-response","text":planner_response.to_string()}
+                "item":{"type":"agent_message","id":"planner-response","text":"narration only"}
             }),
             serde_json::json!({
                 "type":"turn.completed",
@@ -36426,6 +36525,34 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             );
             (source_task_id, graph_id)
         };
+        // Provision the planner run exactly as the spawn site does, then record
+        // the submission its endpoint call would have accepted.
+        let planner_run_id = agent::new_session_id();
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            assert!(quorum_core::decomposition::issue_planner_run(
+                &mut conn,
+                graph_id,
+                source_task_id,
+                &planner_run_id,
+                &decomposition_process_name(graph_id, "planner"),
+                5,
+            )
+            .unwrap());
+            let tx = quorum_core::db::begin_immediate(&mut conn).unwrap();
+            assert_eq!(
+                quorum_core::planner_submissions::record_accepted(
+                    &tx,
+                    &planner_run_id,
+                    graph_id,
+                    &planner_response.to_string(),
+                    6,
+                )
+                .unwrap(),
+                quorum_core::planner_submissions::SubmitOutcome::Accepted
+            );
+            tx.commit().unwrap();
+        }
         let planner_slot = planner::spawn_planner(
             runner::AgentKind::Codex,
             planner::CODEX_PLANNER_MODEL,
@@ -36452,18 +36579,31 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             graph_id: Some(graph_id),
             planner_slot: Some(planner_slot),
             planner_source_task_id: Some(source_task_id),
+            planner_run_id: Some(planner_run_id.clone()),
             ..Default::default()
         };
 
-        tick_decomposition(
-            &config,
-            &mut coordinator,
-            &[],
-            &[],
-            DecompositionLiveWork::default(),
-        )
-        .await
-        .unwrap();
+        // The fake provider's exit is observed by the poll, not by the tick
+        // count: under load its EOF can precede its reaped status by a tick.
+        for _ in 0..200 {
+            tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap();
+            if coordinator.planner_slot.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            coordinator.planner_slot.is_none(),
+            "the planner fixture never reached a terminal outcome"
+        );
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let planner_run = quorum_core::token_usage::for_task(&conn, source_task_id)
@@ -36483,6 +36623,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "validating",
             "planner usage is visible only after its durable proposal acceptance"
         );
+        assert!(
+            conn.query_row(
+                "SELECT revoked_at IS NOT NULL FROM run_capabilities WHERE run_id=?1",
+                [&planner_run_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap(),
+            "a finished planner attempt must not keep submit_plan authority"
+        );
+        assert!(coordinator.planner_run_id.is_none());
         drop(conn);
         assert!(coordinator.arbiter_slot.is_some());
 
@@ -36524,6 +36674,479 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "preclassifying",
             "Arbiter usage is visible only after durable approval"
         );
+    }
+
+    /// End-to-end cutover contract, driven by a real planner process against a
+    /// real endpoint socket.
+    ///
+    /// The submission is accepted only if one identity is shared by the run
+    /// capability, `task_decompositions.planner_session_id`, and the spawned
+    /// process's `QUORUM_RUN_ID` — `resolve_planner_context` requires all three
+    /// to agree — so an accepted plan is itself proof of the coupling. The
+    /// explicit assertions below pin each leg so a regression names the broken
+    /// one instead of only failing the submission.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_reports_its_plan_through_the_endpoint_under_one_run_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipped: no python3 to drive the endpoint socket");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("planner-submit.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("tests")).unwrap();
+        std::fs::write(repo_dir.join("src/core.rs"), "pub fn core() {}\n").unwrap();
+        std::fs::write(repo_dir.join("tests/core.rs"), "#[test] fn core() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "frozen"]);
+        let frozen_base_sha = git(&["rev-parse", "HEAD"]);
+
+        let proposal = arbiter_gate_proposal();
+        let plan_path = dir.path().join("plan.json");
+        std::fs::write(
+            &plan_path,
+            serde_json::json!({"outcome":"plan","tasks":proposal}).to_string(),
+        )
+        .unwrap();
+        let stdout_path = dir.path().join("planner.jsonl");
+        std::fs::write(
+            &stdout_path,
+            format!("{}\n", serde_json::json!({"type":"turn.completed"})),
+        )
+        .unwrap();
+        let run_capture = dir.path().join("observed-run-id");
+        let submit_log = dir.path().join("submit.log");
+
+        // The provider reports its plan the way the MCP tool does — one
+        // length-prefixed frame on the daemon-injected socket, authenticated by
+        // the daemon-injected run id — and never prints it.
+        let runner = dir.path().join("planner-codex");
+        std::fs::write(
+            &runner,
+            format!(
+                r#"#!/bin/sh
+printf '%s' "$QUORUM_RUN_ID" > '{run_capture}.tmp'
+mv '{run_capture}.tmp' '{run_capture}'
+python3 - "$QUORUM_AGENT_ENDPOINT" "$QUORUM_RUN_ID" '{plan}' >> '{log}' 2>&1 <<'PROBE'
+import json, socket, struct, sys
+
+endpoint, capability, plan_path = sys.argv[1], sys.argv[2], sys.argv[3]
+body = json.dumps({{
+    "version": 1,
+    "capability": capability,
+    "operation": {{"type": "submit_plan", "response": json.load(open(plan_path))}},
+}}).encode()
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(20)
+sock.connect(endpoint)
+sock.sendall(struct.pack(">I", len(body)) + body)
+length = struct.unpack(">I", sock.recv(4))[0]
+payload = b""
+while len(payload) < length:
+    payload += sock.recv(length - len(payload))
+print(payload.decode())
+PROBE
+exec /bin/cat '{stdout}'
+"#,
+                run_capture = run_capture.display(),
+                plan = plan_path.display(),
+                log = submit_log.display(),
+                stdout = stdout_path.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (source_task_id, graph_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source_task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "split source",
+                Some("split this safely"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph_id = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "gpt-5.6-sol",
+                    frozen_base_sha: &frozen_base_sha,
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph_id,
+                "freeze-requested",
+                "draining",
+                None,
+                3,
+            )
+            .unwrap();
+            assert!(
+                quorum_core::decomposition::bind_frozen_base_and_enter_planning(
+                    &mut conn,
+                    graph_id,
+                    &frozen_base_sha,
+                    4,
+                )
+                .unwrap()
+            );
+            (source_task_id, graph_id)
+        };
+
+        let mut config = pre_review_checks_config(db_path.clone(), repo_dir.clone());
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "test".to_string(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: planner::CODEX_PLANNER_MODEL.into(),
+                effort: planner::PLANNER_EFFORT.into(),
+            },
+        )]);
+        config.agent_bin = Some(runner.to_string_lossy().into_owned());
+        let mut coordinator = DecompositionCoordinator::default();
+        let endpoint = agent_endpoint::AgentEndpoint::start(
+            &db_path,
+            &config.repo,
+            &config.repo_dir,
+            coordinator.writable_path_resolver.clone(),
+        )
+        .await
+        .unwrap();
+
+        tick_decomposition(
+            &config,
+            &mut coordinator,
+            &[],
+            &[],
+            DecompositionLiveWork::default(),
+        )
+        .await
+        .unwrap();
+        let run_id = coordinator
+            .planner_run_id
+            .clone()
+            .expect("the spawned planner holds a run capability");
+        assert!(coordinator.planner_slot.is_some());
+
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT planner_session_id FROM task_decompositions WHERE id=?1",
+                    [graph_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                run_id,
+                "the graph's live planner session must be this run"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT role,task_id,revoked_at IS NULL FROM run_capabilities WHERE run_id=?1",
+                    [&run_id],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, bool>(2)?
+                    )),
+                )
+                .unwrap(),
+                ("planner".to_string(), source_task_id, true)
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT session_id FROM journal WHERE agent=?1",
+                    [decomposition_process_name(graph_id, "planner")],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                run_id,
+                "the journalled session id must be the same single identity"
+            );
+        }
+
+        let observed_run_id = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(observed) = std::fs::read_to_string(&run_capture) {
+                    return observed;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the planner process never reported its run envelope");
+        assert_eq!(observed_run_id, run_id, "QUORUM_RUN_ID must be that id too");
+
+        for _ in 0..200 {
+            if coordinator.planner_slot.is_none() {
+                break;
+            }
+            tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            coordinator.planner_slot.is_none(),
+            "the planner turn never reached a terminal outcome"
+        );
+
+        let submitted = std::fs::read_to_string(&submit_log).unwrap_or_default();
+        assert!(submitted.contains(r#""ok":true"#), "{submitted}");
+        assert_eq!(
+            coordinator.proposal.as_deref(),
+            Some(proposal.as_slice()),
+            "the accepted proposal must be the submitted plan"
+        );
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            assert_eq!(
+                load_planning_snapshot(&conn).unwrap().unwrap().state,
+                "validating"
+            );
+            assert!(
+                conn.query_row(
+                    "SELECT revoked_at IS NOT NULL FROM run_capabilities WHERE run_id=?1",
+                    [&run_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap(),
+                "a finished planner attempt must not keep submit_plan authority"
+            );
+        }
+        assert!(coordinator.planner_run_id.is_none());
+
+        reap_decomposition_arbiter_with_usage(&db_path, &mut coordinator).await;
+        endpoint.shutdown().await;
+    }
+
+    /// The deliberate consequence of "a submission is the outcome however the
+    /// process ended", pinned on its sharpest case: the run submitted a blocker
+    /// and then died badly. The blocker parks the source — it is not downgraded
+    /// to a retryable provider failure because the transport misbehaved after
+    /// the daemon had already accepted the answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_submitted_blocker_holds_the_source_even_when_the_turn_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("planner-blocker.db");
+        // Exits immediately with no terminal event: a genuine provider failure.
+        let runner = dir.path().join("planner-codex");
+        std::fs::write(&runner, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (source_task_id, graph_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source_task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "split source",
+                Some("split this safely"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph_id = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "gpt-5.6-sol",
+                    frozen_base_sha: "0".repeat(40).as_str(),
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph_id,
+                "freeze-requested",
+                "planning",
+                None,
+                3,
+            )
+            .unwrap());
+            (source_task_id, graph_id)
+        };
+
+        let blocker = serde_json::json!({
+            "outcome": "blocker",
+            "category": "missing_decision",
+            "evidence": ["two incompatible outcomes are requested"],
+            "required_decision": "choose one outcome",
+            "why_no_safe_split": "both children would mutate the same contract",
+        });
+        let planner_run_id = agent::new_session_id();
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            assert!(quorum_core::decomposition::issue_planner_run(
+                &mut conn,
+                graph_id,
+                source_task_id,
+                &planner_run_id,
+                &decomposition_process_name(graph_id, "planner"),
+                4,
+            )
+            .unwrap());
+            let tx = quorum_core::db::begin_immediate(&mut conn).unwrap();
+            assert_eq!(
+                quorum_core::planner_submissions::record_accepted(
+                    &tx,
+                    &planner_run_id,
+                    graph_id,
+                    &blocker.to_string(),
+                    5,
+                )
+                .unwrap(),
+                quorum_core::planner_submissions::SubmitOutcome::Accepted
+            );
+            tx.commit().unwrap();
+        }
+
+        let planner_slot = planner::spawn_planner(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "test".to_string(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: planner::CODEX_PLANNER_MODEL.into(),
+                effort: planner::PLANNER_EFFORT.into(),
+            },
+        )]);
+        config.agent_bin = Some(runner.to_string_lossy().into_owned());
+        let mut coordinator = DecompositionCoordinator {
+            graph_id: Some(graph_id),
+            planner_slot: Some(planner_slot),
+            planner_source_task_id: Some(source_task_id),
+            planner_run_id: Some(planner_run_id.clone()),
+            ..Default::default()
+        };
+
+        for _ in 0..200 {
+            tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap();
+            if coordinator.planner_slot.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            coordinator.planner_slot.is_none(),
+            "the failed planner turn never reached a terminal outcome"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state,freeze_active,hold_code FROM task_decompositions WHERE id=?1",
+                [graph_id],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?
+                )),
+            )
+            .unwrap(),
+            ("held".to_string(), 0, "missing_decision".to_string())
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM tasks WHERE id=?1",
+                [source_task_id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT kind,reason_code FROM decomposition_attempts WHERE graph_id=?1",
+                [graph_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            ("blocker".to_string(), "missing_decision".to_string()),
+            "the blocker was recorded, not a retryable provider failure"
+        );
+        assert!(
+            conn.query_row(
+                "SELECT revoked_at IS NOT NULL FROM run_capabilities WHERE run_id=?1",
+                [&planner_run_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap(),
+            "a finished planner attempt must not keep submit_plan authority"
+        );
+        assert!(coordinator.proposal.is_none());
     }
 
     #[tokio::test]
@@ -37206,7 +37829,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .unwrap();
         assert!(matches!(
             planner::poll_planner(&mut planner_slot).await,
-            Some(planner::PlannerPoll::ProviderFailed(_))
+            Some(planner::PlannerTurnEnd::Failed(_))
         ));
 
         let mut arbiter_slot = arbiter::spawn_arbiter(

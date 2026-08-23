@@ -18,10 +18,13 @@ use std::time::Duration;
 /// budget so a verdict shares the same bounded-text discipline.
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 
-/// Reuse the planner's 64 KiB whole-response ceiling so a verdict cannot grow
-/// past the durable-response envelope, plus the shared prompt/stdout ceilings so
-/// the Arbiter transport inherits the planner's bounded-I/O discipline.
-use super::planner::{MAX_PROMPT_BYTES, MAX_RESPONSE_BYTES, MAX_STDOUT_BYTES};
+/// The Arbiter's whole-response ceiling. The planner no longer reads provider
+/// text at all, so this bound now lives with the one role that still parses a
+/// terminal response; the shared prompt/stdout ceilings keep the Arbiter
+/// transport on the planner's bounded-I/O discipline.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+use super::planner::{MAX_PROMPT_BYTES, MAX_STDOUT_BYTES};
 
 /// Access the planner's source/proposal types and shared caps so the Arbiter
 /// prompt shares the same bounded-input discipline as `planner::build_prompt`.
@@ -104,8 +107,8 @@ struct WireFinding {
 
 /// Parse exactly one closed verdict object.
 ///
-/// Mirrors `planner::parse_response` framing: an empty/whitespace body, a
-/// wrapper, or trailing bytes after the single object is a provider failure
+/// An empty/whitespace body, a wrapper, or trailing bytes after the single
+/// object is a provider failure
 /// (fail closed to a re-attempt, never a silent approve); well-formed JSON of
 /// the wrong shape or an unknown `outcome` is a semantic rejection.
 pub fn parse_verdict(text: &str) -> Result<ArbiterVerdict, ArbiterParseError> {
