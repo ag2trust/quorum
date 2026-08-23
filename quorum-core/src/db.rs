@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 59;
+pub const SCHEMA_VERSION: i64 = 60;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -163,10 +163,10 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
     // enforcement. rusqlite's bundled SQLite defaults `foreign_keys` ON, and `PRAGMA
     // foreign_keys` is a no-op inside a transaction, so the toggle must straddle the
     // `BEGIN IMMEDIATE` below. The v58 rebuilds (`decomposition_attempts`,
-    // `token_usage_runs`) and the v59 rebuild (`run_capabilities`) have no external FK
-    // children today, but reuse the same straddle so future references would migrate
-    // safely. Capture the connection's prior state and restore it on every exit path so
-    // we never leave enforcement disabled on a live connection.
+    // `token_usage_runs`) have no external FK children today, but reuse the same straddle
+    // so future references would migrate safely. Capture the connection's prior state and
+    // restore it on every exit path so we never leave enforcement disabled on a live
+    // connection.
     let fk_prior: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
     conn.pragma_update(None, "foreign_keys", false)?;
     let outcome = migrate_txn(conn, current, fk_prior);
@@ -1027,14 +1027,17 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 )?;
             }
         }
-        // v59 widens run_capabilities.role to admit 'planner' alongside
+        // v59 = planner `submit_plan` MCP tool storage (`planner_submissions`). Net-new
+        // table — the `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL (which runs above) handles
+        // fresh DBs and upgrades alike; no ALTER needed.
+        // v60 widens run_capabilities.role to admit 'planner' alongside
         // ('worker','reviewer'), so the daemon can issue a planner-scoped run capability
         // ahead of a `submit_plan` MCP call. SQLite cannot ALTER a CHECK, so the table is
         // rebuilt in place following the v57/v58 precedent. Guarded on stored constraint
         // text so it is a no-op on a fresh DB (SCHEMA_SQL already creates the widened
         // table) and on any re-run. No table holds a foreign key into run_capabilities, so
         // the rebuild has no dangling-reference risk.
-        if current < 59 {
+        if current < 60 {
             let role_admits_planner: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(sql LIKE '%''planner''%'), 1) FROM sqlite_master
                  WHERE type='table' AND name='run_capabilities'",
@@ -1711,12 +1714,89 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v59_widens_run_capabilities_role_check() {
+    fn migrates_v58_to_v59_adds_planner_submissions_table() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v59-widen-run-capabilities.db");
+        let path = dir.path().join("v58-planner-submissions.db");
+        {
+            // Open fresh at the latest shape (SCHEMA_SQL already creates
+            // `planner_submissions` unconditionally), then drop it and stamp
+            // user_version=58 to simulate a pre-v59 DB missing the table.
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE planner_submissions;
+                 PRAGMA user_version=58;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='planner_submissions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+
+        // Idempotency that actually re-enters `migrate_txn` (not the
+        // `current == SCHEMA_VERSION` early return above): re-stamp
+        // user_version=58 WITHOUT dropping the table this time, so migrate
+        // reruns SCHEMA_SQL and the v59 step over a DB that already has
+        // `planner_submissions`. Seed a row first so a non-idempotent v59
+        // step (e.g. a bare `CREATE TABLE` instead of `IF NOT EXISTS`) fails
+        // loud, and the row's survival proves the rerun doesn't
+        // destructively rebuild the table.
+        conn.execute(
+            "INSERT INTO planner_submissions(run_id, graph_id) VALUES ('idempotent-check', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA user_version=58;").unwrap();
+        drop(conn);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name='planner_submissions'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT graph_id FROM planner_submissions WHERE run_id='idempotent-check'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn migrates_v60_widens_run_capabilities_role_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v60-widen-run-capabilities.db");
         {
             // Open fresh at the latest shape, then rebuild run_capabilities in the narrow
-            // (pre-v59) form so we can verify the rebuild widens the CHECK and preserves
+            // (pre-v60) form so we can verify the rebuild widens the CHECK and preserves
             // existing rows. Mirrors `migrates_v57_widens_decomposition_attempts_and_token_usage_runs_checks`
             // and, for the FK straddle, `migrates_v56_widens_role_assignment_check_to_admit_arbiter`.
             let conn = open(&path).unwrap();
