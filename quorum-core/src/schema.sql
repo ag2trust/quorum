@@ -942,7 +942,7 @@ CREATE TABLE IF NOT EXISTS run_capabilities (
     run_id      TEXT PRIMARY KEY,
     task_id     INTEGER NOT NULL,
     agent       TEXT NOT NULL,
-    -- v59 widened this to admit 'planner': a run capability issued to a planning-graph
+    -- v60 widened this to admit 'planner': a run capability issued to a planning-graph
     -- planner ahead of a `submit_plan` MCP call. See the v59 migration in db.rs.
     role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','planner')),
     created_at  INTEGER NOT NULL,
