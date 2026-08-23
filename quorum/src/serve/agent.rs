@@ -337,9 +337,15 @@ impl AgentProc {
     /// write files, load customizations, or persist a provider session.
     ///
     /// `agent_mcp` is `Some` only for a planner carrying a complete managed run
-    /// envelope. It adds exactly one tool — `submit_plan` — and no other
-    /// authority: the planner keeps its read-only tool surface and still cannot
-    /// reach a shell.
+    /// envelope. It adds exactly one tool — `submit_plan` — and the planner
+    /// keeps its read-only `--tools` surface.
+    ///
+    /// The tool surface narrows what the planner reaches for; it is not what
+    /// bounds the capability now in its environment. A `planner` capability is
+    /// honored by `SubmitPlan` alone — `resolve_live_run_context`
+    /// (`quorum-core/src/capabilities.rs:113-116,140`) admits only the `worker`
+    /// and `reviewer` roles — under a once-only guard and a bounded rejection
+    /// budget.
     #[allow(dead_code)] // consumed by the pending daemon decomposition coordinator
     pub fn spawn_planner(
         spec: &AgentSpec,

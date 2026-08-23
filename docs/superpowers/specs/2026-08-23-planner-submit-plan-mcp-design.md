@@ -19,8 +19,11 @@ never consulted for lifecycle outcomes. Tool-less single-shot extraction calls
 (classifier, collector) keep tolerant JSON extraction; they are out of scope.
 
 Reviewers and workers already satisfy this via `quorum submit` → Unix socket. The
-planner is sandboxed without a shell (`Read,Glob,Grep` / `-s read-only`), so its door
-is an MCP tool. Arbiter follows in a later spec.
+planner has no comparable path: Claude gives it `Read,Glob,Grep` with no Bash tool,
+and Codex runs it under `-s read-only`, so an MCP tool is its practical door.
+`-s read-only` sandboxes model-generated shell commands rather than removing the
+shell, so the sandbox is not the containment — see section 3. Arbiter follows in a
+later spec.
 
 ## Design
 
@@ -63,7 +66,8 @@ is an MCP tool. Arbiter follows in a later spec.
 - `AgentProc::spawn_planner` and `CodexProc::spawn_planner` accept
   `Option<AgentMcpServer>` and pass it through `spawn_configured` /
   `planner_exec_args`. Claude: `RestrictedMode::Planner` keeps `--tools Read,Glob,Grep`
-  and the MCP allowlist adds `mcp__quorum__submit_plan` only (no `mcp__github__*`).
+  and the MCP allowlist adds `mcp__github__submit_plan` only (no `mcp__github__*`);
+  the server is registered under the key `github` by both provider adapters.
   Codex: `-s read-only` stays; the MCP server override is appended as for other roles.
   Verify with a real-binary argument test that the Codex read-only sandbox permits the
   stdio MCP child to connect to the Unix socket; if it does not, record the finding and
@@ -72,8 +76,18 @@ is an MCP tool. Arbiter follows in a later spec.
   `QUORUM_AGENT_ENDPOINT`) is placed in the planner process environment, exactly as
   for workers/reviewers, because the stdio MCP child inherits it
   (`claude_mcp_config` at `agent.rs:62` carries no `env` block; Codex forwards via
-  `env_vars`). The planner has no shell, so the token is reachable only through its
-  file-read tools. Moving the envelope into provider `env` blocks is a follow-up.
+  `env_vars`). The envelope is therefore readable by the planner itself, and the
+  sandbox is not what prevents it being used directly: `-s read-only` sandboxes
+  model-generated shell commands but does not remove the shell, so a Codex planner
+  can in principle read `QUORUM_RUN_ID` and call the endpoint without the tool.
+  Containment is the endpoint's, not the sandbox's: a `planner` capability is
+  honored by `SubmitPlan` alone — `resolve_live_run_context`
+  (`quorum-core/src/capabilities.rs:113-116,140`) admits only the `worker` and
+  `reviewer` operation roles and requires an exact role match, so every GitHub and
+  lifecycle operation rejects it — and `SubmitPlan` itself is bounded by the
+  once-only guard and `MAX_PLAN_SUBMIT_REJECTIONS`
+  (`quorum-core/src/planner_submissions.rs:16`). Moving the envelope into provider
+  `env` blocks is a follow-up.
 - Authority for `SubmitPlan` uses a dedicated resolver
   `quorum_core::capabilities::resolve_planner_context(conn, run_id)` returning
   `{ run_id, task_id, graph_id, source_revision }`: capability exists, not revoked,

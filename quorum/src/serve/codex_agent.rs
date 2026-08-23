@@ -145,9 +145,16 @@ pub fn planner_exec_args(spec: &CodexSpec) -> Vec<String> {
     planner_exec_args_configured(spec, None)
 }
 
-/// The planner argument shape with an optional `submit_plan` MCP server. The
-/// server is the planner's only outbound door; `-s read-only` and every other
-/// pinned isolation flag are unchanged by its presence.
+/// The planner argument shape with an optional `submit_plan` MCP server.
+/// `-s read-only` and every other pinned isolation flag are unchanged by its
+/// presence.
+///
+/// `-s read-only` sandboxes model-generated shell commands; it does not remove
+/// the shell, so this argument shape is not what stops a Codex planner from
+/// using its run envelope directly. That containment is the endpoint's: a
+/// `planner` capability is honored by `SubmitPlan` alone
+/// (`quorum-core/src/capabilities.rs:113-116,140,313-335`), under a once-only
+/// guard and a bounded rejection budget.
 fn planner_exec_args_configured(
     spec: &CodexSpec,
     agent_mcp: Option<AgentMcpServer>,
@@ -1475,7 +1482,7 @@ while IFS= read -r request; do :; done
         );
     }
 
-    /// Real-binary sandbox boundary for the planner's only door.
+    /// Real-binary reachability check for the planner's `submit_plan` door.
     ///
     /// `-s read-only` is the planner's mechanism-level isolation. `submit_plan`
     /// is useless if that sandbox also stops the stdio MCP child from reaching
