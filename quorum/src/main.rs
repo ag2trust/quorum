@@ -1591,10 +1591,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     if line.trim().is_empty() {
                         continue;
                     }
-                    if raw {
-                        println!("{line}");
-                    } else if let Some(event) = serve::stream::parse_line(&line) {
-                        if let Some(rendered) = serve::render::render_event(&event) {
+                    if let Some(rendered) = tail_output_for_line(&agent, raw, &line) {
+                        if raw {
+                            println!("{rendered}");
+                        } else {
                             print!("{rendered}");
                         }
                     }
@@ -2090,6 +2090,26 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
     }
 }
 
+/// Format a single `quorum tail` record. Decomposition planners use a closed,
+/// sanitized stream; every other agent keeps the existing provider-stream
+/// renderer unchanged.
+fn tail_output_for_line(agent: &str, raw: bool, line: &str) -> Option<String> {
+    if agent.starts_with("decomposition-planner-") {
+        let event = serde_json::from_str::<serve::session_log::SanitizedSessionEvent>(line).ok()?;
+        return Some(if raw {
+            line.to_string()
+        } else {
+            serve::render::render_sanitized_session_event(&event)
+        });
+    }
+
+    if raw {
+        Some(line.to_string())
+    } else {
+        serve::stream::parse_line(line).and_then(|event| serve::render::render_event(&event))
+    }
+}
+
 fn diff_lines(old: &str, new: &str) -> Vec<String> {
     let mut out = Vec::new();
     let old_lines: Vec<&str> = old.lines().collect();
@@ -2130,8 +2150,31 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_ttl, resolve_repo_override, validate_external_poll_interval, wait_child_stdout,
+        parse_ttl, resolve_repo_override, tail_output_for_line, validate_external_poll_interval,
+        wait_child_stdout,
     };
+
+    #[test]
+    fn planner_tail_accepts_only_sanitized_records_in_rendered_and_raw_modes() {
+        let secret = "sk-tail-secret-must-not-appear";
+        let record = r#"{"event":"command_summary","command":"shell","outcome":"succeeded","details":{"summary":"structural","shape":"string","captured_bytes":30}}"#;
+        let rendered = tail_output_for_line("decomposition-planner-17", false, record).unwrap();
+        assert!(rendered.contains("Command shell succeeded"));
+        assert!(!rendered.contains(secret));
+
+        assert_eq!(
+            tail_output_for_line("decomposition-planner-17", true, record).as_deref(),
+            Some(record),
+            "raw planner tail preserves the bounded sanitized record"
+        );
+        assert!(tail_output_for_line(
+            "decomposition-planner-17",
+            false,
+            &format!(r#"{{"event":"command_summary","credential":"{secret}"}}"#),
+        )
+        .is_none());
+        assert!(tail_output_for_line("decomposition-planner-17", true, secret).is_none());
+    }
 
     #[test]
     fn parse_ttl_units() {
