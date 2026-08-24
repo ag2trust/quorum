@@ -783,20 +783,11 @@ impl PlannerSlot {
         if self.session_log.is_none() {
             return;
         }
-        self.log_sanitized_events(&[
-            SanitizedSessionEvent::ProviderFailure {
-                provider: sanitized_provider(self.proc.kind()),
-                kind: provider_failure_kind(reason),
-                details: SanitizedField::from_text(reason),
-            },
-            SanitizedSessionEvent::ProviderLifecycle {
-                provider: sanitized_provider(self.proc.kind()),
-                phase: ProviderLifecyclePhase::Stopped,
-            },
-            SanitizedSessionEvent::Completion {
-                outcome: SanitizedCompletionOutcome::Failed,
-            },
-        ]);
+        self.log_sanitized_events(&[SanitizedSessionEvent::ProviderFailure {
+            provider: sanitized_provider(self.proc.kind()),
+            kind: provider_failure_kind(reason),
+            details: SanitizedField::from_text(reason),
+        }]);
     }
 
     fn log_missing_submission(&mut self) {
@@ -834,6 +825,21 @@ impl PlannerSlot {
             },
             SanitizedSessionEvent::Completion {
                 outcome: SanitizedCompletionOutcome::Completed,
+            },
+        ]);
+    }
+
+    fn log_failed_completion(&mut self) {
+        if self.session_log.is_none() {
+            return;
+        }
+        self.log_sanitized_events(&[
+            SanitizedSessionEvent::ProviderLifecycle {
+                provider: sanitized_provider(self.proc.kind()),
+                phase: ProviderLifecyclePhase::Stopped,
+            },
+            SanitizedSessionEvent::Completion {
+                outcome: SanitizedCompletionOutcome::Failed,
             },
         ]);
     }
@@ -935,20 +941,25 @@ pub fn planner_outcome(
     if let Some(response) = submitted {
         return match rehydrate_submitted_response(response) {
             Ok(response) => {
-                if matches!(end, PlannerTurnEnd::Complete) {
-                    slot.log_completion();
-                }
+                // The daemon accepted this submission before the provider
+                // ended, so it remains the attempt outcome even after a
+                // provider crash or timeout.
+                slot.log_completion();
                 PlannerPoll::Done(response)
             }
             Err(error) => {
                 let reason = error.to_string();
                 slot.log_provider_failure(&reason);
+                slot.log_failed_completion();
                 PlannerPoll::ProviderFailed(provider_failure_summary(slot, &reason, "exact"))
             }
         };
     }
     PlannerPoll::ProviderFailed(match end {
-        PlannerTurnEnd::Failed(summary) => summary,
+        PlannerTurnEnd::Failed(summary) => {
+            slot.log_failed_completion();
+            summary
+        }
         PlannerTurnEnd::Complete => {
             slot.log_missing_submission();
             provider_failure_summary(slot, "planner exited without submit_plan", "exact")
@@ -2346,6 +2357,58 @@ mod tests {
             ),
             PlannerPoll::ProviderFailed(ref summary) if summary == "planner timed out"
         ));
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_submission_after_provider_failure_logs_completed_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let submitted = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        })
+        .to_string();
+        let output = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "turn.failed",
+                "error": {"message": "provider crashed after submit_plan"}
+            })
+        );
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-planner-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            planner_outcome(&mut slot, turn_end, Some(&submitted)),
+            PlannerPoll::Done(PlannerResponse::Plan { .. })
+        ));
+
+        let stream = std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap();
+        let events = stream
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events
+            .iter()
+            .any(|event| event["event"] == "provider_failure"));
+        let completions = events
+            .iter()
+            .filter(|event| event["event"] == "completion")
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0]["outcome"], "completed");
+
         slot.kill_and_reap().await;
     }
 
