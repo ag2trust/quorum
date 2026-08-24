@@ -123,9 +123,11 @@ async fn spawn_classifier_configured_with_timeout(
     let prompt = classify::build_prompt_with_recommendations(tasks, dup_context, recommendations);
     let started_at = tokio::time::Instant::now();
     let deadline = started_at + turn_timeout;
-    // Safe mode retains Claude's configured auth path while suppressing user
-    // context; Codex retains its read-only sandbox without the normal bypass.
-    // The empty temporary cwd is the only directory exposed to either runner.
+    // `--setting-sources ""` retains Claude's configured auth path while
+    // fully unloading user/project settings, hooks, and plugins; Codex
+    // retains its read-only sandbox without the normal bypass. The empty
+    // temporary cwd is the only directory exposed to either runner, so no
+    // CLAUDE.md ever exists there to inject.
     let proc = RunnerProc::launch_restricted_until(
         &LaunchRequest {
             model,
@@ -758,7 +760,15 @@ mod tests {
 
         let args = std::fs::read_to_string(args_log).unwrap();
         let argv: Vec<&str> = args.lines().collect();
-        assert!(argv.contains(&"<--safe-mode>"), "{args}");
+        assert!(
+            !argv.contains(&"<--safe-mode>"),
+            "classifier still carries the flag that silently suppresses MCP servers: {args}"
+        );
+        let sources = argv
+            .iter()
+            .position(|arg| *arg == "<--setting-sources>")
+            .unwrap_or_else(|| panic!("--setting-sources missing: {args}"));
+        assert_eq!(argv.get(sources + 1), Some(&"<>"), "{args}");
         assert!(argv.contains(&"<--disable-slash-commands>"), "{args}");
         assert!(argv.contains(&"<--no-session-persistence>"), "{args}");
         let tools = argv.iter().position(|arg| *arg == "<--tools>").unwrap();
@@ -769,6 +779,12 @@ mod tests {
             "operator auth must remain enabled: {args}"
         );
         assert!(!args.contains(&repo.path().display().to_string()), "{args}");
+        // The isolated worktree is a fresh empty tempdir, so no CLAUDE.md
+        // exists there to inject — confirms the injection stays conditional.
+        assert!(
+            !argv.contains(&"<--append-system-prompt-file>"),
+            "classifier injected a nonexistent CLAUDE.md: {args}"
+        );
     }
 
     #[cfg(unix)]

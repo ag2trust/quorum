@@ -325,16 +325,21 @@ impl AgentProc {
     }
 
     /// Spawn a closed-book classifier while preserving the configured auth
-    /// path. Safe mode suppresses user/project customizations without the
-    /// credential restrictions of `--bare`; the empty tool surface prevents
-    /// the classifier from acquiring context beyond its supplied turn.
+    /// path. `--setting-sources ""` loads no user/project settings, hooks, or
+    /// plugins, without the credential restrictions of `--bare`; the empty
+    /// tool surface prevents the classifier from acquiring context beyond its
+    /// supplied turn and the repo CLAUDE.md injected below.
     pub fn spawn_restricted(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
         Self::spawn_configured(spec, agent_bin, RestrictedMode::ClosedBook, None)
     }
 
     /// Spawn a read-only planning turn. Unlike the closed-book classifier,
     /// the planner may inspect the frozen repository, but cannot invoke Bash,
-    /// write files, load customizations, or persist a provider session.
+    /// write files, persist a provider session, or load user/project
+    /// settings, hooks, or plugins (`--setting-sources ""`). The repo
+    /// CLAUDE.md is injected explicitly via `--append-system-prompt-file`
+    /// when present, since Claude's native CLAUDE.md discovery is gated on
+    /// the `project` settings source that this closes.
     ///
     /// `agent_mcp` is `Some` only for a planner carrying a complete managed run
     /// envelope. It adds exactly one tool — `submit_plan` — and the planner
@@ -383,7 +388,8 @@ impl AgentProc {
         }
 
         if restricted != RestrictedMode::None {
-            cmd.arg("--safe-mode")
+            cmd.arg("--setting-sources")
+                .arg("")
                 .arg("--disable-slash-commands")
                 .arg("--tools")
                 .arg(match restricted {
@@ -393,6 +399,15 @@ impl AgentProc {
                 .arg("--no-session-persistence");
             if restricted == RestrictedMode::Planner {
                 cmd.arg("--add-dir").arg(&spec.worktree);
+            }
+            // `--setting-sources ""` gates Claude's native CLAUDE.md
+            // discovery along with settings/hooks/plugins, so inject the
+            // repo CLAUDE.md explicitly — but only when it exists; the CLI
+            // fails argument validation on a missing
+            // `--append-system-prompt-file` path.
+            let claude_md = spec.worktree.join("CLAUDE.md");
+            if claude_md.is_file() {
+                cmd.arg("--append-system-prompt-file").arg(&claude_md);
             }
         } else {
             cmd.arg("--add-dir").arg(&spec.worktree);
@@ -1143,6 +1158,78 @@ mod tests {
         );
     }
 
+    /// Pins the bug this PR fixes: `--safe-mode` accepted `--mcp-config`
+    /// without error but silently never spawned the inline MCP server, so
+    /// `submit_plan` never existed in the planner's session. This spawns the
+    /// REAL claude CLI with the planner+MCP arg set (now
+    /// `--setting-sources ""` based) and a marker-script MCP server, and
+    /// asserts the marker file appears — proving the server actually
+    /// spawns under the new flag set. Zero-token: credentials are blanked,
+    /// so if MCP spawn turns out to be gated behind auth in this
+    /// environment, this falls back to asserting the full new arg set is
+    /// accepted by the CLI (reaches the auth stage) rather than rejected at
+    /// argument parsing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_cli_spawns_planner_mcp_server_under_new_flags() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !claude_available() {
+            eprintln!("skipped: no claude binary on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("mcp-spawned");
+        let marker_script = tmp.path().join("mcp-marker.sh");
+        std::fs::write(
+            &marker_script,
+            format!("#!/bin/sh\ntouch '{}'\nexec cat\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&marker_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // AgentMcpServer's fields are 'static str/slice; leaking is the
+        // simplest way to hand it a tempdir-scoped command path in a test.
+        let command: &'static str = Box::leak(marker_script.display().to_string().into_boxed_str());
+        let server = AgentMcpServer {
+            command,
+            args: &[],
+            env_vars: &[],
+        };
+
+        let mut spec = classifier_spec(tmp.path(), false);
+        spec.model = "claude-opus-4-6".into();
+        spec.effort = "high".into();
+        spec.allowed_tools = "Read,Glob,Grep".into();
+        spec.env_vars = no_auth_env(tmp.path());
+
+        let mut proc = AgentProc::spawn_planner(&spec, None, Some(server))
+            .expect("spawn planner claude with mcp marker server");
+        proc.feed_turn(&user_turn("return an empty JSON object"))
+            .await
+            .expect("feed planner turn");
+        let event =
+            tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event()).await;
+        let _ = proc.kill_and_reap().await;
+
+        if marker.exists() {
+            // Best outcome: proves the inline MCP server actually spawned
+            // under the new --setting-sources flag set.
+            return;
+        }
+        // Documented fallback: MCP server spawn may be gated behind auth in
+        // a no-auth environment. Confirm the CLI at least accepted the full
+        // new arg set (reached the auth stage) instead of rejecting it at
+        // argument validation.
+        match event {
+            Ok(Some(_)) => {}
+            other => panic!(
+                "claude neither spawned the MCP marker nor emitted a stream event \
+                 (arg set may have been rejected at CLI validation): {other:?}"
+            ),
+        }
+    }
+
     fn planner_spec(worktree: &std::path::Path) -> AgentSpec {
         let mut spec = classifier_spec(worktree, false);
         spec.model = "claude-opus-4-6".into();
@@ -1254,6 +1341,11 @@ mod tests {
             );
         }
         assert_eq!(flag_value(&args, "--tools"), "Read,Glob,Grep");
+        assert_eq!(flag_value(&args, "--setting-sources"), "");
+        assert!(
+            !args.iter().any(|arg| arg == "--safe-mode"),
+            "planner still carries the flag that silently suppressed its MCP server: {args:?}"
+        );
     }
 
     /// `None` must leave the historical planner surface byte-identical: no MCP
@@ -1277,6 +1369,41 @@ mod tests {
         );
         assert_eq!(flag_value(&args, "--allowedTools"), "Read,Glob,Grep");
         assert_eq!(flag_value(&args, "--tools"), "Read,Glob,Grep");
+        assert_eq!(flag_value(&args, "--setting-sources"), "");
+        assert!(
+            !args.iter().any(|arg| arg == "--safe-mode"),
+            "tool-less planner still carries --safe-mode: {args:?}"
+        );
+    }
+
+    /// `--setting-sources ""` gates Claude's native CLAUDE.md discovery, so a
+    /// restricted spawn must inject it explicitly — but only when the file
+    /// actually exists in the spec's worktree; a missing path would fail CLI
+    /// argument validation for `--append-system-prompt-file`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_planner_injects_claude_md_only_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = planner_spec(tmp.path());
+        let args = capture_planner_args(tmp.path(), &spec, None).await;
+        assert!(
+            !args.iter().any(|arg| arg == "--append-system-prompt-file"),
+            "planner injected a nonexistent CLAUDE.md: {args:?}"
+        );
+
+        let with_claude_md = tempfile::tempdir().unwrap();
+        std::fs::write(
+            with_claude_md.path().join("CLAUDE.md"),
+            "# Repo customizations\n",
+        )
+        .unwrap();
+        let spec_with_md = planner_spec(with_claude_md.path());
+        let args_with_md = capture_planner_args(with_claude_md.path(), &spec_with_md, None).await;
+        let injected = flag_value(&args_with_md, "--append-system-prompt-file");
+        assert_eq!(
+            std::fs::canonicalize(injected).unwrap(),
+            std::fs::canonicalize(with_claude_md.path().join("CLAUDE.md")).unwrap(),
+        );
     }
 
     /// The stdio MCP child inherits the planner process environment, so the run

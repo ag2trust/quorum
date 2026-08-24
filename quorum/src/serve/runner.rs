@@ -1587,6 +1587,8 @@ mod tests {
         assert!(args.contains("<--bare>"), "{args}");
         assert!(args.contains("<Bash,Read>"), "{args}");
         assert!(!args.contains("<--safe-mode>"), "{args}");
+        assert!(!args.contains("<--setting-sources>"), "{args}");
+        assert!(!args.contains("<--append-system-prompt-file>"), "{args}");
         let argv: Vec<&str> = args.lines().collect();
         let session_flag = argv
             .iter()
@@ -1952,7 +1954,13 @@ mod tests {
             let args = std::fs::read_to_string(dir.path().join("args.log")).unwrap();
             match expected_kind {
                 AgentKind::Claude => {
-                    assert!(args.contains("<--safe-mode>"), "{args}");
+                    assert!(!args.contains("<--safe-mode>"), "{args}");
+                    let argv: Vec<&str> = args.lines().collect();
+                    let sources = argv
+                        .iter()
+                        .position(|arg| *arg == "<--setting-sources>")
+                        .unwrap_or_else(|| panic!("--setting-sources missing: {args}"));
+                    assert_eq!(argv.get(sources + 1), Some(&"<>"), "{args}");
                     assert!(args.contains("<--no-session-persistence>"), "{args}");
                     assert!(!args.contains("<--add-dir>"), "{args}");
                 }
