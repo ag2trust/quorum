@@ -1656,8 +1656,10 @@ async fn publish_worker_completion(
     let local_sha = match (&prior, supersede_source) {
         // A parked-rework retry is a new, explicitly requested delivery round.
         // Its worktree was provisioned from the recorded PR lease, so its
-        // completed HEAD supersedes the failed pre-park source. Ordinary
-        // publication crash recovery still replays the exact durable source.
+        // completed HEAD supersedes the failed pre-park source. `retry_parked`
+        // atomically removes only a confirmed rejected initial-push intent;
+        // every intent retained here, including crash recovery, replays its
+        // exact durable source.
         (_, true) | (None, false) => wt_mgr.head_sha(worktree).await?,
         (Some(intent), false) => intent.local_sha.clone(),
     };
@@ -30190,6 +30192,155 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             intent.stage == "verified",
             "successful publication must verify the backfilled intent"
         );
+        assert_eq!(
+            published.source_sha, fixture.source_sha,
+            "a publication crash recovery must replay the exact durable source"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_initial_publication_retry_publishes_fresh_worker_head_and_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+        let base_sha = git(&["rev-parse", "HEAD"]);
+
+        let stale_branch = "daemon/first-worker-t89";
+        git(&["checkout", "-q", "-b", stale_branch]);
+        std::fs::write(repo.join("state.txt"), "first worker\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "first worker completion"]);
+        let stale_sha = git(&["rev-parse", "HEAD"]);
+
+        let fresh_branch = "daemon/second-worker-t89";
+        git(&["checkout", "-q", "-b", fresh_branch, &base_sha]);
+        std::fs::write(repo.join("state.txt"), "second worker\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "second worker completion"]);
+        let fresh_sha = git(&["rev-parse", "HEAD"]);
+        git(&[
+            "push",
+            "-q",
+            "origin",
+            &format!("{base_sha}:refs/heads/{fresh_branch}"),
+        ]);
+
+        let db_path = dir.path().join("retry-publication.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = tasks::create(
+                &mut conn,
+                "owner",
+                "rejected initial publication",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let stale = PublicationIntent {
+                branch: stale_branch.into(),
+                local_sha: stale_sha,
+                pr: None,
+                stage: "intent".into(),
+                target_branch: None,
+                expected_remote_sha: None,
+            };
+            tasks::update_refs_daemon(
+                &mut conn,
+                id,
+                &serde_json::json!({
+                    "daemon_publication": stale,
+                    "runner_continuation": {"provider": "codex", "id": "old-turn"}
+                })
+                .to_string(),
+                now_unix(),
+            )
+            .unwrap();
+            let run = quorum_core::agent_runs::insert(
+                &conn,
+                id,
+                "FirstWorker",
+                "worker",
+                "model",
+                "high",
+                "codex",
+                now_unix(),
+            )
+            .unwrap();
+            quorum_core::agent_runs::close(&conn, run, now_unix(), "daemon_push_failed").unwrap();
+            tasks::park(
+                &mut conn,
+                id,
+                "daemon-owned publication failed: remote rejected push",
+                "open",
+                now_unix(),
+            )
+            .unwrap();
+            tasks::retry_parked(&mut conn, id, "owner", true, now_unix())
+                .unwrap()
+                .expect("rejected initial publication must retry");
+            pr_targets::upsert(&mut conn, id, 482, fresh_branch, &base_sha, false).unwrap();
+            id
+        };
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-fresh-worker",
+            &open_pr_target_json(fresh_branch, &base_sha, "main"),
+        ));
+        let published = publish_worker_completion(
+            &config,
+            &WorktreeManager::new(),
+            task_id,
+            &repo,
+            fresh_branch,
+            Some(482),
+        )
+        .await
+        .expect("fresh worker publication must not replay the rejected source");
+
+        assert_eq!(published.source_sha, fresh_sha);
+        assert_eq!(published.head_ref, fresh_branch);
+        assert_eq!(remote_branch_sha(&repo, fresh_branch), fresh_sha);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let intent = publication_intent_from_refs(task.refs.as_deref()).unwrap();
+        assert_eq!(intent.local_sha, fresh_sha);
+        assert_eq!(intent.branch, fresh_branch);
     }
 
     #[cfg(unix)]

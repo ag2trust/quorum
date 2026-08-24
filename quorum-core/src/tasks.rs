@@ -4135,7 +4135,37 @@ pub fn retry_parked(
          SET status=?2,
              assignee=NULL,
              recovery_attempts=CASE WHEN ?5 THEN 0 ELSE recovery_attempts END,
-             refs=CASE WHEN ?4='rework'
+             refs=CASE
+                  -- A rejected initial branch push has no remote/PR authority
+                  -- to preserve. Its retry must provision a fresh worker and
+                  -- publish that worker's HEAD rather than replaying the
+                  -- failed intent. Require both the parked publication reason
+                  -- and the most recent worker outcome so an older rejected
+                  -- push cannot affect a later, unrelated park.
+                  WHEN json_extract(refs, '$.daemon_parked_reason')
+                           LIKE 'daemon-owned publication failed:%'
+                       AND json_extract(refs, '$.daemon_publication.stage')='intent'
+                       AND json_type(refs, '$.daemon_publication.pr')='null'
+                       AND COALESCE((
+                           SELECT end_reason
+                           FROM agent_runs
+                           WHERE task_id=tasks.id AND role='worker'
+                           ORDER BY id DESC
+                           LIMIT 1
+                       ), '')='daemon_push_failed'
+                  THEN json_remove(
+                      refs,
+                      '$.daemon_parked',
+                      '$.daemon_parked_reason',
+                      '$.daemon_parked_unsatisfiable',
+                      '$.daemon_resume_status',
+                      '$.daemon_rework_retry_requested',
+                      '$.daemon_parked_head_check',
+                      '$.daemon_merge_retry',
+                      '$.daemon_publication',
+                      '$.runner_continuation'
+                  )
+                  WHEN ?4='rework'
                   THEN json_set(
                       json_remove(
                           refs,
@@ -12420,6 +12450,94 @@ mod tests {
             refs.get(PARKED_UNSATISFIABLE_REF).is_none(),
             "successful retry must strip the unsatisfiable marker; leftover refs: {refs}"
         );
+    }
+
+    #[test]
+    fn retry_parked_discards_only_rejected_new_branch_publication_intent() {
+        let (_d, mut c) = open_tmp();
+        for (title, pr, stage, end_reason, clears_intent) in [
+            (
+                "rejected new branch",
+                None,
+                "intent",
+                "daemon_push_failed",
+                true,
+            ),
+            (
+                "pr-backed publication",
+                Some(482),
+                "intent",
+                "daemon_push_failed",
+                false,
+            ),
+            (
+                "pushed publication",
+                None,
+                "pushed",
+                "daemon_push_failed",
+                false,
+            ),
+            ("crash recovery", None, "intent", "daemon_crashed", false),
+        ] {
+            let id = create(
+                &mut c, "owner", title, None, 0, None, None, None, None, 1000,
+            )
+            .unwrap();
+            let refs = serde_json::json!({
+                "daemon_publication": {
+                    "branch": "daemon/first-worker-t89",
+                    "local_sha": "sha-a",
+                    "pr": pr,
+                    "stage": stage
+                },
+                "runner_continuation": {"provider": "codex", "id": "old-turn"}
+            });
+            update_refs_daemon(&mut c, id, &refs.to_string(), 1001).unwrap();
+            let run = crate::agent_runs::insert(
+                &c,
+                id,
+                "FirstWorker",
+                "worker",
+                "model",
+                "high",
+                "codex",
+                1002,
+            )
+            .unwrap();
+            crate::agent_runs::close(&c, run, 1003, end_reason).unwrap();
+            park(
+                &mut c,
+                id,
+                "daemon-owned publication failed: remote rejected push",
+                "open",
+                1004,
+            )
+            .unwrap();
+
+            let retried = retry_parked(&mut c, id, "operator", true, 1005)
+                .unwrap()
+                .expect("parked task must retry");
+            assert_eq!(retried.status, "open");
+            let refs: serde_json::Value =
+                serde_json::from_str(retried.refs.as_deref().unwrap_or("{}")).unwrap();
+            if clears_intent {
+                assert!(
+                    refs.get("daemon_publication").is_none(),
+                    "rejected new-branch retry must discard stale publication: {refs}"
+                );
+                assert!(
+                    refs.get("runner_continuation").is_none(),
+                    "fresh delivery must not retain the previous worker continuation: {refs}"
+                );
+            } else {
+                assert_eq!(
+                    refs["daemon_publication"]["local_sha"], "sha-a",
+                    "non-rejected or PR-backed retries must replay their exact durable source"
+                );
+                assert_eq!(refs["daemon_publication"]["pr"], serde_json::json!(pr));
+                assert_eq!(refs["runner_continuation"]["id"], "old-turn");
+            }
+        }
     }
 
     /// Task #473 R4 defense: `retry_parked`'s policy branch keeps
