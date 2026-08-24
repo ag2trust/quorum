@@ -225,8 +225,8 @@ printf 'compiled schema input\n' > "$INERT_REPO/quorum-core/src/schema.sql"
 ! grep -q 'skipping clippy + test' "$TMP/inert-mixed-schema.out"
 cmp "$TMP/inert-full.expected" "$TMP/inert-cargo.log"
 
-# Merely branching from develop is not integration: the branch omits current
-# main and must remain subject to the normal branch-base rejection.
+# A normal branch from develop is valid even when develop lags main. Its
+# single branch-owned session must pass without requiring main in its history.
 git switch -q --detach origin/develop
 git switch -qc daemon/tester-t2
 printf 'feature\n' > feature
@@ -237,10 +237,30 @@ chmod +x ./preflight.sh
 mkdir -p scripts/preflight
 cp "$ROOT/scripts/preflight/timing.sh" scripts/preflight/timing.sh
 chmod +x scripts/preflight/timing.sh
-if PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/feature.out" 2>&1; then
-  echo 'expected develop-based feature branch to fail preflight' >&2
+PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/develop-feature.out"
+grep -q 'PREFLIGHT: PASS (quick' "$TMP/develop-feature.out"
+
+# A branch cut from that feature still has both sessions in its develop-owned
+# range and must be rejected as feature-on-feature stacking.
+git switch -qc daemon/tester-t3
+printf 'stacked feature\n' >> feature
+git commit -qam 'stacked feature work' \
+  -m 'Co-Authored-By: Stacked-agent <stacked@example.invalid>'
+if PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/develop-stacked.out" 2>&1; then
+  echo 'expected feature-on-feature branch to fail preflight' >&2
   exit 1
 fi
+grep -q 'sessions in branch-owned commits' "$TMP/develop-stacked.out"
+
+# A normal main-based branch retains the existing single-session pass path.
+git switch -q --detach origin/main
+git switch -qc daemon/tester-t4
+printf 'main feature\n' > main-feature
+git add main-feature
+git commit -qm 'main feature work' \
+  -m 'Co-Authored-By: Main-feature-agent <main-feature@example.invalid>'
+PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/main-feature.out"
+grep -q 'PREFLIGHT: PASS (quick' "$TMP/main-feature.out"
 
 # Install the real hook and prove its standard stdin tuple against a bare
 # remote. The daemon publishes an exact SHA rather than a same-named local ref,
