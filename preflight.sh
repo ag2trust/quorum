@@ -369,6 +369,7 @@ git rev-parse --verify --quiet origin/main >/dev/null \
   || fail "origin/main not found — missing remote-tracking ref; gate cannot run"
 BASE_REF=origin/main
 INTEGRATION=0
+DEVELOP_BASED=0
 INERT_DIFF_BASE=
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 TIP=HEAD
@@ -416,6 +417,21 @@ if git rev-parse --verify --quiet origin/develop >/dev/null \
   BASE_REF=origin/develop
   INTEGRATION=1
 fi
+# A normal feature branch may start from develop while develop temporarily
+# lags main. Recognize that shape from ancestry rather than its branch name:
+# develop must be reachable from the tip, and its fork point must be at least
+# as recent as main's. A branch from main fails the latter check; a branch
+# whose fork point is on neither base keeps the strict origin/main path.
+if [ "$INTEGRATION" -eq 0 ] \
+  && git rev-parse --verify --quiet origin/develop >/dev/null \
+  && git merge-base --is-ancestor origin/develop "$TIP"; then
+  DEVELOP_FORK=$(git merge-base "$TIP" origin/develop)
+  MAIN_FORK=$(git merge-base "$TIP" origin/main)
+  if git merge-base --is-ancestor "$MAIN_FORK" "$DEVELOP_FORK"; then
+    BASE_REF=origin/develop
+    DEVELOP_BASED=1
+  fi
+fi
 if [ "$BRANCH" = "main" ] && [ "$PROPOSED_SET" -eq 0 ]; then
   printf 'on main — nothing to compare, skipping\n'
 else
@@ -453,6 +469,14 @@ else
     # sync session. Inspect only commits belonging to neither remote history.
     OWN_COMMITS=$(git rev-list "$TIP" --not origin/main origin/develop)
     printf 'integration-only commits:\n'
+    if [ -n "$OWN_COMMITS" ]; then
+      git show -s --oneline $OWN_COMMITS
+    fi
+  elif [ "$DEVELOP_BASED" -eq 1 ]; then
+    # Main may have advanced past develop. Exclude both base histories so
+    # only this branch's commits are checked for session stacking.
+    OWN_COMMITS=$(git rev-list "$TIP" --not origin/develop origin/main)
+    printf 'develop-based branch-owned commits excluding origin/develop and origin/main:\n'
     if [ -n "$OWN_COMMITS" ]; then
       git show -s --oneline $OWN_COMMITS
     fi
