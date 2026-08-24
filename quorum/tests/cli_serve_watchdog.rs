@@ -559,15 +559,24 @@ fn seed_review_only_task(home: &std::path::Path, repo: &std::path::Path, title: 
 
 fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     let db = home.join("repos").join("test__repo").join("quorum.db");
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut seen_run_id: Option<String> = None;
     while std::time::Instant::now() < deadline {
         let conn = quorum_core::db::open(&db).unwrap();
         if let Some(cap) = quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
             if cap.task_id > 0 && cap.role == role {
-                return cap.run_id;
+                seen_run_id = Some(cap.run_id.clone());
+                if quorum_core::capabilities::resolve_live_run_context(&conn, &cap.run_id, role)
+                    .is_ok()
+                {
+                    return cap.run_id;
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+    if let Some(rid) = seen_run_id {
+        return rid;
     }
     let mut conn = quorum_core::db::open(&db).unwrap();
     let rid = format!("test-{agent}-{}", std::process::id());
