@@ -4130,29 +4130,39 @@ pub fn retry_parked(
         )));
     }
     let restored_status = resume_status.as_str();
+    // A rejected initial branch push has no remote/PR authority to preserve.
+    // Require both the parked publication reason and the most recent worker
+    // outcome so an older rejected push cannot affect a later, unrelated
+    // park. This is intentionally computed inside the retry transaction: the
+    // same decision clears the stale source, continuation, author, and branch
+    // allocation before another worker can claim the fresh delivery round.
+    let fresh_initial_delivery: bool = tx.query_row(
+        "SELECT COALESCE(
+             json_extract(refs, '$.daemon_parked_reason')
+                 LIKE 'daemon-owned publication failed:%'
+             AND json_extract(refs, '$.daemon_publication.stage')='intent'
+             AND json_type(refs, '$.daemon_publication.pr')='null'
+             AND COALESCE((
+                 SELECT end_reason
+                 FROM agent_runs
+                 WHERE task_id=tasks.id AND role='worker'
+                 ORDER BY id DESC
+                 LIMIT 1
+             ), '')='daemon_push_failed',
+             0
+         )
+         FROM tasks WHERE id=?1",
+        params![id],
+        |row| row.get(0),
+    )?;
     let updated = tx.execute(
         "UPDATE tasks
          SET status=?2,
              assignee=NULL,
+             author=CASE WHEN ?6 THEN NULL ELSE author END,
              recovery_attempts=CASE WHEN ?5 THEN 0 ELSE recovery_attempts END,
              refs=CASE
-                  -- A rejected initial branch push has no remote/PR authority
-                  -- to preserve. Its retry must provision a fresh worker and
-                  -- publish that worker's HEAD rather than replaying the
-                  -- failed intent. Require both the parked publication reason
-                  -- and the most recent worker outcome so an older rejected
-                  -- push cannot affect a later, unrelated park.
-                  WHEN json_extract(refs, '$.daemon_parked_reason')
-                           LIKE 'daemon-owned publication failed:%'
-                       AND json_extract(refs, '$.daemon_publication.stage')='intent'
-                       AND json_type(refs, '$.daemon_publication.pr')='null'
-                       AND COALESCE((
-                           SELECT end_reason
-                           FROM agent_runs
-                           WHERE task_id=tasks.id AND role='worker'
-                           ORDER BY id DESC
-                           LIMIT 1
-                       ), '')='daemon_push_failed'
+                  WHEN ?6
                   THEN json_remove(
                       refs,
                       '$.daemon_parked',
@@ -4213,12 +4223,16 @@ pub fn retry_parked(
             restored_status,
             now,
             resume_status,
-            reset_recovery_budget
+            reset_recovery_budget,
+            fresh_initial_delivery,
         ],
     )?;
     if updated == 0 {
         tx.commit()?;
         return Ok(None);
+    }
+    if fresh_initial_delivery {
+        tx.execute("DELETE FROM task_branches WHERE task_id=?1", params![id])?;
     }
     deactivate_lease(&tx, id, now)?;
     crate::events::emit(
@@ -12493,6 +12507,23 @@ mod tests {
                 "runner_continuation": {"provider": "codex", "id": "old-turn"}
             });
             update_refs_daemon(&mut c, id, &refs.to_string(), 1001).unwrap();
+            c.execute(
+                "UPDATE tasks
+                 SET status='working', assignee='FirstWorker', author='FirstWorker'
+                 WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at)
+                 VALUES (?1,?2,?3,'FirstWorker',1001)",
+                params![
+                    id,
+                    format!("daemon/first-worker-t{id}"),
+                    format!("/tmp/first-worker-t{id}")
+                ],
+            )
+            .unwrap();
             let run = crate::agent_runs::insert(
                 &c,
                 id,
@@ -12529,6 +12560,10 @@ mod tests {
                     refs.get("runner_continuation").is_none(),
                     "fresh delivery must not retain the previous worker continuation: {refs}"
                 );
+                assert_eq!(
+                    retried.author, None,
+                    "fresh delivery needs a new branch owner"
+                );
             } else {
                 assert_eq!(
                     refs["daemon_publication"]["local_sha"], "sha-a",
@@ -12536,7 +12571,16 @@ mod tests {
                 );
                 assert_eq!(refs["daemon_publication"]["pr"], serde_json::json!(pr));
                 assert_eq!(refs["runner_continuation"]["id"], "old-turn");
+                assert_eq!(retried.author.as_deref(), Some("FirstWorker"));
             }
+            let branch_allocations: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM task_branches WHERE task_id=?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(branch_allocations, i64::from(!clears_intent));
         }
     }
 

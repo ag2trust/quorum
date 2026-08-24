@@ -30241,7 +30241,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         git(&["commit", "-qm", "first worker completion"]);
         let stale_sha = git(&["rev-parse", "HEAD"]);
 
-        let fresh_branch = "daemon/second-worker-t89";
+        let fresh_branch = "daemon/secondworker-t1";
         git(&["checkout", "-q", "-b", fresh_branch, &base_sha]);
         std::fs::write(repo.join("state.txt"), "second worker\n").unwrap();
         git(&["add", "state.txt"]);
@@ -30270,6 +30270,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 now_unix(),
             )
             .unwrap();
+            assert_eq!(id, 1, "fresh fixture has one task");
             let stale = PublicationIntent {
                 branch: stale_branch.into(),
                 local_sha: stale_sha,
@@ -30283,10 +30284,28 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 id,
                 &serde_json::json!({
                     "daemon_publication": stale,
-                    "runner_continuation": {"provider": "codex", "id": "old-turn"}
+                    "runner_continuation": {"provider": "codex", "id": "old-turn"},
+                    "cx_est": 3,
+                    "cx_size": "M",
+                    "cx_ready": true,
+                    "cx_not_ready_reason": null,
+                    "cx_by": "test:v2"
                 })
                 .to_string(),
                 now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET status='working', assignee='FirstWorker', author='FirstWorker'
+                 WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at)
+                 VALUES (?1,?2,?3,'FirstWorker',?4)",
+                rusqlite::params![id, stale_branch, "/tmp/first-worker-t89", now_unix()],
             )
             .unwrap();
             let run = quorum_core::agent_runs::insert(
@@ -30309,9 +30328,34 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 now_unix(),
             )
             .unwrap();
-            tasks::retry_parked(&mut conn, id, "owner", true, now_unix())
+            let retried = tasks::retry_parked(&mut conn, id, "owner", true, now_unix())
                 .unwrap()
                 .expect("rejected initial publication must retry");
+            assert_eq!(
+                retried.author, None,
+                "retry must release the stale branch owner"
+            );
+            let allocations: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_branches WHERE task_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                allocations, 0,
+                "retry must release the stale branch allocation"
+            );
+            let second_worker =
+                tasks::claim(&mut conn, "SecondWorker", Some(id), &[], 3600, now_unix())
+                    .unwrap()
+                    .expect("fresh delivery must claim a new worker");
+            assert_eq!(second_worker.author.as_deref(), Some("SecondWorker"));
+            assert_eq!(
+                orphan_worker_branch("SecondWorker", id, false).as_deref(),
+                Some(fresh_branch),
+                "normal provisioning must derive the branch from the new worker"
+            );
             pr_targets::upsert(&mut conn, id, 482, fresh_branch, &base_sha, false).unwrap();
             id
         };
