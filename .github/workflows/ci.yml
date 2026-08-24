@@ -54,7 +54,7 @@ jobs:
           --skip-clippy
           --test-jobs 2
           --test-threads 2
-          --test-timeout-secs 180
+          --test-timeout-secs 150
           --out target/ci-test-timing
 
   shell-tests:

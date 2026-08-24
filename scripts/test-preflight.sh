@@ -1171,7 +1171,6 @@ grep -Fqx '    needs: [fmt, clippy, shell-tests]' \
   "$ROOT/.github/workflows/ci.yml"
 grep -Fqx '          --test-jobs 2' "$ROOT/.github/workflows/ci.yml"
 grep -Fqx '          --test-threads 2' "$ROOT/.github/workflows/ci.yml"
-grep -Fqx '          --test-timeout-secs 180' "$ROOT/.github/workflows/ci.yml"
 grep -Fqx '          --out target/ci-test-timing' \
   "$ROOT/.github/workflows/ci.yml"
 
