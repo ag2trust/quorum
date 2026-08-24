@@ -94,12 +94,12 @@ same PR and provide concurrency/runtime evidence appropriate to the invariant.
   gh pr create --base develop
   ```
 
-- Hotfixes to push/verification gates and operating tooling (`preflight.sh`, git hooks,
-  `dev-install.sh`, `scripts/serve-supervisor.sh`, CI workflow files) branch from and target
-  `main`, then get synced into `develop`. A gate fix merged only to `develop` is inert for
-  main-based pushes until the next develop→main sync, and daemon workers on `develop` keep
-  failing the old gate until it lands there — so do not route such fixes through a
-  develop-based Quorum task.
+- The daemon's default base branch is `develop`. Hotfixes to push/verification gates and
+  operating tooling (`preflight.sh`, git hooks, `dev-install.sh`,
+  `scripts/serve-supervisor.sh`, CI workflow files) must target `main` instead: create the
+  Quorum task with `--base-branch main` (or cut a direct worktree from `origin/main`), then
+  sync `main` into `develop`. A gate fix merged only to `develop` is inert for main-based
+  pushes until the next develop→main sync.
 - Never branch from another feature branch. Do not rebase solely to become current;
   up-to-date-before-merge is disabled, while a push dismisses prior approvals.
 - Commit, push, and open PRs with the default `ag2trust-dev` identity. Never override the
