@@ -1,22 +1,399 @@
 //! Per-agent session log: hierarchical files (stream.jsonl, transcript.md, meta.json).
 //!
-//! Each agent session gets its own directory under `{log_dir}/{agent}-{start_ts}/`.
-//! `stream.jsonl` captures raw events, `transcript.md` formats assistant output for
+//! Each agent session gets its own directory under
+//! `{log_dir}/{agent}-{start_ts}[-nonce]/`. `stream.jsonl` captures raw events
+//! and bounded sanitized events, `transcript.md` formats assistant output for
 //! human reading, and `meta.json` identifies the session while it is active
 //! and summarizes it on finalize.
+
+// The closed sanitized API is intentionally not wired into the existing raw
+// provider-log paths in this batch. Those callers change in their own scoped
+// work, so keep this module's future-facing API from tripping the binary's
+// dead-code gate in the meantime.
+#![allow(dead_code)]
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::render;
 use super::runner::AgentEvent;
+
+/// Maximum source bytes represented by one sanitized field. The source itself
+/// is never retained: this cap only bounds the structural metadata we write.
+pub const MAX_SANITIZED_FIELD_BYTES: usize = 256;
+/// Maximum closed sanitized-event records retained for one session.
+pub const MAX_SANITIZED_RECORDS_PER_SESSION: usize = 256;
+const MAX_SANITIZED_RECORD_BYTES: usize = 1024;
+static LOG_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Explicit marker written when a source field exceeds its retained bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedTruncation {
+    Truncated,
+}
+
+/// A closed provider set used in durable sanitized session events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedProvider {
+    Claude,
+    Codex,
+    Grok,
+    Other,
+}
+
+/// A provider lifecycle boundary. It intentionally has no free-text payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderLifecyclePhase {
+    Started,
+    Ready,
+    Stopped,
+}
+
+/// A turn lifecycle boundary. It intentionally has no free-text payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnLifecyclePhase {
+    Started,
+    Continued,
+    Ended,
+    Cancelled,
+}
+
+/// The structural shape of an untrusted field. Values are never serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedFieldShape {
+    Null,
+    Boolean,
+    Number,
+    String,
+    Array,
+    Object,
+}
+
+/// A bounded structural/redacted representation of an untrusted field.
+///
+/// The constructors inspect values only in memory. They retain neither text,
+/// object keys, nor values, which keeps prompts, environment values,
+/// credentials, and provider/tool output out of durable logs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "summary", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SanitizedField {
+    Structural {
+        shape: SanitizedFieldShape,
+        captured_bytes: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        truncation: Option<SanitizedTruncation>,
+    },
+    Malformed {
+        captured_bytes: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        truncation: Option<SanitizedTruncation>,
+    },
+}
+
+impl SanitizedField {
+    /// Capture only the shape and capped byte count of arbitrary text.
+    pub fn from_text(value: &str) -> Self {
+        Self::structural(SanitizedFieldShape::String, value.len())
+    }
+
+    /// Capture only the shape and capped serialized byte count of a JSON value.
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        match serde_json::to_vec(value) {
+            Ok(json) => Self::structural(json_shape(value), json.len()),
+            // `serde_json::Value` normally serializes, but fail closed if a
+            // future Value-like input cannot be represented.
+            Err(_) => Self::malformed(MAX_SANITIZED_FIELD_BYTES, true),
+        }
+    }
+
+    /// Capture a JSON field without retaining malformed input or parse errors.
+    pub fn from_json_text(value: &str) -> Self {
+        match serde_json::from_str(value) {
+            Ok(json) => Self::from_json(&json),
+            Err(_) => Self::malformed(
+                value.len().min(MAX_SANITIZED_FIELD_BYTES),
+                value.len() > MAX_SANITIZED_FIELD_BYTES,
+            ),
+        }
+    }
+
+    fn structural(shape: SanitizedFieldShape, bytes: usize) -> Self {
+        let (captured_bytes, truncated) = bounded_byte_len(bytes);
+        Self::Structural {
+            shape,
+            captured_bytes,
+            truncation: truncated.then_some(SanitizedTruncation::Truncated),
+        }
+    }
+
+    fn malformed(captured_bytes: usize, truncated: bool) -> Self {
+        Self::Malformed {
+            captured_bytes: captured_bytes.min(MAX_SANITIZED_FIELD_BYTES),
+            truncation: truncated.then_some(SanitizedTruncation::Truncated),
+        }
+    }
+
+    fn bounded(&self) -> Self {
+        match self {
+            Self::Structural {
+                shape,
+                captured_bytes,
+                truncation,
+            } => {
+                let (captured_bytes, capped) = bounded_byte_len(*captured_bytes);
+                Self::Structural {
+                    shape: *shape,
+                    captured_bytes,
+                    truncation: (*truncation).or(capped.then_some(SanitizedTruncation::Truncated)),
+                }
+            }
+            Self::Malformed {
+                captured_bytes,
+                truncation,
+            } => {
+                let (captured_bytes, capped) = bounded_byte_len(*captured_bytes);
+                Self::Malformed {
+                    captured_bytes,
+                    truncation: (*truncation).or(capped.then_some(SanitizedTruncation::Truncated)),
+                }
+            }
+        }
+    }
+}
+
+fn bounded_byte_len(bytes: usize) -> (usize, bool) {
+    (
+        bytes.min(MAX_SANITIZED_FIELD_BYTES),
+        bytes > MAX_SANITIZED_FIELD_BYTES,
+    )
+}
+
+fn json_shape(value: &serde_json::Value) -> SanitizedFieldShape {
+    match value {
+        serde_json::Value::Null => SanitizedFieldShape::Null,
+        serde_json::Value::Bool(_) => SanitizedFieldShape::Boolean,
+        serde_json::Value::Number(_) => SanitizedFieldShape::Number,
+        serde_json::Value::String(_) => SanitizedFieldShape::String,
+        serde_json::Value::Array(_) => SanitizedFieldShape::Array,
+        serde_json::Value::Object(_) => SanitizedFieldShape::Object,
+    }
+}
+
+/// Closed categories for a command summary. Raw command strings are not part
+/// of the durable event shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedCommandKind {
+    Shell,
+    Read,
+    Write,
+    Edit,
+    Search,
+    Other,
+}
+
+/// Closed categories for a tool summary. Raw tool names are not part of the
+/// durable event shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedToolKind {
+    Bash,
+    Read,
+    Write,
+    Edit,
+    Grep,
+    Glob,
+    Skill,
+    Agent,
+    Other,
+}
+
+/// The outcome of a bounded command or tool summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedSummaryOutcome {
+    Started,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// Terminal-response status, without retaining its response text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedTerminalStatus {
+    Success,
+    Error,
+    Incomplete,
+}
+
+/// Closed provider-failure categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedProviderFailureKind {
+    Authentication,
+    Protocol,
+    Transport,
+    Timeout,
+    Exit,
+    Other,
+}
+
+/// Closed semantic-rejection categories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedRejectionKind {
+    InvalidSubmission,
+    MissingSubmission,
+    Policy,
+    Validation,
+    Other,
+}
+
+/// Closed completion outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedCompletionOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// A closed, durable-safe session event.
+///
+/// This type deliberately permits only lifecycle categories, numeric turn
+/// indices, and [`SanitizedField`] summaries. It is `deny_unknown_fields` so a
+/// provider payload cannot gain a durable escape hatch through a future or
+/// malformed field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SanitizedSessionEvent {
+    ProviderLifecycle {
+        provider: SanitizedProvider,
+        phase: ProviderLifecyclePhase,
+    },
+    TurnLifecycle {
+        turn: u32,
+        phase: TurnLifecyclePhase,
+    },
+    CommandSummary {
+        command: SanitizedCommandKind,
+        outcome: SanitizedSummaryOutcome,
+        details: SanitizedField,
+    },
+    ToolSummary {
+        tool: SanitizedToolKind,
+        outcome: SanitizedSummaryOutcome,
+        details: SanitizedField,
+    },
+    TerminalResponse {
+        status: SanitizedTerminalStatus,
+        response: SanitizedField,
+    },
+    ProviderFailure {
+        provider: SanitizedProvider,
+        kind: SanitizedProviderFailureKind,
+        details: SanitizedField,
+    },
+    SemanticRejection {
+        kind: SanitizedRejectionKind,
+        details: SanitizedField,
+    },
+    Completion {
+        outcome: SanitizedCompletionOutcome,
+    },
+}
+
+impl SanitizedSessionEvent {
+    fn bounded(&self) -> Self {
+        match self {
+            Self::ProviderLifecycle { provider, phase } => Self::ProviderLifecycle {
+                provider: *provider,
+                phase: *phase,
+            },
+            Self::TurnLifecycle { turn, phase } => Self::TurnLifecycle {
+                turn: *turn,
+                phase: *phase,
+            },
+            Self::CommandSummary {
+                command,
+                outcome,
+                details,
+            } => Self::CommandSummary {
+                command: *command,
+                outcome: *outcome,
+                details: details.bounded(),
+            },
+            Self::ToolSummary {
+                tool,
+                outcome,
+                details,
+            } => Self::ToolSummary {
+                tool: *tool,
+                outcome: *outcome,
+                details: details.bounded(),
+            },
+            Self::TerminalResponse { status, response } => Self::TerminalResponse {
+                status: *status,
+                response: response.bounded(),
+            },
+            Self::ProviderFailure {
+                provider,
+                kind,
+                details,
+            } => Self::ProviderFailure {
+                provider: *provider,
+                kind: *kind,
+                details: details.bounded(),
+            },
+            Self::SemanticRejection { kind, details } => Self::SemanticRejection {
+                kind: *kind,
+                details: details.bounded(),
+            },
+            Self::Completion { outcome } => Self::Completion { outcome: *outcome },
+        }
+    }
+
+    fn summary_line(&self) -> &'static str {
+        match self {
+            Self::ProviderLifecycle { .. } => "- Provider lifecycle event",
+            Self::TurnLifecycle { .. } => "- Turn lifecycle event",
+            Self::CommandSummary { .. } => "- Command summary",
+            Self::ToolSummary { .. } => "- Tool summary",
+            Self::TerminalResponse { .. } => "- Terminal response summary",
+            Self::ProviderFailure { .. } => "- Provider failure summary",
+            Self::SemanticRejection { .. } => "- Semantic rejection summary",
+            Self::Completion { .. } => "- Session completion",
+        }
+    }
+
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::ProviderLifecycle { .. } => "provider_lifecycle",
+            Self::TurnLifecycle { .. } => "turn_lifecycle",
+            Self::CommandSummary { .. } => "command_summary",
+            Self::ToolSummary { .. } => "tool_summary",
+            Self::TerminalResponse { .. } => "terminal_response",
+            Self::ProviderFailure { .. } => "provider_failure",
+            Self::SemanticRejection { .. } => "semantic_rejection",
+            Self::Completion { .. } => "completion",
+        }
+    }
+}
 
 pub struct SessionLog {
     dir: PathBuf,
     stream_file: File,
     transcript_file: File,
     meta: SessionMeta,
+    sanitized_record_count: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -47,8 +424,7 @@ impl SessionLog {
         branch: &str,
         start_time: i64,
     ) -> io::Result<Self> {
-        let dir = log_dir.join(format!("{agent}-{start_time}"));
-        fs::create_dir_all(&dir)?;
+        let dir = create_session_dir(log_dir, agent, start_time)?;
 
         let stream_file = OpenOptions::new()
             .create(true)
@@ -87,6 +463,7 @@ impl SessionLog {
             stream_file,
             transcript_file,
             meta,
+            sanitized_record_count: 0,
         };
         // The task detail API verifies a run link against this metadata. Write
         // it before the daemon persists the durable run so active sessions are
@@ -97,6 +474,42 @@ impl SessionLog {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Append one closed, durable-safe event to the regular session stream and
+    /// its one-line transcript. Returns `false` after the per-session record
+    /// limit has been reached; no additional provider data is then retained.
+    pub fn log_sanitized_event(&mut self, event: &SanitizedSessionEvent) -> bool {
+        if self.sanitized_record_count >= MAX_SANITIZED_RECORDS_PER_SESSION {
+            return false;
+        }
+
+        let event = event.bounded();
+        let json = match serde_json::to_vec(&event) {
+            Ok(json) if json.len() <= MAX_SANITIZED_RECORD_BYTES => json,
+            // Every current variant is bounded by construction. Keep a
+            // defensive fixed-size record in case a future change breaks that
+            // property rather than leaking a new unbounded field to disk.
+            _ => format!(
+                r#"{{"event":"{}","truncation":"record_truncated"}}"#,
+                event.kind_name()
+            )
+            .into_bytes(),
+        };
+
+        let stream_result = self
+            .stream_file
+            .write_all(&json)
+            .and_then(|_| self.stream_file.write_all(b"\n"));
+        let transcript_result = writeln!(self.transcript_file, "{}", event.summary_line());
+        if stream_result.is_err() || transcript_result.is_err() {
+            return false;
+        }
+
+        self.sanitized_record_count += 1;
+        let _ = self.transcript_file.flush();
+        let _ = self.stream_file.flush();
+        true
     }
 
     #[cfg(test)]
@@ -154,6 +567,27 @@ impl SessionLog {
             fs::write(meta_path, json)?;
         }
         Ok(())
+    }
+}
+
+fn create_session_dir(log_dir: &Path, agent: &str, start_time: i64) -> io::Result<PathBuf> {
+    fs::create_dir_all(log_dir)?;
+    let base = format!("{agent}-{start_time}");
+    let legacy_dir = log_dir.join(&base);
+    match fs::create_dir(&legacy_dir) {
+        Ok(()) => return Ok(legacy_dir),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    loop {
+        let nonce = LOG_DIR_NONCE.fetch_add(1, Ordering::Relaxed);
+        let dir = log_dir.join(format!("{base}-{nonce}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -293,6 +727,152 @@ mod tests {
                 .unwrap();
         assert_eq!(meta["cost_tokens"], 123);
         assert_eq!(meta["cost_usd"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn sanitized_events_are_closed_bounded_and_never_retain_field_values() {
+        let dir = TempDir::new().unwrap();
+        let mut log =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
+        let credential = "sk-session-log-secret-value";
+        let oversized = format!("{credential}{}", "x".repeat(MAX_SANITIZED_FIELD_BYTES * 4));
+        let malformed = format!(r#"{{"token":"{oversized}""#);
+
+        let events = [
+            SanitizedSessionEvent::ProviderLifecycle {
+                provider: SanitizedProvider::Codex,
+                phase: ProviderLifecyclePhase::Started,
+            },
+            SanitizedSessionEvent::TurnLifecycle {
+                turn: 1,
+                phase: TurnLifecyclePhase::Started,
+            },
+            SanitizedSessionEvent::CommandSummary {
+                command: SanitizedCommandKind::Shell,
+                outcome: SanitizedSummaryOutcome::Succeeded,
+                details: SanitizedField::from_json(&serde_json::json!({
+                    "command": oversized,
+                    "api_key": credential,
+                })),
+            },
+            SanitizedSessionEvent::ToolSummary {
+                tool: SanitizedToolKind::Bash,
+                outcome: SanitizedSummaryOutcome::Failed,
+                details: SanitizedField::from_text(&oversized),
+            },
+            SanitizedSessionEvent::TerminalResponse {
+                status: SanitizedTerminalStatus::Success,
+                response: SanitizedField::from_text(credential),
+            },
+            SanitizedSessionEvent::ProviderFailure {
+                provider: SanitizedProvider::Codex,
+                kind: SanitizedProviderFailureKind::Protocol,
+                details: SanitizedField::from_json_text(&malformed),
+            },
+            SanitizedSessionEvent::SemanticRejection {
+                kind: SanitizedRejectionKind::Validation,
+                details: SanitizedField::from_json(&serde_json::json!({"env": credential})),
+            },
+            SanitizedSessionEvent::Completion {
+                outcome: SanitizedCompletionOutcome::Completed,
+            },
+        ];
+
+        for event in &events {
+            assert!(log.log_sanitized_event(event));
+        }
+
+        let stream = fs::read_to_string(log.dir().join("stream.jsonl")).unwrap();
+        let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
+        let meta = fs::read_to_string(log.dir().join("meta.json")).unwrap();
+        for durable_file in [&stream, &transcript, &meta] {
+            assert!(
+                !durable_file.contains(credential),
+                "secret leaked: {durable_file}"
+            );
+            assert!(
+                !durable_file.contains("api_key"),
+                "untrusted field name leaked: {durable_file}"
+            );
+        }
+
+        let records: Vec<&str> = stream.lines().collect();
+        assert_eq!(records.len(), events.len());
+        assert!(records
+            .iter()
+            .all(|record| record.len() <= MAX_SANITIZED_RECORD_BYTES));
+        for record in &records {
+            let record: serde_json::Value = serde_json::from_str(record).unwrap();
+            for field in ["details", "response"] {
+                if let Some(bytes) = record
+                    .get(field)
+                    .and_then(|summary| summary.get("captured_bytes"))
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    assert!(bytes <= MAX_SANITIZED_FIELD_BYTES as u64);
+                }
+            }
+        }
+        assert!(stream.contains(r#""truncation":"truncated""#));
+        assert!(stream.contains(r#""summary":"malformed""#));
+        assert_eq!(
+            transcript
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .count(),
+            events.len(),
+            "each sanitized event has exactly one rendered transcript line"
+        );
+
+        assert!(serde_json::from_str::<SanitizedSessionEvent>(
+            r#"{"event":"completion","outcome":"completed","provider_payload":"must-not-serialize"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sanitized_event_record_limit_drops_later_events() {
+        let dir = TempDir::new().unwrap();
+        let mut log =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
+        let event = SanitizedSessionEvent::SemanticRejection {
+            kind: SanitizedRejectionKind::Validation,
+            details: SanitizedField::from_text("credential-shaped-but-not-retained"),
+        };
+
+        for index in 0..MAX_SANITIZED_RECORDS_PER_SESSION + 1 {
+            assert_eq!(
+                log.log_sanitized_event(&event),
+                index < MAX_SANITIZED_RECORDS_PER_SESSION
+            );
+        }
+
+        let stream = fs::read_to_string(log.dir().join("stream.jsonl")).unwrap();
+        assert_eq!(stream.lines().count(), MAX_SANITIZED_RECORDS_PER_SESSION);
+        assert!(stream
+            .lines()
+            .all(|line| line.len() <= MAX_SANITIZED_RECORD_BYTES));
+    }
+
+    #[test]
+    fn same_start_time_creates_unique_session_directories() {
+        let dir = TempDir::new().unwrap();
+        let first =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "first", "b", 1000).unwrap();
+        let second =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(2), "second", "b", 1000)
+                .unwrap();
+
+        assert_ne!(first.dir(), second.dir());
+        assert!(first.dir().starts_with(dir.path()));
+        assert!(second.dir().starts_with(dir.path()));
+        assert_eq!(first.dir().file_name().unwrap(), "Agent-1000");
+        assert!(second
+            .dir()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("Agent-1000-"));
     }
 
     #[test]
