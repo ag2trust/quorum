@@ -37874,10 +37874,12 @@ exec /bin/cat '{stdout}'
             Some(arbiter::ArbiterPoll::ProviderFailed { .. })
         ));
 
-        for log_dir in [&planner_log_dir, &arbiter_log_dir] {
-            let raw_stream = std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap();
-            assert!(raw_stream.contains(r#"{"type":"turn.failed"}"#));
-        }
+        let planner_stream = std::fs::read_to_string(planner_log_dir.join("stream.jsonl")).unwrap();
+        assert!(planner_stream.contains(r#""event":"provider_failure""#));
+        assert!(!planner_stream.contains(r#"{"type":"turn.failed"}"#));
+
+        let arbiter_stream = std::fs::read_to_string(arbiter_log_dir.join("stream.jsonl")).unwrap();
+        assert!(arbiter_stream.contains(r#"{"type":"turn.failed"}"#));
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let status =
