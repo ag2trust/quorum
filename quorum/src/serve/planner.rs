@@ -11,7 +11,7 @@ use super::session_log::{
     ProviderLifecyclePhase, SanitizedCommandKind, SanitizedCompletionOutcome, SanitizedField,
     SanitizedProvider, SanitizedProviderFailureKind, SanitizedRejectionKind, SanitizedSessionEvent,
     SanitizedSummaryOutcome, SanitizedTerminalStatus, SanitizedToolKind, SessionLog,
-    TurnLifecyclePhase,
+    TurnLifecyclePhase, MAX_SANITIZED_RECORDS_PER_SESSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -35,6 +35,9 @@ const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
+// A clean terminal provider line followed by no accepted `submit_plan` emits
+// one terminal response and these four closure records.
+const PLANNER_SANITIZED_CLOSURE_RESERVE: usize = 5;
 
 /// Process-local admission gate for filesystem-backed write-path resolution.
 ///
@@ -583,6 +586,7 @@ pub struct PlannerSlot {
     codex_terminal_candidate: bool,
     diagnostics: PlannerDiagnostics,
     session_log: Option<SessionLog>,
+    sanitized_record_count: usize,
 }
 
 #[derive(Default)]
@@ -695,6 +699,7 @@ impl PlannerSlot {
             branch,
             started_at,
         )?);
+        self.sanitized_record_count = 0;
         self.log_sanitized_events(&[
             SanitizedSessionEvent::ProviderLifecycle {
                 provider: sanitized_provider(self.proc.kind()),
@@ -713,9 +718,30 @@ impl PlannerSlot {
     }
 
     fn log_sanitized_events(&mut self, events: &[SanitizedSessionEvent]) {
+        self.log_sanitized_events_with_reserve(events, true);
+    }
+
+    fn log_sanitized_closure_events(&mut self, events: &[SanitizedSessionEvent]) {
+        self.log_sanitized_events_with_reserve(events, false);
+    }
+
+    fn log_sanitized_events_with_reserve(
+        &mut self,
+        events: &[SanitizedSessionEvent],
+        reserve_closure_capacity: bool,
+    ) {
         if let Some(session_log) = self.session_log.as_mut() {
             for event in events {
-                let _ = session_log.log_sanitized_event(event);
+                if reserve_closure_capacity
+                    && self.sanitized_record_count
+                        >= MAX_SANITIZED_RECORDS_PER_SESSION
+                            .saturating_sub(PLANNER_SANITIZED_CLOSURE_RESERVE)
+                {
+                    break;
+                }
+                if session_log.log_sanitized_event(event) {
+                    self.sanitized_record_count = self.sanitized_record_count.saturating_add(1);
+                }
             }
         }
     }
@@ -776,7 +802,11 @@ impl PlannerSlot {
                 details,
             },
         };
-        self.log_sanitized_events(&[event]);
+        if matches!(event, SanitizedSessionEvent::TerminalResponse { .. }) {
+            self.log_sanitized_closure_events(&[event]);
+        } else {
+            self.log_sanitized_events(&[event]);
+        }
     }
 
     fn log_provider_failure(&mut self, reason: &str) {
@@ -794,7 +824,7 @@ impl PlannerSlot {
         if self.session_log.is_none() {
             return;
         }
-        self.log_sanitized_events(&[
+        self.log_sanitized_closure_events(&[
             SanitizedSessionEvent::SemanticRejection {
                 kind: SanitizedRejectionKind::MissingSubmission,
                 details: SanitizedField::from_text("planner exited without submit_plan"),
@@ -818,7 +848,7 @@ impl PlannerSlot {
         if self.session_log.is_none() {
             return;
         }
-        self.log_sanitized_events(&[
+        self.log_sanitized_closure_events(&[
             SanitizedSessionEvent::ProviderLifecycle {
                 provider: sanitized_provider(self.proc.kind()),
                 phase: ProviderLifecyclePhase::Stopped,
@@ -833,7 +863,7 @@ impl PlannerSlot {
         if self.session_log.is_none() {
             return;
         }
-        self.log_sanitized_events(&[
+        self.log_sanitized_closure_events(&[
             SanitizedSessionEvent::ProviderLifecycle {
                 provider: sanitized_provider(self.proc.kind()),
                 phase: ProviderLifecyclePhase::Stopped,
@@ -1119,6 +1149,7 @@ async fn spawn_planner_with_timeout(
         codex_terminal_candidate: false,
         diagnostics: PlannerDiagnostics::default(),
         session_log: None,
+        sanitized_record_count: 0,
     })
 }
 
@@ -1772,6 +1803,84 @@ mod tests {
                 "missing sanitized {expected} event: {stream}"
             );
         }
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_log_reserves_terminal_and_closure_events_after_long_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut output = (0..300)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "id": format!("command-{index}"),
+                        "status": "completed",
+                    },
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.push('\n');
+        output.push_str(&serde_json::json!({"type": "turn.completed"}).to_string());
+        output.push('\n');
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-planner-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(turn_end, PlannerTurnEnd::Complete));
+        assert!(matches!(
+            planner_outcome(&mut slot, turn_end, None),
+            PlannerPoll::ProviderFailed(_)
+        ));
+
+        let events = std::fs::read_to_string(log_dir.join("stream.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), MAX_SANITIZED_RECORDS_PER_SESSION);
+        for expected in [
+            "terminal_response",
+            "semantic_rejection",
+            "provider_failure",
+            "completion",
+        ] {
+            assert!(
+                events.iter().any(|event| event["event"] == expected),
+                "missing {expected} after long planner progress"
+            );
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "completion")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events.last().unwrap()["event"],
+            "completion",
+            "completion must remain the final durable record"
+        );
+        assert_eq!(events.last().unwrap()["outcome"], "failed");
+        assert!(events.iter().any(|event| {
+            event["event"] == "provider_lifecycle" && event["phase"] == "stopped"
+        }));
+
         slot.kill_and_reap().await;
     }
 
