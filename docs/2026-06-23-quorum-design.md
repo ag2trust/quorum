@@ -1670,9 +1670,11 @@ Grok permission/sandbox profile) are adapter configuration, not part of turn ide
 `agent.rs`, `codex_agent.rs`, and `grok_agent.rs` alone translate the neutral request
 into provider command specs, apply environment and execution mode, feed or embed the
 initial prompt, and parse raw protocol lines. Restricted mode remains an explicit adapter
-behavior: Claude uses its closed-book safe-mode invocation, Codex uses its pinned read-only
-invocation without the normal sandbox bypass, and Grok uses native `read-only` plus
-`dontAsk` with a reduced turn ceiling.
+behavior: Claude uses `--setting-sources ""` to fully unload user/project settings, hooks,
+and plugins (with the repo CLAUDE.md injected explicitly via
+`--append-system-prompt-file` when present, and the planner's inline MCP server serving
+normally), Codex uses its pinned read-only invocation without the normal sandbox bypass,
+and Grok uses native `read-only` plus `dontAsk` with a reduced turn ceiling.
 
 Do not mirror any CLI's complete schema. Preserve each raw JSON line in
 `stream.jsonl`, parse only fields Quorum consumes, render a compact normalized
