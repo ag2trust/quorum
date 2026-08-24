@@ -1566,7 +1566,8 @@ fn planning_hold_condition(graph: &ProgressGraph) -> String {
         .hold_summary
         .as_deref()
         .filter(|summary| !summary.is_empty())
-        .map(bounded_progress_text)
+        .map(|summary| render_graph_hold_summary(graph.hold_code.as_deref(), summary))
+        .map(|summary| bounded_progress_text(&summary))
         .unwrap_or_else(|| {
             graph
                 .hold_code
@@ -1574,6 +1575,25 @@ fn planning_hold_condition(graph: &ProgressGraph) -> String {
                 .map(|code| format!("Planning held: {}", bounded_progress_text(code)))
                 .unwrap_or_else(|| "Planning is held".into())
         })
+}
+
+/// Preserve a readable status surface while graph holds retain structured
+/// identity for guarded recovery writes.
+fn render_graph_hold_summary(hold_code: Option<&str>, summary: &str) -> String {
+    if hold_code == Some("generated-child-failed") {
+        if let Some((task_id, reason)) = serde_json::from_str::<serde_json::Value>(summary)
+            .ok()
+            .and_then(|value| {
+                Some((
+                    value.get("affected_task")?.as_i64()?,
+                    value.get("reason")?.as_str()?.to_owned(),
+                ))
+            })
+        {
+            return format!("Generated child task #{task_id} failed: {reason}");
+        }
+    }
+    summary.to_owned()
 }
 
 fn retry_eligible(task: &crate::tasks::Task, graph: Option<&ProgressGraph>) -> bool {
@@ -2639,7 +2659,10 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
 
     // Keep reasons bounded independently of graph history. Summaries are already
     // length-bounded at their write boundary; no prompt or transcript is selected.
-    let mut reasons = hold_summary.into_iter().collect::<Vec<_>>();
+    let mut reasons = hold_summary
+        .into_iter()
+        .map(|summary| render_graph_hold_summary(hold_code.as_deref(), &summary))
+        .collect::<Vec<_>>();
     let mut reason_stmt = conn.prepare(
         "SELECT summary FROM decomposition_attempts WHERE graph_id=?1
          ORDER BY id DESC LIMIT 6",
@@ -4562,6 +4585,23 @@ mod tests {
         assert_eq!(graph.members[1].prerequisites, vec![child_a]);
         assert_eq!(graph.reasons.len(), 6, "owner-facing reasons stay bounded");
         assert_eq!(graph.reasons[0], "child failed");
+    }
+
+    #[test]
+    fn generated_child_failure_hold_renders_as_readable_status() {
+        let summary = serde_json::json!({
+            "affected_task": 42,
+            "reason": "daemon push failed",
+        })
+        .to_string();
+        assert_eq!(
+            render_graph_hold_summary(Some("generated-child-failed"), &summary),
+            "Generated child task #42 failed: daemon push failed"
+        );
+        assert_eq!(
+            render_graph_hold_summary(Some("generated-child-failed"), "legacy child failure"),
+            "legacy child failure"
+        );
     }
 
     #[test]
