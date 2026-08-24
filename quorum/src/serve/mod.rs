@@ -4583,15 +4583,24 @@ async fn reap_decomposition_planner_with_usage(
         slot.kill_and_reap().await;
         return;
     };
-    let context = DecompositionUsageContext {
-        purpose: "planner",
-        task_id,
-        provider: slot.provider,
-        model: slot.model,
-        effort: slot.effort,
-    };
-    let usage = reap_decomposition_provider_with_usage(slot.proc, context, slot.usage).await;
-    record_usage_best_effort(db_path, usage).await;
+    let provider = slot.provider.clone();
+    let model = slot.model.clone();
+    let effort = slot.effort.clone();
+    let usage = slot.kill_and_reap().await;
+    record_usage_best_effort(
+        db_path,
+        UsageWriteRecord {
+            agent_run_id: None,
+            purpose: "planner".into(),
+            task_ids: vec![task_id],
+            pr_number: None,
+            provider,
+            model,
+            effort,
+            usage,
+        },
+    )
+    .await;
 }
 
 async fn reap_decomposition_arbiter_with_usage(
@@ -5371,6 +5380,7 @@ fn decomposition_process_name(graph_id: i64, role: &str) -> String {
 struct DecompositionProcessSession<'a> {
     id: &'a str,
     log_dir: Option<&'a Path>,
+    provider: Option<&'a str>,
 }
 
 async fn journal_decomposition_process(
@@ -5401,7 +5411,7 @@ async fn journal_decomposition_process(
         pid,
         pr: None,
         rework_count: 0,
-        provider: None,
+        provider: session.provider.map(str::to_owned),
         continuation_id: None,
         local_branch: None,
     };
@@ -6030,6 +6040,7 @@ async fn spawn_arbiter_review(
                 DecompositionProcessSession {
                     id: &session_id,
                     log_dir: slot.log_dir(),
+                    provider: None,
                 },
             )
             .await
@@ -6184,10 +6195,15 @@ async fn tick_decomposition(
                 }
             };
             let outcome = planner::planner_outcome(slot, turn_end, submitted.as_deref());
-            let slot = coordinator
+            let mut slot = coordinator
                 .planner_slot
                 .take()
                 .expect("planner slot exists");
+            // The terminal poll path moves the process into the generic usage
+            // reaper below, so it must close the planner-owned log first.
+            // `PlannerSlot` takes the log while finalizing, which makes a
+            // second finalization impossible.
+            slot.finalize_session_log();
             let usage = match coordinator.planner_source_task_id.take() {
                 Some(task_id) => Some(
                     reap_decomposition_provider_with_usage(
@@ -6735,6 +6751,7 @@ async fn tick_decomposition(
                     DecompositionProcessSession {
                         id: &session_id,
                         log_dir: slot.log_dir(),
+                        provider: Some(&slot.provider),
                     },
                 )
                 .await
@@ -6834,6 +6851,7 @@ async fn tick_decomposition(
                     DecompositionProcessSession {
                         id: &session_id,
                         log_dir: None,
+                        provider: None,
                     },
                 )
                 .await
@@ -37961,6 +37979,133 @@ exec /bin/cat '{stdout}'
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn planner_journal_retry_replaces_the_current_attempt_and_retains_logs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("quorum.db");
+        let log_root = dir.path().join("logs");
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.log_dir = Some(log_root.clone());
+
+        let runner = dir.path().join("codex");
+        std::fs::write(&runner, "#!/bin/sh\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let graph_id = 17;
+        let source_task_id = 42;
+        let started_at = now_unix();
+        let planner_name = decomposition_process_name(graph_id, "planner");
+
+        let mut first = planner::spawn_planner(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            true,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        first
+            .start_session_log(
+                &log_root,
+                &planner_name,
+                source_task_id,
+                "planner-session-first",
+                "frozen-base",
+                started_at,
+            )
+            .unwrap();
+        let first_log_dir = first.log_dir().unwrap().to_path_buf();
+        journal_decomposition_process(
+            &config,
+            graph_id,
+            source_task_id,
+            "planner",
+            first.pid(),
+            Some(dir.path()),
+            DecompositionProcessSession {
+                id: "planner-session-first",
+                log_dir: first.log_dir(),
+                provider: Some(&first.provider),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = first.kill_and_reap().await;
+
+        let mut second = planner::spawn_planner(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            true,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        second
+            .start_session_log(
+                &log_root,
+                &planner_name,
+                source_task_id,
+                "planner-session-second",
+                "frozen-base",
+                started_at,
+            )
+            .unwrap();
+        let second_log_dir = second.log_dir().unwrap().to_path_buf();
+        assert_ne!(first_log_dir, second_log_dir);
+        journal_decomposition_process(
+            &config,
+            graph_id,
+            source_task_id,
+            "planner",
+            second.pid(),
+            Some(dir.path()),
+            DecompositionProcessSession {
+                id: "planner-session-second",
+                log_dir: second.log_dir(),
+                provider: Some(&second.provider),
+            },
+        )
+        .await
+        .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let rows = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent, planner_name);
+        assert_eq!(rows[0].session_id, "planner-session-second");
+        assert_eq!(rows[0].log_dir.as_deref(), second_log_dir.to_str());
+        assert_eq!(rows[0].provider.as_deref(), Some("codex"));
+        drop(conn);
+
+        delete_decomposition_process(&config, graph_id, "planner")
+            .await
+            .unwrap();
+        assert!(first_log_dir.is_dir());
+        assert!(second_log_dir.is_dir());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(journal::list_in_flight(&conn).unwrap().is_empty());
+        drop(conn);
+
+        let _ = second.kill_and_reap().await;
+        for log_dir in [&first_log_dir, &second_log_dir] {
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(log_dir.join("meta.json")).unwrap())
+                    .unwrap();
+            assert!(meta["end_time"].is_i64());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn decomposition_slots_publish_raw_stream_log_dirs() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -38018,6 +38163,7 @@ exec /bin/cat '{stdout}'
             DecompositionProcessSession {
                 id: "planner-session",
                 log_dir: planner_slot.log_dir(),
+                provider: Some(&planner_slot.provider),
             },
         )
         .await
@@ -38060,6 +38206,7 @@ exec /bin/cat '{stdout}'
             DecompositionProcessSession {
                 id: "arbiter-session",
                 log_dir: arbiter_slot.log_dir(),
+                provider: None,
             },
         )
         .await
