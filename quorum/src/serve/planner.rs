@@ -36,7 +36,8 @@ const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
 // A clean terminal provider line followed by no accepted `submit_plan` emits
-// one terminal response and these four closure records.
+// one terminal response and four closure records. Provider failures and their
+// final outcome share this fixed reserve.
 const PLANNER_SANITIZED_CLOSURE_RESERVE: usize = 5;
 
 /// Process-local admission gate for filesystem-backed write-path resolution.
@@ -813,7 +814,7 @@ impl PlannerSlot {
         if self.session_log.is_none() {
             return;
         }
-        self.log_sanitized_events(&[SanitizedSessionEvent::ProviderFailure {
+        self.log_sanitized_closure_events(&[SanitizedSessionEvent::ProviderFailure {
             provider: sanitized_provider(self.proc.kind()),
             kind: provider_failure_kind(reason),
             details: SanitizedField::from_text(reason),
@@ -1880,6 +1881,78 @@ mod tests {
         assert!(events.iter().any(|event| {
             event["event"] == "provider_lifecycle" && event["phase"] == "stopped"
         }));
+
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_log_reserves_provider_failure_after_long_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut output = (0..300)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "id": format!("command-{index}"),
+                        "status": "completed",
+                    },
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.push('\n');
+        output.push_str(
+            &serde_json::json!({
+                "type": "turn.failed",
+                "error": {"message": "provider failed after long progress"},
+            })
+            .to_string(),
+        );
+        output.push('\n');
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-planner-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(turn_end, PlannerTurnEnd::Failed(_)));
+        assert!(matches!(
+            planner_outcome(&mut slot, turn_end, None),
+            PlannerPoll::ProviderFailed(_)
+        ));
+
+        let events = std::fs::read_to_string(log_dir.join("stream.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events.len() <= MAX_SANITIZED_RECORDS_PER_SESSION);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "provider_failure")
+                .count(),
+            1,
+            "the reserved provider-failure record must survive the progress cap"
+        );
+        let completions = events
+            .iter()
+            .filter(|event| event["event"] == "completion")
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0]["outcome"], "failed");
+        assert_eq!(events.last().unwrap()["event"], "completion");
 
         slot.kill_and_reap().await;
     }
