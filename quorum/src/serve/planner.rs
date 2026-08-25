@@ -888,7 +888,7 @@ impl PlannerSlot {
     /// Kill this planner attempt, retain its terminal diagnostics, and return
     /// its complete token usage for the caller's durable accounting.
     pub async fn kill_and_reap(mut self) -> super::runner::TokenUsage {
-        let mut session_log = self.session_log.take();
+        let session_log = self.session_log.take();
         let kind = self.proc.kind();
         let output = self.proc.kill_and_reap().await;
         for captured in &output {
