@@ -7,7 +7,12 @@
 use super::agent::{self, AgentProc, AgentSpec};
 use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, CapturedOutput, RunnerFailure, RunnerProc};
-use super::session_log::SessionLog;
+use super::session_log::{
+    ProviderLifecyclePhase, SanitizedCommandKind, SanitizedCompletionOutcome, SanitizedField,
+    SanitizedProvider, SanitizedProviderFailureKind, SanitizedRejectionKind, SanitizedSessionEvent,
+    SanitizedSummaryOutcome, SanitizedTerminalStatus, SanitizedToolKind, SessionLog,
+    TurnLifecyclePhase, MAX_SANITIZED_RECORDS_PER_SESSION,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -30,6 +35,10 @@ const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
+// A clean terminal provider line followed by no accepted `submit_plan` emits
+// one terminal response and four closure records. Provider failures and their
+// final outcome share this fixed reserve.
+const PLANNER_SANITIZED_CLOSURE_RESERVE: usize = 5;
 
 /// Process-local admission gate for filesystem-backed write-path resolution.
 ///
@@ -578,6 +587,7 @@ pub struct PlannerSlot {
     codex_terminal_candidate: bool,
     diagnostics: PlannerDiagnostics,
     session_log: Option<SessionLog>,
+    sanitized_record_count: usize,
 }
 
 #[derive(Default)]
@@ -690,11 +700,179 @@ impl PlannerSlot {
             branch,
             started_at,
         )?);
+        self.sanitized_record_count = 0;
+        self.log_sanitized_events(&[
+            SanitizedSessionEvent::ProviderLifecycle {
+                provider: sanitized_provider(self.proc.kind()),
+                phase: ProviderLifecyclePhase::Started,
+            },
+            SanitizedSessionEvent::TurnLifecycle {
+                turn: 1,
+                phase: TurnLifecyclePhase::Started,
+            },
+        ]);
         Ok(())
     }
 
     pub fn log_dir(&self) -> Option<&Path> {
         self.session_log.as_ref().map(|log| log.dir())
+    }
+
+    fn log_sanitized_events(&mut self, events: &[SanitizedSessionEvent]) {
+        self.log_sanitized_events_with_reserve(events, true);
+    }
+
+    fn log_sanitized_closure_events(&mut self, events: &[SanitizedSessionEvent]) {
+        self.log_sanitized_events_with_reserve(events, false);
+    }
+
+    fn log_sanitized_events_with_reserve(
+        &mut self,
+        events: &[SanitizedSessionEvent],
+        reserve_closure_capacity: bool,
+    ) {
+        if let Some(session_log) = self.session_log.as_mut() {
+            for event in events {
+                if reserve_closure_capacity
+                    && self.sanitized_record_count
+                        >= MAX_SANITIZED_RECORDS_PER_SESSION
+                            .saturating_sub(PLANNER_SANITIZED_CLOSURE_RESERVE)
+                {
+                    break;
+                }
+                if session_log.log_sanitized_event(event) {
+                    self.sanitized_record_count = self.sanitized_record_count.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    fn log_sanitized_line(&mut self, raw: &str) {
+        if self.session_log.is_none() {
+            return;
+        }
+        let event_type = safe_event_type(self.proc.kind(), raw);
+        let details = SanitizedField::from_json_text(raw);
+        let provider = sanitized_provider(self.proc.kind());
+        let event = match event_type {
+            "thread.started" => SanitizedSessionEvent::ProviderLifecycle {
+                provider,
+                phase: ProviderLifecyclePhase::Ready,
+            },
+            "turn.started" => SanitizedSessionEvent::TurnLifecycle {
+                turn: 1,
+                phase: TurnLifecyclePhase::Started,
+            },
+            "turn.completed" | "result" | "end" => SanitizedSessionEvent::TerminalResponse {
+                status: terminal_status(event_type, raw),
+                response: details,
+            },
+            "turn.failed"
+            | "error"
+            | "item.started/error"
+            | "item.completed/error"
+            | "malformed-json" => SanitizedSessionEvent::ProviderFailure {
+                provider,
+                kind: SanitizedProviderFailureKind::Protocol,
+                details,
+            },
+            "item.started/command_execution" | "item.completed/command_execution" => {
+                SanitizedSessionEvent::CommandSummary {
+                    command: SanitizedCommandKind::Shell,
+                    outcome: summary_outcome(event_type),
+                    details,
+                }
+            }
+            "item.started/file_change" | "item.completed/file_change" => {
+                SanitizedSessionEvent::CommandSummary {
+                    command: SanitizedCommandKind::Write,
+                    outcome: summary_outcome(event_type),
+                    details,
+                }
+            }
+            "tool_use" | "item.started/mcp_call" | "item.completed/mcp_call" => {
+                SanitizedSessionEvent::ToolSummary {
+                    tool: SanitizedToolKind::Other,
+                    outcome: summary_outcome(event_type),
+                    details,
+                }
+            }
+            _ => SanitizedSessionEvent::ToolSummary {
+                tool: SanitizedToolKind::Other,
+                outcome: summary_outcome(event_type),
+                details,
+            },
+        };
+        if matches!(event, SanitizedSessionEvent::TerminalResponse { .. }) {
+            self.log_sanitized_closure_events(&[event]);
+        } else {
+            self.log_sanitized_events(&[event]);
+        }
+    }
+
+    fn log_provider_failure(&mut self, reason: &str) {
+        if self.session_log.is_none() {
+            return;
+        }
+        self.log_sanitized_closure_events(&[SanitizedSessionEvent::ProviderFailure {
+            provider: sanitized_provider(self.proc.kind()),
+            kind: provider_failure_kind(reason),
+            details: SanitizedField::from_text(reason),
+        }]);
+    }
+
+    fn log_missing_submission(&mut self) {
+        if self.session_log.is_none() {
+            return;
+        }
+        self.log_sanitized_closure_events(&[
+            SanitizedSessionEvent::SemanticRejection {
+                kind: SanitizedRejectionKind::MissingSubmission,
+                details: SanitizedField::from_text("planner exited without submit_plan"),
+            },
+            SanitizedSessionEvent::ProviderFailure {
+                provider: sanitized_provider(self.proc.kind()),
+                kind: SanitizedProviderFailureKind::Other,
+                details: SanitizedField::from_text("planner exited without submit_plan"),
+            },
+            SanitizedSessionEvent::ProviderLifecycle {
+                provider: sanitized_provider(self.proc.kind()),
+                phase: ProviderLifecyclePhase::Stopped,
+            },
+            SanitizedSessionEvent::Completion {
+                outcome: SanitizedCompletionOutcome::Failed,
+            },
+        ]);
+    }
+
+    fn log_completion(&mut self) {
+        if self.session_log.is_none() {
+            return;
+        }
+        self.log_sanitized_closure_events(&[
+            SanitizedSessionEvent::ProviderLifecycle {
+                provider: sanitized_provider(self.proc.kind()),
+                phase: ProviderLifecyclePhase::Stopped,
+            },
+            SanitizedSessionEvent::Completion {
+                outcome: SanitizedCompletionOutcome::Completed,
+            },
+        ]);
+    }
+
+    fn log_failed_completion(&mut self) {
+        if self.session_log.is_none() {
+            return;
+        }
+        self.log_sanitized_closure_events(&[
+            SanitizedSessionEvent::ProviderLifecycle {
+                provider: sanitized_provider(self.proc.kind()),
+                phase: ProviderLifecyclePhase::Stopped,
+            },
+            SanitizedSessionEvent::Completion {
+                outcome: SanitizedCompletionOutcome::Failed,
+            },
+        ]);
     }
 
     /// Finalize this attempt's session log at most once.
@@ -710,7 +888,7 @@ impl PlannerSlot {
     /// Kill this planner attempt, retain its terminal diagnostics, and return
     /// its complete token usage for the caller's durable accounting.
     pub async fn kill_and_reap(mut self) -> super::runner::TokenUsage {
-        let mut session_log = self.session_log.take();
+        let session_log = self.session_log.take();
         let kind = self.proc.kind();
         let output = self.proc.kill_and_reap().await;
         for captured in &output {
@@ -729,11 +907,61 @@ impl PlannerSlot {
                 }
             }
         }
-        super::persist_terminal_output(&mut session_log, output);
+        // Teardown may uncover provider bytes which never crossed
+        // `poll_planner`. They are diagnostic-only and must not bypass the
+        // planner's sanitized poll boundary into its durable session log.
         if let Some(mut session_log) = session_log {
             session_log.finalize(None);
         }
         self.usage
+    }
+}
+
+fn sanitized_provider(provider: AgentKind) -> SanitizedProvider {
+    match provider {
+        AgentKind::Claude => SanitizedProvider::Claude,
+        AgentKind::Codex => SanitizedProvider::Codex,
+        AgentKind::Grok => SanitizedProvider::Grok,
+    }
+}
+
+fn summary_outcome(event_type: &str) -> SanitizedSummaryOutcome {
+    if event_type.starts_with("item.started") {
+        SanitizedSummaryOutcome::Started
+    } else if event_type.ends_with("/error") {
+        SanitizedSummaryOutcome::Failed
+    } else {
+        SanitizedSummaryOutcome::Succeeded
+    }
+}
+
+fn terminal_status(event_type: &str, raw: &str) -> SanitizedTerminalStatus {
+    if event_type == "result"
+        && serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|value| value.get("is_error").and_then(serde_json::Value::as_bool))
+            == Some(true)
+    {
+        SanitizedTerminalStatus::Error
+    } else {
+        SanitizedTerminalStatus::Success
+    }
+}
+
+fn provider_failure_kind(reason: &str) -> SanitizedProviderFailureKind {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("auth") || reason.contains("credential") {
+        SanitizedProviderFailureKind::Authentication
+    } else if reason.contains("timed out") {
+        SanitizedProviderFailureKind::Timeout
+    } else if reason.contains("protocol") || reason.contains("stdout") {
+        SanitizedProviderFailureKind::Protocol
+    } else if reason.contains("read failed") || reason.contains("transport") {
+        SanitizedProviderFailureKind::Transport
+    } else if reason.contains("exited") || reason.contains("status") {
+        SanitizedProviderFailureKind::Exit
+    } else {
+        SanitizedProviderFailureKind::Other
     }
 }
 
@@ -768,23 +996,34 @@ pub enum PlannerPoll {
 /// crashed or timed out after submitting still delivered a plan. Provider
 /// stdout is operator diagnostics only and is never consulted for the plan.
 pub fn planner_outcome(
-    slot: &PlannerSlot,
+    slot: &mut PlannerSlot,
     end: PlannerTurnEnd,
     submitted: Option<&str>,
 ) -> PlannerPoll {
     if let Some(response) = submitted {
         return match rehydrate_submitted_response(response) {
-            Ok(response) => PlannerPoll::Done(response),
-            Err(error) => PlannerPoll::ProviderFailed(provider_failure_summary(
-                slot,
-                &error.to_string(),
-                "exact",
-            )),
+            Ok(response) => {
+                // The daemon accepted this submission before the provider
+                // ended, so it remains the attempt outcome even after a
+                // provider crash or timeout.
+                slot.log_completion();
+                PlannerPoll::Done(response)
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                slot.log_provider_failure(&reason);
+                slot.log_failed_completion();
+                PlannerPoll::ProviderFailed(provider_failure_summary(slot, &reason, "exact"))
+            }
         };
     }
     PlannerPoll::ProviderFailed(match end {
-        PlannerTurnEnd::Failed(summary) => summary,
+        PlannerTurnEnd::Failed(summary) => {
+            slot.log_failed_completion();
+            summary
+        }
         PlannerTurnEnd::Complete => {
+            slot.log_missing_submission();
             provider_failure_summary(slot, "planner exited without submit_plan", "exact")
         }
     })
@@ -942,10 +1181,12 @@ async fn spawn_planner_with_timeout(
         codex_terminal_candidate: false,
         diagnostics: PlannerDiagnostics::default(),
         session_log: None,
+        sanitized_record_count: 0,
     })
 }
 
-fn provider_failure(slot: &PlannerSlot, reason: &str, byte_count_kind: &str) -> PlannerTurnEnd {
+fn provider_failure(slot: &mut PlannerSlot, reason: &str, byte_count_kind: &str) -> PlannerTurnEnd {
+    slot.log_provider_failure(reason);
     PlannerTurnEnd::Failed(provider_failure_summary(slot, reason, byte_count_kind))
 }
 
@@ -994,7 +1235,7 @@ fn provider_failure_summary(slot: &PlannerSlot, reason: &str, byte_count_kind: &
     summary
 }
 
-fn planner_exit_failure(slot: &PlannerSlot, failure: RunnerFailure) -> PlannerTurnEnd {
+fn planner_exit_failure(slot: &mut PlannerSlot, failure: RunnerFailure) -> PlannerTurnEnd {
     provider_failure(
         slot,
         &format!(
@@ -1073,8 +1314,8 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerTurnEnd> {
             AgentKind::Codex => super::runner::normalize_codex_line(&raw),
             AgentKind::Grok => super::runner::normalize_grok_line(&raw),
         };
-        if let Some(session_log) = slot.session_log.as_mut() {
-            session_log.log_raw_and_normalized(&raw, &events);
+        if slot.session_log.is_some() {
+            slot.log_sanitized_line(&raw);
         }
         slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
         slot.diagnostics.observe_line(slot.proc.kind(), &raw);
@@ -1469,7 +1710,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn no_poll_reap_persists_buffered_provider_stream() {
+    async fn no_poll_reap_does_not_persist_buffered_provider_stream() {
         let dir = tempfile::tempdir().unwrap();
         let raw = r#"{"type":"turn.failed","error":{"message":"provider failed"}}"#;
         let mut slot = spawn_fake_codex(dir.path(), &format!("{raw}\n")).await;
@@ -1493,10 +1734,287 @@ mod tests {
         .expect("planner provider did not exit");
 
         slot.kill_and_reap().await;
-        assert_eq!(
-            std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap(),
-            format!("{raw}\n")
+        let stream = std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap();
+        assert!(!stream.contains(raw));
+        assert!(stream.contains(r#""event":"provider_lifecycle""#));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_planner_logs_only_sanitized_progress_and_redacts_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let credential = "sk-planner-provider-payload-secret";
+        let prompt = format!("credential-shaped prompt value: {credential}");
+        let output = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            serde_json::json!({"type":"thread.started","thread_id":"fixture-thread"}),
+            serde_json::json!({"type":"turn.started"}),
+            serde_json::json!({
+                "type":"item.started",
+                "item":{"type":"command_execution","id":"command-1","command":format!("echo {credential}"),"status":"in_progress"}
+            }),
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{"type":"command_execution","id":"command-1","command":"echo redacted","aggregated_output":credential,"exit_code":0,"status":"completed"}
+            }),
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{"type":"mcp_call","id":"tool-1","tool_output":credential}
+            }),
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{"type":"agent_message","id":"message-1","text":credential}
+            }),
+            serde_json::json!({"type":"turn.completed"}),
         );
+        let stdout_path = dir.path().join("stdout.jsonl");
+        std::fs::write(&stdout_path, output).unwrap();
+        let runner = executable_script(
+            dir.path(),
+            "codex",
+            &format!("exec /bin/cat '{}'", stdout_path.display()),
+        );
+        let mut slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            &prompt,
+            false,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-planner-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        let turn_end = poll_to_terminal(&mut slot).await;
+        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&mut slot, turn_end, None)
+        else {
+            panic!("a planner without submit_plan must fail");
+        };
+
+        let stream = std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap();
+        let transcript = std::fs::read_to_string(log_dir.join("transcript.md")).unwrap();
+        for durable_surface in [&stream, &transcript, &summary] {
+            assert!(
+                !durable_surface.contains(credential),
+                "credential leaked into durable planner evidence: {durable_surface}"
+            );
+        }
+        assert!(
+            !stream.contains("aggregated_output"),
+            "raw provider JSON reached the sanitized stream: {stream}"
+        );
+
+        let event_kinds = stream
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"].clone())
+            .collect::<Vec<_>>();
+        for expected in [
+            "provider_lifecycle",
+            "turn_lifecycle",
+            "command_summary",
+            "tool_summary",
+            "terminal_response",
+            "provider_failure",
+            "semantic_rejection",
+            "completion",
+        ] {
+            assert!(
+                event_kinds.iter().any(|kind| kind == expected),
+                "missing sanitized {expected} event: {stream}"
+            );
+        }
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_log_reserves_terminal_and_closure_events_after_long_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut output = (0..300)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "id": format!("command-{index}"),
+                        "status": "completed",
+                    },
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.push('\n');
+        output.push_str(&serde_json::json!({"type": "turn.completed"}).to_string());
+        output.push('\n');
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-planner-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(turn_end, PlannerTurnEnd::Complete));
+        assert!(matches!(
+            planner_outcome(&mut slot, turn_end, None),
+            PlannerPoll::ProviderFailed(_)
+        ));
+
+        let events = std::fs::read_to_string(log_dir.join("stream.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), MAX_SANITIZED_RECORDS_PER_SESSION);
+        for expected in [
+            "terminal_response",
+            "semantic_rejection",
+            "provider_failure",
+            "completion",
+        ] {
+            assert!(
+                events.iter().any(|event| event["event"] == expected),
+                "missing {expected} after long planner progress"
+            );
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "completion")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events.last().unwrap()["event"],
+            "completion",
+            "completion must remain the final durable record"
+        );
+        assert_eq!(events.last().unwrap()["outcome"], "failed");
+        assert!(events.iter().any(|event| {
+            event["event"] == "provider_lifecycle" && event["phase"] == "stopped"
+        }));
+
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_log_reserves_provider_failure_after_long_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut output = (0..300)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "id": format!("command-{index}"),
+                        "status": "completed",
+                    },
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.push('\n');
+        output.push_str(
+            &serde_json::json!({
+                "type": "turn.failed",
+                "error": {"message": "provider failed after long progress"},
+            })
+            .to_string(),
+        );
+        output.push('\n');
+
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-planner-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(turn_end, PlannerTurnEnd::Failed(_)));
+        assert!(matches!(
+            planner_outcome(&mut slot, turn_end, None),
+            PlannerPoll::ProviderFailed(_)
+        ));
+
+        let events = std::fs::read_to_string(log_dir.join("stream.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events.len() <= MAX_SANITIZED_RECORDS_PER_SESSION);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "provider_failure")
+                .count(),
+            1,
+            "the reserved provider-failure record must survive the progress cap"
+        );
+        let completions = events
+            .iter()
+            .filter(|event| event["event"] == "completion")
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0]["outcome"], "failed");
+        assert_eq!(events.last().unwrap()["event"], "completion");
+
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_failure_is_unchanged_when_session_logging_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"fixture-thread\"}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"provider failed\"}}\n"
+        );
+        let mut without_log = spawn_fake_codex(dir.path(), output).await;
+        let without_log = poll_to_terminal(&mut without_log).await;
+        let without_log = failure_json(&without_log);
+
+        let mut with_log = spawn_fake_codex(dir.path(), output).await;
+        with_log
+            .start_session_log(
+                dir.path(),
+                "decomposition-planner-test",
+                42,
+                "session",
+                "frozen-base",
+                2,
+            )
+            .unwrap();
+        let with_log = poll_to_terminal(&mut with_log).await;
+        let with_log = failure_json(&with_log);
+
+        assert_eq!(without_log, with_log);
     }
 
     #[cfg(unix)]
@@ -2048,7 +2566,7 @@ mod tests {
         let mut slot = spawn_fake_codex(dir.path(), &output).await;
         let turn_end = poll_to_terminal(&mut slot).await;
         assert!(matches!(turn_end, PlannerTurnEnd::Complete));
-        let outcome = planner_outcome(&slot, turn_end, None);
+        let outcome = planner_outcome(&mut slot, turn_end, None);
         let PlannerPoll::ProviderFailed(summary) = outcome else {
             panic!("a turn without an accepted submission must not produce a plan");
         };
@@ -2091,22 +2609,78 @@ mod tests {
         let mut slot = spawn_fake_codex(dir.path(), &output).await;
         let turn_end = poll_to_terminal(&mut slot).await;
         assert!(matches!(
-            planner_outcome(&slot, turn_end, Some(&submitted)),
+            planner_outcome(&mut slot, turn_end, Some(&submitted)),
             PlannerPoll::Done(PlannerResponse::Plan { ref tasks })
                 if tasks.len() == 2 && tasks[1].prerequisites == ["core"]
         ));
         assert!(matches!(
             planner_outcome(
-                &slot,
+                &mut slot,
                 PlannerTurnEnd::Failed("planner timed out".into()),
                 Some(&submitted),
             ),
             PlannerPoll::Done(PlannerResponse::Plan { .. })
         ));
         assert!(matches!(
-            planner_outcome(&slot, PlannerTurnEnd::Failed("planner timed out".into()), None),
+            planner_outcome(
+                &mut slot,
+                PlannerTurnEnd::Failed("planner timed out".into()),
+                None,
+            ),
             PlannerPoll::ProviderFailed(ref summary) if summary == "planner timed out"
         ));
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accepted_submission_after_provider_failure_logs_completed_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let submitted = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        })
+        .to_string();
+        let output = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "turn.failed",
+                "error": {"message": "provider crashed after submit_plan"}
+            })
+        );
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-planner-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            planner_outcome(&mut slot, turn_end, Some(&submitted)),
+            PlannerPoll::Done(PlannerResponse::Plan { .. })
+        ));
+
+        let stream = std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap();
+        let events = stream
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events
+            .iter()
+            .any(|event| event["event"] == "provider_failure"));
+        let completions = events
+            .iter()
+            .filter(|event| event["event"] == "completion")
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0]["outcome"], "completed");
+
         slot.kill_and_reap().await;
     }
 
@@ -2132,7 +2706,8 @@ mod tests {
         let mut slot = spawn_fake_claude(dir.path(), &output).await;
         let turn_end = poll_to_terminal(&mut slot).await;
         assert!(matches!(turn_end, PlannerTurnEnd::Complete));
-        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&slot, turn_end, None) else {
+        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&mut slot, turn_end, None)
+        else {
             panic!("Claude assistant text must not produce a plan");
         };
         assert!(summary.contains("without submit_plan"), "{summary}");
