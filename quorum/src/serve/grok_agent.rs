@@ -547,7 +547,7 @@ fn write_managed_config_layer(
         root.insert(
             "mcp_servers".into(),
             toml::Value::Table(toml::Table::from_iter([(
-                "github".into(),
+                "quorum".into(),
                 toml::Value::Table(toml::Table::from_iter([
                     ("command".into(), toml::Value::String(server.command.into())),
                     (
@@ -1495,11 +1495,11 @@ mod tests {
             Some("high")
         );
         assert_eq!(
-            config["mcp_servers"]["github"]["command"].as_str(),
+            config["mcp_servers"]["quorum"]["command"].as_str(),
             Some("quorum")
         );
         assert_eq!(
-            config["mcp_servers"]["github"]["args"].as_array().unwrap(),
+            config["mcp_servers"]["quorum"]["args"].as_array().unwrap(),
             &[toml::Value::String("agent-mcp".into())]
         );
         assert_eq!(config["mcp_servers"].as_table().unwrap().len(), 1);
@@ -2498,16 +2498,16 @@ mod tests {
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let mcp_servers = report["mcpServers"].as_array().unwrap();
         assert_eq!(mcp_servers.len(), 1, "{report}");
-        let github = mcp_servers
+        let quorum = mcp_servers
             .iter()
-            .find(|server| server["name"] == "github")
-            .expect("official Grok loader omitted managed github MCP server");
-        assert_eq!(github["transport"], "stdio");
+            .find(|server| server["name"] == "quorum")
+            .expect("official Grok loader omitted managed quorum MCP server");
+        assert_eq!(quorum["transport"], "stdio");
         assert!(
-            github["target"]
+            quorum["target"]
                 .as_str()
                 .is_some_and(|target| target.contains("quorum")),
-            "{github}"
+            "{quorum}"
         );
     }
 

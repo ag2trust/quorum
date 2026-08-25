@@ -604,9 +604,9 @@ pub const AGENT_MCP_SERVER: AgentMcpServer = AgentMcpServer {
 /// and `MAX_PLAN_SUBMIT_REJECTIONS`
 /// (`quorum-core/src/planner_submissions.rs:16`).
 ///
-/// `github` is the server name registered by the provider adapters
-/// (`agent::claude_mcp_config`, `mcp_servers.github` for Codex).
-pub const PLANNER_MCP_ALLOWED_TOOL: &str = "mcp__github__submit_plan";
+/// `quorum` is the server name registered by the provider adapters
+/// (`agent::claude_mcp_config`, `mcp_servers.quorum` for Codex).
+pub const PLANNER_MCP_ALLOWED_TOOL: &str = "mcp__quorum__submit_plan";
 
 impl LaunchRequest<'_> {
     /// Restricted/internal turns lack this complete capability envelope. The
@@ -1727,7 +1727,7 @@ mod tests {
             "{claude_args}"
         );
         assert!(
-            claude_args.contains("<Bash,Read,mcp__github__*>"),
+            claude_args.contains("<Bash,Read,mcp__quorum__*>"),
             "{claude_args}"
         );
         let config_line = claude_args
@@ -1740,7 +1740,7 @@ mod tests {
             config,
             serde_json::json!({
                 "mcpServers": {
-                    "github": {"command": "quorum", "args": ["agent-mcp"]}
+                    "quorum": {"command": "quorum", "args": ["agent-mcp"]}
                 }
             })
         );
@@ -1781,7 +1781,7 @@ mod tests {
         );
         assert!(
             codex_args.contains(
-                r#"<mcp_servers.github={command="quorum",args=["agent-mcp"],env_vars=["QUORUM_REPO","QUORUM_AGENT","QUORUM_RUN_ID","QUORUM_AGENT_ENDPOINT"]}>"#
+                r#"<mcp_servers.quorum={command="quorum",args=["agent-mcp"],env_vars=["QUORUM_REPO","QUORUM_AGENT","QUORUM_RUN_ID","QUORUM_AGENT_ENDPOINT"]}>"#
             ),
             "{codex_args}"
         );
@@ -1852,11 +1852,11 @@ mod tests {
         let grok_config = std::fs::read_to_string(grok_dir.path().join("grok-config.log")).unwrap();
         let grok_config: toml::Value = toml::from_str(&grok_config).unwrap();
         assert_eq!(
-            grok_config["mcp_servers"]["github"]["command"].as_str(),
+            grok_config["mcp_servers"]["quorum"]["command"].as_str(),
             Some("quorum")
         );
         assert_eq!(
-            grok_config["mcp_servers"]["github"]["args"]
+            grok_config["mcp_servers"]["quorum"]["args"]
                 .as_array()
                 .unwrap(),
             &[toml::Value::String("agent-mcp".into())]

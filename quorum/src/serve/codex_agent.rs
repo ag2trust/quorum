@@ -109,7 +109,7 @@ fn append_agent_mcp_override(args: &mut Vec<String>, server: Option<AgentMcpServ
     args.extend([
         "-c".into(),
         format!(
-            "mcp_servers.github={{command={},args=[{}],env_vars=[{}]}}",
+            "mcp_servers.quorum={{command={},args=[{}],env_vars=[{}]}}",
             serde_json::to_string(server.command).expect("static MCP command serializes"),
             server_args,
             env_vars
@@ -1034,7 +1034,7 @@ mod tests {
         assert_eq!(args[sandbox + 1], "read-only");
         assert!(
             args.iter().any(|arg| arg
-                == r#"mcp_servers.github={command="quorum",args=["agent-mcp"],env_vars=["QUORUM_REPO","QUORUM_AGENT","QUORUM_RUN_ID","QUORUM_AGENT_ENDPOINT"]}"#),
+                == r#"mcp_servers.quorum={command="quorum",args=["agent-mcp"],env_vars=["QUORUM_REPO","QUORUM_AGENT","QUORUM_RUN_ID","QUORUM_AGENT_ENDPOINT"]}"#),
             "{args:?}"
         );
         assert_eq!(args.last().unwrap(), "say hello");

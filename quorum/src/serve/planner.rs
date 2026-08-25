@@ -1604,7 +1604,7 @@ mod tests {
             observed.contains("endpoint=/tmp/quorum-agent.sock\n"),
             "{observed}"
         );
-        assert!(observed.contains("mcp_servers.github="), "{observed}");
+        assert!(observed.contains("mcp_servers.quorum="), "{observed}");
         assert!(observed.contains("-s read-only"), "{observed}");
     }
 
