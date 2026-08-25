@@ -2625,7 +2625,17 @@ pub(crate) fn block_graph_if_child_failed(
         }
     }
 
-    let summary = format!("generated child task #{task_id} failed: {reason}");
+    let summary = serde_json::json!({
+        "affected_task": task_id,
+        "reason": reason,
+    })
+    .to_string();
+    if summary.len() > 8192 {
+        return Err(QuorumError::Usage(
+            "generated child failure reason exceeds bounded storage".into(),
+        ));
+    }
+    let event_summary = format!("generated child task #{task_id} failed: {reason}");
     let graph_changed = conn.execute(
         "UPDATE task_decompositions
          SET state='blocked',hold_code='generated-child-failed',hold_summary=?2,updated_at=?3
@@ -2639,7 +2649,7 @@ pub(crate) fn block_graph_if_child_failed(
         conn,
         "task_graph_blocked",
         &format!("task#{task_id}"),
-        &summary,
+        &event_summary,
         now,
     )?;
     crate::tasks::alert_owner_of_park(
@@ -5822,14 +5832,12 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
+        assert_eq!(aggregate.0, "blocked");
+        assert_eq!(aggregate.1, 1);
+        assert_eq!(aggregate.2, "generated-child-failed");
         assert_eq!(
-            aggregate,
-            (
-                "blocked".into(),
-                1,
-                "generated-child-failed".into(),
-                format!("generated child task #{} failed: {reason}", ids[0]),
-            )
+            serde_json::from_str::<serde_json::Value>(&aggregate.3).unwrap(),
+            serde_json::json!({"affected_task": ids[0], "reason": reason})
         );
         let event: (String, String, String) = conn
             .query_row(

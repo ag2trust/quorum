@@ -4235,6 +4235,24 @@ pub fn retry_parked(
         tx.execute("DELETE FROM task_branches WHERE task_id=?1", params![id])?;
     }
     deactivate_lease(&tx, id, now)?;
+    // Pre-structured generated-child holds from before this recovery path have
+    // string summaries. They intentionally do not match: no migration or
+    // backfill can safely infer which child those legacy rows name.
+    let graph_reactivated = tx.execute(
+        "UPDATE task_decompositions
+         SET state='active',hold_code=NULL,hold_summary=NULL,updated_at=?2
+         WHERE active=1 AND state='blocked' AND hold_code='generated-child-failed'
+           AND CASE WHEN json_valid(hold_summary)
+                    THEN json_type(hold_summary,'$.affected_task')='integer'
+                         AND json_extract(hold_summary,'$.affected_task')=?1
+                    ELSE 0
+               END
+           AND EXISTS(
+               SELECT 1 FROM task_graph_members m
+               WHERE m.graph_id=task_decompositions.id AND m.task_id=?1 AND m.active=1
+           )",
+        params![id, now],
+    )?;
     crate::events::emit(
         &tx,
         "task_retry",
@@ -4242,6 +4260,15 @@ pub fn retry_parked(
         &format!("parked task resumed by {by}"),
         now,
     )?;
+    if graph_reactivated == 1 {
+        crate::events::emit(
+            &tx,
+            "task_graph_unblocked",
+            &lease_target(id),
+            "generated child retry restored graph authority",
+            now,
+        )?;
+    }
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -9711,8 +9738,10 @@ mod tests {
             .unwrap();
         assert_eq!(state, "blocked");
         assert_eq!(hold_code, "generated-child-failed");
-        assert!(hold_summary.contains(&format!("#{}", ids[0])));
-        assert!(hold_summary.contains(reason));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&hold_summary).unwrap(),
+            serde_json::json!({"affected_task": ids[0], "reason": reason})
+        );
 
         let event_count: i64 = conn
             .query_row(
@@ -9734,6 +9763,157 @@ mod tests {
             .expect("graph-blocked alert must exist");
         assert!(graph_alert.contains("task graph blocked"));
         assert!(graph_alert.contains(reason));
+
+        assert!(
+            !crate::decomposition_review::is_reviewable_graph_member(&conn, ids[1]).unwrap(),
+            "a blocked graph must withhold sibling reviewer authority"
+        );
+        let retried = retry_parked(&mut conn, ids[0], "operator", true, 11)
+            .unwrap()
+            .expect("parked child must resume");
+        assert_eq!(retried.status, "open");
+        let graph_state: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(graph_state, ("active".into(), None, None));
+        let unblocked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE kind='task_graph_unblocked' AND subject=?1",
+                [lease_target(ids[0])],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unblocked, 1);
+        assert!(
+            crate::decomposition_review::is_reviewable_graph_member(&conn, ids[1]).unwrap(),
+            "reactivating the graph must restore sibling reviewer authority"
+        );
+    }
+
+    fn blocked_graph_with_parked_children(
+        conn: &mut Connection,
+        hold_code: &str,
+        hold_summary: &str,
+        child_refs: &str,
+    ) -> (i64, i64, i64) {
+        let source = create(conn, "owner", "source", None, 0, None, None, None, None, 1).unwrap();
+        let affected = create(
+            conn, "owner", "affected", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let retried = create(conn, "owner", "retried", None, 0, None, None, None, None, 1).unwrap();
+        conn.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,hold_code,hold_summary,created_at,updated_at)
+             VALUES (?1,'blocked',1,0,1,1,1,?2,?3,1,1)",
+            params![source, hold_code, hold_summary],
+        )
+        .unwrap();
+        let graph = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'affected',1,1),(?1,?3,'retried',1,1)",
+            params![graph, affected, retried],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='failed',refs=?2 WHERE id=?1",
+            params![retried, child_refs],
+        )
+        .unwrap();
+        (graph, affected, retried)
+    }
+
+    #[test]
+    fn retry_parked_leaves_unrelated_or_legacy_graph_holds_blocked() {
+        let parked = r#"{"daemon_parked":true,"daemon_resume_status":"open"}"#;
+        for (name, hold_code, affected_task, policy_parked, legacy_summary) in [
+            (
+                "different child",
+                "generated-child-failed",
+                true,
+                false,
+                false,
+            ),
+            (
+                "reviewer blocker",
+                "boundary-violation",
+                false,
+                false,
+                false,
+            ),
+            ("policy park", "generated-child-failed", false, true, false),
+            (
+                "legacy summary",
+                "generated-child-failed",
+                false,
+                false,
+                true,
+            ),
+        ] {
+            let (_dir, mut conn) = open_tmp();
+            let provisional_summary = serde_json::json!({"affected_task": 0, "reason": "failed"});
+            let (graph, affected, retried) = blocked_graph_with_parked_children(
+                &mut conn,
+                hold_code,
+                &provisional_summary.to_string(),
+                if policy_parked {
+                    r#"{"daemon_parked":true,"daemon_resume_status":"open","classifier_policy_parked":true}"#
+                } else {
+                    parked
+                },
+            );
+            let summary = if legacy_summary {
+                "generated child task #old failed: failed".to_owned()
+            } else {
+                serde_json::json!({
+                    "affected_task": if affected_task { affected } else { retried },
+                    "reason": "failed",
+                })
+                .to_string()
+            };
+            conn.execute(
+                "UPDATE task_decompositions SET hold_summary=?2 WHERE id=?1",
+                params![graph, summary],
+            )
+            .unwrap();
+
+            let result = retry_parked(&mut conn, retried, "operator", true, 2)
+                .unwrap()
+                .expect("parked child retry must succeed");
+            assert_eq!(
+                result.status,
+                if policy_parked { "failed" } else { "open" },
+                "{name}"
+            );
+            let state: (String, String, String) = conn
+                .query_row(
+                    "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state.0, "blocked", "{name}");
+            assert_eq!(state.1, hold_code, "{name}");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind='task_graph_unblocked'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+                "{name} must not reactivate the graph"
+            );
+        }
     }
 
     #[test]

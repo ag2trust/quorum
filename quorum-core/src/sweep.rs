@@ -1496,8 +1496,10 @@ mod tests {
             .unwrap();
         assert_eq!(aggregate.0, "blocked");
         assert_eq!(aggregate.1, "generated-child-failed");
-        assert!(aggregate.2.contains(&format!("task #{child}")));
-        assert!(aggregate.2.contains(&reason));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&aggregate.2).unwrap(),
+            serde_json::json!({"affected_task": child, "reason": reason})
+        );
         assert_eq!(aggregate.3, 300);
         let event: (String, String, String) = c
             .query_row(
@@ -2056,14 +2058,15 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
+        assert_eq!(graph_state.0, "blocked");
+        assert_eq!(graph_state.1, 1);
+        assert_eq!(graph_state.2, "generated-child-failed");
         assert_eq!(
-            graph_state,
-            (
-                "blocked".into(),
-                1,
-                "generated-child-failed".into(),
-                format!("generated child task #{child} failed: remediation lease lapsed"),
-            )
+            serde_json::from_str::<serde_json::Value>(&graph_state.3).unwrap(),
+            serde_json::json!({
+                "affected_task": child,
+                "reason": "remediation lease lapsed",
+            })
         );
         let graph_event: (String, String) = c
             .query_row(
