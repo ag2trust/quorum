@@ -4242,9 +4242,11 @@ pub fn retry_parked(
         "UPDATE task_decompositions
          SET state='active',hold_code=NULL,hold_summary=NULL,updated_at=?2
          WHERE active=1 AND state='blocked' AND hold_code='generated-child-failed'
-           AND json_valid(hold_summary)
-           AND json_type(hold_summary,'$.affected_task')='integer'
-           AND json_extract(hold_summary,'$.affected_task')=?1
+           AND CASE WHEN json_valid(hold_summary)
+                    THEN json_type(hold_summary,'$.affected_task')='integer'
+                         AND json_extract(hold_summary,'$.affected_task')=?1
+                    ELSE 0
+               END
            AND EXISTS(
                SELECT 1 FROM task_graph_members m
                WHERE m.graph_id=task_decompositions.id AND m.task_id=?1 AND m.active=1
