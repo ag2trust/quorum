@@ -875,14 +875,45 @@ impl PlannerSlot {
         ]);
     }
 
-    pub async fn kill_and_reap(mut self) {
+    /// Finalize this attempt's session log at most once.
+    ///
+    /// Taking the log makes finalization ownership explicit: normal terminal
+    /// handling and forced reaping cannot both rewrite its metadata.
+    pub fn finalize_session_log(&mut self) {
+        if let Some(mut session_log) = self.session_log.take() {
+            session_log.finalize(None);
+        }
+    }
+
+    /// Kill this planner attempt, retain its terminal diagnostics, and return
+    /// its complete token usage for the caller's durable accounting.
+    pub async fn kill_and_reap(mut self) -> super::runner::TokenUsage {
+        let mut session_log = self.session_log.take();
+        let kind = self.proc.kind();
+        let output = self.proc.kill_and_reap().await;
+        for captured in &output {
+            let CapturedOutput::Stdout(raw) = captured else {
+                continue;
+            };
+            for event in super::runner::normalize_line(kind, raw) {
+                match event {
+                    AgentEvent::TurnCompleted {
+                        usage: Some(usage), ..
+                    }
+                    | AgentEvent::TurnFailed {
+                        usage: Some(usage), ..
+                    } => self.usage.saturating_add_assign(usage),
+                    _ => {}
+                }
+            }
+        }
         // Teardown may uncover provider bytes which never crossed
         // `poll_planner`. They are diagnostic-only and must not bypass the
         // planner's sanitized poll boundary into its durable session log.
-        let _ = self.proc.kill_and_reap().await;
-        if let Some(session_log) = self.session_log.as_mut() {
+        if let Some(mut session_log) = session_log {
             session_log.finalize(None);
         }
+        self.usage
     }
 }
 
@@ -1984,6 +2015,65 @@ mod tests {
         let with_log = failure_json(&with_log);
 
         assert_eq!(without_log, with_log);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_logs_finalize_once_for_all_terminal_paths() {
+        for terminal in [
+            "success",
+            "provider-failure",
+            "semantic-rejection",
+            "timeout",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut slot = spawn_fake_codex(dir.path(), "").await;
+            slot.start_session_log(
+                dir.path(),
+                "decomposition-planner-test",
+                42,
+                terminal,
+                "frozen-base",
+                1,
+            )
+            .unwrap();
+            let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+            // The terminal coordinator path finalizes before moving `proc`
+            // into generic usage cleanup. Taking the log makes a repeated
+            // call a no-op rather than a second metadata write.
+            slot.finalize_session_log();
+            assert!(slot.log_dir().is_none());
+            slot.finalize_session_log();
+            let _ = slot.proc.kill_and_reap().await;
+
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(log_dir.join("meta.json")).unwrap())
+                    .unwrap();
+            assert!(meta["end_time"].is_i64(), "{terminal}");
+        }
+
+        for terminal in ["shutdown-drain", "forced-reap"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut slot = spawn_fake_codex(dir.path(), "").await;
+            slot.start_session_log(
+                dir.path(),
+                "decomposition-planner-test",
+                42,
+                terminal,
+                "frozen-base",
+                1,
+            )
+            .unwrap();
+            let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+            let _ = slot.kill_and_reap().await;
+
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(log_dir.join("meta.json")).unwrap())
+                    .unwrap();
+            assert!(meta["end_time"].is_i64(), "{terminal}");
+        }
     }
 
     fn failure_json(outcome: &PlannerTurnEnd) -> serde_json::Value {
