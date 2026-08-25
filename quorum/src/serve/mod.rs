@@ -5521,7 +5521,7 @@ fn bounded_with_ellipsis(value: &str, limit: usize) -> String {
 }
 
 /// Produce text that is safe to retain in task state and the errors table.
-/// Git stderr reaches this boundary only after `worktree::git_stderr` rejects
+/// Git output reaches this boundary only after `worktree::git_diagnostic` rejects
 /// malformed UTF-8 and NUL bytes. Keep this defensive check for other
 /// provisioning errors, which may originate outside that subprocess boundary.
 fn bounded_provisioning_cause(cause: &str) -> String {

@@ -11,6 +11,9 @@ use tokio::sync::Mutex;
 const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_PIPE_LIMIT: usize = 1024 * 1024;
+// Push rejection text is persisted as a task park reason and event body. Keep
+// the complete error within the serving layer's provisioning-cause bound.
+const PUSH_REJECTION_MAX_BYTES: usize = 2048;
 
 pub struct WorktreeManager {
     lock: Mutex<()>,
@@ -37,16 +40,66 @@ struct GitPipeOutput {
     exceeded_limit: bool,
 }
 
-/// Render captured git stderr only when it is safe to carry into a durable
+/// Render captured git output only when it is safe to carry into a durable
 /// diagnostic. Git output is untrusted process output: replacement-decoding
 /// malformed bytes would make an operator believe the captured text was exact,
 /// and SQLite text must never receive an embedded NUL.
-fn git_stderr(stderr: &[u8]) -> String {
-    match std::str::from_utf8(stderr) {
+fn git_diagnostic(output: &[u8]) -> String {
+    match std::str::from_utf8(output) {
         Ok(value) if !value.contains('\0') => value.trim().to_string(),
-        Ok(_) => "git stderr rejected: contains embedded NUL".into(),
-        Err(_) => "git stderr rejected: invalid UTF-8".into(),
+        Ok(_) => "git output rejected: contains embedded NUL".into(),
+        Err(_) => "git output rejected: invalid UTF-8".into(),
     }
+}
+
+fn truncate_utf8_prefix(value: &str, limit: usize) -> &str {
+    let mut end = limit.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn truncate_utf8_suffix(value: &str, limit: usize) -> &str {
+    let mut start = value.len().saturating_sub(limit);
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
+/// Bound a durable diagnostic without discarding either the hook's headline
+/// or Git's final rejection summary.
+fn middle_truncate_git_output(value: &str, limit: usize) -> String {
+    const MARKER: &str = "\n…<middle truncated>…\n";
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    if limit <= MARKER.len() {
+        return truncate_utf8_prefix(value, limit).to_string();
+    }
+    let head_limit = (limit - MARKER.len()) / 2;
+    let tail_limit = limit - MARKER.len() - head_limit;
+    format!(
+        "{}{}{}",
+        truncate_utf8_prefix(value, head_limit),
+        MARKER,
+        truncate_utf8_suffix(value, tail_limit)
+    )
+}
+
+fn push_rejection(remote_ref: &str, new_branch: bool, stdout: &[u8], stderr: &[u8]) -> String {
+    let target = if new_branch {
+        format!("daemon push to new branch {remote_ref} rejected:")
+    } else {
+        format!("daemon push to {remote_ref} rejected:")
+    };
+    let diagnostic = format!(
+        "{target}\nhook-stdout:\n{}\nstderr:\n{}",
+        git_diagnostic(stdout),
+        git_diagnostic(stderr)
+    );
+    middle_truncate_git_output(&diagnostic, PUSH_REJECTION_MAX_BYTES)
 }
 
 async fn drain_git_pipe<R>(
@@ -554,7 +607,7 @@ impl WorktreeManager {
             if !add.status.success() {
                 return Err(format!(
                     "git worktree add (reuse branch) failed: {}",
-                    git_stderr(&add.stderr)
+                    git_diagnostic(&add.stderr)
                 ));
             }
         } else {
@@ -565,7 +618,7 @@ impl WorktreeManager {
             if !add.status.success() {
                 return Err(format!(
                     "git worktree add failed: {}",
-                    git_stderr(&add.stderr)
+                    git_diagnostic(&add.stderr)
                 ));
             }
         }
@@ -589,7 +642,7 @@ impl WorktreeManager {
         if !fetch.status.success() {
             return Err(format!(
                 "git fetch origin {remote_branch} failed: {}",
-                git_stderr(&fetch.stderr)
+                git_diagnostic(&fetch.stderr)
             ));
         }
 
@@ -619,7 +672,7 @@ impl WorktreeManager {
         if !add.status.success() {
             return Err(format!(
                 "git worktree add failed: {}",
-                git_stderr(&add.stderr)
+                git_diagnostic(&add.stderr)
             ));
         }
 
@@ -646,7 +699,7 @@ impl WorktreeManager {
         if !fetched.status.success() {
             return Err(format!(
                 "git fetch origin {remote_ref} failed: {}",
-                git_stderr(&fetched.stderr)
+                git_diagnostic(&fetched.stderr)
             ));
         }
 
@@ -684,7 +737,7 @@ impl WorktreeManager {
         } else {
             Err(format!(
                 "git merge {base_ref} failed without leaving a resolvable merge: {}",
-                git_stderr(&merged.stderr)
+                git_diagnostic(&merged.stderr)
             ))
         }
     }
@@ -708,7 +761,7 @@ impl WorktreeManager {
         if !fetch.status.success() {
             return Err(format!(
                 "git fetch origin {refspec} failed: {}",
-                git_stderr(&fetch.stderr)
+                git_diagnostic(&fetch.stderr)
             ));
         }
 
@@ -736,7 +789,7 @@ impl WorktreeManager {
         if !add.status.success() {
             return Err(format!(
                 "git worktree add failed: {}",
-                git_stderr(&add.stderr)
+                git_diagnostic(&add.stderr)
             ));
         }
 
@@ -752,7 +805,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git config {} failed: {}",
                 args.join(" "),
-                git_stderr(&out.stderr)
+                git_diagnostic(&out.stderr)
             ));
         }
         Ok(())
@@ -792,7 +845,7 @@ impl WorktreeManager {
             _ => {
                 return Err(format!(
                     "git config --get core.worktree failed: {}",
-                    git_stderr(&worktree.stderr)
+                    git_diagnostic(&worktree.stderr)
                 ));
             }
         }
@@ -821,7 +874,7 @@ impl WorktreeManager {
             _ => {
                 return Err(format!(
                     "git config --bool --get core.bare failed: {}",
-                    git_stderr(&bare.stderr)
+                    git_diagnostic(&bare.stderr)
                 ));
             }
         }
@@ -865,7 +918,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git rev-parse HEAD failed in {}: {}",
                 worktree_dir.display(),
-                git_stderr(&out.stderr)
+                git_diagnostic(&out.stderr)
             ));
         }
         let actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -885,7 +938,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git rev-parse HEAD failed in {}: {}",
                 worktree_dir.display(),
-                git_stderr(&out.stderr)
+                git_diagnostic(&out.stderr)
             ));
         }
         let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -993,9 +1046,11 @@ impl WorktreeManager {
             let mut refresh = self.git_cmd(worktree_dir);
             refresh.args(["fetch", "origin", &remote_ref]);
             let _ = run_git(refresh, self.fetch_timeout, "git refetch rejected PR push").await;
-            return Err(format!(
-                "daemon push to {remote_ref} rejected: {}",
-                String::from_utf8_lossy(&pushed.stderr)
+            return Err(push_rejection(
+                &remote_ref,
+                false,
+                &pushed.stdout,
+                &pushed.stderr,
             ));
         }
 
@@ -1082,9 +1137,11 @@ impl WorktreeManager {
         let push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
         let pushed = run_git(push, self.fetch_timeout, "git push new branch").await?;
         if !pushed.status.success() {
-            return Err(format!(
-                "daemon push to new branch {remote_ref} rejected: {}",
-                String::from_utf8_lossy(&pushed.stderr)
+            return Err(push_rejection(
+                &remote_ref,
+                true,
+                &pushed.stdout,
+                &pushed.stderr,
             ));
         }
         let mut verify = self.git_cmd(worktree_dir);
@@ -1188,7 +1245,7 @@ impl WorktreeManager {
         if !out.status.success() {
             return Err(format!(
                 "git worktree list failed: {}",
-                git_stderr(&out.stderr)
+                git_diagnostic(&out.stderr)
             ));
         }
 
@@ -2441,16 +2498,32 @@ mod tests {
     }
 
     #[test]
-    fn captured_git_stderr_rejects_invalid_utf8_and_nul() {
+    fn captured_git_output_rejects_invalid_utf8_and_nul() {
         assert_eq!(
-            git_stderr(b"fatal: cannot lock ref\0detail"),
-            "git stderr rejected: contains embedded NUL"
+            git_diagnostic(b"fatal: cannot lock ref\0detail"),
+            "git output rejected: contains embedded NUL"
         );
         assert_eq!(
-            git_stderr(&[b'f', b'a', 0x80]),
-            "git stderr rejected: invalid UTF-8"
+            git_diagnostic(&[b'f', b'a', 0x80]),
+            "git output rejected: invalid UTF-8"
         );
-        assert_eq!(git_stderr(b" fatal: missing ref\n"), "fatal: missing ref");
+        assert_eq!(
+            git_diagnostic(b" fatal: missing ref\n"),
+            "fatal: missing ref"
+        );
+    }
+
+    #[test]
+    fn push_rejection_rejects_unsafe_captured_output() {
+        let error = push_rejection(
+            "refs/heads/daemon/test",
+            true,
+            b"hook\0output",
+            &[b'f', b'a', 0x80],
+        );
+        assert!(error.contains("hook-stdout:\ngit output rejected: contains embedded NUL"));
+        assert!(error.contains("stderr:\ngit output rejected: invalid UTF-8"));
+        assert!(!error.contains("hook\0output"));
     }
 
     /// Repo with a real bare `origin` remote and `main` pushed. Returns
@@ -2538,6 +2611,110 @@ mod tests {
         )
         .status
         .success());
+    }
+
+    #[cfg(unix)]
+    fn install_rejecting_pre_push_hook(repo: &Path, base: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hooks = base.join("rejecting-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let hook = hooks.join("pre-push");
+        std::fs::write(&hook, script).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(git_output(
+            repo,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()]
+        )
+        .status
+        .success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_daemon_push_captures_hook_stdout_and_git_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = init_repo_with_bare_remote(tmp.path());
+        let mgr = WorktreeManager::new();
+
+        let pr_head = "fix/rejected-pr";
+        let remote_tip = push_branch(&repo, pr_head);
+        let existing_wt = tmp.path().join("existing-wt");
+        mgr.fetch_and_provision(&repo, "remediation/Rejected-t92", &existing_wt, pr_head)
+            .await
+            .unwrap();
+        assert!(
+            git_output(&existing_wt, &["commit", "--allow-empty", "-m", "work"])
+                .status
+                .success()
+        );
+        let existing_sha = git_rev_parse(&existing_wt, "HEAD");
+
+        let new_branch = "daemon/rejected-t92";
+        let new_wt = tmp.path().join("new-wt");
+        mgr.provision(&repo, new_branch, &new_wt, "origin/main")
+            .await
+            .unwrap();
+        assert!(
+            git_output(&new_wt, &["commit", "--allow-empty", "-m", "work"])
+                .status
+                .success()
+        );
+        let new_sha = git_rev_parse(&new_wt, "HEAD");
+
+        install_rejecting_pre_push_hook(
+            &repo,
+            tmp.path(),
+            "#!/bin/sh\nprintf 'PREFLIGHT: FAIL known hook marker\\n'\nexit 1\n",
+        );
+
+        let new_error = mgr
+            .push_new_branch(&new_wt, new_branch, &new_sha)
+            .await
+            .expect_err("new branch push must be rejected by the hook");
+        let existing_error = mgr
+            .push_to_pr_head(&existing_wt, pr_head, &remote_tip, &existing_sha, "main")
+            .await
+            .expect_err("existing branch push must be rejected by the hook");
+
+        for error in [&new_error, &existing_error] {
+            assert!(error.contains("hook-stdout:\nPREFLIGHT: FAIL known hook marker"));
+            assert!(error.contains("stderr:\n"));
+            assert!(error.contains("failed to push some refs"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_daemon_push_middle_truncates_oversized_hook_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = init_repo_with_bare_remote(tmp.path());
+        let mgr = WorktreeManager::new();
+        let branch = "daemon/oversized-hook-t92";
+        let worktree = tmp.path().join("worktree");
+        mgr.provision(&repo, branch, &worktree, "origin/main")
+            .await
+            .unwrap();
+        assert!(
+            git_output(&worktree, &["commit", "--allow-empty", "-m", "work"])
+                .status
+                .success()
+        );
+        let source_sha = git_rev_parse(&worktree, "HEAD");
+        install_rejecting_pre_push_hook(
+            &repo,
+            tmp.path(),
+            "#!/bin/sh\nprintf 'PREFLIGHT: FAIL hook headline\\n'\ni=0\nwhile [ \"$i\" -lt 4096 ]; do printf x; i=$((i + 1)); done\nprintf '\\nPREFLIGHT: FAIL hook tail\\n'\nexit 1\n",
+        );
+
+        let error = mgr
+            .push_new_branch(&worktree, branch, &source_sha)
+            .await
+            .expect_err("push must be rejected by the hook");
+        assert!(error.len() <= PUSH_REJECTION_MAX_BYTES, "{}", error.len());
+        assert!(error.contains("PREFLIGHT: FAIL hook headline"), "{error}");
+        assert!(error.contains("failed to push some refs"), "{error}");
+        assert!(error.contains("<middle truncated>"), "{error}");
     }
 
     #[cfg(unix)]
