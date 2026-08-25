@@ -72,8 +72,8 @@ later spec.
 - `AgentProc::spawn_planner` and `CodexProc::spawn_planner` accept
   `Option<AgentMcpServer>` and pass it through `spawn_configured` /
   `planner_exec_args`. Claude: `RestrictedMode::Planner` keeps `--tools Read,Glob,Grep`
-  and the MCP allowlist adds `mcp__github__submit_plan` only (no `mcp__github__*`);
-  the server is registered under the key `github` by both provider adapters.
+  and the MCP allowlist adds `mcp__quorum__submit_plan` only (no `mcp__quorum__*`);
+  the server is registered under the key `quorum` by both provider adapters.
   Codex: `-s read-only` stays; the MCP server override is appended as for other roles.
   Verify with a real-binary argument test that the Codex read-only sandbox permits the
   stdio MCP child to connect to the Unix socket; if it does not, record the finding and

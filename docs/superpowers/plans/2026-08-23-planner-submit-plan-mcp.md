@@ -172,9 +172,9 @@
   // agent.rs / codex_agent.rs
   pub fn spawn_planner(spec: &AgentSpec, agent_bin: Option<&str>, agent_mcp: Option<AgentMcpServer>) -> io::Result<Self>
   ```
-  When `envelope` is `Some`, the four env vars are set on the planner process and `AGENT_MCP_SERVER` is passed. Claude allowlist for `RestrictedMode::Planner` with MCP = `"mcp__github__submit_plan"` only (server is named `github` in `claude_mcp_config`; do not add `mcp__github__*`). `--tools Read,Glob,Grep` unchanged. Codex: `-s read-only` unchanged; MCP override appended.
+  When `envelope` is `Some`, the four env vars are set on the planner process and `AGENT_MCP_SERVER` is passed. Claude allowlist for `RestrictedMode::Planner` with MCP = `"mcp__quorum__submit_plan"` only (server is named `quorum` in `claude_mcp_config`; do not add `mcp__quorum__*`). `--tools Read,Glob,Grep` unchanged. Codex: `-s read-only` unchanged; MCP override appended.
 
-- [ ] **Step 1: Write failing arg tests:** `claude_planner_with_mcp_allows_only_submit_plan` (args contain `--mcp-config`, `--strict-mcp-config`, `--allowedTools mcp__github__submit_plan`, `--tools Read,Glob,Grep`, and NOT `mcp__github__*`); `claude_planner_without_envelope_has_no_mcp`; `codex_planner_with_mcp_keeps_read_only_sandbox` (args contain `-s read-only` and the `mcp_servers.github=` override).
+- [ ] **Step 1: Write failing arg tests:** `claude_planner_with_mcp_allows_only_submit_plan` (args contain `--mcp-config`, `--strict-mcp-config`, `--allowedTools mcp__quorum__submit_plan`, `--tools Read,Glob,Grep`, and NOT `mcp__quorum__*`); `claude_planner_without_envelope_has_no_mcp`; `codex_planner_with_mcp_keeps_read_only_sandbox` (args contain `-s read-only` and the `mcp_servers.quorum=` override).
 - [ ] **Step 2: Run** the provider tests — expect FAIL.
 - [ ] **Step 3: Implement** threading `agent_mcp` through both `spawn_planner` paths and env injection in `planner::spawn_planner_with_timeout`.
 - [ ] **Step 4: Run** tests — expect PASS.

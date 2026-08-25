@@ -38,7 +38,7 @@ const MAX_CAPABILITY_BYTES: usize = 128;
 const MAX_ENV_BYTES: usize = 4096;
 
 #[derive(Debug, Clone)]
-struct GithubServer {
+struct QuorumServer {
     endpoint: PathBuf,
     capability: String,
     repository: String,
@@ -397,7 +397,7 @@ enum EndpointFailure {
     Unavailable,
 }
 
-impl GithubServer {
+impl QuorumServer {
     async fn inventory(&self) -> std::result::Result<Inventory, McpError> {
         let response = self
             .exchange(EndpointOperation::Inventory)
@@ -643,7 +643,7 @@ fn tool_error(code: &str) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
-impl ServerHandler for GithubServer {
+impl ServerHandler for QuorumServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -651,7 +651,7 @@ impl ServerHandler for GithubServer {
                 .enable_tool_list_changed()
                 .build(),
         )
-            .with_server_info(Implementation::new("github", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("quorum", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Only tools authorized for this exact managed run are exposed. Workers may write only the assigned worktree and repository.",
             )
@@ -742,7 +742,7 @@ impl ServerHandler for GithubServer {
 /// Keep a persistent provider's cached MCP tool list aligned with the
 /// daemon-derived phase. The endpoint remains the authority for every call;
 /// this only tells clients to rediscover the changed inventory.
-async fn notify_phase_changes(server: GithubServer, peer: Peer<RoleServer>) {
+async fn notify_phase_changes(server: QuorumServer, peer: Peer<RoleServer>) {
     let mut interval = tokio::time::interval(PHASE_POLL_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
@@ -768,7 +768,7 @@ pub fn run() -> Result<()> {
     // Validate the complete managed-run envelope even though agent identity is
     // resolved exclusively by the daemon and never sent as request authority.
     let _agent = required_env("QUORUM_AGENT", 128)?;
-    let server = GithubServer {
+    let server = QuorumServer {
         endpoint: PathBuf::from(endpoint),
         capability,
         repository,
@@ -812,7 +812,7 @@ mod tests {
 
     #[test]
     fn delayed_watcher_snapshot_detects_change_after_tools_list() {
-        let server = GithubServer {
+        let server = QuorumServer {
             endpoint: PathBuf::from("/tmp/agent-endpoint"),
             capability: "run-capability".into(),
             repository: "owner/repository".into(),

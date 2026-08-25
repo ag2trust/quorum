@@ -187,8 +187,8 @@ respawn per turn receive a new process. The endpoint is not a Repository Service
 database channel. Stdout is protocol-only; bounded diagnostics go to stderr and never include
 request bodies, responses, or capabilities.
 
-The logical MCP server name is `github`, yielding familiar client-visible names such as
-`mcp__github__pull_request_read`. The daemon injects only this per-run server into ordinary worker
+The logical MCP server name is `quorum`, yielding client-visible names such as
+`mcp__quorum__pull_request_read`. The daemon injects only this per-run server into ordinary worker
 and reviewer launches:
 
 - Claude receives an explicit generated `--mcp-config` plus `--strict-mcp-config`; this remains
