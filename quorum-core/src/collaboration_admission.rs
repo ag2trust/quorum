@@ -936,12 +936,7 @@ pub fn adopt_exact_continuation(
             return Ok(CollaborationAttemptTransitionResult::Rejected(rejection));
         }
     };
-    let Some(turn_continuation_id) = authority.turn_continuation_id.as_deref() else {
-        tx.commit()?;
-        return Ok(CollaborationAttemptTransitionResult::Rejected(
-            CollaborationAdmissionError::ContinuationMismatch,
-        ));
-    };
+    let turn_continuation_id = authority.turn_continuation_id.as_deref();
     release_expired_run_binding(&tx, request.active_run_id(), now)?;
     let run_already_bound: bool = tx.query_row(
         "SELECT EXISTS(
@@ -969,7 +964,7 @@ pub fn adopt_exact_continuation(
              WHERE attempt_id=?1 AND state='awaiting_resume' AND active_run_id IS NULL
                AND task_id=?3 AND agent=?4 AND role=?5 AND pr_number=?6
                AND head_sha IS ?7 AND lifecycle_generation=?8
-               AND turn_provider=?9 AND turn_continuation_id=?10
+               AND turn_provider=?9 AND turn_continuation_id IS ?10
                AND pending_turn_json IS ?11 AND expires_at>?12
              RETURNING attempt_id,state,lifecycle_generation,expires_at",
             params![
@@ -1043,14 +1038,6 @@ fn transition_active_attempt(
             return Ok(CollaborationAttemptTransitionResult::Rejected(rejection));
         }
     };
-    if target == CollaborationAttemptState::AwaitingResume
-        && authority.turn_continuation_id.is_none()
-    {
-        tx.commit()?;
-        return Ok(CollaborationAttemptTransitionResult::Rejected(
-            CollaborationAdmissionError::ContinuationMismatch,
-        ));
-    }
     let transitioned = tx
         .query_row(
             "UPDATE github_collaboration_attempts
@@ -1355,6 +1342,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1, "exact continuation must not mint a second attempt");
+    }
+
+    #[test]
+    fn initial_rework_continuation_without_provider_id_reuses_one_attempt() {
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        conn.execute(
+            "UPDATE tasks SET refs=?1 WHERE id=1",
+            [serde_json::json!({
+                "pr": WORKER_PR,
+                "runner_retry": {
+                    "provider": "codex",
+                    "model": "model",
+                    "effort": "high",
+                    "prompt": "start exact collaboration turn",
+                    "turn_kind": "initial",
+                    "requested": true
+                }
+            })
+            .to_string()],
+        )
+        .unwrap();
+        insert_live_worker(&mut conn, 1, "Worker", "run-initial", 10);
+        let original = worker_request("attempt-initial", "run-initial", 1, "Worker", 0);
+        assert!(matches!(
+            issue_attempt(&mut conn, &original, 20).unwrap(),
+            CollaborationAttemptAdmissionResult::Created(_)
+        ));
+        let continuation: Option<String> = conn
+            .query_row(
+                "SELECT turn_continuation_id FROM github_collaboration_attempts
+                 WHERE attempt_id='attempt-initial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(continuation, None);
+        assert!(matches!(
+            mark_awaiting_resume(&mut conn, &original, 21).unwrap(),
+            CollaborationAttemptTransitionResult::Transitioned(status)
+                if status.state == CollaborationAttemptState::AwaitingResume
+        ));
+        crate::capabilities::revoke(&mut conn, "run-initial", 22).unwrap();
+        conn.execute(
+            "UPDATE agent_runs SET ended_at=22 WHERE task_id=1 AND agent_name='Worker'",
+            [],
+        )
+        .unwrap();
+        insert_live_worker(&mut conn, 1, "Worker", "run-initial-resume", 30);
+        let resumed = worker_request("attempt-initial", "run-initial-resume", 1, "Worker", 0);
+
+        assert!(matches!(
+            adopt_exact_continuation(&mut conn, &resumed, 31).unwrap(),
+            CollaborationAttemptTransitionResult::Transitioned(status)
+                if status.attempt_id.as_str() == "attempt-initial"
+                    && status.state == CollaborationAttemptState::Active
+        ));
+        assert!(matches!(
+            adopt_exact_continuation(&mut conn, &resumed, 32).unwrap(),
+            CollaborationAttemptTransitionResult::Existing(status)
+                if status.attempt_id.as_str() == "attempt-initial"
+        ));
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM github_collaboration_attempts WHERE task_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "exact initial turn must not mint a second attempt");
     }
 
     #[test]
