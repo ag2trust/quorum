@@ -613,6 +613,9 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     delete_bounded(conn, "agent_sessions", now, limit)?;
     delete_bounded(conn, "activity_events", now, limit)?;
     delete_token_usage_bounded(conn, now, limit)?;
+    // Collaboration operation groups are reclaimed only by the executor's
+    // atomic terminal-and-settled group proof. Generic sweep has no authority
+    // to discard their recovery identities independently.
     crate::task_messages::expire_stale_deliveries(conn, now, limit)?;
     delete_bounded(conn, "task_messages", now, limit)?;
     delete_reclaimable_task_rows_bounded(conn, now, limit)?;
@@ -656,6 +659,8 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
         params![now],
     )?;
     delete_all_expired_token_usage(&tx, now)?;
+    // See sweep_on_write: executor-owned group reclamation is deliberately
+    // deferred until it can prove terminal and settled parent state atomically.
     crate::task_messages::expire_stale_deliveries(&tx, now, usize::MAX)?;
     tx.execute(
         "DELETE FROM task_messages WHERE expires_at <= ?1",
