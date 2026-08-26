@@ -1101,7 +1101,7 @@ impl AgentKind {
     /// This is the authoritative model-to-runner mapping. Unknown models are
     /// rejected so callers cannot spawn one runner and persist another.
     pub fn for_model(model: &str) -> Result<Self, String> {
-        if model == super::grok_agent::SUPPORTED_MODEL {
+        if super::grok_agent::SUPPORTED_MODELS.contains(&model) {
             Ok(Self::Grok)
         } else if model == "o1"
             || model == "o3"
@@ -1123,7 +1123,7 @@ impl AgentKind {
         } else {
             Err(format!(
                 "unknown model '{model}': cannot resolve provider \
-                 (expected claude-*/Claude alias, supported OpenAI model, or grok-4.5)"
+                 (expected claude-*/Claude alias, supported OpenAI model, grok-4.5, or grok-4.6)"
             ))
         }
     }
@@ -1648,43 +1648,45 @@ mod tests {
             "codex-env"
         );
 
-        let grok_dir = tempfile::tempdir().unwrap();
-        let grok_bin = recording_runner(grok_dir.path());
-        let grok_environment = vec![("QUORUM_ADAPTER_TEST".into(), "grok-env".into())];
-        let mut grok = launch_recording_runner(
-            &LaunchRequest {
-                model: "grok-4.5",
-                effort: "high",
-                worktree: grok_dir.path(),
-                prompt: "grok prompt",
-                environment: &grok_environment,
-                mode: LaunchMode::Normal,
-                continuation_id: None,
-            },
-            &AdapterConfig {
-                executable: grok_bin.to_str(),
-                claude_bare: true,
-                claude_allowed_tools: "Bash,Read",
-                codex_sandbox: "danger-full-access",
-                grok: Default::default(),
-            },
-        )
-        .await;
-        assert_eq!(grok.kind(), AgentKind::Grok);
-        while grok.next_raw_line().await.is_some() {}
-        grok.kill_and_reap().await;
-        let args = std::fs::read_to_string(grok_dir.path().join("args.log")).unwrap();
-        assert!(args.contains("<streaming-json>"), "{args}");
-        assert!(args.contains("<grok-4.5>"), "{args}");
-        assert!(args.contains("<grok prompt>"), "{args}");
-        assert!(!args.contains("<--bare>"), "{args}");
-        assert!(!args.contains("<Bash,Read>"), "{args}");
-        assert_eq!(
-            std::fs::read_to_string(grok_dir.path().join("environment.log"))
-                .unwrap()
-                .trim(),
-            "grok-env"
-        );
+        for model in crate::serve::grok_agent::SUPPORTED_MODELS {
+            let grok_dir = tempfile::tempdir().unwrap();
+            let grok_bin = recording_runner(grok_dir.path());
+            let grok_environment = vec![("QUORUM_ADAPTER_TEST".into(), "grok-env".into())];
+            let mut grok = launch_recording_runner(
+                &LaunchRequest {
+                    model,
+                    effort: "high",
+                    worktree: grok_dir.path(),
+                    prompt: "grok prompt",
+                    environment: &grok_environment,
+                    mode: LaunchMode::Normal,
+                    continuation_id: None,
+                },
+                &AdapterConfig {
+                    executable: grok_bin.to_str(),
+                    claude_bare: true,
+                    claude_allowed_tools: "Bash,Read",
+                    codex_sandbox: "danger-full-access",
+                    grok: Default::default(),
+                },
+            )
+            .await;
+            assert_eq!(grok.kind(), AgentKind::Grok);
+            while grok.next_raw_line().await.is_some() {}
+            grok.kill_and_reap().await;
+            let args = std::fs::read_to_string(grok_dir.path().join("args.log")).unwrap();
+            assert!(args.contains("<streaming-json>"), "{args}");
+            assert!(args.contains(&format!("<{model}>")), "{args}");
+            assert!(args.contains("<grok prompt>"), "{args}");
+            assert!(!args.contains("<--bare>"), "{args}");
+            assert!(!args.contains("<Bash,Read>"), "{args}");
+            assert_eq!(
+                std::fs::read_to_string(grok_dir.path().join("environment.log"))
+                    .unwrap()
+                    .trim(),
+                "grok-env"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2328,8 +2330,9 @@ mod tests {
     #[test]
     fn for_model_grok_is_exact_and_closed() {
         assert_eq!(AgentKind::for_model("grok-4.5").unwrap(), AgentKind::Grok);
+        assert_eq!(AgentKind::for_model("grok-4.6").unwrap(), AgentKind::Grok);
         assert!(AgentKind::for_model("grok").is_err());
-        assert!(AgentKind::for_model("grok-4.6").is_err());
+        assert!(AgentKind::for_model("grok-4.7").is_err());
         assert!(AgentKind::for_model("/opt/bin/grok").is_err());
     }
 

@@ -1655,22 +1655,26 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
             assert_eq!(roles.worker_model, "grok-4.5");
         }
 
-        let worker: ServeFileConfig = toml::from_str("worker_model = \"grok-4.5\"\n").unwrap();
-        assert_eq!(
-            resolve_roles(&worker, None, "sonnet", "high")
-                .unwrap()
-                .worker_model,
-            "grok-4.5"
-        );
-        for key in ["review_model", "classifier_model", "collector_model"] {
-            let cfg: ServeFileConfig = toml::from_str(&format!("{key} = \"grok-4.5\"\n")).unwrap();
-            let error = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("enabled only for managed workers"),
-                "{key}: {error}"
+        for model in ["grok-4.5", "grok-4.6"] {
+            let worker: ServeFileConfig =
+                toml::from_str(&format!("worker_model = \"{model}\"\n")).unwrap();
+            assert_eq!(
+                resolve_roles(&worker, None, "sonnet", "high")
+                    .unwrap()
+                    .worker_model,
+                model
             );
+            for key in ["review_model", "classifier_model", "collector_model"] {
+                let cfg: ServeFileConfig =
+                    toml::from_str(&format!("{key} = \"{model}\"\n")).unwrap();
+                let error = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("enabled only for managed workers"),
+                    "{key}/{model}: {error}"
+                );
+            }
         }
     }
 
@@ -2065,46 +2069,64 @@ worktree_base = "/tmp/wt"
 
     #[test]
     fn worker_allows_grok_but_other_managed_roles_reject_it() {
+        fn config_with_grok_worker(model: &str) -> ServeFileConfig {
+            let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+            cfg.model_profiles.as_mut().unwrap().insert(
+                "grok-worker".into(),
+                ModelProfile {
+                    runner: "grok".into(),
+                    model: model.into(),
+                    effort: "high".into(),
+                },
+            );
+            for pool in cfg.routing.as_mut().unwrap().worker.values_mut() {
+                pool.clear();
+                pool.insert("grok-worker".into(), 100);
+            }
+            cfg
+        }
+
+        for model in ["grok-4.5", "grok-4.6"] {
+            validate_model_routing(&config_with_grok_worker(model)).unwrap();
+
+            for role in [
+                "classifier",
+                "planner",
+                "arbiter",
+                "collector",
+                "reviewer.1",
+            ] {
+                let mut cfg = config_with_grok_worker(model);
+                let routing = cfg.routing.as_mut().unwrap();
+                let pool = match role {
+                    "classifier" => &mut routing.classifier,
+                    "planner" => &mut routing.planner,
+                    "arbiter" => &mut routing.arbiter,
+                    "collector" => &mut routing.collector,
+                    "reviewer.1" => routing.reviewer.get_mut("1").unwrap(),
+                    _ => unreachable!(),
+                };
+                pool.clear();
+                pool.insert("grok-worker".into(), 100);
+                let err = validate_model_routing(&cfg).unwrap_err();
+                assert!(err.to_string().contains(role), "{role}/{model}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn routing_rejects_unknown_grok_model() {
         let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
         cfg.model_profiles.as_mut().unwrap().insert(
-            "grok-worker".into(),
+            "grok-unknown".into(),
             ModelProfile {
                 runner: "grok".into(),
-                model: "grok-4.5".into(),
+                model: "grok-4.7".into(),
                 effort: "high".into(),
             },
         );
-        for pool in cfg.routing.as_mut().unwrap().worker.values_mut() {
-            pool.clear();
-            pool.insert("grok-worker".into(), 100);
-        }
-        validate_model_routing(&cfg).unwrap();
-
-        {
-            let routing = cfg.routing.as_mut().unwrap();
-            routing.reviewer.get_mut("1").unwrap().clear();
-            routing
-                .reviewer
-                .get_mut("1")
-                .unwrap()
-                .insert("grok-worker".into(), 100);
-        }
-        let err = validate_model_routing(&cfg).unwrap_err();
-        assert!(err.to_string().contains("reviewer"), "{err}");
-
-        {
-            let routing = cfg.routing.as_mut().unwrap();
-            routing.reviewer.get_mut("1").unwrap().clear();
-            routing
-                .reviewer
-                .get_mut("1")
-                .unwrap()
-                .insert("primary".into(), 100);
-            routing.planner.clear();
-            routing.planner.insert("grok-worker".into(), 100);
-        }
-        let err = validate_model_routing(&cfg).unwrap_err();
-        assert!(err.to_string().contains("planner"), "{err}");
+        let error = validate_model_routing(&cfg).unwrap_err();
+        assert!(error.to_string().contains("unknown model"), "{error}");
     }
 
     #[test]

@@ -26,7 +26,8 @@ use tokio::io::AsyncReadExt;
 use tokio::io::ReadBuf;
 use tokio::process::{Child, ChildStdout, Command};
 
-pub const SUPPORTED_MODEL: &str = "grok-4.5";
+pub const DEFAULT_MODEL: &str = "grok-4.5";
+pub const SUPPORTED_MODELS: &[&str] = &[DEFAULT_MODEL, "grok-4.6"];
 pub const SUPPORTED_EFFORTS: &[&str] = &["low", "medium", "high"];
 pub const DEFAULT_SANDBOX: &str = "off";
 pub const EXPLICIT_WORKSPACE_SANDBOX: &str = "workspace";
@@ -119,10 +120,11 @@ pub struct GrokSpec {
 
 impl GrokSpec {
     fn validate(&self) -> std::io::Result<()> {
-        if self.model != SUPPORTED_MODEL {
+        if !SUPPORTED_MODELS.contains(&self.model.as_str()) {
             return Err(invalid_input(format!(
-                "unsupported Grok model '{}': expected '{SUPPORTED_MODEL}'",
-                self.model
+                "unsupported Grok model '{}': expected one of {}",
+                self.model,
+                SUPPORTED_MODELS.join(", ")
             )));
         }
         if !SUPPORTED_EFFORTS.contains(&self.effort.as_str()) {
@@ -1434,7 +1436,7 @@ mod tests {
 
     fn test_spec(worktree: &std::path::Path) -> GrokSpec {
         GrokSpec {
-            model: SUPPORTED_MODEL.into(),
+            model: DEFAULT_MODEL.into(),
             effort: "high".into(),
             worktree: worktree.to_path_buf(),
             prompt: "inspect the repository".into(),
@@ -1775,15 +1777,19 @@ mod tests {
 
     #[test]
     fn continuation_argument_shape_is_pinned() {
-        let spec = test_spec(std::path::Path::new("/tmp/repo"));
-        let args = resume_args("019f-session", &spec).unwrap();
-        assert_eq!(
-            &args[..4],
-            ["--resume", "019f-session", "-p", "inspect the repository"]
-        );
-        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "off"]));
-        assert!(!args.iter().any(|arg| arg.contains("allowedTools")));
-        assert!(!args.iter().any(|arg| arg == "--bare"));
+        let mut spec = test_spec(std::path::Path::new("/tmp/repo"));
+        for model in SUPPORTED_MODELS {
+            spec.model = (*model).into();
+            let args = resume_args("019f-session", &spec).unwrap();
+            assert_eq!(
+                &args[..4],
+                ["--resume", "019f-session", "-p", "inspect the repository"]
+            );
+            assert!(args.windows(2).any(|pair| pair == ["--model", *model]));
+            assert!(args.windows(2).any(|pair| pair == ["--sandbox", "off"]));
+            assert!(!args.iter().any(|arg| arg.contains("allowedTools")));
+            assert!(!args.iter().any(|arg| arg == "--bare"));
+        }
     }
 
     #[test]
@@ -1869,12 +1875,17 @@ mod tests {
     fn models_efforts_and_unsupported_safety_combinations_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
         let mut spec = test_spec(dir.path());
-        spec.model = "grok-future".into();
+        for model in SUPPORTED_MODELS {
+            spec.model = (*model).into();
+            let args = headless_args(&spec, LaunchMode::Normal).unwrap();
+            assert!(args.windows(2).any(|pair| pair == ["--model", *model]));
+        }
+        spec.model = "grok-4.7".into();
         assert_eq!(
             headless_args(&spec, LaunchMode::Normal).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
         );
-        spec.model = SUPPORTED_MODEL.into();
+        spec.model = DEFAULT_MODEL.into();
         spec.effort = "xhigh".into();
         assert!(headless_args(&spec, LaunchMode::Normal).is_err());
         spec.effort = "high".into();
@@ -2212,16 +2223,21 @@ mod tests {
         let mut spec = test_spec(worktree.path());
         spec.prompt = "noop".into();
         spec.env_vars = no_auth_env(root.path());
-        let args = headless_args(&spec, LaunchMode::Normal).unwrap();
-        let mut proc = GrokProc::spawn_command(
-            &spec,
-            &args,
-            Some(crate::serve::runner::AGENT_MCP_SERVER),
-            None,
-        )
-        .expect("spawn grok with invocation-local MCP config");
-        let _lines = wait_for_real_cli_terminal_failure(&mut proc).await;
-        proc.kill_and_reap().await;
+        for model in SUPPORTED_MODELS {
+            spec.model = (*model).into();
+            let args = headless_args(&spec, LaunchMode::Normal).unwrap();
+            let mut proc = GrokProc::spawn_command(
+                &spec,
+                &args,
+                Some(crate::serve::runner::AGENT_MCP_SERVER),
+                None,
+            )
+            .unwrap_or_else(|error| {
+                panic!("spawn {model} with invocation-local MCP config: {error}")
+            });
+            let _lines = wait_for_real_cli_terminal_failure(&mut proc).await;
+            proc.kill_and_reap().await;
+        }
     }
 
     #[cfg(unix)]
