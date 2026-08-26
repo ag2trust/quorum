@@ -536,6 +536,28 @@ fn render_decomposition(
         planner,
         revision,
     );
+    let planner_effort = graph.planner_effort.as_deref().unwrap_or("pending");
+    let planner_log_dir = graph
+        .planner_log_dir
+        .as_deref()
+        .map(|dir| truncate(dir, width.saturating_sub(48)))
+        .unwrap_or_else(|| "—".to_string());
+    let planner_age = graph
+        .planner_last_activity_age_secs
+        .map(fmt_age)
+        .unwrap_or_else(|| "—".to_string());
+    let planner_activity = graph
+        .planner_activity_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let planner_tools = graph
+        .planner_tool_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let _ = writeln!(
+        w,
+        "      planner effort={planner_effort} log={planner_log_dir} age={planner_age} activity={planner_activity} tools={planner_tools}",
+    );
     let _ = writeln!(
         w,
         "      {}",
@@ -826,11 +848,11 @@ mod tests {
             operator_retry_cap: 2,
             planner_provider: Some("codex".into()),
             planner_model: Some("gpt-5.6-sol".into()),
-            planner_effort: None,
-            planner_log_dir: None,
-            planner_last_activity_age_secs: None,
-            planner_activity_count: None,
-            planner_tool_count: None,
+            planner_effort: Some("high".into()),
+            planner_log_dir: Some("/tmp/planner-live".into()),
+            planner_last_activity_age_secs: Some(15),
+            planner_activity_count: Some(3),
+            planner_tool_count: Some(2),
             accepted_plan_revision: Some(3),
             completed_children: 1,
             total_children: 2,
@@ -851,6 +873,9 @@ mod tests {
         assert!(output.contains("DECOMPOSITION"));
         assert!(output.contains("source #40"));
         assert!(output.contains("children=1/2"));
+        assert!(
+            output.contains("planner effort=high log=/tmp/planner-live age=15s activity=3 tools=2")
+        );
         assert!(output.contains("proposal=2/3 provider=1/3 operator-retries=0/2"));
         assert!(output.contains("planning-hold: graph-blocked (not retryable)"));
         assert!(output.contains("hold: implementation dispatch held: graph state=blocked"));
