@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 61). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 62). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -1061,3 +1061,15 @@ CREATE INDEX IF NOT EXISTS github_agent_operations_task
     ON github_agent_operations(task_id);
 CREATE INDEX IF NOT EXISTS github_review_publication_slots_task
     ON github_review_publication_slots(task_id);
+
+-- v62: enqueue is the immutable request boundary for canonical GitHub
+-- operations. Executors may update only their send/result fields; they cannot
+-- reinterpret a persisted request or rebind it to a different attempt, run,
+-- target, kind, or deterministic marker.
+CREATE TRIGGER IF NOT EXISTS github_agent_operations_request_immutable
+BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
+                 task_id, agent, role, pr_number, head_sha, kind, request_json,
+                 github_marker, created_at ON github_agent_operations
+BEGIN
+    SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
+END;
