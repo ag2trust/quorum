@@ -797,6 +797,9 @@ impl PlannerSlot {
                     details,
                 }
             }
+            "item.started/agent_message" | "item.completed/agent_message" | "assistant" => {
+                SanitizedSessionEvent::AssistantMessage { details }
+            }
             _ => SanitizedSessionEvent::ToolSummary {
                 tool: SanitizedToolKind::Other,
                 outcome: summary_outcome(event_type),
@@ -1825,6 +1828,7 @@ mod tests {
             "turn_lifecycle",
             "command_summary",
             "tool_summary",
+            "assistant_message",
             "terminal_response",
             "provider_failure",
             "semantic_rejection",

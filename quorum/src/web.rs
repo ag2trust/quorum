@@ -159,6 +159,7 @@ fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
                 "pr": agent.pr,
                 "run_dir": bounded_option(run_dir, MAX_IDENTITY_CHARS),
                 "last_activity_age_secs": agent.last_activity_age_secs,
+                "tool_count": agent.tool_count,
                 "agent_state": bounded_option(agent.agent_state.as_deref(), MAX_IDENTITY_CHARS),
                 "live_error_count": agent.live_error_count,
                 "live_error_text": agent.live_error_text.map(|text| bounded_text(&text, MAX_DETAIL_TEXT_CHARS)),

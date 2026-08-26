@@ -293,6 +293,12 @@ pub enum SanitizedSessionEvent {
         outcome: SanitizedSummaryOutcome,
         details: SanitizedField,
     },
+    /// Assistant text turn (Codex `item.*/agent_message`, Claude `assistant`).
+    /// Kept distinct from `ToolSummary` so status counters do not misreport an
+    /// assistant-only turn as tool use.
+    AssistantMessage {
+        details: SanitizedField,
+    },
     TerminalResponse {
         status: SanitizedTerminalStatus,
         response: SanitizedField,
@@ -340,6 +346,9 @@ impl SanitizedSessionEvent {
                 outcome: *outcome,
                 details: details.bounded(),
             },
+            Self::AssistantMessage { details } => Self::AssistantMessage {
+                details: details.bounded(),
+            },
             Self::TerminalResponse { status, response } => Self::TerminalResponse {
                 status: *status,
                 response: response.bounded(),
@@ -367,6 +376,7 @@ impl SanitizedSessionEvent {
             Self::TurnLifecycle { .. } => "- Turn lifecycle event",
             Self::CommandSummary { .. } => "- Command summary",
             Self::ToolSummary { .. } => "- Tool summary",
+            Self::AssistantMessage { .. } => "- Assistant message",
             Self::TerminalResponse { .. } => "- Terminal response summary",
             Self::ProviderFailure { .. } => "- Provider failure summary",
             Self::SemanticRejection { .. } => "- Semantic rejection summary",
@@ -380,6 +390,7 @@ impl SanitizedSessionEvent {
             Self::TurnLifecycle { .. } => "turn_lifecycle",
             Self::CommandSummary { .. } => "command_summary",
             Self::ToolSummary { .. } => "tool_summary",
+            Self::AssistantMessage { .. } => "assistant_message",
             Self::TerminalResponse { .. } => "terminal_response",
             Self::ProviderFailure { .. } => "provider_failure",
             Self::SemanticRejection { .. } => "semantic_rejection",
@@ -759,6 +770,9 @@ mod tests {
                 tool: SanitizedToolKind::Bash,
                 outcome: SanitizedSummaryOutcome::Failed,
                 details: SanitizedField::from_text(&oversized),
+            },
+            SanitizedSessionEvent::AssistantMessage {
+                details: SanitizedField::from_text(credential),
             },
             SanitizedSessionEvent::TerminalResponse {
                 status: SanitizedTerminalStatus::Success,
