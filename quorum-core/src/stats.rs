@@ -12,6 +12,7 @@
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 /// How many recent messages to surface on `status`. Bounded to keep the output cheap.
 pub const RECENT_MSG_LIMIT: i64 = 5;
@@ -32,6 +33,11 @@ pub const TASK_PROGRESS_HISTORY_LIMIT: usize = 12;
 pub const TASK_PROGRESS_MILESTONE_LIMIT: usize = 16;
 const TASK_PROGRESS_TEXT_LIMIT: usize = 160;
 const TASK_PROGRESS_DEPENDENCY_LIMIT: usize = 8;
+/// Status reads only a bounded prefix of a planner stream. The projection keeps
+/// counters, never provider payloads, and a planner's sanitized stream itself
+/// is capped at this scale.
+const PLANNER_STREAM_INSPECT_BYTES: u64 = 256 * 1024;
+const PLANNER_STREAM_INSPECT_RECORDS: usize = 512;
 
 /// Sidecar file written by the daemon per agent slot — carries live progress
 /// stats that the status reader picks up without a DB schema change.
@@ -306,6 +312,16 @@ pub struct DecompositionStatusView {
     pub operator_retry_cap: i64,
     pub planner_provider: Option<String>,
     pub planner_model: Option<String>,
+    /// Assigned planner effort, resolved from its immutable role assignment.
+    pub planner_effort: Option<String>,
+    /// Current planner attempt's session directory, if logging is configured.
+    pub planner_log_dir: Option<String>,
+    /// Age of the current planner stream's latest write.
+    pub planner_last_activity_age_secs: Option<i64>,
+    /// Bounded count of recognized activity records in the current stream.
+    pub planner_activity_count: Option<u32>,
+    /// Bounded count of recognized tool records in the current stream.
+    pub planner_tool_count: Option<u32>,
     pub accepted_plan_revision: Option<i64>,
     pub completed_children: i64,
     pub total_children: i64,
@@ -2204,26 +2220,31 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
         } else {
             (None, None)
         };
-        let (provider, model, effort) = e.task_id.map_or((None, None, None), |tid| {
-            conn.query_row(
-                "SELECT provider, model, effort FROM agent_runs
-                 WHERE task_id=?1 AND agent_name=?2 AND role=?3
-                 ORDER BY spawned_at DESC, id DESC LIMIT 1",
-                params![tid, e.agent, e.role],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .ok()
-            .map(|(provider, model, effort)| {
-                (
-                    // v31 added this nullable column; NULL is the documented
-                    // legacy-Claude meaning, not an unknown provider.
-                    provider.or_else(|| Some("claude".into())),
-                    Some(model),
-                    Some(effort),
+        let (provider, model, effort) = if e.role == "planner" {
+            planner_journal_identity(conn, e.task_id, &e.session_id, e.provider.as_deref())
+        } else {
+            e.task_id.map_or((None, None, None), |tid| {
+                conn.query_row(
+                    "SELECT provider, model, effort FROM agent_runs
+                     WHERE task_id=?1 AND agent_name=?2 AND role=?3
+                     ORDER BY spawned_at DESC, id DESC LIMIT 1",
+                    params![tid, e.agent, e.role],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get(1)?, r.get(2)?)),
                 )
+                .ok()
+                .map(|(provider, model, effort)| {
+                    (
+                        // v31 added this nullable column; NULL is the documented
+                        // legacy-Claude meaning, not an unknown provider.
+                        provider.or_else(|| Some("claude".into())),
+                        Some(model),
+                        Some(effort),
+                    )
+                })
+                .unwrap_or((None, None, None))
             })
-            .unwrap_or((None, None, None))
-        });
+        };
+        let stream_counters = e.log_dir.as_deref().and_then(planner_stream_counters);
         let (
             tool_count,
             now_label,
@@ -2252,7 +2273,12 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
                 ls.error_text.clone(),
             )
         } else {
-            (0, None, None, None, 0, 0, None)
+            let counters = if e.role == "planner" {
+                stream_counters.unwrap_or_default()
+            } else {
+                PlannerStreamCounters::default()
+            };
+            (counters.tool_count, None, None, None, 0, 0, None)
         };
         let display_tokens = e.cost_tokens + mid_turn_tok;
         let sub_role = if e.phase == "auditing" {
@@ -2287,6 +2313,129 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
         });
     }
     Ok(views)
+}
+
+/// Planner runs do not create `agent_runs`: their immutable executable identity
+/// belongs to the decomposition's role assignment. Match the live journal's
+/// session id so a retained graph never lends an earlier attempt its identity.
+fn planner_journal_identity(
+    conn: &Connection,
+    task_id: Option<i64>,
+    session_id: &str,
+    journal_provider: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(task_id) = task_id else {
+        return (journal_provider.map(str::to_owned), None, None);
+    };
+    conn.query_row(
+        "SELECT d.planner_provider, d.planner_model, a.effort
+         FROM task_decompositions d
+         LEFT JOIN role_assignments a ON a.id=d.planner_assignment_id AND a.role='planner'
+         WHERE d.source_task_id=?1 AND d.planner_session_id=?2
+         ORDER BY d.updated_at DESC, d.id DESC LIMIT 1",
+        params![task_id, session_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )
+    .ok()
+    .map(|(provider, model, effort)| {
+        (
+            journal_provider.map(str::to_owned).or(provider),
+            model,
+            effort,
+        )
+    })
+    .unwrap_or((journal_provider.map(str::to_owned), None, None))
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PlannerStreamCounters {
+    activity_count: u32,
+    tool_count: u32,
+}
+
+/// Derive only structural counters from a bounded prefix of a current planner
+/// stream. No field values or provider payloads leave this function. It accepts
+/// both the closed sanitized stream and the older planner JSONL shape while
+/// migration is in progress.
+fn planner_stream_counters(log_dir: &str) -> Option<PlannerStreamCounters> {
+    let path = std::path::Path::new(log_dir).join("stream.jsonl");
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(PLANNER_STREAM_INSPECT_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+
+    let mut counters = PlannerStreamCounters::default();
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .take(PLANNER_STREAM_INSPECT_RECORDS)
+    {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(event) = value.get("event").and_then(serde_json::Value::as_str) else {
+            // Legacy planner JSONL has no closed event field. Count known
+            // lifecycle/tool shapes only, and retain no provider text.
+            let event_type = value.get("type").and_then(serde_json::Value::as_str);
+            let item_type = value
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(serde_json::Value::as_str);
+            if matches!(
+                event_type,
+                Some(
+                    "thread.started"
+                        | "turn.started"
+                        | "turn.completed"
+                        | "turn.failed"
+                        | "item.started"
+                        | "item.completed"
+                )
+            ) {
+                counters.activity_count = counters.activity_count.saturating_add(1);
+            }
+            if matches!(
+                (event_type, item_type),
+                (
+                    Some("item.started" | "item.completed"),
+                    Some("command_execution" | "file_change" | "mcp_call")
+                )
+            ) {
+                counters.tool_count = counters.tool_count.saturating_add(1);
+            }
+            continue;
+        };
+        if matches!(
+            event,
+            "provider_lifecycle"
+                | "turn_lifecycle"
+                | "command_summary"
+                | "tool_summary"
+                | "assistant_message"
+                | "terminal_response"
+                | "provider_failure"
+                | "semantic_rejection"
+                | "completion"
+        ) {
+            counters.activity_count = counters.activity_count.saturating_add(1);
+        }
+        // `assistant_message` is deliberately excluded: an assistant-only turn
+        // is activity, not a tool action.
+        if matches!(event, "command_summary" | "tool_summary") {
+            counters.tool_count = counters.tool_count.saturating_add(1);
+        }
+    }
+    Some(counters)
 }
 
 /// Build a compact `tier·eff` label from a task's JSON labels array.
@@ -2566,10 +2715,11 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
         .query_row(
             "SELECT d.id, d.source_task_id, t.title, t.status, d.state, d.active,
                     d.proposal_attempts, d.provider_failures, d.planner_provider,
-                    d.planner_model, d.accepted_plan_revision, d.hold_summary,
+                    d.planner_model, a.effort, d.accepted_plan_revision, d.hold_summary,
                     d.hold_code,d.operator_retry_count
              FROM task_decompositions d
              JOIN tasks t ON t.id=d.source_task_id
+             LEFT JOIN role_assignments a ON a.id=d.planner_assignment_id AND a.role='planner'
              WHERE d.active=1 OR d.freeze_active=1
                 OR d.state NOT IN ('completed','cancelled')
              ORDER BY (d.active=1 OR d.freeze_active=1) DESC, d.updated_at DESC, d.id DESC
@@ -2587,10 +2737,11 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
                     r.get::<_, i64>(7)?,
                     r.get::<_, Option<String>>(8)?,
                     r.get::<_, Option<String>>(9)?,
-                    r.get::<_, Option<i64>>(10)?,
-                    r.get::<_, Option<String>>(11)?,
+                    r.get::<_, Option<String>>(10)?,
+                    r.get::<_, Option<i64>>(11)?,
                     r.get::<_, Option<String>>(12)?,
-                    r.get::<_, i64>(13)?,
+                    r.get::<_, Option<String>>(13)?,
+                    r.get::<_, i64>(14)?,
                 ))
             },
         )
@@ -2606,6 +2757,7 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
         provider_failures,
         planner_provider,
         planner_model,
+        planner_effort,
         accepted_plan_revision,
         hold_summary,
         hold_code,
@@ -2616,6 +2768,18 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
     };
     let retryable_planning_hold =
         crate::decomposition::exhausted_planning_retry_is_eligible(conn, source_task_id, now)?;
+    let planner_log_dir: Option<String> = conn
+        .query_row(
+            "SELECT log_dir FROM journal
+             WHERE agent=?1 AND role='planner' AND task_id=?2
+             LIMIT 1",
+            params![format!("decomposition-planner-{graph_id}"), source_task_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let planner_counters = planner_log_dir.as_deref().and_then(planner_stream_counters);
+    let planner_last_activity_age_secs = planner_log_dir.as_deref().and_then(stream_jsonl_age_secs);
 
     let mut stmt = conn.prepare(
         "SELECT m.task_id, m.local_key, t.title, t.status, t.depends_on
@@ -2705,6 +2869,11 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
         operator_retry_cap: crate::decomposition::MAX_OPERATOR_RETRIES,
         planner_provider,
         planner_model,
+        planner_effort,
+        planner_log_dir,
+        planner_last_activity_age_secs,
+        planner_activity_count: planner_counters.map(|counters| counters.activity_count),
+        planner_tool_count: planner_counters.map(|counters| counters.tool_count),
         accepted_plan_revision,
         completed_children,
         total_children: members.len() as i64,
@@ -4601,6 +4770,154 @@ mod tests {
         assert_eq!(
             render_graph_hold_summary(Some("generated-child-failed"), "legacy child failure"),
             "legacy child failure"
+        );
+    }
+
+    #[test]
+    fn planner_stream_counters_do_not_count_assistant_messages_as_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        // Sanitized shape: only assistant-message activity, no command or tool.
+        std::fs::write(
+            dir.path().join("stream.jsonl"),
+            concat!(
+                r#"{"event":"provider_lifecycle","provider":"codex","phase":"started"}"#,
+                "\n",
+                r#"{"event":"turn_lifecycle","turn":1,"phase":"started"}"#,
+                "\n",
+                r#"{"event":"assistant_message","details":{"summary":"structural","shape":"string","captured_bytes":8}}"#,
+                "\n",
+                r#"{"event":"assistant_message","details":{"summary":"structural","shape":"string","captured_bytes":8}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let counters = planner_stream_counters(dir.path().to_str().unwrap()).unwrap();
+        assert!(
+            counters.activity_count >= 3,
+            "assistant messages must count as activity: {counters:?}"
+        );
+        assert_eq!(
+            counters.tool_count, 0,
+            "assistant-only stream must report zero tool actions"
+        );
+    }
+
+    #[test]
+    fn planner_stream_counters_count_command_and_tool_summaries_as_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("stream.jsonl"),
+            concat!(
+                r#"{"event":"turn_lifecycle","turn":1,"phase":"started"}"#,
+                "\n",
+                r#"{"event":"assistant_message","details":{"summary":"structural","shape":"string","captured_bytes":4}}"#,
+                "\n",
+                r#"{"event":"command_summary","command":"shell","outcome":"succeeded","details":{"summary":"structural","shape":"object","captured_bytes":8}}"#,
+                "\n",
+                r#"{"event":"tool_summary","tool":"other","outcome":"started","details":{"summary":"structural","shape":"object","captured_bytes":8}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let counters = planner_stream_counters(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            counters.activity_count, 4,
+            "each sanitized activity record counts once: {counters:?}"
+        );
+        assert_eq!(
+            counters.tool_count, 2,
+            "command_summary and tool_summary count as tools; assistant_message does not"
+        );
+    }
+
+    #[test]
+    fn live_planner_status_uses_assignment_and_bounded_stream_counters() {
+        let (dir, mut c) = open_tmp();
+        let source =
+            crate::tasks::create(&mut c, "A", "source", None, 0, None, None, None, None, 100)
+                .unwrap();
+        c.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at
+             ) VALUES ('planner:task:1:revision:1',?1,'planner','planner-profile','codex',
+                 'codex','gpt-5.6-sol','high','pool','generation',100)",
+            params![source],
+        )
+        .unwrap();
+        let assignment_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 planner_provider,planner_model,planner_assignment_id,planner_session_id,
+                 created_at,updated_at
+             ) VALUES (?1,'planning',0,1,1,'codex','gpt-5.6-sol',?2,'planner-session',100,100)",
+            params![source, assignment_id],
+        )
+        .unwrap();
+        let graph_id = c.last_insert_rowid();
+        let log_dir = dir.path().join("planner-live");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("stream.jsonl"),
+            concat!(
+                r#"{"event":"turn_lifecycle","turn":1,"phase":"started"}"#,
+                "\n",
+                r#"{"event":"tool_summary","tool":"bash","outcome":"started","details":{"summary":"structural","shape":"object","captured_bytes":8}}"#,
+                "\n",
+                r#"{"type":"item.completed","item":{"type":"command_execution","command":"sk-status-must-not-leak"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: format!("decomposition-planner-{graph_id}"),
+                role: "planner".into(),
+                task_id: Some(source),
+                session_id: "planner-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "planner".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: Some(log_dir.to_string_lossy().into_owned()),
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        let status = stats(&c, 100, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let graph = status.decomposition.as_ref().unwrap();
+        assert_eq!(graph.planner_provider.as_deref(), Some("codex"));
+        assert_eq!(graph.planner_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(graph.planner_effort.as_deref(), Some("high"));
+        assert_eq!(graph.planner_log_dir.as_deref(), log_dir.to_str());
+        assert_eq!(graph.planner_activity_count, Some(3));
+        assert_eq!(graph.planner_tool_count, Some(2));
+        assert!(graph.planner_last_activity_age_secs.is_some());
+
+        let planner = status
+            .daemon_agents
+            .iter()
+            .find(|agent| agent.role == "planner")
+            .unwrap();
+        assert_eq!(planner.provider.as_deref(), Some("codex"));
+        assert_eq!(planner.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(planner.effort.as_deref(), Some("high"));
+        assert_eq!(planner.tool_count, 2);
+
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            !json.contains("sk-status-must-not-leak"),
+            "status must not expose provider payload text"
         );
     }
 

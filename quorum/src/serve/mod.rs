@@ -37996,6 +37996,34 @@ exec /bin/cat '{stdout}'
         let source_task_id = 42;
         let started_at = now_unix();
         let planner_name = decomposition_process_name(graph_id, "planner");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+             VALUES (?1,'source','planning','owner',?2,?2)",
+            rusqlite::params![source_task_id, started_at],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at
+             ) VALUES ('planner:task:42:revision:1',?1,'planner','planner-profile','codex',
+                 'codex','gpt-5.6-sol','high','pool','generation',?2)",
+            rusqlite::params![source_task_id, started_at],
+        )
+        .unwrap();
+        let assignment_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 id,source_task_id,state,active,freeze_active,planned_source_revision,
+                 planner_provider,planner_model,planner_assignment_id,planner_session_id,
+                 created_at,updated_at
+             ) VALUES (?1,?2,'planning',0,1,1,'codex','gpt-5.6-sol',?3,
+                 'planner-session-second',?4,?4)",
+            rusqlite::params![graph_id, source_task_id, assignment_id, started_at],
+        )
+        .unwrap();
+        drop(conn);
 
         let mut first = planner::spawn_planner(
             runner::AgentKind::Codex,
@@ -38061,6 +38089,16 @@ exec /bin/cat '{stdout}'
             .unwrap();
         let second_log_dir = second.log_dir().unwrap().to_path_buf();
         assert_ne!(first_log_dir, second_log_dir);
+        std::fs::write(
+            second_log_dir.join("stream.jsonl"),
+            concat!(
+                r#"{"type":"turn.started"}"#,
+                "\n",
+                r#"{"type":"item.completed","item":{"type":"command_execution","command":"sk-status-must-not-leak"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
         journal_decomposition_process(
             &config,
             graph_id,
@@ -38084,6 +38122,31 @@ exec /bin/cat '{stdout}'
         assert_eq!(rows[0].session_id, "planner-session-second");
         assert_eq!(rows[0].log_dir.as_deref(), second_log_dir.to_str());
         assert_eq!(rows[0].provider.as_deref(), Some("codex"));
+        let status =
+            quorum_core::stats::stats(&conn, now_unix(), quorum_core::agents::ONLINE_WINDOW_SECS)
+                .unwrap();
+        let graph = status.decomposition.as_ref().unwrap();
+        assert_eq!(graph.planner_provider.as_deref(), Some("codex"));
+        assert_eq!(graph.planner_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(graph.planner_effort.as_deref(), Some("high"));
+        assert_eq!(graph.planner_log_dir.as_deref(), second_log_dir.to_str());
+        assert_eq!(graph.planner_activity_count, Some(2));
+        assert_eq!(graph.planner_tool_count, Some(1));
+        assert!(graph.planner_last_activity_age_secs.is_some());
+        let planner = status
+            .daemon_agents
+            .iter()
+            .find(|agent| agent.agent == planner_name)
+            .unwrap();
+        assert_eq!(planner.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(planner.effort.as_deref(), Some("high"));
+        assert_eq!(planner.tool_count, 1);
+        assert!(
+            !serde_json::to_string(&status)
+                .unwrap()
+                .contains("sk-status-must-not-leak"),
+            "status must expose counters, not provider payload text"
+        );
         drop(conn);
 
         delete_decomposition_process(&config, graph_id, "planner")
