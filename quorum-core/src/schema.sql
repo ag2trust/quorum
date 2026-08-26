@@ -1055,3 +1055,9 @@ CREATE TABLE IF NOT EXISTS github_review_publication_slots (
     PRIMARY KEY(publisher_scope, pr_number),
     UNIQUE(attempt_id)
 );
+CREATE INDEX IF NOT EXISTS github_collaboration_attempts_task
+    ON github_collaboration_attempts(task_id);
+CREATE INDEX IF NOT EXISTS github_agent_operations_task
+    ON github_agent_operations(task_id);
+CREATE INDEX IF NOT EXISTS github_review_publication_slots_task
+    ON github_review_publication_slots(task_id);
