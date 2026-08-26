@@ -2293,11 +2293,21 @@ pub fn adopt_explicit_recovery_delivery(
                         AND json_extract(original.refs,'$.daemon_publication.stage')='intent'
                         AND json_type(original.refs,'$.daemon_publication.branch')='text'
                         AND length(json_extract(original.refs,'$.daemon_publication.branch'))
-                            BETWEEN 1 AND 512
+                            BETWEEN length('daemon/-t' || original.id) + 1 AND 512
+                        AND substr(
+                            json_extract(original.refs,'$.daemon_publication.branch'),
+                            1, length('daemon/')
+                        )='daemon/'
                         AND substr(
                             json_extract(original.refs,'$.daemon_publication.branch'),
                             -length('-t' || original.id)
                         )='-t' || original.id
+                        AND substr(
+                            json_extract(original.refs,'$.daemon_publication.branch'),
+                            length('daemon/') + 1,
+                            length(json_extract(original.refs,'$.daemon_publication.branch'))
+                              - length('daemon/') - length('-t' || original.id)
+                        ) NOT GLOB '*[^a-z0-9-]*'
                         AND json_type(original.refs,'$.daemon_publication.local_sha')='text'
                         AND length(json_extract(original.refs,'$.daemon_publication.local_sha'))
                             IN (40,64)
@@ -3661,6 +3671,27 @@ mod tests {
                     "UPDATE task_decompositions
                      SET state='blocked',hold_code='generated-child-failed',hold_summary=?2
                      WHERE id=?1",
+                    params![self.graph, summary],
+                )
+                .unwrap();
+        }
+
+        fn rewrite_legacy_prepublication_branch(&mut self, branch: &str) {
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET refs=json_set(refs,'$.daemon_publication.branch',?2)
+                     WHERE id=?1",
+                    params![self.original, branch],
+                )
+                .unwrap();
+            let summary = format!(
+                "generated child task #{} failed: daemon-owned publication failed: daemon push to new branch refs/heads/{} rejected: error: failed to push some refs",
+                self.original, branch
+            );
+            self.conn
+                .execute(
+                    "UPDATE task_decompositions SET hold_summary=?2 WHERE id=?1",
                     params![self.graph, summary],
                 )
                 .unwrap();
@@ -6848,6 +6879,69 @@ mod tests {
                             [fixture.original],
                         )
                         .unwrap();
+                }),
+            ),
+            (
+                "publication branch has a non-daemon prefix",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "feature/unrelated-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has an empty author slug",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch nests an extra path segment",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/worker/nested-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has whitespace in the author slug",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/bad slug-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has uppercase in the author slug",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/BadSlug-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has a dot in the author slug",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/bad.slug-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has another invalid author character",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/bad~slug-t{}",
+                        fixture.original
+                    ));
                 }),
             ),
             (

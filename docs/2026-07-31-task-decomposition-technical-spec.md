@@ -85,7 +85,11 @@ ledger and child projection.
 The explicit command also recognizes one fail-closed legacy prepublication state created by the
 older retry path: the final generated child is unassigned `open`, has no completion or PR target,
 retains a valid task-scoped `daemon_publication` intent before PR creation, and its active graph is
-blocked by the matching non-JSON `generated-child-failed` publication summary. The continuation
+blocked by the matching non-JSON `generated-child-failed` publication summary. The recorded intent
+branch must match the exact daemon-authored grammar `daemon/<author-slug>-t<child-id>`, where
+`<author-slug>` is a non-empty lowercase ASCII `[a-z0-9-]+` run and `<child-id>` is the exact
+original child ID. Non-daemon prefixes, empty slugs, nested paths, whitespace, uppercase letters,
+dots, and every other character outside that grammar are rejected before any lifecycle mutation. The continuation
 must postdate the child, satisfy the same durable managed worker/reviewer/sampling/merge chain,
 and have an immutable target equal to the decomposition
 source's immutable target. No resolved publication field may be present. Success additionally

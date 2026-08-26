@@ -2350,13 +2350,16 @@ only for a generated final child that an older retry reopened after daemon-owned
 already failed, leaving the live graph blocked by the corresponding legacy non-JSON
 `generated-child-failed` summary. The child must be unassigned `open`, have no completion or PR
 target, and retain a task-scoped `daemon_publication` intent with no PR, remote SHA, or resolved
-target and with a valid preserved local commit SHA. The hold must name that exact child and
-publication branch; all siblings must be done. The operator-named managed continuation must
+target and with a valid preserved local commit SHA. The publication branch must match the exact
+daemon-authored grammar `daemon/<author-slug>-t<child-id>`, where `<author-slug>` is a non-empty
+lowercase ASCII `[a-z0-9-]+` run and `<child-id>` is the exact child ID. The hold must name that
+exact child and branch; all siblings must be done. The operator-named managed continuation must
 postdate the stale child, satisfy the ordinary durable worker, approved-head, sampling, and
 merged-provenance chain, and be merged to the decomposition source's
 immutable target branch. This is not a general open-task adoption path: any structured/current
 hold, assigned child, advanced publication state, target mismatch, stale PR row, malformed
-task-scoped branch or SHA is a clean negative. Classifier duplicate hints grant no lifecycle
+task-scoped branch (including non-daemon prefixes, empty slugs, nested paths, whitespace,
+uppercase letters, dots, and other invalid characters) or SHA is a clean negative. Classifier duplicate hints grant no lifecycle
 authority and are neither required nor sufficient. Success
 records the preserved publication branch and SHA in both recovery audit projections, removes the
 stale publication intent, completes the child, clears only that exact legacy hold, and completes
