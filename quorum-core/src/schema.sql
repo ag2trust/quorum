@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 59). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 61). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -973,3 +973,142 @@ CREATE TABLE IF NOT EXISTS planner_submissions (
     rejections    INTEGER NOT NULL DEFAULT 0,
     accepted_at   INTEGER
 );
+
+-- v61: durable collaboration-attempt binding and GitHub-operation outbox.
+-- Attempts bind a daemon-created logical turn to its immutable managed context;
+-- operations carry only bounded JSON request data and retain the exact
+-- deterministic operation/marker identities needed for deduplication and
+-- recovery. Execution and transition logic intentionally live above this
+-- storage slice.
+CREATE TABLE IF NOT EXISTS collaboration_attempts (
+    attempt_id             TEXT PRIMARY KEY
+                           CHECK(length(CAST(attempt_id AS BLOB)) BETWEEN 1 AND 128
+                                 AND instr(CAST(attempt_id AS BLOB), X'00') = 0),
+    task_id                INTEGER NOT NULL REFERENCES tasks(id),
+    agent                  TEXT NOT NULL
+                           CHECK(length(CAST(agent AS BLOB)) BETWEEN 1 AND 256
+                                 AND instr(CAST(agent AS BLOB), X'00') = 0),
+    role                   TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    pr_number              INTEGER NOT NULL CHECK(pr_number > 0),
+    head_sha               TEXT
+                           CHECK(head_sha IS NULL OR
+                                 (length(CAST(head_sha AS BLOB)) BETWEEN 1 AND 128
+                                  AND instr(CAST(head_sha AS BLOB), X'00') = 0)),
+    lifecycle_generation   INTEGER NOT NULL CHECK(lifecycle_generation >= 0),
+    active_run_id          TEXT REFERENCES run_capabilities(run_id),
+    review_owner_marker    TEXT UNIQUE
+                           CHECK(review_owner_marker IS NULL OR
+                                 (length(CAST(review_owner_marker AS BLOB)) BETWEEN 1 AND 512
+                                  AND instr(CAST(review_owner_marker AS BLOB), X'00') = 0)),
+    state                  TEXT NOT NULL
+                           CHECK(state IN ('active','awaiting_resume','completed','revoked')),
+    active                 INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+    review_sealed          INTEGER NOT NULL DEFAULT 0 CHECK(review_sealed IN (0,1)),
+    next_review_sequence   INTEGER NOT NULL DEFAULT 0 CHECK(next_review_sequence >= 0),
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    expires_at             INTEGER NOT NULL,
+    retention_started_at   INTEGER,
+    CHECK((role = 'reviewer' AND head_sha IS NOT NULL)
+          OR (role = 'worker' AND head_sha IS NULL)),
+    UNIQUE(active_run_id)
+);
+-- An exact logical turn has at most one active attempt. `active` remains an
+-- explicit integer flag so this guard uses the same storage-level pattern as
+-- other atomic holders rather than relying on cooperative callers.
+CREATE UNIQUE INDEX IF NOT EXISTS collaboration_attempts_one_active_binding
+    ON collaboration_attempts(
+        task_id, agent, role, pr_number, lifecycle_generation, COALESCE(head_sha, '')
+    ) WHERE active = 1;
+CREATE INDEX IF NOT EXISTS collaboration_attempts_task_expires
+    ON collaboration_attempts(task_id, expires_at);
+
+CREATE TABLE IF NOT EXISTS github_operations (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- Deterministically derived from the attempt and client request ID. This
+    -- is the durable deduplication identity even for operations without a
+    -- GitHub-visible marker (such as a read).
+    operation_id          TEXT NOT NULL UNIQUE
+                          CHECK(length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 128
+                                AND instr(CAST(operation_id AS BLOB), X'00') = 0),
+    client_request_id     TEXT NOT NULL
+                          CHECK(length(CAST(client_request_id AS BLOB)) BETWEEN 1 AND 128
+                                AND instr(CAST(client_request_id AS BLOB), X'00') = 0),
+    attempt_id            TEXT NOT NULL REFERENCES collaboration_attempts(attempt_id),
+    created_by_run_id     TEXT NOT NULL REFERENCES run_capabilities(run_id),
+    task_id               INTEGER NOT NULL REFERENCES tasks(id),
+    agent                 TEXT NOT NULL
+                          CHECK(length(CAST(agent AS BLOB)) BETWEEN 1 AND 256
+                                AND instr(CAST(agent AS BLOB), X'00') = 0),
+    role                  TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    pr_number             INTEGER NOT NULL CHECK(pr_number > 0),
+    head_sha              TEXT
+                          CHECK(head_sha IS NULL OR
+                                (length(CAST(head_sha AS BLOB)) BETWEEN 1 AND 128
+                                 AND instr(CAST(head_sha AS BLOB), X'00') = 0)),
+    kind                  TEXT NOT NULL CHECK(kind IN (
+                              'pull_request_read',
+                              'add_issue_comment',
+                              'pull_request_review_write',
+                              'add_comment_to_pending_review',
+                              'add_reply_to_pull_request_comment',
+                              'resolve_review_thread'
+                          )),
+    request_json          TEXT NOT NULL CHECK(
+                              json_valid(request_json)
+                              AND json_type(request_json) = 'object'
+                              AND length(CAST(request_json AS BLOB)) <= 65536
+                          ),
+    state                 TEXT NOT NULL DEFAULT 'queued'
+                          CHECK(state IN ('queued','running','succeeded','failed','cancelled')),
+    send_state            TEXT NOT NULL DEFAULT 'not_started'
+                          CHECK(send_state IN ('not_started','definitely_unsent',
+                                               'ambiguous','confirmed')),
+    attempts              INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 8),
+    next_attempt_at       INTEGER,
+    deadline_at           INTEGER NOT NULL,
+    review_sequence       INTEGER CHECK(review_sequence IS NULL OR review_sequence >= 0),
+    github_marker         TEXT UNIQUE
+                          CHECK(github_marker IS NULL OR
+                                (length(CAST(github_marker AS BLOB)) BETWEEN 1 AND 512
+                                 AND instr(CAST(github_marker AS BLOB), X'00') = 0)),
+    remote_object_id      TEXT
+                          CHECK(remote_object_id IS NULL OR
+                                (length(CAST(remote_object_id AS BLOB)) BETWEEN 1 AND 256
+                                 AND instr(CAST(remote_object_id AS BLOB), X'00') = 0)),
+    response_json         TEXT CHECK(response_json IS NULL OR
+                              (json_valid(response_json)
+                               AND length(CAST(response_json AS BLOB)) <= 65536)),
+    error_kind            TEXT CHECK(error_kind IS NULL OR
+                              (length(CAST(error_kind AS BLOB)) BETWEEN 1 AND 64
+                               AND instr(CAST(error_kind AS BLOB), X'00') = 0)),
+    error_summary         TEXT CHECK(error_summary IS NULL OR
+                              (length(CAST(error_summary AS BLOB)) <= 2048
+                               AND instr(CAST(error_summary AS BLOB), X'00') = 0)),
+    completed_after_revocation INTEGER NOT NULL DEFAULT 0
+                               CHECK(completed_after_revocation IN (0,1)),
+    created_at            INTEGER NOT NULL,
+    enqueued_at           INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    expires_at            INTEGER NOT NULL,
+    CHECK((role = 'reviewer' AND head_sha IS NOT NULL)
+          OR (role = 'worker' AND head_sha IS NULL)),
+    UNIQUE(attempt_id, client_request_id),
+    UNIQUE(attempt_id, review_sequence)
+);
+CREATE INDEX IF NOT EXISTS github_operations_attempt_state
+    ON github_operations(attempt_id, state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS github_operations_task_expires
+    ON github_operations(task_id, expires_at);
+CREATE INDEX IF NOT EXISTS github_operations_expires ON github_operations(expires_at);
+
+-- Enqueue is the immutable request boundary. Executors may update only their
+-- send/result fields; they cannot reinterpret a persisted request or rebind it
+-- to a different attempt, run, target, kind, or deterministic marker.
+CREATE TRIGGER IF NOT EXISTS github_operations_request_immutable
+BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
+                 task_id, agent, role, pr_number, head_sha, kind, request_json,
+                 github_marker, created_at, enqueued_at ON github_operations
+BEGIN
+    SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
+END;

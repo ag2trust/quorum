@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 60;
+pub const SCHEMA_VERSION: i64 = 61;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1064,6 +1064,23 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 )?;
             }
         }
+        // v61 = collaboration-attempt bindings and the durable GitHub-operation outbox.
+        // Both net-new tables are declared with `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL,
+        // which ran above inside this same BEGIN IMMEDIATE transaction for every upgrade.
+        // Re-create the request immutability trigger here as an explicit migration guard:
+        // current==SCHEMA_VERSION intentionally short-circuits SCHEMA_SQL, while a v60 DB
+        // must receive both tables and the immutable enqueue boundary atomically.
+        if current < 61 {
+            conn.execute_batch(
+                "CREATE TRIGGER IF NOT EXISTS github_operations_request_immutable
+                 BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
+                                  task_id, agent, role, pr_number, head_sha, kind, request_json,
+                                  github_marker, created_at, enqueued_at ON github_operations
+                 BEGIN
+                     SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
+                 END;",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1910,6 +1927,133 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn migrates_v60_to_v61_adds_collaboration_storage_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v60-collaboration.db");
+        {
+            // A v60 database never saw the new tables. Start from a current
+            // shape, remove only the v61 objects, and stamp its stored version
+            // back to v60 to exercise the production upgrade path.
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE github_operations;
+                 DROP TABLE collaboration_attempts;
+                 PRAGMA user_version=60;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        for table in ["collaboration_attempts", "github_operations"] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "{table} missing after v60→v61 migration"
+            );
+        }
+
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'collaboration','in-review','owner',1,1);
+             INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                 VALUES ('reviewer-run',1,'Reviewer','reviewer',1);
+             INSERT INTO collaboration_attempts(
+                 attempt_id,task_id,agent,role,pr_number,head_sha,lifecycle_generation,
+                 active_run_id,state,active,created_at,updated_at,expires_at
+             ) VALUES (
+                 'attempt-v61',1,'Reviewer','reviewer',42,'abc123',3,
+                 'reviewer-run','active',1,10,10,1000
+             );
+             INSERT INTO github_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,
+                 task_id,agent,role,pr_number,head_sha,kind,request_json,
+                 deadline_at,created_at,enqueued_at,updated_at,expires_at
+             ) VALUES (
+                 'operation-v61','request-v61','attempt-v61','reviewer-run',
+                 1,'Reviewer','reviewer',42,'abc123','add_issue_comment','{\"body\":\"hello\"}',
+                 100,10,10,10,1000
+             );",
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "UPDATE github_operations SET request_json='{\"body\":\"mutated\"}'
+                 WHERE operation_id='operation-v61'",
+                [],
+            )
+            .is_err(),
+            "enqueued GitHub request payload must be immutable"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT request_json FROM github_operations WHERE operation_id='operation-v61'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            r#"{"body":"hello"}"#
+        );
+
+        // Re-enter the v61 block with tables and data already present. Every
+        // DDL statement is IF NOT EXISTS, so the migration must preserve the
+        // existing immutable row rather than rebuild or duplicate it.
+        conn.execute_batch("PRAGMA user_version=60;").unwrap();
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            reopened
+                .query_row("SELECT COUNT(*) FROM github_operations", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT request_json FROM github_operations WHERE operation_id='operation-v61'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            r#"{"body":"hello"}"#
+        );
+    }
+
+    #[test]
+    fn migration_refuses_newer_than_v61_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer-than-v61.db");
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch(&format!("PRAGMA user_version={};", SCHEMA_VERSION + 1))
+            .unwrap();
+        drop(raw);
+
+        assert!(matches!(
+            open(&path),
+            Err(QuorumError::SchemaTooNew {
+                db,
+                bin: SCHEMA_VERSION
+            }) if db == SCHEMA_VERSION + 1
+        ));
     }
 
     #[test]

@@ -324,6 +324,11 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
 /// introduced; the FK inventory test below fails when a new one is missed.
 const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
     ("cancelled_dependency_reconciliation", "cancelled_task_id"),
+    // A collaboration group owns its shared retention window. The task stays
+    // present until that group expires and bounded housekeeping removes the
+    // operation children before their parent attempt.
+    ("collaboration_attempts", "task_id"),
+    ("github_operations", "task_id"),
     ("task_decompositions", "source_task_id"),
     ("task_graph_members", "task_id"),
     ("decomposition_cleanup", "task_id"),
@@ -610,6 +615,10 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     delete_bounded(conn, "agent_sessions", now, limit)?;
     delete_bounded(conn, "activity_events", now, limit)?;
     delete_token_usage_bounded(conn, now, limit)?;
+    // A GitHub operation's retention is owned by its collaboration attempt,
+    // so child operations must be swept before their parent attempt.
+    delete_bounded(conn, "github_operations", now, limit)?;
+    delete_bounded(conn, "collaboration_attempts", now, limit)?;
     crate::task_messages::expire_stale_deliveries(conn, now, limit)?;
     delete_bounded(conn, "task_messages", now, limit)?;
     delete_reclaimable_task_rows_bounded(conn, now, limit)?;
@@ -653,6 +662,14 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
         params![now],
     )?;
     delete_all_expired_token_usage(&tx, now)?;
+    tx.execute(
+        "DELETE FROM github_operations WHERE expires_at <= ?1",
+        params![now],
+    )?;
+    tx.execute(
+        "DELETE FROM collaboration_attempts WHERE expires_at <= ?1",
+        params![now],
+    )?;
     crate::task_messages::expire_stale_deliveries(&tx, now, usize::MAX)?;
     tx.execute(
         "DELETE FROM task_messages WHERE expires_at <= ?1",
