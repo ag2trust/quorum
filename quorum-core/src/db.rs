@@ -1069,9 +1069,37 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
         // CREATE TABLE / constraint indexes handle both fresh databases and v60 upgrades.
         // This migration intentionally adds no executor, claim, MCP, or GitHub behavior.
 
-        // v62 = immutable enqueue boundary for the canonical GitHub operation outbox. The
-        // trigger is additive so a v61 database receives it under the migration write lock.
+        // v62 = canonical GitHub operation immutability plus reconciliation of the retired
+        // parallel-v61 table family. The legacy tables were never backed by an executor, so an
+        // empty pair is safe to remove. If either table contains a row, fail before dropping
+        // anything: durable attempt/operation identities must never be silently discarded.
         if current < 62 {
+            let legacy_attempts_present = table_exists(conn, "collaboration_attempts")?;
+            let legacy_operations_present = table_exists(conn, "github_operations")?;
+            if legacy_attempts_present || legacy_operations_present {
+                let legacy_attempts_have_rows = legacy_attempts_present
+                    && conn
+                        .prepare("SELECT 1 FROM collaboration_attempts LIMIT 1")?
+                        .exists([])?;
+                let legacy_operations_have_rows = legacy_operations_present
+                    && conn
+                        .prepare("SELECT 1 FROM github_operations LIMIT 1")?
+                        .exists([])?;
+                if legacy_attempts_have_rows || legacy_operations_have_rows {
+                    return Err(QuorumError::Db(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                        Some(
+                            "legacy v61 collaboration storage contains rows; refusing to remove it"
+                                .into(),
+                        ),
+                    )));
+                }
+                // Drop the child first. SQLite drops indexes and triggers owned by each table.
+                conn.execute_batch(
+                    "DROP TABLE IF EXISTS github_operations;
+                     DROP TABLE IF EXISTS collaboration_attempts;",
+                )?;
+            }
             conn.execute_batch(
                 "CREATE TRIGGER IF NOT EXISTS github_agent_operations_request_immutable
                  BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
@@ -1126,6 +1154,11 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
 fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool> {
     let mut stmt = conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?;
     Ok(stmt.exists(rusqlite::params![table, col])?)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?;
+    Ok(stmt.exists([table])?)
 }
 
 #[cfg(test)]
@@ -1930,6 +1963,193 @@ mod tests {
         );
     }
 
+    // Exact parallel storage DDL from the original v61 Task 108 lineage. It remains test-only:
+    // v62 converges on the canonical github_* family instead.
+    const LEGACY_PARALLEL_V61_SCHEMA: &str = r#"
+CREATE TABLE collaboration_attempts (
+    attempt_id             TEXT PRIMARY KEY
+                           CHECK(length(CAST(attempt_id AS BLOB)) BETWEEN 1 AND 128
+                                 AND instr(CAST(attempt_id AS BLOB), X'00') = 0),
+    task_id                INTEGER NOT NULL REFERENCES tasks(id),
+    agent                  TEXT NOT NULL
+                           CHECK(length(CAST(agent AS BLOB)) BETWEEN 1 AND 256
+                                 AND instr(CAST(agent AS BLOB), X'00') = 0),
+    role                   TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    pr_number              INTEGER NOT NULL CHECK(pr_number > 0),
+    head_sha               TEXT
+                           CHECK(head_sha IS NULL OR
+                                 (length(CAST(head_sha AS BLOB)) BETWEEN 1 AND 128
+                                  AND instr(CAST(head_sha AS BLOB), X'00') = 0)),
+    lifecycle_generation   INTEGER NOT NULL CHECK(lifecycle_generation >= 0),
+    active_run_id          TEXT REFERENCES run_capabilities(run_id),
+    review_owner_marker    TEXT UNIQUE
+                           CHECK(review_owner_marker IS NULL OR
+                                 (length(CAST(review_owner_marker AS BLOB)) BETWEEN 1 AND 512
+                                  AND instr(CAST(review_owner_marker AS BLOB), X'00') = 0)),
+    state                  TEXT NOT NULL
+                           CHECK(state IN ('active','awaiting_resume','completed','revoked')),
+    active                 INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+    review_sealed          INTEGER NOT NULL DEFAULT 0 CHECK(review_sealed IN (0,1)),
+    next_review_sequence   INTEGER NOT NULL DEFAULT 0 CHECK(next_review_sequence >= 0),
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    expires_at             INTEGER NOT NULL,
+    retention_started_at   INTEGER,
+    CHECK((role = 'reviewer' AND head_sha IS NOT NULL)
+          OR (role = 'worker' AND head_sha IS NULL)),
+    UNIQUE(active_run_id)
+);
+CREATE UNIQUE INDEX collaboration_attempts_one_active_binding
+    ON collaboration_attempts(
+        task_id, agent, role, pr_number, lifecycle_generation, COALESCE(head_sha, '')
+    ) WHERE active = 1;
+CREATE INDEX collaboration_attempts_task_expires
+    ON collaboration_attempts(task_id, expires_at);
+
+CREATE TABLE github_operations (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id          TEXT NOT NULL UNIQUE
+                          CHECK(length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 128
+                                AND instr(CAST(operation_id AS BLOB), X'00') = 0),
+    client_request_id     TEXT NOT NULL
+                          CHECK(length(CAST(client_request_id AS BLOB)) BETWEEN 1 AND 128
+                                AND instr(CAST(client_request_id AS BLOB), X'00') = 0),
+    attempt_id            TEXT NOT NULL REFERENCES collaboration_attempts(attempt_id),
+    created_by_run_id     TEXT NOT NULL REFERENCES run_capabilities(run_id),
+    task_id               INTEGER NOT NULL REFERENCES tasks(id),
+    agent                 TEXT NOT NULL
+                          CHECK(length(CAST(agent AS BLOB)) BETWEEN 1 AND 256
+                                AND instr(CAST(agent AS BLOB), X'00') = 0),
+    role                  TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    pr_number             INTEGER NOT NULL CHECK(pr_number > 0),
+    head_sha              TEXT
+                          CHECK(head_sha IS NULL OR
+                                (length(CAST(head_sha AS BLOB)) BETWEEN 1 AND 128
+                                 AND instr(CAST(head_sha AS BLOB), X'00') = 0)),
+    kind                  TEXT NOT NULL CHECK(kind IN (
+                              'pull_request_read',
+                              'add_issue_comment',
+                              'pull_request_review_write',
+                              'add_comment_to_pending_review',
+                              'add_reply_to_pull_request_comment',
+                              'resolve_review_thread'
+                          )),
+    request_json          TEXT NOT NULL CHECK(
+                              json_valid(request_json)
+                              AND json_type(request_json) = 'object'
+                              AND length(CAST(request_json AS BLOB)) <= 65536
+                          ),
+    state                 TEXT NOT NULL DEFAULT 'queued'
+                          CHECK(state IN ('queued','running','succeeded','failed','cancelled')),
+    send_state            TEXT NOT NULL DEFAULT 'not_started'
+                          CHECK(send_state IN ('not_started','definitely_unsent',
+                                               'ambiguous','confirmed')),
+    attempts              INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 8),
+    next_attempt_at       INTEGER,
+    deadline_at           INTEGER NOT NULL,
+    review_sequence       INTEGER CHECK(review_sequence IS NULL OR review_sequence >= 0),
+    github_marker         TEXT UNIQUE
+                          CHECK(github_marker IS NULL OR
+                                (length(CAST(github_marker AS BLOB)) BETWEEN 1 AND 512
+                                 AND instr(CAST(github_marker AS BLOB), X'00') = 0)),
+    remote_object_id      TEXT
+                          CHECK(remote_object_id IS NULL OR
+                                (length(CAST(remote_object_id AS BLOB)) BETWEEN 1 AND 256
+                                 AND instr(CAST(remote_object_id AS BLOB), X'00') = 0)),
+    response_json         TEXT CHECK(response_json IS NULL OR
+                              (json_valid(response_json)
+                               AND length(CAST(response_json AS BLOB)) <= 65536)),
+    error_kind            TEXT CHECK(error_kind IS NULL OR
+                              (length(CAST(error_kind AS BLOB)) BETWEEN 1 AND 64
+                               AND instr(CAST(error_kind AS BLOB), X'00') = 0)),
+    error_summary         TEXT CHECK(error_summary IS NULL OR
+                              (length(CAST(error_summary AS BLOB)) <= 2048
+                               AND instr(CAST(error_summary AS BLOB), X'00') = 0)),
+    completed_after_revocation INTEGER NOT NULL DEFAULT 0
+                               CHECK(completed_after_revocation IN (0,1)),
+    created_at            INTEGER NOT NULL,
+    enqueued_at           INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    expires_at            INTEGER NOT NULL,
+    CHECK((role = 'reviewer' AND head_sha IS NOT NULL)
+          OR (role = 'worker' AND head_sha IS NULL)),
+    UNIQUE(attempt_id, client_request_id),
+    UNIQUE(attempt_id, review_sequence)
+);
+CREATE INDEX github_operations_attempt_state
+    ON github_operations(attempt_id, state, next_attempt_at);
+CREATE INDEX github_operations_task_expires
+    ON github_operations(task_id, expires_at);
+CREATE INDEX github_operations_expires ON github_operations(expires_at);
+CREATE TRIGGER github_operations_request_immutable
+BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
+                 task_id, agent, role, pr_number, head_sha, kind, request_json,
+                 github_marker, created_at, enqueued_at ON github_operations
+BEGIN
+    SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
+END;
+"#;
+
+    fn prepare_legacy_parallel_v61_db(path: &Path, with_rows: bool) {
+        let conn = open(path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS github_agent_operations_request_immutable;
+             DROP TABLE github_review_publication_slots;
+             DROP TABLE github_agent_operations;
+             DROP TABLE github_collaboration_attempts;",
+        )
+        .unwrap();
+        conn.execute_batch(LEGACY_PARALLEL_V61_SCHEMA).unwrap();
+        if with_rows {
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                     VALUES (1,'legacy collaboration','working','owner',1,1);
+                 INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                     VALUES ('legacy-run',1,'Worker','worker',1);
+                 INSERT INTO collaboration_attempts(
+                     attempt_id,task_id,agent,role,pr_number,lifecycle_generation,active_run_id,
+                     state,active,created_at,updated_at,expires_at
+                 ) VALUES ('legacy-attempt',1,'Worker','worker',7,1,'legacy-run',
+                           'active',1,1,1,999);
+                 INSERT INTO github_operations(
+                     operation_id,client_request_id,attempt_id,created_by_run_id,
+                     task_id,agent,role,pr_number,kind,request_json,state,
+                     deadline_at,created_at,enqueued_at,updated_at,expires_at
+                 ) VALUES ('legacy-operation','legacy-request','legacy-attempt','legacy-run',
+                           1,'Worker','worker',7,'pull_request_read','{}','queued',
+                           999,1,1,1,999);",
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version=61;").unwrap();
+    }
+
+    fn assert_legacy_parallel_objects_absent(conn: &Connection) {
+        for object in [
+            ("table", "collaboration_attempts"),
+            ("table", "github_operations"),
+            ("index", "collaboration_attempts_one_active_binding"),
+            ("index", "collaboration_attempts_task_expires"),
+            ("index", "github_operations_attempt_state"),
+            ("index", "github_operations_task_expires"),
+            ("index", "github_operations_expires"),
+            ("trigger", "github_operations_request_immutable"),
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+                    object,
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+                "legacy {} {} must be removed",
+                object.0,
+                object.1
+            );
+        }
+    }
+
     fn prepare_v60_github_collaboration_db(path: &Path) {
         let conn = open(path).unwrap();
         conn.execute_batch(
@@ -2276,6 +2496,130 @@ mod tests {
                 )
                 .unwrap(),
             r#"{"body":"hello"}"#
+        );
+    }
+
+    #[test]
+    fn migrates_empty_legacy_parallel_v61_to_canonical_v62_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-parallel-v61.db");
+        prepare_legacy_parallel_v61_db(&path, false);
+
+        let migrated = open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_legacy_parallel_objects_absent(&migrated);
+        for table in [
+            "github_collaboration_attempts",
+            "github_agent_operations",
+            "github_review_publication_slots",
+        ] {
+            assert_eq!(
+                migrated
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                        [table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "{table} must exist after legacy-v61 reconciliation"
+            );
+        }
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='trigger' AND name='github_agent_operations_request_immutable'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        migrated.execute_batch("PRAGMA user_version=61;").unwrap();
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_legacy_parallel_objects_absent(&reopened);
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='trigger' AND name='github_agent_operations_request_immutable'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_parallel_v61_rows_fail_loudly_without_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-parallel-v61-rows.db");
+        prepare_legacy_parallel_v61_db(&path, true);
+
+        let error = open(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("legacy v61 collaboration storage contains rows"),
+            "migration must fail loudly rather than discard legacy rows: {error}"
+        );
+
+        let raw = Connection::open(&path).unwrap();
+        assert_eq!(
+            raw.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            61,
+            "a failed reconciliation must leave the migration unadvanced"
+        );
+        for table in ["collaboration_attempts", "github_operations"] {
+            assert_eq!(
+                raw.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "{table} must remain after a loud migration failure"
+            );
+        }
+        assert_eq!(
+            raw.query_row("SELECT COUNT(*) FROM collaboration_attempts", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            raw.query_row("SELECT COUNT(*) FROM github_operations", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            raw.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='github_agent_operations'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "the failed transaction must roll back canonical table creation"
         );
     }
 
