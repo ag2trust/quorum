@@ -2345,6 +2345,27 @@ code remains non-adoptable. It does not discover candidates, infer equivalence, 
 automatic path's event rules. A rejected pair, replay, or concurrent loser is a clean negative
 with no provenance or lifecycle event.
 
+One legacy prepublication shape is also eligible through that exact operator surface. It exists
+only for a generated final child that an older retry reopened after daemon-owned publication had
+already failed, leaving the live graph blocked by the corresponding legacy non-JSON
+`generated-child-failed` summary. The child must be unassigned `open`, have no completion or PR
+target, and retain a task-scoped `daemon_publication` intent with no PR, remote SHA, or resolved
+target and with a valid preserved local commit SHA. The publication branch must match the exact
+daemon-authored grammar `daemon/<author-slug>-t<child-id>`, where `<author-slug>` is a non-empty
+lowercase ASCII `[a-z0-9-]+` run and `<child-id>` is the exact child ID. The hold must name that
+exact child and branch; all siblings must be done. The operator-named managed continuation must
+postdate the stale child, satisfy the ordinary durable worker, approved-head, sampling, and
+merged-provenance chain, and be merged to the decomposition source's
+immutable target branch. This is not a general open-task adoption path: any structured/current
+hold, assigned child, advanced publication state, target mismatch, stale PR row, malformed
+task-scoped branch (including non-daemon prefixes, empty slugs, nested paths, whitespace,
+uppercase letters, dots, embedded NULs, and other invalid characters) or SHA is a clean negative.
+Both branch and SHA reject embedded NULs before their length or character-class checks. Classifier duplicate hints grant no lifecycle
+authority and are neither required nor sufficient. Success
+records the preserved publication branch and SHA in both recovery audit projections, removes the
+stale publication intent, completes the child, clears only that exact legacy hold, and completes
+the graph and source in the same transaction.
+
 After graph consistency reconciliation and before generic stateless lifecycle recovery or
 provisioning, the daemon automatically discovers eligible event-backed deliveries at startup and
 on ordinary ticks. Discovery
