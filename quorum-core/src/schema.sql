@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 62). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 63). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -984,6 +984,12 @@ CREATE TABLE IF NOT EXISTS github_collaboration_attempts (
     pr_number           INTEGER NOT NULL,
     head_sha            TEXT,
     lifecycle_generation INTEGER NOT NULL,
+    -- v63: immutable daemon-resolved provider-turn identity. New attempts
+    -- always bind a provider; continuation/pending-turn fields remain NULL
+    -- only until the daemon has persisted an exact resumable handoff.
+    turn_provider       TEXT,
+    turn_continuation_id TEXT,
+    pending_turn_json   TEXT,
     active_run_id       TEXT REFERENCES run_capabilities(run_id),
     review_owner_marker TEXT UNIQUE,
     state               TEXT NOT NULL

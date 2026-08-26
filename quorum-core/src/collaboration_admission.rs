@@ -5,7 +5,7 @@
 //! separate: attempts only establish the durable, exact managed-turn identity
 //! on which those later paths rely.
 
-use crate::capabilities::{self, LiveRunContextResolution};
+use crate::capabilities::{self, LiveCollaborationContext, LiveCollaborationContextResolution};
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -608,6 +608,9 @@ struct StoredAttempt {
     pr_number: i64,
     head_sha: Option<String>,
     lifecycle_generation: i64,
+    turn_provider: Option<String>,
+    turn_continuation_id: Option<String>,
+    pending_turn_json: Option<String>,
     active_run_id: Option<String>,
     state: CollaborationAttemptState,
     expires_at: i64,
@@ -647,14 +650,14 @@ fn get_attempt(
     attempt_id: &CollaborationAttemptId,
 ) -> Result<Option<StoredAttempt>> {
     conn.query_row(
-        "SELECT task_id,agent,role,pr_number,head_sha,lifecycle_generation,active_run_id,state,
-                expires_at
+        "SELECT task_id,agent,role,pr_number,head_sha,lifecycle_generation,turn_provider,
+                turn_continuation_id,pending_turn_json,active_run_id,state,expires_at
          FROM github_collaboration_attempts WHERE attempt_id=?1",
         [attempt_id.as_str()],
         |row| {
-            let state: String = row.get(7)?;
+            let state: String = row.get(10)?;
             let state = state.parse().map_err(|_| {
-                rusqlite::Error::InvalidColumnType(7, "state".into(), rusqlite::types::Type::Text)
+                rusqlite::Error::InvalidColumnType(10, "state".into(), rusqlite::types::Type::Text)
             })?;
             Ok(StoredAttempt {
                 task_id: row.get(0)?,
@@ -663,9 +666,12 @@ fn get_attempt(
                 pr_number: row.get(3)?,
                 head_sha: row.get(4)?,
                 lifecycle_generation: row.get(5)?,
-                active_run_id: row.get(6)?,
+                turn_provider: row.get(6)?,
+                turn_continuation_id: row.get(7)?,
+                pending_turn_json: row.get(8)?,
+                active_run_id: row.get(9)?,
                 state,
-                expires_at: row.get(8)?,
+                expires_at: row.get(11)?,
             })
         },
     )
@@ -685,35 +691,57 @@ fn request_matches_attempt(
         && attempt.lifecycle_generation == request.lifecycle_generation()
 }
 
-/// Revalidate request-shaped context against daemon-owned authority. Capability
-/// failures are deliberately returned as a closed clean negative; database
-/// failures retain the normal error path.
-fn validate_request_authority(
+enum AttemptAuthority {
+    Authorized(Box<LiveCollaborationContext>),
+    Rejected(CollaborationAdmissionError),
+}
+
+/// Revalidate request-shaped context against daemon-owned authority. The
+/// lifecycle generation and provider-turn identity are derived from durable
+/// daemon state, never accepted from the request.
+fn resolve_attempt_authority(
     conn: &Connection,
     request: &CreateCollaborationAttemptRequest,
-) -> Result<Option<CollaborationAdmissionError>> {
-    let context = match capabilities::resolve_live_run_context_for_admission(
+) -> Result<AttemptAuthority> {
+    let context = match capabilities::resolve_live_collaboration_context_for_admission(
         conn,
         request.active_run_id().as_str(),
         request.role().as_str(),
     )? {
-        LiveRunContextResolution::Live(context) => context,
-        LiveRunContextResolution::Rejected => {
-            return Ok(Some(CollaborationAdmissionError::CapabilityRejected));
+        LiveCollaborationContextResolution::Live(context) => *context,
+        LiveCollaborationContextResolution::Rejected => {
+            return Ok(AttemptAuthority::Rejected(
+                CollaborationAdmissionError::CapabilityRejected,
+            ));
         }
     };
-    Ok((context.task_id != request.task_id()
-        || context.agent != request.agent().as_str()
-        || context.role != request.role().as_str()
-        || context.pr != Some(request.pr_number())
-        || context.review_revision.as_deref()
-            != request.reviewer_head_sha().map(ReviewerHeadSha::as_str))
-    .then_some(CollaborationAdmissionError::AttemptBindingMismatch))
+    let run = &context.run;
+    Ok(
+        if run.task_id != request.task_id()
+            || run.agent != request.agent().as_str()
+            || run.role != request.role().as_str()
+            || run.pr != Some(request.pr_number())
+            || run.review_revision.as_deref()
+                != request.reviewer_head_sha().map(ReviewerHeadSha::as_str)
+            || context.lifecycle_generation != request.lifecycle_generation()
+        {
+            AttemptAuthority::Rejected(CollaborationAdmissionError::AttemptBindingMismatch)
+        } else {
+            AttemptAuthority::Authorized(Box::new(context))
+        },
+    )
+}
+
+fn attempt_matches_turn(attempt: &StoredAttempt, authority: &LiveCollaborationContext) -> bool {
+    attempt.turn_provider.as_deref() == Some(authority.turn_provider.as_str())
+        && attempt.turn_continuation_id.as_deref() == authority.turn_continuation_id.as_deref()
+        && attempt.pending_turn_json.as_deref() == authority.pending_turn_json.as_deref()
 }
 
 fn logical_attempt_exists(
     conn: &Connection,
     request: &CreateCollaborationAttemptRequest,
+    now: i64,
 ) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(
@@ -721,6 +749,7 @@ fn logical_attempt_exists(
              WHERE task_id=?1 AND agent=?2 AND role=?3 AND pr_number=?4
                AND head_sha IS ?5 AND lifecycle_generation=?6
                AND state IN ('active','awaiting_resume')
+               AND expires_at>?7
          )",
         params![
             request.task_id(),
@@ -729,10 +758,27 @@ fn logical_attempt_exists(
             request.pr_number(),
             request.reviewer_head_sha().map(ReviewerHeadSha::as_str),
             request.lifecycle_generation(),
+            now,
         ],
         |row| row.get(0),
     )
     .map_err(Into::into)
+}
+
+/// Physical release of a logically dead unique run binding. Retention rows
+/// remain for audit; clearing this pointer only prevents SQLite's unconditional
+/// `UNIQUE(active_run_id)` from overriding logical expiry on a new issuance.
+fn release_expired_run_binding(
+    conn: &Connection,
+    run_id: &RunCapabilityId,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE github_collaboration_attempts SET active_run_id=NULL
+         WHERE active_run_id=?1 AND expires_at<=?2",
+        params![run_id.as_str(), now],
+    )?;
+    Ok(())
 }
 
 fn capacity_rejection(
@@ -761,27 +807,44 @@ fn capacity_rejection(
 }
 
 /// Issue the one active collaboration attempt for a daemon-created logical
-/// turn. The supplied binding is only an assertion: task, agent, role, PR, and
-/// reviewer SHA are derived again from the live run capability inside the same
-/// `BEGIN IMMEDIATE` transaction as the insert.
+/// turn. The supplied binding is only an assertion: task, agent, role, PR,
+/// reviewer SHA, lifecycle generation, and provider-turn identity are derived
+/// again from daemon-owned state inside the same `BEGIN IMMEDIATE` transaction
+/// as the insert. `now` is the daemon's authoritative admission time.
 pub fn issue_attempt(
     conn: &mut Connection,
     request: &CreateCollaborationAttemptRequest,
+    now: i64,
 ) -> Result<CollaborationAttemptAdmissionResult> {
+    if now < 0 {
+        return Err(QuorumError::Usage(
+            "collaboration admission timestamp is invalid".into(),
+        ));
+    }
     let tx = begin_immediate(conn)?;
-    if let Some(rejection) = validate_request_authority(&tx, request)? {
+    let authority = match resolve_attempt_authority(&tx, request)? {
+        AttemptAuthority::Authorized(authority) => *authority,
+        AttemptAuthority::Rejected(rejection) => {
+            tx.commit()?;
+            return Ok(CollaborationAttemptAdmissionResult::Rejected(rejection));
+        }
+    };
+    if request.expires_at() <= now {
         tx.commit()?;
-        return Ok(CollaborationAttemptAdmissionResult::Rejected(rejection));
+        return Ok(CollaborationAttemptAdmissionResult::Rejected(
+            CollaborationAdmissionError::AttemptExpired,
+        ));
     }
 
     if let Some(existing) = get_attempt(&tx, request.attempt_id())? {
-        let result = if existing.expires_at <= request.created_at() {
+        let result = if existing.expires_at <= now {
             CollaborationAttemptAdmissionResult::Rejected(
                 CollaborationAdmissionError::AttemptExpired,
             )
         } else if request_matches_attempt(request, &existing)
             && existing.state == CollaborationAttemptState::Active
             && existing.active_run_id.as_deref() == Some(request.active_run_id().as_str())
+            && attempt_matches_turn(&existing, &authority)
         {
             CollaborationAttemptAdmissionResult::Existing(CollaborationAttemptStatus {
                 attempt_id: request.attempt_id().clone(),
@@ -798,15 +861,19 @@ pub fn issue_attempt(
         return Ok(result);
     }
 
-    if logical_attempt_exists(&tx, request)? {
+    if logical_attempt_exists(&tx, request, now)? {
         tx.commit()?;
         return Ok(CollaborationAttemptAdmissionResult::Rejected(
             CollaborationAdmissionError::ActiveAttemptExists,
         ));
     }
+    release_expired_run_binding(&tx, request.active_run_id(), now)?;
     let run_already_bound: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM github_collaboration_attempts WHERE active_run_id=?1)",
-        [request.active_run_id().as_str()],
+        "SELECT EXISTS(
+             SELECT 1 FROM github_collaboration_attempts
+             WHERE active_run_id=?1 AND expires_at>?2
+         )",
+        params![request.active_run_id().as_str(), now],
         |row| row.get(0),
     )?;
     if run_already_bound {
@@ -815,7 +882,7 @@ pub fn issue_attempt(
             CollaborationAdmissionError::ActiveAttemptExists,
         ));
     }
-    if let Some(rejection) = capacity_rejection(&tx, request.task_id(), request.created_at())? {
+    if let Some(rejection) = capacity_rejection(&tx, request.task_id(), now)? {
         tx.commit()?;
         return Ok(CollaborationAttemptAdmissionResult::Rejected(rejection));
     }
@@ -823,8 +890,9 @@ pub fn issue_attempt(
     let created = tx.query_row(
         "INSERT INTO github_collaboration_attempts(
              attempt_id,task_id,agent,role,pr_number,head_sha,lifecycle_generation,
-             active_run_id,state,created_at,updated_at,expires_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'active',?9,?9,?10)
+             turn_provider,turn_continuation_id,pending_turn_json,active_run_id,state,
+             created_at,updated_at,expires_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'active',?12,?12,?13)
          RETURNING attempt_id,state,lifecycle_generation,expires_at",
         params![
             request.attempt_id().as_str(),
@@ -834,8 +902,11 @@ pub fn issue_attempt(
             request.pr_number(),
             request.reviewer_head_sha().map(ReviewerHeadSha::as_str),
             request.lifecycle_generation(),
+            authority.turn_provider,
+            authority.turn_continuation_id,
+            authority.pending_turn_json,
             request.active_run_id().as_str(),
-            request.created_at(),
+            now,
             request.expires_at(),
         ],
         row_to_status,
@@ -858,18 +929,29 @@ pub fn adopt_exact_continuation(
         ));
     }
     let tx = begin_immediate(conn)?;
-    if let Some(rejection) = validate_request_authority(&tx, request)? {
+    let authority = match resolve_attempt_authority(&tx, request)? {
+        AttemptAuthority::Authorized(authority) => *authority,
+        AttemptAuthority::Rejected(rejection) => {
+            tx.commit()?;
+            return Ok(CollaborationAttemptTransitionResult::Rejected(rejection));
+        }
+    };
+    let Some(turn_continuation_id) = authority.turn_continuation_id.as_deref() else {
         tx.commit()?;
-        return Ok(CollaborationAttemptTransitionResult::Rejected(rejection));
-    }
+        return Ok(CollaborationAttemptTransitionResult::Rejected(
+            CollaborationAdmissionError::ContinuationMismatch,
+        ));
+    };
+    release_expired_run_binding(&tx, request.active_run_id(), now)?;
     let run_already_bound: bool = tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM github_collaboration_attempts
-             WHERE active_run_id=?1 AND attempt_id<>?2
+             WHERE active_run_id=?1 AND attempt_id<>?2 AND expires_at>?3
          )",
         params![
             request.active_run_id().as_str(),
-            request.attempt_id().as_str()
+            request.attempt_id().as_str(),
+            now,
         ],
         |row| row.get(0),
     )?;
@@ -883,10 +965,12 @@ pub fn adopt_exact_continuation(
     let adopted = tx
         .query_row(
             "UPDATE github_collaboration_attempts
-             SET active_run_id=?2,state='active',updated_at=?9
+             SET active_run_id=?2,state='active',updated_at=?12
              WHERE attempt_id=?1 AND state='awaiting_resume' AND active_run_id IS NULL
                AND task_id=?3 AND agent=?4 AND role=?5 AND pr_number=?6
-               AND head_sha IS ?7 AND lifecycle_generation=?8 AND expires_at>?9
+               AND head_sha IS ?7 AND lifecycle_generation=?8
+               AND turn_provider=?9 AND turn_continuation_id=?10
+               AND pending_turn_json IS ?11 AND expires_at>?12
              RETURNING attempt_id,state,lifecycle_generation,expires_at",
             params![
                 request.attempt_id().as_str(),
@@ -897,6 +981,9 @@ pub fn adopt_exact_continuation(
                 request.pr_number(),
                 request.reviewer_head_sha().map(ReviewerHeadSha::as_str),
                 request.lifecycle_generation(),
+                authority.turn_provider,
+                turn_continuation_id,
+                authority.pending_turn_json,
                 now,
             ],
             row_to_status,
@@ -912,7 +999,8 @@ pub fn adopt_exact_continuation(
         Some(existing)
             if request_matches_attempt(request, &existing)
                 && existing.state == CollaborationAttemptState::Active
-                && existing.active_run_id.as_deref() == Some(request.active_run_id().as_str()) =>
+                && existing.active_run_id.as_deref() == Some(request.active_run_id().as_str())
+                && attempt_matches_turn(&existing, &authority) =>
         {
             let status = CollaborationAttemptStatus {
                 attempt_id: request.attempt_id().clone(),
@@ -948,17 +1036,29 @@ fn transition_active_attempt(
         ));
     }
     let tx = begin_immediate(conn)?;
-    if let Some(rejection) = validate_request_authority(&tx, request)? {
+    let authority = match resolve_attempt_authority(&tx, request)? {
+        AttemptAuthority::Authorized(authority) => *authority,
+        AttemptAuthority::Rejected(rejection) => {
+            tx.commit()?;
+            return Ok(CollaborationAttemptTransitionResult::Rejected(rejection));
+        }
+    };
+    if target == CollaborationAttemptState::AwaitingResume
+        && authority.turn_continuation_id.is_none()
+    {
         tx.commit()?;
-        return Ok(CollaborationAttemptTransitionResult::Rejected(rejection));
+        return Ok(CollaborationAttemptTransitionResult::Rejected(
+            CollaborationAdmissionError::ContinuationMismatch,
+        ));
     }
     let transitioned = tx
         .query_row(
             "UPDATE github_collaboration_attempts
-             SET active_run_id=NULL,state=?9,updated_at=?10
+             SET active_run_id=NULL,state=?9,turn_provider=?10,
+                 turn_continuation_id=?11,pending_turn_json=?12,updated_at=?13
              WHERE attempt_id=?1 AND active_run_id=?2 AND state='active'
                AND task_id=?3 AND agent=?4 AND role=?5 AND pr_number=?6
-               AND head_sha IS ?7 AND lifecycle_generation=?8 AND expires_at>?10
+               AND head_sha IS ?7 AND lifecycle_generation=?8 AND expires_at>?13
              RETURNING attempt_id,state,lifecycle_generation,expires_at",
             params![
                 request.attempt_id().as_str(),
@@ -970,6 +1070,9 @@ fn transition_active_attempt(
                 request.reviewer_head_sha().map(ReviewerHeadSha::as_str),
                 request.lifecycle_generation(),
                 target.as_str(),
+                authority.turn_provider,
+                authority.turn_continuation_id,
+                authority.pending_turn_json,
                 now,
             ],
             row_to_status,
@@ -1049,7 +1152,23 @@ mod tests {
             "INSERT INTO tasks(
                  id,title,status,assignee,author,created_by,created_at,updated_at,refs
              ) VALUES (?1,'collaboration test','rework',?2,?2,'owner',1,1,?3)",
-            params![task_id, agent, serde_json::json!({"pr": pr}).to_string()],
+            params![
+                task_id,
+                agent,
+                serde_json::json!({
+                    "pr": pr,
+                    "runner_retry": {
+                        "provider": "codex",
+                        "model": "model",
+                        "effort": "high",
+                        "prompt": "resume exact collaboration turn",
+                        "turn_kind": "rework",
+                        "continuation_id": "turn-exact",
+                        "requested": true
+                    }
+                })
+                .to_string()
+            ],
         )
         .unwrap();
     }
@@ -1102,7 +1221,7 @@ mod tests {
             CollaborationRole::Reviewer,
             WORKER_PR,
             Some(ReviewerHeadSha::new(reviewer_sha).unwrap()),
-            1,
+            0,
             RunCapabilityId::new(run_id).unwrap(),
             20,
             1_000,
@@ -1197,9 +1316,9 @@ mod tests {
         let (_dir, mut conn) = open_tmp();
         insert_worker_task(&conn, 1, "Worker", WORKER_PR);
         insert_live_worker(&mut conn, 1, "Worker", "run-original", 10);
-        let original = worker_request("attempt-1", "run-original", 1, "Worker", 7);
+        let original = worker_request("attempt-1", "run-original", 1, "Worker", 0);
         assert!(matches!(
-            issue_attempt(&mut conn, &original).unwrap(),
+            issue_attempt(&mut conn, &original, 20).unwrap(),
             CollaborationAttemptAdmissionResult::Created(_)
         ));
         assert!(matches!(
@@ -1214,7 +1333,7 @@ mod tests {
         )
         .unwrap();
         insert_live_worker(&mut conn, 1, "Worker", "run-resume", 30);
-        let resumed = worker_request("attempt-1", "run-resume", 1, "Worker", 7);
+        let resumed = worker_request("attempt-1", "run-resume", 1, "Worker", 0);
 
         let adopted = adopt_exact_continuation(&mut conn, &resumed, 31).unwrap();
         assert!(matches!(
@@ -1239,6 +1358,121 @@ mod tests {
     }
 
     #[test]
+    fn exact_continuation_rejects_changed_lifecycle_generation() {
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", "run-original", 10);
+        let original = worker_request("attempt-generation", "run-original", 1, "Worker", 0);
+        assert!(matches!(
+            issue_attempt(&mut conn, &original, 20).unwrap(),
+            CollaborationAttemptAdmissionResult::Created(_)
+        ));
+        assert!(matches!(
+            mark_awaiting_resume(&mut conn, &original, 21).unwrap(),
+            CollaborationAttemptTransitionResult::Transitioned(_)
+        ));
+        crate::capabilities::revoke(&mut conn, "run-original", 22).unwrap();
+        conn.execute(
+            "UPDATE agent_runs SET ended_at=22 WHERE task_id=1 AND agent_name='Worker'",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET rework_round=1 WHERE id=1", [])
+            .unwrap();
+        insert_live_worker(&mut conn, 1, "Worker", "run-new-generation", 30);
+        let resumed = worker_request("attempt-generation", "run-new-generation", 1, "Worker", 0);
+
+        assert!(matches!(
+            adopt_exact_continuation(&mut conn, &resumed, 31).unwrap(),
+            CollaborationAttemptTransitionResult::Rejected(
+                CollaborationAdmissionError::AttemptBindingMismatch
+            )
+        ));
+    }
+
+    #[test]
+    fn exact_continuation_rejects_changed_daemon_pending_turn() {
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", "run-original", 10);
+        let original = worker_request("attempt-turn", "run-original", 1, "Worker", 0);
+        assert!(matches!(
+            issue_attempt(&mut conn, &original, 20).unwrap(),
+            CollaborationAttemptAdmissionResult::Created(_)
+        ));
+        assert!(matches!(
+            mark_awaiting_resume(&mut conn, &original, 21).unwrap(),
+            CollaborationAttemptTransitionResult::Transitioned(_)
+        ));
+        crate::capabilities::revoke(&mut conn, "run-original", 22).unwrap();
+        conn.execute(
+            "UPDATE agent_runs SET ended_at=22 WHERE task_id=1 AND agent_name='Worker'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET refs=?1 WHERE id=1",
+            [serde_json::json!({
+                "pr": WORKER_PR,
+                "runner_retry": {
+                    "provider": "codex",
+                    "model": "model",
+                    "effort": "high",
+                    "prompt": "a different daemon-owned turn",
+                    "turn_kind": "rework",
+                    "continuation_id": "turn-other",
+                    "requested": true
+                }
+            })
+            .to_string()],
+        )
+        .unwrap();
+        insert_live_worker(&mut conn, 1, "Worker", "run-other-turn", 30);
+        let resumed = worker_request("attempt-turn", "run-other-turn", 1, "Worker", 0);
+
+        assert!(matches!(
+            adopt_exact_continuation(&mut conn, &resumed, 31).unwrap(),
+            CollaborationAttemptTransitionResult::Rejected(
+                CollaborationAdmissionError::ContinuationMismatch
+            )
+        ));
+    }
+
+    #[test]
+    fn issuance_ignores_expired_resumable_attempt_and_releases_expired_run_binding() {
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", "run-live", 10);
+        let expired = worker_request("attempt-expired", "run-live", 1, "Worker", 0);
+        assert!(matches!(
+            issue_attempt(&mut conn, &expired, 20).unwrap(),
+            CollaborationAttemptAdmissionResult::Created(_)
+        ));
+        conn.execute(
+            "UPDATE github_collaboration_attempts SET expires_at=20 WHERE attempt_id='attempt-expired'",
+            [],
+        )
+        .unwrap();
+        let fresh = worker_request("attempt-fresh", "run-live", 1, "Worker", 0);
+
+        assert!(matches!(
+            issue_attempt(&mut conn, &fresh, 21).unwrap(),
+            CollaborationAttemptAdmissionResult::Created(_)
+        ));
+        let expired_run: Option<String> = conn
+            .query_row(
+                "SELECT active_run_id FROM github_collaboration_attempts WHERE attempt_id='attempt-expired'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            expired_run, None,
+            "expired run binding must not block re-issuance"
+        );
+    }
+
+    #[test]
     fn issuance_rejects_foreign_stale_revoked_and_mismatched_pr_capabilities() {
         let (_dir, mut conn) = open_tmp();
         insert_worker_task(&conn, 1, "Worker", WORKER_PR);
@@ -1246,9 +1480,9 @@ mod tests {
 
         insert_worker_task(&conn, 2, "Other", WORKER_PR);
         insert_live_worker(&mut conn, 2, "Other", "run-foreign", 10);
-        let foreign = worker_request("foreign", "run-foreign", 1, "Worker", 1);
+        let foreign = worker_request("foreign", "run-foreign", 1, "Worker", 0);
         assert!(matches!(
-            issue_attempt(&mut conn, &foreign).unwrap(),
+            issue_attempt(&mut conn, &foreign, 20).unwrap(),
             CollaborationAttemptAdmissionResult::Rejected(
                 CollaborationAdmissionError::AttemptBindingMismatch
             )
@@ -1261,14 +1495,14 @@ mod tests {
             CollaborationRole::Worker,
             WORKER_PR + 1,
             None,
-            1,
+            0,
             RunCapabilityId::new("run-live").unwrap(),
             20,
             1_000,
         )
         .unwrap();
         assert!(matches!(
-            issue_attempt(&mut conn, &wrong_pr).unwrap(),
+            issue_attempt(&mut conn, &wrong_pr, 20).unwrap(),
             CollaborationAttemptAdmissionResult::Rejected(
                 CollaborationAdmissionError::AttemptBindingMismatch
             )
@@ -1279,18 +1513,18 @@ mod tests {
             [],
         )
         .unwrap();
-        let stale = worker_request("stale", "run-live", 1, "Worker", 1);
+        let stale = worker_request("stale", "run-live", 1, "Worker", 0);
         assert!(matches!(
-            issue_attempt(&mut conn, &stale).unwrap(),
+            issue_attempt(&mut conn, &stale, 20).unwrap(),
             CollaborationAttemptAdmissionResult::Rejected(
                 CollaborationAdmissionError::CapabilityRejected
             )
         ));
 
         crate::capabilities::revoke(&mut conn, "run-live", 12).unwrap();
-        let revoked = worker_request("revoked", "run-live", 1, "Worker", 1);
+        let revoked = worker_request("revoked", "run-live", 1, "Worker", 0);
         assert!(matches!(
-            issue_attempt(&mut conn, &revoked).unwrap(),
+            issue_attempt(&mut conn, &revoked, 20).unwrap(),
             CollaborationAttemptAdmissionResult::Rejected(
                 CollaborationAdmissionError::CapabilityRejected
             )
@@ -1311,7 +1545,7 @@ mod tests {
             "ffffffffffffffffffffffffffffffffffffffff",
         );
         assert!(matches!(
-            issue_attempt(&mut conn, &mismatched).unwrap(),
+            issue_attempt(&mut conn, &mismatched, 20).unwrap(),
             CollaborationAttemptAdmissionResult::Rejected(
                 CollaborationAdmissionError::AttemptBindingMismatch
             )
@@ -1333,9 +1567,9 @@ mod tests {
         let (dir, mut conn) = open_tmp();
         insert_worker_task(&conn, 1, "Worker", WORKER_PR);
         insert_live_worker(&mut conn, 1, "Worker", "race-run", 10);
-        let request = worker_request("attempt-terminal", "race-run", 1, "Worker", 1);
+        let request = worker_request("attempt-terminal", "race-run", 1, "Worker", 0);
         assert!(matches!(
-            issue_attempt(&mut conn, &request).unwrap(),
+            issue_attempt(&mut conn, &request, 20).unwrap(),
             CollaborationAttemptAdmissionResult::Created(_)
         ));
         let path = dir.path().join("q.db");
@@ -1413,9 +1647,9 @@ mod tests {
             )
             .unwrap();
         }
-        let request = worker_request("over-capacity", "capacity-run", 1, "Worker", 1);
+        let request = worker_request("over-capacity", "capacity-run", 1, "Worker", 0);
         assert!(matches!(
-            issue_attempt(&mut conn, &request).unwrap(),
+            issue_attempt(&mut conn, &request, 20).unwrap(),
             CollaborationAttemptAdmissionResult::Rejected(
                 CollaborationAdmissionError::AttemptLimitReached
             )
@@ -1445,8 +1679,8 @@ mod tests {
         if let (Ok(path), Ok(attempt_id)) = (std::env::var(CHILD_DB), std::env::var(CHILD_ATTEMPT))
         {
             let mut conn = crate::db::open(std::path::Path::new(&path)).unwrap();
-            let request = worker_request(&attempt_id, "race-run", 1, "Worker", 1);
-            let result = issue_attempt(&mut conn, &request).unwrap();
+            let request = worker_request(&attempt_id, "race-run", 1, "Worker", 0);
+            let result = issue_attempt(&mut conn, &request, 20).unwrap();
             assert!(matches!(
                 result,
                 CollaborationAttemptAdmissionResult::Created(_)
