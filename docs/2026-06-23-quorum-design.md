@@ -2351,12 +2351,13 @@ already failed, leaving the live graph blocked by the corresponding legacy non-J
 `generated-child-failed` summary. The child must be unassigned `open`, have no completion or PR
 target, and retain a task-scoped `daemon_publication` intent with no PR, remote SHA, or resolved
 target and with a valid preserved local commit SHA. The hold must name that exact child and
-publication branch; all siblings must be done. The named managed continuation must postdate the
-stale child, be classified as its exact duplicate, satisfy the ordinary durable worker,
-approved-head, sampling, and merged-provenance chain, and be merged to the decomposition source's
+publication branch; all siblings must be done. The operator-named managed continuation must
+postdate the stale child, satisfy the ordinary durable worker, approved-head, sampling, and
+merged-provenance chain, and be merged to the decomposition source's
 immutable target branch. This is not a general open-task adoption path: any structured/current
 hold, assigned child, advanced publication state, target mismatch, stale PR row, malformed
-task-scoped branch or SHA, or missing exact duplicate evidence is a clean negative. Success
+task-scoped branch or SHA is a clean negative. Classifier duplicate hints grant no lifecycle
+authority and are neither required nor sufficient. Success
 records the preserved publication branch and SHA in both recovery audit projections, removes the
 stale publication intent, completes the child, clears only that exact legacy hold, and completes
 the graph and source in the same transaction.

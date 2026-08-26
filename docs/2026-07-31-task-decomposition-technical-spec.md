@@ -86,12 +86,13 @@ The explicit command also recognizes one fail-closed legacy prepublication state
 older retry path: the final generated child is unassigned `open`, has no completion or PR target,
 retains a valid task-scoped `daemon_publication` intent before PR creation, and its active graph is
 blocked by the matching non-JSON `generated-child-failed` publication summary. The continuation
-must postdate the child, carry exact duplicate classification, satisfy the same durable managed
-worker/reviewer/sampling/merge chain, and have an immutable target equal to the decomposition
+must postdate the child, satisfy the same durable managed worker/reviewer/sampling/merge chain,
+and have an immutable target equal to the decomposition
 source's immutable target. No resolved publication field may be present. Success additionally
 audits the preserved local SHA and branch, removes the stale intent, and clears only that exact
 legacy hold while atomically completing the child, graph, and source. This predicate does not
-accept any other open task or generated-child failure.
+accept any other open task or generated-child failure. Classifier duplicate hints are explicitly
+non-authoritative and do not participate in this lifecycle predicate.
 
 Both paths use the same transaction-scoped finalizer: mark only the eligible child done and
 preserve its PR association when one exists. The automatic path then runs ordinary final-child

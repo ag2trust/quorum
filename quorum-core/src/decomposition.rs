@@ -2317,11 +2317,6 @@ pub fn adopt_explicit_recovery_delivery(
                         AND source.target_branch!=''
                         AND recovery.target_branch=source.target_branch
                         AND recovery.created_at>original.updated_at
-                        AND json_type(recovery.refs,'$.cx_dup_of')='array'
-                        AND EXISTS (
-                            SELECT 1 FROM json_each(recovery.refs,'$.cx_dup_of') duplicate
-                            WHERE duplicate.type='integer' AND duplicate.value=original.id
-                        )
                     )
                )
                AND source.status='decomposed'
@@ -3655,14 +3650,6 @@ mod tests {
                 .execute(
                     "UPDATE tasks SET target_branch='main' WHERE id IN (?1,?2)",
                     params![1, self.recovery],
-                )
-                .unwrap();
-            self.conn
-                .execute(
-                    "UPDATE tasks
-                     SET refs=json_set(refs,'$.cx_dup_of',json_array(?2))
-                     WHERE id=?1",
-                    params![self.recovery, self.original],
                 )
                 .unwrap();
             let summary = format!(
@@ -6838,12 +6825,12 @@ mod tests {
                 }),
             ),
             (
-                "missing exact duplicate classification",
+                "recovery predates the stale child state",
                 Box::new(|fixture| {
                     fixture
                         .conn
                         .execute(
-                            "UPDATE tasks SET refs=json_remove(refs,'$.cx_dup_of') WHERE id=?1",
+                            "UPDATE tasks SET created_at=1 WHERE id=?1",
                             [fixture.recovery],
                         )
                         .unwrap();
