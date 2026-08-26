@@ -13,6 +13,7 @@ pub mod capabilities;
 pub mod claims;
 pub mod classify;
 pub mod clock;
+pub mod collaboration_admission;
 pub mod complexity;
 pub mod control;
 pub mod daemon_lock;

@@ -49,6 +49,18 @@ pub struct LiveRunContext {
     pub phase: LiveRunPhase,
 }
 
+/// The clean authority outcome used by durable admission paths.
+///
+/// A missing, stale, revoked, or otherwise non-live capability is an expected
+/// negative at an endpoint boundary, rather than an internal error that should
+/// create an `errors` row. Database failures still propagate as errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveRunContextResolution {
+    Live(LiveRunContext),
+    Rejected,
+}
+
 #[derive(Debug)]
 struct LiveAgentRun {
     id: i64,
@@ -290,6 +302,22 @@ pub fn resolve_live_run_context(
         review_revision,
         phase,
     })
+}
+
+/// Resolve a managed run while preserving expected authority failures as a
+/// typed clean negative. This is intentionally a thin adapter over
+/// [`resolve_live_run_context`], so every live-context predicate remains in
+/// one place.
+pub fn resolve_live_run_context_for_admission(
+    conn: &Connection,
+    run_id: &str,
+    operation_role: &str,
+) -> Result<LiveRunContextResolution> {
+    match resolve_live_run_context(conn, run_id, operation_role) {
+        Ok(context) => Ok(LiveRunContextResolution::Live(context)),
+        Err(QuorumError::Usage(_)) => Ok(LiveRunContextResolution::Rejected),
+        Err(error) => Err(error),
+    }
 }
 
 /// Identity and target derived from daemon-owned state for one live planner run.
