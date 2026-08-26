@@ -7,6 +7,7 @@
 
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
+use crate::runner_state::{self, ContinuationSlot, PendingTurn};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 
@@ -47,6 +48,40 @@ pub struct LiveRunContext {
     pub pr: Option<i64>,
     pub review_revision: Option<String>,
     pub phase: LiveRunPhase,
+}
+
+/// The clean authority outcome used by durable admission paths.
+///
+/// A missing, stale, revoked, or otherwise non-live capability is an expected
+/// negative at an endpoint boundary, rather than an internal error that should
+/// create an `errors` row. Database failures still propagate as errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveRunContextResolution {
+    Live(LiveRunContext),
+    Rejected,
+}
+
+/// The daemon-owned lifecycle and provider-turn binding for a collaboration
+/// attempt. `run` establishes the live capability identity; the remaining
+/// fields are read from durable task/run state in the same caller transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveCollaborationContext {
+    pub run: LiveRunContext,
+    pub lifecycle_generation: i64,
+    pub turn_provider: String,
+    pub turn_continuation_id: Option<String>,
+    /// Canonical `runner_retry` content when a daemon has an exact pending
+    /// turn. It is intentionally opaque to collaboration callers.
+    pub pending_turn_json: Option<String>,
+}
+
+/// Clean authority outcome for collaboration attempt admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveCollaborationContextResolution {
+    Live(Box<LiveCollaborationContext>),
+    Rejected,
 }
 
 #[derive(Debug)]
@@ -290,6 +325,147 @@ pub fn resolve_live_run_context(
         review_revision,
         phase,
     })
+}
+
+/// Resolve a managed run while preserving expected authority failures as a
+/// typed clean negative. This is intentionally a thin adapter over
+/// [`resolve_live_run_context`], so every live-context predicate remains in
+/// one place.
+pub fn resolve_live_run_context_for_admission(
+    conn: &Connection,
+    run_id: &str,
+    operation_role: &str,
+) -> Result<LiveRunContextResolution> {
+    match resolve_live_run_context(conn, run_id, operation_role) {
+        Ok(context) => Ok(LiveRunContextResolution::Live(context)),
+        Err(QuorumError::Usage(_)) => Ok(LiveRunContextResolution::Rejected),
+        Err(error) => Err(error),
+    }
+}
+
+const MAX_TURN_PROVIDER_BYTES: usize = 64;
+const MAX_TURN_CONTINUATION_BYTES: usize = 1024;
+const MAX_PENDING_TURN_JSON_BYTES: usize = 64 * 1024;
+
+fn authority_text_is_valid(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.trim() == value
+        && !value.contains('\0')
+        && !value.chars().any(char::is_control)
+}
+
+fn canonical_pending_turn(turn: &PendingTurn) -> Result<String> {
+    if !authority_text_is_valid(&turn.provider, MAX_TURN_PROVIDER_BYTES)
+        || !authority_text_is_valid(&turn.model, 256)
+        || !authority_text_is_valid(&turn.effort, 64)
+        || !authority_text_is_valid(&turn.turn_kind, 64)
+        || turn.prompt.is_empty()
+        || turn.prompt.len() > MAX_PENDING_TURN_JSON_BYTES
+        || turn.prompt.contains('\0')
+        || turn
+            .continuation_id
+            .as_deref()
+            .is_some_and(|id| !authority_text_is_valid(id, MAX_TURN_CONTINUATION_BYTES))
+    {
+        return Err(authority_error("pending turn is invalid"));
+    }
+    let canonical = serde_json::to_string(turn)
+        .map_err(|_| authority_error("pending turn cannot be serialized"))?;
+    if canonical.len() > MAX_PENDING_TURN_JSON_BYTES {
+        return Err(authority_error("pending turn is oversized"));
+    }
+    Ok(canonical)
+}
+
+/// Resolve the exact durable lifecycle and provider-turn identity for a live
+/// collaboration capability. The task's rework round is the lifecycle
+/// generation; a daemon-owned requested retry, when present, supplies the
+/// complete pending-turn identity. Otherwise the role-scoped continuation is
+/// retained as the available exact provider identity.
+pub fn resolve_live_collaboration_context(
+    conn: &Connection,
+    run_id: &str,
+    operation_role: &str,
+) -> Result<LiveCollaborationContext> {
+    let run = resolve_live_run_context(conn, run_id, operation_role)?;
+    let (provider, sub_role): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT provider,sub_role FROM agent_runs
+             WHERE id=?1 AND task_id=?2 AND agent_name=?3 AND role=?4 AND ended_at IS NULL",
+            params![run.agent_run_id, run.task_id, run.agent, run.role],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("live run provider binding is absent"))?;
+    let provider = provider
+        .filter(|provider| authority_text_is_valid(provider, MAX_TURN_PROVIDER_BYTES))
+        .ok_or_else(|| authority_error("live run provider is invalid"))?;
+
+    let (lifecycle_generation, refs): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT rework_round,refs FROM tasks WHERE id=?1",
+            [run.task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("task does not exist"))?;
+    if lifecycle_generation < 0 {
+        return Err(authority_error("task lifecycle generation is invalid"));
+    }
+    let refs = match refs {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|_| authority_error("task references are invalid"))?,
+        None => serde_json::json!({}),
+    };
+    if !refs.is_object() {
+        return Err(authority_error("task references are invalid"));
+    }
+
+    let slot = match (run.role.as_str(), sub_role.as_deref()) {
+        ("worker", None) => ContinuationSlot::Worker,
+        ("reviewer", None) => ContinuationSlot::ReviewerR1,
+        ("reviewer", Some("r2")) => ContinuationSlot::ReviewerR2,
+        _ => return Err(authority_error("live run role binding is invalid")),
+    };
+    let (turn_continuation_id, pending_turn_json) = if refs.get(runner_state::RETRY_REF).is_some() {
+        let pending = runner_state::requested_retry(&refs, &provider)
+            .ok_or_else(|| authority_error("pending turn does not match live provider"))?;
+        let canonical = canonical_pending_turn(&pending)?;
+        (pending.continuation_id, Some(canonical))
+    } else {
+        let continuation =
+            runner_state::continuation(&refs, slot, &provider).map(|continuation| continuation.id);
+        if continuation
+            .as_deref()
+            .is_some_and(|id| !authority_text_is_valid(id, MAX_TURN_CONTINUATION_BYTES))
+        {
+            return Err(authority_error("provider continuation is invalid"));
+        }
+        (continuation, None)
+    };
+
+    Ok(LiveCollaborationContext {
+        run,
+        lifecycle_generation,
+        turn_provider: provider,
+        turn_continuation_id,
+        pending_turn_json,
+    })
+}
+
+/// Resolve collaboration authority while mapping expected authority failures to
+/// a typed clean negative for the caller-owned admission transaction.
+pub fn resolve_live_collaboration_context_for_admission(
+    conn: &Connection,
+    run_id: &str,
+    operation_role: &str,
+) -> Result<LiveCollaborationContextResolution> {
+    match resolve_live_collaboration_context(conn, run_id, operation_role) {
+        Ok(context) => Ok(LiveCollaborationContextResolution::Live(Box::new(context))),
+        Err(QuorumError::Usage(_)) => Ok(LiveCollaborationContextResolution::Rejected),
+        Err(error) => Err(error),
+    }
 }
 
 /// Identity and target derived from daemon-owned state for one live planner run.

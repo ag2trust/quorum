@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 62;
+pub const SCHEMA_VERSION: i64 = 63;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1119,6 +1119,35 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                      SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
                  END;",
             )?;
+        }
+        // v63 persists the daemon-resolved provider-turn binding for every
+        // newly admitted collaboration attempt. Existing rows deliberately
+        // remain NULL rather than receiving a guessed continuation; that
+        // makes legacy resumptions fail closed until a new attempt is issued.
+        if current < 63 {
+            if !column_exists(conn, "github_collaboration_attempts", "turn_provider")? {
+                conn.execute(
+                    "ALTER TABLE github_collaboration_attempts ADD COLUMN turn_provider TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(
+                conn,
+                "github_collaboration_attempts",
+                "turn_continuation_id",
+            )? {
+                conn.execute(
+                    "ALTER TABLE github_collaboration_attempts
+                     ADD COLUMN turn_continuation_id TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "github_collaboration_attempts", "pending_turn_json")? {
+                conn.execute(
+                    "ALTER TABLE github_collaboration_attempts ADD COLUMN pending_turn_json TEXT",
+                    [],
+                )?;
+            }
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
@@ -2351,6 +2380,54 @@ END;
             1
         );
         assert_github_collaboration_constraints(&conn);
+    }
+
+    #[test]
+    fn migrates_v62_adds_collaboration_turn_binding_columns_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v62-collaboration-turn-binding.db");
+        let conn = open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE github_review_publication_slots;
+             DROP TABLE github_agent_operations;
+             DROP TABLE github_collaboration_attempts;
+             CREATE TABLE github_collaboration_attempts (
+                 attempt_id TEXT PRIMARY KEY,
+                 task_id INTEGER NOT NULL REFERENCES tasks(id),
+                 agent TEXT NOT NULL,
+                 role TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+                 pr_number INTEGER NOT NULL,
+                 head_sha TEXT,
+                 lifecycle_generation INTEGER NOT NULL,
+                 active_run_id TEXT REFERENCES run_capabilities(run_id),
+                 review_owner_marker TEXT UNIQUE,
+                 state TEXT NOT NULL
+                     CHECK(state IN ('active','awaiting_resume','completed','revoked')),
+                 review_sealed INTEGER NOT NULL DEFAULT 0 CHECK(review_sealed IN (0,1)),
+                 next_review_sequence INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 expires_at INTEGER NOT NULL,
+                 UNIQUE(active_run_id)
+             );
+             PRAGMA user_version=62;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        for column in ["turn_provider", "turn_continuation_id", "pending_turn_json"] {
+            assert!(
+                column_exists(&migrated, "github_collaboration_attempts", column).unwrap(),
+                "v63 must add {column} without guessing a legacy turn binding"
+            );
+        }
     }
 
     #[test]
