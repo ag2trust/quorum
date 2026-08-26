@@ -406,7 +406,7 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
 
     let mut worker = McpProcess::start(&endpoint, "worker-cap", "Worker");
     let initialized = worker.initialize();
-    assert_eq!(initialized["result"]["serverInfo"]["name"], "github");
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "quorum");
     let capabilities = initialized["result"]["capabilities"].as_object().unwrap();
     assert_eq!(capabilities.keys().collect::<Vec<_>>(), vec!["tools"]);
     assert_eq!(capabilities["tools"]["listChanged"], true);

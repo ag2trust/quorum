@@ -1656,8 +1656,10 @@ async fn publish_worker_completion(
     let local_sha = match (&prior, supersede_source) {
         // A parked-rework retry is a new, explicitly requested delivery round.
         // Its worktree was provisioned from the recorded PR lease, so its
-        // completed HEAD supersedes the failed pre-park source. Ordinary
-        // publication crash recovery still replays the exact durable source.
+        // completed HEAD supersedes the failed pre-park source. `retry_parked`
+        // atomically removes only a confirmed rejected initial-push intent;
+        // every intent retained here, including crash recovery, replays its
+        // exact durable source.
         (_, true) | (None, false) => wt_mgr.head_sha(worktree).await?,
         (Some(intent), false) => intent.local_sha.clone(),
     };
@@ -4581,15 +4583,24 @@ async fn reap_decomposition_planner_with_usage(
         slot.kill_and_reap().await;
         return;
     };
-    let context = DecompositionUsageContext {
-        purpose: "planner",
-        task_id,
-        provider: slot.provider,
-        model: slot.model,
-        effort: slot.effort,
-    };
-    let usage = reap_decomposition_provider_with_usage(slot.proc, context, slot.usage).await;
-    record_usage_best_effort(db_path, usage).await;
+    let provider = slot.provider.clone();
+    let model = slot.model.clone();
+    let effort = slot.effort.clone();
+    let usage = slot.kill_and_reap().await;
+    record_usage_best_effort(
+        db_path,
+        UsageWriteRecord {
+            agent_run_id: None,
+            purpose: "planner".into(),
+            task_ids: vec![task_id],
+            pr_number: None,
+            provider,
+            model,
+            effort,
+            usage,
+        },
+    )
+    .await;
 }
 
 async fn reap_decomposition_arbiter_with_usage(
@@ -5369,6 +5380,7 @@ fn decomposition_process_name(graph_id: i64, role: &str) -> String {
 struct DecompositionProcessSession<'a> {
     id: &'a str,
     log_dir: Option<&'a Path>,
+    provider: Option<&'a str>,
 }
 
 async fn journal_decomposition_process(
@@ -5399,7 +5411,7 @@ async fn journal_decomposition_process(
         pid,
         pr: None,
         rework_count: 0,
-        provider: None,
+        provider: session.provider.map(str::to_owned),
         continuation_id: None,
         local_branch: None,
     };
@@ -5509,7 +5521,7 @@ fn bounded_with_ellipsis(value: &str, limit: usize) -> String {
 }
 
 /// Produce text that is safe to retain in task state and the errors table.
-/// Git stderr reaches this boundary only after `worktree::git_stderr` rejects
+/// Git output reaches this boundary only after `worktree::git_diagnostic` rejects
 /// malformed UTF-8 and NUL bytes. Keep this defensive check for other
 /// provisioning errors, which may originate outside that subprocess boundary.
 fn bounded_provisioning_cause(cause: &str) -> String {
@@ -6028,6 +6040,7 @@ async fn spawn_arbiter_review(
                 DecompositionProcessSession {
                     id: &session_id,
                     log_dir: slot.log_dir(),
+                    provider: None,
                 },
             )
             .await
@@ -6182,10 +6195,15 @@ async fn tick_decomposition(
                 }
             };
             let outcome = planner::planner_outcome(slot, turn_end, submitted.as_deref());
-            let slot = coordinator
+            let mut slot = coordinator
                 .planner_slot
                 .take()
                 .expect("planner slot exists");
+            // The terminal poll path moves the process into the generic usage
+            // reaper below, so it must close the planner-owned log first.
+            // `PlannerSlot` takes the log while finalizing, which makes a
+            // second finalization impossible.
+            slot.finalize_session_log();
             let usage = match coordinator.planner_source_task_id.take() {
                 Some(task_id) => Some(
                     reap_decomposition_provider_with_usage(
@@ -6733,6 +6751,7 @@ async fn tick_decomposition(
                     DecompositionProcessSession {
                         id: &session_id,
                         log_dir: slot.log_dir(),
+                        provider: Some(&slot.provider),
                     },
                 )
                 .await
@@ -6832,6 +6851,7 @@ async fn tick_decomposition(
                     DecompositionProcessSession {
                         id: &session_id,
                         log_dir: None,
+                        provider: None,
                     },
                 )
                 .await
@@ -30190,6 +30210,199 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             intent.stage == "verified",
             "successful publication must verify the backfilled intent"
         );
+        assert_eq!(
+            published.source_sha, fixture.source_sha,
+            "a publication crash recovery must replay the exact durable source"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_initial_publication_retry_publishes_fresh_worker_head_and_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+        let base_sha = git(&["rev-parse", "HEAD"]);
+
+        let stale_branch = "daemon/first-worker-t89";
+        git(&["checkout", "-q", "-b", stale_branch]);
+        std::fs::write(repo.join("state.txt"), "first worker\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "first worker completion"]);
+        let stale_sha = git(&["rev-parse", "HEAD"]);
+
+        let fresh_branch = "daemon/secondworker-t1";
+        git(&["checkout", "-q", "-b", fresh_branch, &base_sha]);
+        std::fs::write(repo.join("state.txt"), "second worker\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "second worker completion"]);
+        let fresh_sha = git(&["rev-parse", "HEAD"]);
+        git(&[
+            "push",
+            "-q",
+            "origin",
+            &format!("{base_sha}:refs/heads/{fresh_branch}"),
+        ]);
+
+        let db_path = dir.path().join("retry-publication.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = tasks::create(
+                &mut conn,
+                "owner",
+                "rejected initial publication",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            assert_eq!(id, 1, "fresh fixture has one task");
+            let stale = PublicationIntent {
+                branch: stale_branch.into(),
+                local_sha: stale_sha,
+                pr: None,
+                stage: "intent".into(),
+                target_branch: None,
+                expected_remote_sha: None,
+            };
+            tasks::update_refs_daemon(
+                &mut conn,
+                id,
+                &serde_json::json!({
+                    "daemon_publication": stale,
+                    "runner_continuation": {"provider": "codex", "id": "old-turn"},
+                    "cx_est": 3,
+                    "cx_size": "M",
+                    "cx_ready": true,
+                    "cx_not_ready_reason": null,
+                    "cx_by": "test:v2"
+                })
+                .to_string(),
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET status='working', assignee='FirstWorker', author='FirstWorker'
+                 WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at)
+                 VALUES (?1,?2,?3,'FirstWorker',?4)",
+                rusqlite::params![id, stale_branch, "/tmp/first-worker-t89", now_unix()],
+            )
+            .unwrap();
+            let run = quorum_core::agent_runs::insert(
+                &conn,
+                id,
+                "FirstWorker",
+                "worker",
+                "model",
+                "high",
+                "codex",
+                now_unix(),
+            )
+            .unwrap();
+            quorum_core::agent_runs::close(&conn, run, now_unix(), "daemon_push_failed").unwrap();
+            tasks::park(
+                &mut conn,
+                id,
+                "daemon-owned publication failed: remote rejected push",
+                "open",
+                now_unix(),
+            )
+            .unwrap();
+            let retried = tasks::retry_parked(&mut conn, id, "owner", true, now_unix())
+                .unwrap()
+                .expect("rejected initial publication must retry");
+            assert_eq!(
+                retried.author, None,
+                "retry must release the stale branch owner"
+            );
+            let allocations: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_branches WHERE task_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                allocations, 0,
+                "retry must release the stale branch allocation"
+            );
+            let second_worker =
+                tasks::claim(&mut conn, "SecondWorker", Some(id), &[], 3600, now_unix())
+                    .unwrap()
+                    .expect("fresh delivery must claim a new worker");
+            assert_eq!(second_worker.author.as_deref(), Some("SecondWorker"));
+            assert_eq!(
+                orphan_worker_branch("SecondWorker", id, false).as_deref(),
+                Some(fresh_branch),
+                "normal provisioning must derive the branch from the new worker"
+            );
+            pr_targets::upsert(&mut conn, id, 482, fresh_branch, &base_sha, false).unwrap();
+            id
+        };
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-fresh-worker",
+            &open_pr_target_json(fresh_branch, &base_sha, "main"),
+        ));
+        let published = publish_worker_completion(
+            &config,
+            &WorktreeManager::new(),
+            task_id,
+            &repo,
+            fresh_branch,
+            Some(482),
+        )
+        .await
+        .expect("fresh worker publication must not replay the rejected source");
+
+        assert_eq!(published.source_sha, fresh_sha);
+        assert_eq!(published.head_ref, fresh_branch);
+        assert_eq!(remote_branch_sha(&repo, fresh_branch), fresh_sha);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let intent = publication_intent_from_refs(task.refs.as_deref()).unwrap();
+        assert_eq!(intent.local_sha, fresh_sha);
+        assert_eq!(intent.branch, fresh_branch);
     }
 
     #[cfg(unix)]
@@ -37766,6 +37979,133 @@ exec /bin/cat '{stdout}'
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn planner_journal_retry_replaces_the_current_attempt_and_retains_logs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("quorum.db");
+        let log_root = dir.path().join("logs");
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.log_dir = Some(log_root.clone());
+
+        let runner = dir.path().join("codex");
+        std::fs::write(&runner, "#!/bin/sh\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let graph_id = 17;
+        let source_task_id = 42;
+        let started_at = now_unix();
+        let planner_name = decomposition_process_name(graph_id, "planner");
+
+        let mut first = planner::spawn_planner(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            true,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        first
+            .start_session_log(
+                &log_root,
+                &planner_name,
+                source_task_id,
+                "planner-session-first",
+                "frozen-base",
+                started_at,
+            )
+            .unwrap();
+        let first_log_dir = first.log_dir().unwrap().to_path_buf();
+        journal_decomposition_process(
+            &config,
+            graph_id,
+            source_task_id,
+            "planner",
+            first.pid(),
+            Some(dir.path()),
+            DecompositionProcessSession {
+                id: "planner-session-first",
+                log_dir: first.log_dir(),
+                provider: Some(&first.provider),
+            },
+        )
+        .await
+        .unwrap();
+        let _ = first.kill_and_reap().await;
+
+        let mut second = planner::spawn_planner(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            true,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        second
+            .start_session_log(
+                &log_root,
+                &planner_name,
+                source_task_id,
+                "planner-session-second",
+                "frozen-base",
+                started_at,
+            )
+            .unwrap();
+        let second_log_dir = second.log_dir().unwrap().to_path_buf();
+        assert_ne!(first_log_dir, second_log_dir);
+        journal_decomposition_process(
+            &config,
+            graph_id,
+            source_task_id,
+            "planner",
+            second.pid(),
+            Some(dir.path()),
+            DecompositionProcessSession {
+                id: "planner-session-second",
+                log_dir: second.log_dir(),
+                provider: Some(&second.provider),
+            },
+        )
+        .await
+        .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let rows = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent, planner_name);
+        assert_eq!(rows[0].session_id, "planner-session-second");
+        assert_eq!(rows[0].log_dir.as_deref(), second_log_dir.to_str());
+        assert_eq!(rows[0].provider.as_deref(), Some("codex"));
+        drop(conn);
+
+        delete_decomposition_process(&config, graph_id, "planner")
+            .await
+            .unwrap();
+        assert!(first_log_dir.is_dir());
+        assert!(second_log_dir.is_dir());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(journal::list_in_flight(&conn).unwrap().is_empty());
+        drop(conn);
+
+        let _ = second.kill_and_reap().await;
+        for log_dir in [&first_log_dir, &second_log_dir] {
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(log_dir.join("meta.json")).unwrap())
+                    .unwrap();
+            assert!(meta["end_time"].is_i64());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn decomposition_slots_publish_raw_stream_log_dirs() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -37823,6 +38163,7 @@ exec /bin/cat '{stdout}'
             DecompositionProcessSession {
                 id: "planner-session",
                 log_dir: planner_slot.log_dir(),
+                provider: Some(&planner_slot.provider),
             },
         )
         .await
@@ -37865,6 +38206,7 @@ exec /bin/cat '{stdout}'
             DecompositionProcessSession {
                 id: "arbiter-session",
                 log_dir: arbiter_slot.log_dir(),
+                provider: None,
             },
         )
         .await
@@ -37874,10 +38216,12 @@ exec /bin/cat '{stdout}'
             Some(arbiter::ArbiterPoll::ProviderFailed { .. })
         ));
 
-        for log_dir in [&planner_log_dir, &arbiter_log_dir] {
-            let raw_stream = std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap();
-            assert!(raw_stream.contains(r#"{"type":"turn.failed"}"#));
-        }
+        let planner_stream = std::fs::read_to_string(planner_log_dir.join("stream.jsonl")).unwrap();
+        assert!(planner_stream.contains(r#""event":"provider_failure""#));
+        assert!(!planner_stream.contains(r#"{"type":"turn.failed"}"#));
+
+        let arbiter_stream = std::fs::read_to_string(arbiter_log_dir.join("stream.jsonl")).unwrap();
+        assert!(arbiter_stream.contains(r#"{"type":"turn.failed"}"#));
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let status =

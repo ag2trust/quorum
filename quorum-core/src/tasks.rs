@@ -4130,12 +4130,52 @@ pub fn retry_parked(
         )));
     }
     let restored_status = resume_status.as_str();
+    // A rejected initial branch push has no remote/PR authority to preserve.
+    // Require both the parked publication reason and the most recent worker
+    // outcome so an older rejected push cannot affect a later, unrelated
+    // park. This is intentionally computed inside the retry transaction: the
+    // same decision clears the stale source, continuation, author, and branch
+    // allocation before another worker can claim the fresh delivery round.
+    let fresh_initial_delivery: bool = tx.query_row(
+        "SELECT COALESCE(
+             json_extract(refs, '$.daemon_parked_reason')
+                 LIKE 'daemon-owned publication failed:%'
+             AND json_extract(refs, '$.daemon_publication.stage')='intent'
+             AND json_type(refs, '$.daemon_publication.pr')='null'
+             AND COALESCE((
+                 SELECT end_reason
+                 FROM agent_runs
+                 WHERE task_id=tasks.id AND role='worker'
+                 ORDER BY id DESC
+                 LIMIT 1
+             ), '')='daemon_push_failed',
+             0
+         )
+         FROM tasks WHERE id=?1",
+        params![id],
+        |row| row.get(0),
+    )?;
     let updated = tx.execute(
         "UPDATE tasks
          SET status=?2,
              assignee=NULL,
+             author=CASE WHEN ?6 THEN NULL ELSE author END,
              recovery_attempts=CASE WHEN ?5 THEN 0 ELSE recovery_attempts END,
-             refs=CASE WHEN ?4='rework'
+             refs=CASE
+                  WHEN ?6
+                  THEN json_remove(
+                      refs,
+                      '$.daemon_parked',
+                      '$.daemon_parked_reason',
+                      '$.daemon_parked_unsatisfiable',
+                      '$.daemon_resume_status',
+                      '$.daemon_rework_retry_requested',
+                      '$.daemon_parked_head_check',
+                      '$.daemon_merge_retry',
+                      '$.daemon_publication',
+                      '$.runner_continuation'
+                  )
+                  WHEN ?4='rework'
                   THEN json_set(
                       json_remove(
                           refs,
@@ -4183,14 +4223,36 @@ pub fn retry_parked(
             restored_status,
             now,
             resume_status,
-            reset_recovery_budget
+            reset_recovery_budget,
+            fresh_initial_delivery,
         ],
     )?;
     if updated == 0 {
         tx.commit()?;
         return Ok(None);
     }
+    if fresh_initial_delivery {
+        tx.execute("DELETE FROM task_branches WHERE task_id=?1", params![id])?;
+    }
     deactivate_lease(&tx, id, now)?;
+    // Pre-structured generated-child holds from before this recovery path have
+    // string summaries. They intentionally do not match: no migration or
+    // backfill can safely infer which child those legacy rows name.
+    let graph_reactivated = tx.execute(
+        "UPDATE task_decompositions
+         SET state='active',hold_code=NULL,hold_summary=NULL,updated_at=?2
+         WHERE active=1 AND state='blocked' AND hold_code='generated-child-failed'
+           AND CASE WHEN json_valid(hold_summary)
+                    THEN json_type(hold_summary,'$.affected_task')='integer'
+                         AND json_extract(hold_summary,'$.affected_task')=?1
+                    ELSE 0
+               END
+           AND EXISTS(
+               SELECT 1 FROM task_graph_members m
+               WHERE m.graph_id=task_decompositions.id AND m.task_id=?1 AND m.active=1
+           )",
+        params![id, now],
+    )?;
     crate::events::emit(
         &tx,
         "task_retry",
@@ -4198,6 +4260,15 @@ pub fn retry_parked(
         &format!("parked task resumed by {by}"),
         now,
     )?;
+    if graph_reactivated == 1 {
+        crate::events::emit(
+            &tx,
+            "task_graph_unblocked",
+            &lease_target(id),
+            "generated child retry restored graph authority",
+            now,
+        )?;
+    }
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -9667,8 +9738,10 @@ mod tests {
             .unwrap();
         assert_eq!(state, "blocked");
         assert_eq!(hold_code, "generated-child-failed");
-        assert!(hold_summary.contains(&format!("#{}", ids[0])));
-        assert!(hold_summary.contains(reason));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&hold_summary).unwrap(),
+            serde_json::json!({"affected_task": ids[0], "reason": reason})
+        );
 
         let event_count: i64 = conn
             .query_row(
@@ -9690,6 +9763,157 @@ mod tests {
             .expect("graph-blocked alert must exist");
         assert!(graph_alert.contains("task graph blocked"));
         assert!(graph_alert.contains(reason));
+
+        assert!(
+            !crate::decomposition_review::is_reviewable_graph_member(&conn, ids[1]).unwrap(),
+            "a blocked graph must withhold sibling reviewer authority"
+        );
+        let retried = retry_parked(&mut conn, ids[0], "operator", true, 11)
+            .unwrap()
+            .expect("parked child must resume");
+        assert_eq!(retried.status, "open");
+        let graph_state: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(graph_state, ("active".into(), None, None));
+        let unblocked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE kind='task_graph_unblocked' AND subject=?1",
+                [lease_target(ids[0])],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unblocked, 1);
+        assert!(
+            crate::decomposition_review::is_reviewable_graph_member(&conn, ids[1]).unwrap(),
+            "reactivating the graph must restore sibling reviewer authority"
+        );
+    }
+
+    fn blocked_graph_with_parked_children(
+        conn: &mut Connection,
+        hold_code: &str,
+        hold_summary: &str,
+        child_refs: &str,
+    ) -> (i64, i64, i64) {
+        let source = create(conn, "owner", "source", None, 0, None, None, None, None, 1).unwrap();
+        let affected = create(
+            conn, "owner", "affected", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let retried = create(conn, "owner", "retried", None, 0, None, None, None, None, 1).unwrap();
+        conn.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,hold_code,hold_summary,created_at,updated_at)
+             VALUES (?1,'blocked',1,0,1,1,1,?2,?3,1,1)",
+            params![source, hold_code, hold_summary],
+        )
+        .unwrap();
+        let graph = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'affected',1,1),(?1,?3,'retried',1,1)",
+            params![graph, affected, retried],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='failed',refs=?2 WHERE id=?1",
+            params![retried, child_refs],
+        )
+        .unwrap();
+        (graph, affected, retried)
+    }
+
+    #[test]
+    fn retry_parked_leaves_unrelated_or_legacy_graph_holds_blocked() {
+        let parked = r#"{"daemon_parked":true,"daemon_resume_status":"open"}"#;
+        for (name, hold_code, affected_task, policy_parked, legacy_summary) in [
+            (
+                "different child",
+                "generated-child-failed",
+                true,
+                false,
+                false,
+            ),
+            (
+                "reviewer blocker",
+                "boundary-violation",
+                false,
+                false,
+                false,
+            ),
+            ("policy park", "generated-child-failed", false, true, false),
+            (
+                "legacy summary",
+                "generated-child-failed",
+                false,
+                false,
+                true,
+            ),
+        ] {
+            let (_dir, mut conn) = open_tmp();
+            let provisional_summary = serde_json::json!({"affected_task": 0, "reason": "failed"});
+            let (graph, affected, retried) = blocked_graph_with_parked_children(
+                &mut conn,
+                hold_code,
+                &provisional_summary.to_string(),
+                if policy_parked {
+                    r#"{"daemon_parked":true,"daemon_resume_status":"open","classifier_policy_parked":true}"#
+                } else {
+                    parked
+                },
+            );
+            let summary = if legacy_summary {
+                "generated child task #old failed: failed".to_owned()
+            } else {
+                serde_json::json!({
+                    "affected_task": if affected_task { affected } else { retried },
+                    "reason": "failed",
+                })
+                .to_string()
+            };
+            conn.execute(
+                "UPDATE task_decompositions SET hold_summary=?2 WHERE id=?1",
+                params![graph, summary],
+            )
+            .unwrap();
+
+            let result = retry_parked(&mut conn, retried, "operator", true, 2)
+                .unwrap()
+                .expect("parked child retry must succeed");
+            assert_eq!(
+                result.status,
+                if policy_parked { "failed" } else { "open" },
+                "{name}"
+            );
+            let state: (String, String, String) = conn
+                .query_row(
+                    "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state.0, "blocked", "{name}");
+            assert_eq!(state.1, hold_code, "{name}");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind='task_graph_unblocked'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+                "{name} must not reactivate the graph"
+            );
+        }
     }
 
     #[test]
@@ -12420,6 +12644,124 @@ mod tests {
             refs.get(PARKED_UNSATISFIABLE_REF).is_none(),
             "successful retry must strip the unsatisfiable marker; leftover refs: {refs}"
         );
+    }
+
+    #[test]
+    fn retry_parked_discards_only_rejected_new_branch_publication_intent() {
+        let (_d, mut c) = open_tmp();
+        for (title, pr, stage, end_reason, clears_intent) in [
+            (
+                "rejected new branch",
+                None,
+                "intent",
+                "daemon_push_failed",
+                true,
+            ),
+            (
+                "pr-backed publication",
+                Some(482),
+                "intent",
+                "daemon_push_failed",
+                false,
+            ),
+            (
+                "pushed publication",
+                None,
+                "pushed",
+                "daemon_push_failed",
+                false,
+            ),
+            ("crash recovery", None, "intent", "daemon_crashed", false),
+        ] {
+            let id = create(
+                &mut c, "owner", title, None, 0, None, None, None, None, 1000,
+            )
+            .unwrap();
+            let refs = serde_json::json!({
+                "daemon_publication": {
+                    "branch": "daemon/first-worker-t89",
+                    "local_sha": "sha-a",
+                    "pr": pr,
+                    "stage": stage
+                },
+                "runner_continuation": {"provider": "codex", "id": "old-turn"}
+            });
+            update_refs_daemon(&mut c, id, &refs.to_string(), 1001).unwrap();
+            c.execute(
+                "UPDATE tasks
+                 SET status='working', assignee='FirstWorker', author='FirstWorker'
+                 WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at)
+                 VALUES (?1,?2,?3,'FirstWorker',1001)",
+                params![
+                    id,
+                    format!("daemon/first-worker-t{id}"),
+                    format!("/tmp/first-worker-t{id}")
+                ],
+            )
+            .unwrap();
+            let run = crate::agent_runs::insert(
+                &c,
+                id,
+                "FirstWorker",
+                "worker",
+                "model",
+                "high",
+                "codex",
+                1002,
+            )
+            .unwrap();
+            crate::agent_runs::close(&c, run, 1003, end_reason).unwrap();
+            park(
+                &mut c,
+                id,
+                "daemon-owned publication failed: remote rejected push",
+                "open",
+                1004,
+            )
+            .unwrap();
+
+            let retried = retry_parked(&mut c, id, "operator", true, 1005)
+                .unwrap()
+                .expect("parked task must retry");
+            assert_eq!(retried.status, "open");
+            let refs: serde_json::Value =
+                serde_json::from_str(retried.refs.as_deref().unwrap_or("{}")).unwrap();
+            if clears_intent {
+                assert!(
+                    refs.get("daemon_publication").is_none(),
+                    "rejected new-branch retry must discard stale publication: {refs}"
+                );
+                assert!(
+                    refs.get("runner_continuation").is_none(),
+                    "fresh delivery must not retain the previous worker continuation: {refs}"
+                );
+                assert_eq!(
+                    retried.author, None,
+                    "fresh delivery needs a new branch owner"
+                );
+            } else {
+                assert_eq!(
+                    refs["daemon_publication"]["local_sha"], "sha-a",
+                    "non-rejected or PR-backed retries must replay their exact durable source"
+                );
+                assert_eq!(refs["daemon_publication"]["pr"], serde_json::json!(pr));
+                assert_eq!(refs["runner_continuation"]["id"], "old-turn");
+                assert_eq!(retried.author.as_deref(), Some("FirstWorker"));
+            }
+            let branch_allocations: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM task_branches WHERE task_id=?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(branch_allocations, i64::from(!clears_intent));
+        }
     }
 
     /// Task #473 R4 defense: `retry_parked`'s policy branch keeps

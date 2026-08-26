@@ -47,7 +47,7 @@ pub struct AgentProc {
 /// (#206) — without it the Skill call is silently denied and the review
 /// degrades to an unstructured read.
 pub(crate) const ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,Skill";
-const AGENT_MCP_ALLOWED_TOOL: &str = "mcp__github__*";
+const AGENT_MCP_ALLOWED_TOOL: &str = "mcp__quorum__*";
 /// Build a stream-json user turn. The claude CLI requires `message.role` and
 /// exits 1 on the first message without it — every turn fed to an agent MUST
 /// go through this helper (first live run died instantly on a role-less turn).
@@ -62,7 +62,7 @@ pub fn user_turn(content: &str) -> String {
 fn claude_mcp_config(server: AgentMcpServer) -> String {
     serde_json::json!({
         "mcpServers": {
-            "github": {
+            "quorum": {
                 "command": server.command,
                 "args": server.args,
             }
@@ -1315,21 +1315,33 @@ mod tests {
         );
         let config: serde_json::Value =
             serde_json::from_str(flag_value(&args, "--mcp-config")).expect("mcp config is JSON");
-        assert_eq!(config["mcpServers"]["github"]["command"], "quorum");
+        assert_eq!(config["mcpServers"]["quorum"]["command"], "quorum");
         assert_eq!(
-            config["mcpServers"]["github"]["args"],
+            config["mcpServers"]["quorum"]["args"],
             serde_json::json!(["agent-mcp"])
+        );
+        assert_eq!(
+            crate::serve::runner::PLANNER_MCP_ALLOWED_TOOL,
+            "mcp__quorum__submit_plan"
         );
 
         let allowed = flag_value(&args, "--allowedTools");
         assert!(
             allowed
                 .split(',')
-                .any(|tool| tool == "mcp__github__submit_plan"),
+                .any(|tool| tool == crate::serve::runner::PLANNER_MCP_ALLOWED_TOOL),
             "planner allowlist {allowed} omits submit_plan"
         );
+        assert_eq!(
+            allowed
+                .split(',')
+                .filter(|tool| tool.starts_with("mcp__"))
+                .collect::<Vec<_>>(),
+            vec![crate::serve::runner::PLANNER_MCP_ALLOWED_TOOL],
+            "planner MCP allowlist {allowed} must agree with its quorum server key"
+        );
         assert!(
-            !allowed.contains("mcp__github__*"),
+            !allowed.contains("mcp__quorum__*"),
             "planner allowlist {allowed} carries the server-wide wildcard"
         );
         // The read-only inspection surface must survive: dontAsk auto-denies
