@@ -2292,6 +2292,9 @@ pub fn adopt_explicit_recovery_delivery(
                         AND json_type(original.refs,'$.daemon_publication.stage')='text'
                         AND json_extract(original.refs,'$.daemon_publication.stage')='intent'
                         AND json_type(original.refs,'$.daemon_publication.branch')='text'
+                        AND instr(
+                            json_extract(original.refs,'$.daemon_publication.branch'), char(0)
+                        )=0
                         AND length(json_extract(original.refs,'$.daemon_publication.branch'))
                             BETWEEN length('daemon/-t' || original.id) + 1 AND 512
                         AND substr(
@@ -2309,6 +2312,9 @@ pub fn adopt_explicit_recovery_delivery(
                               - length('daemon/') - length('-t' || original.id)
                         ) NOT GLOB '*[^a-z0-9-]*'
                         AND json_type(original.refs,'$.daemon_publication.local_sha')='text'
+                        AND instr(
+                            json_extract(original.refs,'$.daemon_publication.local_sha'), char(0)
+                        )=0
                         AND length(json_extract(original.refs,'$.daemon_publication.local_sha'))
                             IN (40,64)
                         AND json_extract(original.refs,'$.daemon_publication.local_sha')
@@ -3693,6 +3699,17 @@ mod tests {
                 .execute(
                     "UPDATE task_decompositions SET hold_summary=?2 WHERE id=?1",
                     params![self.graph, summary],
+                )
+                .unwrap();
+        }
+
+        fn rewrite_legacy_prepublication_local_sha(&mut self, local_sha: &str) {
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET refs=json_set(refs,'$.daemon_publication.local_sha',?2)
+                     WHERE id=?1",
+                    params![self.original, local_sha],
                 )
                 .unwrap();
         }
@@ -6942,6 +6959,44 @@ mod tests {
                         "daemon/bad~slug-t{}",
                         fixture.original
                     ));
+                }),
+            ),
+            (
+                "publication branch has an embedded NUL",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/pivot-sma1-t{}\0trailing",
+                        fixture.original
+                    ));
+                    let nul_position: i64 = fixture
+                        .conn
+                        .query_row(
+                            "SELECT instr(json_extract(refs,'$.daemon_publication.branch'),char(0))
+                             FROM tasks WHERE id=?1",
+                            [fixture.original],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_ne!(nul_position, 0, "fixture must persist the branch NUL");
+                }),
+            ),
+            (
+                "publication SHA has an embedded NUL",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_local_sha(&format!(
+                        "{}\0trailing",
+                        ORIGINAL_HEAD
+                    ));
+                    let nul_position: i64 = fixture
+                        .conn
+                        .query_row(
+                            "SELECT instr(json_extract(refs,'$.daemon_publication.local_sha'),char(0))
+                             FROM tasks WHERE id=?1",
+                            [fixture.original],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_ne!(nul_position, 0, "fixture must persist the SHA NUL");
                 }),
             ),
             (

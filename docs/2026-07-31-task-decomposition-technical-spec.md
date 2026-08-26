@@ -89,7 +89,9 @@ blocked by the matching non-JSON `generated-child-failed` publication summary. T
 branch must match the exact daemon-authored grammar `daemon/<author-slug>-t<child-id>`, where
 `<author-slug>` is a non-empty lowercase ASCII `[a-z0-9-]+` run and `<child-id>` is the exact
 original child ID. Non-daemon prefixes, empty slugs, nested paths, whitespace, uppercase letters,
-dots, and every other character outside that grammar are rejected before any lifecycle mutation. The continuation
+dots, embedded NULs, and every other character outside that grammar are rejected before any lifecycle
+mutation. The preserved local SHA likewise rejects embedded NULs before its length and hexadecimal
+checks. The continuation
 must postdate the child, satisfy the same durable managed worker/reviewer/sampling/merge chain,
 and have an immutable target equal to the decomposition
 source's immutable target. No resolved publication field may be present. Success additionally

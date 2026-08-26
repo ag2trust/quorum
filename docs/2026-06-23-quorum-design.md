@@ -2359,7 +2359,8 @@ merged-provenance chain, and be merged to the decomposition source's
 immutable target branch. This is not a general open-task adoption path: any structured/current
 hold, assigned child, advanced publication state, target mismatch, stale PR row, malformed
 task-scoped branch (including non-daemon prefixes, empty slugs, nested paths, whitespace,
-uppercase letters, dots, and other invalid characters) or SHA is a clean negative. Classifier duplicate hints grant no lifecycle
+uppercase letters, dots, embedded NULs, and other invalid characters) or SHA is a clean negative.
+Both branch and SHA reject embedded NULs before their length or character-class checks. Classifier duplicate hints grant no lifecycle
 authority and are neither required nor sufficient. Success
 records the preserved publication branch and SHA in both recovery audit projections, removes the
 stale publication intent, completes the child, clears only that exact legacy hold, and completes
