@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 60;
+pub const SCHEMA_VERSION: i64 = 61;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1064,6 +1064,10 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 )?;
             }
         }
+        // v61 = durable GitHub collaboration attempt, operation-outbox, and pending-review
+        // publication-slot storage. These are net-new tables, so SCHEMA_SQL's idempotent
+        // CREATE TABLE / constraint indexes handle both fresh databases and v60 upgrades.
+        // This migration intentionally adds no executor, claim, MCP, or GitHub behavior.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1909,6 +1913,239 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    fn prepare_v60_github_collaboration_db(path: &Path) {
+        let conn = open(path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE github_review_publication_slots;
+             DROP TABLE github_agent_operations;
+             DROP TABLE github_collaboration_attempts;
+             PRAGMA user_version=60;",
+        )
+        .unwrap();
+    }
+
+    fn assert_github_collaboration_constraints(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'task','working','owner',1,1);
+             INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                 VALUES ('run-1',1,'Worker','worker',1);
+             INSERT INTO github_collaboration_attempts(
+                 attempt_id,task_id,agent,role,pr_number,lifecycle_generation,active_run_id,
+                 state,created_at,updated_at,expires_at)
+                 VALUES ('attempt-1',1,'Worker','worker',7,1,'run-1','active',1,1,999);
+             INSERT INTO github_agent_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                 role,pr_number,kind,request_json,state,deadline_at,created_at,updated_at,
+                 expires_at)
+                 VALUES ('operation-1','client-1','attempt-1','run-1',1,'Worker','worker',7,
+                         'comment','{}','queued',999,1,1,999);
+             INSERT INTO github_review_publication_slots(
+                 publisher_scope,pr_number,task_id,attempt_id,state,created_at,updated_at)
+                 VALUES ('scope-1',7,1,'attempt-1','owned',1,1);",
+        )
+        .unwrap();
+
+        macro_rules! assert_rejected {
+            ($sql:expr, $message:literal) => {
+                assert!(conn.execute_batch($sql).is_err(), $message);
+            };
+        }
+
+        assert_rejected!(
+            "INSERT INTO github_collaboration_attempts(
+                 attempt_id,task_id,agent,role,pr_number,lifecycle_generation,state,
+                 created_at,updated_at,expires_at)
+             VALUES ('attempt-invalid-role',1,'Worker','invalid',7,1,'active',1,1,999);",
+            "attempt role CHECK must reject unknown roles"
+        );
+        assert_rejected!(
+            "INSERT INTO github_collaboration_attempts(
+                 attempt_id,task_id,agent,role,pr_number,lifecycle_generation,state,
+                 created_at,updated_at,expires_at)
+             VALUES ('attempt-invalid-state',1,'Worker','worker',7,1,'invalid',1,1,999);",
+            "attempt state CHECK must reject unknown states"
+        );
+        assert_rejected!(
+            "INSERT INTO github_collaboration_attempts(
+                 attempt_id,task_id,agent,role,pr_number,lifecycle_generation,active_run_id,
+                 state,created_at,updated_at,expires_at)
+             VALUES ('attempt-duplicate-run',1,'Worker','worker',7,1,'run-1','active',1,1,999);",
+            "active run identity must be unique per attempt"
+        );
+        assert_rejected!(
+            "INSERT INTO github_collaboration_attempts(
+                 attempt_id,task_id,agent,role,pr_number,lifecycle_generation,state,
+                 review_sealed,created_at,updated_at,expires_at)
+             VALUES ('attempt-invalid-sealed',1,'Worker','worker',7,1,'active',2,1,1,999);",
+            "review_sealed must remain a boolean"
+        );
+
+        assert_rejected!(
+            "INSERT INTO github_agent_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                 role,pr_number,kind,request_json,state,deadline_at,created_at,updated_at,expires_at)
+             VALUES ('operation-invalid-role','client-invalid-role','attempt-1','run-1',1,
+                     'Worker','invalid',7,'comment','{}','queued',999,1,1,999);",
+            "operation role CHECK must reject unknown roles"
+        );
+        assert_rejected!(
+            "INSERT INTO github_agent_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                 role,pr_number,kind,request_json,state,deadline_at,created_at,updated_at,expires_at)
+             VALUES ('operation-invalid-state','client-invalid-state','attempt-1','run-1',1,
+                     'Worker','worker',7,'comment','{}','invalid',999,1,1,999);",
+            "operation state CHECK must reject unknown states"
+        );
+        assert_rejected!(
+            "INSERT INTO github_agent_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                 role,pr_number,kind,request_json,state,send_state,deadline_at,created_at,updated_at,expires_at)
+             VALUES ('operation-invalid-send','client-invalid-send','attempt-1','run-1',1,
+                     'Worker','worker',7,'comment','{}','queued','invalid',999,1,1,999);",
+            "operation send-state CHECK must reject unknown states"
+        );
+        assert_rejected!(
+            "INSERT INTO github_agent_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                 role,pr_number,kind,request_json,state,deadline_at,created_at,updated_at,expires_at)
+             VALUES ('operation-duplicate-client','client-1','attempt-1','run-1',1,
+                     'Worker','worker',7,'comment','{}','queued',999,1,1,999);",
+            "client request identity must be unique within an attempt"
+        );
+        conn.execute_batch(
+            "INSERT INTO github_agent_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                 role,pr_number,kind,request_json,state,deadline_at,review_sequence,created_at,
+                 updated_at,expires_at)
+             VALUES ('operation-sequence-1','client-sequence-1','attempt-1','run-1',1,
+                     'Worker','worker',7,'comment','{}','queued',999,1,1,1,999);",
+        )
+        .unwrap();
+        assert_rejected!(
+            "INSERT INTO github_agent_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                 role,pr_number,kind,request_json,state,deadline_at,review_sequence,created_at,
+                 updated_at,expires_at)
+             VALUES ('operation-sequence-duplicate','client-sequence-2','attempt-1','run-1',1,
+                     'Worker','worker',7,'comment','{}','queued',999,1,1,1,999);",
+            "review sequence must be unique within an attempt"
+        );
+
+        assert_rejected!(
+            "INSERT INTO github_review_publication_slots(
+                 publisher_scope,pr_number,task_id,state,created_at,updated_at)
+             VALUES ('scope-invalid-state',7,1,'invalid',1,1);",
+            "publication-slot state CHECK must reject unknown states"
+        );
+        assert_rejected!(
+            "INSERT INTO github_review_publication_slots(
+                 publisher_scope,pr_number,task_id,state,create_send_state,created_at,updated_at)
+             VALUES ('scope-invalid-send',7,1,'probing','invalid',1,1);",
+            "publication-slot send-state CHECK must reject unknown states"
+        );
+        assert_rejected!(
+            "INSERT INTO github_review_publication_slots(
+                 publisher_scope,pr_number,task_id,state,created_at,updated_at)
+             VALUES ('scope-1',7,1,'probing',1,1);",
+            "publication slots must be unique per publisher scope and PR"
+        );
+        assert_rejected!(
+            "INSERT INTO github_review_publication_slots(
+                 publisher_scope,pr_number,task_id,attempt_id,state,created_at,updated_at)
+             VALUES ('scope-2',8,1,'attempt-1','owned',1,1);",
+            "an attempt may own only one publication slot"
+        );
+    }
+
+    #[test]
+    fn migrates_v60_adds_github_collaboration_storage_with_closed_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v60-github-collaboration.db");
+        prepare_v60_github_collaboration_db(&path);
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        for table in [
+            "github_collaboration_attempts",
+            "github_agent_operations",
+            "github_review_publication_slots",
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "{table} must be created by the v60 migration"
+            );
+        }
+        assert_github_collaboration_constraints(&conn);
+    }
+
+    #[test]
+    fn fresh_schema_github_collaboration_storage_matches_migrated_constraints() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("fresh-github-collaboration.db")).unwrap();
+        assert_github_collaboration_constraints(&conn);
+    }
+
+    #[test]
+    fn concurrent_v60_github_collaboration_migration_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-v60-github-collaboration.db");
+        prepare_v60_github_collaboration_db(&path);
+
+        let contenders = 8;
+        let concurrently_open = || {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(contenders));
+            let mut joins = Vec::with_capacity(contenders);
+            for _ in 0..contenders {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                joins.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    open(&path)
+                }));
+            }
+            for join in joins {
+                drop(join.join().unwrap().unwrap());
+            }
+        };
+        concurrently_open();
+
+        // Re-enter the v60 path with all three tables already present: SCHEMA_SQL must stay
+        // idempotent under another concurrent open race, not merely after the latest-version
+        // short circuit.
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch("PRAGMA user_version=60;").unwrap();
+        drop(raw);
+        concurrently_open();
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='github_agent_operations'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
         );
     }
 

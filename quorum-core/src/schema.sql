@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 59). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 61). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -972,4 +972,86 @@ CREATE TABLE IF NOT EXISTS planner_submissions (
     response_json TEXT,
     rejections    INTEGER NOT NULL DEFAULT 0,
     accepted_at   INTEGER
+);
+
+-- v61: durable storage for GitHub collaboration attempts, their agent operation outbox, and
+-- pending-review publication ownership. Runtime claiming/execution is deliberately separate.
+CREATE TABLE IF NOT EXISTS github_collaboration_attempts (
+    attempt_id          TEXT PRIMARY KEY,
+    task_id             INTEGER NOT NULL REFERENCES tasks(id),
+    agent               TEXT NOT NULL,
+    role                TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    pr_number           INTEGER NOT NULL,
+    head_sha            TEXT,
+    lifecycle_generation INTEGER NOT NULL,
+    active_run_id       TEXT REFERENCES run_capabilities(run_id),
+    review_owner_marker TEXT UNIQUE,
+    state               TEXT NOT NULL
+                        CHECK(state IN ('active','awaiting_resume','completed','revoked')),
+    review_sealed       INTEGER NOT NULL DEFAULT 0 CHECK(review_sealed IN (0,1)),
+    next_review_sequence INTEGER NOT NULL DEFAULT 0,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    expires_at          INTEGER NOT NULL,
+    UNIQUE(active_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS github_agent_operations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id       TEXT NOT NULL UNIQUE,
+    client_request_id  TEXT NOT NULL,
+    attempt_id         TEXT NOT NULL REFERENCES github_collaboration_attempts(attempt_id),
+    created_by_run_id  TEXT NOT NULL REFERENCES run_capabilities(run_id),
+    task_id            INTEGER NOT NULL REFERENCES tasks(id),
+    agent              TEXT NOT NULL,
+    role               TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    pr_number          INTEGER NOT NULL,
+    head_sha           TEXT,
+    kind               TEXT NOT NULL,
+    request_json       TEXT NOT NULL,
+    state              TEXT NOT NULL
+                       CHECK(state IN ('queued','running','succeeded','failed','cancelled')),
+    send_state         TEXT NOT NULL DEFAULT 'not_started'
+                       CHECK(send_state IN ('not_started','definitely_unsent',
+                                            'ambiguous','confirmed')),
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at    INTEGER,
+    deadline_at        INTEGER NOT NULL,
+    review_sequence    INTEGER,
+    github_marker      TEXT,
+    remote_object_id   TEXT,
+    response_json      TEXT,
+    error_kind         TEXT,
+    error_summary      TEXT,
+    completed_after_revocation INTEGER NOT NULL DEFAULT 0
+                              CHECK(completed_after_revocation IN (0,1)),
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    expires_at         INTEGER NOT NULL,
+    UNIQUE(attempt_id, client_request_id),
+    UNIQUE(attempt_id, review_sequence)
+);
+
+CREATE TABLE IF NOT EXISTS github_review_publication_slots (
+    publisher_scope     TEXT NOT NULL,
+    pr_number           INTEGER NOT NULL,
+    task_id             INTEGER NOT NULL REFERENCES tasks(id),
+    attempt_id          TEXT REFERENCES github_collaboration_attempts(attempt_id),
+    state               TEXT NOT NULL
+                        CHECK(state IN ('probing','owned','cleanup_required',
+                                        'cleanup_running','blocked')),
+    pending_review_id   TEXT,
+    review_owner_marker TEXT,
+    create_send_state   TEXT NOT NULL DEFAULT 'not_started'
+                        CHECK(create_send_state IN ('not_started','definitely_unsent',
+                                                    'ambiguous','confirmed')),
+    cleanup_attempts    INTEGER NOT NULL DEFAULT 0,
+    next_cleanup_at     INTEGER,
+    cleanup_deadline_at INTEGER,
+    error_kind          TEXT,
+    error_summary       TEXT,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    PRIMARY KEY(publisher_scope, pr_number),
+    UNIQUE(attempt_id)
 );
