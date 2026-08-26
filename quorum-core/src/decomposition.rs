@@ -279,6 +279,9 @@ struct RecoveryDelivery {
     source_revision: i64,
     pr_number: i64,
     merged_head_sha: String,
+    legacy_prepublication: bool,
+    original_publication_branch: Option<String>,
+    original_publication_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2162,6 +2165,9 @@ pub fn adopt_recovery_delivery(
                     source_revision: row.get(2)?,
                     pr_number: row.get(3)?,
                     merged_head_sha: row.get(4)?,
+                    legacy_prepublication: false,
+                    original_publication_branch: None,
+                    original_publication_sha: None,
                 })
             },
         )
@@ -2222,30 +2228,100 @@ pub fn adopt_explicit_recovery_delivery(
     let delivery: Option<RecoveryDelivery> = tx
         .query_row(
             "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
-                    recovery_target.pr_number,recovery_target.head_sha
+                    recovery_target.pr_number,recovery_target.head_sha,
+                    original.status='open',
+                    json_extract(original.refs,'$.daemon_publication.branch'),
+                    json_extract(original.refs,'$.daemon_publication.local_sha')
              FROM task_graph_members member
              JOIN task_decompositions graph ON graph.id=member.graph_id
              JOIN tasks source ON source.id=graph.source_task_id
              JOIN tasks original ON original.id=member.task_id
              JOIN tasks recovery ON recovery.id=?2
-             JOIN pr_targets original_target ON original_target.task_id=original.id
+             LEFT JOIN pr_targets original_target ON original_target.task_id=original.id
              JOIN pr_targets recovery_target ON recovery_target.task_id=recovery.id
              JOIN r2_sampling_decisions sampling
                ON sampling.pr_number=recovery_target.pr_number
               AND sampling.head_sha=recovery_target.head_sha
               AND sampling.task_id=recovery.id
              WHERE original.id=?1 AND original.id!=recovery.id
-               AND original.status='failed'
                AND member.active=1 AND member.plan_revision=graph.accepted_plan_revision
                AND graph.active=1
                AND (
-                    graph.state='active'
+                    (
+                        original.status='failed'
+                        AND (
+                            graph.state='active'
+                            OR (
+                                graph.state='blocked'
+                                AND graph.hold_code=?4
+                                AND json_valid(graph.hold_summary)
+                                AND json_type(graph.hold_summary,'$.affected_task')='integer'
+                                AND json_extract(graph.hold_summary,'$.affected_task')=original.id
+                            )
+                        )
+                        AND json_valid(original.refs)
+                        AND json_type(original.refs,'$.pr')='integer'
+                        AND json_extract(original.refs,'$.pr')=original_target.pr_number
+                        AND original_target.pr_number=recovery_target.pr_number
+                        AND original_target.head_ref!=''
+                        AND original_target.head_ref=recovery_target.head_ref
+                        AND length(original_target.head_sha) IN (40,64)
+                        AND original_target.head_sha NOT GLOB '*[^0-9A-Fa-f]*'
+                    )
                     OR (
-                        graph.state='blocked'
-                        AND graph.hold_code=?4
-                        AND json_valid(graph.hold_summary)
-                        AND json_type(graph.hold_summary,'$.affected_task')='integer'
-                        AND json_extract(graph.hold_summary,'$.affected_task')=original.id
+                        original.status='open'
+                        AND original.assignee IS NULL AND original.reviewer IS NULL
+                        AND original.completion_provenance IS NULL
+                        AND graph.state='blocked'
+                        AND graph.hold_code='generated-child-failed'
+                        AND NOT json_valid(graph.hold_summary)
+                        AND substr(graph.hold_summary,1,length(
+                            'generated child task #' || original.id ||
+                            ' failed: daemon-owned publication failed: daemon push to new branch refs/heads/' ||
+                            json_extract(original.refs,'$.daemon_publication.branch') ||
+                            ' rejected:'
+                        ))=(
+                            'generated child task #' || original.id ||
+                            ' failed: daemon-owned publication failed: daemon push to new branch refs/heads/' ||
+                            json_extract(original.refs,'$.daemon_publication.branch') ||
+                            ' rejected:'
+                        )
+                        AND json_valid(original.refs)
+                        AND json_type(original.refs,'$.pr') IS NULL
+                        AND json_type(original.refs,'$.daemon_publication')='object'
+                        AND json_type(original.refs,'$.daemon_publication.stage')='text'
+                        AND json_extract(original.refs,'$.daemon_publication.stage')='intent'
+                        AND json_type(original.refs,'$.daemon_publication.branch')='text'
+                        AND length(json_extract(original.refs,'$.daemon_publication.branch'))
+                            BETWEEN 1 AND 512
+                        AND substr(
+                            json_extract(original.refs,'$.daemon_publication.branch'),
+                            -length('-t' || original.id)
+                        )='-t' || original.id
+                        AND json_type(original.refs,'$.daemon_publication.local_sha')='text'
+                        AND length(json_extract(original.refs,'$.daemon_publication.local_sha'))
+                            IN (40,64)
+                        AND json_extract(original.refs,'$.daemon_publication.local_sha')
+                            NOT GLOB '*[^0-9A-Fa-f]*'
+                        AND (json_type(original.refs,'$.daemon_publication.pr') IS NULL
+                             OR json_type(original.refs,'$.daemon_publication.pr')='null')
+                        AND (json_type(original.refs,'$.daemon_publication.expected_remote_sha') IS NULL
+                             OR json_type(original.refs,'$.daemon_publication.expected_remote_sha')='null')
+                        AND (json_type(original.refs,'$.daemon_publication.target_branch') IS NULL
+                             OR json_type(original.refs,'$.daemon_publication.target_branch')='null')
+                        AND NOT EXISTS (
+                            SELECT 1 FROM pr_targets stale_original_target
+                            WHERE stale_original_target.task_id=original.id
+                        )
+                        AND source.target_branch IS NOT NULL
+                        AND source.target_branch!=''
+                        AND recovery.target_branch=source.target_branch
+                        AND recovery.created_at>original.updated_at
+                        AND json_type(recovery.refs,'$.cx_dup_of')='array'
+                        AND EXISTS (
+                            SELECT 1 FROM json_each(recovery.refs,'$.cx_dup_of') duplicate
+                            WHERE duplicate.type='integer' AND duplicate.value=original.id
+                        )
                     )
                )
                AND source.status='decomposed'
@@ -2256,14 +2332,6 @@ pub fn adopt_explicit_recovery_delivery(
                       AND sibling.task_id!=original.id
                       AND sibling_task.status!='done'
                )
-               AND json_valid(original.refs)
-               AND json_type(original.refs,'$.pr')='integer'
-               AND json_extract(original.refs,'$.pr')=original_target.pr_number
-               AND original_target.pr_number=recovery_target.pr_number
-               AND original_target.head_ref!=''
-               AND original_target.head_ref=recovery_target.head_ref
-               AND length(original_target.head_sha) IN (40,64)
-               AND original_target.head_sha NOT GLOB '*[^0-9A-Fa-f]*'
                AND recovery.status='done' AND recovery.review_only=0
                AND recovery.completion_provenance=?3
                AND recovery.continue_pr=recovery_target.pr_number
@@ -2346,6 +2414,9 @@ pub fn adopt_explicit_recovery_delivery(
                     source_revision: row.get(2)?,
                     pr_number: row.get(3)?,
                     merged_head_sha: row.get(4)?,
+                    legacy_prepublication: row.get(5)?,
+                    original_publication_branch: row.get(6)?,
+                    original_publication_sha: row.get(7)?,
                 })
             },
         )
@@ -2369,6 +2440,9 @@ pub fn adopt_explicit_recovery_delivery(
         "recovery_task": input.recovery_task_id,
         "pr": delivery.pr_number,
         "merged_head_sha": delivery.merged_head_sha,
+        "legacy_prepublication": delivery.legacy_prepublication,
+        "original_publication_branch": delivery.original_publication_branch,
+        "original_publication_sha": delivery.original_publication_sha,
     })
     .to_string();
     tx.execute(
@@ -2418,6 +2492,14 @@ fn finalize_recovery_delivery(
         recovery_provenance["authorized_by"] = serde_json::json!(authorized_by);
         recovery_provenance["decomposition_source"] =
             serde_json::json!(delivery.decomposition_source_id);
+        recovery_provenance["legacy_prepublication"] =
+            serde_json::json!(delivery.legacy_prepublication);
+        if let Some(branch) = &delivery.original_publication_branch {
+            recovery_provenance["original_publication_branch"] = serde_json::json!(branch);
+        }
+        if let Some(sha) = &delivery.original_publication_sha {
+            recovery_provenance["original_publication_sha"] = serde_json::json!(sha);
+        }
     }
     let recovery_provenance = recovery_provenance.to_string();
 
@@ -2433,12 +2515,14 @@ fn finalize_recovery_delivery(
                      '$.daemon_publication'),
                  '$.recovery_delivery',
                  json(?4))
-         WHERE id=?1 AND status='failed'",
+         WHERE id=?1
+           AND ((?5=0 AND status='failed') OR (?5=1 AND status='open'))",
         params![
             original_child_id,
             now,
             crate::tasks::COMPLETION_PROVENANCE_MERGED,
-            recovery_provenance
+            recovery_provenance,
+            delivery.legacy_prepublication
         ],
     )?;
     if changed != 1 {
@@ -2457,7 +2541,12 @@ fn finalize_recovery_delivery(
         now,
     )?;
     if explicit_authority.is_some() {
-        complete_graph_after_explicit_boundary_recovery(tx, original_child_id, now)?;
+        complete_graph_after_explicit_recovery(
+            tx,
+            original_child_id,
+            now,
+            delivery.legacy_prepublication,
+        )?;
     } else {
         complete_graph_if_final_child(tx, original_child_id, now)?;
     }
@@ -2477,12 +2566,19 @@ pub(crate) fn complete_graph_if_final_child(
 /// The explicit operator recovery path may complete a blocked graph only when
 /// the persisted boundary blocker names the child whose exact delivery it just
 /// adopted. Ordinary child completion intentionally cannot clear a block.
-fn complete_graph_after_explicit_boundary_recovery(
+fn complete_graph_after_explicit_recovery(
     tx: &Transaction<'_>,
     task_id: i64,
     now: i64,
+    allow_legacy_publication_recovery: bool,
 ) -> Result<bool> {
-    complete_graph_if_final_child_with_boundary_recovery(tx, task_id, now, true)
+    complete_graph_if_final_child_with_explicit_recovery(
+        tx,
+        task_id,
+        now,
+        true,
+        allow_legacy_publication_recovery,
+    )
 }
 
 fn complete_graph_if_final_child_with_boundary_recovery(
@@ -2490,6 +2586,22 @@ fn complete_graph_if_final_child_with_boundary_recovery(
     task_id: i64,
     now: i64,
     allow_boundary_recovery: bool,
+) -> Result<bool> {
+    complete_graph_if_final_child_with_explicit_recovery(
+        tx,
+        task_id,
+        now,
+        allow_boundary_recovery,
+        false,
+    )
+}
+
+fn complete_graph_if_final_child_with_explicit_recovery(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    now: i64,
+    allow_boundary_recovery: bool,
+    allow_legacy_publication_recovery: bool,
 ) -> Result<bool> {
     let graph: Option<(i64, i64)> = tx
         .query_row(
@@ -2506,11 +2618,24 @@ fn complete_graph_if_final_child_with_boundary_recovery(
                         AND json_type(d.hold_summary,'$.affected_task')='integer'
                         AND json_extract(d.hold_summary,'$.affected_task')=m.task_id
                     )
+                    OR (
+                        ?4=1 AND d.state='blocked'
+                        AND d.hold_code='generated-child-failed'
+                        AND NOT json_valid(d.hold_summary)
+                        AND substr(d.hold_summary,1,length(
+                            'generated child task #' || m.task_id ||
+                            ' failed: daemon-owned publication failed:'
+                        ))=(
+                            'generated child task #' || m.task_id ||
+                            ' failed: daemon-owned publication failed:'
+                        )
+                    )
                )",
             params![
                 task_id,
                 allow_boundary_recovery,
-                GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION
+                GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION,
+                allow_legacy_publication_recovery
             ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -2542,13 +2667,26 @@ fn complete_graph_if_final_child_with_boundary_recovery(
                     AND json_type(hold_summary,'$.affected_task')='integer'
                     AND json_extract(hold_summary,'$.affected_task')=?5
                 )
+                OR (
+                    ?6=1 AND state='blocked'
+                    AND hold_code='generated-child-failed'
+                    AND NOT json_valid(hold_summary)
+                    AND substr(hold_summary,1,length(
+                        'generated child task #' || ?5 ||
+                        ' failed: daemon-owned publication failed:'
+                    ))=(
+                        'generated child task #' || ?5 ||
+                        ' failed: daemon-owned publication failed:'
+                    )
+                )
            )",
         params![
             graph_id,
             now,
             allow_boundary_recovery,
             GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION,
-            task_id
+            task_id,
+            allow_legacy_publication_recovery
         ],
     )?;
     if graph_changed != 1 {
@@ -3481,6 +3619,62 @@ mod tests {
                 .execute(
                     "UPDATE pr_targets SET resolved_at=20 WHERE task_id=?1",
                     [self.recovery],
+                )
+                .unwrap();
+        }
+
+        fn make_legacy_prepublication_eligible(&mut self) {
+            self.make_explicit_eligible();
+            let branch = format!("daemon/pivot-sma1-t{}", self.original);
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET status='open',assignee=NULL,reviewer=NULL,
+                         completion_provenance=NULL,refs=?2
+                     WHERE id=?1",
+                    params![
+                        self.original,
+                        serde_json::json!({
+                            "daemon_publication": {
+                                "branch": branch,
+                                "expected_remote_sha": null,
+                                "local_sha": ORIGINAL_HEAD,
+                                "pr": null,
+                                "stage": "intent",
+                                "target_branch": null
+                            }
+                        })
+                        .to_string()
+                    ],
+                )
+                .unwrap();
+            self.conn
+                .execute("DELETE FROM pr_targets WHERE task_id=?1", [self.original])
+                .unwrap();
+            self.conn
+                .execute(
+                    "UPDATE tasks SET target_branch='main' WHERE id IN (?1,?2)",
+                    params![1, self.recovery],
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET refs=json_set(refs,'$.cx_dup_of',json_array(?2))
+                     WHERE id=?1",
+                    params![self.recovery, self.original],
+                )
+                .unwrap();
+            let summary = format!(
+                "generated child task #{} failed: daemon-owned publication failed: daemon push to new branch refs/heads/{} rejected: error: failed to push some refs",
+                self.original, branch
+            );
+            self.conn
+                .execute(
+                    "UPDATE task_decompositions
+                     SET state='blocked',hold_code='generated-child-failed',hold_summary=?2
+                     WHERE id=?1",
+                    params![self.graph, summary],
                 )
                 .unwrap();
         }
@@ -6585,6 +6779,146 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_count, 1, "replay must not duplicate provenance");
+    }
+
+    #[test]
+    fn explicit_recovery_adopts_exact_legacy_prepublication_failure_on_source_target() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_legacy_prepublication_eligible();
+
+        assert!(fixture.explicit_adoption(90_000));
+        assert_graph_completed(
+            &fixture.conn,
+            fixture.graph,
+            1,
+            &[
+                fixture.siblings[0],
+                fixture.siblings[1],
+                fixture.siblings[2],
+                fixture.original,
+            ],
+        );
+        let (refs, attempt): (String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT child.refs,attempt.summary
+                 FROM tasks child
+                 JOIN task_graph_members member ON member.task_id=child.id
+                 JOIN decomposition_attempts attempt ON attempt.graph_id=member.graph_id
+                 WHERE child.id=?1 AND attempt.kind='recovery'",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        let attempt: serde_json::Value = serde_json::from_str(&attempt).unwrap();
+        assert!(refs.get("daemon_publication").is_none());
+        assert_eq!(refs["recovery_delivery"]["legacy_prepublication"], true);
+        assert_eq!(
+            refs["recovery_delivery"]["original_publication_sha"],
+            ORIGINAL_HEAD
+        );
+        assert_eq!(attempt["legacy_prepublication"], true);
+        assert_eq!(attempt["original_publication_sha"], ORIGINAL_HEAD);
+    }
+
+    #[test]
+    fn explicit_legacy_prepublication_recovery_fails_closed_on_mismatched_evidence() {
+        let cases: Vec<(&str, RecoveryEvidenceMutation)> = vec![
+            (
+                "recovery landed off the source target",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET target_branch='develop' WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "missing exact duplicate classification",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_remove(refs,'$.cx_dup_of') WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "publication branch is not task scoped",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks
+                             SET refs=json_set(refs,'$.daemon_publication.branch','daemon/wrong')
+                             WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "publication advanced beyond intent",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks
+                             SET refs=json_set(refs,'$.daemon_publication.pr',?2)
+                             WHERE id=?1",
+                            params![fixture.original, RECOVERY_PR],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "legacy hold names a different publication failure",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE task_decompositions
+                             SET hold_summary='generated child task #999 failed: daemon-owned publication failed:'
+                             WHERE id=?1",
+                            [fixture.graph],
+                        )
+                        .unwrap();
+                }),
+            ),
+        ];
+
+        for (name, mutate) in cases {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_legacy_prepublication_eligible();
+            mutate(&mut fixture);
+            assert!(!fixture.explicit_adoption(90_000), "{name}");
+            let state: (String, String, String, i64) = fixture
+                .conn
+                .query_row(
+                    "SELECT child.status,graph.state,source.status,
+                            (SELECT count(*) FROM decomposition_attempts
+                             WHERE graph_id=graph.id AND kind='recovery')
+                     FROM tasks child
+                     JOIN task_graph_members member ON member.task_id=child.id
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     JOIN tasks source ON source.id=graph.source_task_id
+                     WHERE child.id=?1",
+                    [fixture.original],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                ("open".into(), "blocked".into(), "decomposed".into(), 0),
+                "{name} mutated recovery state"
+            );
+        }
     }
 
     #[test]
