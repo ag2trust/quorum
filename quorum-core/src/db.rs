@@ -1069,17 +1069,14 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
         // CREATE TABLE / constraint indexes handle both fresh databases and v60 upgrades.
         // This migration intentionally adds no executor, claim, MCP, or GitHub behavior.
 
-        // v62 = collaboration-attempt bindings and the durable GitHub-operation outbox.
-        // Both v61 lineages existed before they were merged: this version forces SCHEMA_SQL
-        // to add the other lineage's net-new tables to either already-v61 database. Re-create
-        // the request immutability trigger as an explicit migration guard while the write lock
-        // is held.
+        // v62 = immutable enqueue boundary for the canonical GitHub operation outbox. The
+        // trigger is additive so a v61 database receives it under the migration write lock.
         if current < 62 {
             conn.execute_batch(
-                "CREATE TRIGGER IF NOT EXISTS github_operations_request_immutable
+                "CREATE TRIGGER IF NOT EXISTS github_agent_operations_request_immutable
                  BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
                                   task_id, agent, role, pr_number, head_sha, kind, request_json,
-                                  github_marker, created_at, enqueued_at ON github_operations
+                                  github_marker, created_at ON github_agent_operations
                  BEGIN
                      SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
                  END;",
@@ -1938,9 +1935,7 @@ mod tests {
         conn.execute_batch(
             "DROP TABLE github_review_publication_slots;
              DROP TABLE github_agent_operations;
-             DROP TABLE github_operations;
              DROP TABLE github_collaboration_attempts;
-             DROP TABLE collaboration_attempts;
              PRAGMA user_version=60;",
         )
         .unwrap();
@@ -2115,6 +2110,16 @@ mod tests {
     fn fresh_schema_github_collaboration_storage_matches_migrated_constraints() {
         let dir = tempfile::tempdir().unwrap();
         let conn = open(&dir.path().join("fresh-github-collaboration.db")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='trigger' AND name='github_agent_operations_request_immutable'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
         assert_github_collaboration_constraints(&conn);
     }
 
@@ -2169,120 +2174,14 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v60_to_v62_adds_collaboration_storage_idempotently() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v60-collaboration.db");
-        // A v60 database never saw either independently-developed v61
-        // lineage. Remove all of their objects before reopening through the
-        // production migration path.
-        prepare_v60_github_collaboration_db(&path);
-
-        let conn = open(&path).unwrap();
-        assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        for table in ["collaboration_attempts", "github_operations"] {
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-                1,
-                "{table} missing after v60→v62 migration"
-            );
-        }
-
-        conn.execute_batch(
-            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
-                 VALUES (1,'collaboration','in-review','owner',1,1);
-             INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
-                 VALUES ('reviewer-run',1,'Reviewer','reviewer',1);
-             INSERT INTO collaboration_attempts(
-                 attempt_id,task_id,agent,role,pr_number,head_sha,lifecycle_generation,
-                 active_run_id,state,active,created_at,updated_at,expires_at
-             ) VALUES (
-                 'attempt-v61',1,'Reviewer','reviewer',42,'abc123',3,
-                 'reviewer-run','active',1,10,10,1000
-             );
-             INSERT INTO github_operations(
-                 operation_id,client_request_id,attempt_id,created_by_run_id,
-                 task_id,agent,role,pr_number,head_sha,kind,request_json,
-                 deadline_at,created_at,enqueued_at,updated_at,expires_at
-             ) VALUES (
-                 'operation-v61','request-v61','attempt-v61','reviewer-run',
-                 1,'Reviewer','reviewer',42,'abc123','add_issue_comment','{\"body\":\"hello\"}',
-                 100,10,10,10,1000
-             );",
-        )
-        .unwrap();
-        assert!(
-            conn.execute(
-                "UPDATE github_operations SET request_json='{\"body\":\"mutated\"}'
-                 WHERE operation_id='operation-v61'",
-                [],
-            )
-            .is_err(),
-            "enqueued GitHub request payload must be immutable"
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT request_json FROM github_operations WHERE operation_id='operation-v61'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-            r#"{"body":"hello"}"#
-        );
-
-        // Re-enter the v62 block with tables and data already present. Every
-        // DDL statement is IF NOT EXISTS, so the migration must preserve the
-        // existing immutable row rather than rebuild or duplicate it.
-        conn.execute_batch("PRAGMA user_version=60;").unwrap();
-        drop(conn);
-        let reopened = open(&path).unwrap();
-        assert_eq!(
-            reopened
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        assert_eq!(
-            reopened
-                .query_row("SELECT COUNT(*) FROM github_operations", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            reopened
-                .query_row(
-                    "SELECT request_json FROM github_operations WHERE operation_id='operation-v61'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            r#"{"body":"hello"}"#
-        );
-    }
-
-    #[test]
-    fn migrates_v61_github_collaboration_lineage_to_v62() {
+    fn migrates_v61_to_v62_adds_canonical_operation_immutability_trigger_idempotently() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v61-github-collaboration.db");
         prepare_v60_github_collaboration_db(&path);
 
-        // This models the already-shipped develop lineage: it owns the
-        // github_* collaboration tables at v61, but predates the Task 108
-        // collaboration_attempts/github_operations pair. v62 must force the
-        // idempotent schema pass and create the missing pair and trigger.
         let conn = open(&path).unwrap();
         conn.execute_batch(
-            "DROP TABLE github_operations;
-             DROP TABLE collaboration_attempts;
+            "DROP TRIGGER github_agent_operations_request_immutable;
              PRAGMA user_version=61;",
         )
         .unwrap();
@@ -2295,25 +2194,89 @@ mod tests {
                 .unwrap(),
             SCHEMA_VERSION
         );
-        for object in [
-            ("table", "collaboration_attempts"),
-            ("table", "github_operations"),
-            ("trigger", "github_operations_request_immutable"),
-        ] {
-            assert_eq!(
-                migrated
-                    .query_row(
-                        "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND name=?2",
-                        object,
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap(),
-                1,
-                "{} {} missing after v61→v62 migration",
-                object.0,
-                object.1
-            );
-        }
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='trigger' AND name='github_agent_operations_request_immutable'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        migrated
+            .execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                     VALUES (1,'collaboration','in-review','owner',1,1);
+                 INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                     VALUES ('reviewer-run',1,'Reviewer','reviewer',1);
+                 INSERT INTO github_collaboration_attempts(
+                     attempt_id,task_id,agent,role,pr_number,lifecycle_generation,active_run_id,
+                     state,created_at,updated_at,expires_at
+                 ) VALUES ('attempt-v61',1,'Reviewer','reviewer',42,3,'reviewer-run',
+                           'active',10,10,1000);
+                 INSERT INTO github_agent_operations(
+                     operation_id,client_request_id,attempt_id,created_by_run_id,
+                     task_id,agent,role,pr_number,kind,request_json,state,
+                     deadline_at,created_at,updated_at,expires_at
+                 ) VALUES ('operation-v61','request-v61','attempt-v61','reviewer-run',
+                           1,'Reviewer','reviewer',42,'add_issue_comment','{\"body\":\"hello\"}',
+                           'queued',100,10,10,1000);",
+            )
+            .unwrap();
+        assert!(
+            migrated
+                .execute(
+                    "UPDATE github_agent_operations SET request_json='{\"body\":\"mutated\"}'
+                     WHERE operation_id='operation-v61'",
+                    [],
+                )
+                .is_err(),
+            "enqueued canonical GitHub request payload must be immutable"
+        );
+        assert_eq!(
+            migrated
+                .query_row(
+                    "SELECT request_json FROM github_agent_operations WHERE operation_id='operation-v61'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            r#"{"body":"hello"}"#
+        );
+
+        // Re-enter the v62 migration with the trigger and data already present.
+        migrated.execute_batch("PRAGMA user_version=61;").unwrap();
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='trigger' AND name='github_agent_operations_request_immutable'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT request_json FROM github_agent_operations WHERE operation_id='operation-v61'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            r#"{"body":"hello"}"#
+        );
     }
 
     #[test]

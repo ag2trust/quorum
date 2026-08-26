@@ -1,8 +1,10 @@
-//! Closed, bounded vocabulary for collaboration attempts and GitHub operations.
+//! Closed, bounded vocabulary for the canonical GitHub collaboration storage.
 //!
 //! This module deliberately contains no admission, transition, or persistence
-//! logic. It gives the eventual endpoint and executor one validated vocabulary
-//! for request construction and one closed set of durable result/error states.
+//! logic. It prepares later APIs for `github_collaboration_attempts`,
+//! `github_agent_operations`, and `github_review_publication_slots` with one
+//! validated vocabulary for request construction and one closed set of durable
+//! result/error states.
 
 use crate::error::{QuorumError, Result};
 use serde::Serialize;
@@ -190,9 +192,9 @@ pub enum CollaborationAdmissionError {
     OperationLimitReached,
 }
 
-/// JSON text valid for a closed GitHub-operation request. The value is parsed
-/// before it is re-serialized, so durable storage receives SQL-bound canonical
-/// JSON rather than opaque caller-controlled text.
+/// JSON text valid for a closed `github_agent_operations` request. The value is
+/// parsed before it is re-serialized, so durable storage receives SQL-bound
+/// canonical JSON rather than opaque caller-controlled text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct GithubOperationRequestJson(String);
@@ -276,8 +278,9 @@ fn json_has_nul(value: &serde_json::Value) -> bool {
     }
 }
 
-/// A new daemon-owned logical turn. The active attempt is bound to one exact
-/// task/agent/role/PR/generation, plus the immutable reviewer launch SHA.
+/// A prepared insert for one canonical `github_collaboration_attempts` logical
+/// turn, bound to an exact task/agent/role/PR/generation and reviewer launch
+/// SHA.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CreateCollaborationAttemptRequest {
     attempt_id: CollaborationAttemptId,
@@ -365,9 +368,9 @@ impl CreateCollaborationAttemptRequest {
     }
 }
 
-/// One immutable GitHub-operation enqueue request. All target fields repeat
-/// the attempt binding so future storage can reject cross-row disagreement in
-/// its one admission transaction.
+/// One immutable prepared `github_agent_operations` enqueue request. All target
+/// fields repeat the attempt binding so future storage can reject cross-row
+/// disagreement in its one admission transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnqueueGithubOperationRequest {
     operation_id: GithubOperationId,

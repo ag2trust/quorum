@@ -324,11 +324,6 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
 /// introduced; the FK inventory test below fails when a new one is missed.
 const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
     ("cancelled_dependency_reconciliation", "cancelled_task_id"),
-    // A collaboration group owns its shared retention window. The task stays
-    // present until that group expires and bounded housekeeping removes the
-    // operation children before their parent attempt.
-    ("collaboration_attempts", "task_id"),
-    ("github_operations", "task_id"),
     ("task_decompositions", "source_task_id"),
     ("task_graph_members", "task_id"),
     ("decomposition_cleanup", "task_id"),
@@ -789,103 +784,6 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(bodies, vec!["live".to_string()]);
-    }
-
-    #[test]
-    fn sweeps_preserve_expired_ambiguous_operation_under_resumable_attempt() {
-        let (_d, mut c) = open_tmp_fk();
-        let task_id = crate::tasks::create(
-            &mut c,
-            "owner",
-            "collaboration recovery retention",
-            None,
-            0,
-            None,
-            None,
-            None,
-            None,
-            1,
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
-             VALUES ('collaboration-run',?1,'worker','worker',1)",
-            [task_id],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO collaboration_attempts(
-                 attempt_id,task_id,agent,role,pr_number,lifecycle_generation,
-                 active_run_id,state,active,created_at,updated_at,expires_at
-             ) VALUES (
-                 'resumable-attempt',?1,'worker','worker',7,1,
-                 'collaboration-run','awaiting_resume',0,1,1,10
-             )",
-            [task_id],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO github_operations(
-                 operation_id,client_request_id,attempt_id,created_by_run_id,
-                 task_id,agent,role,pr_number,kind,request_json,state,send_state,
-                 deadline_at,created_at,enqueued_at,updated_at,expires_at
-             ) VALUES (
-                 'ambiguous-operation','ambiguous-request','resumable-attempt',
-                 'collaboration-run',?1,'worker','worker',7,
-                 'pull_request_read','{}','running','ambiguous',10,1,1,1,10
-             )",
-            [task_id],
-        )
-        .unwrap();
-
-        // A normal mutation executes the bounded sweep within BEGIN IMMEDIATE.
-        // It must retain this expired but recovery-authoritative group.
-        let ordinary_write = crate::tasks::create(
-            &mut c,
-            "owner",
-            "ordinary write",
-            None,
-            0,
-            None,
-            None,
-            None,
-            None,
-            100,
-        )
-        .unwrap();
-        assert!(ordinary_write > task_id);
-        assert_eq!(
-            c.query_row("SELECT COUNT(*) FROM github_operations", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            1,
-            "ordinary sweeping must not discard an ambiguous operation"
-        );
-        assert_eq!(
-            c.query_row("SELECT COUNT(*) FROM collaboration_attempts", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            1,
-            "ordinary sweeping must not discard a resumable attempt"
-        );
-        sweep_all(&c, 100).unwrap();
-        let state: (String, String, String) = c
-            .query_row(
-                "SELECT a.state,o.state,o.send_state
-                 FROM collaboration_attempts AS a
-                 JOIN github_operations AS o ON o.attempt_id=a.attempt_id",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            state,
-            (
-                "awaiting_resume".into(),
-                "running".into(),
-                "ambiguous".into()
-            )
-        );
     }
 
     #[test]
