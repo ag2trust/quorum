@@ -60,6 +60,10 @@ pub fn render_sanitized_session_event(event: &SanitizedSessionEvent) -> String {
             label(outcome),
             sanitized_field_summary(details)
         ),
+        SanitizedSessionEvent::AssistantMessage { details } => format!(
+            "> Assistant message ({})\n",
+            sanitized_field_summary(details)
+        ),
         SanitizedSessionEvent::TerminalResponse { status, response } => format!(
             "> Terminal response {} ({})\n",
             label(status),

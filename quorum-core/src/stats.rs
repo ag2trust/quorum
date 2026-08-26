@@ -2421,6 +2421,7 @@ fn planner_stream_counters(log_dir: &str) -> Option<PlannerStreamCounters> {
                 | "turn_lifecycle"
                 | "command_summary"
                 | "tool_summary"
+                | "assistant_message"
                 | "terminal_response"
                 | "provider_failure"
                 | "semantic_rejection"
@@ -2428,6 +2429,8 @@ fn planner_stream_counters(log_dir: &str) -> Option<PlannerStreamCounters> {
         ) {
             counters.activity_count = counters.activity_count.saturating_add(1);
         }
+        // `assistant_message` is deliberately excluded: an assistant-only turn
+        // is activity, not a tool action.
         if matches!(event, "command_summary" | "tool_summary") {
             counters.tool_count = counters.tool_count.saturating_add(1);
         }
@@ -4767,6 +4770,63 @@ mod tests {
         assert_eq!(
             render_graph_hold_summary(Some("generated-child-failed"), "legacy child failure"),
             "legacy child failure"
+        );
+    }
+
+    #[test]
+    fn planner_stream_counters_do_not_count_assistant_messages_as_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        // Sanitized shape: only assistant-message activity, no command or tool.
+        std::fs::write(
+            dir.path().join("stream.jsonl"),
+            concat!(
+                r#"{"event":"provider_lifecycle","provider":"codex","phase":"started"}"#,
+                "\n",
+                r#"{"event":"turn_lifecycle","turn":1,"phase":"started"}"#,
+                "\n",
+                r#"{"event":"assistant_message","details":{"summary":"structural","shape":"string","captured_bytes":8}}"#,
+                "\n",
+                r#"{"event":"assistant_message","details":{"summary":"structural","shape":"string","captured_bytes":8}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let counters = planner_stream_counters(dir.path().to_str().unwrap()).unwrap();
+        assert!(
+            counters.activity_count >= 3,
+            "assistant messages must count as activity: {counters:?}"
+        );
+        assert_eq!(
+            counters.tool_count, 0,
+            "assistant-only stream must report zero tool actions"
+        );
+    }
+
+    #[test]
+    fn planner_stream_counters_count_command_and_tool_summaries_as_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("stream.jsonl"),
+            concat!(
+                r#"{"event":"turn_lifecycle","turn":1,"phase":"started"}"#,
+                "\n",
+                r#"{"event":"assistant_message","details":{"summary":"structural","shape":"string","captured_bytes":4}}"#,
+                "\n",
+                r#"{"event":"command_summary","command":"shell","outcome":"succeeded","details":{"summary":"structural","shape":"object","captured_bytes":8}}"#,
+                "\n",
+                r#"{"event":"tool_summary","tool":"other","outcome":"started","details":{"summary":"structural","shape":"object","captured_bytes":8}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let counters = planner_stream_counters(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            counters.activity_count, 4,
+            "each sanitized activity record counts once: {counters:?}"
+        );
+        assert_eq!(
+            counters.tool_count, 2,
+            "command_summary and tool_summary count as tools; assistant_message does not"
         );
     }
 
