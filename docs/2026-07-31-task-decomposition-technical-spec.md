@@ -82,13 +82,33 @@ overrides a conflicting source and never infers from task text or shared PR equa
 records the exact operator/source/child/recovery/PR/head tuple in the decomposition recovery
 ledger and child projection.
 
-Both paths use the same transaction-scoped finalizer: mark only the failed child done and preserve
-its PR association. The automatic path then runs ordinary final-child graph completion only for
-an active graph; on a blocked graph completion is intentionally skipped, leaving the graph blocked
-and active and the source decomposed. The explicit path retains its active-graph predicate. The
-continuation row remains unchanged. No match, replay, or losing concurrent caller changes state or
-emits an event; the winner emits the bounded child-completion event once and emits graph
-completion only for an active graph.
+The explicit command also recognizes one fail-closed legacy prepublication state created by the
+older retry path: the final generated child is unassigned `open`, has no completion or PR target,
+retains a valid task-scoped `daemon_publication` intent before PR creation, and its active graph is
+blocked by the matching non-JSON `generated-child-failed` publication summary. The recorded intent
+branch must match the exact daemon-authored grammar `daemon/<author-slug>-t<child-id>`, where
+`<author-slug>` is a non-empty lowercase ASCII `[a-z0-9-]+` run and `<child-id>` is the exact
+original child ID. Non-daemon prefixes, empty slugs, nested paths, whitespace, uppercase letters,
+dots, embedded NULs, and every other character outside that grammar are rejected before any lifecycle
+mutation. The preserved local SHA likewise rejects embedded NULs before its length and hexadecimal
+checks. The continuation
+must postdate the child, satisfy the same durable managed worker/reviewer/sampling/merge chain,
+and have an immutable target equal to the decomposition
+source's immutable target. No resolved publication field may be present. Success additionally
+audits the preserved local SHA and branch, removes the stale intent, and clears only that exact
+legacy hold while atomically completing the child, graph, and source. This predicate does not
+accept any other open task or generated-child failure. Classifier duplicate hints are explicitly
+non-authoritative and do not participate in this lifecycle predicate.
+
+Both paths use the same transaction-scoped finalizer: mark only the eligible child done and
+preserve its PR association when one exists. The automatic path then runs ordinary final-child
+graph completion only for an active graph; on a blocked graph completion is intentionally skipped,
+leaving the graph blocked and active and the source decomposed. The explicit path may additionally
+complete a blocked graph for either the exact structured `boundary-violation` hold naming the
+failed child or the exact legacy prepublication hold described above. The continuation row remains
+unchanged. No match, replay, or losing concurrent caller changes state or emits an event; the
+winner emits the bounded child-completion event once and emits graph completion only when its
+corresponding guarded graph predicate succeeds.
 
 The daemon invokes this primitive automatically after graph consistency reconciliation and before
 generic stateless lifecycle recovery or provisioning, once at startup and once per ordinary tick.
