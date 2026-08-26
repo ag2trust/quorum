@@ -341,8 +341,8 @@ result, `2` for bad input, and `3` for an internal or database failure.
 
 This is a non-binding view of ongoing directions, not a release schedule:
 
-- Grok Build worker routing is active; the managed worker model is currently
-  pinned to `grok-4.5`; attended real-CLI worker and lifecycle canaries remain
+- Grok Build worker routing is active for the exact `grok-4.5` and `grok-4.6`
+  models; attended real-CLI worker and lifecycle canaries remain
   required before production use.
 - Continuity for turn-oriented runners is being matured, including sticky and
   dormant execution states.

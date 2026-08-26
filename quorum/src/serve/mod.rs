@@ -22951,40 +22951,40 @@ mod tests {
 
     #[test]
     fn grok_resolves_for_workers_but_not_other_managed_roles() {
-        assert_eq!(
-            resolve_provider("grok-4.5").unwrap(),
-            runner::AgentKind::Grok
-        );
-        assert_eq!(
-            resolve_worker_provider("grok-4.5").unwrap(),
-            runner::AgentKind::Grok
-        );
-        for role in ["reviewer", "reviewer recovery"] {
-            let error = resolve_managed_provider("grok-4.5", role).unwrap_err();
-            assert!(error.to_string().contains("not enabled"), "{role}: {error}");
+        for model in ["grok-4.5", "grok-4.6"] {
+            assert_eq!(resolve_provider(model).unwrap(), runner::AgentKind::Grok);
+            assert_eq!(
+                resolve_worker_provider(model).unwrap(),
+                runner::AgentKind::Grok
+            );
+            for role in [
+                "planner",
+                "plan-review arbiter",
+                "classifier",
+                "collector",
+                "reviewer",
+                "reviewer recovery",
+            ] {
+                let error = resolve_managed_provider(model, role).unwrap_err();
+                assert!(error.to_string().contains("not enabled"), "{role}: {error}");
+            }
+            for configured_provider in [None, Some("grok")] {
+                assert_eq!(
+                    resolve_remediation_provider(
+                        configured_provider,
+                        Some(model.into()),
+                        "claude-opus-4-6",
+                        crate::serve_config::RunnerKind::Claude,
+                    )
+                    .unwrap()
+                    .1,
+                    runner::AgentKind::Grok
+                );
+            }
         }
-        assert_eq!(
-            resolve_remediation_provider(
-                None,
-                Some("grok-4.5".into()),
-                "claude-opus-4-6",
-                crate::serve_config::RunnerKind::Claude,
-            )
-            .unwrap()
-            .1,
-            runner::AgentKind::Grok
-        );
-        assert_eq!(
-            resolve_remediation_provider(
-                Some("grok"),
-                Some("grok-4.5".into()),
-                "claude-opus-4-6",
-                crate::serve_config::RunnerKind::Claude,
-            )
-            .unwrap()
-            .1,
-            runner::AgentKind::Grok
-        );
+
+        let error = resolve_worker_provider("grok-4.7").unwrap_err();
+        assert!(error.to_string().contains("unknown model"), "{error}");
     }
 
     #[test]
