@@ -1070,35 +1070,45 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
         // This migration intentionally adds no executor, claim, MCP, or GitHub behavior.
 
         // v62 = canonical GitHub operation immutability plus reconciliation of the retired
-        // parallel-v61 table family. The legacy tables were never backed by an executor, so an
-        // empty pair is safe to remove. If either table contains a row, fail before dropping
-        // anything: durable attempt/operation identities must never be silently discarded.
+        // parallel-v61 table family. The legacy tables were never backed by an executor, so
+        // only the exact empty pair is safe to remove. A partial pair or any row fails before
+        // dropping anything: durable attempt/operation identities must never be discarded.
         if current < 62 {
             let legacy_attempts_present = table_exists(conn, "collaboration_attempts")?;
             let legacy_operations_present = table_exists(conn, "github_operations")?;
-            if legacy_attempts_present || legacy_operations_present {
-                let legacy_attempts_have_rows = legacy_attempts_present
-                    && conn
+            match (legacy_attempts_present, legacy_operations_present) {
+                (false, false) => {}
+                (true, true) => {
+                    let legacy_attempts_have_rows = conn
                         .prepare("SELECT 1 FROM collaboration_attempts LIMIT 1")?
                         .exists([])?;
-                let legacy_operations_have_rows = legacy_operations_present
-                    && conn
+                    let legacy_operations_have_rows = conn
                         .prepare("SELECT 1 FROM github_operations LIMIT 1")?
                         .exists([])?;
-                if legacy_attempts_have_rows || legacy_operations_have_rows {
+                    if legacy_attempts_have_rows || legacy_operations_have_rows {
+                        return Err(QuorumError::Db(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                            Some(
+                                "legacy v61 collaboration storage contains rows; refusing to remove it"
+                                    .into(),
+                            ),
+                        )));
+                    }
+                    // Drop the child first. SQLite drops indexes and triggers owned by each table.
+                    conn.execute_batch(
+                        "DROP TABLE github_operations;
+                         DROP TABLE collaboration_attempts;",
+                    )?;
+                }
+                _ => {
                     return Err(QuorumError::Db(rusqlite::Error::SqliteFailure(
                         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
                         Some(
-                            "legacy v61 collaboration storage contains rows; refusing to remove it"
+                            "legacy v61 collaboration storage is incomplete; refusing to remove it"
                                 .into(),
                         ),
                     )));
                 }
-                // Drop the child first. SQLite drops indexes and triggers owned by each table.
-                conn.execute_batch(
-                    "DROP TABLE IF EXISTS github_operations;
-                     DROP TABLE IF EXISTS collaboration_attempts;",
-                )?;
             }
             conn.execute_batch(
                 "CREATE TRIGGER IF NOT EXISTS github_agent_operations_request_immutable
@@ -2609,6 +2619,51 @@ END;
                 .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+        assert_eq!(
+            raw.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='github_agent_operations'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "the failed transaction must roll back canonical table creation"
+        );
+    }
+
+    #[test]
+    fn incomplete_legacy_parallel_v61_fails_loudly_without_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incomplete-legacy-parallel-v61.db");
+        prepare_legacy_parallel_v61_db(&path, true);
+
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch("DROP TABLE github_operations;").unwrap();
+        drop(raw);
+
+        let error = open(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("legacy v61 collaboration storage is incomplete"),
+            "migration must fail loudly rather than remove a partial legacy pair: {error}"
+        );
+
+        let raw = Connection::open(&path).unwrap();
+        assert_eq!(
+            raw.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            61,
+            "a failed incomplete-pair reconciliation must leave the migration unadvanced"
+        );
+        assert_eq!(
+            raw.query_row("SELECT COUNT(*) FROM collaboration_attempts", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the surviving legacy table and its row must be preserved"
         );
         assert_eq!(
             raw.query_row(
