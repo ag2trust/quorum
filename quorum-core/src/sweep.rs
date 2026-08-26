@@ -178,31 +178,6 @@ fn delete_bounded(conn: &Connection, table: &str, now: i64, limit: usize) -> Res
     Ok(())
 }
 
-/// Reclaim only expired collaboration attempts whose operation children have
-/// already drained. A bounded child sweep can leave an expired child behind;
-/// deleting that parent in the same ordinary-write transaction would violate
-/// the immediate FK and roll back the child reclamation too.
-fn delete_expired_collaboration_attempts_bounded(
-    conn: &Connection,
-    now: i64,
-    limit: usize,
-) -> Result<()> {
-    conn.execute(
-        "DELETE FROM collaboration_attempts WHERE rowid IN (
-             SELECT attempt.rowid
-             FROM collaboration_attempts AS attempt
-             WHERE attempt.expires_at <= ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM github_operations AS operation
-                   WHERE operation.attempt_id=attempt.attempt_id
-               )
-             LIMIT ?2
-         )",
-        params![now, limit as i64],
-    )?;
-    Ok(())
-}
-
 pub(crate) fn sweep_token_usage_on_write(conn: &Connection, now: i64) -> Result<()> {
     delete_token_usage_bounded(conn, now, SWEEP_LIMIT)
 }
@@ -643,10 +618,9 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     delete_bounded(conn, "agent_sessions", now, limit)?;
     delete_bounded(conn, "activity_events", now, limit)?;
     delete_token_usage_bounded(conn, now, limit)?;
-    // A GitHub operation's retention is owned by its collaboration attempt,
-    // so child operations must be swept before a now-childless parent attempt.
-    delete_bounded(conn, "github_operations", now, limit)?;
-    delete_expired_collaboration_attempts_bounded(conn, now, limit)?;
+    // Collaboration operation groups are reclaimed only by the executor's
+    // atomic terminal-and-settled group proof. Generic sweep has no authority
+    // to discard their recovery identities independently.
     crate::task_messages::expire_stale_deliveries(conn, now, limit)?;
     delete_bounded(conn, "task_messages", now, limit)?;
     delete_reclaimable_task_rows_bounded(conn, now, limit)?;
@@ -690,19 +664,8 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
         params![now],
     )?;
     delete_all_expired_token_usage(&tx, now)?;
-    tx.execute(
-        "DELETE FROM github_operations WHERE expires_at <= ?1",
-        params![now],
-    )?;
-    tx.execute(
-        "DELETE FROM collaboration_attempts
-         WHERE expires_at <= ?1
-           AND NOT EXISTS (
-               SELECT 1 FROM github_operations
-               WHERE github_operations.attempt_id=collaboration_attempts.attempt_id
-           )",
-        params![now],
-    )?;
+    // See sweep_on_write: executor-owned group reclamation is deliberately
+    // deferred until it can prove terminal and settled parent state atomically.
     crate::task_messages::expire_stale_deliveries(&tx, now, usize::MAX)?;
     tx.execute(
         "DELETE FROM task_messages WHERE expires_at <= ?1",
@@ -829,12 +792,12 @@ mod tests {
     }
 
     #[test]
-    fn bounded_collaboration_sweep_drains_large_operation_group_without_poisoning_writes() {
+    fn sweeps_preserve_expired_ambiguous_operation_under_resumable_attempt() {
         let (_d, mut c) = open_tmp_fk();
         let task_id = crate::tasks::create(
             &mut c,
             "owner",
-            "collaboration retention",
+            "collaboration recovery retention",
             None,
             0,
             None,
@@ -855,39 +818,32 @@ mod tests {
                  attempt_id,task_id,agent,role,pr_number,lifecycle_generation,
                  active_run_id,state,active,created_at,updated_at,expires_at
              ) VALUES (
-                 'expired-attempt',?1,'worker','worker',7,1,
-                 'collaboration-run','completed',0,1,1,10
+                 'resumable-attempt',?1,'worker','worker',7,1,
+                 'collaboration-run','awaiting_resume',0,1,1,10
              )",
             [task_id],
         )
         .unwrap();
-        for ordinal in 0..=SWEEP_LIMIT {
-            c.execute(
-                "INSERT INTO github_operations(
-                     operation_id,client_request_id,attempt_id,created_by_run_id,
-                     task_id,agent,role,pr_number,kind,request_json,
-                     deadline_at,created_at,enqueued_at,updated_at,expires_at
-                 ) VALUES (
-                     ?1,?2,'expired-attempt','collaboration-run',
-                     ?3,'worker','worker',7,'pull_request_read','{}',
-                     10,1,1,1,10
-                 )",
-                params![
-                    format!("operation-{ordinal}"),
-                    format!("request-{ordinal}"),
-                    task_id,
-                ],
-            )
-            .unwrap();
-        }
+        c.execute(
+            "INSERT INTO github_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,
+                 task_id,agent,role,pr_number,kind,request_json,state,send_state,
+                 deadline_at,created_at,enqueued_at,updated_at,expires_at
+             ) VALUES (
+                 'ambiguous-operation','ambiguous-request','resumable-attempt',
+                 'collaboration-run',?1,'worker','worker',7,
+                 'pull_request_read','{}','running','ambiguous',10,1,1,1,10
+             )",
+            [task_id],
+        )
+        .unwrap();
 
-        // This normal mutation runs the bounded sweep inside BEGIN IMMEDIATE.
-        // It must commit the first child batch rather than rolling it back on
-        // the still-referenced parent delete.
-        let first_write = crate::tasks::create(
+        // A normal mutation executes the bounded sweep within BEGIN IMMEDIATE.
+        // It must retain this expired but recovery-authoritative group.
+        let ordinary_write = crate::tasks::create(
             &mut c,
             "owner",
-            "first ordinary write",
+            "ordinary write",
             None,
             0,
             None,
@@ -897,47 +853,39 @@ mod tests {
             100,
         )
         .unwrap();
-        assert!(first_write > task_id);
+        assert!(ordinary_write > task_id);
         assert_eq!(
             c.query_row("SELECT COUNT(*) FROM github_operations", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
             1,
-            "the first bounded sweep must commit its child batch"
+            "ordinary sweeping must not discard an ambiguous operation"
         );
         assert_eq!(
             c.query_row("SELECT COUNT(*) FROM collaboration_attempts", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
             1,
-            "the parent must remain while an operation child exists"
+            "ordinary sweeping must not discard a resumable attempt"
         );
-
-        // The next ordinary mutation drains the final child and reclaims its
-        // now-childless parent, proving bounded sweeping eventually converges.
-        let second_write = crate::tasks::create(
-            &mut c,
-            "owner",
-            "second ordinary write",
-            None,
-            0,
-            None,
-            None,
-            None,
-            None,
-            101,
-        )
-        .unwrap();
-        assert!(second_write > first_write);
-        for table in ["github_operations", "collaboration_attempts"] {
-            assert_eq!(
-                c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
-                    .get::<_, i64>(0))
-                    .unwrap(),
-                0,
-                "{table} must eventually reclaim after the child fan-out drains"
-            );
-        }
+        sweep_all(&c, 100).unwrap();
+        let state: (String, String, String) = c
+            .query_row(
+                "SELECT a.state,o.state,o.send_state
+                 FROM collaboration_attempts AS a
+                 JOIN github_operations AS o ON o.attempt_id=a.attempt_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "awaiting_resume".into(),
+                "running".into(),
+                "ambiguous".into()
+            )
+        );
     }
 
     #[test]
