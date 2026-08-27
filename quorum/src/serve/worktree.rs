@@ -28,6 +28,15 @@ pub enum ContinuationBaseMerge {
     Conflicted,
 }
 
+/// Result of fetching the target branch immediately before allocating a
+/// dependent task. A missing commit is an expected short-lived GitHub ref
+/// propagation outcome; transport and Git failures remain errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyBaseVerification {
+    Verified { base_sha: String },
+    Missing { merge_commit_sha: String },
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PublicationRefReconcileResult {
     pub kept: usize,
@@ -677,6 +686,76 @@ impl WorktreeManager {
         }
 
         Ok(wt_path)
+    }
+
+    /// Refresh `origin/<base_branch>` and prove every dependency merge commit
+    /// is reachable from the fetched tip. This deliberately runs before a
+    /// caller allocates a branch or worktree; a stale remote ref is a normal
+    /// deferral, never a permissible base for dependent work.
+    pub async fn fetch_base_and_verify_dependency_commits(
+        &self,
+        repo_dir: &Path,
+        base_branch: &str,
+        merge_commits: &[String],
+    ) -> Result<DependencyBaseVerification, String> {
+        let _guard = self.lock.lock().await;
+        let remote_ref = format!("refs/heads/{base_branch}");
+        let tracking_ref = format!("refs/remotes/origin/{base_branch}");
+        let refspec = format!("+{remote_ref}:{tracking_ref}");
+
+        let mut fetch = self.git_cmd(repo_dir);
+        fetch.args(["fetch", "origin", &refspec]);
+        let fetched = run_git(fetch, self.fetch_timeout, "git fetch dependency base").await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {remote_ref} failed: {}",
+                git_diagnostic(&fetched.stderr)
+            ));
+        }
+
+        let base_ref = format!("origin/{base_branch}");
+        let mut resolve = self.git_cmd(repo_dir);
+        resolve.args(["rev-parse", "--verify", &base_ref]);
+        let resolved = run_git(
+            resolve,
+            self.local_timeout,
+            "git resolve dependency base provenance",
+        )
+        .await?;
+        if !resolved.status.success() {
+            return Err(format!("cannot resolve dependency base {base_ref}"));
+        }
+        let base_sha = git_diagnostic(&resolved.stdout).to_ascii_lowercase();
+        if base_sha.is_empty() {
+            return Err(format!(
+                "dependency base {base_ref} resolved to an empty SHA"
+            ));
+        }
+
+        for merge_commit_sha in merge_commits {
+            let mut ancestry = self.git_cmd(repo_dir);
+            ancestry.args(["merge-base", "--is-ancestor", merge_commit_sha, &base_sha]);
+            let ancestry = run_git(
+                ancestry,
+                self.local_timeout,
+                "git verify dependency merge ancestry",
+            )
+            .await?;
+            if ancestry.status.success() {
+                continue;
+            }
+            if ancestry.status.code() == Some(1) {
+                return Ok(DependencyBaseVerification::Missing {
+                    merge_commit_sha: merge_commit_sha.clone(),
+                });
+            }
+            return Err(format!(
+                "cannot verify dependency merge commit {merge_commit_sha} against {base_sha}: {}",
+                git_diagnostic(&ancestry.stderr)
+            ));
+        }
+
+        Ok(DependencyBaseVerification::Verified { base_sha })
     }
 
     /// Refresh and merge the configured base into an exact continuation PR
@@ -1864,6 +1943,92 @@ mod tests {
         );
 
         mgr.remove(repo_dir.path(), &wt_path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn dependency_base_verification_defers_until_remote_contains_merge_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = init_repo_with_bare_remote(tmp.path());
+        let d = repo.to_string_lossy().to_string();
+
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "dependency"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "dependency"])
+            .status()
+            .unwrap()
+            .success());
+        let dependency_commit = git_rev_parse(&repo, "HEAD");
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap()
+            .success());
+
+        let mgr = WorktreeManager::new();
+        let first = mgr
+            .fetch_base_and_verify_dependency_commits(
+                &repo,
+                "main",
+                std::slice::from_ref(&dependency_commit),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            DependencyBaseVerification::Missing {
+                merge_commit_sha: dependency_commit.clone(),
+            }
+        );
+        assert!(
+            !git_output(
+                &repo,
+                &["show-ref", "--verify", "refs/heads/daemon/dependent"]
+            )
+            .status
+            .success(),
+            "verification must not allocate a branch"
+        );
+
+        assert!(StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "merge",
+                "--no-ff",
+                "dependency",
+                "-m",
+                "merge dependency"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "push", "origin", "main"])
+            .status()
+            .unwrap()
+            .success());
+
+        let second = mgr
+            .fetch_base_and_verify_dependency_commits(
+                &repo,
+                "main",
+                std::slice::from_ref(&dependency_commit),
+            )
+            .await
+            .unwrap();
+        let DependencyBaseVerification::Verified { base_sha } = second else {
+            panic!("advanced base must contain dependency commit");
+        };
+        assert!(git_output(
+            &repo,
+            &["merge-base", "--is-ancestor", &dependency_commit, &base_sha]
+        )
+        .status
+        .success());
     }
 
     #[tokio::test]

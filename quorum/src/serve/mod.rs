@@ -117,7 +117,7 @@ fn prepare_reviewer_authority(
     )
 }
 use tokio::io::{AsyncRead, AsyncReadExt};
-use worktree::{ContinuationBaseMerge, WorktreeManager};
+use worktree::{ContinuationBaseMerge, DependencyBaseVerification, WorktreeManager};
 
 const MAX_POISON_STRIKES: u32 = 3;
 const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
@@ -8324,6 +8324,18 @@ async fn rework_explicit_merge_retry(
     Ok(())
 }
 
+/// Read GitHub's immutable merge commit outside any database transaction.
+/// A transiently unavailable value is intentionally left absent; dependent
+/// dispatch then uses its bounded fail-closed deferral rather than guessing.
+async fn merged_commit_sha(config: &ServeConfig, pr: i64) -> Option<String> {
+    let repo = config.repo_dir.clone();
+    let executor = Arc::clone(&config.merge_executor);
+    tokio::task::spawn_blocking(move || executor.merge_commit_sha(pr, &repo))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Consume one owner retry and perform at most one formal approval/merge call.
 /// All network checks precede a final durable-authority reread; failures either
 /// invalidate only stale evidence or park the unchanged exact-SHA authority.
@@ -8428,10 +8440,17 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
     };
     match mergeability {
         merge::MergeabilityState::AlreadyMerged => {
+            let merge_commit_sha = merged_commit_sha(config, pr).await;
             let p = config.db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut conn = quorum_core::db::open(&p)?;
-                tasks::complete_approved_merge(&mut conn, task_id, pr, now_unix())?;
+                tasks::complete_approved_merge(
+                    &mut conn,
+                    task_id,
+                    pr,
+                    merge_commit_sha.as_deref(),
+                    now_unix(),
+                )?;
                 Ok(())
             })
             .await
@@ -8578,10 +8597,17 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
     match final_mergeability {
         merge::MergeabilityState::Mergeable => {}
         merge::MergeabilityState::AlreadyMerged => {
+            let merge_commit_sha = merged_commit_sha(config, pr).await;
             let p = config.db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut conn = quorum_core::db::open(&p)?;
-                tasks::complete_approved_merge(&mut conn, task_id, pr, now_unix())?;
+                tasks::complete_approved_merge(
+                    &mut conn,
+                    task_id,
+                    pr,
+                    merge_commit_sha.as_deref(),
+                    now_unix(),
+                )?;
                 Ok(())
             })
             .await
@@ -8628,10 +8654,17 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
             .map_err(|error| QuorumError::Io(format!("merge retry execution join: {error}")))?
     };
     if result.success {
+        let merge_commit_sha = merged_commit_sha(config, pr).await;
         let p = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&p)?;
-            tasks::complete_approved_merge(&mut conn, task_id, pr, now_unix())?;
+            tasks::complete_approved_merge(
+                &mut conn,
+                task_id,
+                pr,
+                merge_commit_sha.as_deref(),
+                now_unix(),
+            )?;
             Ok(())
         })
         .await
@@ -11640,6 +11673,15 @@ async fn tick(
 
                     if merge_result.success {
                         log(&format!("PR #{pr_num} merged — firing MergeSucceeded"));
+                        // This lookup is outside the lifecycle transaction.
+                        // The resulting immutable GitHub merge commit becomes
+                        // the dependency/base ancestry witness for child work.
+                        let merge_commit_sha = merged_commit_sha(config, pr_num).await;
+                        if merge_commit_sha.is_none() {
+                            log(&format!(
+                                "PR #{pr_num} merged but its merge commit SHA is not yet available; dependent dispatch will defer fail-closed"
+                            ));
+                        }
                         let p = db_path.clone();
                         tokio::task::spawn_blocking(move || -> Result<()> {
                             let mut conn = quorum_core::db::open(&p)?;
@@ -11647,6 +11689,7 @@ async fn tick(
                                 &mut conn,
                                 reviewer_task_id,
                                 pr_num,
+                                merge_commit_sha.as_deref(),
                                 now_unix(),
                             )?;
                             Ok(())
@@ -18231,6 +18274,103 @@ async fn provision_reviewer_reserved(
 
 /// Spawn a worker for the next highest-priority ready task.
 /// Returns true if a worker was spawned, false if no ready tasks or names available.
+enum DependencyBaseAdmission {
+    NotRequired,
+    Verified { base_sha: String },
+    Deferred,
+}
+
+async fn verify_dependency_base_before_allocation(
+    db_path: &Path,
+    wt_mgr: &WorktreeManager,
+    repo_dir: &Path,
+    task: &tasks::Task,
+    agent_name: &str,
+    base_branch: &str,
+) -> Result<DependencyBaseAdmission> {
+    let dependencies = {
+        let db_path = db_path.to_path_buf();
+        let depends_on = task.depends_on.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<tasks::DependencyMergeCommit>> {
+            let conn = quorum_core::db::open(&db_path)?;
+            tasks::dependency_merge_commits(&conn, depends_on.as_deref())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("dependency merge lookup join: {error}")))??
+    };
+    if dependencies.is_empty() {
+        return Ok(DependencyBaseAdmission::NotRequired);
+    }
+
+    let missing_record = dependencies
+        .iter()
+        .find(|dependency| dependency.merge_commit_sha.is_none());
+    let reason = if let Some(dependency) = missing_record {
+        format!(
+            "dependency #{} is done but has no recorded merge commit SHA",
+            dependency.task_id
+        )
+    } else {
+        let merge_commits = dependencies
+            .iter()
+            .filter_map(|dependency| dependency.merge_commit_sha.clone())
+            .collect::<Vec<_>>();
+        match wt_mgr
+            .fetch_base_and_verify_dependency_commits(repo_dir, base_branch, &merge_commits)
+            .await
+        {
+            Ok(DependencyBaseVerification::Verified { base_sha }) => {
+                return Ok(DependencyBaseAdmission::Verified { base_sha });
+            }
+            Ok(DependencyBaseVerification::Missing { merge_commit_sha }) => format!(
+                "fetched origin/{base_branch} does not yet contain dependency merge commit {merge_commit_sha}"
+            ),
+            Err(error) => {
+                let reason = format!(
+                    "dependency base verification failed before allocation: {error}"
+                );
+                require_park_task(db_path, task.id, &reason, "open").await?;
+                log(&format!("PARKED: task #{}: {reason}", task.id));
+                return Ok(DependencyBaseAdmission::Deferred);
+            }
+        }
+    };
+
+    let disposition = {
+        let db_path = db_path.to_path_buf();
+        let agent_name = agent_name.to_string();
+        let reason = reason.clone();
+        let task_id = task.id;
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<tasks::DependencyBaseWaitDisposition>> {
+                let mut conn = quorum_core::db::open(&db_path)?;
+                tasks::defer_dependency_base_wait(
+                    &mut conn,
+                    task_id,
+                    &agent_name,
+                    &reason,
+                    now_unix(),
+                )
+            },
+        )
+        .await
+        .map_err(|error| QuorumError::Io(format!("dependency base deferral join: {error}")))??
+    };
+    match disposition {
+        Some(tasks::DependencyBaseWaitDisposition::Deferred { attempt: 1 }) => {
+            log(&format!("task #{} dispatch deferred: {reason}", task.id));
+        }
+        Some(tasks::DependencyBaseWaitDisposition::Parked { attempt }) => {
+            log(&format!(
+                "PARKED: task #{} after {attempt} dependency-base waits: {reason}",
+                task.id
+            ));
+        }
+        Some(tasks::DependencyBaseWaitDisposition::Deferred { .. }) | None => {}
+    }
+    Ok(DependencyBaseAdmission::Deferred)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_worker(
     config: &ServeConfig,
@@ -18388,13 +18528,6 @@ async fn spawn_worker(
         }
     }
 
-    lifetime_roster.register(&agent_name);
-
-    log(&format!(
-        "spawning agent {} for task #{} ({})",
-        agent_name, task.id, task.title
-    ));
-
     let worker_repo_dir = &config.repo_dir;
 
     // Task creation persists the authoritative target before the daemon can
@@ -18416,6 +18549,35 @@ async fn spawn_worker(
         None => None,
     };
     let effective_base_branch = task_target.unwrap_or(&config.base_branch);
+
+    // Dependency completion alone is not enough to cut a child branch: GitHub
+    // may report a merged PR before its base ref reaches this clone. Fetch and
+    // prove each recorded merge commit before any branch/provenance/worktree
+    // allocation. A propagation lag releases the claim for a bounded retry.
+    let verified_dependency_base = match verify_dependency_base_before_allocation(
+        &db_path,
+        wt_mgr,
+        worker_repo_dir,
+        &task,
+        &agent_name,
+        effective_base_branch,
+    )
+    .await?
+    {
+        DependencyBaseAdmission::NotRequired => None,
+        DependencyBaseAdmission::Verified { base_sha } => Some(base_sha),
+        DependencyBaseAdmission::Deferred => {
+            name_pool.release(&agent_name);
+            return Ok(false);
+        }
+    };
+
+    lifetime_roster.register(&agent_name);
+
+    log(&format!(
+        "spawning agent {} for task #{} ({})",
+        agent_name, task.id, task.title
+    ));
 
     // A continuation assignment is bound to the live PR target resolved after
     // the atomic claim. Explicit --continue-pr remains authoritative. A
@@ -18526,15 +18688,21 @@ async fn spawn_worker(
     // Persist immutable allocation provenance before git creates anything.
     // Ref resolution is external I/O and completes before the short DB write.
     if continue_target.is_none() {
-        let base_ref = format!("origin/{effective_base_branch}");
-        let resolved_provenance = match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
-            Ok(sha) => sha,
-            Err(error) => {
-                let reason = format!("branch provenance resolution failed: {error}");
-                persist_provisioning_failure(&db_path, task.id, &reason).await;
-                park_task(&db_path, task.id, &reason, "open").await;
-                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
-                return Ok(false);
+        let resolved_provenance = match verified_dependency_base {
+            Some(base_sha) => base_sha,
+            None => {
+                let base_ref = format!("origin/{effective_base_branch}");
+                match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
+                    Ok(sha) => sha,
+                    Err(error) => {
+                        let reason = format!("branch provenance resolution failed: {error}");
+                        persist_provisioning_failure(&db_path, task.id, &reason).await;
+                        park_task(&db_path, task.id, &reason, "open").await;
+                        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id)
+                            .await;
+                        return Ok(false);
+                    }
+                }
             }
         };
         let allocation_db = db_path.clone();

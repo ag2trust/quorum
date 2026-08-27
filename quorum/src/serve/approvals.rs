@@ -604,11 +604,25 @@ async fn merge_approved(
     }
 
     if attempt_admitted {
+        let repo = repo_dir.to_path_buf();
+        let exec = Arc::clone(merge_executor);
+        let merge_commit_sha =
+            tokio::task::spawn_blocking(move || exec.merge_commit_sha(pr, &repo))
+                .await
+                .map_err(|error| {
+                    QuorumError::Io(format!("merge commit SHA spawn_blocking join: {error}"))
+                })?;
         let p = db_path.to_path_buf();
         let task_id = appr.task_id;
         run_blocking(move || {
             let mut conn = quorum_core::db::open(&p)?;
-            tasks::complete_approved_merge(&mut conn, task_id, pr, super::now_unix())?;
+            tasks::complete_approved_merge(
+                &mut conn,
+                task_id,
+                pr,
+                merge_commit_sha.as_deref(),
+                super::now_unix(),
+            )?;
             let agents: Vec<String> = journal::list_in_flight(&conn)?
                 .into_iter()
                 .filter(|entry| entry.task_id == Some(task_id))

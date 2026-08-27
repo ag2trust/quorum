@@ -757,6 +757,14 @@ only through an explicit outside request)
   finding requires `--verdict changes --feedback`. Unattested approvals are demoted to
   changes by the daemon.
 - **Dependency gating:** tasks with `depends_on` are only claimable when all deps are `done`.
+  A daemon-observed merge also records GitHub's immutable merge commit in
+  `refs.merge_commit_sha`. Before allocating a dependent task's branch or worktree, the
+  daemon fetches its authoritative target branch and requires every dependency's recorded
+  merge commit to be an ancestor of that fetched base SHA; that exact verified SHA is the
+  allocation provenance. A just-merged commit absent from the fetched ref is a bounded,
+  claim-free deferral (logged once); after three attempts, or when a completed dependency
+  lacks its merge SHA, the task parks loudly with the named commit/dependency. The daemon
+  never cuts the dependent branch from an unverifiable base.
 - **Concurrency cap:** `--cap N` limits the daemon to N concurrent tasks (≤ 2N agents:
   one worker + one reviewer per task).
 - **No passive execution (v2).** External/interactive agents cannot claim, execute,
