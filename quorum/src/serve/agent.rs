@@ -48,6 +48,9 @@ pub struct AgentProc {
 /// degrades to an unstructured read.
 pub(crate) const ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,Skill";
 const AGENT_MCP_ALLOWED_TOOL: &str = "mcp__quorum__*";
+const FIRST_TURN_EXIT_EVIDENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const FIRST_TURN_EXIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const FIRST_TURN_STDERR_TAIL_BYTES: usize = 384;
 /// Build a stream-json user turn. The claude CLI requires `message.role` and
 /// exits 1 on the first message without it — every turn fed to an agent MUST
 /// go through this helper (first live run died instantly on a role-less turn).
@@ -132,8 +135,7 @@ impl AgentProc {
             None => proc.feed_turn(&turn).await,
         };
         if let Err(error) = fed {
-            let _ = proc.kill_and_reap().await;
-            return Err(error);
+            return Err(proc.diagnose_first_turn_feed_failure(error, deadline).await);
         }
         Ok(proc)
     }
@@ -274,6 +276,7 @@ impl AgentProc {
         if text == "Invalid session ID. Must be a valid UUID."
             || text.starts_with("error: unexpected argument")
             || text.starts_with("error: invalid value")
+            || text.starts_with("error: unknown option")
             || text.starts_with("error: unrecognized option")
         {
             return FailureObservation::classified(
@@ -520,6 +523,65 @@ impl AgentProc {
         }
     }
 
+    /// A write-side `BrokenPipe` races an early Claude CLI exit. Before
+    /// treating it as transient, wait briefly for the child and drain the
+    /// already-bounded stderr reader. Argument and authentication failures
+    /// then retain their actual diagnostic and classification irrespective of
+    /// which side of the pipe race won.
+    pub async fn diagnose_first_turn_feed_failure(
+        mut self,
+        feed_error: std::io::Error,
+        turn_deadline: Option<tokio::time::Instant>,
+    ) -> std::io::Error {
+        let evidence_deadline = tokio::time::Instant::now() + FIRST_TURN_EXIT_EVIDENCE_TIMEOUT;
+        let deadline = turn_deadline
+            .map(|deadline| std::cmp::min(deadline, evidence_deadline))
+            .unwrap_or(evidence_deadline);
+        let status = loop {
+            match self.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if tokio::time::Instant::now() >= deadline => break None,
+                Ok(None) => {
+                    let next_check = std::cmp::min(
+                        deadline,
+                        tokio::time::Instant::now() + FIRST_TURN_EXIT_POLL_INTERVAL,
+                    );
+                    tokio::time::sleep_until(next_check).await;
+                }
+                Err(error) => {
+                    let _ = self.kill_and_reap().await;
+                    return std::io::Error::from(RunnerFailure::classified(
+                        FailureDisposition::NonFailover,
+                        format!(
+                            "could not inspect Claude after its first stdin feed failed: {error}"
+                        ),
+                        feed_error.kind(),
+                    ));
+                }
+            }
+        };
+
+        let Some(status) = status else {
+            let _ = self.kill_and_reap().await;
+            return feed_error;
+        };
+
+        let stderr_complete = self.finish_stderr_until(deadline).await;
+        let stderr_tail = first_turn_stderr_tail(self.drain_diagnostics());
+        let disposition = self
+            .classify_pre_authoritative_exit(status)
+            .map(|failure| failure.disposition())
+            .unwrap_or(FailureDisposition::NonFailover);
+        let stderr_state = if stderr_complete { "" } else { " (incomplete)" };
+        std::io::Error::from(RunnerFailure::classified(
+            disposition,
+            format!(
+                "Claude exited before accepting its first turn ({status}); stderr tail{stderr_state}: {stderr_tail}; stdin feed error: {feed_error}"
+            ),
+            feed_error.kind(),
+        ))
+    }
+
     /// Return the next raw stdout line, or `None` on EOF/error.
     /// Used by the daemon to preserve verbatim JSONL in session logs.
     pub async fn next_raw_line(&mut self) -> Option<String> {
@@ -655,6 +717,23 @@ impl AgentProc {
         terminal.extend(diagnostics.drain());
         terminal
     }
+}
+
+fn first_turn_stderr_tail(output: Vec<CapturedOutput>) -> String {
+    let Some(line) = output.iter().rev().find_map(|captured| match captured {
+        CapturedOutput::Stderr(line) if !line.is_empty() => Some(line.as_str()),
+        _ => None,
+    }) else {
+        return "<none captured>".into();
+    };
+    if line.len() <= FIRST_TURN_STDERR_TAIL_BYTES {
+        return line.into();
+    }
+    let mut start = line.len() - FIRST_TURN_STDERR_TAIL_BYTES;
+    while !line.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &line[start..])
 }
 
 fn claude_auth_text(text: &str) -> bool {
@@ -1518,6 +1597,73 @@ while IFS= read -r _line; do :; done
             event.is_none(),
             "claude accepted a non-UUID --session-id — CLI validation changed"
         );
+    }
+
+    /// The real CLI must not be retried as a transient pipe failure when it
+    /// rejects an argument before it ever reads the initial stream-json turn.
+    /// Repeat the boundary because the write can race the parser's early exit:
+    /// every observed EPIPE must retain the CLI's stderr diagnosis.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_cli_invalid_flag_first_turn_exit_is_non_failover() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !claude_available() {
+            eprintln!("skipped: no claude binary on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join("claude-invalid-flag");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nexec claude --quorum-invalid-first-turn-flag \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for attempt in 0..20 {
+            let mut spec = classifier_spec(tmp.path(), true);
+            spec.env_vars = no_auth_env(tmp.path());
+            let mut proc = AgentProc::spawn(&spec, wrapper.to_str()).unwrap();
+            let feed = proc.feed_turn(&user_turn("ping")).await;
+            let error = match feed {
+                Err(error) => proc.diagnose_first_turn_feed_failure(error, None).await,
+                Ok(()) => {
+                    // The pipe write won, but the CLI still exits before
+                    // consuming it. Waiting here exercises the other side of
+                    // the race before asking the same shared helper to
+                    // diagnose the resulting closed pipe.
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        loop {
+                            if proc.try_wait().unwrap().is_some() {
+                                break;
+                            }
+                            tokio::time::sleep(FIRST_TURN_EXIT_POLL_INTERVAL).await;
+                        }
+                    })
+                    .await
+                    .expect("real Claude did not reject the invalid flag");
+                    let error = proc
+                        .feed_turn(&user_turn("second write after CLI exit"))
+                        .await
+                        .expect_err("Claude accepted a turn after exiting");
+                    proc.diagnose_first_turn_feed_failure(error, None).await
+                }
+            };
+            let failure = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<RunnerFailure>())
+                .expect("early Claude exit must retain its classified failure");
+            assert_eq!(
+                failure.disposition(),
+                FailureDisposition::NonFailover,
+                "attempt {attempt}: {error}"
+            );
+            assert!(
+                error.to_string().contains("unknown option"),
+                "attempt {attempt}: {error}"
+            );
+        }
     }
 
     /// #206: reviewers are instructed to invoke the pinned `pr-review` skill;
