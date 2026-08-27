@@ -1141,6 +1141,74 @@ pub fn claim_provider_retry_rework(
     Ok(task)
 }
 
+/// Daemon-private: restore the lease for an exact dormant worker whose
+/// awaiting-review lease expired while the daemon was down. The task must
+/// still be in `in-review` or `merging`, and no other live holder may exist.
+/// The caller validates the durable worker identity before entering this
+/// atomic mutable-state check. Returns `false` if that state changed.
+pub fn reclaim_dormant_review(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    ttl: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let target = lease_target(id);
+    let task_matches: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM tasks
+             WHERE id=?1 AND status IN ('in-review','merging')
+         )",
+        [id],
+        |row| row.get(0),
+    )?;
+    if !task_matches {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    let live_holder: Option<String> = tx
+        .query_row(
+            "SELECT holder FROM claims
+             WHERE target=?1 AND active=1 AND expires_at>?2",
+            params![target, now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match live_holder.as_deref() {
+        Some(holder) if holder == agent => {
+            tx.commit()?;
+            return Ok(true);
+        }
+        Some(_) => {
+            tx.commit()?;
+            return Ok(false);
+        }
+        None => {}
+    }
+
+    crate::agents::touch(&tx, agent, now)?;
+    tx.execute(
+        "UPDATE claims SET active=0 WHERE target=?1 AND active=1 AND expires_at<=?2",
+        params![target, now],
+    )?;
+    tx.execute(
+        "INSERT INTO claims(target,holder,ts,expires_at,active) VALUES (?1,?2,?3,?4,1)",
+        params![target, agent, now, now + ttl],
+    )?;
+    crate::events::emit(
+        &tx,
+        "task_claimed",
+        &target,
+        &format!("by {agent} (dormant recovery)"),
+        now,
+    )?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    tx.commit()?;
+    Ok(true)
+}
+
 // ── claim_remediation_rework ──────────────────────────────────────────────────
 
 /// Daemon-private: atomically claim a rework task for a remediation worker.
