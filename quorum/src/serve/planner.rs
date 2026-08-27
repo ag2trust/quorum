@@ -1167,8 +1167,9 @@ async fn spawn_planner_with_timeout(
                     .feed_turn_until(&agent::user_turn(prompt), deadline)
                     .await
                 {
-                    let _ = proc.kill_and_reap().await;
-                    return Err(error);
+                    return Err(proc
+                        .diagnose_first_turn_feed_failure(error, Some(deadline))
+                        .await);
                 }
                 RunnerProc::Claude(proc)
             }

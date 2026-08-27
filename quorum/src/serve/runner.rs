@@ -68,6 +68,16 @@ impl RunnerFailure {
         self
     }
 
+    /// Build a classified I/O failure at an adapter boundary while retaining
+    /// the original I/O kind for callers that need transport-level detail.
+    pub(crate) fn classified(
+        disposition: FailureDisposition,
+        detail: impl Into<String>,
+        io_kind: std::io::ErrorKind,
+    ) -> Self {
+        Self::new(disposition, detail).with_io_kind(io_kind)
+    }
+
     pub fn disposition(&self) -> FailureDisposition {
         self.disposition
     }
@@ -1066,6 +1076,15 @@ impl RunnerProc {
 }
 
 fn classify_launch_error(kind: AgentKind, error: std::io::Error) -> RunnerFailure {
+    // A Claude child can exit while the first stdin write races it. Its
+    // adapter has already waited for the exit and classified its bounded
+    // stderr, so preserve that evidence instead of letting BrokenPipe win.
+    if let Some(failure) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<RunnerFailure>())
+    {
+        return failure.clone();
+    }
     let disposition = match error.kind() {
         std::io::ErrorKind::TimedOut
         | std::io::ErrorKind::Interrupted
@@ -2053,6 +2072,19 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(error.disposition(), FailureDisposition::NonFailover);
+    }
+
+    #[test]
+    fn classified_first_turn_exit_beats_broken_pipe_retryability() {
+        let error = std::io::Error::from(RunnerFailure::classified(
+            FailureDisposition::NonFailover,
+            "Claude rejected an invalid startup argument",
+            std::io::ErrorKind::BrokenPipe,
+        ));
+        let failure = classify_launch_error(AgentKind::Claude, error);
+        assert_eq!(failure.disposition(), FailureDisposition::NonFailover);
+        assert_eq!(failure.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(failure.detail().contains("invalid startup argument"));
     }
 
     #[test]
