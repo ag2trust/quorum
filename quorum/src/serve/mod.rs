@@ -16479,7 +16479,8 @@ fn require_remediation_continuation(
 /// Drain stream events from an agent slot (bounded per tick, 5s timeout).
 /// Returns `Some(LimitBreached)` if a cost/time ceiling was hit.
 ///
-/// Raw provider lines are preserved verbatim in stream.jsonl; the daemon
+/// Raw provider lines are retained in stream.jsonl; Grok's repeated
+/// in-progress tool output is compacted by the session log, while the daemon
 /// consumes only normalized `AgentEvent`s via the runner boundary.
 async fn drain_events(
     slot: &mut SlotState,
@@ -16538,6 +16539,7 @@ async fn drain_events(
         };
         let events = match drained {
             DrainedLine::Raw(raw_line) => {
+                let kind = slot.process_kind();
                 let events = slot
                     .live_process_mut()
                     .map_err(|error| {
@@ -16547,7 +16549,11 @@ async fn drain_events(
                     })?
                     .normalize_stream_line(&raw_line);
                 if let Some(ref mut sl) = slot.session_log {
-                    sl.log_raw_and_normalized(&raw_line, &events);
+                    if kind == runner::AgentKind::Grok {
+                        sl.log_grok_raw_and_normalized(&raw_line, &events);
+                    } else {
+                        sl.log_raw_and_normalized(&raw_line, &events);
+                    }
                 }
                 events
             }

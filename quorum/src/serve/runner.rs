@@ -1,8 +1,9 @@
 //! Runner boundary: closed AgentKind enum and normalized AgentEvent.
 //!
 //! The daemon lifecycle consumes `AgentEvent`, never provider-specific event
-//! shapes. Raw JSONL lines are preserved verbatim in stream.jsonl; only fields
-//! Quorum consumes are parsed into normalized events. Unknown events are inert.
+//! shapes. Raw JSONL lines are retained in stream.jsonl (with Grok's repeated
+//! in-progress tool output compacted); only fields Quorum consumes are parsed
+//! into normalized events. Unknown events are inert.
 //!
 //! `journal.session_id` is an opaque runner continuation ID: Claude receives a
 //! Quorum-generated UUID before spawn; Codex persists the thread ID from

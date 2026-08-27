@@ -2106,8 +2106,52 @@ fn tail_output_for_line(agent: &str, raw: bool, line: &str) -> Option<String> {
     if raw {
         Some(line.to_string())
     } else {
-        serve::stream::parse_line(line).and_then(|event| serve::render::render_event(&event))
+        grok_delta_tail_output(line).or_else(|| {
+            serve::stream::parse_line(line).and_then(|event| serve::render::render_event(&event))
+        })
     }
+}
+
+/// Grok in-progress tool updates are stored as output deltas. Render the
+/// delta itself so `quorum tail` remains useful without reconstructing and
+/// retaining every previous full snapshot.
+fn grok_delta_tail_output(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str)
+        == Some("provider.stream_bytes_truncated")
+    {
+        let limit = value
+            .get("stream_limit_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        return Some(format!("> Session raw output truncated at {limit} bytes\n"));
+    }
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("tool_call_update")
+        || value
+            .get("quorum_output_delta")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+    let tool_call_id = value
+        .get("toolCallId")
+        .and_then(serde_json::Value::as_str)?;
+    let text = value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.pointer("/content/text")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect::<String>();
+    Some(if text.is_empty() {
+        format!("> Grok tool {tool_call_id} in progress\n")
+    } else {
+        format!("> Grok tool {tool_call_id}: {text}\n")
+    })
 }
 
 fn diff_lines(old: &str, new: &str) -> Vec<String> {
@@ -2174,6 +2218,19 @@ mod tests {
         )
         .is_none());
         assert!(tail_output_for_line("decomposition-planner-17", true, secret).is_none());
+    }
+
+    #[test]
+    fn tail_renders_grok_tool_output_deltas() {
+        let delta = r#"{"type":"tool_call_update","toolCallId":"call-7","status":"in_progress","quorum_output_delta":true,"content":[{"type":"content","content":{"type":"text","text":"new output"}}]}"#;
+        assert_eq!(
+            tail_output_for_line("GrokAgent", false, delta).as_deref(),
+            Some("> Grok tool call-7: new output\n")
+        );
+        assert_eq!(
+            tail_output_for_line("GrokAgent", true, delta).as_deref(),
+            Some(delta)
+        );
     }
 
     #[test]
