@@ -610,6 +610,19 @@ async fn merge_approved(
         .map_err(|error| {
             QuorumError::Io(format!("merge commit SHA spawn_blocking join: {error}"))
         })?;
+    let Some(merge_commit_sha) = merge_commit_sha else {
+        let resume_status = if attempt_admitted {
+            "merging"
+        } else {
+            "in-review"
+        };
+        let reason = format!(
+            "PR #{pr} merged but GitHub merge commit metadata is unavailable; retry after metadata propagation"
+        );
+        super::require_park_task(db_path, appr.task_id, &reason, resume_status).await?;
+        log(&format!("PARKED: task #{}: {reason}", appr.task_id));
+        return Ok(false);
+    };
 
     if attempt_admitted {
         let p = db_path.to_path_buf();
@@ -620,7 +633,7 @@ async fn merge_approved(
                 &mut conn,
                 task_id,
                 pr,
-                merge_commit_sha.as_deref(),
+                &merge_commit_sha,
                 super::now_unix(),
             )?;
             let agents: Vec<String> = journal::list_in_flight(&conn)?
@@ -653,7 +666,7 @@ async fn merge_approved(
             &mut conn,
             task_id,
             &note,
-            merge_commit_sha.as_deref(),
+            &merge_commit_sha,
             now,
         )?;
         // Remove journal rows for this task so recovery won't reset now-merged work.
@@ -715,6 +728,7 @@ mod tests {
         conflicting: bool,
         merge_succeeds: bool,
         failure_kind: merge::MergeFailureKind,
+        merge_commit_available: bool,
     }
 
     impl MockExec {
@@ -725,12 +739,18 @@ mod tests {
                 conflicting: false,
                 merge_succeeds: true,
                 failure_kind: merge::MergeFailureKind::Retryable,
+                merge_commit_available: true,
             }
         }
 
         fn failing(mut self, failure_kind: merge::MergeFailureKind) -> Self {
             self.merge_succeeds = false;
             self.failure_kind = failure_kind;
+            self
+        }
+
+        fn without_merge_commit_sha(mut self) -> Self {
+            self.merge_commit_available = false;
             self
         }
     }
@@ -762,7 +782,9 @@ mod tests {
             self.heads.get(&pr).cloned()
         }
         fn merge_commit_sha(&self, pr: i64, _repo: &Path) -> Option<String> {
-            self.heads.get(&pr).map(|_| format!("merge-{pr}"))
+            self.merge_commit_available
+                .then(|| self.heads.get(&pr).map(|_| format!("merge-{pr}")))
+                .flatten()
         }
     }
 
@@ -922,6 +944,67 @@ mod tests {
         assert_eq!(task.status, "done");
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs[tasks::MERGE_COMMIT_SHA_REF], "merge-208");
+    }
+
+    #[tokio::test]
+    async fn recovered_merge_without_commit_sha_stays_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let tid = seed_task(&mut conn, "metadata retry", "Bellows-d11");
+        assert!(tasks::resolve_target_branch(&mut conn, tid, "develop", 1002).unwrap());
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', refs=json_set(COALESCE(refs, '{}'), '$.pr', 208)
+             WHERE id=?1",
+            [tid],
+        )
+        .unwrap();
+        seed_journal(&mut conn, "Bellows-d11", tid, 208);
+        for (role, reviewer) in [("r1", "Grommet-d14"), ("r2", "Anvil-d22")] {
+            approvals::record(
+                &mut conn,
+                &approvals::Approval {
+                    pr_number: 208,
+                    review_role: role.into(),
+                    task_id: tid,
+                    author: "Bellows-d11".into(),
+                    reviewer: reviewer.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "2c0c833".into(),
+                },
+            )
+            .unwrap();
+        }
+        quorum_core::review_audits::record_r2_requirement(&mut conn, tid, 208, "2c0c833", true)
+            .unwrap();
+        drop(conn);
+
+        let exec = exec_arc(
+            MockExec::new(HashMap::from([(208, "2c0c833".to_string())])).without_merge_commit_sha(),
+        );
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.merged, 0);
+        assert_eq!(outcome.deferred, 1);
+        let conn = db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, tid).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::PARKED_RESUME_STATUS_REF], "merging");
+        assert!(refs[tasks::PARKED_REASON_REF]
+            .as_str()
+            .unwrap()
+            .contains("merge commit metadata is unavailable"));
+        assert!(
+            refs.get(tasks::MERGE_COMMIT_SHA_REF).is_none(),
+            "the task must not be completed with a fabricated merge SHA"
+        );
+        assert_eq!(approvals::get_for_pr(&conn, 208).unwrap().len(), 2);
+        assert_eq!(journal::list_in_flight(&conn).unwrap().len(), 1);
     }
 
     #[tokio::test]

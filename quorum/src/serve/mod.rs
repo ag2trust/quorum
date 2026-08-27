@@ -8325,8 +8325,6 @@ async fn rework_explicit_merge_retry(
 }
 
 /// Read GitHub's immutable merge commit outside any database transaction.
-/// A transiently unavailable value is intentionally left absent; dependent
-/// dispatch then uses its bounded fail-closed deferral rather than guessing.
 async fn merged_commit_sha(config: &ServeConfig, pr: i64) -> Option<String> {
     let repo = config.repo_dir.clone();
     let executor = Arc::clone(&config.merge_executor);
@@ -8334,6 +8332,50 @@ async fn merged_commit_sha(config: &ServeConfig, pr: i64) -> Option<String> {
         .await
         .ok()
         .flatten()
+}
+
+/// A merged task may become `done` only with its durable GitHub merge SHA.
+/// If that post-merge lookup is transiently unavailable, retain a retryable
+/// parked merge instead of creating a dependency that can never prove its
+/// base ancestry.
+async fn required_merged_commit_sha(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    resume_status: &str,
+) -> Result<Option<String>> {
+    let Some(merge_commit_sha) = merged_commit_sha(config, pr).await else {
+        let reason = format!(
+            "PR #{pr} merged but GitHub merge commit metadata is unavailable; retry after metadata propagation"
+        );
+        require_park_task(&config.db_path, task_id, &reason, resume_status).await?;
+        log(&format!("PARKED: task #{task_id}: {reason}"));
+        return Ok(None);
+    };
+    Ok(Some(merge_commit_sha))
+}
+
+/// Persist a merge discovered before the daemon's own merge gate, including
+/// the immutable SHA dependency consumers require for base verification.
+async fn complete_detected_merge_with_metadata(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+) -> Result<bool> {
+    let Some(merge_commit_sha) =
+        required_merged_commit_sha(config, task_id, pr, "in-review").await?
+    else {
+        return Ok(false);
+    };
+    let db_path = config.db_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        tasks::complete_detected_merge(&mut conn, task_id, &merge_commit_sha, now_unix())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("detected merge completion join: {error}")))??;
+    Ok(true)
 }
 
 /// Consume one owner retry and perform at most one formal approval/merge call.
@@ -8440,7 +8482,11 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
     };
     match mergeability {
         merge::MergeabilityState::AlreadyMerged => {
-            let merge_commit_sha = merged_commit_sha(config, pr).await;
+            let Some(merge_commit_sha) =
+                required_merged_commit_sha(config, task_id, pr, "merging").await?
+            else {
+                return Ok(());
+            };
             let p = config.db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut conn = quorum_core::db::open(&p)?;
@@ -8448,7 +8494,7 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
                     &mut conn,
                     task_id,
                     pr,
-                    merge_commit_sha.as_deref(),
+                    &merge_commit_sha,
                     now_unix(),
                 )?;
                 Ok(())
@@ -8597,7 +8643,11 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
     match final_mergeability {
         merge::MergeabilityState::Mergeable => {}
         merge::MergeabilityState::AlreadyMerged => {
-            let merge_commit_sha = merged_commit_sha(config, pr).await;
+            let Some(merge_commit_sha) =
+                required_merged_commit_sha(config, task_id, pr, "merging").await?
+            else {
+                return Ok(());
+            };
             let p = config.db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut conn = quorum_core::db::open(&p)?;
@@ -8605,7 +8655,7 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
                     &mut conn,
                     task_id,
                     pr,
-                    merge_commit_sha.as_deref(),
+                    &merge_commit_sha,
                     now_unix(),
                 )?;
                 Ok(())
@@ -8654,17 +8704,15 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
             .map_err(|error| QuorumError::Io(format!("merge retry execution join: {error}")))?
     };
     if result.success {
-        let merge_commit_sha = merged_commit_sha(config, pr).await;
+        let Some(merge_commit_sha) =
+            required_merged_commit_sha(config, task_id, pr, "merging").await?
+        else {
+            return Ok(());
+        };
         let p = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&p)?;
-            tasks::complete_approved_merge(
-                &mut conn,
-                task_id,
-                pr,
-                merge_commit_sha.as_deref(),
-                now_unix(),
-            )?;
+            tasks::complete_approved_merge(&mut conn, task_id, pr, &merge_commit_sha, now_unix())?;
             Ok(())
         })
         .await
@@ -10420,8 +10468,54 @@ async fn tick(
                         log(&format!(
                             "PR #{pr_num} already merged — firing MergeSucceeded"
                         ));
-                        fire_event(&db_path, "system", reviewer_task_id, &Event::MergeSucceeded)
+                        let Some(merge_commit_sha) =
+                            required_merged_commit_sha(config, reviewer_task_id, pr_num, "merging")
+                                .await?
+                        else {
+                            let r = reviewers.remove(ri);
+                            teardown_reviewer_after_recorded_outcome(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                "merge-metadata-unavailable",
+                            )
                             .await;
+                            if let Some(wi) =
+                                workers.iter().position(|w| w.task_id == reviewer_task_id)
+                            {
+                                let w = workers.remove(wi);
+                                cleanup_slot(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    w,
+                                    None,
+                                    "merge-metadata-unavailable",
+                                )
+                                .await;
+                            }
+                            if !consume_mailbox_row(&db_path, *id).await {
+                                break;
+                            }
+                            break;
+                        };
+                        let p = db_path.clone();
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            tasks::complete_approved_merge(
+                                &mut conn,
+                                reviewer_task_id,
+                                pr_num,
+                                &merge_commit_sha,
+                                now_unix(),
+                            )?;
+                            Ok(())
+                        })
+                        .await
+                        .map_err(|error| {
+                            QuorumError::Io(format!("already-merged completion join: {error}"))
+                        })??;
                         // #125 fires the collector immediately (best-effort).
                         // #127 also durably enqueues so the tick loop retries
                         // with backoff and cap; a successful run deletes the
@@ -11676,12 +11770,38 @@ async fn tick(
                         // This lookup is outside the lifecycle transaction.
                         // The resulting immutable GitHub merge commit becomes
                         // the dependency/base ancestry witness for child work.
-                        let merge_commit_sha = merged_commit_sha(config, pr_num).await;
-                        if merge_commit_sha.is_none() {
-                            log(&format!(
-                                "PR #{pr_num} merged but its merge commit SHA is not yet available; dependent dispatch will defer fail-closed"
-                            ));
-                        }
+                        let Some(merge_commit_sha) =
+                            required_merged_commit_sha(config, reviewer_task_id, pr_num, "merging")
+                                .await?
+                        else {
+                            let r = reviewers.remove(ri);
+                            teardown_reviewer_after_recorded_outcome(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                "merge-metadata-unavailable",
+                            )
+                            .await;
+                            if let Some(wi) =
+                                workers.iter().position(|w| w.task_id == reviewer_task_id)
+                            {
+                                let w = workers.remove(wi);
+                                cleanup_slot(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    w,
+                                    None,
+                                    "merge-metadata-unavailable",
+                                )
+                                .await;
+                            }
+                            if !consume_mailbox_row(&db_path, *id).await {
+                                break;
+                            }
+                            break;
+                        };
                         let p = db_path.clone();
                         tokio::task::spawn_blocking(move || -> Result<()> {
                             let mut conn = quorum_core::db::open(&p)?;
@@ -11689,7 +11809,7 @@ async fn tick(
                                 &mut conn,
                                 reviewer_task_id,
                                 pr_num,
-                                merge_commit_sha.as_deref(),
+                                &merge_commit_sha,
                                 now_unix(),
                             )?;
                             Ok(())
@@ -13699,7 +13819,8 @@ async fn tick(
                         log(&format!(
                             "PR #{pr} already merged — firing PrFoundMerged for task #{task_id}"
                         ));
-                        fire_event(&db_path, "system", *task_id, &Event::PrFoundMerged).await;
+                        let _ =
+                            complete_detected_merge_with_metadata(config, *task_id, *pr).await?;
                         pr_closed_workers.push(*wi);
                         continue;
                     }
@@ -13976,7 +14097,8 @@ async fn tick(
                             "PR #{pr} already merged (orphan in-review) — \
                              firing PrFoundMerged for task #{task_id}"
                         ));
-                        fire_event(&db_path, "system", *task_id, &Event::PrFoundMerged).await;
+                        let _ =
+                            complete_detected_merge_with_metadata(config, *task_id, *pr).await?;
                         continue;
                     }
                     merge::MergeabilityState::Closed => {
@@ -28612,6 +28734,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 message: "merged".into(),
                 failure_kind: None,
             }
+        }
+
+        fn merge_commit_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some("merge-42".into())
         }
     }
 

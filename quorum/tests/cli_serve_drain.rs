@@ -151,7 +151,23 @@ elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  case " $* " in
+    *" --json statusCheckRollup,mergeStateStatus "*)
+      printf '{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}\n'
+      exit 0
+      ;;
+    *" --json mergeCommit "*)
+      printf '{"mergeCommit":{"oid":"%s"}}\n' "$sha"
+      exit 0
+      ;;
+    *" --json headRefOid --jq .headRefOid "*)
+      printf '%s\n' "$sha"
+      exit 0
+      ;;
+  esac
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"%s","state":"OPEN"}\n' "$branch" "$sha" "$QUORUM_TEST_GH_BASE"
+elif [ "$cmd" = "pr review" ] || [ "$cmd" = "pr merge" ]; then
+  exit 0
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -184,14 +200,15 @@ fi
             &names.to_string_lossy(),
             "--agent-bin",
             &fake_agent.to_string_lossy(),
-            "--merge-cmd",
-            merge_cmd,
             "--exit-when-gone",
             &sentinel_path,
         ]
         .into_iter()
         .map(|s| s.to_string())
         .collect();
+        if !merge_cmd.is_empty() {
+            args.extend(["--merge-cmd".to_string(), merge_cmd.to_string()]);
+        }
         for a in extra_args {
             args.push(a.to_string());
         }
@@ -470,13 +487,14 @@ fn self_repo_merge_drains_and_exits_75() {
         r#"{"repo":"test-owner/test-repo"}"#,
     );
 
-    // merge-cmd: "true" — always succeeds
+    // Use the fake GitHub executor so the successful merge has a real
+    // mergeCommit response, as production does.
     let mut handle = ServeHandle::start(
         home.path(),
         repo_dir.path(),
         wt_base.path(),
         &names_file,
-        "true",
+        "",
         &[
             "--self-update-drain",
             "--self-repo",

@@ -1155,6 +1155,24 @@ impl MergeExecutor for CommandMergeExecutor {
         }
     }
 
+    fn merge_commit_sha(&self, _pr: i64, repo_dir: &Path) -> Option<String> {
+        // `--merge-cmd` is a hidden local-test seam rather than a GitHub
+        // executor. Its successful command has no GraphQL mergeCommit to
+        // query, so use the immutable repository object the fixture exposes
+        // as its simulated merge witness. Production uses GhMergeExecutor and
+        // must still obtain GitHub's real mergeCommit above.
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_dir)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!sha.is_empty()).then_some(sha)
+    }
+
     fn wait_for_checks(
         &self,
         pr: i64,
