@@ -11,8 +11,9 @@ use super::runner::{
     FailureTracker, LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
     WorkerTurnRequest,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{symlink, OpenOptionsExt};
@@ -48,6 +49,165 @@ const AUTH_LOCK_FILE: &str = "auth.json.lock";
 const MANAGED_CONFIG_FILES: &[&str] = &["config.toml", "managed_config.toml", "requirements.toml"];
 const SYSTEM_GROK_CONFIG_DIR: &str = "/etc/grok";
 const SYSTEM_MANAGED_CONFIG_FILES: &[&str] = &["managed_config.toml", "requirements.toml"];
+
+/// Compact repeated `tool_call_update` output snapshots before they reach the
+/// session log. Grok reports the complete command output on every poll, so
+/// retaining those records verbatim makes log growth quadratic in command
+/// runtime. The retained records are still valid Grok JSON, with the output
+/// fields marked as incremental by `quorum_output_delta`.
+#[derive(Default)]
+pub(super) struct StreamLogCoalescer {
+    tool_calls: HashMap<String, ToolCallOutputState>,
+}
+
+#[derive(Default)]
+struct ToolCallOutputState {
+    content_text: Vec<OutputPrefix>,
+    raw_output: OutputPrefix,
+    output_for_prompt: OutputPrefix,
+}
+
+#[derive(Default)]
+struct OutputPrefix {
+    previous: Option<PrefixHash>,
+}
+
+#[derive(Clone, Copy)]
+struct PrefixHash {
+    len: usize,
+    hash: u64,
+}
+
+impl OutputPrefix {
+    fn byte_delta_start(&mut self, bytes: &[u8]) -> usize {
+        let offset = self
+            .previous
+            .filter(|previous| {
+                previous.len <= bytes.len() && hash_bytes(&bytes[..previous.len]) == previous.hash
+            })
+            .map_or(0, |previous| previous.len);
+        self.previous = Some(PrefixHash {
+            len: bytes.len(),
+            hash: hash_bytes(bytes),
+        });
+        offset
+    }
+
+    fn value_delta_start(&mut self, values: &[serde_json::Value]) -> usize {
+        let offset = self
+            .previous
+            .filter(|previous| {
+                previous.len <= values.len()
+                    && hash_values(&values[..previous.len]) == previous.hash
+            })
+            .map_or(0, |previous| previous.len);
+        self.previous = Some(PrefixHash {
+            len: values.len(),
+            hash: hash_values(values),
+        });
+        offset
+    }
+}
+
+impl StreamLogCoalescer {
+    /// Return a durable log record for one Grok protocol line. Only
+    /// in-progress updates are compacted; completed tool results remain raw
+    /// evidence and terminal/lifecycle records are never changed.
+    pub(super) fn compact(&mut self, raw: &str) -> String {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return raw.to_string();
+        };
+        let Some(tool_call_id) = value
+            .get("toolCallId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+        else {
+            return raw.to_string();
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("tool_call_update") {
+            return raw.to_string();
+        }
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("in_progress") {
+            self.tool_calls.remove(&tool_call_id);
+            return raw.to_string();
+        }
+
+        let state = self.tool_calls.entry(tool_call_id).or_default();
+        let mut changed = false;
+        if let Some(content) = value
+            .get_mut("content")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for (index, item) in content.iter_mut().enumerate() {
+                while state.content_text.len() <= index {
+                    state.content_text.push(OutputPrefix::default());
+                }
+                if let Some(text) = item
+                    .get_mut("content")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .and_then(|content| content.get_mut("text"))
+                {
+                    changed |= compact_text(text, &mut state.content_text[index]);
+                }
+            }
+        }
+        if let Some(raw_output) = value
+            .get_mut("rawOutput")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if let Some(output) = raw_output.get_mut("output") {
+                changed |= compact_value_array(output, &mut state.raw_output);
+            }
+            if let Some(output_for_prompt) = raw_output.get_mut("output_for_prompt") {
+                changed |= compact_text(output_for_prompt, &mut state.output_for_prompt);
+            }
+        }
+        if changed {
+            value["quorum_output_delta"] = serde_json::Value::Bool(true);
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| raw.to_string())
+    }
+}
+
+fn compact_text(value: &mut serde_json::Value, prefix: &mut OutputPrefix) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    let offset = prefix.byte_delta_start(text.as_bytes());
+    let Some(delta) = text.get(offset..) else {
+        return false;
+    };
+    *value = serde_json::Value::String(delta.to_string());
+    true
+}
+
+fn compact_value_array(value: &mut serde_json::Value, prefix: &mut OutputPrefix) -> bool {
+    let Some(values) = value.as_array_mut() else {
+        return false;
+    };
+    let offset = prefix.value_delta_start(values);
+    values.drain(..offset);
+    true
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_values(values: &[serde_json::Value]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for value in values {
+        if let Some(byte) = value.as_u64() {
+            byte.hash(&mut hasher);
+        } else {
+            value.to_string().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
 
 #[cfg(test)]
 struct InjectedStderrReadError;
