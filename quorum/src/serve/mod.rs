@@ -18693,6 +18693,12 @@ async fn spawn_worker(
     // Persist immutable allocation provenance before git creates anything.
     // Ref resolution is external I/O and completes before the short DB write.
     if continue_target.is_none() {
+        let allocation_resume_status = if task.status == "rework" {
+            "rework"
+        } else {
+            "open"
+        };
+        let requires_verified_dependency_provenance = verified_dependency_base.is_some();
         let resolved_provenance = match verified_dependency_base {
             Some(base_sha) => base_sha,
             None => {
@@ -18702,7 +18708,7 @@ async fn spawn_worker(
                     Err(error) => {
                         let reason = format!("branch provenance resolution failed: {error}");
                         persist_provisioning_failure(&db_path, task.id, &reason).await;
-                        park_task(&db_path, task.id, &reason, "open").await;
+                        park_task(&db_path, task.id, &reason, allocation_resume_status).await;
                         guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id)
                             .await;
                         return Ok(false);
@@ -18724,9 +18730,25 @@ async fn spawn_worker(
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
+            if requires_verified_dependency_provenance
+                && existing
+                    .as_ref()
+                    .is_some_and(|(_, provenance)| provenance.is_none())
+            {
+                // A legacy allocation cannot prove where its already-existing
+                // branch began. Do not backfill the current base onto that
+                // row and then reuse an unverifiable checkout.
+                return Ok(false);
+            }
             let (allocator, provenance) = match existing.as_ref() {
-                Some((allocator, Some(provenance))) => (allocator.as_str(), provenance.as_str()),
-                Some((allocator, None)) => (allocator.as_str(), resolved_provenance.as_str()),
+                // A dependent's freshly verified base is its allocation
+                // provenance requirement. Replaying an older allocation would
+                // otherwise reuse its branch unchanged, even if that branch
+                // was cut before the dependency merge reached the base.
+                Some((allocator, Some(provenance))) if !requires_verified_dependency_provenance => {
+                    (allocator.as_str(), provenance.as_str())
+                }
+                Some((allocator, _)) => (allocator.as_str(), resolved_provenance.as_str()),
                 None => (allocation_agent.as_str(), resolved_provenance.as_str()),
             };
             quorum_core::branches::record_exact_allocation(
@@ -18746,7 +18768,7 @@ async fn spawn_worker(
                 &db_path,
                 task.id,
                 "branch allocation provenance conflict",
-                "open",
+                allocation_resume_status,
             )
             .await;
             guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
@@ -30387,6 +30409,189 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             published.source_sha, fixture.source_sha,
             "a publication crash recovery must replay the exact durable source"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_dependency_base_parks_stale_branch_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let remote = dir.path().join("remote.git");
+        let worker = dir.path().join("worker");
+        let git = |repo: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-q", "origin", "main"]);
+        let stale_provenance = git(&source, &["rev-parse", "HEAD"]);
+
+        assert!(std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                worker.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let stale_branch = "daemon/stale-allocation-t2";
+        git(&worker, &["checkout", "-q", "-b", stale_branch]);
+        git(&worker, &["checkout", "-q", "main"]);
+
+        git(&source, &["checkout", "-q", "-b", "dependency"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "dependency"]);
+        git(&source, &["checkout", "-q", "main"]);
+        git(
+            &source,
+            &["merge", "--no-ff", "dependency", "-m", "merge dependency"],
+        );
+        let merge_commit = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        let db_path = dir.path().join("quorum.db");
+        let worktree = dir.path().join("stale-allocation-worktree");
+        let child_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let dependency_id = tasks::create(
+                &mut conn,
+                "owner",
+                "merged dependency",
+                None,
+                0,
+                None,
+                Some(
+                    &serde_json::json!({
+                        "merge_commit_sha": merge_commit,
+                    })
+                    .to_string(),
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done', completion_provenance='merged' WHERE id=?1",
+                [dependency_id],
+            )
+            .unwrap();
+            let child_id = tasks::create(
+                &mut conn,
+                "owner",
+                "dependent with stale branch",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                Some(&format!("[{dependency_id}]")),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            assert!(quorum_core::branches::record_exact_allocation(
+                &mut conn,
+                child_id,
+                stale_branch,
+                &worktree.to_string_lossy(),
+                "FormerWorker",
+                &stale_provenance,
+                now_unix(),
+            )
+            .unwrap());
+            child_id
+        };
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), worker.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+
+        assert!(
+            !spawn_worker(
+                &config,
+                &WorktreeManager::new(),
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+            )
+            .await
+            .unwrap(),
+            "a freshly verified base must not reuse a stale dependent branch"
+        );
+        assert!(workers.is_empty(), "no worker may be dispatched");
+        assert!(
+            !worktree.exists(),
+            "the stale allocation must be rejected before worktree provisioning"
+        );
+        assert!(
+            !std::process::Command::new("git")
+                .args(["merge-base", "--is-ancestor", &merge_commit, stale_branch])
+                .current_dir(&worker)
+                .status()
+                .unwrap()
+                .success(),
+            "the retained branch is the stale one the daemon must refuse"
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["merge-base", "--is-ancestor", &merge_commit, "origin/main"])
+                .current_dir(&worker)
+                .status()
+                .unwrap()
+                .success(),
+            "dispatch must have first fetched and verified the current base"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let child = tasks::get(&conn, child_id).unwrap().unwrap();
+        assert_eq!(child.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(child.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs[quorum_core::tasks::PARKED_REASON_REF],
+            "branch allocation provenance conflict"
+        );
+        let recorded_provenance: String = conn
+            .query_row(
+                "SELECT provenance_sha FROM task_branches WHERE task_id=?1",
+                [child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded_provenance, stale_provenance);
     }
 
     #[cfg(unix)]

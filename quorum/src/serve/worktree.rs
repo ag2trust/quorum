@@ -744,7 +744,12 @@ impl WorktreeManager {
             if ancestry.status.success() {
                 continue;
             }
-            if ancestry.status.code() == Some(1) {
+            // A fetch of only the stale base ref normally does not transfer
+            // the just-merged dependency object at all. `merge-base` reports
+            // that ordinary propagation state as exit 128 (rather than 1),
+            // so both outcomes must use the bounded defer path. A durable
+            // SHA which never arrives is parked loudly by that path.
+            if matches!(ancestry.status.code(), Some(1) | Some(128)) {
                 return Ok(DependencyBaseVerification::Missing {
                     merge_commit_sha: merge_commit_sha.clone(),
                 });
@@ -1948,8 +1953,14 @@ mod tests {
     #[tokio::test]
     async fn dependency_base_verification_defers_until_remote_contains_merge_commit() {
         let tmp = tempfile::tempdir().unwrap();
-        let (repo, _) = init_repo_with_bare_remote(tmp.path());
-        let d = repo.to_string_lossy().to_string();
+        let (source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("worker");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let d = source.to_string_lossy().to_string();
 
         assert!(StdCommand::new("git")
             .args(["-C", &d, "checkout", "-b", "dependency"])
@@ -1961,17 +1972,32 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let dependency_commit = git_rev_parse(&repo, "HEAD");
+        let dependency_commit = git_rev_parse(&source, "HEAD");
         assert!(StdCommand::new("git")
             .args(["-C", &d, "checkout", "main"])
             .status()
             .unwrap()
             .success());
 
+        let missing_object = git_output(
+            &worker,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &dependency_commit,
+                "origin/main",
+            ],
+        );
+        assert_eq!(
+            missing_object.status.code(),
+            Some(128),
+            "the stale clone must not have the dependency merge object"
+        );
+
         let mgr = WorktreeManager::new();
         let first = mgr
             .fetch_base_and_verify_dependency_commits(
-                &repo,
+                &worker,
                 "main",
                 std::slice::from_ref(&dependency_commit),
             )
@@ -1985,7 +2011,7 @@ mod tests {
         );
         assert!(
             !git_output(
-                &repo,
+                &worker,
                 &["show-ref", "--verify", "refs/heads/daemon/dependent"]
             )
             .status
@@ -2014,7 +2040,7 @@ mod tests {
 
         let second = mgr
             .fetch_base_and_verify_dependency_commits(
-                &repo,
+                &worker,
                 "main",
                 std::slice::from_ref(&dependency_commit),
             )
@@ -2024,7 +2050,7 @@ mod tests {
             panic!("advanced base must contain dependency commit");
         };
         assert!(git_output(
-            &repo,
+            &worker,
             &["merge-base", "--is-ancestor", &dependency_commit, &base_sha]
         )
         .status
