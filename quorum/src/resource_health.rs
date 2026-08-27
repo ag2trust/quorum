@@ -2,7 +2,8 @@
 //!
 //! Sampling is deliberately outside `quorum-core`: it performs platform I/O,
 //! is never persisted, and must run only after status has closed its SQLite
-//! read connection. The daemon uses the same sampler from `spawn_blocking`.
+//! read connection. The daemon runs the same sampler in a detached,
+//! single-flight worker so a stuck platform syscall cannot stall its tick.
 
 use quorum_core::stats::{
     DiskResourceView, HealthVerdict, HostResourcesView, MemoryResourceView, ResourceSeverity, Stats,
@@ -19,6 +20,7 @@ pub const DEFAULT_MEMORY_CRITICAL_AVAILABLE_PCT: u8 = 8;
 pub const MIN_RESOURCE_POLL_SECS: u64 = 5;
 pub const MAX_RESOURCE_POLL_SECS: u64 = 3600;
 const SAMPLE_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const RESOURCE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
 const GIB: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +91,117 @@ pub fn sample_system(
     config: ResourceMonitorConfig,
 ) -> HostResourcesView {
     sample_with(&SystemSampler, sampled_at, targets, config)
+}
+
+#[derive(Debug)]
+struct InFlightSample {
+    started_at: Instant,
+    sampled_at: i64,
+    receiver: std::sync::mpsc::Receiver<HostResourcesView>,
+    timeout_reported: bool,
+}
+
+/// Keeps daemon sampling off the async executor and limits it to one detached
+/// platform call at a time. A detached thread is intentional: Tokio waits for
+/// blocking-pool jobs during runtime shutdown, while a filesystem syscall may
+/// not return promptly on a degraded mount.
+#[derive(Debug)]
+pub struct ResourceSamplePoller {
+    last_started: Option<Instant>,
+    in_flight: Option<InFlightSample>,
+    timeout: Duration,
+}
+
+impl Default for ResourceSamplePoller {
+    fn default() -> Self {
+        Self {
+            last_started: None,
+            in_flight: None,
+            timeout: RESOURCE_SAMPLE_TIMEOUT,
+        }
+    }
+}
+
+impl ResourceSamplePoller {
+    /// Poll an existing sample or start one when due. This never waits for the
+    /// sampler and never starts a replacement while one remains in flight.
+    pub fn poll(
+        &mut self,
+        now: Instant,
+        sampled_at: i64,
+        targets: &[DiskTarget],
+        config: ResourceMonitorConfig,
+    ) -> Option<HostResourcesView> {
+        if let Some(in_flight) = self.in_flight.as_mut() {
+            match in_flight.receiver.try_recv() {
+                Ok(resources) => {
+                    self.in_flight = None;
+                    return Some(resources);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let sampled_at = in_flight.sampled_at;
+                    self.in_flight = None;
+                    return Some(failed_sample(sampled_at, "sampler worker stopped"));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if !in_flight.timeout_reported
+                        && now.saturating_duration_since(in_flight.started_at) >= self.timeout =>
+                {
+                    in_flight.timeout_reported = true;
+                    return Some(failed_sample(
+                        in_flight.sampled_at,
+                        format!(
+                            "sampler exceeded {}s; awaiting the existing sample",
+                            self.timeout.as_secs()
+                        ),
+                    ));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            }
+        }
+
+        let due = self.last_started.is_none_or(|last| {
+            now.saturating_duration_since(last) >= Duration::from_secs(config.poll_secs)
+        });
+        if !due {
+            return None;
+        }
+
+        self.last_started = Some(now);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let targets = targets.to_vec();
+        match std::thread::Builder::new()
+            .name("quorum-resource-sampler".to_string())
+            .spawn(move || {
+                let _ = sender.send(sample_system(sampled_at, &targets, config));
+            }) {
+            Ok(handle) => {
+                drop(handle);
+                self.in_flight = Some(InFlightSample {
+                    started_at: now,
+                    sampled_at,
+                    receiver,
+                    timeout_reported: false,
+                });
+                None
+            }
+            Err(error) => Some(failed_sample(
+                sampled_at,
+                format!("sampler worker start: {error}"),
+            )),
+        }
+    }
+}
+
+fn failed_sample(sampled_at: i64, error: impl Into<String>) -> HostResourcesView {
+    HostResourcesView {
+        sampled_at,
+        complete: false,
+        severity: ResourceSeverity::Normal,
+        memory: None,
+        disks: Vec::new(),
+        errors: vec![error.into()],
+    }
 }
 
 fn sample_with(
@@ -321,9 +434,16 @@ fn platform_disk(path: &Path) -> std::io::Result<DiskReading> {
     Ok(DiskReading {
         device_id: metadata.dev(),
         sampled_path,
-        total_bytes: (stats.f_blocks as u64).saturating_mul(block_size),
-        available_bytes: (stats.f_bavail as u64).saturating_mul(block_size),
+        total_bytes: filesystem_bytes(stats.f_blocks, block_size),
+        available_bytes: filesystem_bytes(stats.f_bavail, block_size),
     })
+}
+
+#[cfg(unix)]
+fn filesystem_bytes(blocks: libc::fsblkcnt_t, block_size: libc::c_ulong) -> u64 {
+    u128::from(blocks)
+        .saturating_mul(u128::from(block_size))
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(not(unix))]
@@ -689,5 +809,69 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn poller_times_out_once_without_replacing_the_in_flight_sample() {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(2);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut poller = ResourceSamplePoller {
+            last_started: Some(start),
+            in_flight: Some(InFlightSample {
+                started_at: start,
+                sampled_at: 123,
+                receiver,
+                timeout_reported: false,
+            }),
+            timeout,
+        };
+
+        let timed_out = poller
+            .poll(
+                start + timeout,
+                456,
+                &targets(),
+                ResourceMonitorConfig::default(),
+            )
+            .expect("deadline should produce one incomplete sample");
+        assert!(!timed_out.complete);
+        assert_eq!(timed_out.sampled_at, 123);
+        assert!(timed_out.errors[0].contains("sampler exceeded 2s"));
+        assert!(poller.in_flight.is_some());
+
+        assert!(
+            poller
+                .poll(
+                    start + timeout + Duration::from_secs(1),
+                    789,
+                    &targets(),
+                    ResourceMonitorConfig::default(),
+                )
+                .is_none(),
+            "the same stalled sample must not produce repeated warnings or replacements"
+        );
+        assert!(poller.in_flight.is_some());
+
+        sender
+            .send(HostResourcesView {
+                sampled_at: 123,
+                complete: true,
+                severity: ResourceSeverity::Normal,
+                memory: None,
+                disks: Vec::new(),
+                errors: Vec::new(),
+            })
+            .unwrap();
+        let completed = poller
+            .poll(
+                start + timeout + Duration::from_secs(2),
+                999,
+                &targets(),
+                ResourceMonitorConfig::default(),
+            )
+            .expect("completed in-flight sample should be collected");
+        assert!(completed.complete);
+        assert!(poller.in_flight.is_none());
     }
 }

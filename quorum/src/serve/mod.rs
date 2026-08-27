@@ -8984,7 +8984,17 @@ async fn tick_loop(
     log(&format!("serving (cap={})", config.cap));
 
     let mut resource_transitions = crate::resource_health::ResourceTransitionMonitor::default();
-    let mut last_resource_poll: Option<std::time::Instant> = None;
+    let mut resource_sampler = crate::resource_health::ResourceSamplePoller::default();
+    let resource_targets = vec![
+        crate::resource_health::DiskTarget {
+            label: "database",
+            path: config.db_path.clone(),
+        },
+        crate::resource_health::DiskTarget {
+            label: "worktrees",
+            path: config.worktree_base.clone(),
+        },
+    ];
 
     // Standalone heartbeat task — refreshes the daemon lock every 10s,
     // independent of tick() duration. Detects lock theft (0-row refresh)
@@ -9129,40 +9139,14 @@ async fn tick_loop(
         }
 
         // Host telemetry is observational and intentionally sampled outside
-        // every SQLite transaction. The bounded blocking task keeps platform
-        // filesystem/VM syscalls off the async executor. It never changes
-        // provisioning, shutdown, or lifecycle decisions.
-        let resource_poll_due = last_resource_poll
-            .is_none_or(|last| last.elapsed().as_secs() >= config.resource_monitor.poll_secs);
-        if resource_poll_due {
-            last_resource_poll = Some(std::time::Instant::now());
-            let sampled_at = now_unix();
-            let monitor_config = config.resource_monitor;
-            let targets = vec![
-                crate::resource_health::DiskTarget {
-                    label: "database",
-                    path: config.db_path.clone(),
-                },
-                crate::resource_health::DiskTarget {
-                    label: "worktrees",
-                    path: config.worktree_base.clone(),
-                },
-            ];
-            let resources = match tokio::task::spawn_blocking(move || {
-                crate::resource_health::sample_system(sampled_at, &targets, monitor_config)
-            })
-            .await
-            {
-                Ok(resources) => resources,
-                Err(error) => quorum_core::stats::HostResourcesView {
-                    sampled_at,
-                    complete: false,
-                    severity: quorum_core::stats::ResourceSeverity::Normal,
-                    memory: None,
-                    disks: Vec::new(),
-                    errors: vec![format!("sampler join: {error}")],
-                },
-            };
+        // every SQLite transaction. Polling is non-blocking and single-flight,
+        // so a degraded filesystem cannot stall lifecycle or shutdown work.
+        if let Some(resources) = resource_sampler.poll(
+            std::time::Instant::now(),
+            now_unix(),
+            &resource_targets,
+            config.resource_monitor,
+        ) {
             for line in resource_transitions.observe(&resources, std::time::Instant::now()) {
                 log(&line);
             }
