@@ -4721,12 +4721,32 @@ pub fn stamp_rework_cap(conn: &mut Connection, task_id: i64, cap: u32, now: i64)
 // ── close_after_merge ─────────────────────────────────────────────────────────
 
 pub fn close_after_merge(conn: &mut Connection, id: i64, note: &str, now: i64) -> Result<bool> {
+    close_after_merge_with_merge_commit_sha(conn, id, note, None, now)
+}
+
+/// Recovery equivalent of [`close_after_merge`] that durably associates the
+/// completed task with GitHub's immutable merge commit in the same transaction.
+pub fn close_after_merge_with_merge_commit_sha(
+    conn: &mut Connection,
+    id: i64,
+    note: &str,
+    merge_commit_sha: Option<&str>,
+    now: i64,
+) -> Result<bool> {
+    if merge_commit_sha.is_some_and(|sha| sha.is_empty() || sha.contains('\0')) {
+        return Err(QuorumError::BadInput(
+            "merge commit SHA must be non-empty and contain no NUL".into(),
+        ));
+    }
     let tx = begin_immediate(conn)?;
     let n = tx.execute(
         "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2,
-                          completion_provenance=?3
+                          completion_provenance=?3,
+                          refs=CASE WHEN ?4 IS NULL THEN refs
+                                    ELSE json_set(COALESCE(refs, '{}'), '$.merge_commit_sha', ?4)
+                               END
          WHERE id=?1 AND status NOT IN ('done', 'failed', 'cancelled')",
-        params![id, now, COMPLETION_PROVENANCE_MERGED],
+        params![id, now, COMPLETION_PROVENANCE_MERGED, merge_commit_sha],
     )?;
     if n == 0 {
         tx.commit()?;

@@ -603,15 +603,15 @@ async fn merge_approved(
         return Ok(false);
     }
 
+    let repo = repo_dir.to_path_buf();
+    let exec = Arc::clone(merge_executor);
+    let merge_commit_sha = tokio::task::spawn_blocking(move || exec.merge_commit_sha(pr, &repo))
+        .await
+        .map_err(|error| {
+            QuorumError::Io(format!("merge commit SHA spawn_blocking join: {error}"))
+        })?;
+
     if attempt_admitted {
-        let repo = repo_dir.to_path_buf();
-        let exec = Arc::clone(merge_executor);
-        let merge_commit_sha =
-            tokio::task::spawn_blocking(move || exec.merge_commit_sha(pr, &repo))
-                .await
-                .map_err(|error| {
-                    QuorumError::Io(format!("merge commit SHA spawn_blocking join: {error}"))
-                })?;
         let p = db_path.to_path_buf();
         let task_id = appr.task_id;
         run_blocking(move || {
@@ -649,7 +649,13 @@ async fn merge_approved(
         let now = super::now_unix();
         let note =
             format!("daemon: PR #{pr} merged on restart recovery (approved by {reviewer}, #228)");
-        tasks::close_after_merge(&mut conn, task_id, &note, now)?;
+        tasks::close_after_merge_with_merge_commit_sha(
+            &mut conn,
+            task_id,
+            &note,
+            merge_commit_sha.as_deref(),
+            now,
+        )?;
         // Remove journal rows for this task so recovery won't reset now-merged work.
         let agents: Vec<String> = journal::list_in_flight(&conn)?
             .into_iter()
@@ -754,6 +760,9 @@ mod tests {
         }
         fn head_sha(&self, pr: i64, _repo: &Path) -> Option<String> {
             self.heads.get(&pr).cloned()
+        }
+        fn merge_commit_sha(&self, pr: i64, _repo: &Path) -> Option<String> {
+            self.heads.get(&pr).map(|_| format!("merge-{pr}"))
         }
     }
 
@@ -865,6 +874,54 @@ mod tests {
         assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
         assert!(approvals::get_for_pr(&conn, 208).unwrap().is_empty());
         assert!(journal::list_in_flight(&conn).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovered_in_review_approval_records_merge_commit_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let tid = seed_task(&mut conn, "in-review recovery", "Bellows-d11");
+        assert!(tasks::resolve_target_branch(&mut conn, tid, "develop", 1002).unwrap());
+        conn.execute(
+            "UPDATE tasks
+             SET status='in-review', refs=json_set(COALESCE(refs, '{}'), '$.pr', 208)
+             WHERE id=?1",
+            [tid],
+        )
+        .unwrap();
+        seed_journal(&mut conn, "Bellows-d11", tid, 208);
+        for (role, reviewer) in [("r1", "Grommet-d14"), ("r2", "Anvil-d22")] {
+            approvals::record(
+                &mut conn,
+                &approvals::Approval {
+                    pr_number: 208,
+                    review_role: role.into(),
+                    task_id: tid,
+                    author: "Bellows-d11".into(),
+                    reviewer: reviewer.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "2c0c833".into(),
+                },
+            )
+            .unwrap();
+        }
+        quorum_core::review_audits::record_r2_requirement(&mut conn, tid, 208, "2c0c833", true)
+            .unwrap();
+        drop(conn);
+
+        let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.merged, 1);
+        let conn = db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, tid).unwrap().unwrap();
+        assert_eq!(task.status, "done");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::MERGE_COMMIT_SHA_REF], "merge-208");
     }
 
     #[tokio::test]
