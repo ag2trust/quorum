@@ -3836,17 +3836,22 @@ pub fn defer_dependency_base_wait(
     now: i64,
 ) -> Result<Option<DependencyBaseWaitDisposition>> {
     let tx = begin_immediate(conn)?;
-    let refs: Option<String> = tx
+    let current: Option<(String, String)> = tx
         .query_row(
-            "SELECT refs FROM tasks
-             WHERE id=?1 AND status='working' AND assignee=?2",
+            "SELECT status,refs FROM tasks
+             WHERE id=?1 AND status IN ('working','rework') AND assignee=?2",
             params![id, agent],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(refs) = refs else {
+    let Some((status, refs)) = current else {
         tx.commit()?;
         return Ok(None);
+    };
+    let deferred_status = if status == "working" {
+        "open"
+    } else {
+        "rework"
     };
     let mut refs_value = serde_json::from_str::<serde_json::Value>(&refs).map_err(|error| {
         QuorumError::Io(format!("invalid task refs while deferring base: {error}"))
@@ -3873,9 +3878,9 @@ pub fn defer_dependency_base_wait(
     if attempt < MAX_DEPENDENCY_BASE_WAIT_ATTEMPTS {
         let changed = tx.execute(
             "UPDATE tasks
-             SET status='open',assignee=NULL,refs=?3,updated_at=?4
-             WHERE id=?1 AND status='working' AND assignee=?2",
-            params![id, agent, refs, now],
+             SET status=?3,assignee=NULL,refs=?4,updated_at=?5
+             WHERE id=?1 AND status=?6 AND assignee=?2",
+            params![id, agent, deferred_status, refs, now, status],
         )?;
         if changed != 1 {
             tx.commit()?;
@@ -3893,12 +3898,12 @@ pub fn defer_dependency_base_wait(
         return Ok(Some(DependencyBaseWaitDisposition::Deferred { attempt }));
     }
 
-    let parked_refs = set_parked_refs(Some(&refs), reason, "open")?;
+    let parked_refs = set_parked_refs(Some(&refs), reason, deferred_status)?;
     let changed = tx.execute(
         "UPDATE tasks
          SET status='failed',assignee=NULL,refs=?3,updated_at=?4
-         WHERE id=?1 AND status='working' AND assignee=?2",
-        params![id, agent, parked_refs, now],
+         WHERE id=?1 AND status=?5 AND assignee=?2",
+        params![id, agent, parked_refs, now, status],
     )?;
     if changed != 1 {
         tx.commit()?;
@@ -10645,6 +10650,74 @@ mod tests {
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs[DEPENDENCY_BASE_WAIT_ATTEMPTS_REF], 3);
         assert_eq!(refs[PARKED_REASON_REF], reason);
+    }
+
+    #[test]
+    fn provider_retry_rework_dependency_base_wait_preserves_rework_then_parks() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create(
+            &mut conn,
+            "owner",
+            "dependency",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"deadbeef"}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done',completion_provenance='merged' WHERE id=?1",
+            [dependency],
+        )
+        .unwrap();
+        let child = create(
+            &mut conn,
+            "owner",
+            "provider retry child",
+            None,
+            0,
+            None,
+            Some(r#"{"codex_retry_requested":true}"#),
+            Some(&format!("[{dependency}]")),
+            None,
+            11,
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [child])
+            .unwrap();
+
+        let reason = "fetched origin/develop does not yet contain dependency merge commit deadbeef";
+        for now in [12, 13] {
+            claim_provider_retry_rework(&mut conn, "replacement", child, TTL, now)
+                .unwrap()
+                .expect("dependency-ready provider retry must claim rework");
+            assert_eq!(
+                defer_dependency_base_wait(&mut conn, child, "replacement", reason, now).unwrap(),
+                Some(DependencyBaseWaitDisposition::Deferred { attempt: now - 11 })
+            );
+            let task = get(&conn, child).unwrap().unwrap();
+            assert_eq!(task.status, "rework");
+            assert!(task.assignee.is_none());
+            assert!(!has_live_lease(&conn, child, now));
+        }
+
+        claim_provider_retry_rework(&mut conn, "replacement", child, TTL, 14)
+            .unwrap()
+            .expect("rework remains claimable after a stale-base deferral");
+        assert_eq!(
+            defer_dependency_base_wait(&mut conn, child, "replacement", reason, 14).unwrap(),
+            Some(DependencyBaseWaitDisposition::Parked { attempt: 3 })
+        );
+        let task = get(&conn, child).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[DEPENDENCY_BASE_WAIT_ATTEMPTS_REF], 3);
+        assert_eq!(refs[PARKED_RESUME_STATUS_REF], "rework");
+        assert_eq!(refs[PARKED_REASON_REF], reason);
+        assert!(!has_live_lease(&conn, child, 14));
     }
 
     #[test]

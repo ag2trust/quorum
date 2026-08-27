@@ -18329,7 +18329,12 @@ async fn verify_dependency_base_before_allocation(
                 let reason = format!(
                     "dependency base verification failed before allocation: {error}"
                 );
-                require_park_task(db_path, task.id, &reason, "open").await?;
+                let resume_status = if task.status == "rework" {
+                    "rework"
+                } else {
+                    "open"
+                };
+                require_park_task(db_path, task.id, &reason, resume_status).await?;
                 log(&format!("PARKED: task #{}: {reason}", task.id));
                 return Ok(DependencyBaseAdmission::Deferred);
             }
