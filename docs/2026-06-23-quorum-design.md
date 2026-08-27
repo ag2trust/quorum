@@ -29,6 +29,13 @@ come from persisted `agent_runs`; queue/blocked rows without an explicit task ti
 the explicit `pending` marker because a read-only status process does not invent the
 daemon's configured provider default. Complexity is task metadata, never a model value.
 
+Status also attaches a live, additive `resources` object containing sampled-at time,
+OS-available memory, swap use, and raw total/available bytes for the database and configured
+worktree-base filesystems. Filesystems are deduplicated by device identity. Sampling is
+non-persistent and fail-open; partial values and bounded sampling errors remain visible. A
+warning or critical resource sample promotes only `OnTrack` to `Attention`, never replaces
+`Stalled`, and never throttles, kills, or transitions managed work.
+
 ### Product boundary: opinionated Git delivery
 
 Quorum is an opinionated local **agentic Git/GitHub coding pipeline**. It provisions
@@ -174,9 +181,11 @@ the WAL self-truncates in normal operation. **The one footgun:** a long-lived re
 an open transaction blocks checkpointing entirely (verified: `-wal` grew to 8.5 MB and
 climbing with one held reader during 2000 writes). The only long-lived reader is
 `status --watch` → it **must open a fresh short read per tick** (connect → read → close),
-never hold a transaction across polls. `quorum sweep` runs `PRAGMA wal_checkpoint(TRUNCATE)`
-as the explicit recovery escape hatch. WAL maintenance is optional **only given** the
-short-connection invariant — stated, not assumed.
+then sample host resources only after that connection closes, and never hold a transaction
+across polls. One-shot status uses the same read-then-sample path and does not depend on daemon
+liveness. `quorum sweep` runs `PRAGMA wal_checkpoint(TRUNCATE)` as the explicit recovery escape
+hatch. WAL maintenance is optional **only given** the short-connection invariant — stated, not
+assumed.
 
 ## Schema versioning & migration (BLOCKER — must exist)
 
@@ -426,9 +435,11 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 ### Ops
 - `quorum status [--watch]` → read-only health snapshot. Alerts and critical messages are
   displayed and affect health only for 12 hours; they remain available through the feed until
-  their normal message TTL expires. **`--watch` opens a fresh short read
-  per ~1–2s tick (connect→read→close) — never holds a transaction across ticks** (else it
-  pins the WAL; verified). Read-only; never blocks writers under WAL.
+  their normal message TTL expires. Live memory/swap and deduplicated DB/worktree filesystem
+  capacity are sampled without persistence and appear in both the cockpit and additive JSON.
+  **`--watch` opens a fresh short read per ~1–2s tick (connect→read→close), then performs the OS
+  sample — never holds a transaction across ticks or resource syscalls** (else it pins the WAL;
+  verified). Read-only; never blocks writers under WAL.
 - `quorum sweep` → unbounded physical reclamation + `wal_checkpoint(TRUNCATE)` (optional;
   sweep-on-write covers normal use)
 - `quorum init` → create `~/.quorum/`, DB, default config; open + migrate (idempotent)
@@ -2057,6 +2068,20 @@ a stable model profile containing an exact provider model, supported runner, and
 Every required role then names a routing pool. Pool entries use positive integer percentages
 that total exactly 100; fixed `agent`, `provider`, `model`, `effort`, `worker_model`,
 `review_model`, `classifier_model`, and `collector_model` selection is not accepted.
+
+The same repository serve file configures observational host-resource diagnostics:
+
+```toml
+resource_poll_secs = 30             # 5..=3600
+disk_warn_free_gib = 80
+disk_critical_free_gib = 40         # positive and less than warning
+memory_warn_available_pct = 15      # 1..=100
+memory_critical_available_pct = 8   # positive and less than warning
+```
+
+The daemon samples on this cadence outside database transactions and logs only severity
+transitions (including recovery). Sampling failures are fail-open and rate-limited. These
+settings have no admission-control or lifecycle authority.
 
 ```toml
 [model_profiles.terra]

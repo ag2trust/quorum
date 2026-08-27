@@ -487,6 +487,56 @@ pub enum HealthVerdict {
     Stalled,
 }
 
+/// Severity assigned to an observed host-resource value.
+#[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy, Default, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceSeverity {
+    #[default]
+    Normal,
+    Warning,
+    Critical,
+}
+
+/// Host memory and swap values sampled by the binary crate.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct MemoryResourceView {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub available_percent: f64,
+    pub swap_total_bytes: u64,
+    pub swap_used_bytes: u64,
+    pub severity: ResourceSeverity,
+}
+
+/// One deduplicated filesystem sampled for host-resource status.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct DiskResourceView {
+    /// Logical consumers located on this filesystem (for example `database`
+    /// and `worktrees`). Multiple consumers prove filesystem deduplication.
+    pub targets: Vec<String>,
+    /// Existing path used for the filesystem sample.
+    pub path: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub available_percent: f64,
+    pub severity: ResourceSeverity,
+}
+
+/// Live, non-persisted host-resource telemetry attached by `quorum status`.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct HostResourcesView {
+    pub sampled_at: i64,
+    /// False when one or more requested samples failed. Known values remain
+    /// visible, but an incomplete sample must not prove a daemon recovery.
+    pub complete: bool,
+    pub severity: ResourceSeverity,
+    pub memory: Option<MemoryResourceView>,
+    pub disks: Vec<DiskResourceView>,
+    /// Bounded, fail-open sampling diagnostics. These are observational and
+    /// never enter the durable Quorum error feed.
+    pub errors: Vec<String>,
+}
+
 /// A point-in-time snapshot of the store.
 #[derive(Debug, Serialize, PartialEq, Default)]
 pub struct Stats {
@@ -545,6 +595,9 @@ pub struct Stats {
     pub merge_blockers: Vec<MergeBlockerView>,
     /// #115: daemon liveness from daemon_lock (populated by binary crate).
     pub daemon: DaemonLiveness,
+    /// Live host memory/swap and filesystem telemetry. Populated after the
+    /// binary closes the status read connection; never persisted in SQLite.
+    pub resources: Option<HostResourcesView>,
 }
 
 /// Gather a snapshot. Read-only.
@@ -668,6 +721,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         alerts,
         merge_blockers,
         daemon: DaemonLiveness::default(),
+        resources: None,
     })
 }
 

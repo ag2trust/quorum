@@ -14,6 +14,7 @@ mod graph_blocker;
 mod input;
 mod output;
 mod paths;
+mod resource_health;
 mod serve;
 mod serve_config;
 mod verdict;
@@ -114,6 +115,11 @@ primary = 100
 ## Diagnostics
 # log_dir = \"/path/to/logs\"
 # doctor_enabled = false
+# resource_poll_secs = 30                  # range: 5..=3600
+# disk_warn_free_gib = 80
+# disk_critical_free_gib = 40              # must be less than warning
+# memory_warn_available_pct = 15
+# memory_critical_available_pct = 8        # must be less than warning
 
 ## R2 pre-merge review sampling (safe defaults remain mandatory).
 ## r2_enabled = true                 # false disables sampling, not the R2 gate
@@ -193,15 +199,73 @@ fn command_source(cmd: &cli::Command) -> &'static str {
     }
 }
 
+/// Gather one DB snapshot, close its connection, and only then perform OS
+/// resource sampling. Keeping this ordering in the shared one-shot/watch path
+/// prevents a slow platform syscall from extending the WAL reader lifetime.
+fn status_snapshot(online_window: i64) -> Result<quorum_core::stats::Stats> {
+    let now = quorum_core::clock::now();
+    let db_path = paths::db_path()?;
+    assemble_status_snapshot(
+        || {
+            let conn = quorum_core::db::open(&db_path)?;
+            let mut stats = quorum_core::stats::stats(&conn, now, online_window)?;
+            stats.daemon =
+                quorum_core::daemon_lock::liveness(&conn, now, DAEMON_STALE_SECS, pid_is_alive)?;
+            drop(conn); // load-bearing: close the short DB read before returning
+            Ok(stats)
+        },
+        || status_resources(&db_path, now),
+    )
+}
+
+fn assemble_status_snapshot<Read, Sample>(
+    read: Read,
+    sample: Sample,
+) -> Result<quorum_core::stats::Stats>
+where
+    Read: FnOnce() -> Result<quorum_core::stats::Stats>,
+    Sample: FnOnce() -> quorum_core::stats::HostResourcesView,
+{
+    let mut stats = read()?;
+    let resources = sample();
+    resource_health::attach_to_stats(&mut stats, resources);
+    Ok(stats)
+}
+
+fn status_resources(db_path: &std::path::Path, now: i64) -> quorum_core::stats::HostResourcesView {
+    let mut monitor = resource_health::ResourceMonitorConfig::default();
+    let mut targets = vec![resource_health::DiskTarget {
+        label: "database",
+        path: db_path.to_path_buf(),
+    }];
+    let mut config_error = None;
+    if let Some(repo) = paths::try_resolve_repo() {
+        match serve_config::status_resource_config(&repo) {
+            Ok(status) => {
+                monitor = status.monitor;
+                if let Some(path) = status.worktree_base {
+                    targets.push(resource_health::DiskTarget {
+                        label: "worktrees",
+                        path,
+                    });
+                }
+            }
+            Err(error) => config_error = Some(format!("resource config: {error}")),
+        }
+    }
+    let mut resources = resource_health::sample_system(now, &targets, monitor);
+    if let Some(error) = config_error {
+        resources.complete = false;
+        resources.errors.push(error);
+    }
+    resources
+}
+
 /// `status --watch`: re-render every ~1.5s. Opens a FRESH short-lived connection per tick and
-/// closes it — never holds a transaction across ticks, which would pin the WAL (see CLAUDE.md).
+/// closes it before every host-resource sample and sleep — never holds a reader across ticks.
 fn watch_status(online_window: i64) -> Result<()> {
     loop {
-        let now = quorum_core::clock::now();
-        let conn = quorum_core::db::open(&paths::db_path()?)?;
-        let mut s = quorum_core::stats::stats(&conn, now, online_window)?;
-        s.daemon = quorum_core::daemon_lock::liveness(&conn, now, DAEMON_STALE_SECS, pid_is_alive)?;
-        drop(conn); // close before sleeping; do not hold across ticks
+        let s = status_snapshot(online_window)?;
         print!("\x1b[H\x1b[J");
         cockpit::render(&s);
         std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -777,14 +841,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 watch_status(cfg.online_window_secs)?;
                 Ok(0)
             } else {
-                let conn = quorum_core::db::open(&paths::db_path()?)?;
-                let mut s = quorum_core::stats::stats(&conn, now, cfg.online_window_secs)?;
-                s.daemon = quorum_core::daemon_lock::liveness(
-                    &conn,
-                    now,
-                    DAEMON_STALE_SECS,
-                    pid_is_alive,
-                )?;
+                let s = status_snapshot(cfg.online_window_secs)?;
                 if json {
                     output::emit(&s);
                 } else {
@@ -1417,6 +1474,32 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_master_ci_gate = resolve_bool(false, file_cfg.master_ci_gate, false);
             let r_master_ci_timeout = resolve_val(None, file_cfg.master_ci_timeout_secs, 300);
             let r_doctor_enabled = resolve_bool(doctor_enabled, file_cfg.doctor_enabled, false);
+            let resource_monitor = serve_config::resolve_resource_monitor_config(&file_cfg)?;
+            let r_resource_poll = resolve_val(
+                None,
+                file_cfg.resource_poll_secs,
+                resource_health::DEFAULT_RESOURCE_POLL_SECS,
+            );
+            let r_disk_warn = resolve_val(
+                None,
+                file_cfg.disk_warn_free_gib,
+                resource_health::DEFAULT_DISK_WARN_FREE_GIB,
+            );
+            let r_disk_critical = resolve_val(
+                None,
+                file_cfg.disk_critical_free_gib,
+                resource_health::DEFAULT_DISK_CRITICAL_FREE_GIB,
+            );
+            let r_memory_warn = resolve_val(
+                None,
+                file_cfg.memory_warn_available_pct,
+                resource_health::DEFAULT_MEMORY_WARN_AVAILABLE_PCT,
+            );
+            let r_memory_critical = resolve_val(
+                None,
+                file_cfg.memory_critical_available_pct,
+                resource_health::DEFAULT_MEMORY_CRITICAL_AVAILABLE_PCT,
+            );
             // Defaults preserve the mandatory R2 gate.  Sampling is opt-in by
             // lowering p (and optionally setting a coverage floor).
             let r_r2_enabled = file_cfg.r2_enabled.unwrap_or(true);
@@ -1477,6 +1560,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 master_ci_gate: &r_master_ci_gate,
                 master_ci_timeout_secs: &r_master_ci_timeout,
                 doctor_enabled: &r_doctor_enabled,
+                resource_poll_secs: &r_resource_poll,
+                disk_warn_free_gib: &r_disk_warn,
+                disk_critical_free_gib: &r_disk_critical,
+                memory_warn_available_pct: &r_memory_warn,
+                memory_critical_available_pct: &r_memory_critical,
             });
             eprintln!(
                 "quorum serve: {}",
@@ -1557,6 +1645,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 master_ci_timeout_secs: r_master_ci_timeout.value,
                 allowed_tools: r_allowed_tools.value.map(|s| s.to_string()),
                 doctor_enabled: r_doctor_enabled.value,
+                resource_monitor,
                 r2_enabled: r_r2_enabled,
                 r2_target_per_stratum: r_r2_target_per_stratum,
                 r2_steady_state_p: r_r2_steady_state_p,
@@ -2150,9 +2239,48 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_ttl, resolve_repo_override, tail_output_for_line, validate_external_poll_interval,
-        wait_child_stdout,
+        assemble_status_snapshot, parse_ttl, resolve_repo_override, tail_output_for_line,
+        validate_external_poll_interval, wait_child_stdout,
     };
+
+    #[test]
+    fn status_read_scope_drops_before_resource_sampling() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct ReadScope(Rc<RefCell<Vec<&'static str>>>);
+        impl Drop for ReadScope {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("read scope dropped");
+            }
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let read_events = Rc::clone(&events);
+        let sample_events = Rc::clone(&events);
+        let snapshot = assemble_status_snapshot(
+            move || {
+                let _scope = ReadScope(Rc::clone(&read_events));
+                read_events.borrow_mut().push("read");
+                Ok(quorum_core::stats::Stats::default())
+            },
+            move || {
+                sample_events.borrow_mut().push("sample");
+                quorum_core::stats::HostResourcesView {
+                    sampled_at: 1,
+                    complete: true,
+                    severity: quorum_core::stats::ResourceSeverity::Normal,
+                    memory: None,
+                    disks: Vec::new(),
+                    errors: Vec::new(),
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(snapshot.resources.is_some());
+        assert_eq!(*events.borrow(), ["read", "read scope dropped", "sample"]);
+    }
 
     #[test]
     fn planner_tail_accepts_only_sanitized_records_in_rendered_and_raw_modes() {

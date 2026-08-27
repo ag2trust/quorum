@@ -3357,6 +3357,9 @@ pub struct ServeConfig {
     /// When true, the daemon spawns a one-shot doctor agent for tasks stalled
     /// with no active worker/reviewer. Default: false.
     pub doctor_enabled: bool,
+    /// Observational host memory/disk polling. It never throttles workers or
+    /// changes lifecycle state.
+    pub resource_monitor: crate::resource_health::ResourceMonitorConfig,
     /// Enable deterministic R2 sampling. False retains the mandatory R2 gate.
     pub r2_enabled: bool,
     /// Guaranteed R2 coverage per stratum before steady-state sampling.
@@ -8980,6 +8983,9 @@ async fn tick_loop(
 
     log(&format!("serving (cap={})", config.cap));
 
+    let mut resource_transitions = crate::resource_health::ResourceTransitionMonitor::default();
+    let mut last_resource_poll: Option<std::time::Instant> = None;
+
     // Standalone heartbeat task — refreshes the daemon lock every 10s,
     // independent of tick() duration. Detects lock theft (0-row refresh)
     // and signals the main loop to exit immediately.
@@ -9119,6 +9125,46 @@ async fn tick_loop(
                     name_pool.release(&agent_name);
                 }
                 return Ok(1);
+            }
+        }
+
+        // Host telemetry is observational and intentionally sampled outside
+        // every SQLite transaction. The bounded blocking task keeps platform
+        // filesystem/VM syscalls off the async executor. It never changes
+        // provisioning, shutdown, or lifecycle decisions.
+        let resource_poll_due = last_resource_poll
+            .is_none_or(|last| last.elapsed().as_secs() >= config.resource_monitor.poll_secs);
+        if resource_poll_due {
+            last_resource_poll = Some(std::time::Instant::now());
+            let sampled_at = now_unix();
+            let monitor_config = config.resource_monitor;
+            let targets = vec![
+                crate::resource_health::DiskTarget {
+                    label: "database",
+                    path: config.db_path.clone(),
+                },
+                crate::resource_health::DiskTarget {
+                    label: "worktrees",
+                    path: config.worktree_base.clone(),
+                },
+            ];
+            let resources = match tokio::task::spawn_blocking(move || {
+                crate::resource_health::sample_system(sampled_at, &targets, monitor_config)
+            })
+            .await
+            {
+                Ok(resources) => resources,
+                Err(error) => quorum_core::stats::HostResourcesView {
+                    sampled_at,
+                    complete: false,
+                    severity: quorum_core::stats::ResourceSeverity::Normal,
+                    memory: None,
+                    disks: Vec::new(),
+                    errors: vec![format!("sampler join: {error}")],
+                },
+            };
+            for line in resource_transitions.observe(&resources, std::time::Instant::now()) {
+                log(&line);
             }
         }
 
@@ -21772,6 +21818,7 @@ mod tests {
             master_ci_timeout_secs: 1,
             allowed_tools: None,
             doctor_enabled: false,
+            resource_monitor: crate::resource_health::ResourceMonitorConfig::default(),
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
@@ -26053,6 +26100,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             master_ci_timeout_secs: 1,
             allowed_tools: None,
             doctor_enabled: false,
+            resource_monitor: crate::resource_health::ResourceMonitorConfig::default(),
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
