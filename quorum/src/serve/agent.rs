@@ -34,6 +34,7 @@ pub fn new_session_id() -> String {
 
 pub struct AgentProc {
     child: Child,
+    process_group_id: libc::pid_t,
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
     line_buffer: Vec<u8>,
@@ -480,6 +481,12 @@ impl AgentProc {
         }
 
         let mut child = cmd.spawn()?;
+        // `Child::id()` becomes `None` after `try_wait()` observes leader
+        // exit, but descendants may still hold the process group's pipes.
+        // Persist the group ID before any caller can reap the leader.
+        let process_group_id = child.id().ok_or_else(|| {
+            std::io::Error::other("spawned Claude process has no process-group ID")
+        })? as libc::pid_t;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout);
@@ -492,6 +499,7 @@ impl AgentProc {
 
         Ok(Self {
             child,
+            process_group_id,
             stdin,
             reader,
             line_buffer: Vec::new(),
@@ -566,6 +574,12 @@ impl AgentProc {
             return feed_error;
         };
 
+        // The leader was reaped by `try_wait`, so `child.id()` is now None.
+        // The spawn-time group ID still reaches any launcher or MCP
+        // descendant holding the pipes open.
+        unsafe {
+            libc::killpg(self.process_group_id, libc::SIGKILL);
+        }
         let stderr_complete = self.finish_stderr_until(deadline).await;
         let stderr_tail = first_turn_stderr_tail(self.drain_diagnostics());
         let disposition = self
@@ -685,10 +699,12 @@ impl AgentProc {
         stdin: tokio::process::ChildStdin,
         reader: BufReader<tokio::process::ChildStdout>,
     ) -> Self {
+        let process_group_id = child.id().map_or(0, |id| id as libc::pid_t);
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Claude);
         let failures = diagnostics.failures();
         Self {
             child,
+            process_group_id,
             stdin,
             reader,
             line_buffer: Vec::new(),
@@ -699,9 +715,12 @@ impl AgentProc {
     }
 
     pub async fn kill_and_reap(mut self) -> Vec<CapturedOutput> {
-        if let Some(pid) = self.child.id() {
+        // Always target the spawn-time process group, even when `try_wait`
+        // already observed and reaped the leader. Descendants can otherwise
+        // retain stdout/stderr and make the drains below wait forever.
+        if self.process_group_id != 0 {
             unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                libc::killpg(self.process_group_id, libc::SIGKILL);
             }
         }
         // Reap the child to avoid zombie accumulation
@@ -953,6 +972,7 @@ mod tests {
             });
         }
         let mut child = command.spawn().unwrap();
+        let process_group_id = child.id().unwrap() as libc::pid_t;
         let stdin = child.stdin.take().unwrap();
         let reader = BufReader::new(child.stdout.take().unwrap());
         let stderr = BufReader::new(child.stderr.take().unwrap());
@@ -963,6 +983,7 @@ mod tests {
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
         AgentProc {
             child,
+            process_group_id,
             stdin,
             reader,
             line_buffer: Vec::new(),
@@ -1664,6 +1685,61 @@ while IFS= read -r _line; do :; done
                 "attempt {attempt}: {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn first_turn_exit_kills_descendant_group_after_leader_is_reaped() {
+        let mut proc = shell_proc("trap '' HUP; (trap '' HUP; exec sleep 30) & exit 2").await;
+        let process_group_id = proc.process_group_id;
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = proc.try_wait().unwrap() {
+                    return status;
+                }
+                tokio::time::sleep(FIRST_TURN_EXIT_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("fixture leader did not exit");
+        assert_eq!(status.code(), Some(2));
+        assert!(
+            proc.child.id().is_none(),
+            "test must exercise diagnosis after try_wait loses the leader ID"
+        );
+        assert_eq!(
+            unsafe { libc::killpg(process_group_id, 0) },
+            0,
+            "fixture descendant must still hold the process group"
+        );
+
+        let feed_error = proc
+            .feed_turn(&user_turn("first turn after CLI exit"))
+            .await
+            .expect_err("fixture accepted a turn after its leader exited");
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            proc.diagnose_first_turn_feed_failure(feed_error, None),
+        )
+        .await
+        .expect("post-exit diagnosis hung on a descendant-held pipe");
+        assert!(error
+            .to_string()
+            .contains("exited before accepting its first turn"));
+
+        let group_gone = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while unsafe { libc::killpg(process_group_id, 0) } == 0 {
+                tokio::time::sleep(FIRST_TURN_EXIT_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !group_gone {
+            unsafe {
+                libc::killpg(process_group_id, libc::SIGKILL);
+            }
+        }
+        assert!(group_gone, "Claude descendant process group was not reaped");
     }
 
     /// #206: reviewers are instructed to invoke the pinned `pr-review` skill;
