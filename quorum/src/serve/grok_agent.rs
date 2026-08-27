@@ -11,7 +11,9 @@ use super::runner::{
     FailureTracker, LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
     WorkerTurnRequest,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{symlink, OpenOptionsExt};
@@ -47,6 +49,165 @@ const AUTH_LOCK_FILE: &str = "auth.json.lock";
 const MANAGED_CONFIG_FILES: &[&str] = &["config.toml", "managed_config.toml", "requirements.toml"];
 const SYSTEM_GROK_CONFIG_DIR: &str = "/etc/grok";
 const SYSTEM_MANAGED_CONFIG_FILES: &[&str] = &["managed_config.toml", "requirements.toml"];
+
+/// Compact repeated `tool_call_update` output snapshots before they reach the
+/// session log. Grok reports the complete command output on every poll, so
+/// retaining those records verbatim makes log growth quadratic in command
+/// runtime. The retained records are still valid Grok JSON, with the output
+/// fields marked as incremental by `quorum_output_delta`.
+#[derive(Default)]
+pub(super) struct StreamLogCoalescer {
+    tool_calls: HashMap<String, ToolCallOutputState>,
+}
+
+#[derive(Default)]
+struct ToolCallOutputState {
+    content_text: Vec<OutputPrefix>,
+    raw_output: OutputPrefix,
+    output_for_prompt: OutputPrefix,
+}
+
+#[derive(Default)]
+struct OutputPrefix {
+    previous: Option<PrefixHash>,
+}
+
+#[derive(Clone, Copy)]
+struct PrefixHash {
+    len: usize,
+    hash: u64,
+}
+
+impl OutputPrefix {
+    fn byte_delta_start(&mut self, bytes: &[u8]) -> usize {
+        let offset = self
+            .previous
+            .filter(|previous| {
+                previous.len <= bytes.len() && hash_bytes(&bytes[..previous.len]) == previous.hash
+            })
+            .map_or(0, |previous| previous.len);
+        self.previous = Some(PrefixHash {
+            len: bytes.len(),
+            hash: hash_bytes(bytes),
+        });
+        offset
+    }
+
+    fn value_delta_start(&mut self, values: &[serde_json::Value]) -> usize {
+        let offset = self
+            .previous
+            .filter(|previous| {
+                previous.len <= values.len()
+                    && hash_values(&values[..previous.len]) == previous.hash
+            })
+            .map_or(0, |previous| previous.len);
+        self.previous = Some(PrefixHash {
+            len: values.len(),
+            hash: hash_values(values),
+        });
+        offset
+    }
+}
+
+impl StreamLogCoalescer {
+    /// Return a durable log record for one Grok protocol line. Only
+    /// in-progress updates are compacted; completed tool results remain raw
+    /// evidence and terminal/lifecycle records are never changed.
+    pub(super) fn compact(&mut self, raw: &str) -> String {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return raw.to_string();
+        };
+        let Some(tool_call_id) = value
+            .get("toolCallId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+        else {
+            return raw.to_string();
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("tool_call_update") {
+            return raw.to_string();
+        }
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("in_progress") {
+            self.tool_calls.remove(&tool_call_id);
+            return raw.to_string();
+        }
+
+        let state = self.tool_calls.entry(tool_call_id).or_default();
+        let mut changed = false;
+        if let Some(content) = value
+            .get_mut("content")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for (index, item) in content.iter_mut().enumerate() {
+                while state.content_text.len() <= index {
+                    state.content_text.push(OutputPrefix::default());
+                }
+                if let Some(text) = item
+                    .get_mut("content")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .and_then(|content| content.get_mut("text"))
+                {
+                    changed |= compact_text(text, &mut state.content_text[index]);
+                }
+            }
+        }
+        if let Some(raw_output) = value
+            .get_mut("rawOutput")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if let Some(output) = raw_output.get_mut("output") {
+                changed |= compact_value_array(output, &mut state.raw_output);
+            }
+            if let Some(output_for_prompt) = raw_output.get_mut("output_for_prompt") {
+                changed |= compact_text(output_for_prompt, &mut state.output_for_prompt);
+            }
+        }
+        if changed {
+            value["quorum_output_delta"] = serde_json::Value::Bool(true);
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| raw.to_string())
+    }
+}
+
+fn compact_text(value: &mut serde_json::Value, prefix: &mut OutputPrefix) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    let offset = prefix.byte_delta_start(text.as_bytes());
+    let Some(delta) = text.get(offset..) else {
+        return false;
+    };
+    *value = serde_json::Value::String(delta.to_string());
+    true
+}
+
+fn compact_value_array(value: &mut serde_json::Value, prefix: &mut OutputPrefix) -> bool {
+    let Some(values) = value.as_array_mut() else {
+        return false;
+    };
+    let offset = prefix.value_delta_start(values);
+    values.drain(..offset);
+    true
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_values(values: &[serde_json::Value]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for value in values {
+        if let Some(byte) = value.as_u64() {
+            byte.hash(&mut hasher);
+        } else {
+            value.to_string().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
 
 #[cfg(test)]
 struct InjectedStderrReadError;
@@ -581,17 +742,64 @@ fn write_managed_config_layer(
 /// Apply the complete managed-MCP process boundary. Grok starts stdio MCP
 /// servers with its own environment, so removing authority at this process
 /// boundary also removes it from the nested `quorum agent-mcp` child.
-fn configure_managed_mcp_environment(command: &mut Command, home: &GrokMcpConfigHome) {
+fn requested_env<'a>(spec: &'a GrokSpec, key: &str) -> Option<&'a str> {
+    spec.env_vars
+        .iter()
+        .rev()
+        .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+}
+
+fn inherited_env(spec: &GrokSpec, key: &str) -> Option<OsString> {
+    match requested_env(spec, key) {
+        Some(value) => (!value.is_empty()).then(|| OsString::from(value)),
+        None => std::env::var_os(key).filter(|value| !value.is_empty()),
+    }
+}
+
+fn real_home_for_child(spec: &GrokSpec) -> std::io::Result<PathBuf> {
+    inherited_env(spec, "HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf()))
+        .ok_or_else(|| invalid_input("cannot resolve home for managed Grok toolchain"))
+}
+
+fn configure_managed_mcp_environment(
+    command: &mut Command,
+    home: &GrokMcpConfigHome,
+    spec: &GrokSpec,
+) -> std::io::Result<()> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN", "QUORUM_HOME", "GH_CONFIG_DIR"] {
         command.env_remove(name);
     }
+    let real_home = real_home_for_child(spec)?;
+    let rustup_home = inherited_env(spec, "RUSTUP_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| real_home.join(".rustup"));
+    let cargo_home = inherited_env(spec, "CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| real_home.join(".cargo"));
+    let path = std::env::join_paths(
+        std::iter::once(cargo_home.join("bin")).chain(
+            inherited_env(spec, "PATH")
+                .as_deref()
+                .map(std::env::split_paths)
+                .into_iter()
+                .flatten(),
+        ),
+    )
+    .map_err(|error| invalid_input(format!("cannot set managed Grok toolchain PATH: {error}")))?;
     // `HOME` is used by the official compatibility loaders. Point it at the
     // private config home so an operator's ~/.claude.json or ~/.cursor/mcp.json
     // cannot leak a second MCP server into the managed run.
+    // Rustup still reads its selected toolchain from the operator home, so pin
+    // its homes and cargo's bin directory before remapping `HOME` below.
     command
         .env("GROK_HOME", home.path())
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+        .env("RUSTUP_HOME", rustup_home)
+        .env("CARGO_HOME", cargo_home)
+        .env("PATH", path)
         // These are the provider's documented source gates. The environment
         // precedence makes them immune to settings in copied config layers.
         .env("GROK_CLAUDE_MCPS_ENABLED", "0")
@@ -599,6 +807,7 @@ fn configure_managed_mcp_environment(command: &mut Command, home: &GrokMcpConfig
         // Project .grok/.mcp sources are allowed only after an explicit trust
         // grant. The managed home intentionally carries no trust-store link.
         .env("GROK_FOLDER_TRUST", "1");
+    Ok(())
 }
 
 fn acquire_auth_lock(source_home: &std::path::Path) -> std::io::Result<std::fs::File> {
@@ -674,14 +883,7 @@ fn args_with_managed_sandbox(
 }
 
 fn grok_home_for_child(spec: &GrokSpec) -> std::io::Result<PathBuf> {
-    fn requested<'a>(spec: &'a GrokSpec, key: &str) -> Option<&'a str> {
-        spec.env_vars
-            .iter()
-            .rev()
-            .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
-    }
-
-    let grok_home = match requested(spec, "GROK_HOME") {
+    let grok_home = match requested_env(spec, "GROK_HOME") {
         Some(value) => (!value.is_empty()).then(|| PathBuf::from(value)),
         None => std::env::var_os("GROK_HOME")
             .filter(|value| !value.is_empty())
@@ -690,7 +892,7 @@ fn grok_home_for_child(spec: &GrokSpec) -> std::io::Result<PathBuf> {
     let path = if let Some(path) = grok_home {
         path
     } else {
-        let home = match requested(spec, "HOME") {
+        let home = match requested_env(spec, "HOME") {
             Some(value) => (!value.is_empty()).then(|| PathBuf::from(value)),
             None => std::env::var_os("HOME")
                 .filter(|value| !value.is_empty())
@@ -980,7 +1182,7 @@ impl GrokProc {
         // Its custom workspace profile grants the original Grok state root,
         // preserving durable session/auth writes through the linked entries.
         if let Some(home) = &mcp_config_home {
-            configure_managed_mcp_environment(&mut command, home);
+            configure_managed_mcp_environment(&mut command, home, spec)?;
         }
         command
             .current_dir(&spec.worktree)
@@ -1445,6 +1647,50 @@ mod tests {
             permission_mode: DEFAULT_PERMISSION_MODE.into(),
             max_turns: DEFAULT_MAX_TURNS,
         }
+    }
+
+    #[tokio::test]
+    async fn managed_mcp_toolchain_environment_keeps_cargo_and_rustup_available() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let real_home = std::env::var_os("HOME").expect("test runner must have a home");
+        let real_home_path = PathBuf::from(&real_home);
+        let expected_rustup_home = std::env::var_os("RUSTUP_HOME")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| real_home_path.join(".rustup").into_os_string());
+        let expected_cargo_home = std::env::var_os("CARGO_HOME")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| real_home_path.join(".cargo").into_os_string());
+        let source_grok_home = root.path().join("grok-home");
+        std::fs::create_dir_all(&source_grok_home).unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = vec![
+            ("HOME".into(), real_home.to_string_lossy().into_owned()),
+            ("GROK_HOME".into(), source_grok_home.display().to_string()),
+        ];
+        let managed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "test \"$HOME\" = \"$EXPECTED_MANAGED_HOME\" && \\
+                 test \"$RUSTUP_HOME\" = \"$EXPECTED_RUSTUP_HOME\" && \\
+                 test \"$CARGO_HOME\" = \"$EXPECTED_CARGO_HOME\" && \\
+                 case \":$PATH:\" in *\":$CARGO_HOME/bin:\"*) ;; *) exit 1;; esac && \\
+                 cargo --version && rustup show active-toolchain",
+            ])
+            .envs(spec.env_vars.iter().map(|(key, value)| (key, value)))
+            .env("EXPECTED_MANAGED_HOME", managed.path())
+            .env("EXPECTED_RUSTUP_HOME", expected_rustup_home)
+            .env("EXPECTED_CARGO_HOME", expected_cargo_home);
+        configure_managed_mcp_environment(&mut command, &managed, &spec).unwrap();
+        let output = command.current_dir(&spec.worktree).output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "cargo/rustup failed with managed Grok environment:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
