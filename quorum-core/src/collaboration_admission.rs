@@ -1,14 +1,20 @@
-//! Closed, bounded vocabulary for the canonical GitHub collaboration storage.
+//! Closed, bounded vocabulary and admission for canonical GitHub collaboration
+//! storage.
 //!
 //! This module owns the capability-bound admission and lifecycle of canonical
-//! `github_collaboration_attempts`. GitHub operation admission/execution stays
-//! separate: attempts only establish the durable, exact managed-turn identity
-//! on which those later paths rely.
+//! `github_collaboration_attempts` and admission/reads for the durable
+//! `github_agent_operations` outbox. GitHub operation *execution* stays
+//! separate: attempts establish the durable, exact managed-turn identity, and
+//! `admit_operation` / `read_operation` decide admission and expose bounded
+//! closed status only. Nothing here executes a GitHub call or contacts the
+//! network.
 
-use crate::capabilities::{self, LiveCollaborationContext, LiveCollaborationContextResolution};
+use crate::capabilities::{
+    self, LiveCollaborationContext, LiveCollaborationContextResolution, LiveRunContext,
+};
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use std::fmt;
 use std::str::FromStr;
@@ -21,6 +27,15 @@ pub const MAX_OPERATION_ERROR_BYTES: usize = 2 * 1024;
 pub const MAX_OPERATION_ATTEMPTS: u8 = 8;
 pub const MAX_NONEXPIRED_ATTEMPTS_PER_TASK: i64 = 16;
 pub const MAX_NONEXPIRED_ATTEMPTS_PER_REPOSITORY: i64 = 1_024;
+
+/// Fixed cap on nonexpired GitHub operations created by one run capability.
+pub const MAX_NONEXPIRED_OPERATIONS_PER_RUN: i64 = 64;
+/// Fixed cap on nonexpired GitHub operations per collaboration attempt.
+pub const MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT: i64 = 128;
+/// Fixed cap on nonexpired GitHub operations per task.
+pub const MAX_NONEXPIRED_OPERATIONS_PER_TASK: i64 = 512;
+/// Fixed cap on nonexpired GitHub operations in the repository database.
+pub const MAX_NONEXPIRED_OPERATIONS_PER_REPOSITORY: i64 = 4_096;
 
 macro_rules! bounded_text {
     ($name:ident, $label:literal, $max:expr) => {
@@ -182,7 +197,7 @@ pub enum CollaborationAdmissionField {
     Expiry,
 }
 
-/// Closed error outcomes for future atomic attempt/operation admission.
+/// Closed error outcomes for atomic attempt/operation admission and reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum CollaborationAdmissionError {
@@ -198,6 +213,14 @@ pub enum CollaborationAdmissionError {
     ContinuationMismatch,
     OperationAlreadyExists,
     OperationLimitReached,
+    OperationIdentityMismatch,
+    OperationBindingMismatch,
+    RunOperationLimitReached,
+    AttemptOperationLimitReached,
+    TaskOperationLimitReached,
+    RepositoryOperationLimitReached,
+    OperationDeadlineInvalid,
+    OperationNotFound,
 }
 
 /// JSON text valid for a closed `github_agent_operations` request. The value is
@@ -586,10 +609,20 @@ pub enum CollaborationAttemptTransitionResult {
 
 /// Closed idempotent outcomes for operation admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum GithubOperationAdmissionResult {
     Enqueued(GithubOperationStatus),
     Existing(GithubOperationStatus),
+    Rejected(CollaborationAdmissionError),
+}
+
+/// Closed outcomes for an authorized operation read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GithubOperationReadResult {
+    Found(GithubOperationStatus),
+    NotFound,
+    Rejected(CollaborationAdmissionError),
 }
 
 /// One closed result envelope for either collaboration admission operation.
@@ -1118,6 +1151,596 @@ pub fn revoke_attempt(
     now: i64,
 ) -> Result<CollaborationAttemptTransitionResult> {
     transition_active_attempt(conn, request, CollaborationAttemptState::Revoked, now)
+}
+
+/// FNV-1a 128-bit hash. Not cryptographic; the derived identity is scoped by
+/// the attempt owner so pre-image resistance is not a requirement, only
+/// deterministic collision-free identity across identical retries.
+fn fnv1a_128(chunks: &[&[u8]]) -> u128 {
+    let mut hash: u128 = 0x6c62272e_07bb0142_62b82175_6295c58d;
+    const PRIME: u128 = 0x00000000_01000000_00000000_0000013b;
+    for chunk in chunks {
+        for &byte in chunk.iter() {
+            hash ^= u128::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    hash
+}
+
+/// Deterministically derive an operation id from the immutable identity fields
+/// an admission request cannot mutate: the collaboration attempt and the
+/// caller-scoped client request id. A repeated identical enqueue therefore
+/// collides on the same `operation_id` and is deduplicated by the unique index
+/// on `(attempt_id, client_request_id)`.
+pub fn derive_operation_id(
+    attempt_id: &CollaborationAttemptId,
+    client_request_id: &ClientRequestId,
+) -> GithubOperationId {
+    let digest = fnv1a_128(&[
+        b"quorum-op\x00",
+        attempt_id.as_str().as_bytes(),
+        b"\x00",
+        client_request_id.as_str().as_bytes(),
+    ]);
+    GithubOperationId::new(format!("op-{digest:032x}"))
+        .expect("derived operation id is bounded ASCII")
+}
+
+/// Deterministically derive the hidden GitHub marker attached to a mutation
+/// body. Reads do not carry a marker; the closed operation vocabulary makes
+/// the presence/absence coupling to `kind` an authoritative validation.
+pub fn derive_github_marker(
+    attempt_id: &CollaborationAttemptId,
+    client_request_id: &ClientRequestId,
+    kind: GithubOperationKind,
+) -> Option<GithubMarker> {
+    match kind {
+        GithubOperationKind::PullRequestRead => None,
+        GithubOperationKind::AddIssueComment
+        | GithubOperationKind::PullRequestReviewWrite
+        | GithubOperationKind::AddCommentToPendingReview
+        | GithubOperationKind::AddReplyToPullRequestComment
+        | GithubOperationKind::ResolveReviewThread => {
+            let digest = fnv1a_128(&[
+                b"quorum-marker\x00",
+                kind.as_str().as_bytes(),
+                b"\x00",
+                attempt_id.as_str().as_bytes(),
+                b"\x00",
+                client_request_id.as_str().as_bytes(),
+            ]);
+            Some(
+                GithubMarker::new(format!("<!-- quorum-op:{digest:032x} -->"))
+                    .expect("derived marker is bounded ASCII"),
+            )
+        }
+    }
+}
+
+/// The subset of a collaboration attempt loaded during operation admission.
+/// Kept separate from the top-level `StoredAttempt` used by attempt lifecycle
+/// so operation admission only reads what it needs.
+#[derive(Debug, Clone)]
+struct AttemptBinding {
+    task_id: i64,
+    agent: String,
+    role: CollaborationRole,
+    pr_number: i64,
+    head_sha: Option<String>,
+    active_run_id: Option<String>,
+    state: CollaborationAttemptState,
+    expires_at: i64,
+}
+
+fn load_attempt_binding(
+    conn: &Connection,
+    attempt_id: &CollaborationAttemptId,
+) -> Result<Option<AttemptBinding>> {
+    conn.query_row(
+        "SELECT task_id, agent, role, pr_number, head_sha, active_run_id, state, expires_at
+         FROM github_collaboration_attempts WHERE attempt_id=?1",
+        [attempt_id.as_str()],
+        |row| {
+            let role_raw: String = row.get(2)?;
+            let state_raw: String = row.get(6)?;
+            let role = role_raw.parse().map_err(|_| {
+                rusqlite::Error::InvalidColumnType(2, "role".into(), rusqlite::types::Type::Text)
+            })?;
+            let state = state_raw.parse().map_err(|_| {
+                rusqlite::Error::InvalidColumnType(6, "state".into(), rusqlite::types::Type::Text)
+            })?;
+            Ok(AttemptBinding {
+                task_id: row.get(0)?,
+                agent: row.get(1)?,
+                role,
+                pr_number: row.get(3)?,
+                head_sha: row.get(4)?,
+                active_run_id: row.get(5)?,
+                state,
+                expires_at: row.get(7)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn row_to_operation_status(
+    operation_id: GithubOperationId,
+    state_raw: String,
+    send_state_raw: String,
+    remote_object_id: Option<String>,
+    response_json: Option<String>,
+    error_summary: Option<String>,
+) -> Result<GithubOperationStatus> {
+    let state = state_raw.parse::<GithubOperationState>()?;
+    let send_state = send_state_raw.parse::<GithubSendState>()?;
+    let remote_object_id = remote_object_id.map(RemoteObjectId::new).transpose()?;
+    let response_json = response_json
+        .as_deref()
+        .map(GithubOperationResponseJson::new)
+        .transpose()?;
+    let error_summary = error_summary.map(OperationErrorSummary::new).transpose()?;
+    Ok(GithubOperationStatus {
+        operation_id,
+        state,
+        send_state,
+        remote_object_id,
+        response_json,
+        error_summary,
+    })
+}
+
+struct StoredOperationRow {
+    operation_id: String,
+    state: String,
+    send_state: String,
+    remote_object_id: Option<String>,
+    response_json: Option<String>,
+    error_summary: Option<String>,
+}
+
+fn load_operation_by_dedup_key(
+    conn: &Connection,
+    attempt_id: &CollaborationAttemptId,
+    client_request_id: &ClientRequestId,
+) -> Result<Option<GithubOperationStatus>> {
+    let raw: Option<StoredOperationRow> = conn
+        .query_row(
+            "SELECT operation_id, state, send_state, remote_object_id, response_json, error_summary
+             FROM github_agent_operations
+             WHERE attempt_id=?1 AND client_request_id=?2",
+            params![attempt_id.as_str(), client_request_id.as_str()],
+            |row| {
+                Ok(StoredOperationRow {
+                    operation_id: row.get(0)?,
+                    state: row.get(1)?,
+                    send_state: row.get(2)?,
+                    remote_object_id: row.get(3)?,
+                    response_json: row.get(4)?,
+                    error_summary: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let operation_id = GithubOperationId::new(raw.operation_id)?;
+    Ok(Some(row_to_operation_status(
+        operation_id,
+        raw.state,
+        raw.send_state,
+        raw.remote_object_id,
+        raw.response_json,
+        raw.error_summary,
+    )?))
+}
+
+/// Delete every attempt group whose parent is terminal, unpinned, and past its
+/// shared retention. Operations are only ever deleted as part of their parent
+/// attempt: this preserves the "sweeper never deletes an operation
+/// independently" contract. The transaction guards ensure a live parent, an
+/// unresolved child, or a pending publication slot pins the group.
+fn sweep_expired_terminal_groups(tx: &Transaction<'_>, now: i64) -> Result<()> {
+    let attempt_ids: Vec<String> = {
+        let mut statement = tx.prepare(
+            "SELECT a.attempt_id FROM github_collaboration_attempts a
+             WHERE a.state IN ('completed','revoked')
+               AND a.expires_at <= ?1
+               AND a.active_run_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM github_review_publication_slots s
+                   WHERE s.attempt_id = a.attempt_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM github_agent_operations o
+                   WHERE o.attempt_id = a.attempt_id
+                     AND o.state NOT IN ('succeeded','failed','cancelled')
+               )",
+        )?;
+        let rows = statement
+            .query_map([now], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for attempt_id in attempt_ids {
+        tx.execute(
+            "DELETE FROM github_agent_operations WHERE attempt_id=?1",
+            [&attempt_id],
+        )?;
+        tx.execute(
+            "DELETE FROM github_collaboration_attempts WHERE attempt_id=?1",
+            [&attempt_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn operation_capacity_rejection(
+    tx: &Transaction<'_>,
+    request: &EnqueueGithubOperationRequest,
+    now: i64,
+) -> Result<Option<CollaborationAdmissionError>> {
+    let per_run: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM github_agent_operations
+         WHERE created_by_run_id=?1 AND expires_at>?2",
+        params![request.created_by_run_id().as_str(), now],
+        |row| row.get(0),
+    )?;
+    if per_run >= MAX_NONEXPIRED_OPERATIONS_PER_RUN {
+        return Ok(Some(CollaborationAdmissionError::RunOperationLimitReached));
+    }
+    let per_attempt: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM github_agent_operations
+         WHERE attempt_id=?1 AND expires_at>?2",
+        params![request.attempt_id().as_str(), now],
+        |row| row.get(0),
+    )?;
+    if per_attempt >= MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT {
+        return Ok(Some(
+            CollaborationAdmissionError::AttemptOperationLimitReached,
+        ));
+    }
+    let per_task: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM github_agent_operations
+         WHERE task_id=?1 AND expires_at>?2",
+        params![request.task_id(), now],
+        |row| row.get(0),
+    )?;
+    if per_task >= MAX_NONEXPIRED_OPERATIONS_PER_TASK {
+        return Ok(Some(CollaborationAdmissionError::TaskOperationLimitReached));
+    }
+    let per_repo: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM github_agent_operations WHERE expires_at>?1",
+        [now],
+        |row| row.get(0),
+    )?;
+    if per_repo >= MAX_NONEXPIRED_OPERATIONS_PER_REPOSITORY {
+        return Ok(Some(
+            CollaborationAdmissionError::RepositoryOperationLimitReached,
+        ));
+    }
+    Ok(None)
+}
+
+fn attempt_binding_matches_request(
+    attempt: &AttemptBinding,
+    request: &EnqueueGithubOperationRequest,
+) -> bool {
+    attempt.task_id == request.task_id()
+        && attempt.agent == request.agent().as_str()
+        && attempt.role == request.role()
+        && attempt.pr_number == request.pr_number()
+        && attempt.head_sha.as_deref() == request.reviewer_head_sha().map(ReviewerHeadSha::as_str)
+}
+
+fn live_context_matches_request(
+    context: &LiveRunContext,
+    request: &EnqueueGithubOperationRequest,
+) -> bool {
+    context.task_id == request.task_id()
+        && context.agent == request.agent().as_str()
+        && context.role == request.role().as_str()
+        && context.pr == Some(request.pr_number())
+        && context.review_revision.as_deref()
+            == request.reviewer_head_sha().map(ReviewerHeadSha::as_str)
+}
+
+fn insert_operation(
+    tx: &Transaction<'_>,
+    request: &EnqueueGithubOperationRequest,
+    now: i64,
+) -> Result<GithubOperationStatus> {
+    tx.execute(
+        "INSERT INTO github_agent_operations(
+             operation_id, client_request_id, attempt_id, created_by_run_id,
+             task_id, agent, role, pr_number, head_sha, kind, request_json,
+             state, send_state, attempts, deadline_at, github_marker,
+             created_at, updated_at, expires_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'queued','not_started',
+                   0,?12,?13,?14,?14,?15)",
+        params![
+            request.operation_id().as_str(),
+            request.client_request_id().as_str(),
+            request.attempt_id().as_str(),
+            request.created_by_run_id().as_str(),
+            request.task_id(),
+            request.agent().as_str(),
+            request.role().as_str(),
+            request.pr_number(),
+            request.reviewer_head_sha().map(ReviewerHeadSha::as_str),
+            request.kind().as_str(),
+            request.request_json().as_str(),
+            request.deadline_at(),
+            request.github_marker().map(GithubMarker::as_str),
+            now,
+            request.expires_at(),
+        ],
+    )?;
+    Ok(GithubOperationStatus {
+        operation_id: request.operation_id().clone(),
+        state: GithubOperationState::Queued,
+        send_state: GithubSendState::NotStarted,
+        remote_object_id: None,
+        response_json: None,
+        error_summary: None,
+    })
+}
+
+/// Admit one GitHub operation into the durable outbox. Every check and the
+/// insert run inside a single `BEGIN IMMEDIATE` transaction, so admission
+/// serializes on the database write lock. Nothing here executes a GitHub call
+/// or contacts the network; the row is stored `queued/not_started` for a
+/// separate executor to claim later.
+///
+/// The admission steps, in order:
+///  1. Reject the caller if `caller_run_id` does not match the request's
+///     immutable `created_by_run_id`.
+///  2. Recompute `operation_id` and (for mutations) the hidden GitHub marker
+///     from the immutable attempt/client-request identity and reject any
+///     drifted request.
+///  3. Sweep every eligible expired terminal attempt group so its rows do not
+///     wrongly consume capacity or shadow a fresh admission.
+///  4. Revalidate the caller's live capability against the current task phase
+///     via `capabilities::resolve_live_run_context` and reject any binding
+///     mismatch.
+///  5. Load the collaboration attempt row and reject if it is missing,
+///     expired, not `active`, or not bound to the caller's capability with
+///     the request's immutable target.
+///  6. Return the existing row if one already matches the deterministic
+///     `(attempt_id, client_request_id)` identity: identical retries are
+///     idempotent by design.
+///  7. Enforce per-run, per-attempt, per-task and per-repository nonexpired
+///     operation caps and reject with a typed capacity outcome if any fires.
+///  8. Insert the durable row.
+pub fn admit_operation(
+    conn: &mut Connection,
+    caller_run_id: &str,
+    request: &EnqueueGithubOperationRequest,
+    now: i64,
+) -> Result<GithubOperationAdmissionResult> {
+    if now < 0 {
+        return Err(QuorumError::Usage(
+            "collaboration admission timestamp is invalid".into(),
+        ));
+    }
+    if caller_run_id.is_empty()
+        || caller_run_id.contains('\0')
+        || caller_run_id.len() > MAX_COLLABORATION_ID_BYTES
+    {
+        return Err(QuorumError::Usage(
+            "collaboration admission caller run id is invalid".into(),
+        ));
+    }
+    if caller_run_id != request.created_by_run_id().as_str() {
+        return Ok(GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::CapabilityRejected,
+        ));
+    }
+    if request.expires_at() <= now || request.deadline_at() <= now {
+        return Ok(GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::OperationDeadlineInvalid,
+        ));
+    }
+
+    let expected_operation_id =
+        derive_operation_id(request.attempt_id(), request.client_request_id());
+    if request.operation_id() != &expected_operation_id {
+        return Ok(GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::OperationIdentityMismatch,
+        ));
+    }
+    let expected_marker = derive_github_marker(
+        request.attempt_id(),
+        request.client_request_id(),
+        request.kind(),
+    );
+    if request.github_marker() != expected_marker.as_ref() {
+        return Ok(GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::OperationIdentityMismatch,
+        ));
+    }
+
+    let tx = begin_immediate(conn)?;
+
+    sweep_expired_terminal_groups(&tx, now)?;
+
+    let context =
+        match capabilities::resolve_live_run_context(&tx, caller_run_id, request.role().as_str()) {
+            Ok(context) => context,
+            Err(_) => {
+                tx.commit()?;
+                return Ok(GithubOperationAdmissionResult::Rejected(
+                    CollaborationAdmissionError::CapabilityRejected,
+                ));
+            }
+        };
+    if !live_context_matches_request(&context, request) {
+        tx.commit()?;
+        return Ok(GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::AttemptBindingMismatch,
+        ));
+    }
+
+    let Some(attempt) = load_attempt_binding(&tx, request.attempt_id())? else {
+        tx.commit()?;
+        return Ok(GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::AttemptNotFound,
+        ));
+    };
+    if attempt.expires_at <= now {
+        tx.commit()?;
+        return Ok(GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::AttemptExpired,
+        ));
+    }
+    if attempt.state != CollaborationAttemptState::Active {
+        tx.commit()?;
+        return Ok(GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::AttemptNotActive,
+        ));
+    }
+    if attempt.active_run_id.as_deref() != Some(caller_run_id) {
+        tx.commit()?;
+        return Ok(GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::CapabilityRejected,
+        ));
+    }
+    if !attempt_binding_matches_request(&attempt, request) {
+        tx.commit()?;
+        return Ok(GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::AttemptBindingMismatch,
+        ));
+    }
+
+    if let Some(existing) =
+        load_operation_by_dedup_key(&tx, request.attempt_id(), request.client_request_id())?
+    {
+        // The unique index makes the derived id necessarily equal to the
+        // existing row's id, but re-check defensively: a drifted stored
+        // identity is a storage fault, not an admission outcome.
+        if existing.operation_id.as_str() != expected_operation_id.as_str() {
+            tx.commit()?;
+            return Ok(GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::OperationIdentityMismatch,
+            ));
+        }
+        tx.commit()?;
+        return Ok(GithubOperationAdmissionResult::Existing(existing));
+    }
+
+    if let Some(rejection) = operation_capacity_rejection(&tx, request, now)? {
+        tx.commit()?;
+        return Ok(GithubOperationAdmissionResult::Rejected(rejection));
+    }
+
+    let status = match insert_operation(&tx, request, now) {
+        Ok(status) => status,
+        Err(QuorumError::Db(rusqlite::Error::SqliteFailure(failure, _)))
+            if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            // A race lost the UNIQUE(attempt_id, client_request_id) or
+            // UNIQUE(operation_id) tie. Reload and admit as Existing.
+            if let Some(existing) =
+                load_operation_by_dedup_key(&tx, request.attempt_id(), request.client_request_id())?
+            {
+                tx.commit()?;
+                return Ok(GithubOperationAdmissionResult::Existing(existing));
+            }
+            tx.commit()?;
+            return Ok(GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::OperationAlreadyExists,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    tx.commit()?;
+    Ok(GithubOperationAdmissionResult::Enqueued(status))
+}
+
+/// Read a stored operation only when the caller owns the operation's
+/// collaboration attempt as its current active run. Adoption of an interrupted
+/// attempt rebinds `active_run_id` to the fresh capability, so an adopted
+/// caller passes the same authority gate as the original live caller. This
+/// function returns bounded closed status only and never exposes the hidden
+/// marker, request JSON, or transport credentials.
+pub fn read_operation(
+    conn: &Connection,
+    caller_run_id: &str,
+    attempt_id: &CollaborationAttemptId,
+    operation_id: &GithubOperationId,
+) -> Result<GithubOperationReadResult> {
+    if caller_run_id.is_empty()
+        || caller_run_id.contains('\0')
+        || caller_run_id.len() > MAX_COLLABORATION_ID_BYTES
+    {
+        return Err(QuorumError::Usage(
+            "collaboration operation read caller run id is invalid".into(),
+        ));
+    }
+    struct ReadJoinRow {
+        attempt_id: String,
+        op_state: String,
+        op_send_state: String,
+        remote_object_id: Option<String>,
+        response_json: Option<String>,
+        error_summary: Option<String>,
+        attempt_active_run_id: Option<String>,
+        attempt_state: String,
+    }
+    let raw: Option<ReadJoinRow> = conn
+        .query_row(
+            "SELECT o.attempt_id, o.state, o.send_state,
+                    o.remote_object_id, o.response_json, o.error_summary,
+                    a.active_run_id, a.state
+             FROM github_agent_operations o
+             JOIN github_collaboration_attempts a ON a.attempt_id = o.attempt_id
+             WHERE o.operation_id = ?1",
+            [operation_id.as_str()],
+            |row| {
+                Ok(ReadJoinRow {
+                    attempt_id: row.get(0)?,
+                    op_state: row.get(1)?,
+                    op_send_state: row.get(2)?,
+                    remote_object_id: row.get(3)?,
+                    response_json: row.get(4)?,
+                    error_summary: row.get(5)?,
+                    attempt_active_run_id: row.get(6)?,
+                    attempt_state: row.get(7)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(row) = raw else {
+        return Ok(GithubOperationReadResult::NotFound);
+    };
+    if row.attempt_id != attempt_id.as_str() {
+        return Ok(GithubOperationReadResult::Rejected(
+            CollaborationAdmissionError::OperationBindingMismatch,
+        ));
+    }
+    let attempt_state = row.attempt_state.parse::<CollaborationAttemptState>()?;
+    if attempt_state != CollaborationAttemptState::Active {
+        return Ok(GithubOperationReadResult::Rejected(
+            CollaborationAdmissionError::AttemptNotActive,
+        ));
+    }
+    if row.attempt_active_run_id.as_deref() != Some(caller_run_id) {
+        return Ok(GithubOperationReadResult::Rejected(
+            CollaborationAdmissionError::CapabilityRejected,
+        ));
+    }
+    let status = row_to_operation_status(
+        operation_id.clone(),
+        row.op_state,
+        row.op_send_state,
+        row.remote_object_id,
+        row.response_json,
+        row.error_summary,
+    )?;
+    Ok(GithubOperationReadResult::Found(status))
 }
 
 #[cfg(test)]
@@ -1793,6 +2416,882 @@ mod tests {
                 .unwrap();
             assert_eq!(active, 1, "round {round} must retain one active holder");
             assert_eq!(errors, 0, "round {round} race loss must stay clean");
+        }
+    }
+
+    // ---- Operation admission integration tests ----
+
+    const OP_NOW: i64 = 1_000;
+    const OP_EXPIRES: i64 = 10_000;
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_attempt_row(
+        conn: &Connection,
+        attempt_id: &str,
+        task_id: i64,
+        agent: &str,
+        role: &str,
+        pr: i64,
+        head_sha: Option<&str>,
+        active_run_id: Option<&str>,
+        state: &str,
+        expires_at: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO github_collaboration_attempts(
+                 attempt_id, task_id, agent, role, pr_number, head_sha,
+                 lifecycle_generation, active_run_id, state,
+                 created_at, updated_at, expires_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?8,1,1,?9)",
+            params![
+                attempt_id,
+                task_id,
+                agent,
+                role,
+                pr,
+                head_sha,
+                active_run_id,
+                state,
+                expires_at,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_op_request(
+        attempt_id: &str,
+        client_request_id: &str,
+        run_id: &str,
+        task_id: i64,
+        agent: &str,
+        pr: i64,
+        kind: GithubOperationKind,
+        body: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> EnqueueGithubOperationRequest {
+        let attempt = CollaborationAttemptId::new(attempt_id).unwrap();
+        let client = ClientRequestId::new(client_request_id).unwrap();
+        let op_id = derive_operation_id(&attempt, &client);
+        let marker = derive_github_marker(&attempt, &client, kind);
+        EnqueueGithubOperationRequest::new(
+            op_id,
+            client,
+            attempt,
+            RunCapabilityId::new(run_id).unwrap(),
+            task_id,
+            CollaborationAgent::new(agent).unwrap(),
+            CollaborationRole::Worker,
+            pr,
+            None,
+            kind,
+            GithubOperationRequestJson::new(body).unwrap(),
+            marker,
+            expires_at - 1,
+            now,
+            expires_at,
+        )
+        .unwrap()
+    }
+
+    fn setup_authorized_worker(task_id: i64) -> (tempfile::TempDir, Connection, &'static str) {
+        const RUN: &str = "run-worker-op";
+        let (dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, task_id, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, task_id, "Worker", RUN, OP_NOW);
+        insert_attempt_row(
+            &conn,
+            "attempt-1",
+            task_id,
+            "Worker",
+            "worker",
+            WORKER_PR,
+            None,
+            Some(RUN),
+            "active",
+            OP_EXPIRES,
+        );
+        (dir, conn, RUN)
+    }
+
+    fn count_operations(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM github_agent_operations", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    fn count_errors(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM errors", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn task_status(conn: &Connection, task_id: i64) -> String {
+        conn.query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn operation_admission_caps_are_defined() {
+        assert_eq!(MAX_NONEXPIRED_OPERATIONS_PER_RUN, 64);
+        assert_eq!(MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT, 128);
+        assert_eq!(MAX_NONEXPIRED_OPERATIONS_PER_TASK, 512);
+        assert_eq!(MAX_NONEXPIRED_OPERATIONS_PER_REPOSITORY, 4_096);
+    }
+
+    #[test]
+    fn derived_identity_is_stable_and_scoped() {
+        let attempt = CollaborationAttemptId::new("attempt-A").unwrap();
+        let other_attempt = CollaborationAttemptId::new("attempt-B").unwrap();
+        let request = ClientRequestId::new("req-1").unwrap();
+        let other_request = ClientRequestId::new("req-2").unwrap();
+
+        assert_eq!(
+            derive_operation_id(&attempt, &request),
+            derive_operation_id(&attempt, &request)
+        );
+        assert_ne!(
+            derive_operation_id(&attempt, &request),
+            derive_operation_id(&other_attempt, &request)
+        );
+        assert_ne!(
+            derive_operation_id(&attempt, &request),
+            derive_operation_id(&attempt, &other_request)
+        );
+
+        assert_eq!(
+            derive_github_marker(&attempt, &request, GithubOperationKind::PullRequestRead),
+            None
+        );
+        let marker =
+            derive_github_marker(&attempt, &request, GithubOperationKind::AddIssueComment).unwrap();
+        assert_ne!(
+            Some(marker),
+            derive_github_marker(&attempt, &request, GithubOperationKind::ResolveReviewThread)
+        );
+    }
+
+    #[test]
+    fn admit_operation_enqueues_and_is_idempotent_on_retry() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        let request = build_op_request(
+            "attempt-1",
+            "req-first",
+            run,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::AddIssueComment,
+            r#"{"body":"hi"}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+
+        let first = admit_operation(&mut conn, run, &request, OP_NOW).unwrap();
+        assert!(matches!(first, GithubOperationAdmissionResult::Enqueued(_)));
+        assert_eq!(count_operations(&conn), 1);
+
+        let second = admit_operation(&mut conn, run, &request, OP_NOW + 1).unwrap();
+        match second {
+            GithubOperationAdmissionResult::Existing(existing) => {
+                let GithubOperationAdmissionResult::Enqueued(original) = first else {
+                    panic!("first admission must be enqueued");
+                };
+                assert_eq!(existing.operation_id, original.operation_id);
+            }
+            other => panic!("expected Existing on retry, got {other:?}"),
+        }
+        assert_eq!(count_operations(&conn), 1);
+        assert_eq!(count_errors(&conn), 0);
+        assert_eq!(task_status(&conn, 1), "rework");
+    }
+
+    #[test]
+    fn admit_operation_rejects_when_caller_run_does_not_match_created_by() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        let request = build_op_request(
+            "attempt-1",
+            "req-1",
+            run,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"note":"read"}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+
+        let result = admit_operation(&mut conn, "run-other", &request, OP_NOW).unwrap();
+        assert_eq!(
+            result,
+            GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::CapabilityRejected
+            )
+        );
+        assert_eq!(count_operations(&conn), 0);
+        assert_eq!(count_errors(&conn), 0);
+    }
+
+    #[test]
+    fn admit_operation_rejects_when_identity_is_forged() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        let attempt = CollaborationAttemptId::new("attempt-1").unwrap();
+        let client = ClientRequestId::new("req-1").unwrap();
+        let forged_op = GithubOperationId::new("op-not-derived").unwrap();
+        let request = EnqueueGithubOperationRequest::new(
+            forged_op,
+            client.clone(),
+            attempt.clone(),
+            RunCapabilityId::new(run).unwrap(),
+            1,
+            CollaborationAgent::new("Worker").unwrap(),
+            CollaborationRole::Worker,
+            WORKER_PR,
+            None,
+            GithubOperationKind::AddIssueComment,
+            GithubOperationRequestJson::new(r#"{"body":"x"}"#).unwrap(),
+            derive_github_marker(&attempt, &client, GithubOperationKind::AddIssueComment),
+            OP_EXPIRES - 1,
+            OP_NOW,
+            OP_EXPIRES,
+        )
+        .unwrap();
+
+        let result = admit_operation(&mut conn, run, &request, OP_NOW).unwrap();
+        assert_eq!(
+            result,
+            GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::OperationIdentityMismatch
+            )
+        );
+        assert_eq!(count_operations(&conn), 0);
+    }
+
+    #[test]
+    fn admit_operation_rejects_when_marker_does_not_match_derivation() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        let attempt = CollaborationAttemptId::new("attempt-1").unwrap();
+        let client = ClientRequestId::new("req-1").unwrap();
+        let op_id = derive_operation_id(&attempt, &client);
+        let request = EnqueueGithubOperationRequest::new(
+            op_id,
+            client,
+            attempt,
+            RunCapabilityId::new(run).unwrap(),
+            1,
+            CollaborationAgent::new("Worker").unwrap(),
+            CollaborationRole::Worker,
+            WORKER_PR,
+            None,
+            GithubOperationKind::AddIssueComment,
+            GithubOperationRequestJson::new(r#"{"body":"x"}"#).unwrap(),
+            Some(GithubMarker::new("<!-- forged -->").unwrap()),
+            OP_EXPIRES - 1,
+            OP_NOW,
+            OP_EXPIRES,
+        )
+        .unwrap();
+
+        let result = admit_operation(&mut conn, run, &request, OP_NOW).unwrap();
+        assert_eq!(
+            result,
+            GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::OperationIdentityMismatch
+            )
+        );
+        assert_eq!(count_operations(&conn), 0);
+    }
+
+    #[test]
+    fn admit_operation_rejects_when_attempt_is_absent() {
+        const RUN: &str = "run-worker-op";
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", RUN, OP_NOW);
+        let request = build_op_request(
+            "missing-attempt",
+            "req-1",
+            RUN,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+
+        let result = admit_operation(&mut conn, RUN, &request, OP_NOW).unwrap();
+        assert_eq!(
+            result,
+            GithubOperationAdmissionResult::Rejected(CollaborationAdmissionError::AttemptNotFound)
+        );
+    }
+
+    #[test]
+    fn admit_operation_rejects_when_attempt_is_not_active() {
+        const RUN: &str = "run-worker-op";
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", RUN, OP_NOW);
+        insert_attempt_row(
+            &conn,
+            "attempt-completed",
+            1,
+            "Worker",
+            "worker",
+            WORKER_PR,
+            None,
+            None,
+            "completed",
+            OP_EXPIRES,
+        );
+        let request = build_op_request(
+            "attempt-completed",
+            "req-1",
+            RUN,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+
+        let result = admit_operation(&mut conn, RUN, &request, OP_NOW).unwrap();
+        assert_eq!(
+            result,
+            GithubOperationAdmissionResult::Rejected(CollaborationAdmissionError::AttemptNotActive)
+        );
+        assert_eq!(count_operations(&conn), 0);
+    }
+
+    #[test]
+    fn admit_operation_rejects_when_attempt_binding_differs() {
+        const RUN: &str = "run-worker-op";
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "OtherWorker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "OtherWorker", RUN, OP_NOW);
+        insert_attempt_row(
+            &conn,
+            "attempt-1",
+            1,
+            "OtherWorker",
+            "worker",
+            WORKER_PR,
+            None,
+            Some(RUN),
+            "active",
+            OP_EXPIRES,
+        );
+
+        let request = build_op_request(
+            "attempt-1",
+            "req-1",
+            RUN,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        let result = admit_operation(&mut conn, RUN, &request, OP_NOW).unwrap();
+        assert_eq!(
+            result,
+            GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::AttemptBindingMismatch
+            )
+        );
+    }
+
+    #[test]
+    fn admit_operation_rejects_when_attempt_is_not_owned_by_caller() {
+        const RUN: &str = "run-worker-op";
+        const OTHER_RUN: &str = "run-other-op";
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", RUN, OP_NOW);
+        insert_worker_task(&conn, 2, "Worker", WORKER_PR);
+        crate::capabilities::issue(&mut conn, OTHER_RUN, 2, "Worker", "worker", OP_NOW).unwrap();
+        crate::agent_runs::insert(
+            &conn, 2, "Worker", "worker", "model", "high", "codex", OP_NOW,
+        )
+        .unwrap();
+        insert_attempt_row(
+            &conn,
+            "attempt-1",
+            1,
+            "Worker",
+            "worker",
+            WORKER_PR,
+            None,
+            Some(OTHER_RUN),
+            "active",
+            OP_EXPIRES,
+        );
+        let request = build_op_request(
+            "attempt-1",
+            "req-1",
+            RUN,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        let result = admit_operation(&mut conn, RUN, &request, OP_NOW).unwrap();
+        assert_eq!(
+            result,
+            GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::CapabilityRejected
+            )
+        );
+    }
+
+    #[test]
+    fn admit_operation_rejects_after_per_run_cap() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        for index in 0..MAX_NONEXPIRED_OPERATIONS_PER_RUN {
+            let request = build_op_request(
+                "attempt-1",
+                &format!("req-{index}"),
+                run,
+                1,
+                "Worker",
+                WORKER_PR,
+                GithubOperationKind::PullRequestRead,
+                r#"{"pr":42}"#,
+                OP_NOW,
+                OP_EXPIRES,
+            );
+            let outcome = admit_operation(&mut conn, run, &request, OP_NOW).unwrap();
+            assert!(matches!(
+                outcome,
+                GithubOperationAdmissionResult::Enqueued(_)
+            ));
+        }
+
+        let over_cap = build_op_request(
+            "attempt-1",
+            "req-over-cap",
+            run,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        let result = admit_operation(&mut conn, run, &over_cap, OP_NOW).unwrap();
+        assert_eq!(
+            result,
+            GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::RunOperationLimitReached
+            )
+        );
+        assert_eq!(count_operations(&conn), MAX_NONEXPIRED_OPERATIONS_PER_RUN);
+        assert_eq!(count_errors(&conn), 0);
+        assert_eq!(task_status(&conn, 1), "rework");
+    }
+
+    #[test]
+    fn admit_operation_sweeps_expired_terminal_groups_before_capacity_check() {
+        const RUN: &str = "run-worker-op";
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", RUN, OP_NOW);
+        insert_attempt_row(
+            &conn,
+            "attempt-live",
+            1,
+            "Worker",
+            "worker",
+            WORKER_PR,
+            None,
+            Some(RUN),
+            "active",
+            OP_EXPIRES,
+        );
+
+        insert_attempt_row(
+            &conn,
+            "attempt-expired",
+            1,
+            "Worker",
+            "worker",
+            WORKER_PR,
+            None,
+            None,
+            "completed",
+            OP_NOW - 1,
+        );
+        crate::capabilities::issue(&mut conn, "run-old", 1, "Worker", "worker", 1).unwrap();
+        crate::capabilities::revoke(&mut conn, "run-old", 2).unwrap();
+        conn.execute(
+            "INSERT INTO github_agent_operations(
+                 operation_id, client_request_id, attempt_id, created_by_run_id,
+                 task_id, agent, role, pr_number, kind, request_json,
+                 state, send_state, attempts, deadline_at,
+                 created_at, updated_at, expires_at
+             ) VALUES ('op-stale','req-stale','attempt-expired','run-old',
+                       1,'Worker','worker',?1,'pull_request_read','{}',
+                       'succeeded','confirmed',1,?2,1,1,?3)",
+            params![WORKER_PR, OP_NOW - 1, OP_NOW - 1],
+        )
+        .unwrap();
+        assert_eq!(count_operations(&conn), 1);
+
+        let request = build_op_request(
+            "attempt-live",
+            "req-fresh",
+            RUN,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        let outcome = admit_operation(&mut conn, RUN, &request, OP_NOW).unwrap();
+        assert!(matches!(
+            outcome,
+            GithubOperationAdmissionResult::Enqueued(_)
+        ));
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM github_collaboration_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
+        assert_eq!(count_operations(&conn), 1);
+    }
+
+    #[test]
+    fn admit_operation_does_not_sweep_terminal_group_pinned_by_ambiguous_child() {
+        const RUN: &str = "run-worker-op";
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", RUN, OP_NOW);
+        insert_attempt_row(
+            &conn,
+            "attempt-live",
+            1,
+            "Worker",
+            "worker",
+            WORKER_PR,
+            None,
+            Some(RUN),
+            "active",
+            OP_EXPIRES,
+        );
+
+        insert_attempt_row(
+            &conn,
+            "attempt-pinned",
+            1,
+            "Worker",
+            "worker",
+            WORKER_PR,
+            None,
+            None,
+            "revoked",
+            OP_NOW - 1,
+        );
+        crate::capabilities::issue(&mut conn, "run-old", 1, "Worker", "worker", 1).unwrap();
+        crate::capabilities::revoke(&mut conn, "run-old", 2).unwrap();
+        conn.execute(
+            "INSERT INTO github_agent_operations(
+                 operation_id, client_request_id, attempt_id, created_by_run_id,
+                 task_id, agent, role, pr_number, kind, request_json,
+                 state, send_state, attempts, deadline_at,
+                 created_at, updated_at, expires_at
+             ) VALUES ('op-pinned','req-pinned','attempt-pinned','run-old',
+                       1,'Worker','worker',?1,'add_issue_comment','{}',
+                       'running','ambiguous',1,?2,1,1,?3)",
+            params![WORKER_PR, OP_NOW - 1, OP_NOW - 1],
+        )
+        .unwrap();
+
+        let request = build_op_request(
+            "attempt-live",
+            "req-fresh",
+            RUN,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        let outcome = admit_operation(&mut conn, RUN, &request, OP_NOW).unwrap();
+        assert!(matches!(
+            outcome,
+            GithubOperationAdmissionResult::Enqueued(_)
+        ));
+        let pinned_alive: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM github_collaboration_attempts
+                 WHERE attempt_id='attempt-pinned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pinned_alive, 1);
+        let pinned_op_alive: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM github_agent_operations WHERE operation_id='op-pinned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pinned_op_alive, 1);
+    }
+
+    #[test]
+    fn read_operation_returns_status_only_for_authorized_caller() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        let request = build_op_request(
+            "attempt-1",
+            "req-1",
+            run,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        let GithubOperationAdmissionResult::Enqueued(enqueued) =
+            admit_operation(&mut conn, run, &request, OP_NOW).unwrap()
+        else {
+            panic!("admission must succeed");
+        };
+        let attempt = CollaborationAttemptId::new("attempt-1").unwrap();
+
+        let read = read_operation(&conn, run, &attempt, &enqueued.operation_id).unwrap();
+        match read {
+            GithubOperationReadResult::Found(status) => {
+                assert_eq!(status.operation_id, enqueued.operation_id);
+                assert_eq!(status.state, GithubOperationState::Queued);
+                assert_eq!(status.send_state, GithubSendState::NotStarted);
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+
+        let read = read_operation(&conn, "run-stranger", &attempt, &enqueued.operation_id).unwrap();
+        assert_eq!(
+            read,
+            GithubOperationReadResult::Rejected(CollaborationAdmissionError::CapabilityRejected)
+        );
+
+        let unknown = GithubOperationId::new("op-does-not-exist").unwrap();
+        let read = read_operation(&conn, run, &attempt, &unknown).unwrap();
+        assert_eq!(read, GithubOperationReadResult::NotFound);
+
+        let wrong_attempt = CollaborationAttemptId::new("attempt-other").unwrap();
+        let read = read_operation(&conn, run, &wrong_attempt, &enqueued.operation_id).unwrap();
+        assert_eq!(
+            read,
+            GithubOperationReadResult::Rejected(
+                CollaborationAdmissionError::OperationBindingMismatch
+            )
+        );
+    }
+
+    #[test]
+    fn read_operation_rejects_reads_after_attempt_leaves_active() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        let request = build_op_request(
+            "attempt-1",
+            "req-1",
+            run,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        let GithubOperationAdmissionResult::Enqueued(enqueued) =
+            admit_operation(&mut conn, run, &request, OP_NOW).unwrap()
+        else {
+            panic!("admission must succeed");
+        };
+        conn.execute(
+            "UPDATE github_collaboration_attempts SET state='awaiting_resume',active_run_id=NULL
+             WHERE attempt_id='attempt-1'",
+            [],
+        )
+        .unwrap();
+        let attempt = CollaborationAttemptId::new("attempt-1").unwrap();
+        let read = read_operation(&conn, run, &attempt, &enqueued.operation_id).unwrap();
+        assert_eq!(
+            read,
+            GithubOperationReadResult::Rejected(CollaborationAdmissionError::AttemptNotActive)
+        );
+
+        conn.execute(
+            "UPDATE github_collaboration_attempts
+             SET state='active', active_run_id=?1
+             WHERE attempt_id='attempt-1'",
+            [run],
+        )
+        .unwrap();
+        let read = read_operation(&conn, run, &attempt, &enqueued.operation_id).unwrap();
+        assert!(matches!(read, GithubOperationReadResult::Found(_)));
+    }
+
+    #[test]
+    fn admit_operation_dedup_survives_two_serial_races_on_same_identity() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        let a = build_op_request(
+            "attempt-1",
+            "req-shared",
+            run,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        let first = admit_operation(&mut conn, run, &a, OP_NOW).unwrap();
+        let second = admit_operation(&mut conn, run, &a, OP_NOW + 1).unwrap();
+        assert_eq!(count_operations(&conn), 1);
+        match (first, second) {
+            (
+                GithubOperationAdmissionResult::Enqueued(one),
+                GithubOperationAdmissionResult::Existing(two),
+            ) => assert_eq!(one.operation_id, two.operation_id),
+            other => panic!("expected Enqueued then Existing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_process_operation_enqueue_race_produces_one_row_and_clean_losers() {
+        const CHILD_DB: &str = "QUORUM_OP_ADMISSION_RACE_DB";
+        const CHILD_ROUND: &str = "QUORUM_OP_ADMISSION_RACE_ROUND";
+
+        if let (Ok(path), Ok(round)) = (std::env::var(CHILD_DB), std::env::var(CHILD_ROUND)) {
+            let mut conn = crate::db::open(std::path::Path::new(&path)).unwrap();
+            let request = build_op_request(
+                "attempt-1",
+                &format!("req-race-{round}"),
+                "run-worker-op",
+                1,
+                "Worker",
+                WORKER_PR,
+                GithubOperationKind::PullRequestRead,
+                r#"{"pr":42}"#,
+                OP_NOW,
+                OP_EXPIRES,
+            );
+            let outcome = admit_operation(&mut conn, "run-worker-op", &request, OP_NOW).unwrap();
+            let tag = match outcome {
+                GithubOperationAdmissionResult::Enqueued(_) => "ENQUEUED",
+                GithubOperationAdmissionResult::Existing(_) => "EXISTING",
+                GithubOperationAdmissionResult::Rejected(_) => "REJECTED",
+            };
+            println!("child-outcome:{tag}");
+            return;
+        }
+
+        for round in 0..3 {
+            let (dir, _conn, _run) = setup_authorized_worker(1);
+            let db_path = dir.path().join("q.db");
+
+            let test_name =
+                "collaboration_admission::tests::real_process_operation_enqueue_race_produces_one_row_and_clean_losers";
+            let mut children = Vec::new();
+            for _ in 0..3 {
+                children.push(
+                    Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", test_name, "--nocapture"])
+                        .env(CHILD_DB, &db_path)
+                        .env(CHILD_ROUND, round.to_string())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .unwrap(),
+                );
+            }
+            let outputs: Vec<_> = children
+                .into_iter()
+                .map(|child| child.wait_with_output().unwrap())
+                .collect();
+            for output in &outputs {
+                assert!(
+                    output.status.success(),
+                    "child failed in round {round}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let enqueued = outputs
+                .iter()
+                .filter(|out| {
+                    String::from_utf8_lossy(&out.stdout).contains("child-outcome:ENQUEUED")
+                })
+                .count();
+            let existing = outputs
+                .iter()
+                .filter(|out| {
+                    String::from_utf8_lossy(&out.stdout).contains("child-outcome:EXISTING")
+                })
+                .count();
+            let rejected = outputs
+                .iter()
+                .filter(|out| {
+                    String::from_utf8_lossy(&out.stdout).contains("child-outcome:REJECTED")
+                })
+                .count();
+            assert_eq!(enqueued, 1, "round {round} must have exactly one enqueuer");
+            assert_eq!(
+                existing,
+                outputs.len() - 1,
+                "round {round} losers must be Existing"
+            );
+            assert_eq!(
+                rejected, 0,
+                "round {round} race loss must never be a rejection"
+            );
+
+            let conn = crate::db::open(&db_path).unwrap();
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM github_agent_operations
+                     WHERE attempt_id='attempt-1' AND client_request_id=?1",
+                    [format!("req-race-{round}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 1, "round {round} must retain one operation row");
+            let errors: i64 = conn
+                .query_row("SELECT COUNT(*) FROM errors", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(errors, 0, "round {round} race loss must stay clean");
+            let status: String = conn
+                .query_row("SELECT status FROM tasks WHERE id=1", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                status, "rework",
+                "round {round} task lifecycle must not move"
+            );
         }
     }
 }
