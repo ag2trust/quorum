@@ -64,6 +64,27 @@ pub const CI_REMEDIATION_CHECKS_REF: &str = "ci_remediation_checks";
 pub const CI_REMEDIATION_ATTEMPTS_REF: &str = "ci_remediation_attempts";
 pub const COMPLETION_PROVENANCE_MERGED: &str = "merged";
 pub const COMPLETION_PROVENANCE_MANUAL: &str = "manual";
+/// Exact commit GitHub created when the daemon merged this task's PR. Dependent
+/// tasks must prove this commit is present in their fetched base before branch
+/// allocation.
+pub const MERGE_COMMIT_SHA_REF: &str = "merge_commit_sha";
+/// Durable bounded retry state for a dependent whose base ref has not yet
+/// propagated the merge commit recorded by one of its prerequisites.
+pub const DEPENDENCY_BASE_WAIT_ATTEMPTS_REF: &str = "dependency_base_wait_attempts";
+pub const DEPENDENCY_BASE_WAIT_REASON_REF: &str = "dependency_base_wait_reason";
+pub const MAX_DEPENDENCY_BASE_WAIT_ATTEMPTS: i64 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyMergeCommit {
+    pub task_id: i64,
+    pub merge_commit_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyBaseWaitDisposition {
+    Deferred { attempt: i64 },
+    Parked { attempt: i64 },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiRemediationIntent {
@@ -1544,8 +1565,14 @@ pub fn complete_approved_merge(
     conn: &mut Connection,
     id: i64,
     pr_number: i64,
+    merge_commit_sha: &str,
     now: i64,
 ) -> Result<TransitionResult> {
+    if merge_commit_sha.is_empty() || merge_commit_sha.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "merge commit SHA must be non-empty and contain no NUL".into(),
+        ));
+    }
     let tx = begin_immediate(conn)?;
     apply_event_tx(tx, "daemon", id, &Event::MergeSucceeded, now, |tx| {
         tx.execute(
@@ -1553,11 +1580,84 @@ pub fn complete_approved_merge(
             params![pr_number],
         )?;
         tx.execute(
-            "UPDATE tasks SET refs=json_remove(refs, '$.daemon_merge_retry') WHERE id=?1",
-            params![id],
+            "UPDATE tasks
+             SET refs=json_set(
+                 json_remove(COALESCE(refs, '{}'), '$.daemon_merge_retry'),
+                 '$.merge_commit_sha',
+                 ?2
+             )
+             WHERE id=?1",
+            params![id, merge_commit_sha],
         )?;
         Ok(())
     })
+}
+
+/// Complete an externally detected merge while recording GitHub's immutable
+/// merge commit. This is the in-review sibling of [`complete_approved_merge`]
+/// for a PR the daemon discovers already merged before it can submit its own
+/// merge call.
+pub fn complete_detected_merge(
+    conn: &mut Connection,
+    id: i64,
+    merge_commit_sha: &str,
+    now: i64,
+) -> Result<TransitionResult> {
+    if merge_commit_sha.is_empty() || merge_commit_sha.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "merge commit SHA must be non-empty and contain no NUL".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    apply_event_tx(tx, "daemon", id, &Event::PrFoundMerged, now, |tx| {
+        tx.execute(
+            "UPDATE tasks
+             SET refs=json_set(COALESCE(refs, '{}'), '$.merge_commit_sha', ?2)
+             WHERE id=?1",
+            params![id, merge_commit_sha],
+        )?;
+        Ok(())
+    })
+}
+
+/// Load the durable merge commit recorded for each dependency. A `done` task
+/// without a recorded commit is deliberately returned as `None`: callers must
+/// defer rather than silently allocate a child from an unverifiable base.
+pub fn dependency_merge_commits(
+    conn: &Connection,
+    depends_on: Option<&str>,
+) -> Result<Vec<DependencyMergeCommit>> {
+    let Some(depends_on) = depends_on else {
+        return Ok(Vec::new());
+    };
+    let dependency_ids = serde_json::from_str::<Vec<i64>>(depends_on).map_err(|error| {
+        QuorumError::Io(format!("invalid persisted task dependencies: {error}"))
+    })?;
+    let mut result = Vec::with_capacity(dependency_ids.len());
+    for task_id in dependency_ids {
+        let row: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT status,refs FROM tasks WHERE id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let merge_commit_sha = row
+            .filter(|(status, _)| status == "done")
+            .and_then(|(_, refs)| refs)
+            .and_then(|refs| serde_json::from_str::<serde_json::Value>(&refs).ok())
+            .and_then(|refs| {
+                refs.get(MERGE_COMMIT_SHA_REF)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|sha| !sha.is_empty() && !sha.contains('\0'))
+                    .map(str::to_owned)
+            });
+        result.push(DependencyMergeCommit {
+            task_id,
+            merge_commit_sha,
+        });
+    }
+    Ok(result)
 }
 
 /// Fail closed from an admitted merge attempt to ordinary review. Only the
@@ -3747,6 +3847,105 @@ pub fn park(
     Ok(Some(task))
 }
 
+/// Release a claimed task while its fetched base has not yet propagated a
+/// dependency's recorded merge commit. The counter and ownership transition
+/// share one transaction so a restart cannot spin an unbounded stale-base
+/// dispatch loop. After the small bound, park loudly and block any generated
+/// graph through the normal parking path.
+pub fn defer_dependency_base_wait(
+    conn: &mut Connection,
+    id: i64,
+    agent: &str,
+    reason: &str,
+    now: i64,
+) -> Result<Option<DependencyBaseWaitDisposition>> {
+    let tx = begin_immediate(conn)?;
+    let current: Option<(String, String)> = tx
+        .query_row(
+            "SELECT status,refs FROM tasks
+             WHERE id=?1 AND status IN ('working','rework') AND assignee=?2",
+            params![id, agent],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((status, refs)) = current else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    let deferred_status = if status == "working" {
+        "open"
+    } else {
+        "rework"
+    };
+    let mut refs_value = serde_json::from_str::<serde_json::Value>(&refs).map_err(|error| {
+        QuorumError::Io(format!("invalid task refs while deferring base: {error}"))
+    })?;
+    let refs_object = refs_value.as_object_mut().ok_or_else(|| {
+        QuorumError::Io("task refs while deferring dependency base must be an object".into())
+    })?;
+    let prior_attempts = refs_object
+        .get(DEPENDENCY_BASE_WAIT_ATTEMPTS_REF)
+        .and_then(serde_json::Value::as_i64)
+        .filter(|attempts| *attempts >= 0)
+        .unwrap_or(0);
+    let attempt = prior_attempts.saturating_add(1);
+    refs_object.insert(
+        DEPENDENCY_BASE_WAIT_ATTEMPTS_REF.to_string(),
+        serde_json::json!(attempt),
+    );
+    refs_object.insert(
+        DEPENDENCY_BASE_WAIT_REASON_REF.to_string(),
+        serde_json::json!(reason),
+    );
+    let refs = refs_value.to_string();
+
+    if attempt < MAX_DEPENDENCY_BASE_WAIT_ATTEMPTS {
+        let changed = tx.execute(
+            "UPDATE tasks
+             SET status=?3,assignee=NULL,refs=?4,updated_at=?5
+             WHERE id=?1 AND status=?6 AND assignee=?2",
+            params![id, agent, deferred_status, refs, now, status],
+        )?;
+        if changed != 1 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        deactivate_lease(&tx, id, now)?;
+        crate::events::emit(
+            &tx,
+            "task_dependency_base_deferred",
+            &lease_target(id),
+            reason,
+            now,
+        )?;
+        tx.commit()?;
+        return Ok(Some(DependencyBaseWaitDisposition::Deferred { attempt }));
+    }
+
+    let parked_refs = set_parked_refs(Some(&refs), reason, deferred_status)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET status='failed',assignee=NULL,refs=?3,updated_at=?4
+         WHERE id=?1 AND status=?5 AND assignee=?2",
+        params![id, agent, parked_refs, now, status],
+    )?;
+    if changed != 1 {
+        tx.commit()?;
+        return Ok(None);
+    }
+    deactivate_lease(&tx, id, now)?;
+    tx.execute(
+        "INSERT INTO task_notes(task_id, ts, agent, body)
+         VALUES (?1, ?2, 'daemon', ?3)",
+        params![id, now, format!("parked: {reason}")],
+    )?;
+    crate::events::emit(&tx, "task_parked", &lease_target(id), reason, now)?;
+    alert_owner_of_park(&tx, id, reason, now)?;
+    crate::decomposition::block_graph_if_child_failed(&tx, id, reason, now)?;
+    tx.commit()?;
+    Ok(Some(DependencyBaseWaitDisposition::Parked { attempt }))
+}
+
 /// Atomically persist the round's blocking feedback on a remediation task.
 /// Single-statement `json_set` — never read-modify-write — so a concurrent
 /// park (sweep or apply_event) can't be overwritten by a stale refs snapshot.
@@ -4551,12 +4750,42 @@ pub fn stamp_rework_cap(conn: &mut Connection, task_id: i64, cap: u32, now: i64)
 // ── close_after_merge ─────────────────────────────────────────────────────────
 
 pub fn close_after_merge(conn: &mut Connection, id: i64, note: &str, now: i64) -> Result<bool> {
+    close_after_merge_inner(conn, id, note, None, now)
+}
+
+/// Recovery equivalent of [`close_after_merge`] that durably associates the
+/// completed task with GitHub's immutable merge commit in the same transaction.
+pub fn close_after_merge_with_merge_commit_sha(
+    conn: &mut Connection,
+    id: i64,
+    note: &str,
+    merge_commit_sha: &str,
+    now: i64,
+) -> Result<bool> {
+    if merge_commit_sha.is_empty() || merge_commit_sha.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "merge commit SHA must be non-empty and contain no NUL".into(),
+        ));
+    }
+    close_after_merge_inner(conn, id, note, Some(merge_commit_sha), now)
+}
+
+fn close_after_merge_inner(
+    conn: &mut Connection,
+    id: i64,
+    note: &str,
+    merge_commit_sha: Option<&str>,
+    now: i64,
+) -> Result<bool> {
     let tx = begin_immediate(conn)?;
     let n = tx.execute(
         "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2,
-                          completion_provenance=?3
+                          completion_provenance=?3,
+                          refs=CASE WHEN ?4 IS NULL THEN refs
+                                    ELSE json_set(COALESCE(refs, '{}'), '$.merge_commit_sha', ?4)
+                               END
          WHERE id=?1 AND status NOT IN ('done', 'failed', 'cancelled')",
-        params![id, now, COMPLETION_PROVENANCE_MERGED],
+        params![id, now, COMPLETION_PROVENANCE_MERGED, merge_commit_sha],
     )?;
     if n == 0 {
         tx.commit()?;
@@ -10371,12 +10600,165 @@ mod tests {
             .unwrap();
         }
 
-        let completed = complete_approved_merge(&mut conn, task_id, 419, 11).unwrap();
+        let completed = complete_approved_merge(&mut conn, task_id, 419, "merge-sha", 11).unwrap();
         assert_eq!(completed.task.status, "done");
         assert!(crate::approvals::get_for_pr(&conn, 419).unwrap().is_empty());
         let refs: serde_json::Value =
             serde_json::from_str(completed.task.refs.as_deref().unwrap()).unwrap();
         assert!(refs.get(MERGE_RETRY_REF).is_none());
+        assert_eq!(refs[MERGE_COMMIT_SHA_REF], "merge-sha");
+    }
+
+    #[test]
+    fn dependency_base_wait_defers_then_parks_with_missing_merge_sha() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create(
+            &mut conn,
+            "owner",
+            "dependency",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"deadbeef"}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done',completion_provenance='merged' WHERE id=?1",
+            [dependency],
+        )
+        .unwrap();
+        let child = create(
+            &mut conn,
+            "owner",
+            "child",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            Some(&format!("[{dependency}]")),
+            None,
+            11,
+        )
+        .unwrap();
+
+        let commits = dependency_merge_commits(
+            &conn,
+            get(&conn, child).unwrap().unwrap().depends_on.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            commits,
+            vec![DependencyMergeCommit {
+                task_id: dependency,
+                merge_commit_sha: Some("deadbeef".into()),
+            }]
+        );
+
+        let reason = "fetched origin/develop does not yet contain dependency merge commit deadbeef";
+        for now in [12, 13] {
+            let claimed = claim(&mut conn, "worker", Some(child), &[], TTL, now)
+                .unwrap()
+                .expect("dispatchable dependency child must claim before deferral");
+            assert_eq!(claimed.status, "working");
+            assert_eq!(
+                defer_dependency_base_wait(&mut conn, child, "worker", reason, now).unwrap(),
+                Some(DependencyBaseWaitDisposition::Deferred { attempt: now - 11 })
+            );
+            let task = get(&conn, child).unwrap().unwrap();
+            assert_eq!(task.status, "open");
+            assert!(!has_live_lease(&conn, child, now));
+        }
+
+        let claimed = claim(&mut conn, "worker", Some(child), &[], TTL, 14)
+            .unwrap()
+            .expect("the released child must remain claimable through the wait bound");
+        assert_eq!(claimed.status, "working");
+        assert_eq!(
+            defer_dependency_base_wait(&mut conn, child, "worker", reason, 14).unwrap(),
+            Some(DependencyBaseWaitDisposition::Parked { attempt: 3 })
+        );
+        let task = get(&conn, child).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[DEPENDENCY_BASE_WAIT_ATTEMPTS_REF], 3);
+        assert_eq!(refs[PARKED_REASON_REF], reason);
+    }
+
+    #[test]
+    fn provider_retry_rework_dependency_base_wait_preserves_rework_then_parks() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create(
+            &mut conn,
+            "owner",
+            "dependency",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"deadbeef"}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done',completion_provenance='merged' WHERE id=?1",
+            [dependency],
+        )
+        .unwrap();
+        let child = create(
+            &mut conn,
+            "owner",
+            "provider retry child",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2","codex_retry_requested":true}"#,
+            ),
+            Some(&format!("[{dependency}]")),
+            None,
+            11,
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [child])
+            .unwrap();
+
+        let reason = "fetched origin/develop does not yet contain dependency merge commit deadbeef";
+        for now in [12, 13] {
+            let claimed = claim_provider_retry_rework(&mut conn, "replacement", child, TTL, now)
+                .unwrap()
+                .expect("dependency-ready provider retry must claim rework");
+            assert_eq!(claimed.status, "rework");
+            assert_eq!(
+                defer_dependency_base_wait(&mut conn, child, "replacement", reason, now).unwrap(),
+                Some(DependencyBaseWaitDisposition::Deferred { attempt: now - 11 })
+            );
+            let task = get(&conn, child).unwrap().unwrap();
+            assert_eq!(task.status, "rework");
+            assert!(task.assignee.is_none());
+            assert!(!has_live_lease(&conn, child, now));
+        }
+
+        let claimed = claim_provider_retry_rework(&mut conn, "replacement", child, TTL, 14)
+            .unwrap()
+            .expect("rework remains claimable after a stale-base deferral");
+        assert_eq!(claimed.status, "rework");
+        assert_eq!(
+            defer_dependency_base_wait(&mut conn, child, "replacement", reason, 14).unwrap(),
+            Some(DependencyBaseWaitDisposition::Parked { attempt: 3 })
+        );
+        let task = get(&conn, child).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[DEPENDENCY_BASE_WAIT_ATTEMPTS_REF], 3);
+        assert_eq!(refs[PARKED_RESUME_STATUS_REF], "rework");
+        assert_eq!(refs[PARKED_REASON_REF], reason);
+        assert!(!has_live_lease(&conn, child, 14));
     }
 
     #[test]

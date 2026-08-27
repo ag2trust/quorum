@@ -117,7 +117,7 @@ fn prepare_reviewer_authority(
     )
 }
 use tokio::io::{AsyncRead, AsyncReadExt};
-use worktree::{ContinuationBaseMerge, WorktreeManager};
+use worktree::{ContinuationBaseMerge, DependencyBaseVerification, WorktreeManager};
 
 const MAX_POISON_STRIKES: u32 = 3;
 const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
@@ -8324,6 +8324,60 @@ async fn rework_explicit_merge_retry(
     Ok(())
 }
 
+/// Read GitHub's immutable merge commit outside any database transaction.
+async fn merged_commit_sha(config: &ServeConfig, pr: i64) -> Option<String> {
+    let repo = config.repo_dir.clone();
+    let executor = Arc::clone(&config.merge_executor);
+    tokio::task::spawn_blocking(move || executor.merge_commit_sha(pr, &repo))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// A merged task may become `done` only with its durable GitHub merge SHA.
+/// If that post-merge lookup is transiently unavailable, retain a retryable
+/// parked merge instead of creating a dependency that can never prove its
+/// base ancestry.
+async fn required_merged_commit_sha(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    resume_status: &str,
+) -> Result<Option<String>> {
+    let Some(merge_commit_sha) = merged_commit_sha(config, pr).await else {
+        let reason = format!(
+            "PR #{pr} merged but GitHub merge commit metadata is unavailable; retry after metadata propagation"
+        );
+        require_park_task(&config.db_path, task_id, &reason, resume_status).await?;
+        log(&format!("PARKED: task #{task_id}: {reason}"));
+        return Ok(None);
+    };
+    Ok(Some(merge_commit_sha))
+}
+
+/// Persist a merge discovered before the daemon's own merge gate, including
+/// the immutable SHA dependency consumers require for base verification.
+async fn complete_detected_merge_with_metadata(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+) -> Result<bool> {
+    let Some(merge_commit_sha) =
+        required_merged_commit_sha(config, task_id, pr, "in-review").await?
+    else {
+        return Ok(false);
+    };
+    let db_path = config.db_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        tasks::complete_detected_merge(&mut conn, task_id, &merge_commit_sha, now_unix())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("detected merge completion join: {error}")))??;
+    Ok(true)
+}
+
 /// Consume one owner retry and perform at most one formal approval/merge call.
 /// All network checks precede a final durable-authority reread; failures either
 /// invalidate only stale evidence or park the unchanged exact-SHA authority.
@@ -8428,10 +8482,21 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
     };
     match mergeability {
         merge::MergeabilityState::AlreadyMerged => {
+            let Some(merge_commit_sha) =
+                required_merged_commit_sha(config, task_id, pr, "merging").await?
+            else {
+                return Ok(());
+            };
             let p = config.db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut conn = quorum_core::db::open(&p)?;
-                tasks::complete_approved_merge(&mut conn, task_id, pr, now_unix())?;
+                tasks::complete_approved_merge(
+                    &mut conn,
+                    task_id,
+                    pr,
+                    &merge_commit_sha,
+                    now_unix(),
+                )?;
                 Ok(())
             })
             .await
@@ -8578,10 +8643,21 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
     match final_mergeability {
         merge::MergeabilityState::Mergeable => {}
         merge::MergeabilityState::AlreadyMerged => {
+            let Some(merge_commit_sha) =
+                required_merged_commit_sha(config, task_id, pr, "merging").await?
+            else {
+                return Ok(());
+            };
             let p = config.db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut conn = quorum_core::db::open(&p)?;
-                tasks::complete_approved_merge(&mut conn, task_id, pr, now_unix())?;
+                tasks::complete_approved_merge(
+                    &mut conn,
+                    task_id,
+                    pr,
+                    &merge_commit_sha,
+                    now_unix(),
+                )?;
                 Ok(())
             })
             .await
@@ -8628,10 +8704,15 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
             .map_err(|error| QuorumError::Io(format!("merge retry execution join: {error}")))?
     };
     if result.success {
+        let Some(merge_commit_sha) =
+            required_merged_commit_sha(config, task_id, pr, "merging").await?
+        else {
+            return Ok(());
+        };
         let p = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&p)?;
-            tasks::complete_approved_merge(&mut conn, task_id, pr, now_unix())?;
+            tasks::complete_approved_merge(&mut conn, task_id, pr, &merge_commit_sha, now_unix())?;
             Ok(())
         })
         .await
@@ -10387,8 +10468,54 @@ async fn tick(
                         log(&format!(
                             "PR #{pr_num} already merged — firing MergeSucceeded"
                         ));
-                        fire_event(&db_path, "system", reviewer_task_id, &Event::MergeSucceeded)
+                        let Some(merge_commit_sha) =
+                            required_merged_commit_sha(config, reviewer_task_id, pr_num, "merging")
+                                .await?
+                        else {
+                            let r = reviewers.remove(ri);
+                            teardown_reviewer_after_recorded_outcome(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                "merge-metadata-unavailable",
+                            )
                             .await;
+                            if let Some(wi) =
+                                workers.iter().position(|w| w.task_id == reviewer_task_id)
+                            {
+                                let w = workers.remove(wi);
+                                cleanup_slot(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    w,
+                                    None,
+                                    "merge-metadata-unavailable",
+                                )
+                                .await;
+                            }
+                            if !consume_mailbox_row(&db_path, *id).await {
+                                break;
+                            }
+                            break;
+                        };
+                        let p = db_path.clone();
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            tasks::complete_approved_merge(
+                                &mut conn,
+                                reviewer_task_id,
+                                pr_num,
+                                &merge_commit_sha,
+                                now_unix(),
+                            )?;
+                            Ok(())
+                        })
+                        .await
+                        .map_err(|error| {
+                            QuorumError::Io(format!("already-merged completion join: {error}"))
+                        })??;
                         // #125 fires the collector immediately (best-effort).
                         // #127 also durably enqueues so the tick loop retries
                         // with backoff and cap; a successful run deletes the
@@ -11640,6 +11767,41 @@ async fn tick(
 
                     if merge_result.success {
                         log(&format!("PR #{pr_num} merged — firing MergeSucceeded"));
+                        // This lookup is outside the lifecycle transaction.
+                        // The resulting immutable GitHub merge commit becomes
+                        // the dependency/base ancestry witness for child work.
+                        let Some(merge_commit_sha) =
+                            required_merged_commit_sha(config, reviewer_task_id, pr_num, "merging")
+                                .await?
+                        else {
+                            let r = reviewers.remove(ri);
+                            teardown_reviewer_after_recorded_outcome(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                "merge-metadata-unavailable",
+                            )
+                            .await;
+                            if let Some(wi) =
+                                workers.iter().position(|w| w.task_id == reviewer_task_id)
+                            {
+                                let w = workers.remove(wi);
+                                cleanup_slot(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    w,
+                                    None,
+                                    "merge-metadata-unavailable",
+                                )
+                                .await;
+                            }
+                            if !consume_mailbox_row(&db_path, *id).await {
+                                break;
+                            }
+                            break;
+                        };
                         let p = db_path.clone();
                         tokio::task::spawn_blocking(move || -> Result<()> {
                             let mut conn = quorum_core::db::open(&p)?;
@@ -11647,6 +11809,7 @@ async fn tick(
                                 &mut conn,
                                 reviewer_task_id,
                                 pr_num,
+                                &merge_commit_sha,
                                 now_unix(),
                             )?;
                             Ok(())
@@ -13656,7 +13819,8 @@ async fn tick(
                         log(&format!(
                             "PR #{pr} already merged — firing PrFoundMerged for task #{task_id}"
                         ));
-                        fire_event(&db_path, "system", *task_id, &Event::PrFoundMerged).await;
+                        let _ =
+                            complete_detected_merge_with_metadata(config, *task_id, *pr).await?;
                         pr_closed_workers.push(*wi);
                         continue;
                     }
@@ -13933,7 +14097,8 @@ async fn tick(
                             "PR #{pr} already merged (orphan in-review) — \
                              firing PrFoundMerged for task #{task_id}"
                         ));
-                        fire_event(&db_path, "system", *task_id, &Event::PrFoundMerged).await;
+                        let _ =
+                            complete_detected_merge_with_metadata(config, *task_id, *pr).await?;
                         continue;
                     }
                     merge::MergeabilityState::Closed => {
@@ -18237,6 +18402,108 @@ async fn provision_reviewer_reserved(
 
 /// Spawn a worker for the next highest-priority ready task.
 /// Returns true if a worker was spawned, false if no ready tasks or names available.
+enum DependencyBaseAdmission {
+    NotRequired,
+    Verified { base_sha: String },
+    Deferred,
+}
+
+async fn verify_dependency_base_before_allocation(
+    db_path: &Path,
+    wt_mgr: &WorktreeManager,
+    repo_dir: &Path,
+    task: &tasks::Task,
+    agent_name: &str,
+    base_branch: &str,
+) -> Result<DependencyBaseAdmission> {
+    let dependencies = {
+        let db_path = db_path.to_path_buf();
+        let depends_on = task.depends_on.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<tasks::DependencyMergeCommit>> {
+            let conn = quorum_core::db::open(&db_path)?;
+            tasks::dependency_merge_commits(&conn, depends_on.as_deref())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("dependency merge lookup join: {error}")))??
+    };
+    if dependencies.is_empty() {
+        return Ok(DependencyBaseAdmission::NotRequired);
+    }
+
+    let missing_record = dependencies
+        .iter()
+        .find(|dependency| dependency.merge_commit_sha.is_none());
+    let reason = if let Some(dependency) = missing_record {
+        format!(
+            "dependency #{} is done but has no recorded merge commit SHA",
+            dependency.task_id
+        )
+    } else {
+        let merge_commits = dependencies
+            .iter()
+            .filter_map(|dependency| dependency.merge_commit_sha.clone())
+            .collect::<Vec<_>>();
+        match wt_mgr
+            .fetch_base_and_verify_dependency_commits(repo_dir, base_branch, &merge_commits)
+            .await
+        {
+            Ok(DependencyBaseVerification::Verified { base_sha }) => {
+                return Ok(DependencyBaseAdmission::Verified { base_sha });
+            }
+            Ok(DependencyBaseVerification::Missing { merge_commit_sha }) => format!(
+                "fetched origin/{base_branch} does not yet contain dependency merge commit {merge_commit_sha}"
+            ),
+            Err(error) => {
+                let reason = format!(
+                    "dependency base verification failed before allocation: {error}"
+                );
+                let resume_status = if task.status == "rework" {
+                    "rework"
+                } else {
+                    "open"
+                };
+                require_park_task(db_path, task.id, &reason, resume_status).await?;
+                log(&format!("PARKED: task #{}: {reason}", task.id));
+                return Ok(DependencyBaseAdmission::Deferred);
+            }
+        }
+    };
+
+    let disposition = {
+        let db_path = db_path.to_path_buf();
+        let agent_name = agent_name.to_string();
+        let reason = reason.clone();
+        let task_id = task.id;
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<tasks::DependencyBaseWaitDisposition>> {
+                let mut conn = quorum_core::db::open(&db_path)?;
+                tasks::defer_dependency_base_wait(
+                    &mut conn,
+                    task_id,
+                    &agent_name,
+                    &reason,
+                    now_unix(),
+                )
+            },
+        )
+        .await
+        .map_err(|error| QuorumError::Io(format!("dependency base deferral join: {error}")))??
+    };
+    match disposition {
+        Some(tasks::DependencyBaseWaitDisposition::Deferred { attempt: 1 }) => {
+            log(&format!("task #{} dispatch deferred: {reason}", task.id));
+        }
+        Some(tasks::DependencyBaseWaitDisposition::Parked { attempt }) => {
+            log(&format!(
+                "PARKED: task #{} after {attempt} dependency-base waits: {reason}",
+                task.id
+            ));
+        }
+        Some(tasks::DependencyBaseWaitDisposition::Deferred { .. }) | None => {}
+    }
+    Ok(DependencyBaseAdmission::Deferred)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_worker(
     config: &ServeConfig,
@@ -18394,13 +18661,6 @@ async fn spawn_worker(
         }
     }
 
-    lifetime_roster.register(&agent_name);
-
-    log(&format!(
-        "spawning agent {} for task #{} ({})",
-        agent_name, task.id, task.title
-    ));
-
     let worker_repo_dir = &config.repo_dir;
 
     // Task creation persists the authoritative target before the daemon can
@@ -18422,6 +18682,35 @@ async fn spawn_worker(
         None => None,
     };
     let effective_base_branch = task_target.unwrap_or(&config.base_branch);
+
+    // Dependency completion alone is not enough to cut a child branch: GitHub
+    // may report a merged PR before its base ref reaches this clone. Fetch and
+    // prove each recorded merge commit before any branch/provenance/worktree
+    // allocation. A propagation lag releases the claim for a bounded retry.
+    let verified_dependency_base = match verify_dependency_base_before_allocation(
+        &db_path,
+        wt_mgr,
+        worker_repo_dir,
+        &task,
+        &agent_name,
+        effective_base_branch,
+    )
+    .await?
+    {
+        DependencyBaseAdmission::NotRequired => None,
+        DependencyBaseAdmission::Verified { base_sha } => Some(base_sha),
+        DependencyBaseAdmission::Deferred => {
+            name_pool.release(&agent_name);
+            return Ok(false);
+        }
+    };
+
+    lifetime_roster.register(&agent_name);
+
+    log(&format!(
+        "spawning agent {} for task #{} ({})",
+        agent_name, task.id, task.title
+    ));
 
     // A continuation assignment is bound to the live PR target resolved after
     // the atomic claim. Explicit --continue-pr remains authoritative. A
@@ -18532,15 +18821,27 @@ async fn spawn_worker(
     // Persist immutable allocation provenance before git creates anything.
     // Ref resolution is external I/O and completes before the short DB write.
     if continue_target.is_none() {
-        let base_ref = format!("origin/{effective_base_branch}");
-        let resolved_provenance = match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
-            Ok(sha) => sha,
-            Err(error) => {
-                let reason = format!("branch provenance resolution failed: {error}");
-                persist_provisioning_failure(&db_path, task.id, &reason).await;
-                park_task(&db_path, task.id, &reason, "open").await;
-                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
-                return Ok(false);
+        let allocation_resume_status = if task.status == "rework" {
+            "rework"
+        } else {
+            "open"
+        };
+        let requires_verified_dependency_provenance = verified_dependency_base.is_some();
+        let resolved_provenance = match verified_dependency_base {
+            Some(base_sha) => base_sha,
+            None => {
+                let base_ref = format!("origin/{effective_base_branch}");
+                match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
+                    Ok(sha) => sha,
+                    Err(error) => {
+                        let reason = format!("branch provenance resolution failed: {error}");
+                        persist_provisioning_failure(&db_path, task.id, &reason).await;
+                        park_task(&db_path, task.id, &reason, allocation_resume_status).await;
+                        guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id)
+                            .await;
+                        return Ok(false);
+                    }
+                }
             }
         };
         let allocation_db = db_path.clone();
@@ -18557,9 +18858,25 @@ async fn spawn_worker(
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
+            if requires_verified_dependency_provenance
+                && existing
+                    .as_ref()
+                    .is_some_and(|(_, provenance)| provenance.is_none())
+            {
+                // A legacy allocation cannot prove where its already-existing
+                // branch began. Do not backfill the current base onto that
+                // row and then reuse an unverifiable checkout.
+                return Ok(false);
+            }
             let (allocator, provenance) = match existing.as_ref() {
-                Some((allocator, Some(provenance))) => (allocator.as_str(), provenance.as_str()),
-                Some((allocator, None)) => (allocator.as_str(), resolved_provenance.as_str()),
+                // A dependent's freshly verified base is its allocation
+                // provenance requirement. Replaying an older allocation would
+                // otherwise reuse its branch unchanged, even if that branch
+                // was cut before the dependency merge reached the base.
+                Some((allocator, Some(provenance))) if !requires_verified_dependency_provenance => {
+                    (allocator.as_str(), provenance.as_str())
+                }
+                Some((allocator, _)) => (allocator.as_str(), resolved_provenance.as_str()),
                 None => (allocation_agent.as_str(), resolved_provenance.as_str()),
             };
             quorum_core::branches::record_exact_allocation(
@@ -18579,7 +18896,7 @@ async fn spawn_worker(
                 &db_path,
                 task.id,
                 "branch allocation provenance conflict",
-                "open",
+                allocation_resume_status,
             )
             .await;
             guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
@@ -28418,6 +28735,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 failure_kind: None,
             }
         }
+
+        fn merge_commit_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some("merge-42".into())
+        }
     }
 
     struct RetryableMergeCounter {
@@ -30220,6 +30541,189 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             published.source_sha, fixture.source_sha,
             "a publication crash recovery must replay the exact durable source"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_dependency_base_parks_stale_branch_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let remote = dir.path().join("remote.git");
+        let worker = dir.path().join("worker");
+        let git = |repo: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-q", "origin", "main"]);
+        let stale_provenance = git(&source, &["rev-parse", "HEAD"]);
+
+        assert!(std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                worker.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let stale_branch = "daemon/stale-allocation-t2";
+        git(&worker, &["checkout", "-q", "-b", stale_branch]);
+        git(&worker, &["checkout", "-q", "main"]);
+
+        git(&source, &["checkout", "-q", "-b", "dependency"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "dependency"]);
+        git(&source, &["checkout", "-q", "main"]);
+        git(
+            &source,
+            &["merge", "--no-ff", "dependency", "-m", "merge dependency"],
+        );
+        let merge_commit = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        let db_path = dir.path().join("quorum.db");
+        let worktree = dir.path().join("stale-allocation-worktree");
+        let child_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let dependency_id = tasks::create(
+                &mut conn,
+                "owner",
+                "merged dependency",
+                None,
+                0,
+                None,
+                Some(
+                    &serde_json::json!({
+                        "merge_commit_sha": merge_commit,
+                    })
+                    .to_string(),
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done', completion_provenance='merged' WHERE id=?1",
+                [dependency_id],
+            )
+            .unwrap();
+            let child_id = tasks::create(
+                &mut conn,
+                "owner",
+                "dependent with stale branch",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                Some(&format!("[{dependency_id}]")),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            assert!(quorum_core::branches::record_exact_allocation(
+                &mut conn,
+                child_id,
+                stale_branch,
+                &worktree.to_string_lossy(),
+                "FormerWorker",
+                &stale_provenance,
+                now_unix(),
+            )
+            .unwrap());
+            child_id
+        };
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), worker.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+
+        assert!(
+            !spawn_worker(
+                &config,
+                &WorktreeManager::new(),
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+            )
+            .await
+            .unwrap(),
+            "a freshly verified base must not reuse a stale dependent branch"
+        );
+        assert!(workers.is_empty(), "no worker may be dispatched");
+        assert!(
+            !worktree.exists(),
+            "the stale allocation must be rejected before worktree provisioning"
+        );
+        assert!(
+            !std::process::Command::new("git")
+                .args(["merge-base", "--is-ancestor", &merge_commit, stale_branch])
+                .current_dir(&worker)
+                .status()
+                .unwrap()
+                .success(),
+            "the retained branch is the stale one the daemon must refuse"
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["merge-base", "--is-ancestor", &merge_commit, "origin/main"])
+                .current_dir(&worker)
+                .status()
+                .unwrap()
+                .success(),
+            "dispatch must have first fetched and verified the current base"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let child = tasks::get(&conn, child_id).unwrap().unwrap();
+        assert_eq!(child.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(child.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs[quorum_core::tasks::PARKED_REASON_REF],
+            "branch allocation provenance conflict"
+        );
+        let recorded_provenance: String = conn
+            .query_row(
+                "SELECT provenance_sha FROM task_branches WHERE task_id=?1",
+                [child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded_provenance, stale_provenance);
     }
 
     #[cfg(unix)]

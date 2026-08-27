@@ -325,6 +325,24 @@ impl Case {
         Self::start_with_role_config(default_provider, model, labels, None)
     }
 
+    fn start_with_merge_metadata(
+        default_provider: &str,
+        model: &str,
+        labels: Option<&str>,
+    ) -> Self {
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            labels,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+    }
+
     fn start_with_role_config(
         default_provider: &str,
         model: &str,
@@ -340,6 +358,26 @@ impl Case {
             None,
             None,
             None,
+            false,
+        )
+    }
+
+    fn start_with_role_config_and_merge_metadata(
+        default_provider: &str,
+        model: &str,
+        labels: Option<&str>,
+        role_config: Option<&str>,
+    ) -> Self {
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            labels,
+            role_config,
+            None,
+            None,
+            None,
+            None,
+            true,
         )
     }
 
@@ -358,6 +396,7 @@ impl Case {
             None,
             None,
             Some(merge_checks_cmd),
+            false,
         )
     }
 
@@ -371,6 +410,7 @@ impl Case {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -384,6 +424,7 @@ impl Case {
             Some(pr),
             None,
             None,
+            false,
         )
     }
 
@@ -401,6 +442,7 @@ impl Case {
                 target_branch: "main",
             }),
             None,
+            false,
         )
     }
 
@@ -418,6 +460,7 @@ impl Case {
                 target_branch: "develop",
             }),
             None,
+            false,
         )
     }
 
@@ -431,6 +474,7 @@ impl Case {
         continue_pr: Option<i64>,
         parked_publication: Option<ParkedPublicationFixture>,
         merge_checks_cmd: Option<&str>,
+        use_gh_merge: bool,
     ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -824,7 +868,23 @@ elif [ "$cmd" = "pr view" ]; then
   if [ -f "$QUORUM_TEST_GH_STATE/state-$pr" ]; then
     state="$(cat "$QUORUM_TEST_GH_STATE/state-$pr")"
   fi
+  case " $* " in
+    *" --json statusCheckRollup,mergeStateStatus "*)
+      printf '{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}\n'
+      exit 0
+      ;;
+    *" --json mergeCommit "*)
+      printf '{"mergeCommit":{"oid":"%s"}}\n' "$sha"
+      exit 0
+      ;;
+    *" --json headRefOid --jq .headRefOid "*)
+      printf '%s\n' "$sha"
+      exit 0
+      ;;
+  esac
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"%s","state":"%s"}\n' "$branch" "$sha" "$base" "$state"
+elif [ "$cmd" = "pr review" ] || [ "$cmd" = "pr merge" ]; then
+  exit 0
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -864,6 +924,11 @@ fi
                 &worktrees.path().to_string_lossy(),
                 "--names-file",
                 &names.to_string_lossy(),
+                "--exit-when-gone",
+                &sentinel.path().to_string_lossy(),
+            ]);
+        if !use_gh_merge {
+            serve.args([
                 "--merge-cmd",
                 "true",
                 "--merge-checks-cmd",
@@ -872,9 +937,8 @@ fi
                 "10",
                 "--merge-checks-poll-secs",
                 "30",
-                "--exit-when-gone",
-                &sentinel.path().to_string_lossy(),
             ]);
+        }
         serve.args(["--config", &config_path.to_string_lossy()]);
         if !config_contents.contains("runner = \"codex\"") {
             serve.args(["--agent-bin", &runner.to_string_lossy()]);
@@ -1874,7 +1938,7 @@ fn continuation_publication_rejects_same_sha_closed_pr() {
 
 #[test]
 fn configurable_chatgpt_only_lifecycle_persists_role_models_and_efforts() {
-    let runs = Case::start_with_role_config(
+    let runs = Case::start_with_role_config_and_merge_metadata(
         "claude",
         "claude-opus-4-6",
         None,
@@ -1895,7 +1959,7 @@ fn configurable_chatgpt_only_lifecycle_persists_role_models_and_efforts() {
 
 #[test]
 fn configurable_chatgpt_only_ignores_legacy_claude_task_tier() {
-    let runs = Case::start_with_role_config(
+    let runs = Case::start_with_role_config_and_merge_metadata(
         "claude",
         "claude-opus-4-6",
         Some(r#"["tier:opus-46"]"#),
@@ -1916,7 +1980,7 @@ fn configurable_chatgpt_only_ignores_legacy_claude_task_tier() {
 
 #[test]
 fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
-    let claude = Case::start("claude", "claude-opus-4-6", None).finish();
+    let claude = Case::start_with_merge_metadata("claude", "claude-opus-4-6", None).finish();
     assert_eq!(
         run_routes(&claude),
         [
@@ -1926,7 +1990,7 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
         ]
     );
 
-    let codex = Case::start("codex", "o3", None).finish();
+    let codex = Case::start_with_merge_metadata("codex", "o3", None).finish();
     assert_eq!(
         run_routes(&codex),
         [
@@ -1936,7 +2000,7 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
         ]
     );
 
-    let mixed = Case::start(
+    let mixed = Case::start_with_merge_metadata(
         "claude",
         "claude-opus-4-6",
         Some(r#"["tier:terra","effort:high"]"#),
@@ -1954,7 +2018,7 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
 
 #[test]
 fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
-    let mut case = Case::start_with_role_config(
+    let mut case = Case::start_with_role_config_and_merge_metadata(
         "codex",
         "gpt-5.6-terra",
         None,
