@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 63;
+pub const SCHEMA_VERSION: i64 = 64;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1148,6 +1148,58 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                     [],
                 )?;
             }
+        }
+        // v64 = outbox revalidation / claim-sentinel columns on
+        // `github_agent_operations`, plus the guarded active-claim partial
+        // UNIQUE index the claim child will enforce. SCHEMA_SQL creates the
+        // index unconditionally (IF NOT EXISTS), but SQLite's CREATE TABLE
+        // IF NOT EXISTS is a no-op for the existing table, so each new column
+        // must be ALTERed in. The `active` sentinel is NOT NULL with DEFAULT 0
+        // so existing v61-vintage rows backfill to inactive without touching
+        // any of the immutable request columns the row trigger guards.
+        if current < 64 {
+            for (col, ddl) in [
+                (
+                    "lifecycle_generation",
+                    "ALTER TABLE github_agent_operations ADD COLUMN \
+                     lifecycle_generation INTEGER",
+                ),
+                (
+                    "reviewer_launch_sha",
+                    "ALTER TABLE github_agent_operations ADD COLUMN \
+                     reviewer_launch_sha TEXT",
+                ),
+                (
+                    "group_key",
+                    "ALTER TABLE github_agent_operations ADD COLUMN group_key TEXT",
+                ),
+                (
+                    "claimed_at",
+                    "ALTER TABLE github_agent_operations ADD COLUMN claimed_at INTEGER",
+                ),
+                (
+                    "execution_started_at",
+                    "ALTER TABLE github_agent_operations ADD COLUMN \
+                     execution_started_at INTEGER",
+                ),
+                (
+                    "active",
+                    "ALTER TABLE github_agent_operations ADD COLUMN active \
+                     INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1))",
+                ),
+            ] {
+                if !column_exists(conn, "github_agent_operations", col)? {
+                    conn.execute(ddl, [])?;
+                }
+            }
+            // The partial UNIQUE index references `active`, so it must be
+            // created after the ALTER above rather than in SCHEMA_SQL, which
+            // executes before any migration block. `IF NOT EXISTS` keeps
+            // re-runs idempotent on already-migrated databases.
+            conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS github_agent_operations_one_active
+                     ON github_agent_operations(operation_id) WHERE active = 1;",
+            )?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
@@ -2428,6 +2480,134 @@ END;
                 "v63 must add {column} without guessing a legacy turn binding"
             );
         }
+    }
+
+    #[test]
+    fn migrates_v63_to_v64_adds_outbox_revalidation_and_active_claim_columns() {
+        // Regression guard for the "already-at-latest short-circuit" trap:
+        // a v63 daemon DB stopped at user_version=63 must actually re-enter
+        // the migration and gain the six revalidation/claim columns plus the
+        // guarded active-claim partial UNIQUE index. Seed an in-flight v63
+        // operation row so a destructive rebuild (e.g. table drop) would be
+        // caught by its disappearance from the migrated database.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v63-outbox-active-claim.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'src','working','owner',1,1);
+                 INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                 VALUES ('run-legacy',1,'Worker','worker',1);
+                 INSERT INTO github_collaboration_attempts(
+                     attempt_id,task_id,agent,role,pr_number,lifecycle_generation,
+                     active_run_id,state,created_at,updated_at,expires_at
+                 ) VALUES ('att-legacy',1,'Worker','worker',7,1,'run-legacy',
+                           'active',1,1,999);
+                 INSERT INTO github_agent_operations(
+                     operation_id,client_request_id,attempt_id,created_by_run_id,
+                     task_id,agent,role,pr_number,kind,request_json,
+                     state,send_state,deadline_at,created_at,updated_at,expires_at
+                 ) VALUES ('op-legacy','req-legacy','att-legacy','run-legacy',
+                           1,'Worker','worker',7,'pull_request_read','{}',
+                           'queued','not_started',999,1,1,999);",
+            )
+            .unwrap();
+            // The `active` column feeds `github_agent_operations_one_active`,
+            // so the index must go before the column can be dropped.
+            conn.execute_batch("DROP INDEX IF EXISTS github_agent_operations_one_active;")
+                .unwrap();
+            for col in [
+                "lifecycle_generation",
+                "reviewer_launch_sha",
+                "group_key",
+                "claimed_at",
+                "execution_started_at",
+                "active",
+            ] {
+                let dropped = conn.execute(
+                    &format!("ALTER TABLE github_agent_operations DROP COLUMN {col}"),
+                    [],
+                );
+                assert!(
+                    dropped.is_ok(),
+                    "seed drop for {col} must succeed: {dropped:?}"
+                );
+            }
+            conn.execute_batch("PRAGMA user_version=63;").unwrap();
+        }
+
+        let migrated = open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        for col in [
+            "lifecycle_generation",
+            "reviewer_launch_sha",
+            "group_key",
+            "claimed_at",
+            "execution_started_at",
+            "active",
+        ] {
+            assert!(
+                column_exists(&migrated, "github_agent_operations", col).unwrap(),
+                "v64 must add github_agent_operations.{col}"
+            );
+        }
+        // The seed row survives — v64 is additive, not a destructive rebuild.
+        let seeded: i64 = migrated
+            .query_row(
+                "SELECT COUNT(*) FROM github_agent_operations WHERE operation_id='op-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seeded, 1, "legacy operation row must survive v64 migration");
+        // Backfill: pre-existing rows inherit active=0 so the claim child sees
+        // them as unclaimed rather than mis-detecting them as live claims.
+        let active: i64 = migrated
+            .query_row(
+                "SELECT active FROM github_agent_operations WHERE operation_id='op-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
+        // The guarded partial UNIQUE index must be present after migration.
+        let idx: i64 = migrated
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='github_agent_operations_one_active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+
+        // Idempotency: re-entering `migrate_txn` (not the early return) with
+        // the columns/index already present must be a no-op — stamp
+        // user_version=63 back without touching the schema so the migration
+        // re-runs against an already-migrated table.
+        migrated.execute_batch("PRAGMA user_version=63;").unwrap();
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let seeded_again: i64 = reopened
+            .query_row(
+                "SELECT COUNT(*) FROM github_agent_operations WHERE operation_id='op-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seeded_again, 1);
     }
 
     #[test]
