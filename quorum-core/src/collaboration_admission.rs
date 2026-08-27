@@ -29,13 +29,13 @@ pub const MAX_OPERATION_ATTEMPTS: u8 = 8;
 pub const MAX_NONEXPIRED_ATTEMPTS_PER_TASK: i64 = 16;
 pub const MAX_NONEXPIRED_ATTEMPTS_PER_REPOSITORY: i64 = 1_024;
 
-/// Fixed cap on nonexpired GitHub operations created by one run capability.
+/// Fixed cap on retained GitHub operations created by one run capability.
 pub const MAX_NONEXPIRED_OPERATIONS_PER_RUN: i64 = 64;
-/// Fixed cap on nonexpired GitHub operations per collaboration attempt.
+/// Fixed cap on retained GitHub operations per collaboration attempt.
 pub const MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT: i64 = 128;
-/// Fixed cap on nonexpired GitHub operations per task.
+/// Fixed cap on retained GitHub operations per task.
 pub const MAX_NONEXPIRED_OPERATIONS_PER_TASK: i64 = 512;
-/// Fixed cap on nonexpired GitHub operations in the repository database.
+/// Fixed cap on retained GitHub operations in the repository database.
 pub const MAX_NONEXPIRED_OPERATIONS_PER_REPOSITORY: i64 = 4_096;
 
 macro_rules! bounded_text {
@@ -1385,13 +1385,16 @@ fn sweep_expired_terminal_groups(tx: &Transaction<'_>, now: i64) -> Result<()> {
 fn operation_capacity_rejection(
     tx: &Transaction<'_>,
     request: &EnqueueGithubOperationRequest,
-    now: i64,
 ) -> Result<Option<CollaborationAdmissionError>> {
+    // `admit_operation` sweeps every reclaimable expired terminal group before
+    // reaching this point. Every remaining row is therefore still owned by an
+    // attempt, including a complete expired group pinned by an ambiguous send
+    // disposition, and must consume capacity until reconciliation releases it.
     let per_run: i64 = tx.query_row(
         "SELECT COUNT(*) FROM github_agent_operations o
          JOIN github_collaboration_attempts a ON a.attempt_id=o.attempt_id
-         WHERE o.created_by_run_id=?1 AND a.expires_at>?2",
-        params![request.created_by_run_id().as_str(), now],
+         WHERE o.created_by_run_id=?1",
+        [request.created_by_run_id().as_str()],
         |row| row.get(0),
     )?;
     if per_run >= MAX_NONEXPIRED_OPERATIONS_PER_RUN {
@@ -1400,8 +1403,8 @@ fn operation_capacity_rejection(
     let per_attempt: i64 = tx.query_row(
         "SELECT COUNT(*) FROM github_agent_operations o
          JOIN github_collaboration_attempts a ON a.attempt_id=o.attempt_id
-         WHERE o.attempt_id=?1 AND a.expires_at>?2",
-        params![request.attempt_id().as_str(), now],
+         WHERE o.attempt_id=?1",
+        [request.attempt_id().as_str()],
         |row| row.get(0),
     )?;
     if per_attempt >= MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT {
@@ -1412,8 +1415,8 @@ fn operation_capacity_rejection(
     let per_task: i64 = tx.query_row(
         "SELECT COUNT(*) FROM github_agent_operations o
          JOIN github_collaboration_attempts a ON a.attempt_id=o.attempt_id
-         WHERE a.task_id=?1 AND a.expires_at>?2",
-        params![request.task_id(), now],
+         WHERE a.task_id=?1",
+        [request.task_id()],
         |row| row.get(0),
     )?;
     if per_task >= MAX_NONEXPIRED_OPERATIONS_PER_TASK {
@@ -1421,9 +1424,8 @@ fn operation_capacity_rejection(
     }
     let per_repo: i64 = tx.query_row(
         "SELECT COUNT(*) FROM github_agent_operations o
-         JOIN github_collaboration_attempts a ON a.attempt_id=o.attempt_id
-         WHERE a.expires_at>?1",
-        [now],
+         JOIN github_collaboration_attempts a ON a.attempt_id=o.attempt_id",
+        [],
         |row| row.get(0),
     )?;
     if per_repo >= MAX_NONEXPIRED_OPERATIONS_PER_REPOSITORY {
@@ -1530,7 +1532,7 @@ fn insert_operation(
 ///  6. Return the existing row if one already matches the deterministic
 ///     `(attempt_id, client_request_id)` identity: identical retries are
 ///     idempotent by design.
-///  7. Enforce per-run, per-attempt, per-task and per-repository nonexpired
+///  7. Enforce per-run, per-attempt, per-task and per-repository retained
 ///     operation caps and reject with a typed capacity outcome if any fires.
 ///  8. Insert the durable row.
 pub fn admit_operation(
@@ -1652,7 +1654,7 @@ pub fn admit_operation(
         return Ok(GithubOperationAdmissionResult::Existing(existing));
     }
 
-    if let Some(rejection) = operation_capacity_rejection(&tx, request, now)? {
+    if let Some(rejection) = operation_capacity_rejection(&tx, request)? {
         tx.commit()?;
         return Ok(GithubOperationAdmissionResult::Rejected(rejection));
     }
@@ -2596,6 +2598,59 @@ mod tests {
         .unwrap()
     }
 
+    fn insert_recovery_pinned_group(
+        conn: &mut Connection,
+        attempt_id: &str,
+        run_id: &str,
+        task_id: i64,
+        pr_number: i64,
+        operation_count: i64,
+    ) {
+        insert_attempt_row(
+            conn,
+            attempt_id,
+            task_id,
+            "Worker",
+            "worker",
+            pr_number,
+            None,
+            None,
+            "revoked",
+            OP_NOW - 1,
+        );
+        crate::capabilities::issue(conn, run_id, task_id, "Worker", "worker", 1).unwrap();
+        for ordinal in 0..operation_count {
+            let (state, send_state) = if ordinal == 0 {
+                ("failed", "ambiguous")
+            } else {
+                ("succeeded", "confirmed")
+            };
+            conn.execute(
+                "INSERT INTO github_agent_operations(
+                     operation_id, client_request_id, attempt_id, created_by_run_id,
+                     task_id, agent, role, pr_number, kind, request_json,
+                     state, send_state, attempts, deadline_at,
+                     created_at, updated_at, expires_at
+                 ) VALUES (?1,?2,?3,?4,?5,'Worker','worker',?6,'pull_request_read','{}',
+                           ?7,?8,1,?9,1,1,?10)",
+                params![
+                    format!("op-{attempt_id}-{ordinal}"),
+                    format!("req-{attempt_id}-{ordinal}"),
+                    attempt_id,
+                    run_id,
+                    task_id,
+                    pr_number,
+                    state,
+                    send_state,
+                    OP_NOW - 1,
+                    OP_NOW - 1,
+                ],
+            )
+            .unwrap();
+        }
+        crate::capabilities::revoke(conn, run_id, 2).unwrap();
+    }
+
     #[test]
     fn operation_admission_caps_are_defined() {
         assert_eq!(MAX_NONEXPIRED_OPERATIONS_PER_RUN, 64);
@@ -3200,6 +3255,93 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pinned_op_alive, 1);
+    }
+
+    #[test]
+    fn admit_operation_counts_complete_recovery_pinned_groups_toward_task_capacity() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        for group in 0..(MAX_NONEXPIRED_OPERATIONS_PER_TASK / MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT)
+        {
+            insert_recovery_pinned_group(
+                &mut conn,
+                &format!("attempt-pinned-task-{group}"),
+                &format!("run-pinned-task-{group}"),
+                1,
+                WORKER_PR,
+                MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT,
+            );
+        }
+
+        let request = build_op_request(
+            "attempt-1",
+            "req-task-cap",
+            run,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        assert_eq!(
+            admit_operation(&mut conn, run, &request, OP_NOW).unwrap(),
+            GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::TaskOperationLimitReached
+            )
+        );
+        assert_eq!(count_operations(&conn), MAX_NONEXPIRED_OPERATIONS_PER_TASK);
+    }
+
+    #[test]
+    fn admit_operation_counts_complete_recovery_pinned_groups_toward_repository_capacity() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        let groups_per_task =
+            MAX_NONEXPIRED_OPERATIONS_PER_TASK / MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT;
+        let task_count =
+            MAX_NONEXPIRED_OPERATIONS_PER_REPOSITORY / MAX_NONEXPIRED_OPERATIONS_PER_TASK;
+        assert_eq!(
+            groups_per_task * task_count * MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT,
+            MAX_NONEXPIRED_OPERATIONS_PER_REPOSITORY
+        );
+        for task_offset in 0..task_count {
+            let task_id = task_offset + 2;
+            let pr_number = WORKER_PR + task_id;
+            insert_worker_task(&conn, task_id, "Worker", pr_number);
+            for group in 0..groups_per_task {
+                insert_recovery_pinned_group(
+                    &mut conn,
+                    &format!("attempt-pinned-repo-{task_id}-{group}"),
+                    &format!("run-pinned-repo-{task_id}-{group}"),
+                    task_id,
+                    pr_number,
+                    MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT,
+                );
+            }
+        }
+
+        let request = build_op_request(
+            "attempt-1",
+            "req-repository-cap",
+            run,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::PullRequestRead,
+            r#"{"pr":42}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        assert_eq!(
+            admit_operation(&mut conn, run, &request, OP_NOW).unwrap(),
+            GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::RepositoryOperationLimitReached
+            )
+        );
+        assert_eq!(
+            count_operations(&conn),
+            MAX_NONEXPIRED_OPERATIONS_PER_REPOSITORY
+        );
     }
 
     #[test]
