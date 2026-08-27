@@ -3357,6 +3357,9 @@ pub struct ServeConfig {
     /// When true, the daemon spawns a one-shot doctor agent for tasks stalled
     /// with no active worker/reviewer. Default: false.
     pub doctor_enabled: bool,
+    /// Observational host memory/disk polling. It never throttles workers or
+    /// changes lifecycle state.
+    pub resource_monitor: crate::resource_health::ResourceMonitorConfig,
     /// Enable deterministic R2 sampling. False retains the mandatory R2 gate.
     pub r2_enabled: bool,
     /// Guaranteed R2 coverage per stratum before steady-state sampling.
@@ -8980,6 +8983,19 @@ async fn tick_loop(
 
     log(&format!("serving (cap={})", config.cap));
 
+    let mut resource_transitions = crate::resource_health::ResourceTransitionMonitor::default();
+    let mut resource_sampler = crate::resource_health::ResourceSamplePoller::default();
+    let resource_targets = vec![
+        crate::resource_health::DiskTarget {
+            label: "database",
+            path: config.db_path.clone(),
+        },
+        crate::resource_health::DiskTarget {
+            label: "worktrees",
+            path: config.worktree_base.clone(),
+        },
+    ];
+
     // Standalone heartbeat task — refreshes the daemon lock every 10s,
     // independent of tick() duration. Detects lock theft (0-row refresh)
     // and signals the main loop to exit immediately.
@@ -9119,6 +9135,20 @@ async fn tick_loop(
                     name_pool.release(&agent_name);
                 }
                 return Ok(1);
+            }
+        }
+
+        // Host telemetry is observational and intentionally sampled outside
+        // every SQLite transaction. Polling is non-blocking and single-flight,
+        // so a degraded filesystem cannot stall lifecycle or shutdown work.
+        if let Some(resources) = resource_sampler.poll(
+            std::time::Instant::now(),
+            now_unix(),
+            &resource_targets,
+            config.resource_monitor,
+        ) {
+            for line in resource_transitions.observe(&resources, std::time::Instant::now()) {
+                log(&line);
             }
         }
 
@@ -21772,6 +21802,7 @@ mod tests {
             master_ci_timeout_secs: 1,
             allowed_tools: None,
             doctor_enabled: false,
+            resource_monitor: crate::resource_health::ResourceMonitorConfig::default(),
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
@@ -26053,6 +26084,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             master_ci_timeout_secs: 1,
             allowed_tools: None,
             doctor_enabled: false,
+            resource_monitor: crate::resource_health::ResourceMonitorConfig::default(),
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,

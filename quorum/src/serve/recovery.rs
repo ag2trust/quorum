@@ -1193,6 +1193,7 @@ mod tests {
             master_ci_timeout_secs: 1,
             allowed_tools: None,
             doctor_enabled: false,
+            resource_monitor: crate::resource_health::ResourceMonitorConfig::default(),
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
