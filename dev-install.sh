@@ -42,8 +42,15 @@ if [ "$VERIFY_ONLY" -eq 0 ]; then
   # --- Install -------------------------------------------------------------
   printf '=== Installing to %s ===\n' "$BINARY"
   mkdir -p "$INSTALL_DIR"
-  cp "$BUILT" "$BINARY"
-  chmod 0755 "$BINARY"
+  TEMP_BINARY=$(mktemp "$INSTALL_DIR/.quorum.tmp.XXXXXX") \
+    || err "could not create temporary binary in $INSTALL_DIR"
+  trap 'rm -f "$TEMP_BINARY"' EXIT HUP INT TERM
+  cp "$BUILT" "$TEMP_BINARY"
+  chmod 0755 "$TEMP_BINARY"
+  # Rename within the install directory so running processes retain their old
+  # executable inode and new launches see the complete, newly signed binary.
+  mv "$TEMP_BINARY" "$BINARY"
+  trap - EXIT HUP INT TERM
 fi
 
 # --- Agent skill (Claude Code) ----------------------------------------------
