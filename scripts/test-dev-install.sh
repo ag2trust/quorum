@@ -46,6 +46,10 @@ run_verify() {
   "$DEV_INSTALL" --verify-only >"$output_path" 2>&1
 }
 
+inode_of() {
+  stat -f '%i' "$1" 2>/dev/null || stat -c '%i' "$1"
+}
+
 printf 'test-dev-install: running tests\n\n'
 
 # `sync` is intentionally absent from the curated guide, but direct --help works.
@@ -77,6 +81,41 @@ if grep -Fq "installed binary lacks 'sync' subcommand — stale build?" "$fail_o
   pass "missing sync reports useful error"
 else
   fail "missing sync reports useful error"
+fi
+
+# Installing over a live executable must replace its directory entry rather
+# than rewriting the inode that macOS has already validated and mapped.
+printf '\ntest 3: install atomically replaces the existing binary inode\n'
+atomic_dir="$TMPDIR_TEST/atomic"
+atomic_install_dir="$atomic_dir/install"
+atomic_build_dir="$atomic_dir/build"
+atomic_fake_bin="$atomic_dir/bin"
+mkdir -p "$atomic_install_dir" "$atomic_build_dir/target/release" "$atomic_fake_bin"
+make_stub_quorum "$atomic_install_dir/quorum" 0 'old installed binary'
+make_stub_quorum "$atomic_build_dir/target/release/quorum" 0 'new built binary'
+cat > "$atomic_fake_bin/cargo" <<'STUB'
+#!/bin/sh
+[ "$#" -eq 2 ] && [ "$1" = "build" ] && [ "$2" = "--release" ]
+STUB
+chmod +x "$atomic_fake_bin/cargo"
+old_inode=$(inode_of "$atomic_install_dir/quorum")
+atomic_output="$atomic_dir/output"
+if (
+  cd "$atomic_build_dir"
+  PATH="$atomic_fake_bin:$PATH" \
+  QUORUM_INSTALL_DIR="$atomic_install_dir" \
+  QUORUM_SKILL_DIR="$TMPDIR_TEST/skills" \
+  "$DEV_INSTALL" >"$atomic_output" 2>&1
+); then
+  new_inode=$(inode_of "$atomic_install_dir/quorum")
+  if [ "$old_inode" != "$new_inode" ]; then
+    pass "install replaces the existing executable inode"
+  else
+    fail "install replaces the existing executable inode"
+  fi
+else
+  fail "atomic install completes successfully"
+  cat "$atomic_output"
 fi
 
 printf '\n%d tests: %d passed, %d failed\n' "$TESTS" "$PASS" "$FAIL"
