@@ -418,13 +418,14 @@ if git rev-parse --verify --quiet origin/develop >/dev/null \
   INTEGRATION=1
 fi
 # A normal feature branch may start from develop while develop temporarily
-# lags main. Recognize that shape from ancestry rather than its branch name:
-# develop must be reachable from the tip, and its fork point must be at least
-# as recent as main's. A branch from main fails the latter check; a branch
-# whose fork point is on neither base keeps the strict origin/main path.
+# lags main, or while develop advances after the branch was cut. Recognize
+# that shape from the fork-point relationship rather than requiring the
+# *current* develop tip to be reachable from TIP: develop's merge-base with
+# TIP must be at least as recent as main's. A branch from main fails that
+# check; a branch whose own commits stack sessions still fails below via
+# `rev-list TIP --not origin/main origin/develop`.
 if [ "$INTEGRATION" -eq 0 ] \
-  && git rev-parse --verify --quiet origin/develop >/dev/null \
-  && git merge-base --is-ancestor origin/develop "$TIP"; then
+  && git rev-parse --verify --quiet origin/develop >/dev/null; then
   DEVELOP_FORK=$(git merge-base "$TIP" origin/develop)
   MAIN_FORK=$(git merge-base "$TIP" origin/main)
   if git merge-base --is-ancestor "$MAIN_FORK" "$DEVELOP_FORK"; then
