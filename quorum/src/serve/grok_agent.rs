@@ -12,6 +12,7 @@ use super::runner::{
     WorkerTurnRequest,
 };
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{symlink, OpenOptionsExt};
@@ -26,7 +27,8 @@ use tokio::io::AsyncReadExt;
 use tokio::io::ReadBuf;
 use tokio::process::{Child, ChildStdout, Command};
 
-pub const SUPPORTED_MODEL: &str = "grok-4.5";
+pub const DEFAULT_MODEL: &str = "grok-4.5";
+pub const SUPPORTED_MODELS: &[&str] = &[DEFAULT_MODEL, "grok-4.6"];
 pub const SUPPORTED_EFFORTS: &[&str] = &["low", "medium", "high"];
 pub const DEFAULT_SANDBOX: &str = "off";
 pub const EXPLICIT_WORKSPACE_SANDBOX: &str = "workspace";
@@ -119,10 +121,11 @@ pub struct GrokSpec {
 
 impl GrokSpec {
     fn validate(&self) -> std::io::Result<()> {
-        if self.model != SUPPORTED_MODEL {
+        if !SUPPORTED_MODELS.contains(&self.model.as_str()) {
             return Err(invalid_input(format!(
-                "unsupported Grok model '{}': expected '{SUPPORTED_MODEL}'",
-                self.model
+                "unsupported Grok model '{}': expected one of {}",
+                self.model,
+                SUPPORTED_MODELS.join(", ")
             )));
         }
         if !SUPPORTED_EFFORTS.contains(&self.effort.as_str()) {
@@ -579,17 +582,64 @@ fn write_managed_config_layer(
 /// Apply the complete managed-MCP process boundary. Grok starts stdio MCP
 /// servers with its own environment, so removing authority at this process
 /// boundary also removes it from the nested `quorum agent-mcp` child.
-fn configure_managed_mcp_environment(command: &mut Command, home: &GrokMcpConfigHome) {
+fn requested_env<'a>(spec: &'a GrokSpec, key: &str) -> Option<&'a str> {
+    spec.env_vars
+        .iter()
+        .rev()
+        .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
+}
+
+fn inherited_env(spec: &GrokSpec, key: &str) -> Option<OsString> {
+    match requested_env(spec, key) {
+        Some(value) => (!value.is_empty()).then(|| OsString::from(value)),
+        None => std::env::var_os(key).filter(|value| !value.is_empty()),
+    }
+}
+
+fn real_home_for_child(spec: &GrokSpec) -> std::io::Result<PathBuf> {
+    inherited_env(spec, "HOME")
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf()))
+        .ok_or_else(|| invalid_input("cannot resolve home for managed Grok toolchain"))
+}
+
+fn configure_managed_mcp_environment(
+    command: &mut Command,
+    home: &GrokMcpConfigHome,
+    spec: &GrokSpec,
+) -> std::io::Result<()> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN", "QUORUM_HOME", "GH_CONFIG_DIR"] {
         command.env_remove(name);
     }
+    let real_home = real_home_for_child(spec)?;
+    let rustup_home = inherited_env(spec, "RUSTUP_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| real_home.join(".rustup"));
+    let cargo_home = inherited_env(spec, "CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| real_home.join(".cargo"));
+    let path = std::env::join_paths(
+        std::iter::once(cargo_home.join("bin")).chain(
+            inherited_env(spec, "PATH")
+                .as_deref()
+                .map(std::env::split_paths)
+                .into_iter()
+                .flatten(),
+        ),
+    )
+    .map_err(|error| invalid_input(format!("cannot set managed Grok toolchain PATH: {error}")))?;
     // `HOME` is used by the official compatibility loaders. Point it at the
     // private config home so an operator's ~/.claude.json or ~/.cursor/mcp.json
     // cannot leak a second MCP server into the managed run.
+    // Rustup still reads its selected toolchain from the operator home, so pin
+    // its homes and cargo's bin directory before remapping `HOME` below.
     command
         .env("GROK_HOME", home.path())
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
+        .env("RUSTUP_HOME", rustup_home)
+        .env("CARGO_HOME", cargo_home)
+        .env("PATH", path)
         // These are the provider's documented source gates. The environment
         // precedence makes them immune to settings in copied config layers.
         .env("GROK_CLAUDE_MCPS_ENABLED", "0")
@@ -597,6 +647,7 @@ fn configure_managed_mcp_environment(command: &mut Command, home: &GrokMcpConfig
         // Project .grok/.mcp sources are allowed only after an explicit trust
         // grant. The managed home intentionally carries no trust-store link.
         .env("GROK_FOLDER_TRUST", "1");
+    Ok(())
 }
 
 fn acquire_auth_lock(source_home: &std::path::Path) -> std::io::Result<std::fs::File> {
@@ -672,14 +723,7 @@ fn args_with_managed_sandbox(
 }
 
 fn grok_home_for_child(spec: &GrokSpec) -> std::io::Result<PathBuf> {
-    fn requested<'a>(spec: &'a GrokSpec, key: &str) -> Option<&'a str> {
-        spec.env_vars
-            .iter()
-            .rev()
-            .find_map(|(candidate, value)| (candidate == key).then_some(value.as_str()))
-    }
-
-    let grok_home = match requested(spec, "GROK_HOME") {
+    let grok_home = match requested_env(spec, "GROK_HOME") {
         Some(value) => (!value.is_empty()).then(|| PathBuf::from(value)),
         None => std::env::var_os("GROK_HOME")
             .filter(|value| !value.is_empty())
@@ -688,7 +732,7 @@ fn grok_home_for_child(spec: &GrokSpec) -> std::io::Result<PathBuf> {
     let path = if let Some(path) = grok_home {
         path
     } else {
-        let home = match requested(spec, "HOME") {
+        let home = match requested_env(spec, "HOME") {
             Some(value) => (!value.is_empty()).then(|| PathBuf::from(value)),
             None => std::env::var_os("HOME")
                 .filter(|value| !value.is_empty())
@@ -978,7 +1022,7 @@ impl GrokProc {
         // Its custom workspace profile grants the original Grok state root,
         // preserving durable session/auth writes through the linked entries.
         if let Some(home) = &mcp_config_home {
-            configure_managed_mcp_environment(&mut command, home);
+            configure_managed_mcp_environment(&mut command, home, spec)?;
         }
         command
             .current_dir(&spec.worktree)
@@ -1434,7 +1478,7 @@ mod tests {
 
     fn test_spec(worktree: &std::path::Path) -> GrokSpec {
         GrokSpec {
-            model: SUPPORTED_MODEL.into(),
+            model: DEFAULT_MODEL.into(),
             effort: "high".into(),
             worktree: worktree.to_path_buf(),
             prompt: "inspect the repository".into(),
@@ -1443,6 +1487,50 @@ mod tests {
             permission_mode: DEFAULT_PERMISSION_MODE.into(),
             max_turns: DEFAULT_MAX_TURNS,
         }
+    }
+
+    #[tokio::test]
+    async fn managed_mcp_toolchain_environment_keeps_cargo_and_rustup_available() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let real_home = std::env::var_os("HOME").expect("test runner must have a home");
+        let real_home_path = PathBuf::from(&real_home);
+        let expected_rustup_home = std::env::var_os("RUSTUP_HOME")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| real_home_path.join(".rustup").into_os_string());
+        let expected_cargo_home = std::env::var_os("CARGO_HOME")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| real_home_path.join(".cargo").into_os_string());
+        let source_grok_home = root.path().join("grok-home");
+        std::fs::create_dir_all(&source_grok_home).unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = vec![
+            ("HOME".into(), real_home.to_string_lossy().into_owned()),
+            ("GROK_HOME".into(), source_grok_home.display().to_string()),
+        ];
+        let managed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "test \"$HOME\" = \"$EXPECTED_MANAGED_HOME\" && \\
+                 test \"$RUSTUP_HOME\" = \"$EXPECTED_RUSTUP_HOME\" && \\
+                 test \"$CARGO_HOME\" = \"$EXPECTED_CARGO_HOME\" && \\
+                 case \":$PATH:\" in *\":$CARGO_HOME/bin:\"*) ;; *) exit 1;; esac && \\
+                 cargo --version && rustup show active-toolchain",
+            ])
+            .envs(spec.env_vars.iter().map(|(key, value)| (key, value)))
+            .env("EXPECTED_MANAGED_HOME", managed.path())
+            .env("EXPECTED_RUSTUP_HOME", expected_rustup_home)
+            .env("EXPECTED_CARGO_HOME", expected_cargo_home);
+        configure_managed_mcp_environment(&mut command, &managed, &spec).unwrap();
+        let output = command.current_dir(&spec.worktree).output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "cargo/rustup failed with managed Grok environment:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1775,15 +1863,19 @@ mod tests {
 
     #[test]
     fn continuation_argument_shape_is_pinned() {
-        let spec = test_spec(std::path::Path::new("/tmp/repo"));
-        let args = resume_args("019f-session", &spec).unwrap();
-        assert_eq!(
-            &args[..4],
-            ["--resume", "019f-session", "-p", "inspect the repository"]
-        );
-        assert!(args.windows(2).any(|pair| pair == ["--sandbox", "off"]));
-        assert!(!args.iter().any(|arg| arg.contains("allowedTools")));
-        assert!(!args.iter().any(|arg| arg == "--bare"));
+        let mut spec = test_spec(std::path::Path::new("/tmp/repo"));
+        for model in SUPPORTED_MODELS {
+            spec.model = (*model).into();
+            let args = resume_args("019f-session", &spec).unwrap();
+            assert_eq!(
+                &args[..4],
+                ["--resume", "019f-session", "-p", "inspect the repository"]
+            );
+            assert!(args.windows(2).any(|pair| pair == ["--model", *model]));
+            assert!(args.windows(2).any(|pair| pair == ["--sandbox", "off"]));
+            assert!(!args.iter().any(|arg| arg.contains("allowedTools")));
+            assert!(!args.iter().any(|arg| arg == "--bare"));
+        }
     }
 
     #[test]
@@ -1869,12 +1961,17 @@ mod tests {
     fn models_efforts_and_unsupported_safety_combinations_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
         let mut spec = test_spec(dir.path());
-        spec.model = "grok-future".into();
+        for model in SUPPORTED_MODELS {
+            spec.model = (*model).into();
+            let args = headless_args(&spec, LaunchMode::Normal).unwrap();
+            assert!(args.windows(2).any(|pair| pair == ["--model", *model]));
+        }
+        spec.model = "grok-4.7".into();
         assert_eq!(
             headless_args(&spec, LaunchMode::Normal).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
         );
-        spec.model = SUPPORTED_MODEL.into();
+        spec.model = DEFAULT_MODEL.into();
         spec.effort = "xhigh".into();
         assert!(headless_args(&spec, LaunchMode::Normal).is_err());
         spec.effort = "high".into();
@@ -2212,16 +2309,21 @@ mod tests {
         let mut spec = test_spec(worktree.path());
         spec.prompt = "noop".into();
         spec.env_vars = no_auth_env(root.path());
-        let args = headless_args(&spec, LaunchMode::Normal).unwrap();
-        let mut proc = GrokProc::spawn_command(
-            &spec,
-            &args,
-            Some(crate::serve::runner::AGENT_MCP_SERVER),
-            None,
-        )
-        .expect("spawn grok with invocation-local MCP config");
-        let _lines = wait_for_real_cli_terminal_failure(&mut proc).await;
-        proc.kill_and_reap().await;
+        for model in SUPPORTED_MODELS {
+            spec.model = (*model).into();
+            let args = headless_args(&spec, LaunchMode::Normal).unwrap();
+            let mut proc = GrokProc::spawn_command(
+                &spec,
+                &args,
+                Some(crate::serve::runner::AGENT_MCP_SERVER),
+                None,
+            )
+            .unwrap_or_else(|error| {
+                panic!("spawn {model} with invocation-local MCP config: {error}")
+            });
+            let _lines = wait_for_real_cli_terminal_failure(&mut proc).await;
+            proc.kill_and_reap().await;
+        }
     }
 
     #[cfg(unix)]

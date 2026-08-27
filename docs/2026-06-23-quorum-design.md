@@ -1859,7 +1859,7 @@ emulation of Claude `allowedTools`/`bare`/hooks or Codex flags.
 First turn, conceptually:
 
 ```text
-grok -p <prompt> --output-format streaming-json --model grok-4.5
+grok -p <prompt> --output-format streaming-json --model <grok-4.5|grok-4.6>
   --reasoning-effort <low|medium|high>
   --permission-mode bypassPermissions --sandbox <off|workspace>
   --max-turns <1..256> --verbatim
@@ -1869,7 +1869,7 @@ Continuation, conceptually:
 
 ```text
 grok --resume <session-id> -p <prompt> --output-format streaming-json
-  --model grok-4.5 --reasoning-effort <low|medium|high>
+  --model <grok-4.5|grok-4.6> --reasoning-effort <low|medium|high>
   --permission-mode bypassPermissions --sandbox <off|workspace>
   --max-turns <1..256> --verbatim
 ```
@@ -1909,15 +1909,16 @@ the session identity late, so no continuation may be relied on before `end`.
 
 #### Grok discovery record
 
-**Verified facts (2026-08-05):**
+**Verified facts (2026-08-26):**
 
 - The installed official executable resolved to `~/.grok/bin/grok` and reported
-  `grok 0.2.114 (0c785038798)`. Its help exposes `-p`/`--single`,
+  `grok 1.0.5 (5115b46bc909)`. Its help exposes `-p`/`--single`,
   `--output-format streaming-json`, `--resume`, `--model`,
   `--reasoning-effort`, `--permission-mode`, `--sandbox`, and `--max-turns`.
-- The installed catalog exposed only `grok-4.5`; its supported effort choices were
-  `low`, `medium`, and `high` (`high` default). The adapter therefore treats both
-  vocabularies as closed rather than forwarding future strings optimistically.
+- The installed catalog exposed `grok-4.6` (default) and `grok-4.5`; its supported
+  effort choices were `low`, `medium`, and `high` (`high` default). The adapter
+  therefore treats both vocabularies as closed rather than forwarding future strings
+  optimistically.
 - Native `streaming-json` is newline-delimited, type-tagged JSON. Official source and
   documentation define `thought`, `text`, `tool_call`, `tool_call_update`, `usage`,
   lifecycle/activity events, terminal `end`, and `error`. The successful `end` line is
@@ -2125,10 +2126,10 @@ sandbox, and the Grok state-root read/write grant are preserved for that opt-in 
 Broader Grok lifecycle validation (remediation, R1, R2, restart, shutdown, mailbox, and
 cost-limit canaries) remains outstanding as recorded below.
 
-`grok-4.5` may be selected only by a worker routing pool. Planner, arbiter, reviewer,
-classifier, and collector Grok selections are rejected at startup. The `[routing.arbiter]`
-pool selects the plan-review Arbiter and defaults to the planner pool when omitted, so an
-existing configuration without it keeps working. The `[grok]`
+`grok-4.5` and `grok-4.6` may be selected only by worker routing pools. Planner,
+arbiter, reviewer, classifier, and collector Grok selections are rejected at startup. The
+`[routing.arbiter]` pool selects the plan-review Arbiter and defaults to the planner pool
+when omitted, so an existing configuration without it keeps working. The `[grok]`
 section pins the adapter safety profile for those managed worker launches.
 
 Never infer runner kind from the executable filename. Existing top-level
@@ -2453,8 +2454,8 @@ labels are ignored.
   creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`
   model), `AgentKind::Codex` (known OpenAI models including `gpt-5*`), or the exact
-  `AgentKind::Grok` model `grok-4.5`. Managed worker resolution accepts Grok;
-  planner, reviewer, classifier, and collector routing reject it.
+  `AgentKind::Grok` models `grok-4.5` and `grok-4.6`. Managed worker resolution accepts
+  Grok; planner, arbiter, reviewer, classifier, and collector routing reject it.
 - The resolved provider, model, and effort are persisted in `agent_runs.provider`
   so continuation and recovery cannot switch providers mid-task.
 - A new R1 or R2 assignment selects from the complexity-specific reviewer pool. Review

@@ -240,8 +240,30 @@ chmod +x scripts/preflight/timing.sh
 PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/develop-feature.out"
 grep -q 'PREFLIGHT: PASS (quick' "$TMP/develop-feature.out"
 
+# After the branch was cut, develop may advance with a different session.
+# Gate 1 must still treat the tip as develop-based and count only branch-owned
+# commits (not the newly merged develop history).
+DEVELOP_CUT=$(git rev-parse origin/develop)
+git switch -q --detach "$DEVELOP_CUT"
+git switch -qc daemon/tester-t2-advanced
+printf 'feature while develop advances\n' > feature-advanced
+git add feature-advanced
+git commit -qm 'feature while develop advances' \
+  -m 'Co-Authored-By: Feature-advanced-agent <feature-advanced@example.invalid>'
+git switch -q develop
+printf 'develop advanced elsewhere\n' >> state
+git commit -qam 'develop advanced after cut' \
+  -m 'Co-Authored-By: Develop-advanced-agent <develop-advanced@example.invalid>'
+git push -q origin develop
+git switch -q daemon/tester-t2-advanced
+PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/develop-advanced.out"
+grep -q 'PREFLIGHT: PASS (quick' "$TMP/develop-advanced.out"
+grep -q 'develop-based branch-owned commits' "$TMP/develop-advanced.out"
+! grep -q 'sessions in branch-owned commits' "$TMP/develop-advanced.out"
+
 # A branch cut from that feature still has both sessions in its develop-owned
 # range and must be rejected as feature-on-feature stacking.
+git switch -q daemon/tester-t2
 git switch -qc daemon/tester-t3
 printf 'stacked feature\n' >> feature
 git commit -qam 'stacked feature work' \
@@ -252,7 +274,8 @@ if PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/develop-stacked.out" 2>&1; th
 fi
 grep -q 'sessions in branch-owned commits' "$TMP/develop-stacked.out"
 
-# A normal main-based branch retains the existing single-session pass path.
+# A normal main-based branch retains the existing single-session pass path
+# while develop still lags main (strict origin/main..TIP path).
 git switch -q --detach origin/main
 git switch -qc daemon/tester-t4
 printf 'main feature\n' > main-feature
@@ -261,6 +284,30 @@ git commit -qm 'main feature work' \
   -m 'Co-Authored-By: Main-feature-agent <main-feature@example.invalid>'
 PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/main-feature.out"
 grep -q 'PREFLIGHT: PASS (quick' "$TMP/main-feature.out"
+grep -q 'commits ahead of origin/main' "$TMP/main-feature.out"
+
+# Without origin/develop, recognition stays on the strict origin/main path.
+# Delete the remote tip too — preflight fetches before gate 1 and would
+# otherwise restore refs/remotes/origin/develop from the bare origin.
+DEVELOP_TIP=$(git rev-parse origin/develop)
+git push -q origin :refs/heads/develop
+git update-ref -d refs/remotes/origin/develop
+git switch -q --detach origin/main
+git switch -qc daemon/tester-t4-no-develop
+printf 'main feature without develop\n' > main-feature-no-develop
+git add main-feature-no-develop
+git commit -qm 'main feature without develop' \
+  -m 'Co-Authored-By: Main-no-develop-agent <main-no-develop@example.invalid>'
+PATH="$BIN:$PATH" ./preflight.sh --quick >"$TMP/main-no-develop.out"
+grep -q 'PREFLIGHT: PASS (quick' "$TMP/main-no-develop.out"
+grep -q 'commits ahead of origin/main' "$TMP/main-no-develop.out"
+! grep -q 'develop-based branch-owned commits' "$TMP/main-no-develop.out"
+# Restore develop for later fixture coverage that needs both remote tips.
+git push -q origin "$DEVELOP_TIP:refs/heads/develop"
+git fetch -q origin develop:refs/remotes/origin/develop
+git branch -f develop origin/develop
+git switch -q develop
+git reset -q --hard origin/develop
 
 # Install the real hook and prove its standard stdin tuple against a bare
 # remote. The daemon publishes an exact SHA rather than a same-named local ref,
