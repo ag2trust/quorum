@@ -302,6 +302,19 @@ pub fn insert_alternate_with_attribution(
         ));
     }
 
+    // Recompute the exclusion set inside the write transaction before the
+    // reuse path. A token whose selected profile has since been classified as
+    // provider-/profile-unavailable must be rejected as expired even when a
+    // prior attributed row still exists — otherwise a replay after later
+    // routing evidence would silently return the stale row instead of failing
+    // closed. The historical row is left in place; only the replay is refused.
+    let current = exclusions(&tx, token.responsibility_key())?;
+    if current.excludes(token.profile()) {
+        return Err(QuorumError::Io(
+            "attributed alternate route was invalidated by later routing evidence".into(),
+        ));
+    }
+
     // Reuse: an existing row for the same (assignment, configured profile) is
     // authoritative. Verify it agrees with the token before returning, so a
     // replay with tampered evidence still fails closed.
@@ -325,16 +338,6 @@ pub fn insert_alternate_with_attribution(
         }
         tx.commit().map_err(map_sql_err)?;
         return Ok(id);
-    }
-
-    // Recompute the exclusion set inside the write transaction so a later
-    // classified attempt that invalidates this alternate cannot slip through as
-    // an expired token.
-    let current = exclusions(&tx, token.responsibility_key())?;
-    if current.excludes(token.profile()) {
-        return Err(QuorumError::Io(
-            "attributed alternate route was invalidated by later routing evidence".into(),
-        ));
     }
 
     let profile = token.profile();
@@ -1596,6 +1599,69 @@ mod tests {
                 insert_alternate_with_attribution(&mut c, &taskless_token, "Alice", 100),
                 Err(QuorumError::Usage(_))
             ));
+        }
+
+        #[test]
+        fn replay_after_selected_profile_becomes_unavailable_rejects_and_preserves_history() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let responsibility = "worker:task:57";
+            seed_worker_assignment(&c, 57, 57, &pool, responsibility);
+
+            let token = issue_alternate_token(
+                &mut c,
+                57,
+                responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProfileUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(57),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+            // The initial attribution creates the historical row.
+            let first = insert_alternate_with_attribution(&mut c, &token, "Alice", 100).unwrap();
+
+            // Later, the alternate's selected profile is itself classified as
+            // profile-unavailable — the exact scenario an alternate route
+            // encounters when it also fails.
+            record(
+                &mut c,
+                &RecordRoutingAttempt {
+                    role_assignment_id: 57,
+                    responsibility_key: responsibility,
+                    profile: token.profile(),
+                    failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                    recorded_at: 20,
+                },
+                &pool,
+            )
+            .unwrap();
+
+            // Replaying the now-expired token must fail closed rather than
+            // returning the pre-existing row through the reuse path.
+            let replay = insert_alternate_with_attribution(&mut c, &token, "Alice", 100);
+            assert!(replay.is_err(), "expired-token replay must be rejected");
+
+            // The historical row survives — expiring the token invalidates the
+            // replay authority, not the immutable evidence of the earlier run.
+            let preserved = fetch_configured_route(&c, 57, &token.profile().id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(preserved.id, first);
+            let rows: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM agent_runs
+                     WHERE role_assignment_id=57 AND configured_profile_id IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 1);
         }
 
         #[test]
