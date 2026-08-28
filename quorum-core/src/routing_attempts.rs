@@ -1,7 +1,8 @@
 //! Immutable responsibility-scoped provider-route attempt evidence.
 //!
-//! This module records evidence only. It does not select or launch routes and
-//! does not mutate role assignments, routing allocation, or task lifecycle.
+//! This module records evidence and derives read-only alternate-route choices.
+//! It never launches routes or mutates role assignments, routing allocation, or
+//! task lifecycle.
 
 use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
@@ -102,6 +103,14 @@ impl RecordOutcome {
 pub struct RouteExclusions {
     providers: BTreeSet<String>,
     profiles: BTreeSet<String>,
+}
+
+/// Read-only result of selecting an alternate route from an immutable pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlternateRoute {
+    Selected(ModelProfile),
+    Exhausted,
+    MismatchedGeneration,
 }
 
 impl RouteExclusions {
@@ -221,6 +230,44 @@ pub fn exclusions(conn: &Connection, responsibility_key: &str) -> Result<RouteEx
     Ok(result)
 }
 
+/// Select the highest-priority executable profile from an assignment's exact pool generation.
+///
+/// This pure primitive never records an attempt, advances the weighted allocation cursor, or
+/// mutates the assignment. Exclusions are the caller's persisted, responsibility-scoped
+/// evidence from [`exclusions`]. All positive-weight profiles remain eligible candidates;
+/// percentage only orders them, descending with profile ID as the stable tie-breaker.
+pub fn select_alternate(
+    assignment: &RoleAssignment,
+    eligible_pool: &ValidatedPool,
+    excluded: &RouteExclusions,
+) -> Result<AlternateRoute> {
+    eligible_pool.validate()?;
+    if !assignment.matches_pool_generation(eligible_pool) {
+        return Ok(AlternateRoute::MismatchedGeneration);
+    }
+    if !pool_contains_exact(eligible_pool, &assignment.profile_snapshot()) {
+        return Err(QuorumError::Io(
+            "routing pool does not contain the assigned profile snapshot".into(),
+        ));
+    }
+
+    let mut candidates: Vec<_> = eligible_pool
+        .profiles
+        .iter()
+        .filter(|weighted| !excluded.excludes(&weighted.profile))
+        .collect();
+    candidates.sort_by(|left, right| {
+        right
+            .percent
+            .cmp(&left.percent)
+            .then_with(|| left.profile.id.cmp(&right.profile.id))
+    });
+    Ok(candidates
+        .first()
+        .map(|weighted| AlternateRoute::Selected(weighted.profile.clone()))
+        .unwrap_or(AlternateRoute::Exhausted))
+}
+
 fn validate_assignment(
     assignment: &RoleAssignment,
     input: &RecordRoutingAttempt<'_>,
@@ -235,13 +282,7 @@ fn validate_assignment(
         ));
     }
 
-    let assigned = ModelProfile {
-        id: assignment.profile_id.clone(),
-        provider: assignment.provider.clone(),
-        runner: assignment.runner.clone(),
-        model: assignment.model.clone(),
-        effort: assignment.effort.clone(),
-    };
+    let assigned = assignment.profile_snapshot();
     if !pool_contains_exact(pool, &assigned) {
         return Err(QuorumError::Io(
             "routing pool does not contain the assigned profile snapshot".into(),
@@ -379,6 +420,35 @@ mod tests {
         }
     }
 
+    fn two_profile_pool(first_percent: u8, first_id: &str, second_id: &str) -> ValidatedPool {
+        ValidatedPool {
+            pool_key: "worker.M".into(),
+            policy_generation: "generation-1".into(),
+            profiles: vec![
+                crate::role_assignments::WeightedProfile {
+                    profile: ModelProfile {
+                        id: first_id.into(),
+                        provider: "claude".into(),
+                        runner: "claude".into(),
+                        model: format!("{first_id}-model"),
+                        effort: "high".into(),
+                    },
+                    percent: first_percent,
+                },
+                crate::role_assignments::WeightedProfile {
+                    profile: ModelProfile {
+                        id: second_id.into(),
+                        provider: "codex".into(),
+                        runner: "codex".into(),
+                        model: format!("{second_id}-model"),
+                        effort: "high".into(),
+                    },
+                    percent: 100 - first_percent,
+                },
+            ],
+        }
+    }
+
     fn insert_assignment(conn: &Connection, id: i64, responsibility: &str, task_id: i64) {
         conn.execute(
             "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
@@ -393,6 +463,42 @@ mod tests {
              VALUES (?1,?2,?3,'worker','M','opus','claude','claude',
                      'claude-opus-4-8','high','worker.M','generation-1',1)",
             params![id, responsibility, task_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_assignment_for_pool(
+        conn: &Connection,
+        id: i64,
+        responsibility: &str,
+        task_id: i64,
+        pool: &ValidatedPool,
+        profile_index: usize,
+    ) {
+        let profile = &pool.profiles[profile_index].profile;
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+             VALUES (?1,'routing fixture','working','test',1,1)",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,complexity,profile_id,provider,runner,
+                 model,effort,pool_key,policy_generation,created_at)
+             VALUES (?1,?2,?3,'worker','M',?4,?5,?6,?7,?8,?9,?10,1)",
+            params![
+                id,
+                responsibility,
+                task_id,
+                profile.id,
+                profile.provider,
+                profile.runner,
+                profile.model,
+                profile.effort,
+                pool.pool_key,
+                pool.policy_generation,
+            ],
         )
         .unwrap();
     }
@@ -466,6 +572,215 @@ mod tests {
         assert!(profile.excludes(&pool.profiles[0].profile));
         assert!(!profile.excludes(&pool.profiles[1].profile));
         assert!(!profile.excludes(&pool.profiles[2].profile));
+    }
+
+    #[test]
+    fn alternate_selection_prioritizes_every_positive_weight_without_allocation_mutation() {
+        for (first_percent, expected_initial) in [(99, "primary"), (1, "alternate")] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut conn = crate::db::open(&dir.path().join("selection.db")).unwrap();
+            let pool = two_profile_pool(first_percent, "primary", "alternate");
+            insert_assignment_for_pool(&conn, 1, "worker:task:1", 1, &pool, 0);
+            let assignment = crate::role_assignments::get(&conn, 1).unwrap().unwrap();
+            let cursor_count: i64 = conn
+                .query_row("SELECT count(*) FROM routing_cursors", [], |row| row.get(0))
+                .unwrap();
+
+            assert_eq!(
+                select_alternate(&assignment, &pool, &RouteExclusions::default()).unwrap(),
+                AlternateRoute::Selected(
+                    pool.profiles
+                        .iter()
+                        .find(|entry| entry.profile.id == expected_initial)
+                        .unwrap()
+                        .profile
+                        .clone()
+                )
+            );
+
+            record_profile(
+                &mut conn,
+                1,
+                "worker:task:1",
+                &pool,
+                0,
+                Some(FailureDisposition::ProfileUnavailable),
+                10,
+            )
+            .unwrap();
+            assert_eq!(
+                select_alternate(
+                    &assignment,
+                    &pool,
+                    &exclusions(&conn, "worker:task:1").unwrap()
+                )
+                .unwrap(),
+                AlternateRoute::Selected(pool.profiles[1].profile.clone()),
+                "a positive one-percent profile remains a fallback candidate"
+            );
+            assert_eq!(
+                crate::role_assignments::get(&conn, 1).unwrap(),
+                Some(assignment)
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM routing_cursors", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                cursor_count
+            );
+        }
+    }
+
+    #[test]
+    fn alternate_selection_uses_stable_profile_id_ties_and_exhaustion() {
+        let pool = two_profile_pool(50, "zeta", "alpha");
+        let assignment = RoleAssignment {
+            id: 1,
+            responsibility_key: "worker:task:1".into(),
+            task_id: Some(1),
+            pr_number: None,
+            role: "worker".into(),
+            review_stage: None,
+            complexity: Some("M".into()),
+            profile_id: "zeta".into(),
+            provider: "claude".into(),
+            runner: "claude".into(),
+            model: "zeta-model".into(),
+            effort: "high".into(),
+            pool_key: pool.pool_key.clone(),
+            policy_generation: pool.policy_generation.clone(),
+            created_at: 1,
+        };
+        assert_eq!(
+            select_alternate(&assignment, &pool, &RouteExclusions::default()).unwrap(),
+            AlternateRoute::Selected(pool.profiles[1].profile.clone())
+        );
+
+        let excluded = RouteExclusions {
+            providers: BTreeSet::from(["claude".into(), "codex".into()]),
+            profiles: BTreeSet::new(),
+        };
+        assert_eq!(
+            select_alternate(&assignment, &pool, &excluded).unwrap(),
+            AlternateRoute::Exhausted
+        );
+    }
+
+    #[test]
+    fn alternate_selection_applies_provider_and_profile_exclusions_and_fails_closed() {
+        let pool = ValidatedPool {
+            pool_key: "worker.M".into(),
+            policy_generation: "generation-1".into(),
+            profiles: vec![
+                crate::role_assignments::WeightedProfile {
+                    profile: ModelProfile {
+                        id: "opus".into(),
+                        provider: "claude".into(),
+                        runner: "claude".into(),
+                        model: "opus-model".into(),
+                        effort: "high".into(),
+                    },
+                    percent: 50,
+                },
+                crate::role_assignments::WeightedProfile {
+                    profile: ModelProfile {
+                        id: "sonnet".into(),
+                        provider: "claude".into(),
+                        runner: "claude".into(),
+                        model: "sonnet-model".into(),
+                        effort: "high".into(),
+                    },
+                    percent: 30,
+                },
+                crate::role_assignments::WeightedProfile {
+                    profile: ModelProfile {
+                        id: "sol".into(),
+                        provider: "codex".into(),
+                        runner: "codex".into(),
+                        model: "sol-model".into(),
+                        effort: "high".into(),
+                    },
+                    percent: 20,
+                },
+            ],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("exclusions.db")).unwrap();
+        insert_assignment_for_pool(&conn, 1, "worker:provider", 1, &pool, 0);
+        insert_assignment_for_pool(&conn, 2, "worker:profile", 2, &pool, 0);
+        let provider_assignment = crate::role_assignments::get(&conn, 1).unwrap().unwrap();
+        let profile_assignment = crate::role_assignments::get(&conn, 2).unwrap().unwrap();
+
+        record_profile(
+            &mut conn,
+            1,
+            "worker:provider",
+            &pool,
+            0,
+            Some(FailureDisposition::ProviderUnavailable),
+            10,
+        )
+        .unwrap();
+        record_profile(
+            &mut conn,
+            2,
+            "worker:profile",
+            &pool,
+            0,
+            Some(FailureDisposition::ProfileUnavailable),
+            11,
+        )
+        .unwrap();
+        assert_eq!(
+            select_alternate(
+                &provider_assignment,
+                &pool,
+                &exclusions(&conn, "worker:provider").unwrap()
+            )
+            .unwrap(),
+            AlternateRoute::Selected(pool.profiles[2].profile.clone())
+        );
+        assert_eq!(
+            select_alternate(
+                &profile_assignment,
+                &pool,
+                &exclusions(&conn, "worker:profile").unwrap()
+            )
+            .unwrap(),
+            AlternateRoute::Selected(pool.profiles[1].profile.clone())
+        );
+
+        let mismatched = ValidatedPool {
+            policy_generation: "generation-2".into(),
+            ..pool.clone()
+        };
+        assert_eq!(
+            select_alternate(
+                &provider_assignment,
+                &mismatched,
+                &RouteExclusions::default()
+            )
+            .unwrap(),
+            AlternateRoute::MismatchedGeneration
+        );
+
+        let invalid = ValidatedPool {
+            profiles: vec![
+                crate::role_assignments::WeightedProfile {
+                    percent: 100,
+                    ..pool.profiles[0].clone()
+                },
+                crate::role_assignments::WeightedProfile {
+                    percent: 0,
+                    ..pool.profiles[1].clone()
+                },
+            ],
+            ..pool.clone()
+        };
+        assert!(matches!(
+            select_alternate(&provider_assignment, &invalid, &RouteExclusions::default()),
+            Err(QuorumError::Usage(_))
+        ));
     }
 
     #[test]
