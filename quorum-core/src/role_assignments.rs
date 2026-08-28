@@ -71,6 +71,21 @@ pub struct AssignmentRequest {
     pub complexity: Option<String>,
 }
 
+/// Immutable responsibility identity supplied by a prospective evidence writer.
+///
+/// This deliberately excludes route fields: those are checked against the
+/// assignment's executable snapshot separately. Keeping the lifecycle identity
+/// together prevents a valid route from being attributed to a different task,
+/// responsibility, PR, or reviewer stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssignmentIdentity<'a> {
+    pub task_id: Option<i64>,
+    pub responsibility_key: &'a str,
+    pub role: &'a str,
+    pub pr_number: Option<i64>,
+    pub review_stage: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleAssignment {
     pub id: i64,
@@ -105,6 +120,16 @@ impl RoleAssignment {
     /// Whether a pool is the exact policy generation that created this assignment.
     pub fn matches_pool_generation(&self, pool: &ValidatedPool) -> bool {
         self.pool_key == pool.pool_key && self.policy_generation == pool.policy_generation
+    }
+
+    /// Whether caller-supplied lifecycle identity is the immutable identity of
+    /// this assignment.
+    pub fn matches_identity(&self, identity: &AssignmentIdentity<'_>) -> bool {
+        self.task_id == identity.task_id
+            && self.responsibility_key == identity.responsibility_key
+            && self.role == identity.role
+            && self.pr_number == identity.pr_number
+            && self.review_stage.as_deref() == identity.review_stage
     }
 }
 
@@ -184,6 +209,28 @@ impl AssignmentRequest {
         }
         if let Some(complexity) = &self.complexity {
             validate_text("complexity", complexity)?;
+        }
+        Ok(())
+    }
+}
+
+impl AssignmentIdentity<'_> {
+    pub fn validate(&self) -> Result<()> {
+        validate_text("responsibility key", self.responsibility_key)?;
+        if !matches!(
+            self.role,
+            "classifier" | "planner" | "arbiter" | "worker" | "reviewer" | "collector"
+        ) {
+            return usage("invalid managed role");
+        }
+        match (self.role, self.review_stage) {
+            ("reviewer", Some("r1" | "r2")) => {}
+            ("reviewer", _) => return usage("reviewer identity requires r1 or r2 stage"),
+            (_, None) => {}
+            (_, Some(_)) => return usage("only reviewer identities may have a review stage"),
+        }
+        if self.task_id.is_some_and(|id| id <= 0) || self.pr_number.is_some_and(|id| id <= 0) {
+            return usage("assignment identity task and PR ids must be positive");
         }
         Ok(())
     }
@@ -936,6 +983,30 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn assignment_identity_is_bounded_and_requires_exact_pr_stage_semantics() {
+        let valid = AssignmentIdentity {
+            task_id: Some(7),
+            responsibility_key: "reviewer:task:7:pr:12:r1",
+            role: "reviewer",
+            pr_number: Some(12),
+            review_stage: Some("r1"),
+        };
+        valid.validate().unwrap();
+        assert!(AssignmentIdentity {
+            review_stage: Some("r3"),
+            ..valid
+        }
+        .validate()
+        .is_err());
+        assert!(AssignmentIdentity {
+            task_id: Some(0),
+            ..valid
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
