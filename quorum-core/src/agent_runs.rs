@@ -1077,6 +1077,8 @@ mod tests {
         };
         use std::sync::{Arc, Barrier};
 
+        const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
         fn worker_pool() -> ValidatedPool {
             ValidatedPool {
                 pool_key: "worker.M".into(),
@@ -1984,6 +1986,7 @@ mod tests {
                 agent_run_id,
                 "alternate-capability",
                 "Alternate",
+                None,
                 101,
             )
             .unwrap()
@@ -2021,6 +2024,7 @@ mod tests {
                 agent_run_id,
                 "alternate-capability",
                 "Alternate",
+                None,
                 999,
             )
             .unwrap()
@@ -2037,6 +2041,130 @@ mod tests {
                 assignment_before,
                 "fallback capability issuance must not alter assignment/allocation evidence"
             );
+        }
+
+        #[test]
+        fn attributed_reviewer_capabilities_atomically_bind_r1_and_r2_launch_authority() {
+            let (_d, mut c) = open_tmp();
+
+            for (task_id, stage, agent, capability_run_id) in [
+                (106, "r1", "R1-Alternate", "r1-alternate-capability"),
+                (107, "r2", "R2-Alternate", "r2-alternate-capability"),
+            ] {
+                let pr = 800 + task_id;
+                let pool = ValidatedPool {
+                    pool_key: format!("reviewer.M.{stage}"),
+                    policy_generation: "gen-1".into(),
+                    ..worker_pool()
+                };
+                let responsibility = format!("reviewer:task:{task_id}:pr:{pr}:{stage}");
+                seed_reviewer_assignment(&c, task_id, task_id, pr, stage, &pool, &responsibility);
+                c.execute(
+                    "UPDATE tasks
+                     SET status='in-review',reviewer=?2,refs=json_object('pr',?3)
+                     WHERE id=?1",
+                    params![task_id, agent, pr],
+                )
+                .unwrap();
+                let token = issue_alternate_token(
+                    &mut c,
+                    task_id,
+                    &responsibility,
+                    &pool,
+                    0,
+                    FailureDisposition::ProviderUnavailable,
+                    AssignmentIdentity {
+                        task_id: Some(task_id),
+                        responsibility_key: &responsibility,
+                        role: "reviewer",
+                        pr_number: Some(pr),
+                        review_stage: Some(stage),
+                    },
+                );
+
+                let tx = begin_immediate(&mut c).unwrap();
+                let agent_run_id =
+                    insert_alternate_with_attribution_tx(&tx, &token, agent, task_id).unwrap();
+                let capability = crate::capabilities::issue_attributed_alternate_tx(
+                    &tx,
+                    &token,
+                    agent_run_id,
+                    capability_run_id,
+                    agent,
+                    Some(crate::capabilities::ReviewerLaunchEvidence {
+                        pr,
+                        head_sha: REVIEW_SHA,
+                    }),
+                    task_id + 1,
+                )
+                .unwrap()
+                .expect("an attributed reviewer with an exact launch target is authorized");
+                tx.commit().unwrap();
+
+                let launch: (String, i64, String, Option<String>) = c
+                    .query_row(
+                        "SELECT review_cap_run_id,review_pr,review_head_sha,sub_role
+                         FROM agent_runs WHERE id=?1",
+                        [agent_run_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .unwrap();
+                assert_eq!(launch.0, capability_run_id);
+                assert_eq!(launch.1, pr);
+                assert_eq!(launch.2, REVIEW_SHA);
+                assert_eq!(launch.3.as_deref(), (stage == "r2").then_some("r2"));
+                assert_eq!(capability.agent_run_id, Some(agent_run_id));
+
+                let context = crate::capabilities::resolve_live_run_context(
+                    &c,
+                    capability_run_id,
+                    "reviewer",
+                )
+                .unwrap();
+                assert_eq!(context.agent_run_id, agent_run_id);
+                assert_eq!(context.pr, Some(pr));
+                assert_eq!(context.review_revision.as_deref(), Some(REVIEW_SHA));
+
+                let replay = crate::capabilities::issue_attributed_alternate(
+                    &mut c,
+                    &token,
+                    agent_run_id,
+                    capability_run_id,
+                    agent,
+                    Some(crate::capabilities::ReviewerLaunchEvidence {
+                        pr,
+                        head_sha: REVIEW_SHA,
+                    }),
+                    999,
+                )
+                .unwrap()
+                .expect("the exact reviewer capability replay must converge");
+                assert_eq!(replay.created_at, task_id + 1);
+                assert!(crate::capabilities::issue_attributed_alternate(
+                    &mut c,
+                    &token,
+                    agent_run_id,
+                    capability_run_id,
+                    agent,
+                    Some(crate::capabilities::ReviewerLaunchEvidence {
+                        pr,
+                        head_sha: "fedcba9876543210fedcba9876543210fedcba98",
+                    }),
+                    1000,
+                )
+                .unwrap()
+                .is_none());
+                assert_eq!(
+                    c.query_row(
+                        "SELECT review_head_sha FROM agent_runs WHERE id=?1",
+                        [agent_run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                    REVIEW_SHA,
+                    "a replay mismatch must not overwrite the immutable reviewer target"
+                );
+            }
         }
 
         #[test]
@@ -2071,6 +2199,7 @@ mod tests {
                 worker_run,
                 "wrong-agent",
                 "Other-Agent",
+                None,
                 101,
             )
             .unwrap()
@@ -2093,6 +2222,7 @@ mod tests {
                 worker_run,
                 "cross-task",
                 "Alternate",
+                None,
                 102,
             )
             .unwrap()
@@ -2113,6 +2243,7 @@ mod tests {
                 worker_run,
                 "cross-route",
                 "Alternate",
+                None,
                 103,
             )
             .unwrap()
@@ -2151,6 +2282,17 @@ mod tests {
             let reviewer_run =
                 insert_alternate_with_attribution(&mut c, &reviewer_token, "R2-Alternate", 104)
                     .unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &reviewer_token,
+                reviewer_run,
+                "missing-launch-evidence",
+                "R2-Alternate",
+                None,
+                105,
+            )
+            .unwrap()
+            .is_none());
             c.execute(
                 "UPDATE role_assignments SET review_stage='r1' WHERE id=104",
                 [],
@@ -2162,6 +2304,10 @@ mod tests {
                 reviewer_run,
                 "cross-stage",
                 "R2-Alternate",
+                Some(crate::capabilities::ReviewerLaunchEvidence {
+                    pr: 88,
+                    head_sha: REVIEW_SHA,
+                }),
                 105,
             )
             .unwrap()
@@ -2220,6 +2366,7 @@ mod tests {
                         agent_run_id,
                         &format!("contender-{contender}"),
                         "Alternate",
+                        None,
                         200 + contender,
                     )
                     .unwrap()
@@ -2257,6 +2404,7 @@ mod tests {
                 agent_run_id,
                 &winner,
                 "Alternate",
+                None,
                 999,
             )
             .unwrap()

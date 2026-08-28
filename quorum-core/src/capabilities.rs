@@ -24,6 +24,16 @@ pub struct RunCapability {
     pub agent_run_id: Option<i64>,
 }
 
+/// Immutable daemon-captured reviewer target supplied while issuing an
+/// attributed fallback capability. Reviewer authority is unusable without
+/// this exact PR/head pair, so reviewers never receive a capability unless it
+/// can be bound to their one `agent_runs` row in the same transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewerLaunchEvidence<'a> {
+    pub pr: i64,
+    pub head_sha: &'a str,
+}
+
 /// The collaboration surface available to one authoritative managed run.
 ///
 /// This is deliberately narrower than the task lifecycle status. A worker
@@ -431,10 +441,19 @@ pub fn issue_attributed_alternate(
     agent_run_id: i64,
     run_id: &str,
     agent: &str,
+    reviewer_launch: Option<ReviewerLaunchEvidence<'_>>,
     now: i64,
 ) -> Result<Option<RunCapability>> {
     let tx = begin_immediate(conn)?;
-    let capability = issue_attributed_alternate_tx(&tx, token, agent_run_id, run_id, agent, now)?;
+    let capability = issue_attributed_alternate_tx(
+        &tx,
+        token,
+        agent_run_id,
+        run_id,
+        agent,
+        reviewer_launch,
+        now,
+    )?;
     tx.commit()?;
     Ok(capability)
 }
@@ -451,6 +470,7 @@ pub fn issue_attributed_alternate_tx(
     agent_run_id: i64,
     run_id: &str,
     agent: &str,
+    reviewer_launch: Option<ReviewerLaunchEvidence<'_>>,
     now: i64,
 ) -> Result<Option<RunCapability>> {
     let Some(task_id) = token.task_id() else {
@@ -475,6 +495,25 @@ pub fn issue_attributed_alternate_tx(
         ("worker", None) | ("reviewer", Some("r1")) => None,
         ("reviewer", Some("r2")) => Some("r2"),
         _ => return Ok(None),
+    };
+    let reviewer_launch = match (token.role(), reviewer_launch) {
+        ("worker", None) => None,
+        ("reviewer", Some(launch))
+            if token.pr_number() == Some(launch.pr)
+                && launch.pr > 0
+                && launch.head_sha.len() == 40
+                && launch.head_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Some(launch)
+        }
+        // A reviewer fallback cannot be launched with inferred, stale, or
+        // caller-mismatched target authority. It must wait for the daemon's
+        // exact PR/head capture rather than leave an unusable capability.
+        ("reviewer", _) => return Ok(None),
+        // Worker launch evidence is nonsensical and must not silently change
+        // the worker authority shape.
+        ("worker", Some(_)) => return Ok(None),
+        _ => unreachable!("role shape was validated above"),
     };
 
     // Expired fallback evidence cannot regain authority merely because its
@@ -555,12 +594,29 @@ pub fn issue_attributed_alternate_tx(
         )
         .optional()?;
     if let Some(existing) = existing {
-        return Ok((existing.task_id == task_id
+        let matching_capability = existing.task_id == task_id
             && existing.agent == agent
             && existing.role == token.role()
             && existing.agent_run_id == Some(agent_run_id)
-            && existing.revoked_at.is_none())
-        .then_some(existing));
+            && existing.revoked_at.is_none();
+        if !matching_capability {
+            return Ok(None);
+        }
+        if let Some(launch) = reviewer_launch {
+            let matching_launch: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM agent_runs
+                     WHERE id=?1 AND review_cap_run_id=?2 AND review_pr=?3
+                       AND review_head_sha=?4
+                 )",
+                params![agent_run_id, run_id, launch.pr, launch.head_sha],
+                |row| row.get(0),
+            )?;
+            if !matching_launch {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(existing));
     }
 
     // The partial UNIQUE index on `agent_run_id` prevents a second fresh
@@ -574,6 +630,25 @@ pub fn issue_attributed_alternate_tx(
     )?;
     if already_bound {
         return Ok(None);
+    }
+
+    if let Some(launch) = reviewer_launch {
+        // Bind the reviewer launch target before exposing its capability. This
+        // caller-owned transaction also contains the alternate run insertion,
+        // so a reader can observe either all three authority records or none.
+        // The NULL-only guard makes a conflicting/partial historical bind a
+        // clean rejection rather than an overwrite of immutable evidence.
+        let bound = tx.execute(
+            "UPDATE agent_runs
+             SET review_cap_run_id=?2,review_pr=?3,review_head_sha=?4
+             WHERE id=?1 AND role='reviewer' AND ended_at IS NULL
+               AND review_cap_run_id IS NULL AND review_pr IS NULL
+               AND review_head_sha IS NULL",
+            params![agent_run_id, run_id, launch.pr, launch.head_sha],
+        )?;
+        if bound != 1 {
+            return Ok(None);
+        }
     }
 
     tx.execute(
