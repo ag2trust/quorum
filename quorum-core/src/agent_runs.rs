@@ -4,7 +4,7 @@ use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
 use crate::role_assignments::AssignmentIdentity;
 use crate::routing_attempts::{exclusions, ValidatedFallbackAttribution};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewLaunch {
@@ -264,6 +264,24 @@ pub fn insert_alternate_with_attribution(
     agent_name: &str,
     spawned_at: i64,
 ) -> Result<i64> {
+    let tx = begin_immediate(conn)?;
+    let id = insert_alternate_with_attribution_tx(&tx, token, agent_name, spawned_at)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(id)
+}
+
+/// Transactional form of [`insert_alternate_with_attribution`].
+///
+/// Fallback installation composes the attributed run with a freshly issued
+/// capability and other failure evidence under one serialization point. This
+/// helper keeps the attribution checks identical for that composite write and
+/// for the standalone historical-evidence writer above.
+pub fn insert_alternate_with_attribution_tx(
+    tx: &Transaction<'_>,
+    token: &ValidatedFallbackAttribution,
+    agent_name: &str,
+    spawned_at: i64,
+) -> Result<i64> {
     if agent_name.is_empty() || agent_name.len() > 1024 || agent_name.contains('\0') {
         return Err(QuorumError::Usage("invalid agent name".into()));
     }
@@ -285,9 +303,7 @@ pub fn insert_alternate_with_attribution(
         _ => None,
     };
 
-    let tx = begin_immediate(conn)?;
-
-    let assignment = crate::role_assignments::get(&tx, token.assignment_id())?
+    let assignment = crate::role_assignments::get(tx, token.assignment_id())?
         .ok_or_else(|| QuorumError::Io("attributed alternate assignment is missing".into()))?;
     let identity = AssignmentIdentity {
         task_id: token.task_id(),
@@ -308,7 +324,7 @@ pub fn insert_alternate_with_attribution(
     // prior attributed row still exists — otherwise a replay after later
     // routing evidence would silently return the stale row instead of failing
     // closed. The historical row is left in place; only the replay is refused.
-    let current = exclusions(&tx, token.responsibility_key())?;
+    let current = exclusions(tx, token.responsibility_key())?;
     if current.excludes(token.profile()) {
         return Err(QuorumError::Io(
             "attributed alternate route was invalidated by later routing evidence".into(),
@@ -318,7 +334,7 @@ pub fn insert_alternate_with_attribution(
     // Reuse: an existing row for the same (assignment, configured profile) is
     // authoritative. Verify it agrees with the token before returning, so a
     // replay with tampered evidence still fails closed.
-    let existing = fetch_configured_route(&tx, token.assignment_id(), &token.profile().id)?;
+    let existing = fetch_configured_route(tx, token.assignment_id(), &token.profile().id)?;
 
     if let Some(row) = existing {
         let id = row.id;
@@ -336,7 +352,6 @@ pub fn insert_alternate_with_attribution(
                 "attributed alternate replay conflicts with existing run".into(),
             ));
         }
-        tx.commit().map_err(map_sql_err)?;
         return Ok(id);
     }
 
@@ -363,9 +378,7 @@ pub fn insert_alternate_with_attribution(
             profile.effort,
         ],
     )?;
-    let id = tx.last_insert_rowid();
-    tx.commit().map_err(map_sql_err)?;
-    Ok(id)
+    Ok(tx.last_insert_rowid())
 }
 
 /// Insert an R2 audit run (sub_role='r2'). Returns the row id.
@@ -1063,6 +1076,8 @@ mod tests {
             ValidatedFallbackAttribution,
         };
         use std::sync::{Arc, Barrier};
+
+        const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
         fn worker_pool() -> ValidatedPool {
             ValidatedPool {
@@ -1929,6 +1944,471 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 2);
+        }
+
+        #[test]
+        fn attributed_alternate_capability_atomically_binds_exact_run_and_replays() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let responsibility = "worker:task:101";
+            seed_worker_assignment(&c, 101, 101, &pool, responsibility);
+            c.execute("UPDATE tasks SET assignee='Alternate' WHERE id=101", [])
+                .unwrap();
+            let token = issue_alternate_token(
+                &mut c,
+                101,
+                responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(101),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+            let assignment_before: (i64, String) = c
+                .query_row(
+                    "SELECT id,profile_id FROM role_assignments WHERE id=101",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+
+            let tx = begin_immediate(&mut c).unwrap();
+            let agent_run_id =
+                insert_alternate_with_attribution_tx(&tx, &token, "Alternate", 100).unwrap();
+            let capability = crate::capabilities::issue_attributed_alternate_tx(
+                &tx,
+                &token,
+                agent_run_id,
+                "alternate-capability",
+                "Alternate",
+                None,
+                101,
+            )
+            .unwrap()
+            .expect("matching attributed run must receive capability authority");
+            tx.commit().unwrap();
+
+            assert_eq!(capability.agent_run_id, Some(agent_run_id));
+            assert_eq!(
+                crate::capabilities::validate(
+                    &c,
+                    "alternate-capability",
+                    "Alternate",
+                    "worker",
+                    Some(101),
+                )
+                .unwrap()
+                .agent_run_id,
+                Some(agent_run_id)
+            );
+            assert_eq!(
+                crate::capabilities::resolve_live_run_context(
+                    &c,
+                    "alternate-capability",
+                    "worker",
+                )
+                .unwrap()
+                .agent_run_id,
+                agent_run_id,
+                "exact fallback linkage must win over legacy name/timestamp inference"
+            );
+
+            let replay = crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &token,
+                agent_run_id,
+                "alternate-capability",
+                "Alternate",
+                None,
+                999,
+            )
+            .unwrap()
+            .expect("the exact capability replay must converge");
+            assert_eq!(replay.agent_run_id, Some(agent_run_id));
+            assert_eq!(replay.created_at, 101, "replay must not rewrite authority");
+            assert_eq!(
+                c.query_row(
+                    "SELECT id,profile_id FROM role_assignments WHERE id=101",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+                assignment_before,
+                "fallback capability issuance must not alter assignment/allocation evidence"
+            );
+        }
+
+        #[test]
+        fn attributed_reviewer_capabilities_atomically_bind_r1_and_r2_launch_authority() {
+            let (_d, mut c) = open_tmp();
+
+            for (task_id, stage, agent, capability_run_id) in [
+                (106, "r1", "R1-Alternate", "r1-alternate-capability"),
+                (107, "r2", "R2-Alternate", "r2-alternate-capability"),
+            ] {
+                let pr = 800 + task_id;
+                let pool = ValidatedPool {
+                    pool_key: format!("reviewer.M.{stage}"),
+                    policy_generation: "gen-1".into(),
+                    ..worker_pool()
+                };
+                let responsibility = format!("reviewer:task:{task_id}:pr:{pr}:{stage}");
+                seed_reviewer_assignment(&c, task_id, task_id, pr, stage, &pool, &responsibility);
+                c.execute(
+                    "UPDATE tasks
+                     SET status='in-review',reviewer=?2,refs=json_object('pr',?3)
+                     WHERE id=?1",
+                    params![task_id, agent, pr],
+                )
+                .unwrap();
+                let token = issue_alternate_token(
+                    &mut c,
+                    task_id,
+                    &responsibility,
+                    &pool,
+                    0,
+                    FailureDisposition::ProviderUnavailable,
+                    AssignmentIdentity {
+                        task_id: Some(task_id),
+                        responsibility_key: &responsibility,
+                        role: "reviewer",
+                        pr_number: Some(pr),
+                        review_stage: Some(stage),
+                    },
+                );
+
+                let tx = begin_immediate(&mut c).unwrap();
+                let agent_run_id =
+                    insert_alternate_with_attribution_tx(&tx, &token, agent, task_id).unwrap();
+                let capability = crate::capabilities::issue_attributed_alternate_tx(
+                    &tx,
+                    &token,
+                    agent_run_id,
+                    capability_run_id,
+                    agent,
+                    Some(crate::capabilities::ReviewerLaunchEvidence {
+                        pr,
+                        head_sha: REVIEW_SHA,
+                    }),
+                    task_id + 1,
+                )
+                .unwrap()
+                .expect("an attributed reviewer with an exact launch target is authorized");
+                tx.commit().unwrap();
+
+                let launch: (String, i64, String, Option<String>) = c
+                    .query_row(
+                        "SELECT review_cap_run_id,review_pr,review_head_sha,sub_role
+                         FROM agent_runs WHERE id=?1",
+                        [agent_run_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .unwrap();
+                assert_eq!(launch.0, capability_run_id);
+                assert_eq!(launch.1, pr);
+                assert_eq!(launch.2, REVIEW_SHA);
+                assert_eq!(launch.3.as_deref(), (stage == "r2").then_some("r2"));
+                assert_eq!(capability.agent_run_id, Some(agent_run_id));
+
+                let context = crate::capabilities::resolve_live_run_context(
+                    &c,
+                    capability_run_id,
+                    "reviewer",
+                )
+                .unwrap();
+                assert_eq!(context.agent_run_id, agent_run_id);
+                assert_eq!(context.pr, Some(pr));
+                assert_eq!(context.review_revision.as_deref(), Some(REVIEW_SHA));
+
+                let replay = crate::capabilities::issue_attributed_alternate(
+                    &mut c,
+                    &token,
+                    agent_run_id,
+                    capability_run_id,
+                    agent,
+                    Some(crate::capabilities::ReviewerLaunchEvidence {
+                        pr,
+                        head_sha: REVIEW_SHA,
+                    }),
+                    999,
+                )
+                .unwrap()
+                .expect("the exact reviewer capability replay must converge");
+                assert_eq!(replay.created_at, task_id + 1);
+                assert!(crate::capabilities::issue_attributed_alternate(
+                    &mut c,
+                    &token,
+                    agent_run_id,
+                    capability_run_id,
+                    agent,
+                    Some(crate::capabilities::ReviewerLaunchEvidence {
+                        pr,
+                        head_sha: "fedcba9876543210fedcba9876543210fedcba98",
+                    }),
+                    1000,
+                )
+                .unwrap()
+                .is_none());
+                assert_eq!(
+                    c.query_row(
+                        "SELECT review_head_sha FROM agent_runs WHERE id=?1",
+                        [agent_run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                    REVIEW_SHA,
+                    "a replay mismatch must not overwrite the immutable reviewer target"
+                );
+            }
+        }
+
+        #[test]
+        fn attributed_alternate_capability_rejects_cross_agent_task_stage_and_route() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let worker_responsibility = "worker:task:102";
+            seed_worker_assignment(&c, 102, 102, &pool, worker_responsibility);
+            let worker_token = issue_alternate_token(
+                &mut c,
+                102,
+                worker_responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(102),
+                    responsibility_key: worker_responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+            let worker_run =
+                insert_alternate_with_attribution(&mut c, &worker_token, "Alternate", 100).unwrap();
+
+            // A valid route cannot be replayed under another participant's
+            // identity. The original participant evidence remains untouched.
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &worker_token,
+                worker_run,
+                "wrong-agent",
+                "Other-Agent",
+                None,
+                101,
+            )
+            .unwrap()
+            .is_none());
+
+            c.execute(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (103,'other task','working','test',1,1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE agent_runs SET task_id=103 WHERE id=?1",
+                [worker_run],
+            )
+            .unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &worker_token,
+                worker_run,
+                "cross-task",
+                "Alternate",
+                None,
+                102,
+            )
+            .unwrap()
+            .is_none());
+            c.execute(
+                "UPDATE agent_runs SET task_id=102 WHERE id=?1",
+                [worker_run],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE agent_runs SET configured_model='forged' WHERE id=?1",
+                [worker_run],
+            )
+            .unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &worker_token,
+                worker_run,
+                "cross-route",
+                "Alternate",
+                None,
+                103,
+            )
+            .unwrap()
+            .is_none());
+
+            let reviewer_pool = ValidatedPool {
+                pool_key: "reviewer.M.r2".into(),
+                policy_generation: "gen-1".into(),
+                ..worker_pool()
+            };
+            let reviewer_responsibility = "reviewer:task:104:pr:88:r2";
+            seed_reviewer_assignment(
+                &c,
+                104,
+                104,
+                88,
+                "r2",
+                &reviewer_pool,
+                reviewer_responsibility,
+            );
+            let reviewer_token = issue_alternate_token(
+                &mut c,
+                104,
+                reviewer_responsibility,
+                &reviewer_pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(104),
+                    responsibility_key: reviewer_responsibility,
+                    role: "reviewer",
+                    pr_number: Some(88),
+                    review_stage: Some("r2"),
+                },
+            );
+            let reviewer_run =
+                insert_alternate_with_attribution(&mut c, &reviewer_token, "R2-Alternate", 104)
+                    .unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &reviewer_token,
+                reviewer_run,
+                "missing-launch-evidence",
+                "R2-Alternate",
+                None,
+                105,
+            )
+            .unwrap()
+            .is_none());
+            c.execute(
+                "UPDATE role_assignments SET review_stage='r1' WHERE id=104",
+                [],
+            )
+            .unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &reviewer_token,
+                reviewer_run,
+                "cross-stage",
+                "R2-Alternate",
+                Some(crate::capabilities::ReviewerLaunchEvidence {
+                    pr: 88,
+                    head_sha: REVIEW_SHA,
+                }),
+                105,
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(
+                c.query_row("SELECT count(*) FROM run_capabilities", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "every mismatched link must reject without capability authority"
+            );
+        }
+
+        #[test]
+        fn concurrent_distinct_capabilities_for_one_attributed_run_have_one_clean_winner() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("attributed-capability-race.db");
+            let pool = worker_pool();
+            let responsibility = "worker:task:105";
+            let (token, agent_run_id) = {
+                let mut c = crate::db::open(&path).unwrap();
+                seed_worker_assignment(&c, 105, 105, &pool, responsibility);
+                let token = issue_alternate_token(
+                    &mut c,
+                    105,
+                    responsibility,
+                    &pool,
+                    0,
+                    FailureDisposition::ProviderUnavailable,
+                    AssignmentIdentity {
+                        task_id: Some(105),
+                        responsibility_key: responsibility,
+                        role: "worker",
+                        pr_number: None,
+                        review_stage: None,
+                    },
+                );
+                let run =
+                    insert_alternate_with_attribution(&mut c, &token, "Alternate", 100).unwrap();
+                (token, run)
+            };
+
+            let barrier = Arc::new(Barrier::new(2));
+            let mut handles = Vec::new();
+            for contender in 0..2 {
+                let path = path.clone();
+                let token = token.clone();
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    crate::capabilities::issue_attributed_alternate(
+                        &mut conn,
+                        &token,
+                        agent_run_id,
+                        &format!("contender-{contender}"),
+                        "Alternate",
+                        None,
+                        200 + contender,
+                    )
+                    .unwrap()
+                }));
+            }
+            let winners = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(winners.iter().filter(|winner| winner.is_some()).count(), 1);
+
+            let conn = crate::db::open(&path).unwrap();
+            let winner = conn
+                .query_row(
+                    "SELECT run_id FROM run_capabilities WHERE agent_run_id=?1",
+                    [agent_run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM run_capabilities WHERE agent_run_id=?1",
+                    [agent_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+            drop(conn);
+
+            let mut replay_conn = crate::db::open(&path).unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut replay_conn,
+                &token,
+                agent_run_id,
+                &winner,
+                "Alternate",
+                None,
+                999,
+            )
+            .unwrap()
+            .is_some());
         }
     }
 }

@@ -958,7 +958,10 @@ CREATE TABLE IF NOT EXISTS run_capabilities (
     -- planner ahead of a `submit_plan` MCP call. See the v60 migration in db.rs.
     role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','planner')),
     created_at  INTEGER NOT NULL,
-    revoked_at  INTEGER
+    revoked_at  INTEGER,
+    -- v63: exact, immutable link for authority issued to an attributed
+    -- fallback agent run. NULL preserves legacy and non-fallback capabilities.
+    agent_run_id INTEGER REFERENCES agent_runs(id)
 );
 CREATE INDEX IF NOT EXISTS run_capabilities_agent ON run_capabilities(agent) WHERE revoked_at IS NULL;
 
