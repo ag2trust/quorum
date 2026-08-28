@@ -90,6 +90,7 @@ fn emit_classifier_result(line: &str, bare: bool) {
                 "task_id": id,
                 "complexity": 2,
                 "size": if bare { "M" } else { "S" },
+                "size_reason": "test fixture is one focused execution seam",
                 "ready": true,
                 "not_ready_reason": null,
                 "duplicate_of": [],

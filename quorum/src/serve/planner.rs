@@ -210,7 +210,12 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          without an accepted `submit_plan` call is a failed attempt. {RESPONSE_SHAPES} \
          PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
          to {MAX_REJECTION_SUMMARY_BYTES} bytes. On retry, use only those summaries to correct \
-         the cited semantic defect; do not discuss them or request more context.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
+         the cited semantic defect; do not discuss them or request more context. A classifier \
+         `size_reason` is artifact-specific verdict rationale: when it identifies an L/XL child's \
+         broad or compound surfaces, the next plan must redistribute those named surfaces across \
+         independently deliverable children. Renaming or paraphrasing the rejected child is not \
+         a correction; if the stated atomic boundary makes that split unsafe, return the \
+         `no_safe_split` BLOCKER with concrete evidence.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
     )
 }
 

@@ -5494,12 +5494,17 @@ fn truncate_utf8_bytes(value: &str, limit: usize) -> &str {
 
 const DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES: usize = 2048;
 const MAX_PLANNED_CHILD_KEY_BYTES: usize = 64;
-const CHILD_REJECTION_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 2;
+const CHILD_REJECTION_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 4;
+const CHILD_REJECTION_SIZE_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 4;
 const CHILD_REJECTION_PREFIX_MAX_BYTES: usize =
     "child ".len() + MAX_PLANNED_CHILD_KEY_BYTES + " rejected by preclassification: ".len();
 const CHILD_REJECTION_READY_WRAPPER_BYTES: usize =
     "ready=false (not_ready_reason: ".len() + ")".len();
-const CHILD_REJECTION_SIZE_MAX_BYTES: usize = "size=".len() + "XL".len();
+const CHILD_REJECTION_SIZE_MAX_BYTES: usize = "size=".len()
+    + "XL".len()
+    + " (size_reason: ".len()
+    + CHILD_REJECTION_SIZE_REASON_MAX_BYTES
+    + ")".len();
 const CHILD_REJECTION_DUPLICATE_LABEL_BYTES: usize = "duplicate_of=".len();
 const CHILD_REJECTION_SEPARATORS_MAX_BYTES: usize = 2 * "; ".len();
 const CHILD_REJECTION_CONTEXT_MAX_BYTES: usize = 272;
@@ -5629,7 +5634,11 @@ fn child_preclassification_rejection(
         failed_dimensions.push(format!("ready=false (not_ready_reason: {reason})"));
     }
     if !matches!(result.size.as_str(), "S" | "M") {
-        failed_dimensions.push(format!("size={}", result.size));
+        let reason = bounded_with_ellipsis(
+            result.size_reason.trim(),
+            CHILD_REJECTION_SIZE_REASON_MAX_BYTES,
+        );
+        failed_dimensions.push(format!("size={} (size_reason: {reason})", result.size));
     }
     if !result.duplicate_of.is_empty() {
         let duplicate_limit = if !matches!(result.size.as_str(), "S" | "M")
@@ -6154,10 +6163,11 @@ fn planned_children(
                 classification_refs: serde_json::json!({
                     "cx_est": result.cx_est,
                     "cx_size": result.size,
+                    "cx_size_reason": result.size_reason,
                     "cx_ready": result.ready,
                     "cx_not_ready_reason": result.not_ready_reason,
                     "cx_dup_of": result.duplicate_of,
-                    "cx_by": "decomposition-preclassification:v1",
+                    "cx_by": "decomposition-preclassification:v2",
                 })
                 .to_string(),
                 prerequisite_keys,
@@ -35027,6 +35037,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 task_id: -1,
                 cx_est: 2,
                 size: "S".into(),
+                size_reason: "bounded test classification rationale".into(),
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
@@ -35035,6 +35046,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 task_id: -2,
                 cx_est: 3,
                 size: "M".into(),
+                size_reason: "bounded test classification rationale".into(),
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
@@ -35060,6 +35072,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap()
             .iter()
             .any(|constraint| constraint == planner::WORKER_WRITABILITY_GUIDANCE));
+        let child_refs: serde_json::Value =
+            serde_json::from_str(&children[0].classification_refs).unwrap();
+        assert_eq!(
+            child_refs["cx_size_reason"],
+            "bounded test classification rationale"
+        );
+        assert_eq!(child_refs["cx_by"], "decomposition-preclassification:v2");
         let worker_prompt =
             reviewer::build_worker_prompt("worker", 7, &children[0].title, &children[0].body, None);
         assert!(worker_prompt.contains(planner::WORKER_WRITABILITY_GUIDANCE));
@@ -35077,7 +35096,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             large[1].size = size.into();
             assert_eq!(
                 planned_children(&proposal, &large).unwrap_err(),
-                format!("child b rejected by preclassification: size={size}")
+                format!(
+                    "child b rejected by preclassification: size={size} (size_reason: bounded test classification rationale)"
+                )
             );
         }
 
@@ -35095,7 +35116,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         combined[0].duplicate_of = vec![301, 302];
         assert_eq!(
             planned_children(&proposal, &combined).unwrap_err(),
-            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL; duplicate_of=[301, 302]; rejected_delta=change layer a; affected_paths=[src/a.rs]"
+            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL (size_reason: bounded test classification rationale); duplicate_of=[301, 302]; rejected_delta=change layer a; affected_paths=[src/a.rs]"
         );
 
         assert_eq!(
@@ -35123,6 +35144,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             task_id: -1,
             cx_est: 5,
             size: "XL".into(),
+            size_reason: format!(
+                "{} and {}",
+                "cross-component execution surfaces ".repeat(64),
+                "independently deliverable storage and daemon seams"
+            ),
             ready: false,
             not_ready_reason: Some("é".repeat(4_096)),
             duplicate_of: (1..=1_000).collect(),
@@ -35133,7 +35159,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
         assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
         assert!(summary.contains("ready=false (not_ready_reason: é"));
-        assert!(summary.contains("…); size=XL; duplicate_of=[1, 2"));
+        assert!(summary.contains("…); size=XL (size_reason: cross-component"));
+        assert!(summary.contains("…); duplicate_of=[1, 2"));
         assert!(summary.contains("rejected_delta=change the bounded planner seam"));
         assert!(
             summary.ends_with("affected_paths=[src/bounded.rs]"),
@@ -35153,6 +35180,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             prompt.ends_with(&format!("PRIOR_REJECTIONS={retry_json}")),
             "planner retry feedback altered the bounded rejection summary: {prompt}"
         );
+        assert!(prompt.contains("size_reason"));
+        assert!(prompt.contains("Renaming or paraphrasing the rejected child is not a correction"));
     }
 
     #[test]
@@ -35172,6 +35201,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             task_id: -1,
             cx_est: 2,
             size: "S".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: false,
             not_ready_reason: Some("owner must select the storage format".into()),
             duplicate_of: vec![],
@@ -35230,6 +35260,93 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 "child readiness rejected by preclassification: ready=false (not_ready_reason: owner must select the storage format)".into(),
             )
         );
+    }
+
+    #[test]
+    fn proposal_size_verdict_reason_is_durable_planner_retry_context() {
+        let proposal = vec![planner::ProposedTask {
+            key: "broad-child".into(),
+            title: "broad child".into(),
+            implementation_delta: "change storage and daemon orchestration".into(),
+            affected_paths: vec![
+                "quorum-core/src/schema.sql".into(),
+                "quorum/src/serve/mod.rs".into(),
+            ],
+            observable_outcome: "the broad behavior works".into(),
+            deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: "quorum-core/src/schema.sql".into(),
+                },
+                quorum_core::decomposition::ChildDeliverable::Write {
+                    path: "quorum/src/serve/mod.rs".into(),
+                },
+            ]),
+            acceptance_criteria: vec!["broad behavior is atomic".into()],
+            source_constraints: vec!["preserve atomicity".into()],
+            verification_expectations: vec!["real DB test".into()],
+            prerequisites: vec![],
+            ..Default::default()
+        }];
+        let classifications = vec![quorum_core::classify::TaskClassification {
+            task_id: -1,
+            cx_est: 4,
+            size: "L".into(),
+            size_reason:
+                "the child owns independently deliverable storage and daemon orchestration seams"
+                    .into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }];
+        let summary = planned_children(&proposal, &classifications).unwrap_err();
+        assert!(summary.contains(
+            "size=L (size_reason: the child owns independently deliverable storage and daemon orchestration seams)"
+        ));
+        assert!(summary.contains("rejected_delta=change storage and daemon orchestration"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("size-reason.db")).unwrap();
+        let source = tasks::create(
+            &mut conn,
+            "owner",
+            "source",
+            Some("source outcome"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "claude",
+                model: "opus",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph,
+            "proposal",
+            "child-preclassification",
+            &summary,
+            3,
+        )
+        .unwrap();
+
+        let snapshot = load_planning_snapshot(&conn).unwrap().unwrap();
+        assert_eq!(snapshot.rejection_summaries, vec![summary.clone()]);
+        let prompt = bounded_planning_prompt(&snapshot).unwrap();
+        assert!(prompt.contains(&summary));
+        assert!(prompt.contains("redistribute those named surfaces"));
     }
 
     #[tokio::test]

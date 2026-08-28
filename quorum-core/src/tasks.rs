@@ -554,6 +554,7 @@ fn preserve_protected_refs(
                 key.as_str(),
                 "pr" | "cx_est"
                     | "cx_size"
+                    | "cx_size_reason"
                     | "cx_ready"
                     | "cx_not_ready_reason"
                     | "cx_by"
@@ -589,6 +590,7 @@ fn invalidate_classifier_refs(
     for key in [
         "cx_est",
         "cx_size",
+        "cx_size_reason",
         "cx_ready",
         "cx_not_ready_reason",
         "cx_by",
@@ -4162,6 +4164,7 @@ pub fn retry_parked(
                      refs,
                      '$.cx_est',
                      '$.cx_size',
+                     '$.cx_size_reason',
                      '$.cx_ready',
                      '$.cx_not_ready_reason',
                      '$.cx_by',
@@ -5030,6 +5033,8 @@ mod tests {
         map.entry("cx_est").or_insert_with(|| serde_json::json!(3));
         map.entry("cx_size")
             .or_insert_with(|| serde_json::json!("M"));
+        map.entry("cx_size_reason")
+            .or_insert_with(|| serde_json::json!("bounded test classification rationale"));
         map.entry("cx_ready")
             .or_insert_with(|| serde_json::json!(true));
         map.entry("cx_not_ready_reason")
@@ -7117,6 +7122,7 @@ mod tests {
                 task_id: child,
                 cx_est: 3,
                 size: "M".into(),
+                size_reason: "bounded test classification rationale".into(),
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
@@ -8294,6 +8300,7 @@ mod tests {
         assert_eq!(refs["pr"], 42);
         assert!(refs.get("cx_est").is_none());
         assert!(refs.get("cx_size").is_none());
+        assert!(refs.get("cx_size_reason").is_none());
         assert!(refs.get("cx_ready").is_none());
         assert_eq!(t.status, "working");
     }
@@ -8696,6 +8703,7 @@ mod tests {
             task_id: id,
             cx_est: 3,
             size: "M".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: true,
             not_ready_reason: None,
             duplicate_of: Vec::new(),
@@ -8745,6 +8753,10 @@ mod tests {
         assert_eq!(refs["runner_provider_block"]["reason"], "quota");
         assert_eq!(refs["codex_thread_id"], "thread-legacy");
         assert_eq!(refs["codex_retry_requested"], true);
+        assert_eq!(
+            refs["cx_size_reason"],
+            "bounded test classification rationale"
+        );
 
         update_refs_daemon(
             &mut conn,
@@ -8763,6 +8775,10 @@ mod tests {
         assert!(refs.get("codex_retry_requested").is_none());
         assert_eq!(refs["pr"], 513);
         assert_eq!(refs["cx_by"], "test:v2");
+        assert_eq!(
+            refs["cx_size_reason"],
+            "bounded test classification rationale"
+        );
     }
 
     // ── T6: lifecycle replay idempotency ──────────────────────────────────
@@ -10297,6 +10313,7 @@ mod tests {
                 task_id,
                 cx_est: 3,
                 size: "M".into(),
+                size_reason: "bounded test classification rationale".into(),
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],

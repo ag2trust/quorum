@@ -394,6 +394,7 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
             task_id: id,
             cx_est: 3,
             size: "M".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],

@@ -379,9 +379,14 @@ or a planner self-attestation check.
 
 All proposed children are classified together before any child row exists. Classification uses
 temporary proposal keys, not task IDs. Every result must be present, admission-ready,
-implementation work, nonduplicate, and size S or M. Runtime readiness is deliberately not
-required: a child may wait for another generated prerequisite. Any missing, malformed, L/XL,
-not-ready, duplicate, or extra classification rejects the entire plan as a semantic proposal.
+implementation work, nonduplicate, size S or M, and carry a nonempty, NUL-free `size_reason`
+bounded to 1 KiB. The reason names the concrete execution surfaces supporting the selected size;
+for L/XL it identifies independently deliverable seams rather than merely repeating the rubric.
+Runtime readiness is deliberately not required: a child may wait for another generated
+prerequisite. Any missing, malformed, L/XL, not-ready, duplicate, or extra classification rejects
+the entire plan as a semantic proposal. An L/XL rejection records the bounded child key, verdict,
+size rationale, implementation delta, and affected paths in the proposal-attempt ledger, and the
+next planner attempt receives that rejection context.
 
 Semantic rejection increments only `proposal_attempts`; provider/protocol/sandbox failure
 increments only `provider_failures`. Each cap is three per unchanged source revision. A valid
