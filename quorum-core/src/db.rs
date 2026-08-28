@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 60;
+pub const SCHEMA_VERSION: i64 = 61;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1064,6 +1064,35 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 )?;
             }
         }
+        // v61 stores the configured route actually used by an alternate agent
+        // run. Original-route and historical rows intentionally remain NULL;
+        // the guarded attribution API that writes these fields lands separately.
+        if current < 61 {
+            if !column_exists(conn, "agent_runs", "configured_profile_id")? {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN configured_profile_id TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "agent_runs", "configured_provider")? {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN configured_provider TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "agent_runs", "configured_model")? {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN configured_model TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "agent_runs", "configured_effort")? {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN configured_effort TEXT",
+                    [],
+                )?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1176,10 +1205,83 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1);
+        for column in [
+            "configured_profile_id",
+            "configured_provider",
+            "configured_model",
+            "configured_effort",
+        ] {
+            assert!(column_exists(&c, "agent_runs", column).unwrap());
+        }
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v60_to_v61_adds_nullable_configured_route_snapshot_without_rewriting_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v60-configured-route.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at)
+                 VALUES (7,'legacy','worker','opus','high','claude',1)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE agent_runs DROP COLUMN configured_effort;
+                 ALTER TABLE agent_runs DROP COLUMN configured_model;
+                 ALTER TABLE agent_runs DROP COLUMN configured_provider;
+                 ALTER TABLE agent_runs DROP COLUMN configured_profile_id;
+                 PRAGMA user_version=60;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = open(&path).unwrap();
+        for column in [
+            "configured_profile_id",
+            "configured_provider",
+            "configured_model",
+            "configured_effort",
+        ] {
+            assert!(column_exists(&upgraded, "agent_runs", column).unwrap());
+        }
+        let legacy = crate::agent_runs::latest_for_task(&upgraded, 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.agent, "legacy");
+        assert_eq!(legacy.provider.as_deref(), Some("claude"));
+        assert_eq!(legacy.model, "opus");
+        assert_eq!(legacy.effort, "high");
+        assert_eq!(legacy.role_assignment_id, None);
+        assert_eq!(legacy.configured_profile_id, None);
+        assert_eq!(legacy.configured_provider, None);
+        assert_eq!(legacy.configured_model, None);
+        assert_eq!(legacy.configured_effort, None);
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            crate::agent_runs::latest_for_task(&reopened, 7)
+                .unwrap()
+                .unwrap()
+                .configured_profile_id,
+            None
+        );
     }
 
     #[test]
