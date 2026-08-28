@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 62;
+pub const SCHEMA_VERSION: i64 = 63;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1107,6 +1107,24 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                      WHERE configured_profile_id IS NOT NULL",
             )?;
         }
+        // v63 binds a freshly issued fallback capability to exactly one
+        // attributed agent run. Legacy and ordinary capabilities intentionally
+        // retain NULL, so this additive link neither rewrites history nor
+        // changes their existing resolver behavior.
+        if current < 63 {
+            if !column_exists(conn, "run_capabilities", "agent_run_id")? {
+                conn.execute(
+                    "ALTER TABLE run_capabilities
+                     ADD COLUMN agent_run_id INTEGER REFERENCES agent_runs(id)",
+                    [],
+                )?;
+            }
+            conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS run_capabilities_agent_run
+                     ON run_capabilities(agent_run_id)
+                     WHERE agent_run_id IS NOT NULL",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1227,6 +1245,7 @@ mod tests {
         ] {
             assert!(column_exists(&c, "agent_runs", column).unwrap());
         }
+        assert!(column_exists(&c, "run_capabilities", "agent_run_id").unwrap());
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
@@ -1414,6 +1433,70 @@ mod tests {
             [],
         );
         assert!(dup.is_err(), "duplicate configured route must fail closed");
+    }
+
+    #[test]
+    fn v62_to_v63_adds_nullable_capability_run_link_without_rewriting_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v62-attributed-capability.db");
+        {
+            let mut conn = open(&path).unwrap();
+            crate::capabilities::issue(&mut conn, "legacy-cap", 7, "Legacy", "worker", 1).unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "CREATE TABLE run_capabilities_v62 (
+                     run_id      TEXT PRIMARY KEY,
+                     task_id     INTEGER NOT NULL,
+                     agent       TEXT NOT NULL,
+                     role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','planner')),
+                     created_at  INTEGER NOT NULL,
+                     revoked_at  INTEGER
+                 );
+                 INSERT INTO run_capabilities_v62
+                     SELECT run_id,task_id,agent,role,created_at,revoked_at
+                     FROM run_capabilities;
+                 DROP TABLE run_capabilities;
+                 ALTER TABLE run_capabilities_v62 RENAME TO run_capabilities;
+                 CREATE INDEX run_capabilities_agent
+                     ON run_capabilities(agent) WHERE revoked_at IS NULL;
+                 PRAGMA user_version=62;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = open(&path).unwrap();
+        assert!(column_exists(&upgraded, "run_capabilities", "agent_run_id").unwrap());
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT agent_run_id FROM run_capabilities WHERE run_id='legacy-cap'",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap(),
+            None,
+            "legacy capabilities must remain unlinked rather than being inferred"
+        );
+        let index_exists: i64 = upgraded
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='index' AND name='run_capabilities_agent_run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
     }
 
     #[test]

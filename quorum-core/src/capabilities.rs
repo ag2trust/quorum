@@ -7,6 +7,7 @@
 
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
+use crate::routing_attempts::{exclusions, ValidatedFallbackAttribution};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 
@@ -18,6 +19,9 @@ pub struct RunCapability {
     pub role: String,
     pub created_at: i64,
     pub revoked_at: Option<i64>,
+    /// Exact fallback-run linkage. NULL is retained for legacy and ordinary
+    /// managed capabilities that predate this narrower authority evidence.
+    pub agent_run_id: Option<i64>,
 }
 
 /// The collaboration surface available to one authoritative managed run.
@@ -118,7 +122,7 @@ pub fn resolve_live_run_context(
 
     let capability = conn
         .query_row(
-            "SELECT run_id, task_id, agent, role, created_at, revoked_at
+            "SELECT run_id, task_id, agent, role, created_at, revoked_at, agent_run_id
              FROM run_capabilities WHERE run_id=?1",
             [run_id],
             |row| {
@@ -129,6 +133,7 @@ pub fn resolve_live_run_context(
                     role: row.get(3)?,
                     created_at: row.get(4)?,
                     revoked_at: row.get(5)?,
+                    agent_run_id: row.get(6)?,
                 })
             },
         )
@@ -141,7 +146,30 @@ pub fn resolve_live_run_context(
         return Err(authority_error("operation role does not match capability"));
     }
 
-    let live_run = if capability.role == "reviewer" {
+    let live_run = if let Some(agent_run_id) = capability.agent_run_id {
+        // Attributed fallback runs carry an exact immutable link from the
+        // capability to this one agent_runs row. Prefer it to every legacy
+        // name/timestamp inference path so a recycled participant cannot
+        // inherit another fallback run's authority.
+        conn.query_row(
+            "SELECT id,task_id,agent_name,role,ended_at,review_pr,review_head_sha
+             FROM agent_runs WHERE id=?1 AND ended_at IS NULL",
+            [agent_run_id],
+            |row| {
+                Ok(LiveAgentRun {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent: row.get(2)?,
+                    role: row.get(3)?,
+                    ended_at: row.get(4)?,
+                    review_pr: row.get(5)?,
+                    review_revision: row.get(6)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("no matching live capability-bound run"))?
+    } else if capability.role == "reviewer" {
         conn.query_row(
             "SELECT id,task_id,agent_name,role,ended_at,review_pr,review_head_sha
              FROM agent_runs
@@ -313,7 +341,7 @@ pub struct PlannerRunContext {
 pub fn resolve_planner_context(conn: &Connection, run_id: &str) -> Result<PlannerRunContext> {
     let capability = conn
         .query_row(
-            "SELECT run_id, task_id, agent, role, created_at, revoked_at
+            "SELECT run_id, task_id, agent, role, created_at, revoked_at, agent_run_id
              FROM run_capabilities WHERE run_id=?1",
             [run_id],
             |row| {
@@ -324,6 +352,7 @@ pub fn resolve_planner_context(conn: &Connection, run_id: &str) -> Result<Planne
                     role: row.get(3)?,
                     created_at: row.get(4)?,
                     revoked_at: row.get(5)?,
+                    agent_run_id: row.get(6)?,
                 })
             },
         )
@@ -389,6 +418,180 @@ pub fn issue_tx(
     Ok(())
 }
 
+/// Issue and bind a capability for one already-attributed fallback run.
+///
+/// The capability is not merely named after the same agent: its immutable
+/// `agent_run_id` links to the exact `agent_runs` row that re-proves the
+/// fallback token's task, responsibility, role, PR-stage, assignment, and
+/// configured route. A clean `None` means the row, token, run id, or existing
+/// binding did not agree; no capability is written in that case.
+pub fn issue_attributed_alternate(
+    conn: &mut Connection,
+    token: &ValidatedFallbackAttribution,
+    agent_run_id: i64,
+    run_id: &str,
+    agent: &str,
+    now: i64,
+) -> Result<Option<RunCapability>> {
+    let tx = begin_immediate(conn)?;
+    let capability = issue_attributed_alternate_tx(&tx, token, agent_run_id, run_id, agent, now)?;
+    tx.commit()?;
+    Ok(capability)
+}
+
+/// Transactional form of [`issue_attributed_alternate`].
+///
+/// This is deliberately composable with fallback-attempt installation: a
+/// caller can create the attributed `agent_runs` evidence and issue this
+/// capability under the same `BEGIN IMMEDIATE` transaction, before it makes
+/// any provider call.
+pub fn issue_attributed_alternate_tx(
+    tx: &Transaction<'_>,
+    token: &ValidatedFallbackAttribution,
+    agent_run_id: i64,
+    run_id: &str,
+    agent: &str,
+    now: i64,
+) -> Result<Option<RunCapability>> {
+    let Some(task_id) = token.task_id() else {
+        return Err(QuorumError::Usage(
+            "attributed alternate capability requires a task-scoped role assignment".into(),
+        ));
+    };
+    if agent_run_id <= 0
+        || task_id <= 0
+        || run_id.is_empty()
+        || run_id.contains('\0')
+        || agent.is_empty()
+        || agent.contains('\0')
+        || now < 0
+        || !matches!(token.role(), "worker" | "reviewer")
+    {
+        return Err(QuorumError::Usage(
+            "invalid attributed alternate capability identity".into(),
+        ));
+    }
+    let sub_role = match (token.role(), token.review_stage()) {
+        ("worker", None) | ("reviewer", Some("r1")) => None,
+        ("reviewer", Some("r2")) => Some("r2"),
+        _ => return Ok(None),
+    };
+
+    // Expired fallback evidence cannot regain authority merely because its
+    // historical run row still exists. This mirrors the attributed-run writer
+    // and leaves that immutable history intact on clean rejection.
+    if exclusions(tx, token.responsibility_key())?.excludes(token.profile()) {
+        return Ok(None);
+    }
+
+    // Re-prove every link from the opaque token to the persisted row before
+    // capability issuance. `agent_name` is intentionally exact: participant
+    // identity belongs to the run evidence and cannot be changed by replaying
+    // a valid route for a different fallback agent.
+    let profile = token.profile();
+    let run_matches: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM agent_runs AS run
+             JOIN role_assignments AS assignment ON assignment.id=run.role_assignment_id
+             WHERE run.id=?1
+               AND run.task_id=?2
+               AND run.agent_name=?3
+               AND run.role=?4
+               AND run.sub_role IS ?5
+               AND run.ended_at IS NULL
+               AND run.role_assignment_id=?6
+               AND run.configured_profile_id=?7
+               AND run.configured_provider=?8
+               AND run.configured_model=?9
+               AND run.configured_effort=?10
+               AND run.provider=?8
+               AND run.model=?9
+               AND run.effort=?10
+               AND assignment.task_id IS ?2
+               AND assignment.responsibility_key=?11
+               AND assignment.role=?4
+               AND assignment.pr_number IS ?12
+               AND assignment.review_stage IS ?13
+               AND EXISTS(SELECT 1 FROM tasks WHERE id=?2)
+         )",
+        params![
+            agent_run_id,
+            task_id,
+            agent,
+            token.role(),
+            sub_role,
+            token.assignment_id(),
+            profile.id,
+            profile.provider,
+            profile.model,
+            profile.effort,
+            token.responsibility_key(),
+            token.pr_number(),
+            token.review_stage(),
+        ],
+        |row| row.get(0),
+    )?;
+    if !run_matches {
+        return Ok(None);
+    }
+
+    let existing = tx
+        .query_row(
+            "SELECT run_id,task_id,agent,role,created_at,revoked_at,agent_run_id
+             FROM run_capabilities WHERE run_id=?1",
+            [run_id],
+            |row| {
+                Ok(RunCapability {
+                    run_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent: row.get(2)?,
+                    role: row.get(3)?,
+                    created_at: row.get(4)?,
+                    revoked_at: row.get(5)?,
+                    agent_run_id: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        return Ok((existing.task_id == task_id
+            && existing.agent == agent
+            && existing.role == token.role()
+            && existing.agent_run_id == Some(agent_run_id)
+            && existing.revoked_at.is_none())
+        .then_some(existing));
+    }
+
+    // The partial UNIQUE index on `agent_run_id` prevents a second fresh
+    // capability from being attached to the same process evidence. Check it
+    // before insertion so replay/concurrent mismatch is a clean negative
+    // outcome, never a leaked half-issued capability.
+    let already_bound: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run_capabilities WHERE agent_run_id=?1)",
+        [agent_run_id],
+        |row| row.get(0),
+    )?;
+    if already_bound {
+        return Ok(None);
+    }
+
+    tx.execute(
+        "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at,agent_run_id)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![run_id, task_id, agent, token.role(), now, agent_run_id],
+    )?;
+    Ok(Some(RunCapability {
+        run_id: run_id.to_string(),
+        task_id,
+        agent: agent.to_string(),
+        role: token.role().to_string(),
+        created_at: now,
+        revoked_at: None,
+        agent_run_id: Some(agent_run_id),
+    }))
+}
+
 /// Validate a run capability: it must exist, not be revoked, and its derived
 /// identity must match the expected agent + role (+ optionally task). Returns
 /// the capability on success, or an error describing the mismatch.
@@ -407,7 +610,7 @@ pub fn validate(
 ) -> Result<RunCapability> {
     let cap = conn
         .query_row(
-            "SELECT run_id, task_id, agent, role, created_at, revoked_at
+            "SELECT run_id, task_id, agent, role, created_at, revoked_at, agent_run_id
              FROM run_capabilities WHERE run_id = ?1",
             params![run_id],
             |r| {
@@ -418,6 +621,7 @@ pub fn validate(
                     role: r.get(3)?,
                     created_at: r.get(4)?,
                     revoked_at: r.get(5)?,
+                    agent_run_id: r.get(6)?,
                 })
             },
         )
@@ -569,7 +773,7 @@ pub fn active_for_agent_task(
     role: &str,
 ) -> Result<Option<RunCapability>> {
     conn.query_row(
-        "SELECT run_id, task_id, agent, role, created_at, revoked_at
+        "SELECT run_id, task_id, agent, role, created_at, revoked_at, agent_run_id
          FROM run_capabilities
          WHERE agent = ?1 AND task_id = ?2 AND role = ?3 AND revoked_at IS NULL
          ORDER BY created_at DESC LIMIT 1",
@@ -582,6 +786,7 @@ pub fn active_for_agent_task(
                 role: r.get(3)?,
                 created_at: r.get(4)?,
                 revoked_at: r.get(5)?,
+                agent_run_id: r.get(6)?,
             })
         },
     )
@@ -593,7 +798,7 @@ pub fn active_for_agent_task(
 /// Returns None if no active capability exists.
 pub fn active_for_agent(conn: &Connection, agent: &str) -> Result<Option<RunCapability>> {
     conn.query_row(
-        "SELECT run_id, task_id, agent, role, created_at, revoked_at
+        "SELECT run_id, task_id, agent, role, created_at, revoked_at, agent_run_id
          FROM run_capabilities
          WHERE agent = ?1 AND revoked_at IS NULL
          ORDER BY created_at DESC LIMIT 1",
@@ -606,6 +811,7 @@ pub fn active_for_agent(conn: &Connection, agent: &str) -> Result<Option<RunCapa
                 role: r.get(3)?,
                 created_at: r.get(4)?,
                 revoked_at: r.get(5)?,
+                agent_run_id: r.get(6)?,
             })
         },
     )
