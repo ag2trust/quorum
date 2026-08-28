@@ -1099,7 +1099,8 @@ CREATE INDEX IF NOT EXISTS github_review_publication_slots_task
 CREATE TRIGGER IF NOT EXISTS github_agent_operations_request_immutable
 BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
                  task_id, agent, role, pr_number, head_sha, kind, request_json,
-                 github_marker, created_at ON github_agent_operations
+                 github_marker, lifecycle_generation, reviewer_launch_sha, group_key,
+                 created_at ON github_agent_operations
 BEGIN
     SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
 END;

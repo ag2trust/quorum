@@ -1200,6 +1200,20 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 "CREATE UNIQUE INDEX IF NOT EXISTS github_agent_operations_one_active
                      ON github_agent_operations(operation_id) WHERE active = 1;",
             )?;
+            // v62's trigger predates the revalidation snapshots. Replace it
+            // after adding the v64 columns so upgraded databases enforce the
+            // same immutable request boundary as fresh databases.
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS github_agent_operations_request_immutable;
+                 CREATE TRIGGER github_agent_operations_request_immutable
+                 BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
+                                  task_id, agent, role, pr_number, head_sha, kind, request_json,
+                                  github_marker, lifecycle_generation, reviewer_launch_sha, group_key,
+                                  created_at ON github_agent_operations
+                 BEGIN
+                     SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
+                 END;",
+            )?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
@@ -2513,10 +2527,13 @@ END;
                            'queued','not_started',999,1,1,999);",
             )
             .unwrap();
-            // The `active` column feeds `github_agent_operations_one_active`,
-            // so the index must go before the column can be dropped.
-            conn.execute_batch("DROP INDEX IF EXISTS github_agent_operations_one_active;")
-                .unwrap();
+            // The v63 trigger and index must go before their v64 dependencies
+            // can be dropped from this otherwise-current schema fixture.
+            conn.execute_batch(
+                "DROP TRIGGER github_agent_operations_request_immutable;
+                 DROP INDEX IF EXISTS github_agent_operations_one_active;",
+            )
+            .unwrap();
             for col in [
                 "lifecycle_generation",
                 "reviewer_launch_sha",
@@ -2534,7 +2551,17 @@ END;
                     "seed drop for {col} must succeed: {dropped:?}"
                 );
             }
-            conn.execute_batch("PRAGMA user_version=63;").unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER github_agent_operations_request_immutable
+                 BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
+                                  task_id, agent, role, pr_number, head_sha, kind, request_json,
+                                  github_marker, created_at ON github_agent_operations
+                 BEGIN
+                     SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
+                 END;
+                 PRAGMA user_version=63;",
+            )
+            .unwrap();
         }
 
         let migrated = open(&path).unwrap();
@@ -2586,6 +2613,22 @@ END;
             )
             .unwrap();
         assert_eq!(idx, 1);
+
+        for (column, value) in [
+            ("lifecycle_generation", "2"),
+            ("reviewer_launch_sha", "'different-sha'"),
+            ("group_key", "'different-group'"),
+        ] {
+            assert!(
+                migrated
+                    .execute_batch(&format!(
+                        "UPDATE github_agent_operations SET {column}={value} \
+                         WHERE operation_id='op-legacy'"
+                    ))
+                    .is_err(),
+                "v64 revalidation field {column} must be immutable after migration"
+            );
+        }
 
         // Idempotency: re-entering `migrate_txn` (not the early return) with
         // the columns/index already present must be a no-op — stamp
