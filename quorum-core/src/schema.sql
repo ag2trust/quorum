@@ -577,7 +577,14 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     review_pr         INTEGER,
     review_head_sha   TEXT,
     -- v42: durable routing decision that caused this process run.
-    role_assignment_id INTEGER REFERENCES role_assignments(id)
+    role_assignment_id INTEGER REFERENCES role_assignments(id),
+    -- v61: an alternate route's immutable configured profile snapshot. NULL
+    -- retains the original assigned route (and all historical rows); a later
+    -- guarded evidence API is the only writer for populated values.
+    configured_profile_id TEXT,
+    configured_provider   TEXT,
+    configured_model      TEXT,
+    configured_effort     TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
 

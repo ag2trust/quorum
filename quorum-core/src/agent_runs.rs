@@ -160,6 +160,10 @@ pub struct AgentRun {
     pub effort: String,
     pub provider: Option<String>,
     pub role_assignment_id: Option<i64>,
+    pub configured_profile_id: Option<String>,
+    pub configured_provider: Option<String>,
+    pub configured_model: Option<String>,
+    pub configured_effort: Option<String>,
     pub spawned_at: i64,
     pub ended_at: Option<i64>,
     pub end_reason: Option<String>,
@@ -281,7 +285,9 @@ pub fn insert_r2_with_assignment(
 /// new worker profile under the daemon's current policy.
 pub fn first_worker(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>> {
     conn.query_row(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id,
+                configured_profile_id, configured_provider, configured_model, configured_effort,
+                spawned_at, ended_at, end_reason
          FROM agent_runs
          WHERE task_id = ?1 AND role = 'worker'
          ORDER BY spawned_at ASC LIMIT 1",
@@ -296,9 +302,13 @@ pub fn first_worker(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>>
                 effort: r.get(5)?,
                 provider: r.get(6)?,
                 role_assignment_id: r.get(7)?,
-                spawned_at: r.get(8)?,
-                ended_at: r.get(9)?,
-                end_reason: r.get(10)?,
+                configured_profile_id: r.get(8)?,
+                configured_provider: r.get(9)?,
+                configured_model: r.get(10)?,
+                configured_effort: r.get(11)?,
+                spawned_at: r.get(12)?,
+                ended_at: r.get(13)?,
+                end_reason: r.get(14)?,
             })
         },
     )
@@ -326,7 +336,9 @@ pub fn interrupted_reviewer(
     is_r2: bool,
 ) -> Result<Option<AgentRun>> {
     conn.query_row(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id,
+                configured_profile_id, configured_provider, configured_model, configured_effort,
+                spawned_at, ended_at, end_reason
          FROM agent_runs
          WHERE task_id = ?1
            AND role = 'reviewer'
@@ -345,9 +357,13 @@ pub fn interrupted_reviewer(
                 effort: r.get(5)?,
                 provider: r.get(6)?,
                 role_assignment_id: r.get(7)?,
-                spawned_at: r.get(8)?,
-                ended_at: r.get(9)?,
-                end_reason: r.get(10)?,
+                configured_profile_id: r.get(8)?,
+                configured_provider: r.get(9)?,
+                configured_model: r.get(10)?,
+                configured_effort: r.get(11)?,
+                spawned_at: r.get(12)?,
+                ended_at: r.get(13)?,
+                end_reason: r.get(14)?,
             })
         },
     )
@@ -358,7 +374,9 @@ pub fn interrupted_reviewer(
 /// All runs for a task, ordered by id.
 pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
     let mut stmt = conn.prepare(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason \
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id,
+                configured_profile_id, configured_provider, configured_model, configured_effort,
+                spawned_at, ended_at, end_reason \
          FROM agent_runs WHERE task_id = ?1 ORDER BY id ASC",
     )?;
     let runs = stmt
@@ -372,9 +390,13 @@ pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
                 effort: r.get(5)?,
                 provider: r.get(6)?,
                 role_assignment_id: r.get(7)?,
-                spawned_at: r.get(8)?,
-                ended_at: r.get(9)?,
-                end_reason: r.get(10)?,
+                configured_profile_id: r.get(8)?,
+                configured_provider: r.get(9)?,
+                configured_model: r.get(10)?,
+                configured_effort: r.get(11)?,
+                spawned_at: r.get(12)?,
+                ended_at: r.get(13)?,
+                end_reason: r.get(14)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -384,15 +406,33 @@ pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
 /// Latest run identity for a task, without materializing its complete history.
 pub fn latest_for_task(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>> {
     conn.query_row(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id,
+                configured_profile_id, configured_provider, configured_model, configured_effort,
+                spawned_at, ended_at, end_reason
          FROM agent_runs WHERE task_id = ?1 ORDER BY spawned_at DESC, id DESC LIMIT 1",
         params![task_id],
-        |r| Ok(AgentRun {
-            id: r.get(0)?, agent: r.get(1)?, role: r.get(2)?, sub_role: r.get(3)?,
-            model: r.get(4)?, effort: r.get(5)?, provider: r.get(6)?, role_assignment_id: r.get(7)?,
-            spawned_at: r.get(8)?, ended_at: r.get(9)?, end_reason: r.get(10)?,
-        }),
-    ).optional().map_err(Into::into)
+        |r| {
+            Ok(AgentRun {
+                id: r.get(0)?,
+                agent: r.get(1)?,
+                role: r.get(2)?,
+                sub_role: r.get(3)?,
+                model: r.get(4)?,
+                effort: r.get(5)?,
+                provider: r.get(6)?,
+                role_assignment_id: r.get(7)?,
+                configured_profile_id: r.get(8)?,
+                configured_provider: r.get(9)?,
+                configured_model: r.get(10)?,
+                configured_effort: r.get(11)?,
+                spawned_at: r.get(12)?,
+                ended_at: r.get(13)?,
+                end_reason: r.get(14)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// Close an open run row at teardown/terminal.
@@ -454,6 +494,42 @@ mod tests {
             .unwrap();
         assert_eq!(ended, 200);
         assert_eq!(reason, "done");
+        let run = latest_for_task(&c, tid).unwrap().unwrap();
+        assert_eq!(run.configured_profile_id, None);
+        assert_eq!(run.configured_provider, None);
+        assert_eq!(run.configured_model, None);
+        assert_eq!(run.configured_effort, None);
+    }
+
+    #[test]
+    fn configured_route_fixture_round_trips_with_immutable_assignment() {
+        let (_d, c) = open_tmp();
+        c.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (42,'worker:task:7:revision:1',7,'worker','original','claude','claude',
+                     'opus','high','worker:M','generation-1',1)",
+            [],
+        )
+        .unwrap();
+        // This internal fixture deliberately bypasses the future guarded writer.
+        c.execute(
+            "INSERT INTO agent_runs(
+                 task_id,agent_name,role,model,effort,provider,role_assignment_id,spawned_at,
+                 configured_profile_id,configured_provider,configured_model,configured_effort)
+             VALUES (7,'alternate','worker','gpt-5.6-sol','medium','codex',42,2,
+                     'sol','codex','gpt-5.6-sol','medium')",
+            [],
+        )
+        .unwrap();
+
+        let run = latest_for_task(&c, 7).unwrap().unwrap();
+        assert_eq!(run.role_assignment_id, Some(42));
+        assert_eq!(run.configured_profile_id.as_deref(), Some("sol"));
+        assert_eq!(run.configured_provider.as_deref(), Some("codex"));
+        assert_eq!(run.configured_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(run.configured_effort.as_deref(), Some("medium"));
     }
 
     #[test]

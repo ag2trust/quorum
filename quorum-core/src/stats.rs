@@ -954,6 +954,7 @@ fn progress_runs(conn: &Connection, task_id: i64) -> Result<Vec<crate::agent_run
     let mut runs = conn
         .prepare(
             "SELECT id,agent_name,role,sub_role,model,effort,provider,role_assignment_id,
+                    configured_profile_id,configured_provider,configured_model,configured_effort,
                     spawned_at,ended_at,end_reason
              FROM agent_runs WHERE task_id=?1 ORDER BY id DESC LIMIT ?2",
         )?
@@ -969,9 +970,13 @@ fn progress_runs(conn: &Connection, task_id: i64) -> Result<Vec<crate::agent_run
                     effort: row.get(5)?,
                     provider: row.get(6)?,
                     role_assignment_id: row.get(7)?,
-                    spawned_at: row.get(8)?,
-                    ended_at: row.get(9)?,
-                    end_reason: row.get(10)?,
+                    configured_profile_id: row.get(8)?,
+                    configured_provider: row.get(9)?,
+                    configured_model: row.get(10)?,
+                    configured_effort: row.get(11)?,
+                    spawned_at: row.get(12)?,
+                    ended_at: row.get(13)?,
+                    end_reason: row.get(14)?,
                 })
             },
         )?
@@ -990,6 +995,10 @@ fn progress_runs(conn: &Connection, task_id: i64) -> Result<Vec<crate::agent_run
                 effort: String::new(),
                 provider: None,
                 role_assignment_id: None,
+                configured_profile_id: None,
+                configured_provider: None,
+                configured_model: None,
+                configured_effort: None,
                 spawned_at: 0,
                 ended_at: Some(0),
                 end_reason: Some(format!("{omitted} earlier completed runs")),
