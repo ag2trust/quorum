@@ -587,6 +587,11 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     configured_effort     TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
+-- v62: the UNIQUE partial index `agent_runs_configured_route` is defined only in
+-- the migration branch below because it names `role_assignment_id` and
+-- `configured_profile_id`, both of which pre-v42 / pre-v61 legacy tables lack.
+-- SCHEMA_SQL is a no-op for existing tables and would try to create the index
+-- against the still-legacy shape.
 
 -- Durable token telemetry for every model invocation. Managed worker/reviewer
 -- rows point at agent_runs; daemon classifier and post-merge collector rows do
