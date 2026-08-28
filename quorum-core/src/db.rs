@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 61;
+pub const SCHEMA_VERSION: i64 = 62;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1093,6 +1093,20 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 )?;
             }
         }
+        // v62 enforces at most one attributed alternate agent_run per
+        // (role_assignment_id, configured_profile_id). Partial `WHERE
+        // configured_profile_id IS NOT NULL` leaves every historical and
+        // original-route row (all NULL today) outside the index, so the migration
+        // is a no-op for existing rows. `CREATE UNIQUE INDEX IF NOT EXISTS` is
+        // idempotent for re-run under the same migration transaction and matches
+        // the shape SCHEMA_SQL applies to a fresh DB.
+        if current < 62 {
+            conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_configured_route
+                     ON agent_runs(role_assignment_id, configured_profile_id)
+                     WHERE configured_profile_id IS NOT NULL",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1235,8 +1249,11 @@ mod tests {
         }
         {
             let raw = Connection::open(&path).unwrap();
+            // Drop the v62 partial index before removing its columns; SQLite
+            // refuses a DROP COLUMN that leaves a live index referencing it.
             raw.execute_batch(
-                "ALTER TABLE agent_runs DROP COLUMN configured_effort;
+                "DROP INDEX IF EXISTS agent_runs_configured_route;
+                 ALTER TABLE agent_runs DROP COLUMN configured_effort;
                  ALTER TABLE agent_runs DROP COLUMN configured_model;
                  ALTER TABLE agent_runs DROP COLUMN configured_provider;
                  ALTER TABLE agent_runs DROP COLUMN configured_profile_id;
@@ -1282,6 +1299,121 @@ mod tests {
                 .configured_profile_id,
             None
         );
+    }
+
+    #[test]
+    fn v61_to_v62_adds_configured_route_unique_partial_index_without_touching_null_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v61-configured-route-index.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (7,'migration fixture','working','test',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,role,complexity,profile_id,provider,runner,
+                     model,effort,pool_key,policy_generation,created_at)
+                 VALUES (42,'worker:task:7',7,'worker','M','opus','claude','claude',
+                         'opus','high','worker.M','gen-1',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at,
+                     role_assignment_id)
+                 VALUES (7,'legacy','worker','opus','high','claude',1,NULL),
+                        (7,'original','worker','opus','high','claude',2,42)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "DROP INDEX IF EXISTS agent_runs_configured_route;
+                 PRAGMA user_version=61;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = open(&path).unwrap();
+        assert_eq!(
+            upgraded
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let index_exists: i64 = upgraded
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='index' AND name='agent_runs_configured_route'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT count(*) FROM agent_runs WHERE configured_profile_id IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2,
+            "NULL configured routes must remain readable after the migration"
+        );
+
+        // A second run is a no-op: idempotent.
+        drop(upgraded);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        // Original-route rows (NULL configured_profile_id) can coexist without
+        // conflict; the partial index only spans populated rows.
+        reopened
+            .execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at,
+                     role_assignment_id)
+                 VALUES (7,'another-original','worker','opus','high','claude',3,42)",
+                [],
+            )
+            .unwrap();
+
+        // A duplicate populated configured route for the same assignment is
+        // rejected by the partial UNIQUE index.
+        reopened
+            .execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at,
+                     role_assignment_id,configured_profile_id,configured_provider,
+                     configured_model,configured_effort)
+                 VALUES (7,'alt-1','worker','sol','high','codex',4,42,
+                         'sol','codex','sol','high')",
+                [],
+            )
+            .unwrap();
+        let dup = reopened.execute(
+            "INSERT INTO agent_runs(
+                 task_id,agent_name,role,model,effort,provider,spawned_at,
+                 role_assignment_id,configured_profile_id,configured_provider,
+                 configured_model,configured_effort)
+             VALUES (7,'alt-2','worker','sol','high','codex',5,42,
+                     'sol','codex','sol','high')",
+            [],
+        );
+        assert!(dup.is_err(), "duplicate configured route must fail closed");
     }
 
     #[test]
