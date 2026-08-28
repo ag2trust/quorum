@@ -90,6 +90,24 @@ pub struct RoleAssignment {
     pub created_at: i64,
 }
 
+impl RoleAssignment {
+    /// The immutable executable profile snapshot selected for this responsibility.
+    pub fn profile_snapshot(&self) -> ModelProfile {
+        ModelProfile {
+            id: self.profile_id.clone(),
+            provider: self.provider.clone(),
+            runner: self.runner.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        }
+    }
+
+    /// Whether a pool is the exact policy generation that created this assignment.
+    pub fn matches_pool_generation(&self, pool: &ValidatedPool) -> bool {
+        self.pool_key == pool.pool_key && self.policy_generation == pool.policy_generation
+    }
+}
+
 /// Minimum semantic identity required when canonical evidence links to a role
 /// assignment.
 ///
