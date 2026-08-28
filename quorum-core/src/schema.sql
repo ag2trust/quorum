@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 63). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 64). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -1031,12 +1031,36 @@ CREATE TABLE IF NOT EXISTS github_agent_operations (
     error_summary      TEXT,
     completed_after_revocation INTEGER NOT NULL DEFAULT 0
                               CHECK(completed_after_revocation IN (0,1)),
+    -- v64: managed-run revalidation snapshot columns the claim child will
+    -- re-check against the live collaboration attempt on every claim attempt.
+    -- Nullable so v61-vintage inserts (which never populated them) continue
+    -- to round-trip; new callers using `github_operations::enqueue` stamp them.
+    lifecycle_generation INTEGER,
+    reviewer_launch_sha  TEXT,
+    -- v64: coarse ordering key for the claim child's fair pick order across
+    -- operations that share a natural batch (e.g. all pending replies on one
+    -- pull-request review). Storage-only; no semantics are assigned yet.
+    group_key          TEXT,
+    -- v64: claim/execution wall-clock stamps. Set by the claim child when it
+    -- transitions active 0→1 and again when execution begins; NULL until then.
+    claimed_at         INTEGER,
+    execution_started_at INTEGER,
+    -- v64: guarded active-claim sentinel. The claim child transitions this
+    -- 0→1 atomically alongside stamping `claimed_at`, and the partial UNIQUE
+    -- index below enforces at most one live claim per operation_id.
+    active             INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL,
     expires_at         INTEGER NOT NULL,
     UNIQUE(attempt_id, client_request_id),
     UNIQUE(attempt_id, review_sequence)
 );
+-- v64: the load-bearing invariant for the claim child — at most one active
+-- claim per operation. Created by the v64 migration block in `db.rs` *after*
+-- the `active` column is ALTERed in, because SCHEMA_SQL runs before the
+-- migration ALTERs and cannot reference a not-yet-added column. `operation_id`
+-- is already globally UNIQUE, so this partial index adds no row-shape
+-- constraint beyond declaring the invariant (parallels `claims_one_active`).
 
 CREATE TABLE IF NOT EXISTS github_review_publication_slots (
     publisher_scope     TEXT NOT NULL,
@@ -1075,7 +1099,8 @@ CREATE INDEX IF NOT EXISTS github_review_publication_slots_task
 CREATE TRIGGER IF NOT EXISTS github_agent_operations_request_immutable
 BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
                  task_id, agent, role, pr_number, head_sha, kind, request_json,
-                 github_marker, created_at ON github_agent_operations
+                 github_marker, lifecycle_generation, reviewer_launch_sha, group_key,
+                 created_at ON github_agent_operations
 BEGIN
     SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
 END;
