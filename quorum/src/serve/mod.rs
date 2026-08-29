@@ -15,6 +15,8 @@ pub mod codex_agent;
 pub mod codex_stream;
 pub mod collector;
 pub mod doctor;
+#[allow(dead_code)] // The retire step is intentionally unwired until fallback activation.
+pub mod fallback_retire;
 pub mod grok_agent;
 pub mod merge;
 pub mod merged_continuation;

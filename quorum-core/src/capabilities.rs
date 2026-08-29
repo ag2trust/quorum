@@ -987,7 +987,7 @@ pub(crate) fn managed_run_is_active_tx(
 }
 
 /// Revoke one exact managed-run capability within a caller-owned transaction.
-pub(crate) fn revoke_managed_run_tx(
+pub fn revoke_managed_run_tx(
     tx: &Transaction<'_>,
     run_id: &str,
     agent: &str,

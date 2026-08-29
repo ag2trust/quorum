@@ -629,6 +629,15 @@ pub fn close(conn: &Connection, run_id: i64, ended_at: i64, end_reason: &str) ->
     Ok(())
 }
 
+/// Close a run row within a caller-owned transaction.
+pub fn close_tx(tx: &Transaction<'_>, run_id: i64, ended_at: i64, end_reason: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE agent_runs SET ended_at = ?1, end_reason = ?2 WHERE id = ?3",
+        params![ended_at, end_reason, run_id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
