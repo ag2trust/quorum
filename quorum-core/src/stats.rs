@@ -1163,13 +1163,13 @@ fn decomposition_history(
             );
         }
     }
-    // Moving beyond `validating` is durable proof that the current proposal cleared
-    // the Arbiter gate. A `planning` task alone is intentionally never such proof.
+    // Materialization is durable proof that the current proposal cleared the
+    // Arbiter gate: the Arbiter phase (`validating`) follows classification
+    // (`preclassifying`) and approval materializes the children directly. A
+    // `planning` or `preclassifying` graph is intentionally never such proof.
     if let Some(graph) = graph {
-        if matches!(
-            graph.state.as_str(),
-            "preclassifying" | "active" | "blocked" | "completed"
-        ) || graph.accepted_plan_revision.is_some()
+        if matches!(graph.state.as_str(), "active" | "blocked" | "completed")
+            || graph.accepted_plan_revision.is_some()
         {
             let already_approved = history.iter().any(|milestone| {
                 milestone.stage == "Plan review"
@@ -1367,13 +1367,13 @@ fn decomposition_current_progress(
         ),
         "preclassifying" => (
             TaskProgressStage {
-                label: "Plan accepted".into(),
+                label: "Pre-classification".into(),
                 role: None,
-                activity: "Classifying accepted child work".into(),
+                activity: "Classifying proposed child work".into(),
             },
             None,
             Some(possible_next(
-                "Accepted work may be materialized as child tasks",
+                "Classified work may proceed to Arbiter plan review",
             )),
         ),
         "active" | "blocked" | "completed" => {
@@ -1529,17 +1529,17 @@ fn execution_future(
 fn decomposition_future(current: &str) -> Vec<TaskProgressMilestone> {
     let labels = match current {
         "Intake / classification" | "Planning" => vec![
+            ("Pre-classification", None),
             ("Plan review", Some("Arbiter")),
-            ("Plan accepted", None),
             ("Child execution", None),
             ("Complete", None),
         ],
-        "Plan review" => vec![
-            ("Plan accepted", None),
+        "Pre-classification" => vec![
+            ("Plan review", Some("Arbiter")),
             ("Child execution", None),
             ("Complete", None),
         ],
-        "Plan accepted" => vec![("Child execution", None), ("Complete", None)],
+        "Plan review" => vec![("Child execution", None), ("Complete", None)],
         "Child execution" => vec![("Complete", None)],
         _ => Vec::new(),
     };
@@ -6075,13 +6075,36 @@ mod tests {
         );
         assert_eq!(changed.attempts.arbiter_rounds, 3);
 
+        // Classification precedes the Arbiter: a `preclassifying` graph has not
+        // been reviewed yet, so it must not claim an approval.
         c.execute(
             "UPDATE task_decompositions SET state='preclassifying' WHERE id=?1",
             [graph],
         )
         .unwrap();
+        let classifying = projection(&c, source);
+        assert_eq!(classifying.stage.label, "Pre-classification");
+        assert!(!classifying.history.iter().any(|milestone| {
+            milestone.stage == "Plan review" && milestone.activity.as_deref() == Some("Approved")
+        }));
+        assert_eq!(
+            classifying
+                .milestones
+                .iter()
+                .filter(|milestone| milestone.state == TaskProgressMilestoneState::Future)
+                .map(|milestone| milestone.stage.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Plan review", "Child execution", "Complete"],
+            "the Arbiter review is still ahead of a preclassifying graph"
+        );
+
+        // Materialization is the durable approval evidence.
+        c.execute(
+            "UPDATE task_decompositions SET state='active',active=1 WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
         let approved = projection(&c, source);
-        assert_eq!(approved.stage.label, "Plan accepted");
         assert!(approved.history.iter().any(|milestone| {
             milestone.stage == "Plan review" && milestone.activity.as_deref() == Some("Approved")
         }));

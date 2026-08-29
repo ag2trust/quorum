@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 63;
+pub const SCHEMA_VERSION: i64 = 64;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1125,6 +1125,19 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                      WHERE agent_run_id IS NOT NULL",
             )?;
         }
+        // v64 persists the classifier's accepted verdicts alongside the accepted
+        // proposal so the Arbiter phase (which now follows classification) and a
+        // restart inside it materialize from the classification that was actually
+        // reviewed, never a re-run. Plain nullable TEXT like v37; the write bound
+        // is enforced by `decomposition::accept_classifications`.
+        if current < 64
+            && !column_exists(conn, "task_decompositions", "accepted_classifications_json")?
+        {
+            conn.execute(
+                "ALTER TABLE task_decompositions ADD COLUMN accepted_classifications_json TEXT",
+                [],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1488,6 +1501,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index_exists, 1);
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn v63_to_v64_adds_nullable_accepted_classifications_without_touching_proposals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v63-accepted-classifications.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','planning','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                    source_task_id,state,freeze_active,planned_source_revision,
+                    accepted_proposal_json,created_at,updated_at)
+                 VALUES (1,'validating',1,1,'[]',2,2)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE task_decompositions DROP COLUMN accepted_classifications_json;
+                 PRAGMA user_version=63;",
+            )
+            .unwrap();
+        }
+
+        let mut upgraded = open(&path).unwrap();
+        assert!(column_exists(
+            &upgraded,
+            "task_decompositions",
+            "accepted_classifications_json"
+        )
+        .unwrap());
+        let preserved: (String, Option<String>, Option<String>) = upgraded
+            .query_row(
+                "SELECT state,accepted_proposal_json,accepted_classifications_json
+                 FROM task_decompositions WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("validating".into(), Some("[]".into()), None),
+            "a pre-v64 validating row keeps its proposal and gains no inferred classification"
+        );
+
+        // The write bound is enforced by the guarded core write, mirroring v37.
+        upgraded
+            .execute(
+                "UPDATE task_decompositions SET state='preclassifying' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        let exact = format!("\"{}\"", "a".repeat(65_534));
+        assert_eq!(exact.len(), 65_536);
+        assert!(crate::decomposition::accept_classifications(&mut upgraded, 1, &exact, 3).unwrap());
+        upgraded
+            .execute(
+                "UPDATE task_decompositions
+                 SET state='preclassifying',accepted_classifications_json=NULL WHERE id=1",
+                [],
+            )
+            .unwrap();
+        let over = format!("\"{}\"", "é".repeat(32_768));
+        assert!(over.len() > 65_536);
+        assert!(crate::decomposition::accept_classifications(&mut upgraded, 1, &over, 4).is_err());
         drop(upgraded);
 
         let reopened = open(&path).unwrap();

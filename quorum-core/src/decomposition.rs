@@ -1044,6 +1044,7 @@ pub fn reject_frozen_proposal(
         tx.execute(
             "UPDATE task_decompositions SET state='held',freeze_active=0,
                  proposal_attempts=?2,accepted_proposal_json=NULL,
+                 accepted_classifications_json=NULL,
                  planner_session_id=NULL,hold_code='proposal-attempts-exhausted',
                  hold_summary=?3,updated_at=?4
              WHERE id=?1",
@@ -1057,7 +1058,8 @@ pub fn reject_frozen_proposal(
     } else {
         tx.execute(
             "UPDATE task_decompositions SET state='planning',proposal_attempts=?2,
-                 accepted_proposal_json=NULL,planner_session_id=NULL,updated_at=?3
+                 accepted_proposal_json=NULL,accepted_classifications_json=NULL,
+                 planner_session_id=NULL,updated_at=?3
              WHERE id=?1",
             params![graph_id, next_count, now],
         )?;
@@ -1204,7 +1206,8 @@ pub fn reset_accepted_proposal_to_planning(
     let tx = begin_immediate(conn)?;
     let changed = tx.execute(
         "UPDATE task_decompositions
-         SET state='planning',planner_session_id=NULL,accepted_proposal_json=NULL,updated_at=?3
+         SET state='planning',planner_session_id=NULL,accepted_proposal_json=NULL,
+             accepted_classifications_json=NULL,updated_at=?3
          WHERE id=?1 AND state=?2 AND freeze_active=1 AND active=0",
         params![graph_id, expected, now],
     )?;
@@ -1212,9 +1215,11 @@ pub fn reset_accepted_proposal_to_planning(
     Ok(changed == 1)
 }
 
-/// Durably accept one bounded provider proposal before leaving planning. This
-/// makes validating and preclassifying restart-resumable without charging a
-/// semantic rejection budget.
+/// Durably accept one bounded provider proposal before leaving planning. The
+/// graph enters `preclassifying` (the closed-book classifier runs before the
+/// Arbiter), which makes preclassifying and validating restart-resumable
+/// without charging a semantic rejection budget. Any classification from an
+/// earlier proposal is discarded with it.
 pub fn accept_proposal(
     conn: &mut Connection,
     graph_id: i64,
@@ -1232,9 +1237,43 @@ pub fn accept_proposal(
     let tx = begin_immediate(conn)?;
     let changed = tx.execute(
         "UPDATE task_decompositions
-         SET state='validating',accepted_proposal_json=?2,updated_at=?3
+         SET state='preclassifying',accepted_proposal_json=?2,
+             accepted_classifications_json=NULL,updated_at=?3
          WHERE id=?1 AND state='planning' AND freeze_active=1 AND active=0",
         params![graph_id, proposal_json, now],
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed == 1)
+}
+
+/// Durably accept the classifier's complete verdict batch for the accepted
+/// proposal and advance `preclassifying` -> `validating`, where the Arbiter
+/// gates the classified proposal. The batch is persisted next to the proposal
+/// so the later materialization (and a restart inside `validating`) consumes
+/// exactly the classification that was reviewed rather than re-running a
+/// non-deterministic classifier. Guarded on `preclassifying` with a present
+/// proposal: a zero-row bind is a clean lost race (invariant #3).
+pub fn accept_classifications(
+    conn: &mut Connection,
+    graph_id: i64,
+    classifications_json: &str,
+    now: i64,
+) -> Result<bool> {
+    if classifications_json.is_empty()
+        || classifications_json.len() > 65_536
+        || serde_json::from_str::<serde_json::Value>(classifications_json).is_err()
+    {
+        return Err(QuorumError::Usage(
+            "invalid bounded accepted decomposition classification".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE task_decompositions
+         SET state='validating',accepted_classifications_json=?2,updated_at=?3
+         WHERE id=?1 AND state='preclassifying' AND freeze_active=1 AND active=0
+           AND accepted_proposal_json IS NOT NULL",
+        params![graph_id, classifications_json, now],
     )?;
     tx.commit().map_err(map_sql_err)?;
     Ok(changed == 1)
@@ -1441,7 +1480,8 @@ pub fn materialize_graph(
     }
     let changed = tx.execute(
         "UPDATE task_decompositions SET state='active',active=1,freeze_active=0,
-             accepted_plan_revision=plan_revision,accepted_proposal_json=NULL,updated_at=?2
+             accepted_plan_revision=plan_revision,accepted_proposal_json=NULL,
+             accepted_classifications_json=NULL,updated_at=?2
          WHERE id=?1 AND active=0 AND freeze_active=1",
         params![graph_id, now],
     );
@@ -4220,6 +4260,167 @@ mod tests {
             "SELECT state,freeze_active,proposal_attempts,provider_failures FROM task_decompositions WHERE id=?1",
             [graph], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(state, ("held".into(), 0, 0, 0));
+    }
+
+    fn accepted_columns(conn: &Connection, graph: i64) -> (String, Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT state,accepted_proposal_json,accepted_classifications_json
+             FROM task_decompositions WHERE id=?1",
+            [graph],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    fn planning_graph(conn: &mut Connection) -> i64 {
+        let graph = begin_planning(
+            conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(set_frozen_phase(conn, graph, "freeze-requested", "planning", None, 2).unwrap());
+        graph
+    }
+
+    /// The lifecycle order is planning -> preclassifying (classifier) ->
+    /// validating (Arbiter): an accepted proposal never reaches the Arbiter
+    /// phase until its classification is durably accepted, and the
+    /// classification is discarded with the proposal it belongs to.
+    #[test]
+    fn accepted_proposal_is_classified_before_it_reaches_the_arbiter_phase() {
+        let mut conn = setup();
+        let graph = planning_graph(&mut conn);
+
+        assert!(accept_proposal(&mut conn, graph, "[]", 3).unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("preclassifying".into(), Some("[]".into()), None)
+        );
+        assert!(
+            !accept_proposal(&mut conn, graph, "[]", 4).unwrap(),
+            "a proposal is accepted from planning only"
+        );
+
+        assert!(accept_classifications(&mut conn, graph, r#"{"tasks":[]}"#, 5).unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            (
+                "validating".into(),
+                Some("[]".into()),
+                Some(r#"{"tasks":[]}"#.into())
+            )
+        );
+        assert!(
+            !accept_classifications(&mut conn, graph, "[]", 6).unwrap(),
+            "the guarded classification write is keyed on preclassifying"
+        );
+        assert_eq!(
+            accepted_columns(&conn, graph).2.as_deref(),
+            Some(r#"{"tasks":[]}"#),
+            "a second classification cannot replace the reviewed one"
+        );
+
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "validating",
+            "arbiter-changes",
+            "blocking finding",
+            7,
+        )
+        .unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("planning".into(), None, None),
+            "an Arbiter rejection discards the proposal and its classification"
+        );
+
+        // The next proposal must be classified again before any Arbiter run.
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_classifications_json='stale' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert!(accept_proposal(&mut conn, graph, "[1]", 8).unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("preclassifying".into(), Some("[1]".into()), None),
+            "a stale classification never carries into a new proposal"
+        );
+    }
+
+    #[test]
+    fn classification_acceptance_requires_a_durable_proposal() {
+        let mut conn = setup();
+        let graph = planning_graph(&mut conn);
+        assert!(set_frozen_phase(&mut conn, graph, "planning", "preclassifying", None, 3).unwrap());
+        assert!(
+            !accept_classifications(&mut conn, graph, "[]", 4).unwrap(),
+            "preclassifying without an accepted proposal has nothing to classify"
+        );
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("preclassifying".into(), None, None)
+        );
+        assert!(accept_classifications(&mut conn, graph, "", 5).is_err());
+        assert!(accept_classifications(&mut conn, graph, "not json", 5).is_err());
+    }
+
+    #[test]
+    fn classifier_rejection_from_preclassifying_never_reaches_validating() {
+        let mut conn = setup();
+        let graph = planning_graph(&mut conn);
+        assert!(accept_proposal(&mut conn, graph, "[]", 3).unwrap());
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "preclassifying",
+            "child-preclassification",
+            "child a rejected by preclassification: size L",
+            4,
+        )
+        .unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("planning".into(), None, None)
+        );
+        assert!(
+            !accept_classifications(&mut conn, graph, "[]", 5).unwrap(),
+            "a rejected proposal cannot be advanced into the Arbiter phase"
+        );
+        assert_eq!(accepted_columns(&conn, graph).0, "planning");
+    }
+
+    #[test]
+    fn compatibility_reset_and_materialization_clear_accepted_classifications() {
+        let mut conn = setup();
+        let graph = planning_graph(&mut conn);
+        assert!(accept_proposal(&mut conn, graph, "[]", 3).unwrap());
+        assert!(accept_classifications(&mut conn, graph, "[]", 4).unwrap());
+        assert!(reset_accepted_proposal_to_planning(&mut conn, graph, "validating", 5).unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("planning".into(), None, None)
+        );
+
+        assert!(accept_proposal(&mut conn, graph, "[]", 6).unwrap());
+        assert!(accept_classifications(&mut conn, graph, "[]", 7).unwrap());
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("active".into(), None, None)
+        );
     }
 
     #[test]
