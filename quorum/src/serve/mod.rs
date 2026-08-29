@@ -5495,19 +5495,36 @@ fn truncate_utf8_bytes(value: &str, limit: usize) -> &str {
 const DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES;
 const MAX_PLANNED_CHILD_KEY_BYTES: usize = 64;
 const CHILD_REJECTION_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 4;
-const CHILD_REJECTION_SIZE_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 4;
+// A classifier `size_reason` is already bounded at persistence, so the whole
+// rationale always reaches the planner.
+const CHILD_REJECTION_SIZE_REASON_MAX_BYTES: usize = quorum_core::classify::MAX_SIZE_REASON_BYTES;
 const CHILD_REJECTION_PREFIX_MAX_BYTES: usize =
     "child ".len() + MAX_PLANNED_CHILD_KEY_BYTES + " rejected by preclassification: ".len();
 const CHILD_REJECTION_READY_WRAPPER_BYTES: usize =
     "ready=false (not_ready_reason: ".len() + ")".len();
 const CHILD_REJECTION_SIZE_MAX_BYTES: usize = "size=".len()
     + "XL".len()
+    + " cx_est=".len()
+    + "5".len()
     + " (size_reason: ".len()
     + CHILD_REJECTION_SIZE_REASON_MAX_BYTES
     + ")".len();
 const CHILD_REJECTION_DUPLICATE_LABEL_BYTES: usize = "duplicate_of=".len();
 const CHILD_REJECTION_SEPARATORS_MAX_BYTES: usize = 2 * "; ".len();
-const CHILD_REJECTION_CONTEXT_MAX_BYTES: usize = 272;
+// The rejected child's own delta and paths are the planner's correction
+// anchor: keep them wide enough that a realistic child contract survives.
+const CHILD_REJECTION_DELTA_MAX_BYTES: usize = PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES;
+const CHILD_REJECTION_PATHS_MAX_BYTES: usize = 512;
+const CHILD_REJECTION_CONTEXT_MAX_BYTES: usize = "; rejected_delta=".len()
+    + CHILD_REJECTION_DELTA_MAX_BYTES
+    + "; affected_paths=[".len()
+    + CHILD_REJECTION_PATHS_MAX_BYTES
+    + "]".len();
+/// Per-field byte bound applied to planner-written child text before it is
+/// assembled into the classifier body. Planner fields are already bounded at
+/// 8 KiB; this keeps the eight-field body inside the classifier's
+/// `PLANNED_CHILD_BODY_CHAR_LIMIT` envelope without cutting the body itself.
+const PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES: usize = 4 * 1024;
 // Keep the complete combined rejection within the planner retry-feedback
 // consumer's bound. Reserve fixed space for every dimension, then divide the
 // variable space between the readiness reason and duplicate task IDs.
@@ -5644,17 +5661,21 @@ fn child_preclassification_rejection_detail(
         );
         failed_dimensions.push(format!("ready=false (not_ready_reason: {reason})"));
     }
-    if !matches!(result.size.as_str(), "S" | "M") {
+    let rejected_size = child_size_is_rejected(result);
+    if rejected_size {
         let reason = bounded_with_ellipsis(
             result.size_reason.trim(),
             CHILD_REJECTION_SIZE_REASON_MAX_BYTES,
         );
-        failed_dimensions.push(format!("size={} (size_reason: {reason})", result.size));
+        failed_dimensions.push(format!(
+            "size={} cx_est={} (size_reason: {reason})",
+            result.size, result.cx_est
+        ));
     }
+    let include_context =
+        rejected_size && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty());
     if !result.duplicate_of.is_empty() {
-        let duplicate_limit = if !matches!(result.size.as_str(), "S" | "M")
-            && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty())
-        {
+        let duplicate_limit = if include_context {
             CHILD_REJECTION_DUPLICATES_MAX_BYTES.saturating_sub(CHILD_REJECTION_CONTEXT_MAX_BYTES)
         } else {
             CHILD_REJECTION_DUPLICATES_MAX_BYTES
@@ -5668,16 +5689,25 @@ fn child_preclassification_rejection_detail(
         return None;
     }
     let mut detail = failed_dimensions.join("; ");
-    if !matches!(result.size.as_str(), "S" | "M")
-        && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty())
-    {
-        let paths = bounded_with_ellipsis(&task.affected_paths.join(", "), 96);
-        let delta = bounded_with_ellipsis(&task.implementation_delta, 128);
+    if include_context {
+        let paths = bounded_with_ellipsis(
+            &task.affected_paths.join(", "),
+            CHILD_REJECTION_PATHS_MAX_BYTES,
+        );
+        let delta =
+            bounded_with_ellipsis(&task.implementation_delta, CHILD_REJECTION_DELTA_MAX_BYTES);
         detail.push_str(&format!(
             "; rejected_delta={delta}; affected_paths=[{paths}]"
         ));
     }
     Some(detail)
+}
+
+/// A planned child's size verdict is judged by the same implementation-size
+/// policy that dispatches root tasks, so a child the classifier calls `L` at
+/// complexity 3 or lower is accepted exactly as its root would be.
+fn child_size_is_rejected(result: &quorum_core::classify::TaskClassification) -> bool {
+    !quorum_core::tasks::size_is_dispatchable(&result.size, result.cx_est)
 }
 
 /// Preserve every verdict from one complete preclassification batch. Each
@@ -5730,7 +5760,7 @@ fn compact_child_preclassification_rejection(
     result: &quorum_core::classify::TaskClassification,
     limit: usize,
 ) -> String {
-    let rejected_size = !matches!(result.size.as_str(), "S" | "M");
+    let rejected_size = child_size_is_rejected(result);
     let include_delta = rejected_size && !task.implementation_delta.is_empty();
     let include_paths = rejected_size && !task.affected_paths.is_empty();
     let dimension_count = usize::from(!result.ready)
@@ -5743,7 +5773,7 @@ fn compact_child_preclassification_rejection(
 
     let fixed_bytes = format!("child {}: ", task.key).len()
         + usize::from(!result.ready) * "ready=false (not_ready_reason=)".len()
-        + usize::from(rejected_size) * "size=XL (size_reason=)".len()
+        + usize::from(rejected_size) * "size=XL cx_est=5 (size_reason=)".len()
         + usize::from(!result.duplicate_of.is_empty()) * "duplicate_of=".len()
         + usize::from(include_delta) * "rejected_delta=".len()
         + usize::from(include_paths) * "affected_paths=[]".len()
@@ -5773,8 +5803,9 @@ fn compact_child_preclassification_rejection(
     }
     if rejected_size {
         dimensions.push(format!(
-            "size={} (size_reason={})",
+            "size={} cx_est={} (size_reason={})",
             result.size,
+            result.cx_est,
             bounded_field(&result.size_reason)
         ));
     }
@@ -6207,8 +6238,158 @@ async fn spawn_arbiter_review(
     Ok(())
 }
 
+/// Render a planned child's contract as JSON with an explicit, stable field
+/// order. `serde_json` maps are alphabetized, which would put
+/// `acceptance_criteria` first and the delta, non-goals, and outcome behind
+/// it; a classifier reading a bounded prefix must see the sizing-relevant
+/// fields first. With `text_limit`, every text value and list is bounded
+/// separately so no single oversized field can push the rest out of the
+/// classifier's envelope.
+fn planned_child_body_json(task: &planner::ProposedTask, text_limit: Option<usize>) -> String {
+    fn bound_text(value: &str, limit: Option<usize>) -> String {
+        match limit {
+            Some(limit) => bounded_with_ellipsis(value, limit),
+            None => value.to_owned(),
+        }
+    }
+    // Bound a list by cumulative bytes: items past the budget are replaced by
+    // one ellipsis item rather than silently dropped.
+    fn bound_list(values: &[String], limit: Option<usize>) -> Vec<String> {
+        let Some(limit) = limit else {
+            return values.to_vec();
+        };
+        let mut used = 0usize;
+        let mut bounded = Vec::with_capacity(values.len());
+        for value in values {
+            if used + value.len() > limit {
+                let remaining = limit.saturating_sub(used);
+                bounded.push(bounded_with_ellipsis(value, remaining.max("…".len())));
+                break;
+            }
+            used += value.len();
+            bounded.push(value.clone());
+        }
+        bounded
+    }
+    let fields: [(&str, serde_json::Value); 8] = [
+        (
+            "implementation_delta",
+            serde_json::json!(bound_text(&task.implementation_delta, text_limit)),
+        ),
+        (
+            "affected_paths",
+            serde_json::json!(bound_list(&task.affected_paths, text_limit)),
+        ),
+        (
+            "deliverables",
+            serde_json::to_value(&task.deliverables).expect("child deliverables serialize"),
+        ),
+        (
+            "non_goals",
+            serde_json::json!(bound_list(&task.non_goals, text_limit)),
+        ),
+        (
+            "observable_outcome",
+            serde_json::json!(bound_text(&task.observable_outcome, text_limit)),
+        ),
+        (
+            "acceptance_criteria",
+            serde_json::json!(bound_list(&task.acceptance_criteria, text_limit)),
+        ),
+        (
+            "source_constraints",
+            serde_json::json!(bound_list(
+                &planner::with_worker_writability_guidance(&task.source_constraints),
+                text_limit,
+            )),
+        ),
+        (
+            "verification_expectations",
+            serde_json::json!(bound_list(&task.verification_expectations, text_limit)),
+        ),
+    ];
+    let mut body = String::from("{");
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(&serde_json::to_string(key).expect("field name serializes"));
+        body.push(':');
+        body.push_str(&serde_json::to_string(value).expect("field value serializes"));
+    }
+    body.push('}');
+    body
+}
+
+/// Resolve a planned child's prerequisites into classifier context: a sibling
+/// key becomes `key — <sibling title>` and `source:N` becomes
+/// `source:N — <task N title>` when that task is known. Unresolvable entries
+/// keep their raw text so the classifier still sees the declared edge.
+fn planned_child_dependency_labels(
+    task: &planner::ProposedTask,
+    proposal: &[planner::ProposedTask],
+    source_titles: &HashMap<i64, String>,
+) -> Vec<String> {
+    task.prerequisites
+        .iter()
+        .map(|dependency| {
+            let title = match dependency.strip_prefix("source:") {
+                Some(raw) => raw
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|id| source_titles.get(&id))
+                    .map(String::as_str),
+                None => proposal
+                    .iter()
+                    .find(|sibling| &sibling.key == dependency)
+                    .map(|sibling| sibling.title.as_str()),
+            };
+            match title.map(str::trim).filter(|title| !title.is_empty()) {
+                Some(title) => format!(
+                    "{dependency} — {}",
+                    bounded_with_ellipsis(
+                        title,
+                        quorum_core::classify::DEPENDENCY_TITLE_CHAR_LIMIT
+                    )
+                ),
+                None => dependency.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Titles of every `source:N` prerequisite in the proposal, read in one short
+/// connection. Missing tasks are simply absent from the map.
+async fn planned_source_dependency_titles(
+    db_path: &Path,
+    proposal: &[planner::ProposedTask],
+) -> Result<HashMap<i64, String>> {
+    let ids = proposal
+        .iter()
+        .flat_map(|task| task.prerequisites.iter())
+        .filter_map(|dependency| dependency.strip_prefix("source:")?.parse::<i64>().ok())
+        .collect::<std::collections::BTreeSet<i64>>();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<HashMap<i64, String>> {
+        let conn = quorum_core::db::open(&path)?;
+        let mut titles = HashMap::with_capacity(ids.len());
+        for id in ids {
+            if let Some(task) = quorum_core::tasks::get(&conn, id)? {
+                titles.insert(id, task.title);
+            }
+        }
+        Ok(titles)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("source dependency title join: {error}")))?
+}
+
 fn proposed_classifier_tasks(
     tasks: &[planner::ProposedTask],
+    source_titles: &HashMap<i64, String>,
 ) -> Vec<quorum_core::classify::TaskForClassification> {
     tasks
         .iter()
@@ -6218,23 +6399,13 @@ fn proposed_classifier_tasks(
                 id: -(index as i64) - 1,
                 revision: 1,
                 title: task.title.clone(),
-                body: Some(
-                    serde_json::json!({
-                        "implementation_delta": task.implementation_delta,
-                        "affected_paths": task.affected_paths,
-                        "observable_outcome": task.observable_outcome,
-                        "deliverables": task.deliverables,
-                        "acceptance_criteria": task.acceptance_criteria,
-                        "source_constraints": planner::with_worker_writability_guidance(
-                            &task.source_constraints,
-                        ),
-                        "verification_expectations": task.verification_expectations,
-                        "non_goals": task.non_goals,
-                    })
-                    .to_string(),
-                ),
-                dependencies: task.prerequisites.clone(),
+                body: Some(planned_child_body_json(
+                    task,
+                    Some(PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES),
+                )),
+                dependencies: planned_child_dependency_labels(task, tasks, source_titles),
                 recovery_notes: vec![],
+                body_char_limit: quorum_core::classify::PLANNED_CHILD_BODY_CHAR_LIMIT,
             },
         )
         .collect()
@@ -6280,19 +6451,7 @@ fn planned_children(
             Ok(quorum_core::decomposition::PlannedChild {
                 local_key: task.key.clone(),
                 title: task.title.clone(),
-                body: serde_json::json!({
-                    "implementation_delta": task.implementation_delta,
-                    "affected_paths": task.affected_paths,
-                    "observable_outcome": task.observable_outcome,
-                    "deliverables": task.deliverables,
-                    "acceptance_criteria": task.acceptance_criteria,
-                    "source_constraints": planner::with_worker_writability_guidance(
-                        &task.source_constraints,
-                    ),
-                    "verification_expectations": task.verification_expectations,
-                    "non_goals": task.non_goals,
-                })
-                .to_string(),
+                body: planned_child_body_json(task, None),
                 labels: Some("[\"type:implementation\",\"generated:decomposition\"]".into()),
                 classification_refs: serde_json::json!({
                     "cx_est": result.cx_est,
@@ -6963,7 +7122,8 @@ async fn tick_decomposition(
                 "preclassifying decomposition lacks its durable accepted proposal".into(),
             ));
         };
-        let tasks = proposed_classifier_tasks(proposal);
+        let source_titles = planned_source_dependency_titles(&config.db_path, proposal).await?;
+        let tasks = proposed_classifier_tasks(proposal, &source_titles);
         let classifier_assignment = assign_classifier_batch(
             config,
             &tasks,
@@ -35225,13 +35385,25 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "child a rejected by preclassification: ready=false (not_ready_reason: missing acceptance criteria)"
         );
 
-        for size in ["L", "XL"] {
+        // `L` at complexity 3 satisfies the shared implementation-size policy
+        // exactly as a root task would; the child is accepted with its verdict.
+        let mut large_but_simple = valid.clone();
+        large_but_simple[1].size = "L".into();
+        large_but_simple[1].cx_est = 3;
+        let accepted = planned_children(&proposal, &large_but_simple).unwrap();
+        let accepted_refs: serde_json::Value =
+            serde_json::from_str(&accepted[1].classification_refs).unwrap();
+        assert_eq!(accepted_refs["cx_size"], "L");
+        assert_eq!(accepted_refs["cx_est"], 3);
+
+        for (size, cx_est) in [("L", 4), ("L", 5), ("XL", 2)] {
             let mut large = valid.clone();
             large[1].size = size.into();
+            large[1].cx_est = cx_est;
             assert_eq!(
                 planned_children(&proposal, &large).unwrap_err(),
                 format!(
-                    "child b rejected by preclassification: size={size} (size_reason: bounded test classification rationale)"
+                    "child b rejected by preclassification: size={size} cx_est={cx_est} (size_reason: bounded test classification rationale)"
                 )
             );
         }
@@ -35250,13 +35422,225 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         combined[0].duplicate_of = vec![301, 302];
         assert_eq!(
             planned_children(&proposal, &combined).unwrap_err(),
-            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL (size_reason: bounded test classification rationale); duplicate_of=[301, 302]; rejected_delta=change layer a; affected_paths=[src/a.rs]"
+            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL cx_est=2 (size_reason: bounded test classification rationale); duplicate_of=[301, 302]; rejected_delta=change layer a; affected_paths=[src/a.rs]"
         );
 
         assert_eq!(
             planned_children(&proposal, &valid[..1]).unwrap_err(),
             "missing classification for b"
         );
+    }
+
+    fn composition_child_fixture() -> Vec<planner::ProposedTask> {
+        vec![
+            planner::ProposedTask {
+                key: "fallback-record-tx".into(),
+                title: "Record fallback transactions in storage".into(),
+                implementation_delta: "add the fallback record write path".into(),
+                affected_paths: vec!["src/storage/fallback.rs".into()],
+                observable_outcome: "fallback rows persist".into(),
+                deliverables: writable_deliverables("src/storage/fallback.rs"),
+                acceptance_criteria: vec!["rows persist".into()],
+                source_constraints: vec!["atomic".into()],
+                verification_expectations: vec!["storage test".into()],
+                prerequisites: vec![],
+                ..Default::default()
+            },
+            planner::ProposedTask {
+                key: "compose".into(),
+                title: "Compose the fallback flow".into(),
+                implementation_delta: format!(
+                    "Wire the delivered primitives into one flow. {}",
+                    "The composition calls each sibling seam in order and records the outcome. "
+                        .repeat(40)
+                ),
+                affected_paths: vec!["src/flow/compose.rs".into()],
+                observable_outcome: "the end-to-end fallback flow runs".into(),
+                deliverables: writable_deliverables("src/flow/compose.rs"),
+                acceptance_criteria: vec![
+                    "criterion one: the flow records a transaction".into(),
+                    format!("criterion two: {}", "long acceptance detail ".repeat(30)),
+                ],
+                source_constraints: vec!["preserve the atomic boundary".into()],
+                verification_expectations: vec!["flow integration test".into()],
+                non_goals: vec!["NON_GOAL_MARKER: do not reimplement sibling primitives".into()],
+                prerequisites: vec!["fallback-record-tx".into(), "source:7".into()],
+            },
+        ]
+    }
+
+    #[test]
+    fn planned_child_classifier_input_keeps_whole_contract_and_resolves_dependencies() {
+        let proposal = composition_child_fixture();
+        assert!(proposal[1].implementation_delta.chars().count() > 2_000);
+        let source_titles = HashMap::from([(7_i64, "Source prerequisite seven".to_string())]);
+        let tasks = proposed_classifier_tasks(&proposal, &source_titles);
+        let prompt = quorum_core::classify::build_prompt(&tasks, &[]);
+
+        // The whole planner-written delta reaches the classifier, not a
+        // 2000-character prefix of an alphabetized JSON object.
+        assert!(
+            prompt.contains(&proposal[1].implementation_delta),
+            "{prompt}"
+        );
+        assert!(prompt.contains("NON_GOAL_MARKER: do not reimplement sibling primitives"));
+        assert!(prompt.contains("criterion two: long acceptance detail"));
+        assert!(prompt.contains("fallback-record-tx — Record fallback transactions in storage"));
+        assert!(prompt.contains("source:7 — Source prerequisite seven"));
+
+        // Sizing-relevant fields precede the criteria in the body.
+        let body = tasks[1].body.as_deref().unwrap();
+        let position = |key: &str| body.find(&format!("\"{key}\":")).unwrap();
+        assert!(position("implementation_delta") < position("affected_paths"));
+        assert!(position("affected_paths") < position("deliverables"));
+        assert!(position("deliverables") < position("non_goals"));
+        assert!(position("non_goals") < position("observable_outcome"));
+        assert!(position("observable_outcome") < position("acceptance_criteria"));
+        assert!(position("acceptance_criteria") < position("source_constraints"));
+        assert!(position("source_constraints") < position("verification_expectations"));
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            parsed["implementation_delta"],
+            proposal[1].implementation_delta
+        );
+        assert_eq!(
+            tasks[1].body_char_limit,
+            quorum_core::classify::PLANNED_CHILD_BODY_CHAR_LIMIT
+        );
+
+        // An unknown source task keeps its raw reference.
+        let unresolved = proposed_classifier_tasks(&proposal, &HashMap::new());
+        assert_eq!(
+            unresolved[1].dependencies,
+            vec![
+                "fallback-record-tx — Record fallback transactions in storage".to_string(),
+                "source:7".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_child_classifier_input_bounds_each_field_separately() {
+        let mut proposal = composition_child_fixture();
+        proposal[1].implementation_delta =
+            "D".repeat(PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES + 500);
+        proposal[1].acceptance_criteria = (0..40)
+            .map(|index| format!("criterion-{index}-{}", "c".repeat(200)))
+            .collect();
+        let tasks = proposed_classifier_tasks(&proposal, &HashMap::new());
+        let body = tasks[1].body.as_deref().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        let delta = parsed["implementation_delta"].as_str().unwrap();
+        assert!(delta.len() <= PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES);
+        assert!(delta.ends_with('…'));
+        let criteria = parsed["acceptance_criteria"].as_array().unwrap();
+        let criteria_bytes: usize = criteria
+            .iter()
+            .map(|value| value.as_str().unwrap().len())
+            .sum();
+        assert!(criteria_bytes <= PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES + "…".len());
+        assert!(criteria.len() < 40);
+        assert!(criteria.last().unwrap().as_str().unwrap().ends_with('…'));
+        // Later fields survive the oversized earlier ones.
+        assert_eq!(
+            parsed["non_goals"][0],
+            "NON_GOAL_MARKER: do not reimplement sibling primitives"
+        );
+        assert_eq!(
+            parsed["verification_expectations"][0],
+            "flow integration test"
+        );
+        assert!(body.chars().count() <= quorum_core::classify::PLANNED_CHILD_BODY_CHAR_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn planned_source_dependency_titles_are_read_from_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("titles.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let existing = tasks::create(
+            &mut conn,
+            "owner",
+            "Source prerequisite title",
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        drop(conn);
+        let mut proposal = composition_child_fixture();
+        proposal[1].prerequisites = vec![
+            "fallback-record-tx".into(),
+            format!("source:{existing}"),
+            format!("source:{}", existing + 500),
+        ];
+        let titles = planned_source_dependency_titles(&db_path, &proposal)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles,
+            HashMap::from([(existing, "Source prerequisite title".to_string())])
+        );
+        let tasks = proposed_classifier_tasks(&proposal, &titles);
+        assert_eq!(
+            tasks[1].dependencies[1],
+            format!("source:{existing} — Source prerequisite title")
+        );
+        assert_eq!(
+            tasks[1].dependencies[2],
+            format!("source:{}", existing + 500)
+        );
+        assert!(planned_source_dependency_titles(&db_path, &proposal[..1])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn child_preclassification_uses_the_shared_size_policy_and_records_complexity() {
+        let proposal = composition_child_fixture();
+        let verdict = |size: &str, cx_est: i64| quorum_core::classify::TaskClassification {
+            task_id: -2,
+            cx_est,
+            size: size.into(),
+            size_reason: "composition over delivered sibling seams".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        };
+        for (size, cx_est) in [("S", 5), ("M", 5), ("L", 1), ("L", 3)] {
+            assert!(
+                child_preclassification_rejection_detail(&proposal[1], &verdict(size, cx_est))
+                    .is_none(),
+                "{size}/{cx_est} must be accepted"
+            );
+        }
+        for (size, cx_est) in [("L", 4), ("L", 5), ("XL", 1), ("XL", 5)] {
+            let detail =
+                child_preclassification_rejection_detail(&proposal[1], &verdict(size, cx_est))
+                    .unwrap();
+            assert!(
+                detail.starts_with(&format!("size={size} cx_est={cx_est} (size_reason: ")),
+                "{detail}"
+            );
+        }
+        let detail =
+            child_preclassification_rejection_detail(&proposal[1], &verdict("L", 4)).unwrap();
+        assert!(detail.contains("cx_est=4"));
+        // The planner sees the complete rejected delta and paths, not a
+        // 128-byte prefix.
+        assert!(detail.contains(&format!(
+            "rejected_delta={}; affected_paths=[src/flow/compose.rs]",
+            proposal[1].implementation_delta
+        )));
+        assert!(detail.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
+        let summary = child_preclassification_rejection(&proposal[1], &verdict("L", 4)).unwrap();
+        assert!(summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
+        assert!(summary.contains(&proposal[1].implementation_delta));
     }
 
     #[test]
@@ -35293,7 +35677,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
         assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
         assert!(summary.contains("ready=false (not_ready_reason: é"));
-        assert!(summary.contains("…); size=XL (size_reason: cross-component"));
+        assert!(summary.contains("…); size=XL cx_est=5 (size_reason: cross-component"));
         assert!(summary.contains("…); duplicate_of=[1, 2"));
         assert!(summary.contains("rejected_delta=change the bounded planner seam"));
         assert!(
@@ -35472,10 +35856,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let summary = planned_children(&proposal, &classifications).unwrap_err();
         assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
         assert!(summary.contains(
-            "child storage-child: size=L (size_reason=independently deliverable storage and daemon orchestration seams)"
+            "child storage-child: size=L cx_est=4 (size_reason=independently deliverable storage and daemon orchestration seams)"
         ));
         assert!(summary.contains(
-            "child provider-child: size=XL (size_reason=independently deliverable provider launch and restart reconstruction seams)"
+            "child provider-child: size=XL cx_est=5 (size_reason=independently deliverable provider launch and restart reconstruction seams)"
         ));
         assert!(summary.contains("rejected_delta=change storage and daemon orchestration"));
         assert!(
@@ -36805,6 +37189,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 body: None,
                 dependencies: vec![],
                 recovery_notes: vec![],
+                body_char_limit: quorum_core::classify::BODY_CHAR_LIMIT,
             },
             quorum_core::classify::TaskForClassification {
                 id: -2,
@@ -36813,6 +37198,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 body: None,
                 dependencies: vec![],
                 recovery_notes: vec![],
+                body_char_limit: quorum_core::classify::BODY_CHAR_LIMIT,
             },
         ];
         let first_identity = DecompositionClassifierResponsibility {
@@ -36909,6 +37295,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: quorum_core::classify::BODY_CHAR_LIMIT,
         }];
         let mut classifier_slot = classifier::spawn_classifier_configured(
             &classifier_tasks,
@@ -37017,6 +37404,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: quorum_core::classify::BODY_CHAR_LIMIT,
         }];
         let slot = classifier::spawn_classifier_configured(
             &tasks,
