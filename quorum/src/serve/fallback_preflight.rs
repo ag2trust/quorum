@@ -56,7 +56,10 @@ pub struct ManagedTurnCurrency {
 
 /// All immutable evidence the preflight gate needs. `expected_currency` is
 /// captured with the failed turn; `current_currency` is freshly read by the
-/// caller. The gate never opens a database connection to obtain either.
+/// caller. `observed_at` is the instant at which the current currency was
+/// observed, so an otherwise matching lease is live only when
+/// `expires_at > observed_at`. The gate never opens a database connection to
+/// obtain this evidence.
 #[derive(Debug, Clone)]
 pub struct FallbackPreflightInput<'a> {
     pub disposition: FailureDisposition,
@@ -67,6 +70,7 @@ pub struct FallbackPreflightInput<'a> {
     pub eligible_pool: &'a ValidatedPool,
     pub expected_currency: &'a ManagedTurnCurrency,
     pub current_currency: &'a ManagedTurnCurrency,
+    pub observed_at: i64,
 }
 
 /// Authorize only a current, exact provider/profile-unavailable failure.
@@ -79,6 +83,7 @@ pub fn preflight(input: &FallbackPreflightInput<'_>) -> FallbackPreflightOutcome
         input.assignment,
         input.expected_currency,
         input.current_currency,
+        input.observed_at,
     ) || input.eligible_pool.validate().is_err()
         || !input.assignment.matches_identity(&input.responsibility)
         || !input
@@ -105,6 +110,7 @@ fn currency_is_current(
     assignment: &RoleAssignment,
     expected: &ManagedTurnCurrency,
     current: &ManagedTurnCurrency,
+    observed_at: i64,
 ) -> bool {
     expected == current
         && assignment.id > 0
@@ -114,7 +120,8 @@ fn currency_is_current(
         && expected.lifecycle.generation >= 0
         && expected.lease.claim_id > 0
         && !expected.lease.holder.is_empty()
-        && expected.lease.expires_at >= 0
+        && observed_at >= 0
+        && expected.lease.expires_at > observed_at
         && match (&assignment.pr_number, &expected.head) {
             (None, None) => true,
             (Some(pr), Some(head)) => {
@@ -253,6 +260,7 @@ mod tests {
             eligible_pool: pool,
             expected_currency,
             current_currency,
+            observed_at: 99,
         }
     }
 
@@ -377,6 +385,22 @@ mod tests {
                 &pending_turn,
                 &failed_route,
             )),
+            FallbackPreflightOutcome::FailClosed,
+        );
+        assert_eq!(snapshot(), before);
+
+        let mut expired_lease = input(
+            FailureDisposition::ProviderUnavailable,
+            &assignment,
+            &pool,
+            &expected,
+            &expected,
+            &pending_turn,
+            &failed_route,
+        );
+        expired_lease.observed_at = 100;
+        assert_eq!(
+            preflight(&expired_lease),
             FallbackPreflightOutcome::FailClosed,
         );
         assert_eq!(snapshot(), before);
