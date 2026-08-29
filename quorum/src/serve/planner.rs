@@ -34,7 +34,7 @@ pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigne
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
-pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
+pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 2048;
 // A clean terminal provider line followed by no accepted `submit_plan` emits
 // one terminal response and four closure records. Provider failures and their
 // final outcome share this fixed reserve.
@@ -3653,10 +3653,11 @@ mod tests {
 
     #[test]
     fn retry_summary_truncation_preserves_utf8_at_the_byte_limit() {
-        let summary = "😀".repeat(300);
+        let chars_at_limit = MAX_REJECTION_SUMMARY_BYTES / "😀".len();
+        let summary = "😀".repeat(chars_at_limit + 1);
         let truncated = truncate_utf8(&summary, MAX_REJECTION_SUMMARY_BYTES);
         assert!(truncated.is_char_boundary(truncated.len()));
         assert!(truncated.len() <= MAX_REJECTION_SUMMARY_BYTES);
-        assert_eq!(truncated, "😀".repeat(256));
+        assert_eq!(truncated, "😀".repeat(chars_at_limit));
     }
 }

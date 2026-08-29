@@ -5492,7 +5492,7 @@ fn truncate_utf8_bytes(value: &str, limit: usize) -> &str {
     &value[..end]
 }
 
-const DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES: usize = 2048;
+const DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES;
 const MAX_PLANNED_CHILD_KEY_BYTES: usize = 64;
 const CHILD_REJECTION_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 4;
 const CHILD_REJECTION_SIZE_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 4;
@@ -5691,16 +5691,12 @@ fn aggregate_child_preclassification_rejections(
 ) -> Option<String> {
     let rejections = classified
         .iter()
-        .filter_map(|(task, result)| {
-            child_preclassification_rejection_detail(task, result)
-                .map(|detail| format!("child {}: {detail}", task.key))
-        })
+        .filter(|(task, result)| child_preclassification_rejection_detail(task, result).is_some())
+        .copied()
         .collect::<Vec<_>>();
     match rejections.as_slice() {
         [] => None,
-        [_] => classified
-            .iter()
-            .find_map(|(task, result)| child_preclassification_rejection(task, result)),
+        [(task, result)] => child_preclassification_rejection(task, result),
         _ => {
             const HEADER: &str = "preclassification rejected children:\n";
             let separator_bytes = rejections.len() - 1;
@@ -5710,17 +5706,102 @@ fn aggregate_child_preclassification_rejections(
             let extra = available % rejections.len();
             let mut summary = String::with_capacity(planner::MAX_REJECTION_SUMMARY_BYTES);
             summary.push_str(HEADER);
-            for (index, rejection) in rejections.iter().enumerate() {
+            for (index, (task, result)) in rejections.iter().enumerate() {
                 if index > 0 {
                     summary.push('\n');
                 }
                 let share = base_share + usize::from(index < extra);
-                summary.push_str(&bounded_with_ellipsis(rejection, share));
+                summary.push_str(&compact_child_preclassification_rejection(
+                    task, result, share,
+                ));
             }
             debug_assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
             Some(summary)
         }
     }
+}
+
+/// Render one child inside its aggregate share while reserving space for every
+/// failed dimension before distributing the remaining bytes across the
+/// artifact-specific values. This prevents a long readiness reason from
+/// hiding the same child's size, duplication, or implementation context.
+fn compact_child_preclassification_rejection(
+    task: &planner::ProposedTask,
+    result: &quorum_core::classify::TaskClassification,
+    limit: usize,
+) -> String {
+    let rejected_size = !matches!(result.size.as_str(), "S" | "M");
+    let include_delta = rejected_size && !task.implementation_delta.is_empty();
+    let include_paths = rejected_size && !task.affected_paths.is_empty();
+    let dimension_count = usize::from(!result.ready)
+        + usize::from(rejected_size)
+        + usize::from(!result.duplicate_of.is_empty())
+        + usize::from(include_delta)
+        + usize::from(include_paths);
+    let variable_count = dimension_count;
+    debug_assert!(dimension_count > 0);
+
+    let fixed_bytes = format!("child {}: ", task.key).len()
+        + usize::from(!result.ready) * "ready=false (not_ready_reason=)".len()
+        + usize::from(rejected_size) * "size=XL (size_reason=)".len()
+        + usize::from(!result.duplicate_of.is_empty()) * "duplicate_of=".len()
+        + usize::from(include_delta) * "rejected_delta=".len()
+        + usize::from(include_paths) * "affected_paths=[]".len()
+        + dimension_count.saturating_sub(1) * "; ".len();
+    let available = limit.saturating_sub(fixed_bytes);
+    let base_share = available / variable_count;
+    let extra = available % variable_count;
+    debug_assert!(base_share >= "…".len());
+    let mut variable_index = 0usize;
+    let mut bounded_field = |value: &str| {
+        let share = base_share + usize::from(variable_index < extra);
+        variable_index += 1;
+        bounded_with_ellipsis(value.trim(), share)
+    };
+
+    let mut dimensions = Vec::with_capacity(dimension_count);
+    if !result.ready {
+        dimensions.push(format!(
+            "ready=false (not_ready_reason={})",
+            bounded_field(
+                result
+                    .not_ready_reason
+                    .as_deref()
+                    .unwrap_or("missing not_ready_reason")
+            )
+        ));
+    }
+    if rejected_size {
+        dimensions.push(format!(
+            "size={} (size_reason={})",
+            result.size,
+            bounded_field(&result.size_reason)
+        ));
+    }
+    if !result.duplicate_of.is_empty() {
+        let ids = result
+            .duplicate_of
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        dimensions.push(format!("duplicate_of={}", bounded_field(&ids)));
+    }
+    if include_delta {
+        dimensions.push(format!(
+            "rejected_delta={}",
+            bounded_field(&task.implementation_delta)
+        ));
+    }
+    if include_paths {
+        dimensions.push(format!(
+            "affected_paths=[{}]",
+            bounded_field(&task.affected_paths.join(","))
+        ));
+    }
+    let summary = format!("child {}: {}", task.key, dimensions.join("; "));
+    debug_assert!(summary.len() <= limit, "{summary}");
+    summary
 }
 
 async fn reject_decomposition_proposal(
@@ -35391,10 +35472,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let summary = planned_children(&proposal, &classifications).unwrap_err();
         assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
         assert!(summary.contains(
-            "child storage-child: size=L (size_reason: independently deliverable storage and daemon orchestration seams)"
+            "child storage-child: size=L (size_reason=independently deliverable storage and daemon orchestration seams)"
         ));
         assert!(summary.contains(
-            "child provider-child: size=XL (size_reason: independently deliverable provider launch and restart reconstruction seams)"
+            "child provider-child: size=XL (size_reason=independently deliverable provider launch and restart reconstruction seams)"
         ));
         assert!(summary.contains("rejected_delta=change storage and daemon orchestration"));
         assert!(
@@ -35447,6 +35528,122 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(prompt.contains("independently deliverable storage and daemon orchestration"));
         assert!(prompt.contains("independently deliverable provider launch and restart"));
         assert!(prompt.contains("redistribute those named surfaces"));
+    }
+
+    #[test]
+    fn maximum_batch_preserves_every_failed_dimension_through_planner_retry() {
+        let mut proposal = Vec::new();
+        let mut classifications = Vec::new();
+        let mut keys = Vec::new();
+        for index in 0..8 {
+            let key = format!("child-{index}-{}", "k".repeat(56));
+            assert_eq!(key.len(), MAX_PLANNED_CHILD_KEY_BYTES);
+            proposal.push(planner::ProposedTask {
+                key: key.clone(),
+                title: format!("child {index}"),
+                implementation_delta: format!("delta-{index}-{}", "d".repeat(160)),
+                affected_paths: vec![format!("src/path-{index}.rs")],
+                observable_outcome: format!("outcome {index}"),
+                deliverables: writable_deliverables(&format!("src/path-{index}.rs")),
+                acceptance_criteria: vec![format!("criterion {index}")],
+                source_constraints: vec!["preserve atomicity".into()],
+                verification_expectations: vec![format!("test {index}")],
+                prerequisites: vec![],
+                ..Default::default()
+            });
+            classifications.push(quorum_core::classify::TaskClassification {
+                task_id: -(index as i64) - 1,
+                cx_est: 5,
+                size: if index % 2 == 0 { "L" } else { "XL" }.into(),
+                size_reason: format!("size-seam-{index}-{}", "s".repeat(160)),
+                ready: false,
+                not_ready_reason: Some(format!("ready-{index}-{}", "r".repeat(160))),
+                duplicate_of: vec![700 + index as i64],
+            });
+            keys.push(key);
+        }
+
+        let summary = planned_children(&proposal, &classifications).unwrap_err();
+        assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
+        for (index, key) in keys.iter().enumerate() {
+            let line = summary
+                .lines()
+                .find(|line| line.starts_with(&format!("child {key}:")))
+                .unwrap_or_else(|| panic!("missing child {key} in {summary}"));
+            assert!(
+                line.contains(&format!("not_ready_reason=ready-{index}-")),
+                "{line}"
+            );
+            let size = if index % 2 == 0 { "L" } else { "XL" };
+            assert!(line.contains(&format!("size={size}")), "{line}");
+            assert!(
+                line.contains(&format!("size_reason=size-seam-{index}-")),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("duplicate_of={}", 700 + index)),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("rejected_delta=delta-{index}-")),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("affected_paths=[src/path-{index}")),
+                "{line}"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("maximum-batch.db")).unwrap();
+        let source = tasks::create(
+            &mut conn,
+            "owner",
+            "source",
+            Some("source outcome"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "claude",
+                model: "opus",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph,
+            "proposal",
+            "child-preclassification",
+            &summary,
+            3,
+        )
+        .unwrap();
+
+        let snapshot = load_planning_snapshot(&conn).unwrap().unwrap();
+        assert_eq!(snapshot.rejection_summaries, vec![summary.clone()]);
+        let prompt = bounded_planning_prompt(&snapshot).unwrap();
+        let retry_json = serde_json::to_string(&vec![summary]).unwrap();
+        assert!(prompt.ends_with(&format!("PRIOR_REJECTIONS={retry_json}")));
+        for index in 0..8 {
+            assert!(prompt.contains(&format!("ready-{index}-")));
+            assert!(prompt.contains(&format!("size-seam-{index}-")));
+            assert!(prompt.contains(&format!("duplicate_of={}", 700 + index)));
+            assert!(prompt.contains(&format!("delta-{index}-")));
+            assert!(prompt.contains(&format!("src/path-{index}")));
+        }
     }
 
     #[tokio::test]
