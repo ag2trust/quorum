@@ -777,7 +777,7 @@ This is not a cross-vendor benchmark and does not change the required output.
    - complexity 4 / size M: add one atomic orchestration module over dependency-delivered primitives with focused replay/race tests; the semantics are hard but form one bounded seam.
    - complexity 3 / size L: extend an established behavior through storage, CLI, status output, and documentation; each layer is straightforward but the artifact owns several seams.
    - complexity 4 / size XL: build storage, lifecycle coordination, provider launching, and restart recovery when those are independently deliverable outcomes.
-3. **size_reason**: a required, concrete rationale of at most {MAX_SIZE_REASON_BYTES} UTF-8 bytes tied to this exact task artifact. Name the implementation surfaces or responsibilities that make the selected size fit better than the adjacent sizes; do not merely restate the rubric or task title. For L/XL, identify independently deliverable seams that make the artifact broad or compound. For S/M, identify the focused or bounded coherent seam. This rationale is durable review feedback for a later planning iteration.
+3. **size_reason**: a required, concrete rationale of at most {MAX_SIZE_REASON_BYTES} UTF-8 bytes tied to this exact task artifact. Name the implementation surfaces or responsibilities that make the selected size fit better than the adjacent sizes; do not merely restate the rubric or task title. For L, name the multiple owned seams or layers that remain one coherent outcome and explain why the artifact is broader than M. For XL, identify independently deliverable outcomes or seams that require decomposition. For S/M, identify the focused or bounded coherent seam. This rationale is durable review feedback for a later planning iteration.
 4. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. Declared dependencies are scheduler-enforced assumptions whose required outcomes will be satisfied before execution. Use their bounded context to understand assumed outcomes, scope, complexity, and duplication, but never return ready=false merely because a dependency is currently incomplete; dependency ordering is not classifier authority. If false, provide a concrete **not_ready_reason**; if true, it must be null.
 5. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
 
@@ -2051,6 +2051,12 @@ mod tests {
             );
         }
         assert!(rubric.contains("dependency-delivered primitives"));
+        assert!(rubric.contains(
+            "For L, name the multiple owned seams or layers that remain one coherent outcome"
+        ));
+        assert!(rubric.contains(
+            "For XL, identify independently deliverable outcomes or seams that require decomposition"
+        ));
     }
 
     #[test]
@@ -2126,7 +2132,12 @@ mod redesigned_tests {
         ));
         assert!(p.contains("intended outcome cannot be determined"));
         assert!(p.contains("size_reason"));
-        assert!(p.contains("independently deliverable seams"));
+        assert!(p.contains(
+            "For L, name the multiple owned seams or layers that remain one coherent outcome"
+        ));
+        assert!(p.contains(
+            "For XL, identify independently deliverable outcomes or seams that require decomposition"
+        ));
         assert!(p.contains("durable review feedback"));
         assert!(p.contains("Judge the serial implementation and verification work"));
         assert!(p.contains(

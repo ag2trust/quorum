@@ -315,12 +315,12 @@ or:
 A plan contains 2–8 uniquely keyed tasks. Each task has a title, concrete implementation delta,
 affected repository paths, observable outcome, acceptance criteria, applicable source constraints,
 verification expectations, explicit non-goals, byte-exact preserved literals, and prerequisite
-local keys or source dependency IDs. The planner receives the same S/M execution-size rubric as
-the classifier. It inspects from source-named paths and symbols under bounded search/read guidance,
-and separates independently deliverable code or ownership seams rather than turning preserved
-outcomes into standalone work. A blocker must be concrete. Markdown wrappers, unknown fields,
-multiple outcomes, oversized output, malformed JSON, and sandbox violations are provider
-failures.
+local keys or source dependency IDs. The planner receives the same agent execution-size rubric and
+shared dispatchability policy as the classifier: S/M at any complexity and L at complexity 3 or
+lower. It inspects from source-named paths and symbols under bounded search/read guidance, and
+separates independently deliverable code or ownership seams rather than turning preserved outcomes
+into standalone work. A blocker must be concrete. Markdown wrappers, unknown fields, multiple
+outcomes, oversized output, malformed JSON, and sandbox violations are provider failures.
 
 Literal preservation is byte-exact and bounded by the 8 KiB `preserved_literals` field and an
 8 KiB aggregate across all extracted values. Inline/fenced Markdown code uses matching backtick
@@ -384,8 +384,9 @@ All proposed children are classified together before any child row exists. Class
 temporary proposal keys, not task IDs. Every result must be present, admission-ready,
 implementation work, nonduplicate, dispatchable under the shared size policy (S/M at any
 complexity, or L at complexity 3 or lower), and carry a nonempty, NUL-free `size_reason` bounded
-to 1 KiB. The reason names the concrete execution surfaces supporting the selected size; for
-L/XL it identifies independently deliverable seams rather than merely repeating the rubric.
+to 1 KiB. The reason names the concrete execution surfaces supporting the selected size. An L
+rationale names multiple owned seams or layers that remain one coherent outcome; an XL rationale
+identifies independently deliverable outcomes or seams requiring decomposition.
 Complexity and size are orthogonal agent-facing dimensions. Complexity measures the hardest
 reasoning problem without using file count or component breadth as proxies. Size measures the
 serial implementation and verification surface owned by one managed AI coding agent, not a human
