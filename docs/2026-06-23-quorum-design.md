@@ -2243,8 +2243,10 @@ manifest (below); it no longer requires a byte-exact echo of source-marked liter
 faithfulness — that every load-bearing source requirement and constraint is carried forward,
 nothing is dropped or silently weakened, the children cover the source without overlap, and the
 plan is coherent — is judged by the Arbiter plan-review gate (below), not by a deterministic
-literal match. Only after the Arbiter approves is the complete proposal classified as one batch.
-Every child must be
+literal match. Once deterministic validation passes, the complete proposal is classified as one
+closed-book batch (`preclassifying`) *before* the Arbiter reviews it (`validating`): the
+classifier is cheap and rejects most oversized plans, so the expensive Arbiter run is spent only
+on classifier-accepted proposals. Every child must be
 admission-ready, nonduplicate, and size S or M under the same execution-size rubric given to the
 planner. Admission readiness means the scope is sufficiently clear for delivery; it is distinct
 from runtime readiness, which still requires dependencies to be done.
@@ -2254,19 +2256,20 @@ implementation context in one deterministic, globally bounded `decomposition_att
 the next fresh planner attempt receives the complete applicable batch as structured rejection
 feedback. Renaming or paraphrasing a rejected child is not scope reduction.
 
-**Arbiter plan-review gate.** Between deterministic validation and materialization the daemon
-gates every structurally valid proposal on a single-shot, stateless **Arbiter** — a model
+**Arbiter plan-review gate.** Between classification and materialization the daemon gates every
+classifier-accepted proposal on a single-shot, stateless **Arbiter** — a model
 reviewer spawned fresh per proposal in the same frozen read-only repository view the planner used,
 selected from the `[routing.arbiter]` pool (defaulting to the planner pool). The Arbiter judges the
 proposal against the authoritative source on four mandates — faithfulness, coverage and
 non-overlap, coherence, and decomposability — and emits exactly one closed verdict, parsed with the
 planner's fail-closed discipline. The Arbiter only emits a verdict; the daemon alone transitions
 lifecycle and materializes children (lifecycle authority stays with the daemon). Verdict mapping:
-*approve* (or a *changes* verdict with no blocking finding) advances the graph from `validating`
-to `preclassifying`, and the unchanged classification/materialization path then creates the
-children; *changes* with at least one blocking finding records a normal `proposal` attempt whose
-summary is the Arbiter's findings and returns the graph to `planning` so the planner re-proposes
-against those findings; *reject_source* holds the graph and fails the source for a required
+*approve* (or a *changes* verdict with no blocking finding) materializes the children directly
+from `validating`, using the classifier batch that was durably accepted when the graph left
+`preclassifying` (the classifier is never re-run after the Arbiter); *changes* with at least one
+blocking finding records a normal `proposal` attempt whose summary is the Arbiter's findings and
+returns the graph to `planning` so the planner re-proposes against those findings — the next
+proposal is classified again before any Arbiter run; *reject_source* holds the graph and fails the source for a required
 owner decision, materializing no children; and a malformed, absent, or provider/protocol-failed
 verdict records a `provider` attempt (fail closed — never a silent approval). Every terminal
 Arbiter outcome also writes exactly one additional `decomposition_attempts` row with
@@ -2277,9 +2280,15 @@ and tool counts, plus provider, model, and effort. This observational verdict ro
 lifecycle nor consumes a budget; only `proposal` and `provider` attempts count toward their
 existing limits. Its JSON stays valid while being reduced to the existing 2 KiB attempt-summary
 cap. A *changes* verdict consumes the existing three-per-revision proposal budget; a provider
-failure consumes the separate provider budget. The gate is keyed on the guarded `validating ->
-preclassifying` transition, so a daemon restart that re-spawns and re-polls a fresh Arbiter cannot
-double-materialize.
+failure consumes the separate provider budget. Approval is keyed on the guarded materialization
+write, so a daemon restart that re-spawns and re-polls a fresh Arbiter cannot double-materialize.
+Lifecycle order: `planning` -> `preclassifying` (classifier) -> `validating` (Arbiter) ->
+`active`. A classifier rejection returns the proposal to `planning` from `preclassifying` and
+never spawns an Arbiter; the accepted classification is persisted next to the accepted proposal
+(`accepted_classifications_json`) and discarded with it on any rejection or reset. A restart
+resumes the interrupted phase: `preclassifying` re-runs only the classifier, `validating` re-runs
+only the Arbiter from the persisted classification, and a `validating` row without an accepted
+classification steps back to `preclassifying` rather than reaching the Arbiter unclassified.
 
 Each proposed child also carries a bounded structured deliverables manifest that distinguishes
 requested writes from read-only contextual references. Deterministic validation rejects a write
@@ -2295,8 +2304,8 @@ self-attestation nor redesigns the worker filesystem sandbox.
 Semantic proposal rejections and provider/protocol failures have independent caps of three per
 unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
 the freeze during backoff, and retry drains again. Full prompts and transcripts are not persisted;
-only bounded structured attempts, the accepted closed proposal needed to resume validation or
-preclassification, and final reasons are durable. Restart inspection never consumes a semantic
+only bounded structured attempts, the accepted closed proposal and its accepted classification
+needed to resume preclassification or validation, and final reasons are durable. Restart inspection never consumes a semantic
 proposal attempt.
 
 Exhausting either three-attempt planning budget holds the graph and fails the source; it never

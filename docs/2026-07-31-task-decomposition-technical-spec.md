@@ -186,7 +186,10 @@ CREATE UNIQUE INDEX one_planning_freeze
 ```
 
 States are `freeze-requested`, `draining`, `planning`, `validating`, `preclassifying`,
-`provider-backoff`, `held`, `active`, `blocked`, `completed`, and `cancelled`. `active=1` is set
+`provider-backoff`, `held`, `active`, `blocked`, `completed`, and `cancelled`. The frozen planning
+order is `planning` -> `preclassifying` (closed-book classifier) -> `validating` (Arbiter) ->
+`active`; `accepted_classifications_json` (v64) carries the accepted classifier batch from
+`preclassifying` into `validating` and materialization. `active=1` is set
 only for a materialized `active` or `blocked` graph. `freeze_active=1` covers the stable-repo
 planning window. `planned_source_revision` is only the captured task revision for compare-and-swap
 validation; `tasks.revision` and `tasks.edit_count` remain authoritative. Partial unique indexes
@@ -335,7 +338,7 @@ planner response and durable proposal. Source authors should use those explicit 
 spelling is load-bearing and fits both bounds.
 
 Durable accepted proposals are revalidated against the complete closed-plan semantic contract
-before a restart resumes validating or preclassifying. Compatibility defaults for newly added
+before a restart resumes preclassifying or validating. Compatibility defaults for newly added
 fields never admit an older stored proposal with empty required fields; an atomic compatibility
 reset clears the accepted JSON and returns it to planning without consuming the current semantic
 proposal-rejection budget.
