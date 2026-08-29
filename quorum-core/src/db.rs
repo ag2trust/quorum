@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 68;
+pub const SCHEMA_VERSION: i64 = 69;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1289,6 +1289,10 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 [],
             )?;
         }
+        // v69 = restart-safe fallback launch intent. This is a net-new,
+        // append-only table, so SCHEMA_SQL's idempotent CREATE TABLE handles
+        // both fresh databases and upgrades from v68 without backfilling or
+        // inferring any historical provider continuation.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1385,6 +1389,7 @@ mod tests {
             "role_assignments",
             "routing_cursors",
             "routing_attempts",
+            "fallback_launch_intents",
             "task_messages",
             "task_message_deliveries",
         ] {
@@ -1747,6 +1752,59 @@ mod tests {
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn v68_to_v69_creates_fallback_launch_intents_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v68-fallback-launch-intents.db");
+        {
+            let conn = open(&path).unwrap();
+            let table_exists: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type='table' AND name='fallback_launch_intents'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_exists, 1);
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "DROP TABLE fallback_launch_intents;
+                 PRAGMA user_version=68;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = open(&path).unwrap();
+        assert_eq!(
+            upgraded
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let unique_key: i64 = upgraded
+            .query_row(
+                "SELECT count(*) FROM pragma_index_list('fallback_launch_intents')
+                 WHERE [unique] = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unique_key, 1);
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION,
+            "a second migration-open must be a no-op"
         );
     }
 

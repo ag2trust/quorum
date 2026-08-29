@@ -331,6 +331,10 @@ const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
     ("github_collaboration_attempts", "task_id"),
     ("github_agent_operations", "task_id"),
     ("github_review_publication_slots", "task_id"),
+    // A fallback launch remains replayable across restart, so its exact
+    // descriptor must retain the owning task until an explicit lifecycle path
+    // clears the durable intent in a future change.
+    ("fallback_launch_intents", "task_id"),
     ("review_followup_batches", "task_id"),
     ("review_followup_batches", "source_task_id"),
     ("review_followup_artifacts", "linked_task_id"),
