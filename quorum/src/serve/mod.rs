@@ -4840,10 +4840,8 @@ fn rehydrate_accepted_classifications(
     raw: Option<&str>,
 ) -> Option<Vec<quorum_core::classify::TaskClassification>> {
     let raw = raw?;
-    let expected: Vec<i64> = proposed_classifier_tasks(proposal)
-        .iter()
-        .map(|task| task.id)
-        .collect();
+    // Positional ids, matching `proposed_classifier_tasks`: child i is -(i+1).
+    let expected: Vec<i64> = (0..proposal.len()).map(|i| -(i as i64) - 1).collect();
     let parsed = serde_json::from_str::<Vec<quorum_core::classify::TaskClassification>>(raw)
         .map_err(|error| error.to_string())
         .and_then(|batch| {
@@ -6623,6 +6621,16 @@ async fn tick_decomposition(
             delete_decomposition_process(config, graph_id, "arbiter").await?;
             let proposal = coordinator.proposal.take().unwrap_or_default();
             let classifications = coordinator.classifications.take().unwrap_or_default();
+            if !proposal.is_empty() && classifications.is_empty() {
+                // The Arbiter can only be spawned for a classified proposal, so
+                // this is a daemon invariant failure, not a planner fault: fail
+                // loudly (the next tick reloads the durable pair and re-polls a
+                // fresh Arbiter) rather than charge the proposal budget for a
+                // batch that was never rejected.
+                return Err(QuorumError::Io(
+                    "arbiter verdict for an unclassified proposal".into(),
+                ));
+            }
             // Every verdict ends this proposal's life in the coordinator: an
             // Approve materialized it (or rejected an unusable pair), and
             // every other verdict returned the graph to planning/backoff/hold.
@@ -37271,6 +37279,96 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(coordinator.arbiter_slot.is_none());
         assert_eq!(harness.spawn_footprint(), (0, 1, 0));
         harness.settle(&mut coordinator).await;
+    }
+
+    /// An Arbiter verdict polled while the coordinator holds a proposal but no
+    /// classification is a daemon invariant failure: the tick errors and
+    /// records nothing, so the planner budget is never charged for a batch
+    /// that was never rejected and no children materialize.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn arbiter_verdict_without_a_classification_is_a_loud_error_not_a_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("unclassified-verdict.db");
+        let proposal = arbiter_gate_proposal();
+        let (source, graph) = arbiter_validating_graph(&db_path, "large", None, &proposal);
+        let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+
+        let output = dir.path().join("arbiter.jsonl");
+        std::fs::write(&output, codex_transcript(r#"{"outcome":"approve"}"#)).unwrap();
+        let runner = dir.path().join("arbiter-codex");
+        std::fs::write(
+            &runner,
+            format!("#!/bin/sh\nexec /bin/cat '{}'\n", output.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let slot = arbiter::spawn_arbiter(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let mut coordinator = DecompositionCoordinator {
+            graph_id: Some(graph),
+            proposal: Some(proposal),
+            classifications: None,
+            arbiter_slot: Some(slot),
+            arbiter_source_task_id: Some(source),
+            ..DecompositionCoordinator::default()
+        };
+
+        let mut error = None;
+        for _ in 0..200 {
+            match tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            {
+                Ok(_) if coordinator.arbiter_slot.is_some() => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(_) => panic!("an unclassified Arbiter verdict must not be applied"),
+                Err(failure) => {
+                    error = Some(failure);
+                    break;
+                }
+            }
+        }
+        let error = error.expect("the Arbiter fixture never reached its terminal path");
+        assert!(
+            matches!(&error, QuorumError::Io(message)
+                if message == "arbiter verdict for an unclassified proposal"),
+            "{error:?}"
+        );
+        assert!(coordinator.arbiter_slot.is_none());
+
+        let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
+        assert_eq!(
+            state, "validating",
+            "the graph keeps its phase for a fresh poll"
+        );
+        assert_eq!(attempts, 0, "no proposal budget is charged");
+        assert!(hold.is_none());
+        assert_eq!(status, "planning");
+        assert!(
+            arbiter_gate_attempts(&db_path, graph).is_empty(),
+            "nothing is recorded: no proposal, provider, blocker, or verdict row"
+        );
+        assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
+        let (durable_proposal, durable_batch) = arbiter_gate_accepted_columns(&db_path, graph);
+        assert!(durable_proposal.is_some() && durable_batch.is_some());
     }
 
     #[test]
