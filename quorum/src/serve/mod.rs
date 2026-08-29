@@ -5520,11 +5520,12 @@ const CHILD_REJECTION_CONTEXT_MAX_BYTES: usize = "; rejected_delta=".len()
     + "; affected_paths=[".len()
     + CHILD_REJECTION_PATHS_MAX_BYTES
     + "]".len();
-/// Per-field byte bound applied to planner-written child text before it is
-/// assembled into the classifier body. Planner fields are already bounded at
-/// 8 KiB; this keeps the eight-field body inside the classifier's
-/// `PLANNED_CHILD_BODY_CHAR_LIMIT` envelope without cutting the body itself.
-const PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES: usize = 4 * 1024;
+/// Per-field byte bound applied to planner-written child fields before they
+/// are assembled into the classifier body. The classifier's
+/// `PLANNED_CHILD_BODY_CHAR_LIMIT` envelope is derived from this bound, so a
+/// body built here is never cut by the whole-body truncation.
+const PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES: usize =
+    quorum_core::classify::PLANNED_CHILD_FIELD_MAX_BYTES;
 // Keep the complete combined rejection within the planner retry-feedback
 // consumer's bound. Reserve fixed space for every dimension, then divide the
 // variable space between the readiness reason and duplicate task IDs.
@@ -6271,7 +6272,40 @@ fn planned_child_body_json(task: &planner::ProposedTask, text_limit: Option<usiz
         }
         bounded
     }
-    let fields: [(&str, serde_json::Value); 8] = [
+    // Deliverables are bounded by cumulative path bytes like any other list;
+    // the entry that crosses the budget keeps a bounded path and the rest are
+    // cut so the field stays inside its share of the envelope.
+    fn bound_deliverables(
+        deliverables: &quorum_core::decomposition::ChildDeliverables,
+        limit: Option<usize>,
+    ) -> quorum_core::decomposition::ChildDeliverables {
+        use quorum_core::decomposition::ChildDeliverable;
+        let Some(limit) = limit else {
+            return deliverables.clone();
+        };
+        let mut used = 0usize;
+        let mut bounded = Vec::with_capacity(deliverables.0.len());
+        for deliverable in &deliverables.0 {
+            let (path, rebuild): (&String, fn(String) -> ChildDeliverable) = match deliverable {
+                ChildDeliverable::Write { path } => (path, |path| ChildDeliverable::Write { path }),
+                ChildDeliverable::ReadOnlyReference { path } => {
+                    (path, |path| ChildDeliverable::ReadOnlyReference { path })
+                }
+            };
+            if used + path.len() > limit {
+                let remaining = limit.saturating_sub(used);
+                bounded.push(rebuild(bounded_with_ellipsis(
+                    path,
+                    remaining.max("…".len()),
+                )));
+                break;
+            }
+            used += path.len();
+            bounded.push(deliverable.clone());
+        }
+        quorum_core::decomposition::ChildDeliverables(bounded)
+    }
+    let fields: [(&str, serde_json::Value); quorum_core::classify::PLANNED_CHILD_BODY_FIELDS] = [
         (
             "implementation_delta",
             serde_json::json!(bound_text(&task.implementation_delta, text_limit)),
@@ -6282,7 +6316,8 @@ fn planned_child_body_json(task: &planner::ProposedTask, text_limit: Option<usiz
         ),
         (
             "deliverables",
-            serde_json::to_value(&task.deliverables).expect("child deliverables serialize"),
+            serde_json::to_value(bound_deliverables(&task.deliverables, text_limit))
+                .expect("child deliverables serialize"),
         ),
         (
             "non_goals",
@@ -35551,6 +35586,57 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "flow integration test"
         );
         assert!(body.chars().count() <= quorum_core::classify::PLANNED_CHILD_BODY_CHAR_LIMIT);
+
+        // Worst case: every text and list field over the per-field cap, with
+        // escape-heavy content, and 32 deliverables at the planner's 8 KiB
+        // path bound. The last field still survives and the body still fits
+        // the classifier envelope.
+        let over = PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES + 700;
+        let heavy = |seed: &str| format!("\"{}\n", seed).repeat(over / (seed.len() + 3) + 1);
+        let heavy_list = |seed: &str| (0..40).map(|i| heavy(&format!("{seed}{i}"))).collect();
+        let mut worst = composition_child_fixture();
+        let child = &mut worst[1];
+        child.implementation_delta = heavy("delta");
+        child.affected_paths = heavy_list("path");
+        child.deliverables = quorum_core::decomposition::ChildDeliverables(
+            (0..32)
+                .map(|i| quorum_core::decomposition::ChildDeliverable::Write {
+                    path: format!("src/{i}/{}", "p".repeat(8 * 1024 - 8)),
+                })
+                .collect(),
+        );
+        child.non_goals = heavy_list("non-goal");
+        child.observable_outcome = heavy("outcome");
+        child.acceptance_criteria = heavy_list("criterion");
+        child.source_constraints = heavy_list("constraint");
+        child.verification_expectations = {
+            let mut items: Vec<String> = heavy_list("verify");
+            items.insert(0, "VERIFY_MARKER survives the worst case".into());
+            items
+        };
+        let tasks = proposed_classifier_tasks(&worst, &HashMap::new());
+        let body = tasks[1].body.as_deref().unwrap();
+        assert!(
+            body.chars().count() <= quorum_core::classify::PLANNED_CHILD_BODY_CHAR_LIMIT,
+            "{} chars",
+            body.chars().count()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            parsed["verification_expectations"][0],
+            "VERIFY_MARKER survives the worst case"
+        );
+        let deliverables = parsed["deliverables"].as_array().unwrap();
+        assert!(deliverables.len() < 32);
+        let deliverable_bytes: usize = deliverables
+            .iter()
+            .map(|value| value["path"].as_str().unwrap().len())
+            .sum();
+        assert!(deliverable_bytes <= PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES + "…".len());
+        // The rendered prompt is the body, not a truncated prefix of it.
+        let prompt = quorum_core::classify::build_prompt(&tasks, &[]);
+        assert!(prompt.contains("VERIFY_MARKER survives the worst case"));
+        assert!(prompt.contains(body));
     }
 
     #[tokio::test]

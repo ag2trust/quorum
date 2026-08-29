@@ -32,7 +32,7 @@ pub struct ClassifierResponse {
 }
 
 /// Minimal task info needed for classification input.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskForClassification {
     pub id: i64,
     #[serde(skip)]
@@ -46,9 +46,14 @@ pub struct TaskForClassification {
     /// children carry the larger [`PLANNED_CHILD_BODY_CHAR_LIMIT`] because
     /// their body is the complete planner-written child contract, not free
     /// text. The prompt is fingerprinted from `body` itself, so the bound is
-    /// not part of the identity.
-    #[serde(skip)]
+    /// not part of the identity, and a deserialized value defaults to the
+    /// root bound rather than to zero.
+    #[serde(skip, default = "default_body_char_limit")]
     pub body_char_limit: usize,
+}
+
+fn default_body_char_limit() -> usize {
+    BODY_CHAR_LIMIT
 }
 
 /// An internally-derived identity for the exact bounded task input given to a
@@ -86,12 +91,20 @@ pub const DUP_CONTEXT_LIMIT: usize = 60;
 const TITLE_CHAR_LIMIT: usize = 300;
 /// Prompt body bound for DB-sourced root tasks.
 pub const BODY_CHAR_LIMIT: usize = 2_000;
-/// Prompt body bound for planned decomposition children. The child body is
-/// the planner's structured contract (delta, paths, deliverables, non-goals,
-/// outcome, criteria, constraints, verification) and must reach the classifier
-/// whole; each text field is separately bounded by the daemon before it is
-/// assembled, so this is a total envelope rather than a truncation point.
-pub const PLANNED_CHILD_BODY_CHAR_LIMIT: usize = 16 * 1024;
+/// Per-field byte bound the daemon applies to each of a planned child's
+/// contract fields (text, list, and deliverable paths, cumulatively per
+/// field) before assembling the classifier body.
+pub const PLANNED_CHILD_FIELD_MAX_BYTES: usize = 4 * 1024;
+/// Number of bounded fields in a planned child's classifier body: delta,
+/// paths, deliverables, non-goals, outcome, criteria, constraints,
+/// verification.
+pub const PLANNED_CHILD_BODY_FIELDS: usize = 8;
+/// Prompt body bound for planned decomposition children, derived from the
+/// per-field bound so a fully loaded child never reaches the whole-body
+/// truncation: every field at its cap, doubled for JSON escaping of quotes and
+/// newlines, plus structure (keys, punctuation, deliverable `kind` tags).
+pub const PLANNED_CHILD_BODY_CHAR_LIMIT: usize =
+    2 * PLANNED_CHILD_BODY_FIELDS * PLANNED_CHILD_FIELD_MAX_BYTES + 2 * 1024;
 pub const DEPENDENCY_TITLE_CHAR_LIMIT: usize = 240;
 /// Rendered dependency bound: a `#id ` or `<local-key> — ` prefix (planned
 /// child keys are at most 64 bytes) followed by a bounded title.
@@ -2084,6 +2097,24 @@ mod redesigned_tests {
         assert!(p.contains(
             "responsibilities delivered by its declared dependencies are not part of this artifact's surface"
         ));
+    }
+
+    #[test]
+    fn deserialized_task_keeps_a_nonzero_body_bound() {
+        let task = TaskForClassification {
+            id: 1,
+            revision: 1,
+            title: "root".into(),
+            body: Some("body".into()),
+            dependencies: vec![],
+            recovery_notes: vec![],
+            body_char_limit: PLANNED_CHILD_BODY_CHAR_LIMIT,
+        };
+        let round_tripped: TaskForClassification =
+            serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+        assert_eq!(round_tripped.body_char_limit, BODY_CHAR_LIMIT);
+        assert!(round_tripped.body_char_limit > 0);
+        assert!(build_prompt(&[round_tripped], &[]).contains("body"));
     }
 
     #[test]
