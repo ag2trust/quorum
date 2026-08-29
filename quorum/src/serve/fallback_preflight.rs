@@ -34,6 +34,7 @@ pub struct LifecycleCurrency {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseCurrency {
     pub claim_id: i64,
+    pub target: String,
     pub holder: String,
     pub expires_at: i64,
 }
@@ -119,6 +120,7 @@ fn currency_is_current(
         && lifecycle_is_live(assignment, &expected.lifecycle.status)
         && expected.lifecycle.generation >= 0
         && expected.lease.claim_id > 0
+        && expected.lease.target == format!("task#{}", expected.lifecycle.task_id)
         && !expected.lease.holder.is_empty()
         && observed_at >= 0
         && expected.lease.expires_at > observed_at
@@ -137,7 +139,7 @@ fn currency_is_current(
 fn lifecycle_is_live(assignment: &RoleAssignment, status: &str) -> bool {
     match assignment.role.as_str() {
         "worker" => matches!(status, "working" | "rework"),
-        "reviewer" => status == "in_review",
+        "reviewer" => status == "in-review",
         _ => false,
     }
 }
@@ -159,6 +161,7 @@ fn pending_turn_matches_route(turn: &PendingTurn, route: &ModelProfile) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quorum_core::claims::{self, ClaimOutcome};
     use quorum_core::role_assignments::WeightedProfile;
     use quorum_core::tasks;
 
@@ -213,6 +216,7 @@ mod tests {
             },
             lease: LeaseCurrency {
                 claim_id: 11,
+                target: "task#42".into(),
                 holder: "worker-a".into(),
                 expires_at: 100,
             },
@@ -309,6 +313,39 @@ mod tests {
     }
 
     #[test]
+    fn current_reviewer_provider_unavailability_authorizes() {
+        let mut assignment = assignment();
+        assignment.responsibility_key = "task:42:reviewer".into();
+        assignment.role = "reviewer".into();
+        assignment.review_stage = Some("r1".into());
+        let pool = pool();
+        let mut currency = currency();
+        currency.lifecycle.status = "in-review".into();
+        let pending_turn = pending_turn();
+        let failed_route = profile();
+        let mut reviewer_input = input(
+            FailureDisposition::ProviderUnavailable,
+            &assignment,
+            &pool,
+            &currency,
+            &currency,
+            &pending_turn,
+            &failed_route,
+        );
+        reviewer_input.responsibility = AssignmentIdentity {
+            task_id: Some(42),
+            responsibility_key: "task:42:reviewer",
+            role: "reviewer",
+            pr_number: Some(9),
+            review_stage: Some("r1"),
+        };
+        assert_eq!(
+            preflight(&reviewer_input),
+            FallbackPreflightOutcome::Authorized
+        );
+    }
+
+    #[test]
     fn stale_currency_and_pool_generation_fail_closed_without_db_mutation() {
         let assignment = assignment();
         let pool = pool();
@@ -330,6 +367,10 @@ mod tests {
             1,
         )
         .unwrap();
+        let unrelated_claim = match claims::claim(&mut conn, "other", "pr#9", 100, 1).unwrap() {
+            ClaimOutcome::Won(claim) => claim,
+            ClaimOutcome::Lost { .. } => unreachable!("fresh claim must win"),
+        };
         let snapshot = || {
             conn.query_row(
                 "SELECT (SELECT count(*) FROM tasks),
@@ -350,6 +391,26 @@ mod tests {
         };
         let before = snapshot();
         assert_eq!(before.0, 1);
+        assert_eq!(before.1, 1);
+
+        let mut unrelated_lease = expected.clone();
+        unrelated_lease.lease.claim_id = unrelated_claim.id;
+        unrelated_lease.lease.target = unrelated_claim.target;
+        unrelated_lease.lease.holder = unrelated_claim.holder;
+        unrelated_lease.lease.expires_at = unrelated_claim.expires_at;
+        assert_eq!(
+            preflight(&input(
+                FailureDisposition::ProviderUnavailable,
+                &assignment,
+                &pool,
+                &unrelated_lease,
+                &unrelated_lease,
+                &pending_turn,
+                &failed_route,
+            )),
+            FallbackPreflightOutcome::FailClosed,
+        );
+        assert_eq!(snapshot(), before);
 
         let mut stale_lifecycle = expected.clone();
         stale_lifecycle.lifecycle.generation += 1;
