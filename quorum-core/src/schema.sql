@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS task_decompositions (
     planner_assignment_id   INTEGER REFERENCES role_assignments(id),
     frozen_base_sha         TEXT,
     accepted_proposal_json  TEXT CHECK(accepted_proposal_json IS NULL OR length(CAST(accepted_proposal_json AS BLOB)) <= 65536),
+    accepted_classifications_json TEXT CHECK(accepted_classifications_json IS NULL OR length(CAST(accepted_classifications_json AS BLOB)) <= 65536),
     accepted_plan_revision  INTEGER,
     hold_code               TEXT,
     hold_summary            TEXT,
