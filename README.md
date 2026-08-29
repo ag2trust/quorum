@@ -333,6 +333,10 @@ quorum tail Agent-42          # one managed session
 quorum perf --by complexity   # terminal-task performance aggregates
 ```
 
+`quorum status` samples host-available memory, swap use, and free capacity on the database
+and configured worktree filesystems even when the daemon is not running. Low-resource values
+raise the read-only health display to attention; they do not throttle or terminate agents.
+
 Use `quorum <command> --help` for exact flags and `quorum help` for the current workflow.
 Most commands emit JSON. Exit codes are `0` for success, `1` for an expected negative
 result, `2` for bad input, and `3` for an internal or database failure.

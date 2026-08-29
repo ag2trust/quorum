@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS task_decompositions (
     planner_assignment_id   INTEGER REFERENCES role_assignments(id),
     frozen_base_sha         TEXT,
     accepted_proposal_json  TEXT CHECK(accepted_proposal_json IS NULL OR length(CAST(accepted_proposal_json AS BLOB)) <= 65536),
+    accepted_classifications_json TEXT CHECK(accepted_classifications_json IS NULL OR length(CAST(accepted_classifications_json AS BLOB)) <= 65536),
     accepted_plan_revision  INTEGER,
     hold_code               TEXT,
     hold_summary            TEXT,
@@ -577,9 +578,21 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     review_pr         INTEGER,
     review_head_sha   TEXT,
     -- v42: durable routing decision that caused this process run.
-    role_assignment_id INTEGER REFERENCES role_assignments(id)
+    role_assignment_id INTEGER REFERENCES role_assignments(id),
+    -- v61: an alternate route's immutable configured profile snapshot. NULL
+    -- retains the original assigned route (and all historical rows); a later
+    -- guarded evidence API is the only writer for populated values.
+    configured_profile_id TEXT,
+    configured_provider   TEXT,
+    configured_model      TEXT,
+    configured_effort     TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
+-- v62: the UNIQUE partial index `agent_runs_configured_route` is defined only in
+-- the migration branch below because it names `role_assignment_id` and
+-- `configured_profile_id`, both of which pre-v42 / pre-v61 legacy tables lack.
+-- SCHEMA_SQL is a no-op for existing tables and would try to create the index
+-- against the still-legacy shape.
 
 -- Durable token telemetry for every model invocation. Managed worker/reviewer
 -- rows point at agent_runs; daemon classifier and post-merge collector rows do
@@ -946,7 +959,10 @@ CREATE TABLE IF NOT EXISTS run_capabilities (
     -- planner ahead of a `submit_plan` MCP call. See the v60 migration in db.rs.
     role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','planner')),
     created_at  INTEGER NOT NULL,
-    revoked_at  INTEGER
+    revoked_at  INTEGER,
+    -- v63: exact, immutable link for authority issued to an attributed
+    -- fallback agent run. NULL preserves legacy and non-fallback capabilities.
+    agent_run_id INTEGER REFERENCES agent_runs(id)
 );
 CREATE INDEX IF NOT EXISTS run_capabilities_agent ON run_capabilities(agent) WHERE revoked_at IS NULL;
 

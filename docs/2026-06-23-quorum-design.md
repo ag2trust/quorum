@@ -29,6 +29,13 @@ come from persisted `agent_runs`; queue/blocked rows without an explicit task ti
 the explicit `pending` marker because a read-only status process does not invent the
 daemon's configured provider default. Complexity is task metadata, never a model value.
 
+Status also attaches a live, additive `resources` object containing sampled-at time,
+OS-available memory, swap use, and raw total/available bytes for the database and configured
+worktree-base filesystems. Filesystems are deduplicated by device identity. Sampling is
+non-persistent and fail-open; partial values and bounded sampling errors remain visible. A
+warning or critical resource sample promotes only `OnTrack` to `Attention`, never replaces
+`Stalled`, and never throttles, kills, or transitions managed work.
+
 ### Product boundary: opinionated Git delivery
 
 Quorum is an opinionated local **agentic Git/GitHub coding pipeline**. It provisions
@@ -174,9 +181,11 @@ the WAL self-truncates in normal operation. **The one footgun:** a long-lived re
 an open transaction blocks checkpointing entirely (verified: `-wal` grew to 8.5 MB and
 climbing with one held reader during 2000 writes). The only long-lived reader is
 `status --watch` → it **must open a fresh short read per tick** (connect → read → close),
-never hold a transaction across polls. `quorum sweep` runs `PRAGMA wal_checkpoint(TRUNCATE)`
-as the explicit recovery escape hatch. WAL maintenance is optional **only given** the
-short-connection invariant — stated, not assumed.
+then sample host resources only after that connection closes, and never hold a transaction
+across polls. One-shot status uses the same read-then-sample path and does not depend on daemon
+liveness. `quorum sweep` runs `PRAGMA wal_checkpoint(TRUNCATE)` as the explicit recovery escape
+hatch. WAL maintenance is optional **only given** the short-connection invariant — stated, not
+assumed.
 
 ## Schema versioning & migration (BLOCKER — must exist)
 
@@ -426,9 +435,11 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 ### Ops
 - `quorum status [--watch]` → read-only health snapshot. Alerts and critical messages are
   displayed and affect health only for 12 hours; they remain available through the feed until
-  their normal message TTL expires. **`--watch` opens a fresh short read
-  per ~1–2s tick (connect→read→close) — never holds a transaction across ticks** (else it
-  pins the WAL; verified). Read-only; never blocks writers under WAL.
+  their normal message TTL expires. Live memory/swap and deduplicated DB/worktree filesystem
+  capacity are sampled without persistence and appear in both the cockpit and additive JSON.
+  **`--watch` opens a fresh short read per ~1–2s tick (connect→read→close), then performs the OS
+  sample — never holds a transaction across ticks or resource syscalls** (else it pins the WAL;
+  verified). Read-only; never blocks writers under WAL.
 - `quorum sweep` → unbounded physical reclamation + `wal_checkpoint(TRUNCATE)` (optional;
   sweep-on-write covers normal use)
 - `quorum init` → create `~/.quorum/`, DB, default config; open + migrate (idempotent)
@@ -974,6 +985,17 @@ from comment text. Concretely:
   reviewer signals `changes`. This is lifecycle authority, not the findings ledger;
   the reviewer's inline and summary comments remain the source of truth.
 
+**Iterative verdict-context contract.** Any bounded Quorum loop in which one role produces an
+artifact and another role reviews it preserves three distinct things across every permitted
+iteration: the authoritative artifact identity (including its revision or SHA), the closed
+verdict, and a bounded artifact-specific rationale explaining that verdict. The rationale is
+review feedback, never lifecycle authority. The next producer iteration receives the applicable
+rationale tied to the reviewed artifact, and a new review judges the new artifact rather than
+silently reusing an old verdict. The authoritative ledger remains workflow-specific: GitHub PR
+discussion is authoritative for worker/reviewer findings, while `decomposition_attempts` is the
+durable planner/classifier/Arbiter iteration ledger. Sharing this contract does not require one
+generic backing store or permit a lifecycle signal to become a second findings ledger.
+
 This preserves #206 verdict attestation, reviewer separation, the rework cap, sticky
 reviewer, the stale-SHA gate, and R1/R2 lifecycle. It shifts only who writes to the PR:
 agents author the content and the daemon publishes it through run-scoped operations.
@@ -1294,10 +1316,11 @@ On daemon startup, before generic crash recovery:
 A delivered respawn-per-turn worker is not an orphan while its review is pending. Its
 `awaiting-review` journal row has no PID and durably binds the agent/task, provider and exact
 continuation, worktree, local and publication branches, and PR. Startup preserves that row and
-worktree, verifies the live task claim plus task/run/capability/publication bindings, reserves the
-same name, and reconstructs a dormant capacity slot without launching a provider turn. Missing or
-mismatched identity is fatal recovery corruption; the row and name authority are not converted
-into a fresh worker assignment. Startup accepts PID omission only for this explicit dormant shape.
+worktree, verifies the task ownership plus task/run/capability/publication bindings, atomically
+restores an expired lease when no competing live holder exists, reserves the same name, and
+reconstructs a dormant capacity slot without launching a provider turn. Missing or mismatched
+identity is fatal recovery corruption; the row and name authority are not converted into a fresh
+worker assignment. Startup accepts PID omission only for this explicit dormant shape.
 
 Head-SHA invalidation on restart: the approval record stores `approved_head_sha`. On
 re-entry, `head_sha()` is queried and compared. If different, the approval is stale —
@@ -2066,6 +2089,20 @@ Every required role then names a routing pool. Pool entries use positive integer
 that total exactly 100; fixed `agent`, `provider`, `model`, `effort`, `worker_model`,
 `review_model`, `classifier_model`, and `collector_model` selection is not accepted.
 
+The same repository serve file configures observational host-resource diagnostics:
+
+```toml
+resource_poll_secs = 30             # 5..=3600
+disk_warn_free_gib = 80
+disk_critical_free_gib = 40         # positive and less than warning
+memory_warn_available_pct = 15      # 1..=100
+memory_critical_available_pct = 8   # positive and less than warning
+```
+
+The daemon samples on this cadence outside database transactions and logs only severity
+transitions (including recovery). Sampling failures are fail-open and rate-limited. These
+settings have no admission-control or lifecycle authority.
+
 ```toml
 [model_profiles.terra]
 runner = "codex"
@@ -2214,25 +2251,40 @@ manifest (below); it no longer requires a byte-exact echo of source-marked liter
 faithfulness — that every load-bearing source requirement and constraint is carried forward,
 nothing is dropped or silently weakened, the children cover the source without overlap, and the
 plan is coherent — is judged by the Arbiter plan-review gate (below), not by a deterministic
-literal match. Only after the Arbiter approves is the complete proposal classified as one batch.
-Every child must be
-admission-ready, nonduplicate, and size S or M under the same execution-size rubric given to the
-planner. Admission readiness means the scope is sufficiently clear for delivery; it is distinct
+literal match. Once deterministic validation passes, the complete proposal is classified as one
+closed-book batch (`preclassifying`) *before* the Arbiter reviews it (`validating`): the
+classifier is cheap and rejects most oversized plans, so the expensive Arbiter run is spent only
+on classifier-accepted proposals. Every child must be
+admission-ready, nonduplicate, and sized within the same implementation-size policy that
+dispatches root tasks directly: S or M at any complexity, or L at `cx_est` 1–3. One Rust
+predicate and one SQL fragment define that policy for dispatch, sync, materialization, and child
+preclassification, so the daemon cannot reject a child it would have dispatched as a root. The
+classifier receives each planned child's whole contract in a stable order (delta, paths,
+deliverables, non-goals, outcome, criteria, constraints, verification), bounded per field rather
+than truncated as one blob, with every prerequisite rendered as its sibling or source title so
+responsibilities delivered by dependencies are not counted against the child's own surface.
+Admission readiness means the scope is sufficiently clear for delivery; it is distinct
 from runtime readiness, which still requires dependencies to be done.
+Every classifier verdict also carries a bounded `size_reason` tied to the exact classified child.
+A completed batch preserves every rejected child's rationale with its child key and bounded
+implementation context in one deterministic, globally bounded `decomposition_attempts` summary;
+the next fresh planner attempt receives the complete applicable batch as structured rejection
+feedback. Renaming or paraphrasing a rejected child is not scope reduction.
 
-**Arbiter plan-review gate.** Between deterministic validation and materialization the daemon
-gates every structurally valid proposal on a single-shot, stateless **Arbiter** — a model
+**Arbiter plan-review gate.** Between classification and materialization the daemon gates every
+classifier-accepted proposal on a single-shot, stateless **Arbiter** — a model
 reviewer spawned fresh per proposal in the same frozen read-only repository view the planner used,
 selected from the `[routing.arbiter]` pool (defaulting to the planner pool). The Arbiter judges the
 proposal against the authoritative source on four mandates — faithfulness, coverage and
 non-overlap, coherence, and decomposability — and emits exactly one closed verdict, parsed with the
 planner's fail-closed discipline. The Arbiter only emits a verdict; the daemon alone transitions
 lifecycle and materializes children (lifecycle authority stays with the daemon). Verdict mapping:
-*approve* (or a *changes* verdict with no blocking finding) advances the graph from `validating`
-to `preclassifying`, and the unchanged classification/materialization path then creates the
-children; *changes* with at least one blocking finding records a normal `proposal` attempt whose
-summary is the Arbiter's findings and returns the graph to `planning` so the planner re-proposes
-against those findings; *reject_source* holds the graph and fails the source for a required
+*approve* (or a *changes* verdict with no blocking finding) materializes the children directly
+from `validating`, using the classifier batch that was durably accepted when the graph left
+`preclassifying` (the classifier is never re-run after the Arbiter); *changes* with at least one
+blocking finding records a normal `proposal` attempt whose summary is the Arbiter's findings and
+returns the graph to `planning` so the planner re-proposes against those findings — the next
+proposal is classified again before any Arbiter run; *reject_source* holds the graph and fails the source for a required
 owner decision, materializing no children; and a malformed, absent, or provider/protocol-failed
 verdict records a `provider` attempt (fail closed — never a silent approval). Every terminal
 Arbiter outcome also writes exactly one additional `decomposition_attempts` row with
@@ -2243,9 +2295,15 @@ and tool counts, plus provider, model, and effort. This observational verdict ro
 lifecycle nor consumes a budget; only `proposal` and `provider` attempts count toward their
 existing limits. Its JSON stays valid while being reduced to the existing 2 KiB attempt-summary
 cap. A *changes* verdict consumes the existing three-per-revision proposal budget; a provider
-failure consumes the separate provider budget. The gate is keyed on the guarded `validating ->
-preclassifying` transition, so a daemon restart that re-spawns and re-polls a fresh Arbiter cannot
-double-materialize.
+failure consumes the separate provider budget. Approval is keyed on the guarded materialization
+write, so a daemon restart that re-spawns and re-polls a fresh Arbiter cannot double-materialize.
+Lifecycle order: `planning` -> `preclassifying` (classifier) -> `validating` (Arbiter) ->
+`active`. A classifier rejection returns the proposal to `planning` from `preclassifying` and
+never spawns an Arbiter; the accepted classification is persisted next to the accepted proposal
+(`accepted_classifications_json`) and discarded with it on any rejection or reset. A restart
+resumes the interrupted phase: `preclassifying` re-runs only the classifier, `validating` re-runs
+only the Arbiter from the persisted classification, and a `validating` row without an accepted
+classification steps back to `preclassifying` rather than reaching the Arbiter unclassified.
 
 Each proposed child also carries a bounded structured deliverables manifest that distinguishes
 requested writes from read-only contextual references. Deterministic validation rejects a write
@@ -2261,8 +2319,8 @@ self-attestation nor redesigns the worker filesystem sandbox.
 Semantic proposal rejections and provider/protocol failures have independent caps of three per
 unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
 the freeze during backoff, and retry drains again. Full prompts and transcripts are not persisted;
-only bounded structured attempts, the accepted closed proposal needed to resume validation or
-preclassification, and final reasons are durable. Restart inspection never consumes a semantic
+only bounded structured attempts, the accepted closed proposal and its accepted classification
+needed to resume preclassification or validation, and final reasons are durable. Restart inspection never consumes a semantic
 proposal attempt.
 
 Exhausting either three-attempt planning budget holds the graph and fails the source; it never
@@ -2445,6 +2503,12 @@ labels are ignored.
   refs. A false readiness result carries a concrete `cx_not_ready_reason`; missing,
   partial, or malformed classification never falls back to worker or reviewer
   provisioning.
+- Every newly accepted v3 classifier result also requires a nonempty, NUL-free, bounded
+  `cx_size_reason` that identifies the concrete execution surfaces supporting its size verdict.
+  The reason is preserved in refs for inspection and in generated-child refs after successful
+  preclassification. Historical v2 classifications remain dispatch-compatible; absence of a
+  reason on such a row means the older contract did not guarantee one, not that the daemon
+  synthesized a rationale.
 - The classifier is closed-book: it receives bounded task/dependency/recovery context but
   does not inspect source, Git, CI, or external systems. Readiness is permissive: ordinary
   repository discovery and bounded engineering choices are execution work, not a reason to

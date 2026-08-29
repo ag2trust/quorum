@@ -321,7 +321,7 @@ pub fn parse_response(text: &str) -> Option<Vec<TaskClassification>> {
 
 /// Parse and validate one complete classifier batch. A syntactically valid
 /// response is still a provider failure unless it covers every requested task
-/// exactly once and every item satisfies the v2 contract.
+/// exactly once and every item satisfies the v3 contract.
 pub fn parse_validated_response(
     text: &str,
     expected_task_ids: &[i64],
@@ -334,12 +334,14 @@ pub fn parse_validated_response(
         .get("tasks")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "classifier response is missing its tasks array".to_string())?;
-    if raw_tasks.iter().any(|task| {
-        !task
-            .as_object()
-            .is_some_and(|object| object.contains_key("not_ready_reason"))
-    }) {
-        return Err("classifier response item is missing not_ready_reason".into());
+    for field in ["size_reason", "not_ready_reason"] {
+        if raw_tasks.iter().any(|task| {
+            !task
+                .as_object()
+                .is_some_and(|object| object.contains_key(field))
+        }) {
+            return Err(format!("classifier response item is missing {field}"));
+        }
     }
     let resp: ClassifierResponse = serde_json::from_value(raw)
         .map_err(|error| format!("classifier response has an invalid item: {error}"))?;
@@ -404,6 +406,7 @@ mod tests {
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: classify::BODY_CHAR_LIMIT,
         }];
         let slot = spawn_classifier_configured(
             &tasks,
@@ -619,6 +622,7 @@ mod tests {
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: classify::BODY_CHAR_LIMIT,
         }];
         let mut slot = spawn_classifier_configured(
             &tasks,
@@ -666,6 +670,7 @@ mod tests {
                 body: Some("🦀".repeat(2_000)),
                 dependencies: vec![],
                 recovery_notes: vec![],
+                body_char_limit: classify::BODY_CHAR_LIMIT,
             })
             .collect::<Vec<_>>();
 
@@ -733,6 +738,7 @@ mod tests {
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: classify::BODY_CHAR_LIMIT,
         }];
         let mut slot = spawn_classifier_configured(
             &tasks,
@@ -798,7 +804,7 @@ mod tests {
             &runner,
             "#!/bin/sh\n\
              while IFS= read -r _turn; do\n\
-               printf '%s\\n' '{\"type\":\"result\",\"result\":\"{\\\"tasks\\\":[{\\\"task_id\\\":7,\\\"complexity\\\":2,\\\"size\\\":\\\"S\\\",\\\"ready\\\":true,\\\"not_ready_reason\\\":null}]}\",\"is_error\":false}'\n\
+               printf '%s\\n' '{\"type\":\"result\",\"result\":\"{\\\"tasks\\\":[{\\\"task_id\\\":7,\\\"complexity\\\":2,\\\"size\\\":\\\"S\\\",\\\"size_reason\\\":\\\"one focused test seam\\\",\\\"ready\\\":true,\\\"not_ready_reason\\\":null}]}\",\"is_error\":false}'\n\
              done\n",
         )
         .unwrap();
@@ -811,6 +817,7 @@ mod tests {
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: classify::BODY_CHAR_LIMIT,
         }];
         let mut slot = spawn_classifier_configured(
             &tasks,
@@ -872,7 +879,7 @@ mod tests {
 
     #[test]
     fn parse_response_valid() {
-        let text = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null, "duplicate_of": []}]}"#;
+        let text = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "size_reason": "one bounded seam", "ready": true, "not_ready_reason": null, "duplicate_of": []}]}"#;
         let results = parse_response(text).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_id, 1);
@@ -886,27 +893,32 @@ mod tests {
 
     #[test]
     fn validated_response_requires_exact_unique_coverage() {
-        let valid = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null}]}"#;
+        let valid = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "size_reason": "one bounded seam", "ready": true, "not_ready_reason": null}]}"#;
         assert!(parse_validated_response(valid, &[1]).is_ok());
         assert!(parse_validated_response(valid, &[1, 2]).is_err());
 
         let duplicate = r#"{"tasks": [
-            {"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null},
-            {"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null}
+            {"task_id": 1, "complexity": 3, "size": "M", "size_reason": "one bounded seam", "ready": true, "not_ready_reason": null},
+            {"task_id": 1, "complexity": 3, "size": "M", "size_reason": "one bounded seam", "ready": true, "not_ready_reason": null}
         ]}"#;
         assert!(parse_validated_response(duplicate, &[1, 2]).is_err());
     }
 
     #[test]
     fn validated_response_rejects_partial_item_contract() {
-        let missing_reason =
-            r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": true}]}"#;
-        assert!(parse_validated_response(missing_reason, &[1]).is_err());
+        let missing_size_reason = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null}]}"#;
+        assert!(parse_validated_response(missing_size_reason, &[1]).is_err());
 
-        let invalid_ready = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": false, "not_ready_reason": "  "}]}"#;
+        let missing_readiness_reason = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "size_reason": "one bounded seam", "ready": true}]}"#;
+        assert!(parse_validated_response(missing_readiness_reason, &[1]).is_err());
+
+        let invalid_ready = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "size_reason": "one bounded seam", "ready": false, "not_ready_reason": "  "}]}"#;
         assert!(parse_validated_response(invalid_ready, &[1]).is_err());
 
-        let nul_reason = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": false, "not_ready_reason": "missing\u0000criteria"}]}"#;
+        let invalid_size_reason = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "size_reason": "  ", "ready": true, "not_ready_reason": null}]}"#;
+        assert!(parse_validated_response(invalid_size_reason, &[1]).is_err());
+
+        let nul_reason = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "size_reason": "one bounded seam", "ready": false, "not_ready_reason": "missing\u0000criteria"}]}"#;
         assert!(parse_validated_response(nul_reason, &[1]).is_err());
     }
 

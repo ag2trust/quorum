@@ -39,6 +39,7 @@ struct DormantRecovery {
     limit_tokens: i64,
     cap_run_id: String,
     rework_feedback: Option<String>,
+    needs_review_claim: bool,
     needs_rework_claim: bool,
 }
 
@@ -151,13 +152,18 @@ fn validate_dormant_recovery(
     // accepted rework and graph-block transitions instead retire the stale
     // runtime row after every immutable binding below has been revalidated.
     let mut rework_feedback = None;
+    let mut needs_review_claim = false;
     let mut needs_rework_claim = false;
     let task_disposition = match task.status.as_str() {
         "in-review" | "merging" => {
-            if claim_holder.as_deref() != Some(entry.agent.as_str()) {
-                return Err(invalid(format!(
-                    "claim mismatch: task #{task_id} has no live lease for this agent"
-                )));
+            match claim_holder.as_deref() {
+                Some(holder) if holder == entry.agent => {}
+                None => needs_review_claim = true,
+                _ => {
+                    return Err(invalid(format!(
+                        "claim mismatch: task #{task_id} has another live lease holder"
+                    )));
+                }
             }
             None
         }
@@ -362,6 +368,7 @@ fn validate_dormant_recovery(
         limit_tokens,
         cap_run_id: capability.run_id,
         rework_feedback,
+        needs_review_claim,
         needs_rework_claim,
     };
     if entry.phase == "resuming-rework" && recovery.rework_feedback.is_none() {
@@ -519,6 +526,34 @@ async fn install_recovered_rework_claim(db_path: &Path, recovery: &DormantRecove
         return Err(dormant_recovery_error(
             &recovery.entry.agent,
             format!("could not re-install sticky lease for task #{task_id}"),
+        ));
+    }
+    Ok(())
+}
+
+async fn install_recovered_review_claim(db_path: &Path, recovery: &DormantRecovery) -> Result<()> {
+    if !recovery.needs_review_claim {
+        return Ok(());
+    }
+    let path = db_path.to_path_buf();
+    let agent = recovery.entry.agent.clone();
+    let task_id = recovery.task_id;
+    let claimed = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&path)?;
+        tasks::reclaim_dormant_review(
+            &mut conn,
+            &agent,
+            task_id,
+            tasks::DEFAULT_LEASE_TTL_SECS,
+            super::now_unix(),
+        )
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("recovered review claim join: {error}")))??;
+    if !claimed {
+        return Err(dormant_recovery_error(
+            &recovery.entry.agent,
+            format!("could not re-install dormant lease for task #{task_id}"),
         ));
     }
     Ok(())
@@ -784,6 +819,7 @@ pub(crate) async fn recover(
         verify_dormant_worktree(config, wt_mgr, recovery).await?;
     }
     for recovery in &recoveries {
+        install_recovered_review_claim(&config.db_path, recovery).await?;
         install_recovered_rework_claim(&config.db_path, recovery).await?;
     }
     {
@@ -1193,6 +1229,7 @@ mod tests {
             master_ci_timeout_secs: 1,
             allowed_tools: None,
             doctor_enabled: false,
+            resource_monitor: crate::resource_health::ResourceMonitorConfig::default(),
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
@@ -1422,6 +1459,59 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "recovery duplicated {table}");
         }
+    }
+
+    #[tokio::test]
+    async fn restart_restores_expired_dormant_review_lease() {
+        let fixture = dormant_fixture();
+        let expired_at = super::super::now_unix() - 1;
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Reviewer",
+            fixture.task_id,
+            &Event::ReviewerAttached {
+                agent: "Reviewer".into(),
+            },
+            super::super::now_unix(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE claims SET expires_at=?1 WHERE target=?2 AND active=1",
+            rusqlite::params![expired_at, tasks::lease_target(fixture.task_id)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &WorktreeManager::new(),
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(workers.len(), 1);
+        assert!(matches!(workers[0].proc, SlotProcess::Dormant { .. }));
+        let now = super::super::now_unix();
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let (holder, expires_at, active_count): (String, i64, i64) = conn
+            .query_row(
+                "SELECT holder,expires_at,
+                        (SELECT count(*) FROM claims WHERE target=?1 AND active=1)
+                 FROM claims WHERE target=?1 AND active=1",
+                [tasks::lease_target(fixture.task_id)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(holder, "Dormant");
+        assert!(expires_at > now, "recovery must install a live lease");
+        assert_eq!(active_count, 1, "recovery must retain one active holder");
     }
 
     #[tokio::test]

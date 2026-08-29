@@ -186,7 +186,10 @@ CREATE UNIQUE INDEX one_planning_freeze
 ```
 
 States are `freeze-requested`, `draining`, `planning`, `validating`, `preclassifying`,
-`provider-backoff`, `held`, `active`, `blocked`, `completed`, and `cancelled`. `active=1` is set
+`provider-backoff`, `held`, `active`, `blocked`, `completed`, and `cancelled`. The frozen planning
+order is `planning` -> `preclassifying` (closed-book classifier) -> `validating` (Arbiter) ->
+`active`; `accepted_classifications_json` (v64) carries the accepted classifier batch from
+`preclassifying` into `validating` and materialization. `active=1` is set
 only for a materialized `active` or `blocked` graph. `freeze_active=1` covers the stable-repo
 planning window. `planned_source_revision` is only the captured task revision for compare-and-swap
 validation; `tasks.revision` and `tasks.edit_count` remain authoritative. Partial unique indexes
@@ -335,7 +338,7 @@ planner response and durable proposal. Source authors should use those explicit 
 spelling is load-bearing and fits both bounds.
 
 Durable accepted proposals are revalidated against the complete closed-plan semantic contract
-before a restart resumes validating or preclassifying. Compatibility defaults for newly added
+before a restart resumes preclassifying or validating. Compatibility defaults for newly added
 fields never admit an older stored proposal with empty required fields; an atomic compatibility
 reset clears the accepted JSON and returns it to planning without consuming the current semantic
 proposal-rejection budget.
@@ -379,9 +382,15 @@ or a planner self-attestation check.
 
 All proposed children are classified together before any child row exists. Classification uses
 temporary proposal keys, not task IDs. Every result must be present, admission-ready,
-implementation work, nonduplicate, and size S or M. Runtime readiness is deliberately not
-required: a child may wait for another generated prerequisite. Any missing, malformed, L/XL,
-not-ready, duplicate, or extra classification rejects the entire plan as a semantic proposal.
+implementation work, nonduplicate, size S or M, and carry a nonempty, NUL-free `size_reason`
+bounded to 1 KiB. The reason names the concrete execution surfaces supporting the selected size;
+for L/XL it identifies independently deliverable seams rather than merely repeating the rubric.
+Runtime readiness is deliberately not required: a child may wait for another generated
+prerequisite. Any missing, malformed, L/XL, not-ready, duplicate, or extra classification rejects
+the entire plan as a semantic proposal. A completed batch records every rejected child's bounded
+key, verdict, size rationale, implementation delta, and affected paths in one deterministic,
+globally bounded proposal-attempt summary, and the next planner attempt receives that complete
+applicable rejection context.
 
 Semantic rejection increments only `proposal_attempts`; provider/protocol/sandbox failure
 increments only `provider_failures`. Each cap is three per unchanged source revision. A valid

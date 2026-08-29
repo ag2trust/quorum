@@ -1,7 +1,10 @@
 //! Agent-performance capture: one row per daemon-spawned agent process.
 
-use crate::error::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::db::{begin_immediate, map_sql_err};
+use crate::error::{QuorumError, Result};
+use crate::role_assignments::AssignmentIdentity;
+use crate::routing_attempts::{exclusions, ValidatedFallbackAttribution};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewLaunch {
@@ -160,6 +163,10 @@ pub struct AgentRun {
     pub effort: String,
     pub provider: Option<String>,
     pub role_assignment_id: Option<i64>,
+    pub configured_profile_id: Option<String>,
+    pub configured_provider: Option<String>,
+    pub configured_model: Option<String>,
+    pub configured_effort: Option<String>,
     pub spawned_at: i64,
     pub ended_at: Option<i64>,
     pub end_reason: Option<String>,
@@ -232,6 +239,148 @@ pub fn insert_worker_with_assignment(
     Ok(conn.last_insert_rowid())
 }
 
+/// Create or reuse the agent_runs row that records the deterministic alternate
+/// route named by an immutable [`ValidatedFallbackAttribution`] token.
+///
+/// The row persists both `role_assignment_id` (the original immutable
+/// assignment) and the exact configured alternate profile (in both
+/// `model/effort/provider` and the `configured_*` snapshot columns). The insert
+/// runs inside `BEGIN IMMEDIATE`; the assignment identity is re-verified
+/// against the persisted row, the routing-attempt exclusions are recomputed
+/// from live evidence, and the token is rejected when the assignment no longer
+/// matches, when the selected profile is now excluded, or when the token's
+/// evidence disagrees with an existing row for the same assignment/profile.
+///
+/// Replay is idempotent: calling twice with the same token returns the same
+/// row without inserting a duplicate. The `UNIQUE(role_assignment_id,
+/// configured_profile_id)` partial index and the `BEGIN IMMEDIATE` guard mean
+/// concurrent mismatched attributions cannot both win — one row is committed
+/// per (assignment, configured profile), and stale evidence fails closed rather
+/// than inserting a divergent row. This primitive never touches
+/// `run_capabilities` or task lifecycle; the daemon binds those separately.
+pub fn insert_alternate_with_attribution(
+    conn: &mut Connection,
+    token: &ValidatedFallbackAttribution,
+    agent_name: &str,
+    spawned_at: i64,
+) -> Result<i64> {
+    let tx = begin_immediate(conn)?;
+    let id = insert_alternate_with_attribution_tx(&tx, token, agent_name, spawned_at)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(id)
+}
+
+/// Transactional form of [`insert_alternate_with_attribution`].
+///
+/// Fallback installation composes the attributed run with a freshly issued
+/// capability and other failure evidence under one serialization point. This
+/// helper keeps the attribution checks identical for that composite write and
+/// for the standalone historical-evidence writer above.
+pub fn insert_alternate_with_attribution_tx(
+    tx: &Transaction<'_>,
+    token: &ValidatedFallbackAttribution,
+    agent_name: &str,
+    spawned_at: i64,
+) -> Result<i64> {
+    if agent_name.is_empty() || agent_name.len() > 1024 || agent_name.contains('\0') {
+        return Err(QuorumError::Usage("invalid agent name".into()));
+    }
+    if spawned_at < 0 {
+        return Err(QuorumError::Usage(
+            "attributed alternate run spawned_at must be non-negative".into(),
+        ));
+    }
+    let task_id = token.task_id().ok_or_else(|| {
+        QuorumError::Usage("attributed alternate run requires a task-scoped role assignment".into())
+    })?;
+    if !matches!(token.role(), "worker" | "reviewer") {
+        return Err(QuorumError::Usage(
+            "attributed alternate run role must be worker or reviewer".into(),
+        ));
+    }
+    let sub_role: Option<&str> = match (token.role(), token.review_stage()) {
+        ("reviewer", Some("r2")) => Some("r2"),
+        _ => None,
+    };
+
+    let assignment = crate::role_assignments::get(tx, token.assignment_id())?
+        .ok_or_else(|| QuorumError::Io("attributed alternate assignment is missing".into()))?;
+    let identity = AssignmentIdentity {
+        task_id: token.task_id(),
+        responsibility_key: token.responsibility_key(),
+        role: token.role(),
+        pr_number: token.pr_number(),
+        review_stage: token.review_stage(),
+    };
+    if !assignment.matches_identity(&identity) || assignment.role != token.role() {
+        return Err(QuorumError::Io(
+            "attributed alternate assignment identity mismatch".into(),
+        ));
+    }
+
+    // Recompute the exclusion set inside the write transaction before the
+    // reuse path. A token whose selected profile has since been classified as
+    // provider-/profile-unavailable must be rejected as expired even when a
+    // prior attributed row still exists — otherwise a replay after later
+    // routing evidence would silently return the stale row instead of failing
+    // closed. The historical row is left in place; only the replay is refused.
+    let current = exclusions(tx, token.responsibility_key())?;
+    if current.excludes(token.profile()) {
+        return Err(QuorumError::Io(
+            "attributed alternate route was invalidated by later routing evidence".into(),
+        ));
+    }
+
+    // Reuse: an existing row for the same (assignment, configured profile) is
+    // authoritative. Verify it agrees with the token before returning, so a
+    // replay with tampered evidence still fails closed.
+    let existing = fetch_configured_route(tx, token.assignment_id(), &token.profile().id)?;
+
+    if let Some(row) = existing {
+        let id = row.id;
+        let profile = token.profile();
+        if row.role != token.role()
+            || row.sub_role.as_deref() != sub_role
+            || row.model != profile.model
+            || row.effort != profile.effort
+            || row.provider.as_deref() != Some(profile.provider.as_str())
+            || row.configured_provider.as_deref() != Some(profile.provider.as_str())
+            || row.configured_model.as_deref() != Some(profile.model.as_str())
+            || row.configured_effort.as_deref() != Some(profile.effort.as_str())
+        {
+            return Err(QuorumError::Io(
+                "attributed alternate replay conflicts with existing run".into(),
+            ));
+        }
+        return Ok(id);
+    }
+
+    let profile = token.profile();
+    tx.execute(
+        "INSERT INTO agent_runs(
+             task_id, agent_name, role, sub_role, model, effort, provider,
+             role_assignment_id, spawned_at,
+             configured_profile_id, configured_provider, configured_model, configured_effort)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            task_id,
+            agent_name,
+            token.role(),
+            sub_role,
+            profile.model,
+            profile.effort,
+            profile.provider,
+            token.assignment_id(),
+            spawned_at,
+            profile.id,
+            profile.provider,
+            profile.model,
+            profile.effort,
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
 /// Insert an R2 audit run (sub_role='r2'). Returns the row id.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_r2(
@@ -281,7 +430,9 @@ pub fn insert_r2_with_assignment(
 /// new worker profile under the daemon's current policy.
 pub fn first_worker(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>> {
     conn.query_row(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id,
+                configured_profile_id, configured_provider, configured_model, configured_effort,
+                spawned_at, ended_at, end_reason
          FROM agent_runs
          WHERE task_id = ?1 AND role = 'worker'
          ORDER BY spawned_at ASC LIMIT 1",
@@ -296,9 +447,13 @@ pub fn first_worker(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>>
                 effort: r.get(5)?,
                 provider: r.get(6)?,
                 role_assignment_id: r.get(7)?,
-                spawned_at: r.get(8)?,
-                ended_at: r.get(9)?,
-                end_reason: r.get(10)?,
+                configured_profile_id: r.get(8)?,
+                configured_provider: r.get(9)?,
+                configured_model: r.get(10)?,
+                configured_effort: r.get(11)?,
+                spawned_at: r.get(12)?,
+                ended_at: r.get(13)?,
+                end_reason: r.get(14)?,
             })
         },
     )
@@ -326,7 +481,9 @@ pub fn interrupted_reviewer(
     is_r2: bool,
 ) -> Result<Option<AgentRun>> {
     conn.query_row(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id,
+                configured_profile_id, configured_provider, configured_model, configured_effort,
+                spawned_at, ended_at, end_reason
          FROM agent_runs
          WHERE task_id = ?1
            AND role = 'reviewer'
@@ -345,9 +502,13 @@ pub fn interrupted_reviewer(
                 effort: r.get(5)?,
                 provider: r.get(6)?,
                 role_assignment_id: r.get(7)?,
-                spawned_at: r.get(8)?,
-                ended_at: r.get(9)?,
-                end_reason: r.get(10)?,
+                configured_profile_id: r.get(8)?,
+                configured_provider: r.get(9)?,
+                configured_model: r.get(10)?,
+                configured_effort: r.get(11)?,
+                spawned_at: r.get(12)?,
+                ended_at: r.get(13)?,
+                end_reason: r.get(14)?,
             })
         },
     )
@@ -358,7 +519,9 @@ pub fn interrupted_reviewer(
 /// All runs for a task, ordered by id.
 pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
     let mut stmt = conn.prepare(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason \
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id,
+                configured_profile_id, configured_provider, configured_model, configured_effort,
+                spawned_at, ended_at, end_reason \
          FROM agent_runs WHERE task_id = ?1 ORDER BY id ASC",
     )?;
     let runs = stmt
@@ -372,27 +535,89 @@ pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
                 effort: r.get(5)?,
                 provider: r.get(6)?,
                 role_assignment_id: r.get(7)?,
-                spawned_at: r.get(8)?,
-                ended_at: r.get(9)?,
-                end_reason: r.get(10)?,
+                configured_profile_id: r.get(8)?,
+                configured_provider: r.get(9)?,
+                configured_model: r.get(10)?,
+                configured_effort: r.get(11)?,
+                spawned_at: r.get(12)?,
+                ended_at: r.get(13)?,
+                end_reason: r.get(14)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(runs)
 }
 
+/// Fetch the row (if any) that already attributes `profile_id` as an alternate
+/// route for `role_assignment_id`. Used by
+/// [`insert_alternate_with_attribution`] to detect idempotent replays and
+/// concurrent duplicate attributions.
+pub(crate) fn fetch_configured_route(
+    conn: &Connection,
+    role_assignment_id: i64,
+    profile_id: &str,
+) -> Result<Option<AgentRun>> {
+    conn.query_row(
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id,
+                configured_profile_id, configured_provider, configured_model, configured_effort,
+                spawned_at, ended_at, end_reason
+         FROM agent_runs
+         WHERE role_assignment_id = ?1 AND configured_profile_id = ?2",
+        params![role_assignment_id, profile_id],
+        |r| {
+            Ok(AgentRun {
+                id: r.get(0)?,
+                agent: r.get(1)?,
+                role: r.get(2)?,
+                sub_role: r.get(3)?,
+                model: r.get(4)?,
+                effort: r.get(5)?,
+                provider: r.get(6)?,
+                role_assignment_id: r.get(7)?,
+                configured_profile_id: r.get(8)?,
+                configured_provider: r.get(9)?,
+                configured_model: r.get(10)?,
+                configured_effort: r.get(11)?,
+                spawned_at: r.get(12)?,
+                ended_at: r.get(13)?,
+                end_reason: r.get(14)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Latest run identity for a task, without materializing its complete history.
 pub fn latest_for_task(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>> {
     conn.query_row(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id,
+                configured_profile_id, configured_provider, configured_model, configured_effort,
+                spawned_at, ended_at, end_reason
          FROM agent_runs WHERE task_id = ?1 ORDER BY spawned_at DESC, id DESC LIMIT 1",
         params![task_id],
-        |r| Ok(AgentRun {
-            id: r.get(0)?, agent: r.get(1)?, role: r.get(2)?, sub_role: r.get(3)?,
-            model: r.get(4)?, effort: r.get(5)?, provider: r.get(6)?, role_assignment_id: r.get(7)?,
-            spawned_at: r.get(8)?, ended_at: r.get(9)?, end_reason: r.get(10)?,
-        }),
-    ).optional().map_err(Into::into)
+        |r| {
+            Ok(AgentRun {
+                id: r.get(0)?,
+                agent: r.get(1)?,
+                role: r.get(2)?,
+                sub_role: r.get(3)?,
+                model: r.get(4)?,
+                effort: r.get(5)?,
+                provider: r.get(6)?,
+                role_assignment_id: r.get(7)?,
+                configured_profile_id: r.get(8)?,
+                configured_provider: r.get(9)?,
+                configured_model: r.get(10)?,
+                configured_effort: r.get(11)?,
+                spawned_at: r.get(12)?,
+                ended_at: r.get(13)?,
+                end_reason: r.get(14)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 /// Close an open run row at teardown/terminal.
@@ -454,6 +679,42 @@ mod tests {
             .unwrap();
         assert_eq!(ended, 200);
         assert_eq!(reason, "done");
+        let run = latest_for_task(&c, tid).unwrap().unwrap();
+        assert_eq!(run.configured_profile_id, None);
+        assert_eq!(run.configured_provider, None);
+        assert_eq!(run.configured_model, None);
+        assert_eq!(run.configured_effort, None);
+    }
+
+    #[test]
+    fn configured_route_fixture_round_trips_with_immutable_assignment() {
+        let (_d, c) = open_tmp();
+        c.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (42,'worker:task:7:revision:1',7,'worker','original','claude','claude',
+                     'opus','high','worker:M','generation-1',1)",
+            [],
+        )
+        .unwrap();
+        // This internal fixture deliberately bypasses the future guarded writer.
+        c.execute(
+            "INSERT INTO agent_runs(
+                 task_id,agent_name,role,model,effort,provider,role_assignment_id,spawned_at,
+                 configured_profile_id,configured_provider,configured_model,configured_effort)
+             VALUES (7,'alternate','worker','gpt-5.6-sol','medium','codex',42,2,
+                     'sol','codex','gpt-5.6-sol','medium')",
+            [],
+        )
+        .unwrap();
+
+        let run = latest_for_task(&c, 7).unwrap().unwrap();
+        assert_eq!(run.role_assignment_id, Some(42));
+        assert_eq!(run.configured_profile_id.as_deref(), Some("sol"));
+        assert_eq!(run.configured_provider.as_deref(), Some("codex"));
+        assert_eq!(run.configured_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(run.configured_effort.as_deref(), Some("medium"));
     }
 
     #[test]
@@ -801,6 +1062,1353 @@ mod tests {
                 actual, expected,
                 "run {rid} should have end_reason={expected}"
             );
+        }
+    }
+
+    mod alternate_attribution {
+        use super::*;
+        use crate::role_assignments::{
+            AssignmentIdentity, ModelProfile, ValidatedPool, WeightedProfile,
+        };
+        use crate::routing_attempts::{
+            record, select_alternate, validate_fallback_attribution, AlternateRoute,
+            FailureDisposition, FallbackAttributionInput, RecordRoutingAttempt,
+            ValidatedFallbackAttribution,
+        };
+        use std::sync::{Arc, Barrier};
+
+        const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+        fn worker_pool() -> ValidatedPool {
+            ValidatedPool {
+                pool_key: "worker.M".into(),
+                policy_generation: "gen-1".into(),
+                profiles: vec![
+                    WeightedProfile {
+                        profile: ModelProfile {
+                            id: "opus".into(),
+                            provider: "claude".into(),
+                            runner: "claude".into(),
+                            model: "claude-opus-4-8".into(),
+                            effort: "high".into(),
+                        },
+                        percent: 50,
+                    },
+                    WeightedProfile {
+                        profile: ModelProfile {
+                            id: "sonnet".into(),
+                            provider: "claude".into(),
+                            runner: "claude".into(),
+                            model: "claude-sonnet-4-6".into(),
+                            effort: "medium".into(),
+                        },
+                        percent: 30,
+                    },
+                    WeightedProfile {
+                        profile: ModelProfile {
+                            id: "sol".into(),
+                            provider: "codex".into(),
+                            runner: "codex".into(),
+                            model: "gpt-5.6-sol".into(),
+                            effort: "high".into(),
+                        },
+                        percent: 20,
+                    },
+                ],
+            }
+        }
+
+        fn seed_worker_assignment(
+            conn: &Connection,
+            assignment_id: i64,
+            task_id: i64,
+            pool: &ValidatedPool,
+            responsibility: &str,
+        ) {
+            conn.execute(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (?1,'attribution fixture','working','test',1,1)",
+                [task_id],
+            )
+            .unwrap();
+            let primary = &pool.profiles[0].profile;
+            conn.execute(
+                "INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,role,complexity,profile_id,provider,runner,
+                     model,effort,pool_key,policy_generation,created_at)
+                 VALUES (?1,?2,?3,'worker','M',?4,?5,?6,?7,?8,?9,?10,1)",
+                params![
+                    assignment_id,
+                    responsibility,
+                    task_id,
+                    primary.id,
+                    primary.provider,
+                    primary.runner,
+                    primary.model,
+                    primary.effort,
+                    pool.pool_key,
+                    pool.policy_generation,
+                ],
+            )
+            .unwrap();
+        }
+
+        fn seed_reviewer_assignment(
+            conn: &Connection,
+            assignment_id: i64,
+            task_id: i64,
+            pr: i64,
+            stage: &str,
+            pool: &ValidatedPool,
+            responsibility: &str,
+        ) {
+            conn.execute(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (?1,'attribution fixture','working','test',1,1)",
+                [task_id],
+            )
+            .unwrap();
+            let primary = &pool.profiles[0].profile;
+            conn.execute(
+                "INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                     profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (?1,?2,?3,?4,'reviewer',?5,'M',?6,?7,?8,?9,?10,?11,?12,1)",
+                params![
+                    assignment_id,
+                    responsibility,
+                    task_id,
+                    pr,
+                    stage,
+                    primary.id,
+                    primary.provider,
+                    primary.runner,
+                    primary.model,
+                    primary.effort,
+                    pool.pool_key,
+                    pool.policy_generation,
+                ],
+            )
+            .unwrap();
+        }
+
+        fn issue_alternate_token(
+            conn: &mut Connection,
+            assignment_id: i64,
+            responsibility: &str,
+            pool: &ValidatedPool,
+            failed_index: usize,
+            disposition: FailureDisposition,
+            identity: AssignmentIdentity<'_>,
+        ) -> ValidatedFallbackAttribution {
+            record(
+                conn,
+                &RecordRoutingAttempt {
+                    role_assignment_id: assignment_id,
+                    responsibility_key: responsibility,
+                    profile: &pool.profiles[failed_index].profile,
+                    failure_disposition: Some(disposition),
+                    recorded_at: 10,
+                },
+                pool,
+            )
+            .unwrap();
+            let attempts = crate::routing_attempts::list(conn, responsibility).unwrap();
+            let attempt = attempts.last().unwrap().clone();
+            let assignment = crate::role_assignments::get(conn, assignment_id)
+                .unwrap()
+                .unwrap();
+            let excluded = crate::routing_attempts::exclusions(conn, responsibility).unwrap();
+            let selected = match select_alternate(&assignment, pool, &excluded).unwrap() {
+                AlternateRoute::Selected(profile) => profile,
+                other => panic!("expected an alternate selection, got {other:?}"),
+            };
+            let input = FallbackAttributionInput {
+                assignment: &assignment,
+                identity,
+                eligible_pool: pool,
+                attempt: &attempt,
+                exclusions: &excluded,
+                selected_profile: &selected,
+            };
+            validate_fallback_attribution(&input)
+                .unwrap()
+                .expect("valid fallback evidence must issue a token")
+        }
+
+        #[test]
+        fn happy_path_persists_alternate_bindings_and_original_route_unchanged() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let responsibility = "worker:task:7";
+            seed_worker_assignment(&c, 42, 7, &pool, responsibility);
+
+            let token = issue_alternate_token(
+                &mut c,
+                42,
+                responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(7),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+            let run_id =
+                insert_alternate_with_attribution(&mut c, &token, "Dowel-9nmu", 100).unwrap();
+
+            let row = latest_for_task(&c, 7).unwrap().unwrap();
+            assert_eq!(row.id, run_id);
+            assert_eq!(row.agent, "Dowel-9nmu");
+            assert_eq!(row.role, "worker");
+            assert_eq!(row.sub_role, None);
+            // Excluded provider=claude → selected=sol (the codex profile).
+            assert_eq!(row.model, "gpt-5.6-sol");
+            assert_eq!(row.effort, "high");
+            assert_eq!(row.provider.as_deref(), Some("codex"));
+            assert_eq!(row.role_assignment_id, Some(42));
+            assert_eq!(row.configured_profile_id.as_deref(), Some("sol"));
+            assert_eq!(row.configured_provider.as_deref(), Some("codex"));
+            assert_eq!(row.configured_model.as_deref(), Some("gpt-5.6-sol"));
+            assert_eq!(row.configured_effort.as_deref(), Some("high"));
+            assert_eq!(row.spawned_at, 100);
+            let task_id: i64 = c
+                .query_row(
+                    "SELECT task_id FROM agent_runs WHERE id=?1",
+                    [run_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(task_id, 7);
+
+            // Original-route insertion for the same assignment stays compatible.
+            let responsibility_key = format!("worker:task:{}:revision:1", 7);
+            c.execute(
+                "INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,role,profile_id,provider,runner,
+                     model,effort,pool_key,policy_generation,created_at)
+                 VALUES (43,?1,7,'worker','opus','claude','claude','claude-opus-4-8','high',
+                         'worker.M','gen-1',1)",
+                [&responsibility_key],
+            )
+            .unwrap();
+            let original_run = insert_worker_with_assignment(
+                &c,
+                7,
+                "OriginalWorker",
+                &responsibility_key,
+                "claude-opus-4-8",
+                "high",
+                "claude",
+                "claude",
+                Some(43),
+                200,
+            )
+            .unwrap();
+            assert!(original_run > 0);
+            let original = latest_for_task(&c, 7).unwrap().unwrap();
+            assert_eq!(original.role_assignment_id, Some(43));
+            assert_eq!(original.configured_profile_id, None);
+        }
+
+        #[test]
+        fn replay_is_idempotent_and_conflicting_replay_fails_closed() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let responsibility = "worker:task:11";
+            seed_worker_assignment(&c, 11, 11, &pool, responsibility);
+
+            let token = issue_alternate_token(
+                &mut c,
+                11,
+                responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(11),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+            let first = insert_alternate_with_attribution(&mut c, &token, "Alice", 100).unwrap();
+            let replay = insert_alternate_with_attribution(&mut c, &token, "Alice", 100).unwrap();
+            assert_eq!(first, replay);
+            // Different agent_name / spawned_at with the SAME token still fold to
+            // the same attributed row — the (assignment, configured profile) pair
+            // is the reuse identity.
+            let replay_with_different_process =
+                insert_alternate_with_attribution(&mut c, &token, "Different-Agent", 999).unwrap();
+            assert_eq!(first, replay_with_different_process);
+            let count: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM agent_runs WHERE role_assignment_id=11
+                     AND configured_profile_id IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+
+            // Corrupt the persisted row to simulate a tampered replay path — the
+            // stored profile no longer agrees with the token, so replay rejects.
+            c.execute(
+                "UPDATE agent_runs SET configured_model='tampered' WHERE id=?1",
+                [first],
+            )
+            .unwrap();
+            let result = insert_alternate_with_attribution(&mut c, &token, "Alice", 100);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn missing_or_identity_mismatched_assignment_fails_closed() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let responsibility = "worker:task:5";
+            seed_worker_assignment(&c, 5, 5, &pool, responsibility);
+            let token = issue_alternate_token(
+                &mut c,
+                5,
+                responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProfileUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(5),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+
+            // Rebind the assignment's responsibility identity, simulating a
+            // mismatched-token / rebound assignment window.
+            c.execute(
+                "UPDATE role_assignments SET responsibility_key='worker:rebound' WHERE id=5",
+                [],
+            )
+            .unwrap();
+            assert!(insert_alternate_with_attribution(&mut c, &token, "Alice", 100).is_err());
+
+            // A token whose assignment_id names an id that does not exist here
+            // also fails closed. routing_attempts are immutable-by-trigger and
+            // FK back to role_assignments, so cover the "missing" branch by
+            // replaying the token into a fresh DB where that id was never
+            // created.
+            let fresh_dir = tempfile::tempdir().unwrap();
+            let mut fresh = crate::db::open(&fresh_dir.path().join("fresh.db")).unwrap();
+            assert!(insert_alternate_with_attribution(&mut fresh, &token, "Alice", 100).is_err());
+        }
+
+        #[test]
+        fn expired_token_from_later_routing_attempt_fails_closed() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let responsibility = "worker:task:12";
+            seed_worker_assignment(&c, 12, 12, &pool, responsibility);
+            let token = issue_alternate_token(
+                &mut c,
+                12,
+                responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(12),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+            // Selected alternate was `sol`; a later profile-unavailable attempt for
+            // `sol` invalidates the token, expiring it before the row lands.
+            record(
+                &mut c,
+                &RecordRoutingAttempt {
+                    role_assignment_id: 12,
+                    responsibility_key: responsibility,
+                    profile: &pool.profiles[2].profile,
+                    failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                    recorded_at: 15,
+                },
+                &pool,
+            )
+            .unwrap();
+
+            let result = insert_alternate_with_attribution(&mut c, &token, "Alice", 100);
+            assert!(result.is_err(), "expired token must be rejected");
+            let inserted: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM agent_runs WHERE role_assignment_id=12",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(inserted, 0);
+        }
+
+        #[test]
+        fn reviewer_stage_r2_is_persisted_as_sub_role_and_r1_stays_null() {
+            let (_d, mut c) = open_tmp();
+            let pool = ValidatedPool {
+                pool_key: "reviewer.M.r2".into(),
+                policy_generation: "gen-1".into(),
+                ..worker_pool()
+            };
+            let r2_responsibility = "reviewer:task:20:pr:8:r2";
+            seed_reviewer_assignment(&c, 20, 20, 8, "r2", &pool, r2_responsibility);
+            let token = issue_alternate_token(
+                &mut c,
+                20,
+                r2_responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(20),
+                    responsibility_key: r2_responsibility,
+                    role: "reviewer",
+                    pr_number: Some(8),
+                    review_stage: Some("r2"),
+                },
+            );
+            let run = insert_alternate_with_attribution(&mut c, &token, "R2-Alt", 100).unwrap();
+            let sub_role: Option<String> = c
+                .query_row(
+                    "SELECT sub_role FROM agent_runs WHERE id=?1",
+                    [run],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sub_role.as_deref(), Some("r2"));
+
+            let r1_pool = ValidatedPool {
+                pool_key: "reviewer.M.r1".into(),
+                policy_generation: "gen-1".into(),
+                ..worker_pool()
+            };
+            let r1_responsibility = "reviewer:task:21:pr:9:r1";
+            seed_reviewer_assignment(&c, 21, 21, 9, "r1", &r1_pool, r1_responsibility);
+            let r1_token = issue_alternate_token(
+                &mut c,
+                21,
+                r1_responsibility,
+                &r1_pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(21),
+                    responsibility_key: r1_responsibility,
+                    role: "reviewer",
+                    pr_number: Some(9),
+                    review_stage: Some("r1"),
+                },
+            );
+            let r1_run =
+                insert_alternate_with_attribution(&mut c, &r1_token, "R1-Alt", 101).unwrap();
+            let r1_sub: Option<String> = c
+                .query_row(
+                    "SELECT sub_role FROM agent_runs WHERE id=?1",
+                    [r1_run],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(r1_sub, None, "r1 must not populate the r2-only sub_role");
+        }
+
+        #[test]
+        fn invalid_input_and_taskless_token_fail_usage() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let responsibility = "worker:task:33";
+            seed_worker_assignment(&c, 33, 33, &pool, responsibility);
+            let token = issue_alternate_token(
+                &mut c,
+                33,
+                responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(33),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+
+            assert!(matches!(
+                insert_alternate_with_attribution(&mut c, &token, "", 100),
+                Err(QuorumError::Usage(_))
+            ));
+            assert!(matches!(
+                insert_alternate_with_attribution(&mut c, &token, "bad\0name", 100),
+                Err(QuorumError::Usage(_))
+            ));
+            assert!(matches!(
+                insert_alternate_with_attribution(&mut c, &token, "Alice", -1),
+                Err(QuorumError::Usage(_))
+            ));
+
+            // Task-less role assignments cannot attribute an agent_runs row
+            // because agent_runs.task_id is NOT NULL. Construct such an
+            // assignment directly and drive the validator to prove the writer
+            // fails closed on a valid-shaped but task-less token.
+            c.execute(
+                "INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,role,profile_id,provider,runner,
+                     model,effort,pool_key,policy_generation,created_at)
+                 VALUES (44,'worker:taskless',NULL,'worker','opus','claude','claude',
+                         'claude-opus-4-8','high','worker.M','gen-1',1)",
+                [],
+            )
+            .unwrap();
+            let taskless_assignment = crate::role_assignments::get(&c, 44).unwrap().unwrap();
+            record(
+                &mut c,
+                &RecordRoutingAttempt {
+                    role_assignment_id: 44,
+                    responsibility_key: "worker:taskless",
+                    profile: &pool.profiles[0].profile,
+                    failure_disposition: Some(FailureDisposition::ProviderUnavailable),
+                    recorded_at: 5,
+                },
+                &pool,
+            )
+            .unwrap();
+            let taskless_attempts = crate::routing_attempts::list(&c, "worker:taskless").unwrap();
+            let taskless_excluded =
+                crate::routing_attempts::exclusions(&c, "worker:taskless").unwrap();
+            let taskless_selected =
+                match select_alternate(&taskless_assignment, &pool, &taskless_excluded).unwrap() {
+                    AlternateRoute::Selected(profile) => profile,
+                    other => panic!("expected alternate selection, got {other:?}"),
+                };
+            let taskless_token = validate_fallback_attribution(&FallbackAttributionInput {
+                assignment: &taskless_assignment,
+                identity: AssignmentIdentity {
+                    task_id: None,
+                    responsibility_key: "worker:taskless",
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+                eligible_pool: &pool,
+                attempt: taskless_attempts.last().unwrap(),
+                exclusions: &taskless_excluded,
+                selected_profile: &taskless_selected,
+            })
+            .unwrap()
+            .expect("valid task-less evidence must issue a token");
+            assert!(matches!(
+                insert_alternate_with_attribution(&mut c, &taskless_token, "Alice", 100),
+                Err(QuorumError::Usage(_))
+            ));
+        }
+
+        #[test]
+        fn replay_after_selected_profile_becomes_unavailable_rejects_and_preserves_history() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let responsibility = "worker:task:57";
+            seed_worker_assignment(&c, 57, 57, &pool, responsibility);
+
+            let token = issue_alternate_token(
+                &mut c,
+                57,
+                responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProfileUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(57),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+            // The initial attribution creates the historical row.
+            let first = insert_alternate_with_attribution(&mut c, &token, "Alice", 100).unwrap();
+
+            // Later, the alternate's selected profile is itself classified as
+            // profile-unavailable — the exact scenario an alternate route
+            // encounters when it also fails.
+            record(
+                &mut c,
+                &RecordRoutingAttempt {
+                    role_assignment_id: 57,
+                    responsibility_key: responsibility,
+                    profile: token.profile(),
+                    failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                    recorded_at: 20,
+                },
+                &pool,
+            )
+            .unwrap();
+
+            // Replaying the now-expired token must fail closed rather than
+            // returning the pre-existing row through the reuse path.
+            let replay = insert_alternate_with_attribution(&mut c, &token, "Alice", 100);
+            assert!(replay.is_err(), "expired-token replay must be rejected");
+
+            // The historical row survives — expiring the token invalidates the
+            // replay authority, not the immutable evidence of the earlier run.
+            let preserved = fetch_configured_route(&c, 57, &token.profile().id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(preserved.id, first);
+            let rows: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM agent_runs
+                     WHERE role_assignment_id=57 AND configured_profile_id IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
+
+        #[test]
+        fn concurrent_same_evidence_converges_on_one_attributed_row() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("concurrent-same.db");
+            let pool = worker_pool();
+            let responsibility = "worker:task:70";
+            let token = {
+                let mut c = crate::db::open(&path).unwrap();
+                seed_worker_assignment(&c, 70, 70, &pool, responsibility);
+                issue_alternate_token(
+                    &mut c,
+                    70,
+                    responsibility,
+                    &pool,
+                    0,
+                    FailureDisposition::ProviderUnavailable,
+                    AssignmentIdentity {
+                        task_id: Some(70),
+                        responsibility_key: responsibility,
+                        role: "worker",
+                        pr_number: None,
+                        review_stage: None,
+                    },
+                )
+            };
+
+            let barrier = Arc::new(Barrier::new(8));
+            let mut handles = Vec::new();
+            for thread in 0..8 {
+                let path = path.clone();
+                let token = token.clone();
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    insert_alternate_with_attribution(
+                        &mut conn,
+                        &token,
+                        &format!("agent-{thread}"),
+                        100 + thread,
+                    )
+                    .unwrap()
+                }));
+            }
+            let ids: std::collections::HashSet<i64> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            assert_eq!(ids.len(), 1);
+
+            let conn = crate::db::open(&path).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM agent_runs
+                     WHERE role_assignment_id=70 AND configured_profile_id IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+        }
+
+        #[test]
+        fn concurrent_stale_and_current_tokens_cannot_both_write_for_the_same_evidence() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("concurrent-mismatch.db");
+            let pool = worker_pool();
+            let responsibility = "worker:task:80";
+            let (stale_token, current_token) = {
+                let mut c = crate::db::open(&path).unwrap();
+                seed_worker_assignment(&c, 80, 80, &pool, responsibility);
+                // ProfileUnavailable excludes just `opus`, leaving `sonnet`
+                // (30%) as the stale token's selected alternate.
+                let stale = issue_alternate_token(
+                    &mut c,
+                    80,
+                    responsibility,
+                    &pool,
+                    0,
+                    FailureDisposition::ProfileUnavailable,
+                    AssignmentIdentity {
+                        task_id: Some(80),
+                        responsibility_key: responsibility,
+                        role: "worker",
+                        pr_number: None,
+                        review_stage: None,
+                    },
+                );
+                // Later evidence excludes `sonnet` (the stale token's selected
+                // profile). A fresh token now selects the next executable
+                // alternate (`sol`).
+                record(
+                    &mut c,
+                    &RecordRoutingAttempt {
+                        role_assignment_id: 80,
+                        responsibility_key: responsibility,
+                        profile: &pool.profiles[1].profile,
+                        failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                        recorded_at: 20,
+                    },
+                    &pool,
+                )
+                .unwrap();
+                let assignment = crate::role_assignments::get(&c, 80).unwrap().unwrap();
+                let excluded = crate::routing_attempts::exclusions(&c, responsibility).unwrap();
+                let selected = match select_alternate(&assignment, &pool, &excluded).unwrap() {
+                    AlternateRoute::Selected(profile) => profile,
+                    other => panic!("expected an alternate selection, got {other:?}"),
+                };
+                let attempts = crate::routing_attempts::list(&c, responsibility).unwrap();
+                // Use the ORIGINAL classified attempt for the current token
+                // (the one that first excluded the primary profile); the second
+                // profile-unavailable attempt is what makes the stale token's
+                // selection now excluded.
+                let attempt = attempts
+                    .iter()
+                    .find(|a| a.profile.id == pool.profiles[0].profile.id)
+                    .unwrap()
+                    .clone();
+                let current = validate_fallback_attribution(&FallbackAttributionInput {
+                    assignment: &assignment,
+                    identity: AssignmentIdentity {
+                        task_id: Some(80),
+                        responsibility_key: responsibility,
+                        role: "worker",
+                        pr_number: None,
+                        review_stage: None,
+                    },
+                    eligible_pool: &pool,
+                    attempt: &attempt,
+                    exclusions: &excluded,
+                    selected_profile: &selected,
+                })
+                .unwrap()
+                .expect("current fresh evidence must issue a token");
+                assert_ne!(stale.profile(), current.profile());
+                (stale, current)
+            };
+
+            let barrier = Arc::new(Barrier::new(2));
+            let stale_path = path.clone();
+            let current_path = path.clone();
+            let stale_barrier = Arc::clone(&barrier);
+            let current_barrier = Arc::clone(&barrier);
+            let stale_handle = std::thread::spawn(move || {
+                let mut conn = crate::db::open(&stale_path).unwrap();
+                stale_barrier.wait();
+                insert_alternate_with_attribution(&mut conn, &stale_token, "stale", 100)
+            });
+            let current_handle = std::thread::spawn(move || {
+                let mut conn = crate::db::open(&current_path).unwrap();
+                current_barrier.wait();
+                insert_alternate_with_attribution(&mut conn, &current_token, "current", 101)
+            });
+            let stale_result = stale_handle.join().unwrap();
+            let current_result = current_handle.join().unwrap();
+
+            // The stale token's profile is now excluded; only the current
+            // token's selection wins. The current token always succeeds.
+            assert!(
+                stale_result.is_err(),
+                "the stale token must fail closed instead of writing a mismatched attribution"
+            );
+            assert!(current_result.is_ok());
+            let rows: Vec<(i64, String)> = crate::db::open(&path)
+                .unwrap()
+                .prepare(
+                    "SELECT id,configured_profile_id FROM agent_runs
+                     WHERE role_assignment_id=80 AND configured_profile_id IS NOT NULL
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, current_result.unwrap());
+        }
+
+        #[test]
+        fn distinct_alternates_over_time_produce_distinct_rows_for_the_same_assignment() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let responsibility = "worker:task:91";
+            seed_worker_assignment(&c, 91, 91, &pool, responsibility);
+
+            // Exclude just the primary so both `sonnet` (30%) and `sol` (20%)
+            // remain executable alternates.
+            let first_token = issue_alternate_token(
+                &mut c,
+                91,
+                responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProfileUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(91),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+            let first_run =
+                insert_alternate_with_attribution(&mut c, &first_token, "first", 100).unwrap();
+
+            // The first alternate (`sonnet`) is now unavailable — the daemon
+            // records its classified failure and selects the next executable
+            // profile (`sol`).
+            record(
+                &mut c,
+                &RecordRoutingAttempt {
+                    role_assignment_id: 91,
+                    responsibility_key: responsibility,
+                    profile: &pool.profiles[1].profile,
+                    failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                    recorded_at: 20,
+                },
+                &pool,
+            )
+            .unwrap();
+            let assignment = crate::role_assignments::get(&c, 91).unwrap().unwrap();
+            let excluded = crate::routing_attempts::exclusions(&c, responsibility).unwrap();
+            let selected = match select_alternate(&assignment, &pool, &excluded).unwrap() {
+                AlternateRoute::Selected(profile) => profile,
+                other => panic!("expected an alternate selection, got {other:?}"),
+            };
+            let attempts = crate::routing_attempts::list(&c, responsibility).unwrap();
+            let attempt = attempts
+                .iter()
+                .find(|a| a.profile.id == pool.profiles[0].profile.id)
+                .unwrap()
+                .clone();
+            let second_token = validate_fallback_attribution(&FallbackAttributionInput {
+                assignment: &assignment,
+                identity: AssignmentIdentity {
+                    task_id: Some(91),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+                eligible_pool: &pool,
+                attempt: &attempt,
+                exclusions: &excluded,
+                selected_profile: &selected,
+            })
+            .unwrap()
+            .expect("fresh evidence must issue a distinct alternate token");
+            assert_ne!(first_token.profile(), second_token.profile());
+
+            let second_run =
+                insert_alternate_with_attribution(&mut c, &second_token, "second", 200).unwrap();
+            assert_ne!(first_run, second_run);
+            let count: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM agent_runs
+                     WHERE role_assignment_id=91 AND configured_profile_id IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+
+        #[test]
+        fn attributed_alternate_capability_atomically_binds_exact_run_and_replays() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let responsibility = "worker:task:101";
+            seed_worker_assignment(&c, 101, 101, &pool, responsibility);
+            c.execute("UPDATE tasks SET assignee='Alternate' WHERE id=101", [])
+                .unwrap();
+            let token = issue_alternate_token(
+                &mut c,
+                101,
+                responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(101),
+                    responsibility_key: responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+            let assignment_before: (i64, String) = c
+                .query_row(
+                    "SELECT id,profile_id FROM role_assignments WHERE id=101",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+
+            let tx = begin_immediate(&mut c).unwrap();
+            let agent_run_id =
+                insert_alternate_with_attribution_tx(&tx, &token, "Alternate", 100).unwrap();
+            let capability = crate::capabilities::issue_attributed_alternate_tx(
+                &tx,
+                &token,
+                agent_run_id,
+                "alternate-capability",
+                "Alternate",
+                None,
+                101,
+            )
+            .unwrap()
+            .expect("matching attributed run must receive capability authority");
+            tx.commit().unwrap();
+
+            assert_eq!(capability.agent_run_id, Some(agent_run_id));
+            assert_eq!(
+                crate::capabilities::validate(
+                    &c,
+                    "alternate-capability",
+                    "Alternate",
+                    "worker",
+                    Some(101),
+                )
+                .unwrap()
+                .agent_run_id,
+                Some(agent_run_id)
+            );
+            assert_eq!(
+                crate::capabilities::resolve_live_run_context(
+                    &c,
+                    "alternate-capability",
+                    "worker",
+                )
+                .unwrap()
+                .agent_run_id,
+                agent_run_id,
+                "exact fallback linkage must win over legacy name/timestamp inference"
+            );
+
+            let replay = crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &token,
+                agent_run_id,
+                "alternate-capability",
+                "Alternate",
+                None,
+                999,
+            )
+            .unwrap()
+            .expect("the exact capability replay must converge");
+            assert_eq!(replay.agent_run_id, Some(agent_run_id));
+            assert_eq!(replay.created_at, 101, "replay must not rewrite authority");
+            assert_eq!(
+                c.query_row(
+                    "SELECT id,profile_id FROM role_assignments WHERE id=101",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap(),
+                assignment_before,
+                "fallback capability issuance must not alter assignment/allocation evidence"
+            );
+        }
+
+        #[test]
+        fn attributed_reviewer_capabilities_atomically_bind_r1_and_r2_launch_authority() {
+            let (_d, mut c) = open_tmp();
+
+            for (task_id, stage, agent, capability_run_id) in [
+                (106, "r1", "R1-Alternate", "r1-alternate-capability"),
+                (107, "r2", "R2-Alternate", "r2-alternate-capability"),
+            ] {
+                let pr = 800 + task_id;
+                let pool = ValidatedPool {
+                    pool_key: format!("reviewer.M.{stage}"),
+                    policy_generation: "gen-1".into(),
+                    ..worker_pool()
+                };
+                let responsibility = format!("reviewer:task:{task_id}:pr:{pr}:{stage}");
+                seed_reviewer_assignment(&c, task_id, task_id, pr, stage, &pool, &responsibility);
+                c.execute(
+                    "UPDATE tasks
+                     SET status='in-review',reviewer=?2,refs=json_object('pr',?3)
+                     WHERE id=?1",
+                    params![task_id, agent, pr],
+                )
+                .unwrap();
+                let token = issue_alternate_token(
+                    &mut c,
+                    task_id,
+                    &responsibility,
+                    &pool,
+                    0,
+                    FailureDisposition::ProviderUnavailable,
+                    AssignmentIdentity {
+                        task_id: Some(task_id),
+                        responsibility_key: &responsibility,
+                        role: "reviewer",
+                        pr_number: Some(pr),
+                        review_stage: Some(stage),
+                    },
+                );
+
+                let tx = begin_immediate(&mut c).unwrap();
+                let agent_run_id =
+                    insert_alternate_with_attribution_tx(&tx, &token, agent, task_id).unwrap();
+                let capability = crate::capabilities::issue_attributed_alternate_tx(
+                    &tx,
+                    &token,
+                    agent_run_id,
+                    capability_run_id,
+                    agent,
+                    Some(crate::capabilities::ReviewerLaunchEvidence {
+                        pr,
+                        head_sha: REVIEW_SHA,
+                    }),
+                    task_id + 1,
+                )
+                .unwrap()
+                .expect("an attributed reviewer with an exact launch target is authorized");
+                tx.commit().unwrap();
+
+                let launch: (String, i64, String, Option<String>) = c
+                    .query_row(
+                        "SELECT review_cap_run_id,review_pr,review_head_sha,sub_role
+                         FROM agent_runs WHERE id=?1",
+                        [agent_run_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .unwrap();
+                assert_eq!(launch.0, capability_run_id);
+                assert_eq!(launch.1, pr);
+                assert_eq!(launch.2, REVIEW_SHA);
+                assert_eq!(launch.3.as_deref(), (stage == "r2").then_some("r2"));
+                assert_eq!(capability.agent_run_id, Some(agent_run_id));
+
+                let context = crate::capabilities::resolve_live_run_context(
+                    &c,
+                    capability_run_id,
+                    "reviewer",
+                )
+                .unwrap();
+                assert_eq!(context.agent_run_id, agent_run_id);
+                assert_eq!(context.pr, Some(pr));
+                assert_eq!(context.review_revision.as_deref(), Some(REVIEW_SHA));
+
+                let replay = crate::capabilities::issue_attributed_alternate(
+                    &mut c,
+                    &token,
+                    agent_run_id,
+                    capability_run_id,
+                    agent,
+                    Some(crate::capabilities::ReviewerLaunchEvidence {
+                        pr,
+                        head_sha: REVIEW_SHA,
+                    }),
+                    999,
+                )
+                .unwrap()
+                .expect("the exact reviewer capability replay must converge");
+                assert_eq!(replay.created_at, task_id + 1);
+                assert!(crate::capabilities::issue_attributed_alternate(
+                    &mut c,
+                    &token,
+                    agent_run_id,
+                    capability_run_id,
+                    agent,
+                    Some(crate::capabilities::ReviewerLaunchEvidence {
+                        pr,
+                        head_sha: "fedcba9876543210fedcba9876543210fedcba98",
+                    }),
+                    1000,
+                )
+                .unwrap()
+                .is_none());
+                assert_eq!(
+                    c.query_row(
+                        "SELECT review_head_sha FROM agent_runs WHERE id=?1",
+                        [agent_run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                    REVIEW_SHA,
+                    "a replay mismatch must not overwrite the immutable reviewer target"
+                );
+            }
+        }
+
+        #[test]
+        fn attributed_alternate_capability_rejects_cross_agent_task_stage_and_route() {
+            let (_d, mut c) = open_tmp();
+            let pool = worker_pool();
+            let worker_responsibility = "worker:task:102";
+            seed_worker_assignment(&c, 102, 102, &pool, worker_responsibility);
+            let worker_token = issue_alternate_token(
+                &mut c,
+                102,
+                worker_responsibility,
+                &pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(102),
+                    responsibility_key: worker_responsibility,
+                    role: "worker",
+                    pr_number: None,
+                    review_stage: None,
+                },
+            );
+            let worker_run =
+                insert_alternate_with_attribution(&mut c, &worker_token, "Alternate", 100).unwrap();
+
+            // A valid route cannot be replayed under another participant's
+            // identity. The original participant evidence remains untouched.
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &worker_token,
+                worker_run,
+                "wrong-agent",
+                "Other-Agent",
+                None,
+                101,
+            )
+            .unwrap()
+            .is_none());
+
+            c.execute(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (103,'other task','working','test',1,1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE agent_runs SET task_id=103 WHERE id=?1",
+                [worker_run],
+            )
+            .unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &worker_token,
+                worker_run,
+                "cross-task",
+                "Alternate",
+                None,
+                102,
+            )
+            .unwrap()
+            .is_none());
+            c.execute(
+                "UPDATE agent_runs SET task_id=102 WHERE id=?1",
+                [worker_run],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE agent_runs SET configured_model='forged' WHERE id=?1",
+                [worker_run],
+            )
+            .unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &worker_token,
+                worker_run,
+                "cross-route",
+                "Alternate",
+                None,
+                103,
+            )
+            .unwrap()
+            .is_none());
+
+            let reviewer_pool = ValidatedPool {
+                pool_key: "reviewer.M.r2".into(),
+                policy_generation: "gen-1".into(),
+                ..worker_pool()
+            };
+            let reviewer_responsibility = "reviewer:task:104:pr:88:r2";
+            seed_reviewer_assignment(
+                &c,
+                104,
+                104,
+                88,
+                "r2",
+                &reviewer_pool,
+                reviewer_responsibility,
+            );
+            let reviewer_token = issue_alternate_token(
+                &mut c,
+                104,
+                reviewer_responsibility,
+                &reviewer_pool,
+                0,
+                FailureDisposition::ProviderUnavailable,
+                AssignmentIdentity {
+                    task_id: Some(104),
+                    responsibility_key: reviewer_responsibility,
+                    role: "reviewer",
+                    pr_number: Some(88),
+                    review_stage: Some("r2"),
+                },
+            );
+            let reviewer_run =
+                insert_alternate_with_attribution(&mut c, &reviewer_token, "R2-Alternate", 104)
+                    .unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &reviewer_token,
+                reviewer_run,
+                "missing-launch-evidence",
+                "R2-Alternate",
+                None,
+                105,
+            )
+            .unwrap()
+            .is_none());
+            c.execute(
+                "UPDATE role_assignments SET review_stage='r1' WHERE id=104",
+                [],
+            )
+            .unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut c,
+                &reviewer_token,
+                reviewer_run,
+                "cross-stage",
+                "R2-Alternate",
+                Some(crate::capabilities::ReviewerLaunchEvidence {
+                    pr: 88,
+                    head_sha: REVIEW_SHA,
+                }),
+                105,
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(
+                c.query_row("SELECT count(*) FROM run_capabilities", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "every mismatched link must reject without capability authority"
+            );
+        }
+
+        #[test]
+        fn concurrent_distinct_capabilities_for_one_attributed_run_have_one_clean_winner() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("attributed-capability-race.db");
+            let pool = worker_pool();
+            let responsibility = "worker:task:105";
+            let (token, agent_run_id) = {
+                let mut c = crate::db::open(&path).unwrap();
+                seed_worker_assignment(&c, 105, 105, &pool, responsibility);
+                let token = issue_alternate_token(
+                    &mut c,
+                    105,
+                    responsibility,
+                    &pool,
+                    0,
+                    FailureDisposition::ProviderUnavailable,
+                    AssignmentIdentity {
+                        task_id: Some(105),
+                        responsibility_key: responsibility,
+                        role: "worker",
+                        pr_number: None,
+                        review_stage: None,
+                    },
+                );
+                let run =
+                    insert_alternate_with_attribution(&mut c, &token, "Alternate", 100).unwrap();
+                (token, run)
+            };
+
+            let barrier = Arc::new(Barrier::new(2));
+            let mut handles = Vec::new();
+            for contender in 0..2 {
+                let path = path.clone();
+                let token = token.clone();
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    crate::capabilities::issue_attributed_alternate(
+                        &mut conn,
+                        &token,
+                        agent_run_id,
+                        &format!("contender-{contender}"),
+                        "Alternate",
+                        None,
+                        200 + contender,
+                    )
+                    .unwrap()
+                }));
+            }
+            let winners = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(winners.iter().filter(|winner| winner.is_some()).count(), 1);
+
+            let conn = crate::db::open(&path).unwrap();
+            let winner = conn
+                .query_row(
+                    "SELECT run_id FROM run_capabilities WHERE agent_run_id=?1",
+                    [agent_run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM run_capabilities WHERE agent_run_id=?1",
+                    [agent_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+            drop(conn);
+
+            let mut replay_conn = crate::db::open(&path).unwrap();
+            assert!(crate::capabilities::issue_attributed_alternate(
+                &mut replay_conn,
+                &token,
+                agent_run_id,
+                &winner,
+                "Alternate",
+                None,
+                999,
+            )
+            .unwrap()
+            .is_some());
         }
     }
 }

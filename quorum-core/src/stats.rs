@@ -487,6 +487,56 @@ pub enum HealthVerdict {
     Stalled,
 }
 
+/// Severity assigned to an observed host-resource value.
+#[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy, Default, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceSeverity {
+    #[default]
+    Normal,
+    Warning,
+    Critical,
+}
+
+/// Host memory and swap values sampled by the binary crate.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct MemoryResourceView {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub available_percent: f64,
+    pub swap_total_bytes: u64,
+    pub swap_used_bytes: u64,
+    pub severity: ResourceSeverity,
+}
+
+/// One deduplicated filesystem sampled for host-resource status.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct DiskResourceView {
+    /// Logical consumers located on this filesystem (for example `database`
+    /// and `worktrees`). Multiple consumers prove filesystem deduplication.
+    pub targets: Vec<String>,
+    /// Existing path used for the filesystem sample.
+    pub path: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub available_percent: f64,
+    pub severity: ResourceSeverity,
+}
+
+/// Live, non-persisted host-resource telemetry attached by `quorum status`.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct HostResourcesView {
+    pub sampled_at: i64,
+    /// False when one or more requested samples failed. Known values remain
+    /// visible, but an incomplete sample must not prove a daemon recovery.
+    pub complete: bool,
+    pub severity: ResourceSeverity,
+    pub memory: Option<MemoryResourceView>,
+    pub disks: Vec<DiskResourceView>,
+    /// Bounded, fail-open sampling diagnostics. These are observational and
+    /// never enter the durable Quorum error feed.
+    pub errors: Vec<String>,
+}
+
 /// A point-in-time snapshot of the store.
 #[derive(Debug, Serialize, PartialEq, Default)]
 pub struct Stats {
@@ -545,6 +595,9 @@ pub struct Stats {
     pub merge_blockers: Vec<MergeBlockerView>,
     /// #115: daemon liveness from daemon_lock (populated by binary crate).
     pub daemon: DaemonLiveness,
+    /// Live host memory/swap and filesystem telemetry. Populated after the
+    /// binary closes the status read connection; never persisted in SQLite.
+    pub resources: Option<HostResourcesView>,
 }
 
 /// Gather a snapshot. Read-only.
@@ -668,6 +721,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         alerts,
         merge_blockers,
         daemon: DaemonLiveness::default(),
+        resources: None,
     })
 }
 
@@ -900,6 +954,7 @@ fn progress_runs(conn: &Connection, task_id: i64) -> Result<Vec<crate::agent_run
     let mut runs = conn
         .prepare(
             "SELECT id,agent_name,role,sub_role,model,effort,provider,role_assignment_id,
+                    configured_profile_id,configured_provider,configured_model,configured_effort,
                     spawned_at,ended_at,end_reason
              FROM agent_runs WHERE task_id=?1 ORDER BY id DESC LIMIT ?2",
         )?
@@ -915,9 +970,13 @@ fn progress_runs(conn: &Connection, task_id: i64) -> Result<Vec<crate::agent_run
                     effort: row.get(5)?,
                     provider: row.get(6)?,
                     role_assignment_id: row.get(7)?,
-                    spawned_at: row.get(8)?,
-                    ended_at: row.get(9)?,
-                    end_reason: row.get(10)?,
+                    configured_profile_id: row.get(8)?,
+                    configured_provider: row.get(9)?,
+                    configured_model: row.get(10)?,
+                    configured_effort: row.get(11)?,
+                    spawned_at: row.get(12)?,
+                    ended_at: row.get(13)?,
+                    end_reason: row.get(14)?,
                 })
             },
         )?
@@ -936,6 +995,10 @@ fn progress_runs(conn: &Connection, task_id: i64) -> Result<Vec<crate::agent_run
                 effort: String::new(),
                 provider: None,
                 role_assignment_id: None,
+                configured_profile_id: None,
+                configured_provider: None,
+                configured_model: None,
+                configured_effort: None,
                 spawned_at: 0,
                 ended_at: Some(0),
                 end_reason: Some(format!("{omitted} earlier completed runs")),
@@ -1100,13 +1163,13 @@ fn decomposition_history(
             );
         }
     }
-    // Moving beyond `validating` is durable proof that the current proposal cleared
-    // the Arbiter gate. A `planning` task alone is intentionally never such proof.
+    // Materialization is durable proof that the current proposal cleared the
+    // Arbiter gate: the Arbiter phase (`validating`) follows classification
+    // (`preclassifying`) and approval materializes the children directly. A
+    // `planning` or `preclassifying` graph is intentionally never such proof.
     if let Some(graph) = graph {
-        if matches!(
-            graph.state.as_str(),
-            "preclassifying" | "active" | "blocked" | "completed"
-        ) || graph.accepted_plan_revision.is_some()
+        if matches!(graph.state.as_str(), "active" | "blocked" | "completed")
+            || graph.accepted_plan_revision.is_some()
         {
             let already_approved = history.iter().any(|milestone| {
                 milestone.stage == "Plan review"
@@ -1304,13 +1367,13 @@ fn decomposition_current_progress(
         ),
         "preclassifying" => (
             TaskProgressStage {
-                label: "Plan accepted".into(),
+                label: "Pre-classification".into(),
                 role: None,
-                activity: "Classifying accepted child work".into(),
+                activity: "Classifying proposed child work".into(),
             },
             None,
             Some(possible_next(
-                "Accepted work may be materialized as child tasks",
+                "Classified work may proceed to Arbiter plan review",
             )),
         ),
         "active" | "blocked" | "completed" => {
@@ -1466,17 +1529,17 @@ fn execution_future(
 fn decomposition_future(current: &str) -> Vec<TaskProgressMilestone> {
     let labels = match current {
         "Intake / classification" | "Planning" => vec![
+            ("Pre-classification", None),
             ("Plan review", Some("Arbiter")),
-            ("Plan accepted", None),
             ("Child execution", None),
             ("Complete", None),
         ],
-        "Plan review" => vec![
-            ("Plan accepted", None),
+        "Pre-classification" => vec![
+            ("Plan review", Some("Arbiter")),
             ("Child execution", None),
             ("Complete", None),
         ],
-        "Plan accepted" => vec![("Child execution", None), ("Complete", None)],
+        "Plan review" => vec![("Child execution", None), ("Complete", None)],
         "Child execution" => vec![("Complete", None)],
         _ => Vec::new(),
     };
@@ -3220,6 +3283,7 @@ mod tests {
                     task_id: id,
                     cx_est: 3,
                     size: "M".into(),
+                    size_reason: "bounded test classification rationale".into(),
                     ready: true,
                     not_ready_reason: None,
                     duplicate_of: vec![],
@@ -6011,13 +6075,36 @@ mod tests {
         );
         assert_eq!(changed.attempts.arbiter_rounds, 3);
 
+        // Classification precedes the Arbiter: a `preclassifying` graph has not
+        // been reviewed yet, so it must not claim an approval.
         c.execute(
             "UPDATE task_decompositions SET state='preclassifying' WHERE id=?1",
             [graph],
         )
         .unwrap();
+        let classifying = projection(&c, source);
+        assert_eq!(classifying.stage.label, "Pre-classification");
+        assert!(!classifying.history.iter().any(|milestone| {
+            milestone.stage == "Plan review" && milestone.activity.as_deref() == Some("Approved")
+        }));
+        assert_eq!(
+            classifying
+                .milestones
+                .iter()
+                .filter(|milestone| milestone.state == TaskProgressMilestoneState::Future)
+                .map(|milestone| milestone.stage.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Plan review", "Child execution", "Complete"],
+            "the Arbiter review is still ahead of a preclassifying graph"
+        );
+
+        // Materialization is the durable approval evidence.
+        c.execute(
+            "UPDATE task_decompositions SET state='active',active=1 WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
         let approved = projection(&c, source);
-        assert_eq!(approved.stage.label, "Plan accepted");
         assert!(approved.history.iter().any(|milestone| {
             milestone.stage == "Plan review" && milestone.activity.as_deref() == Some("Approved")
         }));

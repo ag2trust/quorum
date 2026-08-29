@@ -1,8 +1,9 @@
 //! TOML config file for `quorum serve`. Missing file → built-in defaults.
 //! Malformed or unknown keys → fail loud (exit 2).
 //!
-//! CLI flags override config-file values (explicit wins). The resolved config
-//! and each value's source (file vs flag vs default) are logged at startup.
+//! Corresponding CLI flags override config-file values (explicit wins); some
+//! diagnostics are intentionally file-only. The resolved config and each
+//! value's source (file vs flag vs default) are logged at startup.
 
 use quorum_core::error::{QuorumError, Result};
 use serde::Deserialize;
@@ -214,6 +215,12 @@ declare_serve_file_config! {
     master_ci_gate: Option<bool>,
     master_ci_timeout_secs: Option<u64>,
     doctor_enabled: Option<bool>,
+    /// Cadence for observational host memory/disk sampling.
+    resource_poll_secs: Option<u64>,
+    disk_warn_free_gib: Option<u64>,
+    disk_critical_free_gib: Option<u64>,
+    memory_warn_available_pct: Option<u8>,
+    memory_critical_available_pct: Option<u8>,
     /// Whether deterministic R2 sampling participates. `false` keeps R2 mandatory.
     r2_enabled: Option<bool>,
     /// Guaranteed coverage floor per (model, effort, complexity) stratum.
@@ -294,6 +301,14 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("master_ci_gate", ConfigKeyDisposition::Runtime),
     ("master_ci_timeout_secs", ConfigKeyDisposition::Runtime),
     ("doctor_enabled", ConfigKeyDisposition::Runtime),
+    ("resource_poll_secs", ConfigKeyDisposition::Runtime),
+    ("disk_warn_free_gib", ConfigKeyDisposition::Runtime),
+    ("disk_critical_free_gib", ConfigKeyDisposition::Runtime),
+    ("memory_warn_available_pct", ConfigKeyDisposition::Runtime),
+    (
+        "memory_critical_available_pct",
+        ConfigKeyDisposition::Runtime,
+    ),
     ("r2_enabled", ConfigKeyDisposition::Runtime),
     ("r2_target_per_stratum", ConfigKeyDisposition::Runtime),
     ("r2_steady_state_p", ConfigKeyDisposition::Runtime),
@@ -585,6 +600,7 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             })?;
             resolve_grok_adapter(cfg.grok.as_ref())?;
             validate_model_routing(&cfg)?;
+            resolve_resource_monitor_config(&cfg)?;
             warn_for_deprecated_keys(&s)?;
             Ok(cfg)
         }
@@ -947,6 +963,98 @@ pub fn validate_max_rework(max_rework: u32) -> Result<()> {
     Ok(())
 }
 
+/// Resolve and validate the daemon's observational host-resource monitor.
+pub fn resolve_resource_monitor_config(
+    file: &ServeFileConfig,
+) -> Result<crate::resource_health::ResourceMonitorConfig> {
+    use crate::resource_health::{
+        ResourceMonitorConfig, DEFAULT_DISK_CRITICAL_FREE_GIB, DEFAULT_DISK_WARN_FREE_GIB,
+        DEFAULT_MEMORY_CRITICAL_AVAILABLE_PCT, DEFAULT_MEMORY_WARN_AVAILABLE_PCT,
+        DEFAULT_RESOURCE_POLL_SECS, MAX_RESOURCE_POLL_SECS, MIN_RESOURCE_POLL_SECS,
+    };
+
+    let resolved = ResourceMonitorConfig {
+        poll_secs: file
+            .resource_poll_secs
+            .unwrap_or(DEFAULT_RESOURCE_POLL_SECS),
+        disk_warn_free_gib: file
+            .disk_warn_free_gib
+            .unwrap_or(DEFAULT_DISK_WARN_FREE_GIB),
+        disk_critical_free_gib: file
+            .disk_critical_free_gib
+            .unwrap_or(DEFAULT_DISK_CRITICAL_FREE_GIB),
+        memory_warn_available_pct: file
+            .memory_warn_available_pct
+            .unwrap_or(DEFAULT_MEMORY_WARN_AVAILABLE_PCT),
+        memory_critical_available_pct: file
+            .memory_critical_available_pct
+            .unwrap_or(DEFAULT_MEMORY_CRITICAL_AVAILABLE_PCT),
+    };
+    if !(MIN_RESOURCE_POLL_SECS..=MAX_RESOURCE_POLL_SECS).contains(&resolved.poll_secs) {
+        return Err(QuorumError::Usage(format!(
+            "resource_poll_secs must be between {MIN_RESOURCE_POLL_SECS} and {MAX_RESOURCE_POLL_SECS}, got {}",
+            resolved.poll_secs
+        )));
+    }
+    if resolved.disk_critical_free_gib == 0
+        || resolved.disk_critical_free_gib >= resolved.disk_warn_free_gib
+    {
+        return Err(QuorumError::Usage(format!(
+            "disk_critical_free_gib must be greater than zero and less than disk_warn_free_gib (got critical={}, warn={})",
+            resolved.disk_critical_free_gib, resolved.disk_warn_free_gib
+        )));
+    }
+    if resolved.memory_critical_available_pct == 0
+        || resolved.memory_warn_available_pct > 100
+        || resolved.memory_critical_available_pct >= resolved.memory_warn_available_pct
+    {
+        return Err(QuorumError::Usage(format!(
+            "memory_critical_available_pct must be greater than zero and less than memory_warn_available_pct, and warning must be at most 100 (got critical={}, warn={})",
+            resolved.memory_critical_available_pct, resolved.memory_warn_available_pct
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Resource settings needed by a read-only status process. Unlike daemon
+/// startup, this does not require or validate model routing: status remains
+/// usable while the daemon is absent. Unknown/malformed TOML still fails loud
+/// to callers, which may choose the documented fail-open defaults.
+pub struct StatusResourceConfig {
+    pub monitor: crate::resource_health::ResourceMonitorConfig,
+    pub worktree_base: Option<std::path::PathBuf>,
+}
+
+pub fn status_resource_config(repo: &str) -> Result<StatusResourceConfig> {
+    status_resource_config_at(&default_config_path(repo)?)
+}
+
+fn status_resource_config_at(path: &Path) -> Result<StatusResourceConfig> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StatusResourceConfig {
+                monitor: crate::resource_health::ResourceMonitorConfig::default(),
+                worktree_base: None,
+            });
+        }
+        Err(error) => {
+            return Err(QuorumError::Io(format!(
+                "cannot read serve config {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let file: ServeFileConfig = toml::from_str(&contents).map_err(|error| {
+        QuorumError::Usage(format!("bad serve config {}: {error}", path.display()))
+    })?;
+    let monitor = resolve_resource_monitor_config(&file)?;
+    Ok(StatusResourceConfig {
+        monitor,
+        worktree_base: file.worktree_base.map(std::path::PathBuf::from),
+    })
+}
+
 /// Tracks where each resolved config value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -1160,6 +1268,11 @@ pub struct BannerData<'a> {
     pub master_ci_gate: &'a Sourced<bool>,
     pub master_ci_timeout_secs: &'a Sourced<u64>,
     pub doctor_enabled: &'a Sourced<bool>,
+    pub resource_poll_secs: &'a Sourced<u64>,
+    pub disk_warn_free_gib: &'a Sourced<u64>,
+    pub disk_critical_free_gib: &'a Sourced<u64>,
+    pub memory_warn_available_pct: &'a Sourced<u8>,
+    pub memory_critical_available_pct: &'a Sourced<u8>,
 }
 
 /// Format the startup banner showing resolved config + sources.
@@ -1268,6 +1381,18 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!(
         "  merge_checks_timeout_secs: {}",
         d.merge_checks_timeout_secs
+    ));
+    lines.push(format!(
+        "  resource_poll_secs:        {}",
+        d.resource_poll_secs
+    ));
+    lines.push(format!(
+        "  disk free GiB warn/crit:   {}/{}",
+        d.disk_warn_free_gib, d.disk_critical_free_gib
+    ));
+    lines.push(format!(
+        "  memory avail % warn/crit:  {}/{}",
+        d.memory_warn_available_pct, d.memory_critical_available_pct
     ));
     if d.required_jobs.is_empty() {
         lines.push("  required_jobs:             (none)".to_string());
@@ -1444,6 +1569,66 @@ primary = 100
 [routing.reviewer.5]
 primary = 100
 "#;
+
+    #[test]
+    fn resource_monitor_defaults_and_custom_values_validate() {
+        let defaults = resolve_resource_monitor_config(&ServeFileConfig::default()).unwrap();
+        assert_eq!(
+            defaults,
+            crate::resource_health::ResourceMonitorConfig::default()
+        );
+
+        let custom: ServeFileConfig = toml::from_str(
+            "resource_poll_secs = 45\ndisk_warn_free_gib = 120\ndisk_critical_free_gib = 60\nmemory_warn_available_pct = 20\nmemory_critical_available_pct = 10\n",
+        )
+        .unwrap();
+        let custom = resolve_resource_monitor_config(&custom).unwrap();
+        assert_eq!(custom.poll_secs, 45);
+        assert_eq!(custom.disk_warn_free_gib, 120);
+        assert_eq!(custom.memory_critical_available_pct, 10);
+    }
+
+    #[test]
+    fn resource_monitor_rejects_bad_interval_and_threshold_ordering() {
+        for (source, expected) in [
+            ("resource_poll_secs = 4\n", "resource_poll_secs"),
+            (
+                "disk_warn_free_gib = 40\ndisk_critical_free_gib = 40\n",
+                "disk_critical_free_gib",
+            ),
+            (
+                "memory_warn_available_pct = 8\nmemory_critical_available_pct = 15\n",
+                "memory_critical_available_pct",
+            ),
+            (
+                "memory_warn_available_pct = 101\nmemory_critical_available_pct = 8\n",
+                "warning must be at most 100",
+            ),
+        ] {
+            let file: ServeFileConfig = toml::from_str(source).unwrap();
+            let error = resolve_resource_monitor_config(&file).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn status_resource_config_reads_worktree_path_without_routing_requirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(
+            &path,
+            "worktree_base = \"/tmp/quorum-worktrees\"\nresource_poll_secs = 60\n",
+        )
+        .unwrap();
+
+        let status = status_resource_config_at(&path).unwrap();
+        assert_eq!(status.monitor.poll_secs, 60);
+        assert_eq!(
+            status.worktree_base,
+            Some(std::path::PathBuf::from("/tmp/quorum-worktrees"))
+        );
+    }
 
     #[test]
     fn load_missing_implicit_returns_defaults() {
@@ -2483,6 +2668,26 @@ worktree_base = "/tmp/wt"
             },
             doctor_enabled: &Sourced {
                 value: false,
+                source: Source::Default,
+            },
+            resource_poll_secs: &Sourced {
+                value: crate::resource_health::DEFAULT_RESOURCE_POLL_SECS,
+                source: Source::Default,
+            },
+            disk_warn_free_gib: &Sourced {
+                value: crate::resource_health::DEFAULT_DISK_WARN_FREE_GIB,
+                source: Source::Default,
+            },
+            disk_critical_free_gib: &Sourced {
+                value: crate::resource_health::DEFAULT_DISK_CRITICAL_FREE_GIB,
+                source: Source::Default,
+            },
+            memory_warn_available_pct: &Sourced {
+                value: crate::resource_health::DEFAULT_MEMORY_WARN_AVAILABLE_PCT,
+                source: Source::Default,
+            },
+            memory_critical_available_pct: &Sourced {
+                value: crate::resource_health::DEFAULT_MEMORY_CRITICAL_AVAILABLE_PCT,
                 source: Source::Default,
             },
         });

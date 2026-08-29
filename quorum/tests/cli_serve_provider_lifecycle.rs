@@ -533,6 +533,7 @@ impl Case {
                 task_id: 1,
                 cx_est: 2,
                 size: "S".into(),
+                size_reason: "bounded test classification rationale".into(),
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: Vec::new(),

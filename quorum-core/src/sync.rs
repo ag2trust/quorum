@@ -690,6 +690,7 @@ fn next_task_view(
     // `tasks::claim` uses, so a tier-matched, non-self-review, non-sticky-to-other
     // task surfaces instead of the unclaimable head. Tier gate stays exact-`==` per
     // owner — do NOT widen to `>=`.
+    use crate::tasks::SIZE_DISPATCH_POLICY_SQL;
     const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
         SELECT 1 FROM json_each(depends_on) je
         WHERE NOT EXISTS (
@@ -703,10 +704,10 @@ fn next_task_view(
            AND json_type(refs, '$.cx_est')='integer'
            AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
            AND json_type(refs, '$.cx_size')='text'
-           AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+           AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
+           AND {SIZE_DISPATCH_POLICY_SQL}
            AND json_type(refs, '$.cx_ready')='true'
            AND json_type(refs, '$.cx_not_ready_reason')='null'
-           AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
            AND {DEP_READY_CLAUSE}"
     );
     if !match_labels.is_empty() {
@@ -993,6 +994,29 @@ mod tests {
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(nxt.id, high, "highest priority wins");
         assert_eq!(nxt.priority, 10);
+    }
+
+    #[test]
+    fn snapshot_next_task_uses_the_shared_size_policy() {
+        let (_d, mut c) = open_tmp();
+        let too_complex = make_task(&mut c, "large complex", 10, None, 100);
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.cx_size','L','$.cx_est',4) WHERE id=?1",
+            [too_complex],
+        )
+        .unwrap();
+        let simple_large = make_task(&mut c, "large simple", 5, None, 100);
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.cx_size','L','$.cx_est',3) WHERE id=?1",
+            [simple_large],
+        )
+        .unwrap();
+        let snap = gather(&c, "A", &[], 200).unwrap();
+        let nxt = snap.next_task.as_ref().expect("next_task present");
+        assert_eq!(
+            nxt.id, simple_large,
+            "L at complexity 4 is outside dispatch policy"
+        );
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! Immutable responsibility-scoped provider-route attempt evidence.
 //!
-//! This module records evidence only. It does not select or launch routes and
-//! does not mutate role assignments, routing allocation, or task lifecycle.
+//! This module records evidence and derives read-only alternate-route choices.
+//! It never launches routes or mutates role assignments, routing allocation, or
+//! task lifecycle.
 
 use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
-use crate::role_assignments::{ModelProfile, RoleAssignment, ValidatedPool};
+use crate::role_assignments::{AssignmentIdentity, ModelProfile, RoleAssignment, ValidatedPool};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::BTreeSet;
 
@@ -102,6 +103,75 @@ impl RecordOutcome {
 pub struct RouteExclusions {
     providers: BTreeSet<String>,
     profiles: BTreeSet<String>,
+}
+
+/// Read-only result of selecting an alternate route from an immutable pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlternateRoute {
+    Selected(ModelProfile),
+    Exhausted,
+    MismatchedGeneration,
+}
+
+/// All immutable evidence needed to validate one alternate-route attribution.
+///
+/// The caller supplies the exact role assignment, one persisted classified
+/// routing attempt, and the identity of the run it intends to attribute. This
+/// primitive only validates them; it never writes a run or capability.
+#[derive(Debug, Clone, Copy)]
+pub struct FallbackAttributionInput<'a> {
+    pub assignment: &'a RoleAssignment,
+    pub identity: AssignmentIdentity<'a>,
+    pub eligible_pool: &'a ValidatedPool,
+    pub attempt: &'a RoutingAttempt,
+    pub exclusions: &'a RouteExclusions,
+    pub selected_profile: &'a ModelProfile,
+}
+
+/// Opaque, bounded authority to attribute one validated fallback route.
+///
+/// It can only be constructed by [`validate_fallback_attribution`]. A future
+/// run writer can use its accessors without accepting arbitrary profile or
+/// lifecycle tuples from a caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedFallbackAttribution {
+    assignment_id: i64,
+    task_id: Option<i64>,
+    responsibility_key: String,
+    role: String,
+    pr_number: Option<i64>,
+    review_stage: Option<String>,
+    profile: ModelProfile,
+}
+
+impl ValidatedFallbackAttribution {
+    pub fn assignment_id(&self) -> i64 {
+        self.assignment_id
+    }
+
+    pub fn task_id(&self) -> Option<i64> {
+        self.task_id
+    }
+
+    pub fn responsibility_key(&self) -> &str {
+        &self.responsibility_key
+    }
+
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    pub fn pr_number(&self) -> Option<i64> {
+        self.pr_number
+    }
+
+    pub fn review_stage(&self) -> Option<&str> {
+        self.review_stage.as_deref()
+    }
+
+    pub fn profile(&self) -> &ModelProfile {
+        &self.profile
+    }
 }
 
 impl RouteExclusions {
@@ -221,6 +291,99 @@ pub fn exclusions(conn: &Connection, responsibility_key: &str) -> Result<RouteEx
     Ok(result)
 }
 
+/// Select the highest-priority executable profile from an assignment's exact pool generation.
+///
+/// This pure primitive never records an attempt, advances the weighted allocation cursor, or
+/// mutates the assignment. Exclusions are the caller's persisted, responsibility-scoped
+/// evidence from [`exclusions`]. All positive-weight profiles remain eligible candidates;
+/// percentage only orders them, descending with profile ID as the stable tie-breaker.
+pub fn select_alternate(
+    assignment: &RoleAssignment,
+    eligible_pool: &ValidatedPool,
+    excluded: &RouteExclusions,
+) -> Result<AlternateRoute> {
+    eligible_pool.validate()?;
+    if !assignment.matches_pool_generation(eligible_pool) {
+        return Ok(AlternateRoute::MismatchedGeneration);
+    }
+    if !pool_contains_exact(eligible_pool, &assignment.profile_snapshot()) {
+        return Err(QuorumError::Io(
+            "routing pool does not contain the assigned profile snapshot".into(),
+        ));
+    }
+
+    let mut candidates: Vec<_> = eligible_pool
+        .profiles
+        .iter()
+        .filter(|weighted| !excluded.excludes(&weighted.profile))
+        .collect();
+    candidates.sort_by(|left, right| {
+        right
+            .percent
+            .cmp(&left.percent)
+            .then_with(|| left.profile.id.cmp(&right.profile.id))
+    });
+    Ok(candidates
+        .first()
+        .map(|weighted| AlternateRoute::Selected(weighted.profile.clone()))
+        .unwrap_or(AlternateRoute::Exhausted))
+}
+
+/// Validate one deterministically selected fallback route for later durable
+/// attribution.
+///
+/// `None` is the clean, fail-closed outcome for stale, cross-responsibility,
+/// excluded, non-selected, or otherwise insufficient immutable evidence. An
+/// invalid pool or identity is bad input and returns [`QuorumError::Usage`].
+/// The returned token is bounded by the validated pool and assignment snapshot;
+/// this function has no database access and mutates no assignment, cursor, run,
+/// or capability state.
+pub fn validate_fallback_attribution(
+    input: &FallbackAttributionInput<'_>,
+) -> Result<Option<ValidatedFallbackAttribution>> {
+    input.eligible_pool.validate()?;
+    input.identity.validate()?;
+
+    let assignment = input.assignment;
+    let attempt = input.attempt;
+    if assignment.id <= 0
+        || !assignment.matches_identity(&input.identity)
+        || !assignment.matches_pool_generation(input.eligible_pool)
+        || !pool_contains_exact(input.eligible_pool, &assignment.profile_snapshot())
+        || attempt.id <= 0
+        || attempt.role_assignment_id != assignment.id
+        || attempt.responsibility_key != assignment.responsibility_key
+        || attempt.pool_key != assignment.pool_key
+        || attempt.policy_generation != assignment.policy_generation
+        || !pool_contains_exact(input.eligible_pool, &attempt.profile)
+        || !matches!(
+            attempt.failure_disposition,
+            Some(FailureDisposition::ProviderUnavailable | FailureDisposition::ProfileUnavailable)
+        )
+        || !input.exclusions.excludes(&attempt.profile)
+        || input.exclusions.excludes(input.selected_profile)
+    {
+        return Ok(None);
+    }
+
+    match select_alternate(assignment, input.eligible_pool, input.exclusions)? {
+        AlternateRoute::Selected(profile) if profile == *input.selected_profile => {
+            Ok(Some(ValidatedFallbackAttribution {
+                assignment_id: assignment.id,
+                task_id: assignment.task_id,
+                responsibility_key: assignment.responsibility_key.clone(),
+                role: assignment.role.clone(),
+                pr_number: assignment.pr_number,
+                review_stage: assignment.review_stage.clone(),
+                profile,
+            }))
+        }
+        AlternateRoute::Selected(_)
+        | AlternateRoute::Exhausted
+        | AlternateRoute::MismatchedGeneration => Ok(None),
+    }
+}
+
 fn validate_assignment(
     assignment: &RoleAssignment,
     input: &RecordRoutingAttempt<'_>,
@@ -235,13 +398,7 @@ fn validate_assignment(
         ));
     }
 
-    let assigned = ModelProfile {
-        id: assignment.profile_id.clone(),
-        provider: assignment.provider.clone(),
-        runner: assignment.runner.clone(),
-        model: assignment.model.clone(),
-        effort: assignment.effort.clone(),
-    };
+    let assigned = assignment.profile_snapshot();
     if !pool_contains_exact(pool, &assigned) {
         return Err(QuorumError::Io(
             "routing pool does not contain the assigned profile snapshot".into(),
@@ -379,6 +536,35 @@ mod tests {
         }
     }
 
+    fn two_profile_pool(first_percent: u8, first_id: &str, second_id: &str) -> ValidatedPool {
+        ValidatedPool {
+            pool_key: "worker.M".into(),
+            policy_generation: "generation-1".into(),
+            profiles: vec![
+                crate::role_assignments::WeightedProfile {
+                    profile: ModelProfile {
+                        id: first_id.into(),
+                        provider: "claude".into(),
+                        runner: "claude".into(),
+                        model: format!("{first_id}-model"),
+                        effort: "high".into(),
+                    },
+                    percent: first_percent,
+                },
+                crate::role_assignments::WeightedProfile {
+                    profile: ModelProfile {
+                        id: second_id.into(),
+                        provider: "codex".into(),
+                        runner: "codex".into(),
+                        model: format!("{second_id}-model"),
+                        effort: "high".into(),
+                    },
+                    percent: 100 - first_percent,
+                },
+            ],
+        }
+    }
+
     fn insert_assignment(conn: &Connection, id: i64, responsibility: &str, task_id: i64) {
         conn.execute(
             "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
@@ -393,6 +579,42 @@ mod tests {
              VALUES (?1,?2,?3,'worker','M','opus','claude','claude',
                      'claude-opus-4-8','high','worker.M','generation-1',1)",
             params![id, responsibility, task_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_assignment_for_pool(
+        conn: &Connection,
+        id: i64,
+        responsibility: &str,
+        task_id: i64,
+        pool: &ValidatedPool,
+        profile_index: usize,
+    ) {
+        let profile = &pool.profiles[profile_index].profile;
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+             VALUES (?1,'routing fixture','working','test',1,1)",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,complexity,profile_id,provider,runner,
+                 model,effort,pool_key,policy_generation,created_at)
+             VALUES (?1,?2,?3,'worker','M',?4,?5,?6,?7,?8,?9,?10,1)",
+            params![
+                id,
+                responsibility,
+                task_id,
+                profile.id,
+                profile.provider,
+                profile.runner,
+                profile.model,
+                profile.effort,
+                pool.pool_key,
+                pool.policy_generation,
+            ],
         )
         .unwrap();
     }
@@ -466,6 +688,525 @@ mod tests {
         assert!(profile.excludes(&pool.profiles[0].profile));
         assert!(!profile.excludes(&pool.profiles[1].profile));
         assert!(!profile.excludes(&pool.profiles[2].profile));
+    }
+
+    #[test]
+    fn alternate_selection_prioritizes_every_positive_weight_without_allocation_mutation() {
+        for (first_percent, expected_initial) in [(99, "primary"), (1, "alternate")] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut conn = crate::db::open(&dir.path().join("selection.db")).unwrap();
+            let pool = two_profile_pool(first_percent, "primary", "alternate");
+            insert_assignment_for_pool(&conn, 1, "worker:task:1", 1, &pool, 0);
+            let assignment = crate::role_assignments::get(&conn, 1).unwrap().unwrap();
+            let cursor_count: i64 = conn
+                .query_row("SELECT count(*) FROM routing_cursors", [], |row| row.get(0))
+                .unwrap();
+
+            assert_eq!(
+                select_alternate(&assignment, &pool, &RouteExclusions::default()).unwrap(),
+                AlternateRoute::Selected(
+                    pool.profiles
+                        .iter()
+                        .find(|entry| entry.profile.id == expected_initial)
+                        .unwrap()
+                        .profile
+                        .clone()
+                )
+            );
+
+            record_profile(
+                &mut conn,
+                1,
+                "worker:task:1",
+                &pool,
+                0,
+                Some(FailureDisposition::ProfileUnavailable),
+                10,
+            )
+            .unwrap();
+            assert_eq!(
+                select_alternate(
+                    &assignment,
+                    &pool,
+                    &exclusions(&conn, "worker:task:1").unwrap()
+                )
+                .unwrap(),
+                AlternateRoute::Selected(pool.profiles[1].profile.clone()),
+                "a positive one-percent profile remains a fallback candidate"
+            );
+            assert_eq!(
+                crate::role_assignments::get(&conn, 1).unwrap(),
+                Some(assignment)
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM routing_cursors", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                cursor_count
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_attribution_requires_exact_selected_immutable_evidence_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("attribution.db")).unwrap();
+        let pool = pool();
+        insert_assignment_for_pool(&conn, 1, "worker:task:1", 1, &pool, 0);
+        let assignment = crate::role_assignments::get(&conn, 1).unwrap().unwrap();
+        let attempt = record_profile(
+            &mut conn,
+            assignment.id,
+            &assignment.responsibility_key,
+            &pool,
+            0,
+            Some(FailureDisposition::ProfileUnavailable),
+            10,
+        )
+        .unwrap()
+        .attempt()
+        .clone();
+        let excluded = exclusions(&conn, &assignment.responsibility_key).unwrap();
+        let selected = match select_alternate(&assignment, &pool, &excluded).unwrap() {
+            AlternateRoute::Selected(profile) => profile,
+            other => panic!("expected selected alternate, got {other:?}"),
+        };
+        let before_assignment = crate::role_assignments::get(&conn, assignment.id).unwrap();
+        let before_cursor: i64 = conn
+            .query_row("SELECT count(*) FROM routing_cursors", [], |row| row.get(0))
+            .unwrap();
+        let before_runs: i64 = conn
+            .query_row("SELECT count(*) FROM agent_runs", [], |row| row.get(0))
+            .unwrap();
+        let before_capabilities: i64 = conn
+            .query_row("SELECT count(*) FROM run_capabilities", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        let token = validate_fallback_attribution(&FallbackAttributionInput {
+            assignment: &assignment,
+            identity: AssignmentIdentity {
+                task_id: Some(1),
+                responsibility_key: "worker:task:1",
+                role: "worker",
+                pr_number: None,
+                review_stage: None,
+            },
+            eligible_pool: &pool,
+            attempt: &attempt,
+            exclusions: &excluded,
+            selected_profile: &selected,
+        })
+        .unwrap()
+        .expect("exact fallback evidence must issue a token");
+        assert_eq!(token.assignment_id(), assignment.id);
+        assert_eq!(token.task_id(), Some(1));
+        assert_eq!(token.responsibility_key(), "worker:task:1");
+        assert_eq!(token.role(), "worker");
+        assert_eq!(token.pr_number(), None);
+        assert_eq!(token.review_stage(), None);
+        assert_eq!(token.profile(), &selected);
+        assert_eq!(
+            crate::role_assignments::get(&conn, assignment.id).unwrap(),
+            before_assignment
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM routing_cursors", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            before_cursor
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM agent_runs", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            before_runs
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM run_capabilities", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            before_capabilities
+        );
+    }
+
+    #[test]
+    fn fallback_attribution_fails_closed_for_non_members_stale_or_cross_identity_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("attribution-negative.db")).unwrap();
+        let pool = pool();
+        insert_assignment_for_pool(&conn, 1, "worker:task:1", 1, &pool, 0);
+        let assignment = crate::role_assignments::get(&conn, 1).unwrap().unwrap();
+        let attempt = record_profile(
+            &mut conn,
+            1,
+            "worker:task:1",
+            &pool,
+            0,
+            Some(FailureDisposition::ProfileUnavailable),
+            10,
+        )
+        .unwrap()
+        .attempt()
+        .clone();
+        let excluded = exclusions(&conn, "worker:task:1").unwrap();
+        let selected = match select_alternate(&assignment, &pool, &excluded).unwrap() {
+            AlternateRoute::Selected(profile) => profile,
+            other => panic!("expected selected alternate, got {other:?}"),
+        };
+        let base = FallbackAttributionInput {
+            assignment: &assignment,
+            identity: AssignmentIdentity {
+                task_id: Some(1),
+                responsibility_key: "worker:task:1",
+                role: "worker",
+                pr_number: None,
+                review_stage: None,
+            },
+            eligible_pool: &pool,
+            attempt: &attempt,
+            exclusions: &excluded,
+            selected_profile: &selected,
+        };
+        assert!(validate_fallback_attribution(&base).unwrap().is_some());
+
+        let non_member = ModelProfile {
+            id: "arbitrary".into(),
+            provider: "codex".into(),
+            runner: "codex".into(),
+            model: "arbitrary-model".into(),
+            effort: "high".into(),
+        };
+        assert!(validate_fallback_attribution(&FallbackAttributionInput {
+            selected_profile: &non_member,
+            ..base
+        })
+        .unwrap()
+        .is_none());
+
+        assert!(validate_fallback_attribution(&FallbackAttributionInput {
+            selected_profile: &attempt.profile,
+            ..base
+        })
+        .unwrap()
+        .is_none());
+
+        let not_selected = pool
+            .profiles
+            .iter()
+            .map(|weighted| &weighted.profile)
+            .find(|profile| **profile != selected && !excluded.excludes(profile))
+            .unwrap();
+        assert!(validate_fallback_attribution(&FallbackAttributionInput {
+            selected_profile: not_selected,
+            ..base
+        })
+        .unwrap()
+        .is_none());
+
+        let stale = ValidatedPool {
+            policy_generation: "generation-2".into(),
+            ..pool.clone()
+        };
+        assert!(validate_fallback_attribution(&FallbackAttributionInput {
+            eligible_pool: &stale,
+            ..base
+        })
+        .unwrap()
+        .is_none());
+
+        for identity in [
+            AssignmentIdentity {
+                task_id: Some(2),
+                ..base.identity
+            },
+            AssignmentIdentity {
+                responsibility_key: "worker:task:2",
+                ..base.identity
+            },
+            AssignmentIdentity {
+                role: "planner",
+                ..base.identity
+            },
+            AssignmentIdentity {
+                pr_number: Some(7),
+                ..base.identity
+            },
+        ] {
+            assert!(
+                validate_fallback_attribution(&FallbackAttributionInput { identity, ..base })
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let mut cross_responsibility = attempt.clone();
+        cross_responsibility.responsibility_key = "worker:task:2".into();
+        assert!(validate_fallback_attribution(&FallbackAttributionInput {
+            attempt: &cross_responsibility,
+            ..base
+        })
+        .unwrap()
+        .is_none());
+
+        let zero_weight = ValidatedPool {
+            profiles: vec![
+                crate::role_assignments::WeightedProfile {
+                    percent: 100,
+                    ..pool.profiles[0].clone()
+                },
+                crate::role_assignments::WeightedProfile {
+                    percent: 0,
+                    ..pool.profiles[1].clone()
+                },
+            ],
+            ..pool.clone()
+        };
+        assert!(matches!(
+            validate_fallback_attribution(&FallbackAttributionInput {
+                eligible_pool: &zero_weight,
+                ..base
+            }),
+            Err(QuorumError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn fallback_attribution_preserves_reviewer_pr_and_stage_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("reviewer-attribution.db")).unwrap();
+        let pool = ValidatedPool {
+            pool_key: "reviewer.M.r1".into(),
+            ..pool()
+        };
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+             VALUES (1,'routing fixture','working','test',1,1)",
+            [],
+        )
+        .unwrap();
+        let profile = &pool.profiles[0].profile;
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                 profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (1,'reviewer:task:1:pr:9:r1',1,9,'reviewer','r1','M',
+                     ?1,?2,?3,?4,?5,?6,?7,1)",
+            params![
+                profile.id,
+                profile.provider,
+                profile.runner,
+                profile.model,
+                profile.effort,
+                pool.pool_key,
+                pool.policy_generation,
+            ],
+        )
+        .unwrap();
+        let assignment = crate::role_assignments::get(&conn, 1).unwrap().unwrap();
+        let attempt = record_profile(
+            &mut conn,
+            1,
+            &assignment.responsibility_key,
+            &pool,
+            0,
+            Some(FailureDisposition::ProfileUnavailable),
+            10,
+        )
+        .unwrap()
+        .attempt()
+        .clone();
+        let excluded = exclusions(&conn, &assignment.responsibility_key).unwrap();
+        let selected = match select_alternate(&assignment, &pool, &excluded).unwrap() {
+            AlternateRoute::Selected(profile) => profile,
+            other => panic!("expected selected alternate, got {other:?}"),
+        };
+        let input = FallbackAttributionInput {
+            assignment: &assignment,
+            identity: AssignmentIdentity {
+                task_id: Some(1),
+                responsibility_key: &assignment.responsibility_key,
+                role: "reviewer",
+                pr_number: Some(9),
+                review_stage: Some("r1"),
+            },
+            eligible_pool: &pool,
+            attempt: &attempt,
+            exclusions: &excluded,
+            selected_profile: &selected,
+        };
+        assert!(validate_fallback_attribution(&input).unwrap().is_some());
+        assert!(validate_fallback_attribution(&FallbackAttributionInput {
+            identity: AssignmentIdentity {
+                review_stage: Some("r2"),
+                ..input.identity
+            },
+            ..input
+        })
+        .unwrap()
+        .is_none());
+        assert!(validate_fallback_attribution(&FallbackAttributionInput {
+            identity: AssignmentIdentity {
+                pr_number: Some(10),
+                ..input.identity
+            },
+            ..input
+        })
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn alternate_selection_uses_stable_profile_id_ties_and_exhaustion() {
+        let pool = two_profile_pool(50, "zeta", "alpha");
+        let assignment = RoleAssignment {
+            id: 1,
+            responsibility_key: "worker:task:1".into(),
+            task_id: Some(1),
+            pr_number: None,
+            role: "worker".into(),
+            review_stage: None,
+            complexity: Some("M".into()),
+            profile_id: "zeta".into(),
+            provider: "claude".into(),
+            runner: "claude".into(),
+            model: "zeta-model".into(),
+            effort: "high".into(),
+            pool_key: pool.pool_key.clone(),
+            policy_generation: pool.policy_generation.clone(),
+            created_at: 1,
+        };
+        assert_eq!(
+            select_alternate(&assignment, &pool, &RouteExclusions::default()).unwrap(),
+            AlternateRoute::Selected(pool.profiles[1].profile.clone())
+        );
+
+        let excluded = RouteExclusions {
+            providers: BTreeSet::from(["claude".into(), "codex".into()]),
+            profiles: BTreeSet::new(),
+        };
+        assert_eq!(
+            select_alternate(&assignment, &pool, &excluded).unwrap(),
+            AlternateRoute::Exhausted
+        );
+    }
+
+    #[test]
+    fn alternate_selection_applies_provider_and_profile_exclusions_and_fails_closed() {
+        let pool = ValidatedPool {
+            pool_key: "worker.M".into(),
+            policy_generation: "generation-1".into(),
+            profiles: vec![
+                crate::role_assignments::WeightedProfile {
+                    profile: ModelProfile {
+                        id: "opus".into(),
+                        provider: "claude".into(),
+                        runner: "claude".into(),
+                        model: "opus-model".into(),
+                        effort: "high".into(),
+                    },
+                    percent: 50,
+                },
+                crate::role_assignments::WeightedProfile {
+                    profile: ModelProfile {
+                        id: "sonnet".into(),
+                        provider: "claude".into(),
+                        runner: "claude".into(),
+                        model: "sonnet-model".into(),
+                        effort: "high".into(),
+                    },
+                    percent: 30,
+                },
+                crate::role_assignments::WeightedProfile {
+                    profile: ModelProfile {
+                        id: "sol".into(),
+                        provider: "codex".into(),
+                        runner: "codex".into(),
+                        model: "sol-model".into(),
+                        effort: "high".into(),
+                    },
+                    percent: 20,
+                },
+            ],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("exclusions.db")).unwrap();
+        insert_assignment_for_pool(&conn, 1, "worker:provider", 1, &pool, 0);
+        insert_assignment_for_pool(&conn, 2, "worker:profile", 2, &pool, 0);
+        let provider_assignment = crate::role_assignments::get(&conn, 1).unwrap().unwrap();
+        let profile_assignment = crate::role_assignments::get(&conn, 2).unwrap().unwrap();
+
+        record_profile(
+            &mut conn,
+            1,
+            "worker:provider",
+            &pool,
+            0,
+            Some(FailureDisposition::ProviderUnavailable),
+            10,
+        )
+        .unwrap();
+        record_profile(
+            &mut conn,
+            2,
+            "worker:profile",
+            &pool,
+            0,
+            Some(FailureDisposition::ProfileUnavailable),
+            11,
+        )
+        .unwrap();
+        assert_eq!(
+            select_alternate(
+                &provider_assignment,
+                &pool,
+                &exclusions(&conn, "worker:provider").unwrap()
+            )
+            .unwrap(),
+            AlternateRoute::Selected(pool.profiles[2].profile.clone())
+        );
+        assert_eq!(
+            select_alternate(
+                &profile_assignment,
+                &pool,
+                &exclusions(&conn, "worker:profile").unwrap()
+            )
+            .unwrap(),
+            AlternateRoute::Selected(pool.profiles[1].profile.clone())
+        );
+
+        let mismatched = ValidatedPool {
+            policy_generation: "generation-2".into(),
+            ..pool.clone()
+        };
+        assert_eq!(
+            select_alternate(
+                &provider_assignment,
+                &mismatched,
+                &RouteExclusions::default()
+            )
+            .unwrap(),
+            AlternateRoute::MismatchedGeneration
+        );
+
+        let invalid = ValidatedPool {
+            profiles: vec![
+                crate::role_assignments::WeightedProfile {
+                    percent: 100,
+                    ..pool.profiles[0].clone()
+                },
+                crate::role_assignments::WeightedProfile {
+                    percent: 0,
+                    ..pool.profiles[1].clone()
+                },
+            ],
+            ..pool.clone()
+        };
+        assert!(matches!(
+            select_alternate(&provider_assignment, &invalid, &RouteExclusions::default()),
+            Err(QuorumError::Usage(_))
+        ));
     }
 
     #[test]

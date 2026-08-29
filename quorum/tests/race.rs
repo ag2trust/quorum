@@ -40,6 +40,7 @@ fn n_threads_exactly_one_winner() {
                 task_id: 1,
                 cx_est: 3,
                 size: "M".into(),
+                size_reason: "bounded test classification rationale".into(),
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],

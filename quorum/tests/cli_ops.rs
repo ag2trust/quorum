@@ -135,6 +135,15 @@ fn status_json_includes_dashboard_fields() {
     );
     assert!(json.get("claim_ttls").is_some(), "claim_ttls field missing");
     assert!(json.get("throughput").is_some(), "throughput field missing");
+    let resources = json
+        .get("resources")
+        .and_then(serde_json::Value::as_object)
+        .expect("one-shot status must sample resources with no daemon running");
+    assert!(resources["sampled_at"].is_number());
+    assert!(resources["memory"]["available_bytes"].is_number());
+    assert!(resources["memory"]["swap_used_bytes"].is_number());
+    assert!(resources["disks"][0]["available_bytes"].is_number());
+    assert_eq!(resources["disks"][0]["targets"][0], "database");
     // Data: creator-owned labels do not assign a routing tier.
     let queue = json["queue_by_tier"].as_array().unwrap();
     assert!(
@@ -161,6 +170,7 @@ fn status_dashboard_handles_empty_db() {
         .stdout(predicates::str::contains("WORKING"))
         .stdout(predicates::str::contains("idle"))
         .stdout(predicates::str::contains("QUEUE"))
+        .stdout(predicates::str::contains("RESOURCES"))
         .stdout(predicates::str::contains("ERRORS"));
 }
 

@@ -3357,6 +3357,9 @@ pub struct ServeConfig {
     /// When true, the daemon spawns a one-shot doctor agent for tasks stalled
     /// with no active worker/reviewer. Default: false.
     pub doctor_enabled: bool,
+    /// Observational host memory/disk polling. It never throttles workers or
+    /// changes lifecycle state.
+    pub resource_monitor: crate::resource_health::ResourceMonitorConfig,
     /// Enable deterministic R2 sampling. False retains the mandatory R2 gate.
     pub r2_enabled: bool,
     /// Guaranteed R2 coverage per stratum before steady-state sampling.
@@ -4529,9 +4532,15 @@ struct DecompositionCoordinator {
     /// holds unrevoked `submit_plan` authority.
     planner_run_id: Option<String>,
     classifier_slot: Option<classifier::ClassifierSlot>,
-    /// Live Arbiter plan-review slot. The Arbiter gates a structurally valid
-    /// proposal (state `validating`) before it advances to `preclassifying`;
-    /// it is mutually exclusive with the planner and classifier slots.
+    /// The classifier batch durably accepted for `proposal`. Present only once
+    /// the graph has reached `validating`; materialization consumes exactly
+    /// this batch, so the Arbiter never reviews one classification while the
+    /// daemon materializes another.
+    classifications: Option<Vec<quorum_core::classify::TaskClassification>>,
+    /// Live Arbiter plan-review slot. The Arbiter gates a classified proposal
+    /// (state `validating`, entered from `preclassifying`) before
+    /// materialization; it is mutually exclusive with the planner and
+    /// classifier slots.
     arbiter_slot: Option<arbiter::ArbiterSlot>,
     arbiter_source_task_id: Option<i64>,
     planner_view: Option<tempfile::TempDir>,
@@ -4654,6 +4663,10 @@ struct PlanningSnapshot {
     dependencies: Vec<i64>,
     rejection_summaries: Vec<String>,
     accepted_proposal: Option<Vec<planner::ProposedTask>>,
+    /// The classifier batch durably accepted for `accepted_proposal`. Present
+    /// only once the graph has left `preclassifying`; the Arbiter phase and
+    /// materialization consume exactly this batch.
+    accepted_classifications: Option<Vec<quorum_core::classify::TaskClassification>>,
     frozen_base_sha: String,
 }
 
@@ -4708,6 +4721,7 @@ type PlanningSnapshotRow = (
     Option<String>,
     Option<String>,
     i64,
+    Option<String>,
 );
 
 fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<PlanningSnapshot>> {
@@ -4724,7 +4738,8 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
                          THEN t.body ELSE NULL END,
                     t.depends_on,d.accepted_proposal_json,d.frozen_base_sha,
                     length(CAST(t.title AS BLOB)) +
-                        COALESCE(length(CAST(t.body AS BLOB)),0)
+                        COALESCE(length(CAST(t.body AS BLOB)),0),
+                    d.accepted_classifications_json
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
              WHERE d.state NOT IN ('held','active','blocked','completed','cancelled')
              ORDER BY d.freeze_active DESC,d.id LIMIT 1",
@@ -4744,6 +4759,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
                     row.get(10)?,
                     row.get(11)?,
                     row.get(12)?,
+                    row.get(13)?,
                 ))
             },
         )
@@ -4762,6 +4778,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         accepted_proposal_json,
         frozen_base_sha,
         source_bytes,
+        accepted_classifications_json,
     )) = row
     else {
         return Ok(None);
@@ -4778,6 +4795,13 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         .map(|json| planner::rehydrate_accepted_proposal(&json))
         .transpose()
         .map_err(|error| QuorumError::Io(format!("invalid durable accepted proposal: {error}")))?;
+    let accepted_classifications = accepted_proposal.as_deref().and_then(|proposal| {
+        rehydrate_accepted_classifications(
+            graph_id,
+            proposal,
+            accepted_classifications_json.as_deref(),
+        )
+    });
     let mut statement = conn.prepare(
         "SELECT summary FROM decomposition_attempts
          WHERE graph_id=?1 AND kind='proposal' ORDER BY ordinal DESC LIMIT 3",
@@ -4799,8 +4823,41 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         dependencies,
         rejection_summaries,
         accepted_proposal,
+        accepted_classifications,
         frozen_base_sha: frozen_base_sha.unwrap_or_default(),
     }))
+}
+
+/// Rehydrate the durable classifier batch for an accepted proposal. A batch
+/// that fails to parse or no longer covers the proposal exactly is reported
+/// and treated as absent: the tick then steps the graph back from
+/// `validating` to `preclassifying` so the classifier runs again before any
+/// Arbiter spawn. That is loud, bounded, and never a silent approval; the
+/// alternative (erroring every tick) would leave the graph stuck forever.
+fn rehydrate_accepted_classifications(
+    graph_id: i64,
+    proposal: &[planner::ProposedTask],
+    raw: Option<&str>,
+) -> Option<Vec<quorum_core::classify::TaskClassification>> {
+    let raw = raw?;
+    // Positional ids, matching `proposed_classifier_tasks`: child i is -(i+1).
+    let expected: Vec<i64> = (0..proposal.len()).map(|i| -(i as i64) - 1).collect();
+    let parsed = serde_json::from_str::<Vec<quorum_core::classify::TaskClassification>>(raw)
+        .map_err(|error| error.to_string())
+        .and_then(|batch| {
+            quorum_core::classify::validate_batch(&batch, &expected)?;
+            Ok(batch)
+        });
+    match parsed {
+        Ok(batch) => Some(batch),
+        Err(error) => {
+            log(&format!(
+                "graph {graph_id}: durable accepted classification is unusable ({error}); \
+                 the proposal is classified again before the Arbiter runs"
+            ));
+            None
+        }
+    }
 }
 
 fn bounded_planning_prompt(snapshot: &PlanningSnapshot) -> std::result::Result<String, String> {
@@ -4899,6 +4956,7 @@ async fn reconcile_decomposition_startup(
         coordinator.graph_id = Some(snapshot.graph_id);
         coordinator.classifier_source_task_id = Some(snapshot.source_task_id);
         coordinator.proposal = snapshot.accepted_proposal;
+        coordinator.classifications = snapshot.accepted_classifications;
     }
     Ok(state)
 }
@@ -5467,6 +5525,7 @@ async fn discard_removed_decomposition(
     reap_decomposition_classifier_with_usage(db_path, coordinator).await;
     coordinator.planner_view = None;
     coordinator.proposal = None;
+    coordinator.classifications = None;
     if let Some(graph_id) = graph_id {
         // Both deletes are idempotent. Always attempt both: if a prior tick
         // killed a slot but lost the DB write, the retained graph identity lets
@@ -5489,17 +5548,40 @@ fn truncate_utf8_bytes(value: &str, limit: usize) -> &str {
     &value[..end]
 }
 
-const DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES: usize = 2048;
+const DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES;
 const MAX_PLANNED_CHILD_KEY_BYTES: usize = 64;
-const CHILD_REJECTION_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 2;
+const CHILD_REJECTION_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 4;
+// A classifier `size_reason` is already bounded at persistence, so the whole
+// rationale always reaches the planner.
+const CHILD_REJECTION_SIZE_REASON_MAX_BYTES: usize = quorum_core::classify::MAX_SIZE_REASON_BYTES;
 const CHILD_REJECTION_PREFIX_MAX_BYTES: usize =
     "child ".len() + MAX_PLANNED_CHILD_KEY_BYTES + " rejected by preclassification: ".len();
 const CHILD_REJECTION_READY_WRAPPER_BYTES: usize =
     "ready=false (not_ready_reason: ".len() + ")".len();
-const CHILD_REJECTION_SIZE_MAX_BYTES: usize = "size=".len() + "XL".len();
+const CHILD_REJECTION_SIZE_MAX_BYTES: usize = "size=".len()
+    + "XL".len()
+    + " cx_est=".len()
+    + "5".len()
+    + " (size_reason: ".len()
+    + CHILD_REJECTION_SIZE_REASON_MAX_BYTES
+    + ")".len();
 const CHILD_REJECTION_DUPLICATE_LABEL_BYTES: usize = "duplicate_of=".len();
 const CHILD_REJECTION_SEPARATORS_MAX_BYTES: usize = 2 * "; ".len();
-const CHILD_REJECTION_CONTEXT_MAX_BYTES: usize = 272;
+// The rejected child's own delta and paths are the planner's correction
+// anchor: keep them wide enough that a realistic child contract survives.
+const CHILD_REJECTION_DELTA_MAX_BYTES: usize = PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES;
+const CHILD_REJECTION_PATHS_MAX_BYTES: usize = 512;
+const CHILD_REJECTION_CONTEXT_MAX_BYTES: usize = "; rejected_delta=".len()
+    + CHILD_REJECTION_DELTA_MAX_BYTES
+    + "; affected_paths=[".len()
+    + CHILD_REJECTION_PATHS_MAX_BYTES
+    + "]".len();
+/// Per-field byte bound applied to planner-written child fields before they
+/// are assembled into the classifier body. The classifier's
+/// `PLANNED_CHILD_BODY_CHAR_LIMIT` envelope is derived from this bound, so a
+/// body built here is never cut by the whole-body truncation.
+const PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES: usize =
+    quorum_core::classify::PLANNED_CHILD_FIELD_MAX_BYTES;
 // Keep the complete combined rejection within the planner retry-feedback
 // consumer's bound. Reserve fixed space for every dimension, then divide the
 // variable space between the readiness reason and duplicate task IDs.
@@ -5614,6 +5696,17 @@ fn child_preclassification_rejection(
     task: &planner::ProposedTask,
     result: &quorum_core::classify::TaskClassification,
 ) -> Option<String> {
+    let detail = child_preclassification_rejection_detail(task, result)?;
+    Some(bounded_with_ellipsis(
+        &format!("child {} rejected by preclassification: {detail}", task.key),
+        planner::MAX_REJECTION_SUMMARY_BYTES,
+    ))
+}
+
+fn child_preclassification_rejection_detail(
+    task: &planner::ProposedTask,
+    result: &quorum_core::classify::TaskClassification,
+) -> Option<String> {
     let mut failed_dimensions = Vec::new();
     if !result.ready {
         let reason = bounded_with_ellipsis(
@@ -5625,13 +5718,21 @@ fn child_preclassification_rejection(
         );
         failed_dimensions.push(format!("ready=false (not_ready_reason: {reason})"));
     }
-    if !matches!(result.size.as_str(), "S" | "M") {
-        failed_dimensions.push(format!("size={}", result.size));
+    let rejected_size = child_size_is_rejected(result);
+    if rejected_size {
+        let reason = bounded_with_ellipsis(
+            result.size_reason.trim(),
+            CHILD_REJECTION_SIZE_REASON_MAX_BYTES,
+        );
+        failed_dimensions.push(format!(
+            "size={} cx_est={} (size_reason: {reason})",
+            result.size, result.cx_est
+        ));
     }
+    let include_context =
+        rejected_size && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty());
     if !result.duplicate_of.is_empty() {
-        let duplicate_limit = if !matches!(result.size.as_str(), "S" | "M")
-            && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty())
-        {
+        let duplicate_limit = if include_context {
             CHILD_REJECTION_DUPLICATES_MAX_BYTES.saturating_sub(CHILD_REJECTION_CONTEXT_MAX_BYTES)
         } else {
             CHILD_REJECTION_DUPLICATES_MAX_BYTES
@@ -5644,24 +5745,151 @@ fn child_preclassification_rejection(
     if failed_dimensions.is_empty() {
         return None;
     }
-    let mut summary = format!(
-        "child {} rejected by preclassification: {}",
-        task.key,
-        failed_dimensions.join("; ")
-    );
-    if !matches!(result.size.as_str(), "S" | "M")
-        && (!task.implementation_delta.is_empty() || !task.affected_paths.is_empty())
-    {
-        let paths = bounded_with_ellipsis(&task.affected_paths.join(", "), 96);
-        let delta = bounded_with_ellipsis(&task.implementation_delta, 128);
-        summary.push_str(&format!(
+    let mut detail = failed_dimensions.join("; ");
+    if include_context {
+        let paths = bounded_with_ellipsis(
+            &task.affected_paths.join(", "),
+            CHILD_REJECTION_PATHS_MAX_BYTES,
+        );
+        let delta =
+            bounded_with_ellipsis(&task.implementation_delta, CHILD_REJECTION_DELTA_MAX_BYTES);
+        detail.push_str(&format!(
             "; rejected_delta={delta}; affected_paths=[{paths}]"
         ));
     }
-    Some(bounded_with_ellipsis(
-        &summary,
-        planner::MAX_REJECTION_SUMMARY_BYTES,
-    ))
+    Some(detail)
+}
+
+/// A planned child's size verdict is judged by the same implementation-size
+/// policy that dispatches root tasks, so a child the classifier calls `L` at
+/// complexity 3 or lower is accepted exactly as its root would be.
+fn child_size_is_rejected(result: &quorum_core::classify::TaskClassification) -> bool {
+    !quorum_core::tasks::size_is_dispatchable(&result.size, result.cx_est)
+}
+
+/// Preserve every verdict from one complete preclassification batch. Each
+/// child gets a deterministic share of the global planner-feedback bound so a
+/// long early rejection cannot hide later reviewed children.
+fn aggregate_child_preclassification_rejections(
+    classified: &[(
+        &planner::ProposedTask,
+        &quorum_core::classify::TaskClassification,
+    )],
+) -> Option<String> {
+    let rejections = classified
+        .iter()
+        .filter(|(task, result)| child_preclassification_rejection_detail(task, result).is_some())
+        .copied()
+        .collect::<Vec<_>>();
+    match rejections.as_slice() {
+        [] => None,
+        [(task, result)] => child_preclassification_rejection(task, result),
+        _ => {
+            const HEADER: &str = "preclassification rejected children:\n";
+            let separator_bytes = rejections.len() - 1;
+            let available =
+                planner::MAX_REJECTION_SUMMARY_BYTES.saturating_sub(HEADER.len() + separator_bytes);
+            let base_share = available / rejections.len();
+            let extra = available % rejections.len();
+            let mut summary = String::with_capacity(planner::MAX_REJECTION_SUMMARY_BYTES);
+            summary.push_str(HEADER);
+            for (index, (task, result)) in rejections.iter().enumerate() {
+                if index > 0 {
+                    summary.push('\n');
+                }
+                let share = base_share + usize::from(index < extra);
+                summary.push_str(&compact_child_preclassification_rejection(
+                    task, result, share,
+                ));
+            }
+            debug_assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
+            Some(summary)
+        }
+    }
+}
+
+/// Render one child inside its aggregate share while reserving space for every
+/// failed dimension before distributing the remaining bytes across the
+/// artifact-specific values. This prevents a long readiness reason from
+/// hiding the same child's size, duplication, or implementation context.
+fn compact_child_preclassification_rejection(
+    task: &planner::ProposedTask,
+    result: &quorum_core::classify::TaskClassification,
+    limit: usize,
+) -> String {
+    let rejected_size = child_size_is_rejected(result);
+    let include_delta = rejected_size && !task.implementation_delta.is_empty();
+    let include_paths = rejected_size && !task.affected_paths.is_empty();
+    let dimension_count = usize::from(!result.ready)
+        + usize::from(rejected_size)
+        + usize::from(!result.duplicate_of.is_empty())
+        + usize::from(include_delta)
+        + usize::from(include_paths);
+    let variable_count = dimension_count;
+    debug_assert!(dimension_count > 0);
+
+    let fixed_bytes = format!("child {}: ", task.key).len()
+        + usize::from(!result.ready) * "ready=false (not_ready_reason=)".len()
+        + usize::from(rejected_size) * "size=XL cx_est=5 (size_reason=)".len()
+        + usize::from(!result.duplicate_of.is_empty()) * "duplicate_of=".len()
+        + usize::from(include_delta) * "rejected_delta=".len()
+        + usize::from(include_paths) * "affected_paths=[]".len()
+        + dimension_count.saturating_sub(1) * "; ".len();
+    let available = limit.saturating_sub(fixed_bytes);
+    let base_share = available / variable_count;
+    let extra = available % variable_count;
+    debug_assert!(base_share >= "…".len());
+    let mut variable_index = 0usize;
+    let mut bounded_field = |value: &str| {
+        let share = base_share + usize::from(variable_index < extra);
+        variable_index += 1;
+        bounded_with_ellipsis(value.trim(), share)
+    };
+
+    let mut dimensions = Vec::with_capacity(dimension_count);
+    if !result.ready {
+        dimensions.push(format!(
+            "ready=false (not_ready_reason={})",
+            bounded_field(
+                result
+                    .not_ready_reason
+                    .as_deref()
+                    .unwrap_or("missing not_ready_reason")
+            )
+        ));
+    }
+    if rejected_size {
+        dimensions.push(format!(
+            "size={} cx_est={} (size_reason={})",
+            result.size,
+            result.cx_est,
+            bounded_field(&result.size_reason)
+        ));
+    }
+    if !result.duplicate_of.is_empty() {
+        let ids = result
+            .duplicate_of
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        dimensions.push(format!("duplicate_of={}", bounded_field(&ids)));
+    }
+    if include_delta {
+        dimensions.push(format!(
+            "rejected_delta={}",
+            bounded_field(&task.implementation_delta)
+        ));
+    }
+    if include_paths {
+        dimensions.push(format!(
+            "affected_paths=[{}]",
+            bounded_field(&task.affected_paths.join(","))
+        ));
+    }
+    let summary = format!("child {}: {}", task.key, dimensions.join("; "));
+    debug_assert!(summary.len() <= limit, "{summary}");
+    summary
 }
 
 async fn reject_decomposition_proposal(
@@ -5811,43 +6039,121 @@ fn summarize_arbiter_findings(findings: &[arbiter::ArbiterFinding]) -> String {
     serde_json::json!({ "arbiter_changes": blocking }).to_string()
 }
 
-/// Advance a freeze-owning aggregate from `validating` to `preclassifying`
-/// after the Arbiter approves. The transition is guarded on `state='validating'`
-/// so a restart that re-polls a fresh Arbiter, or a concurrent block/cancel,
-/// cannot double-advance (invariant #3: a zero-row bind is a clean no-op).
-async fn advance_validating_to_preclassifying(config: &ServeConfig, graph_id: i64) -> Result<bool> {
+/// Materialize the Arbiter-approved proposal from `validating` using the
+/// classifier batch that was durably accepted before the Arbiter ran. The
+/// guarded `materialize_graph` write (state/freeze/active/source-revision
+/// checks plus the one-active-graph index) is the exactly-once authority: a
+/// restart that re-polls a fresh Arbiter, or a concurrent block/cancel, binds
+/// zero rows and is a clean no-op (invariant #3). Returns whether children were
+/// created.
+///
+/// The batch was validated against this exact proposal when it was accepted,
+/// so a child-building failure here means the durable pair is unusable; it is
+/// rejected back to planning with its reason (bounded by the proposal budget)
+/// rather than surfacing a tick error that would re-spawn the Arbiter forever.
+async fn materialize_validated_proposal(
+    config: &ServeConfig,
+    graph_id: i64,
+    proposal: &[planner::ProposedTask],
+    classifications: &[quorum_core::classify::TaskClassification],
+) -> Result<bool> {
+    let children = match planned_children(proposal, classifications) {
+        Ok(children) if !children.is_empty() => children,
+        Ok(_) => {
+            reject_decomposition_proposal(
+                config,
+                graph_id,
+                "validating",
+                "child-preclassification",
+                "approved proposal has no classified children to materialize",
+            )
+            .await?;
+            return Ok(false);
+        }
+        Err(summary) => {
+            reject_decomposition_proposal(
+                config,
+                graph_id,
+                "validating",
+                "child-preclassification",
+                &summary,
+            )
+            .await?;
+            return Ok(false);
+        }
+    };
+    let snapshot = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        load_planning_snapshot(&conn)?
+    };
+    let Some(snapshot) = snapshot.filter(|snapshot| snapshot.graph_id == graph_id) else {
+        // The graph left its planning phases (cancelled/edited) after the
+        // verdict: nothing to materialize, and no authority to record against.
+        return Ok(false);
+    };
     let path = config.db_path.clone();
-    tokio::task::spawn_blocking(move || -> Result<bool> {
+    let materialized = tokio::task::spawn_blocking(move || -> Result<Option<bool>> {
         let mut conn = quorum_core::db::open(&path)?;
-        quorum_core::decomposition::set_frozen_phase(
+        match quorum_core::decomposition::materialize_graph(
             &mut conn,
             graph_id,
-            "validating",
-            "preclassifying",
-            None,
+            snapshot.source_revision,
+            &children,
             now_unix(),
-        )
+        ) {
+            Ok(ids) => Ok(Some(ids.is_some())),
+            // A usage error is a durable-input problem (unclassified child,
+            // cycle, source dependency not done): bounded rejection, not a
+            // tick error that would re-spawn the Arbiter every tick.
+            Err(QuorumError::Usage(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     })
     .await
-    .map_err(|error| QuorumError::Io(format!("arbiter approve phase join: {error}")))?
+    .map_err(|error| QuorumError::Io(format!("materialization join: {error}")))??;
+    match materialized {
+        Some(true) => Ok(true),
+        Some(false) => {
+            record_decomposition_attempt(
+                config,
+                graph_id,
+                "blocker",
+                "materialization-authority-lost",
+                "atomic materialization lost graph or source authority",
+            )
+            .await?;
+            Ok(false)
+        }
+        None => {
+            reject_decomposition_proposal(
+                config,
+                graph_id,
+                "validating",
+                "materialization-rejected",
+                "approved proposal is not materializable as classified",
+            )
+            .await?;
+            Ok(false)
+        }
+    }
 }
 
 /// Map one terminal Arbiter outcome onto the decomposition lifecycle. The daemon
 /// alone transitions state here; the verdict never mutates state itself
-/// (invariant #11). Returns `true` when the durable accepted proposal advanced
-/// toward materialization (Approve), so the caller retains it for the classifier
-/// stage; every other outcome returns `false` and the proposal is discarded.
+/// (invariant #11). Returns `true` when the proposal materialized (Approve);
+/// every other outcome returns `false` and the caller discards the proposal.
 ///
 /// Every terminal outcome additionally records one `verdict` attempt with a
 /// bounded JSON run summary; that observational row consumes no budget and
 /// never changes lifecycle state.
 ///
-/// - `Approve` (or a `Changes` verdict with no blocking finding) advances
-///   `validating` -> `preclassifying`; the unchanged classifier/materialize path
-///   then creates children.
+/// - `Approve` (or a `Changes` verdict with no blocking finding) materializes
+///   the children from `validating` using the classifier batch accepted in
+///   `preclassifying`; the classifier is never re-run.
 /// - `Changes` with a blocking finding records a `proposal` attempt coded
 ///   `arbiter-changes` and returns the graph to planning (or fails the source at
-///   the 3rd attempt) so the planner re-proposes against the findings.
+///   the 3rd attempt) so the planner re-proposes against the findings; the next
+///   proposal is classified again before any Arbiter run.
 /// - `RejectSource` records a `blocker` attempt coded `arbiter-reject-source`,
 ///   holding the graph and failing the source for a required decision.
 /// - A provider/protocol failure or malformed verdict records a `provider`
@@ -5856,6 +6162,8 @@ async fn apply_arbiter_verdict(
     config: &ServeConfig,
     graph_id: i64,
     outcome: arbiter::ArbiterPoll,
+    proposal: &[planner::ProposedTask],
+    classifications: &[quorum_core::classify::TaskClassification],
 ) -> Result<bool> {
     let (reason_code, verdict_summary) = bounded_arbiter_verdict_summary(&outcome);
     record_decomposition_attempt(config, graph_id, "verdict", reason_code, &verdict_summary)
@@ -5875,7 +6183,7 @@ async fn apply_arbiter_verdict(
         arbiter::ArbiterPoll::Done {
             verdict: arbiter::ArbiterVerdict::Approve,
             ..
-        } => advance_validating_to_preclassifying(config, graph_id).await,
+        } => materialize_validated_proposal(config, graph_id, proposal, classifications).await,
         arbiter::ArbiterPoll::Done {
             verdict: arbiter::ArbiterVerdict::Changes { findings },
             ..
@@ -5894,7 +6202,7 @@ async fn apply_arbiter_verdict(
             } else {
                 // No blocking finding: nothing bars materialization, so the
                 // advisory-only verdict is treated as an approval.
-                advance_validating_to_preclassifying(config, graph_id).await
+                materialize_validated_proposal(config, graph_id, proposal, classifications).await
             }
         }
         arbiter::ArbiterPoll::Done {
@@ -5945,8 +6253,8 @@ fn arbiter_structural_summary(proposal: &[planner::ProposedTask]) -> String {
     )
 }
 
-/// Spawn the single-shot Arbiter plan reviewer for a structurally valid
-/// proposal. The Arbiter runs in a frozen repository view (the same mechanism
+/// Spawn the single-shot Arbiter plan reviewer for a classified, structurally
+/// valid proposal. The Arbiter runs in a frozen repository view (the same mechanism
 /// the planner uses) so its read-only inspection matches the plan's base. Its
 /// verdict is consumed by the arbiter-poll block on a later tick. A frozen-view
 /// or spawn failure records a bounded `provider` attempt, never a silent
@@ -6003,6 +6311,7 @@ async fn spawn_arbiter_review(
             )
             .await?;
             coordinator.proposal = None;
+            coordinator.classifications = None;
             return Ok(());
         }
     };
@@ -6062,13 +6371,198 @@ async fn spawn_arbiter_review(
             )
             .await?;
             coordinator.proposal = None;
+            coordinator.classifications = None;
         }
     }
     Ok(())
 }
 
+/// Render a planned child's contract as JSON with an explicit, stable field
+/// order. `serde_json` maps are alphabetized, which would put
+/// `acceptance_criteria` first and the delta, non-goals, and outcome behind
+/// it; a classifier reading a bounded prefix must see the sizing-relevant
+/// fields first. With `text_limit`, every text value and list is bounded
+/// separately so no single oversized field can push the rest out of the
+/// classifier's envelope.
+fn planned_child_body_json(task: &planner::ProposedTask, text_limit: Option<usize>) -> String {
+    fn bound_text(value: &str, limit: Option<usize>) -> String {
+        match limit {
+            Some(limit) => bounded_with_ellipsis(value, limit),
+            None => value.to_owned(),
+        }
+    }
+    // Bound a list by cumulative bytes: items past the budget are replaced by
+    // one ellipsis item rather than silently dropped.
+    fn bound_list(values: &[String], limit: Option<usize>) -> Vec<String> {
+        let Some(limit) = limit else {
+            return values.to_vec();
+        };
+        let mut used = 0usize;
+        let mut bounded = Vec::with_capacity(values.len());
+        for value in values {
+            if used + value.len() > limit {
+                let remaining = limit.saturating_sub(used);
+                bounded.push(bounded_with_ellipsis(value, remaining.max("…".len())));
+                break;
+            }
+            used += value.len();
+            bounded.push(value.clone());
+        }
+        bounded
+    }
+    // Deliverables are bounded by cumulative path bytes like any other list;
+    // the entry that crosses the budget keeps a bounded path and the rest are
+    // cut so the field stays inside its share of the envelope.
+    fn bound_deliverables(
+        deliverables: &quorum_core::decomposition::ChildDeliverables,
+        limit: Option<usize>,
+    ) -> quorum_core::decomposition::ChildDeliverables {
+        use quorum_core::decomposition::ChildDeliverable;
+        let Some(limit) = limit else {
+            return deliverables.clone();
+        };
+        let mut used = 0usize;
+        let mut bounded = Vec::with_capacity(deliverables.0.len());
+        for deliverable in &deliverables.0 {
+            let (path, rebuild): (&String, fn(String) -> ChildDeliverable) = match deliverable {
+                ChildDeliverable::Write { path } => (path, |path| ChildDeliverable::Write { path }),
+                ChildDeliverable::ReadOnlyReference { path } => {
+                    (path, |path| ChildDeliverable::ReadOnlyReference { path })
+                }
+            };
+            if used + path.len() > limit {
+                let remaining = limit.saturating_sub(used);
+                bounded.push(rebuild(bounded_with_ellipsis(
+                    path,
+                    remaining.max("…".len()),
+                )));
+                break;
+            }
+            used += path.len();
+            bounded.push(deliverable.clone());
+        }
+        quorum_core::decomposition::ChildDeliverables(bounded)
+    }
+    let fields: [(&str, serde_json::Value); quorum_core::classify::PLANNED_CHILD_BODY_FIELDS] = [
+        (
+            "implementation_delta",
+            serde_json::json!(bound_text(&task.implementation_delta, text_limit)),
+        ),
+        (
+            "affected_paths",
+            serde_json::json!(bound_list(&task.affected_paths, text_limit)),
+        ),
+        (
+            "deliverables",
+            serde_json::to_value(bound_deliverables(&task.deliverables, text_limit))
+                .expect("child deliverables serialize"),
+        ),
+        (
+            "non_goals",
+            serde_json::json!(bound_list(&task.non_goals, text_limit)),
+        ),
+        (
+            "observable_outcome",
+            serde_json::json!(bound_text(&task.observable_outcome, text_limit)),
+        ),
+        (
+            "acceptance_criteria",
+            serde_json::json!(bound_list(&task.acceptance_criteria, text_limit)),
+        ),
+        (
+            "source_constraints",
+            serde_json::json!(bound_list(
+                &planner::with_worker_writability_guidance(&task.source_constraints),
+                text_limit,
+            )),
+        ),
+        (
+            "verification_expectations",
+            serde_json::json!(bound_list(&task.verification_expectations, text_limit)),
+        ),
+    ];
+    let mut body = String::from("{");
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(&serde_json::to_string(key).expect("field name serializes"));
+        body.push(':');
+        body.push_str(&serde_json::to_string(value).expect("field value serializes"));
+    }
+    body.push('}');
+    body
+}
+
+/// Resolve a planned child's prerequisites into classifier context: a sibling
+/// key becomes `key — <sibling title>` and `source:N` becomes
+/// `source:N — <task N title>` when that task is known. Unresolvable entries
+/// keep their raw text so the classifier still sees the declared edge.
+fn planned_child_dependency_labels(
+    task: &planner::ProposedTask,
+    proposal: &[planner::ProposedTask],
+    source_titles: &HashMap<i64, String>,
+) -> Vec<String> {
+    task.prerequisites
+        .iter()
+        .map(|dependency| {
+            let title = match dependency.strip_prefix("source:") {
+                Some(raw) => raw
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|id| source_titles.get(&id))
+                    .map(String::as_str),
+                None => proposal
+                    .iter()
+                    .find(|sibling| &sibling.key == dependency)
+                    .map(|sibling| sibling.title.as_str()),
+            };
+            match title.map(str::trim).filter(|title| !title.is_empty()) {
+                Some(title) => format!(
+                    "{dependency} — {}",
+                    bounded_with_ellipsis(
+                        title,
+                        quorum_core::classify::DEPENDENCY_TITLE_CHAR_LIMIT
+                    )
+                ),
+                None => dependency.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Titles of every `source:N` prerequisite in the proposal, read in one short
+/// connection. Missing tasks are simply absent from the map.
+async fn planned_source_dependency_titles(
+    db_path: &Path,
+    proposal: &[planner::ProposedTask],
+) -> Result<HashMap<i64, String>> {
+    let ids = proposal
+        .iter()
+        .flat_map(|task| task.prerequisites.iter())
+        .filter_map(|dependency| dependency.strip_prefix("source:")?.parse::<i64>().ok())
+        .collect::<std::collections::BTreeSet<i64>>();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<HashMap<i64, String>> {
+        let conn = quorum_core::db::open(&path)?;
+        let mut titles = HashMap::with_capacity(ids.len());
+        for id in ids {
+            if let Some(task) = quorum_core::tasks::get(&conn, id)? {
+                titles.insert(id, task.title);
+            }
+        }
+        Ok(titles)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("source dependency title join: {error}")))?
+}
+
 fn proposed_classifier_tasks(
     tasks: &[planner::ProposedTask],
+    source_titles: &HashMap<i64, String>,
 ) -> Vec<quorum_core::classify::TaskForClassification> {
     tasks
         .iter()
@@ -6078,23 +6572,13 @@ fn proposed_classifier_tasks(
                 id: -(index as i64) - 1,
                 revision: 1,
                 title: task.title.clone(),
-                body: Some(
-                    serde_json::json!({
-                        "implementation_delta": task.implementation_delta,
-                        "affected_paths": task.affected_paths,
-                        "observable_outcome": task.observable_outcome,
-                        "deliverables": task.deliverables,
-                        "acceptance_criteria": task.acceptance_criteria,
-                        "source_constraints": planner::with_worker_writability_guidance(
-                            &task.source_constraints,
-                        ),
-                        "verification_expectations": task.verification_expectations,
-                        "non_goals": task.non_goals,
-                    })
-                    .to_string(),
-                ),
-                dependencies: task.prerequisites.clone(),
+                body: Some(planned_child_body_json(
+                    task,
+                    Some(PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES),
+                )),
+                dependencies: planned_child_dependency_labels(task, tasks, source_titles),
                 recovery_notes: vec![],
+                body_char_limit: quorum_core::classify::PLANNED_CHILD_BODY_CHAR_LIMIT,
             },
         )
         .collect()
@@ -6108,17 +6592,23 @@ fn planned_children(
         .iter()
         .map(|result| (result.task_id, result))
         .collect();
-    proposal
+    let classified = proposal
         .iter()
         .enumerate()
         .map(|(index, task)| {
             let id = -(index as i64) - 1;
-            let result = by_id
+            let result = *by_id
                 .get(&id)
                 .ok_or_else(|| format!("missing classification for {}", task.key))?;
-            if let Some(summary) = child_preclassification_rejection(task, result) {
-                return Err(summary);
-            }
+            Ok((task, result))
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+    if let Some(summary) = aggregate_child_preclassification_rejections(&classified) {
+        return Err(summary);
+    }
+    classified
+        .into_iter()
+        .map(|(task, result)| {
             let mut prerequisite_keys = Vec::new();
             let mut source_dependency_ids = Vec::new();
             for dependency in &task.prerequisites {
@@ -6134,27 +6624,16 @@ fn planned_children(
             Ok(quorum_core::decomposition::PlannedChild {
                 local_key: task.key.clone(),
                 title: task.title.clone(),
-                body: serde_json::json!({
-                    "implementation_delta": task.implementation_delta,
-                    "affected_paths": task.affected_paths,
-                    "observable_outcome": task.observable_outcome,
-                    "deliverables": task.deliverables,
-                    "acceptance_criteria": task.acceptance_criteria,
-                    "source_constraints": planner::with_worker_writability_guidance(
-                        &task.source_constraints,
-                    ),
-                    "verification_expectations": task.verification_expectations,
-                    "non_goals": task.non_goals,
-                })
-                .to_string(),
+                body: planned_child_body_json(task, None),
                 labels: Some("[\"type:implementation\",\"generated:decomposition\"]".into()),
                 classification_refs: serde_json::json!({
                     "cx_est": result.cx_est,
                     "cx_size": result.size,
+                    "cx_size_reason": result.size_reason.trim(),
                     "cx_ready": result.ready,
                     "cx_not_ready_reason": result.not_ready_reason,
                     "cx_dup_of": result.duplicate_of,
-                    "cx_by": "decomposition-preclassification:v1",
+                    "cx_by": "decomposition-preclassification:v2",
                 })
                 .to_string(),
                 prerequisite_keys,
@@ -6281,7 +6760,10 @@ async fn tick_decomposition(
                         QuorumError::Io(format!("validation phase join: {error}"))
                     })??;
                     if moved {
+                        // A new proposal always starts unclassified: the
+                        // classifier runs on it before the Arbiter.
                         coordinator.proposal = Some(tasks);
+                        coordinator.classifications = None;
                     }
                 }
             }
@@ -6295,10 +6777,10 @@ async fn tick_decomposition(
 
     // Consume the Arbiter plan-review verdict. Like the planner slot, the
     // provider process is killed and reaped before any durable lifecycle
-    // decision; the verdict alone never mutates state (invariant #11). The
-    // durable decision is keyed on the graph's current proposal: an Approve
-    // advances `validating` -> `preclassifying` exactly once, so a restart
-    // that re-polls a fresh Arbiter cannot double-materialize.
+    // decision; the verdict alone never mutates state (invariant #11). An
+    // Approve materializes through the guarded `materialize_graph` write
+    // exactly once, so a restart that re-polls a fresh Arbiter cannot
+    // double-materialize.
     if let Some(slot) = coordinator.arbiter_slot.as_mut() {
         if let Some(outcome) = arbiter::poll_arbiter(slot).await {
             let slot = coordinator
@@ -6331,13 +6813,22 @@ async fn tick_decomposition(
                 .graph_id
                 .ok_or_else(|| QuorumError::Io("arbiter lost graph identity".into()))?;
             delete_decomposition_process(config, graph_id, "arbiter").await?;
-            let advanced = apply_arbiter_verdict(config, graph_id, outcome).await?;
-            // Only an Approve keeps the durable accepted proposal in play for
-            // the downstream classifier stage; every other verdict returns the
-            // graph to planning/backoff/hold, so drop the in-memory proposal.
-            if !advanced {
-                coordinator.proposal = None;
+            let proposal = coordinator.proposal.take().unwrap_or_default();
+            let classifications = coordinator.classifications.take().unwrap_or_default();
+            if !proposal.is_empty() && classifications.is_empty() {
+                // The Arbiter can only be spawned for a classified proposal, so
+                // this is a daemon invariant failure, not a planner fault: fail
+                // loudly (the next tick reloads the durable pair and re-polls a
+                // fresh Arbiter) rather than charge the proposal budget for a
+                // batch that was never rejected.
+                return Err(QuorumError::Io(
+                    "arbiter verdict for an unclassified proposal".into(),
+                ));
             }
+            // Every verdict ends this proposal's life in the coordinator: an
+            // Approve materialized it (or rejected an unusable pair), and
+            // every other verdict returned the graph to planning/backoff/hold.
+            apply_arbiter_verdict(config, graph_id, outcome, &proposal, &classifications).await?;
             // Telemetry runs after the durable verdict decision and cannot
             // change it.
             if let Some(usage) = usage {
@@ -6382,15 +6873,20 @@ async fn tick_decomposition(
                     )
                     .await?;
                     coordinator.proposal = None;
+                    coordinator.classifications = None;
                 }
                 classifier::ClassifierResult::Done(text) => {
+                    // The batch must both parse and admit every proposed child
+                    // (size, readiness, duplicates) before the Arbiter is ever
+                    // spawned: a rejected classification returns the proposal to
+                    // the planner retry path without spending an Arbiter run.
                     let result = classifier::parse_validated_response(&text, &expected).and_then(
                         |classifications| {
                             planned_children(
                                 coordinator.proposal.as_deref().unwrap_or_default(),
                                 &classifications,
                             )
-                            .map(|children| (classifications, children))
+                            .map(|_| classifications)
                         },
                     );
                     match result {
@@ -6404,42 +6900,41 @@ async fn tick_decomposition(
                             )
                             .await?;
                             coordinator.proposal = None;
+                            coordinator.classifications = None;
                         }
-                        Ok((_classifications, children)) => {
-                            let snapshot = {
-                                let conn = quorum_core::db::open(&config.db_path)?;
-                                load_planning_snapshot(&conn)?
-                            };
-                            if let Some(snapshot) = snapshot {
-                                let path = config.db_path.clone();
-                                let materialized =
-                                    tokio::task::spawn_blocking(move || -> Result<bool> {
-                                        let mut conn = quorum_core::db::open(&path)?;
-                                        Ok(quorum_core::decomposition::materialize_graph(
-                                            &mut conn,
-                                            graph_id,
-                                            snapshot.source_revision,
-                                            &children,
-                                            now_unix(),
-                                        )?
-                                        .is_some())
-                                    })
-                                    .await
-                                    .map_err(|error| {
-                                        QuorumError::Io(format!("materialization join: {error}"))
-                                    })??;
-                                if !materialized {
-                                    record_decomposition_attempt(
-                                        config,
-                                        graph_id,
-                                        "blocker",
-                                        "materialization-authority-lost",
-                                        "atomic materialization lost graph or source authority",
-                                    )
-                                    .await?;
-                                }
+                        Ok(classifications) => {
+                            // Persist the accepted batch next to the proposal and
+                            // advance `preclassifying` -> `validating` in one
+                            // guarded write, so the Arbiter reviews and the daemon
+                            // materializes exactly this classification even
+                            // across a restart. A lost bind (cancel/edit) drops
+                            // the proposal; nothing was materialized.
+                            let classifications_json = serde_json::to_string(&classifications)
+                                .map_err(|error| {
+                                    QuorumError::Io(format!(
+                                        "classification serialization failed: {error}"
+                                    ))
+                                })?;
+                            let path = config.db_path.clone();
+                            let advanced = tokio::task::spawn_blocking(move || -> Result<bool> {
+                                let mut conn = quorum_core::db::open(&path)?;
+                                quorum_core::decomposition::accept_classifications(
+                                    &mut conn,
+                                    graph_id,
+                                    &classifications_json,
+                                    now_unix(),
+                                )
+                            })
+                            .await
+                            .map_err(|error| {
+                                QuorumError::Io(format!("classification phase join: {error}"))
+                            })??;
+                            if advanced {
+                                coordinator.classifications = Some(classifications);
+                            } else {
+                                coordinator.proposal = None;
+                                coordinator.classifications = None;
                             }
-                            coordinator.proposal = None;
                         }
                     }
                 }
@@ -6511,6 +7006,7 @@ async fn tick_decomposition(
     coordinator.classifier_source_task_id = Some(snapshot.source_task_id);
     if coordinator.proposal.is_none() {
         coordinator.proposal = snapshot.accepted_proposal.clone();
+        coordinator.classifications = snapshot.accepted_classifications.clone();
     }
 
     // Older durable proposals deserialize newly introduced grounding fields
@@ -6548,8 +7044,42 @@ async fn tick_decomposition(
                 ))
             })??;
             coordinator.proposal = None;
+            coordinator.classifications = None;
             return Ok(reset);
         }
+    }
+
+    // `validating` is the Arbiter phase and follows classification. A graph
+    // there without a usable durable classification (a row written by a
+    // binary that ran the Arbiter first, or an unusable batch) steps back to
+    // `preclassifying` so the classifier runs before any Arbiter spawn. The
+    // guarded write is keyed on `validating`; nothing is charged.
+    if snapshot.state == "validating"
+        && coordinator.classifications.is_none()
+        && coordinator.arbiter_slot.is_none()
+    {
+        let path = config.db_path.clone();
+        let graph_id = snapshot.graph_id;
+        let stepped_back = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&path)?;
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph_id,
+                "validating",
+                "preclassifying",
+                None,
+                now_unix(),
+            )
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("classification resume join: {error}")))??;
+        if stepped_back {
+            log(&format!(
+                "graph {graph_id}: validating without an accepted classification; \
+                 classifying before the Arbiter"
+            ));
+        }
+        return Ok(stepped_back);
     }
 
     if snapshot.state == "provider-backoff" {
@@ -6778,12 +7308,35 @@ async fn tick_decomposition(
             }
         }
     } else if snapshot.state == "validating" && coordinator.arbiter_slot.is_none() {
-        let Some(proposal) = coordinator.proposal.as_ref() else {
+        if coordinator.proposal.is_none() {
             return Err(QuorumError::Io(
                 "validating decomposition lacks its durable accepted proposal".into(),
             ));
+        }
+        if coordinator.classifications.is_none() {
+            // Unreachable by construction (the step-back above returns
+            // first); fail loudly rather than spawn an Arbiter for an
+            // unclassified proposal.
+            return Err(QuorumError::Io(
+                "validating decomposition lacks its accepted classification".into(),
+            ));
+        }
+        // The proposal passed deterministic validation and closed-book
+        // classification in `preclassifying`. Spawn the Arbiter plan-review
+        // gate; its verdict (consumed by the arbiter-poll block above on a
+        // later tick) decides whether the classified proposal materializes,
+        // re-plans, or holds the source.
+        spawn_arbiter_review(config, coordinator, &snapshot).await?;
+    } else if snapshot.state == "preclassifying" && coordinator.classifier_slot.is_none() {
+        let Some(proposal) = coordinator.proposal.as_ref() else {
+            return Err(QuorumError::Io(
+                "preclassifying decomposition lacks its durable accepted proposal".into(),
+            ));
         };
-        match planner::validate_for_source(
+        // Deterministic structural validation is the cheapest gate, so it runs
+        // before the classifier spends a provider turn; a failure returns the
+        // proposal to the planner retry path from this phase.
+        if let Err(error) = planner::validate_for_source(
             proposal,
             &snapshot.dependencies,
             &config.repo_dir,
@@ -6791,32 +7344,20 @@ async fn tick_decomposition(
         )
         .await
         {
-            Err(error) => {
-                reject_decomposition_proposal(
-                    config,
-                    snapshot.graph_id,
-                    "validating",
-                    "deterministic-validation",
-                    &error.to_string(),
-                )
-                .await?;
-                coordinator.proposal = None;
-            }
-            // Structural pre-filter passed. Do not advance to preclassifying
-            // yet: spawn the Arbiter plan-review gate. Its verdict (consumed by
-            // the arbiter-poll block above on a later tick) decides whether the
-            // proposal materializes, re-plans, or holds the source.
-            Ok(()) => {
-                spawn_arbiter_review(config, coordinator, &snapshot).await?;
-            }
+            reject_decomposition_proposal(
+                config,
+                snapshot.graph_id,
+                "preclassifying",
+                "deterministic-validation",
+                &error.to_string(),
+            )
+            .await?;
+            coordinator.proposal = None;
+            coordinator.classifications = None;
+            return Ok(true);
         }
-    } else if snapshot.state == "preclassifying" && coordinator.classifier_slot.is_none() {
-        let Some(proposal) = coordinator.proposal.as_ref() else {
-            return Err(QuorumError::Io(
-                "preclassifying decomposition lacks its durable accepted proposal".into(),
-            ));
-        };
-        let tasks = proposed_classifier_tasks(proposal);
+        let source_titles = planned_source_dependency_titles(&config.db_path, proposal).await?;
+        let tasks = proposed_classifier_tasks(proposal, &source_titles);
         let classifier_assignment = assign_classifier_batch(
             config,
             &tasks,
@@ -9061,6 +9602,19 @@ async fn tick_loop(
 
     log(&format!("serving (cap={})", config.cap));
 
+    let mut resource_transitions = crate::resource_health::ResourceTransitionMonitor::default();
+    let mut resource_sampler = crate::resource_health::ResourceSamplePoller::default();
+    let resource_targets = vec![
+        crate::resource_health::DiskTarget {
+            label: "database",
+            path: config.db_path.clone(),
+        },
+        crate::resource_health::DiskTarget {
+            label: "worktrees",
+            path: config.worktree_base.clone(),
+        },
+    ];
+
     // Standalone heartbeat task — refreshes the daemon lock every 10s,
     // independent of tick() duration. Detects lock theft (0-row refresh)
     // and signals the main loop to exit immediately.
@@ -9200,6 +9754,20 @@ async fn tick_loop(
                     name_pool.release(&agent_name);
                 }
                 return Ok(1);
+            }
+        }
+
+        // Host telemetry is observational and intentionally sampled outside
+        // every SQLite transaction. Polling is non-blocking and single-flight,
+        // so a degraded filesystem cannot stall lifecycle or shutdown work.
+        if let Some(resources) = resource_sampler.poll(
+            std::time::Instant::now(),
+            now_unix(),
+            &resource_targets,
+            config.resource_monitor,
+        ) {
+            for line in resource_transitions.observe(&resources, std::time::Instant::now()) {
+                log(&line);
             }
         }
 
@@ -22095,6 +22663,7 @@ mod tests {
             master_ci_timeout_secs: 1,
             allowed_tools: None,
             doctor_enabled: false,
+            resource_monitor: crate::resource_health::ResourceMonitorConfig::default(),
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
@@ -26376,6 +26945,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             master_ci_timeout_secs: 1,
             allowed_tools: None,
             doctor_enabled: false,
+            resource_monitor: crate::resource_health::ResourceMonitorConfig::default(),
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
@@ -35505,6 +36075,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 task_id: -1,
                 cx_est: 2,
                 size: "S".into(),
+                size_reason: "  bounded test classification rationale  ".into(),
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
@@ -35513,6 +36084,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 task_id: -2,
                 cx_est: 3,
                 size: "M".into(),
+                size_reason: "bounded test classification rationale".into(),
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
@@ -35538,6 +36110,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap()
             .iter()
             .any(|constraint| constraint == planner::WORKER_WRITABILITY_GUIDANCE));
+        let child_refs: serde_json::Value =
+            serde_json::from_str(&children[0].classification_refs).unwrap();
+        assert_eq!(
+            child_refs["cx_size_reason"],
+            "bounded test classification rationale"
+        );
+        assert_eq!(child_refs["cx_by"], "decomposition-preclassification:v2");
         let worker_prompt =
             reviewer::build_worker_prompt("worker", 7, &children[0].title, &children[0].body, None);
         assert!(worker_prompt.contains(planner::WORKER_WRITABILITY_GUIDANCE));
@@ -35550,12 +36129,26 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "child a rejected by preclassification: ready=false (not_ready_reason: missing acceptance criteria)"
         );
 
-        for size in ["L", "XL"] {
+        // `L` at complexity 3 satisfies the shared implementation-size policy
+        // exactly as a root task would; the child is accepted with its verdict.
+        let mut large_but_simple = valid.clone();
+        large_but_simple[1].size = "L".into();
+        large_but_simple[1].cx_est = 3;
+        let accepted = planned_children(&proposal, &large_but_simple).unwrap();
+        let accepted_refs: serde_json::Value =
+            serde_json::from_str(&accepted[1].classification_refs).unwrap();
+        assert_eq!(accepted_refs["cx_size"], "L");
+        assert_eq!(accepted_refs["cx_est"], 3);
+
+        for (size, cx_est) in [("L", 4), ("L", 5), ("XL", 2)] {
             let mut large = valid.clone();
             large[1].size = size.into();
+            large[1].cx_est = cx_est;
             assert_eq!(
                 planned_children(&proposal, &large).unwrap_err(),
-                format!("child b rejected by preclassification: size={size}")
+                format!(
+                    "child b rejected by preclassification: size={size} cx_est={cx_est} (size_reason: bounded test classification rationale)"
+                )
             );
         }
 
@@ -35573,13 +36166,276 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         combined[0].duplicate_of = vec![301, 302];
         assert_eq!(
             planned_children(&proposal, &combined).unwrap_err(),
-            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL; duplicate_of=[301, 302]; rejected_delta=change layer a; affected_paths=[src/a.rs]"
+            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL cx_est=2 (size_reason: bounded test classification rationale); duplicate_of=[301, 302]; rejected_delta=change layer a; affected_paths=[src/a.rs]"
         );
 
         assert_eq!(
             planned_children(&proposal, &valid[..1]).unwrap_err(),
             "missing classification for b"
         );
+    }
+
+    fn composition_child_fixture() -> Vec<planner::ProposedTask> {
+        vec![
+            planner::ProposedTask {
+                key: "fallback-record-tx".into(),
+                title: "Record fallback transactions in storage".into(),
+                implementation_delta: "add the fallback record write path".into(),
+                affected_paths: vec!["src/storage/fallback.rs".into()],
+                observable_outcome: "fallback rows persist".into(),
+                deliverables: writable_deliverables("src/storage/fallback.rs"),
+                acceptance_criteria: vec!["rows persist".into()],
+                source_constraints: vec!["atomic".into()],
+                verification_expectations: vec!["storage test".into()],
+                prerequisites: vec![],
+                ..Default::default()
+            },
+            planner::ProposedTask {
+                key: "compose".into(),
+                title: "Compose the fallback flow".into(),
+                implementation_delta: format!(
+                    "Wire the delivered primitives into one flow. {}",
+                    "The composition calls each sibling seam in order and records the outcome. "
+                        .repeat(40)
+                ),
+                affected_paths: vec!["src/flow/compose.rs".into()],
+                observable_outcome: "the end-to-end fallback flow runs".into(),
+                deliverables: writable_deliverables("src/flow/compose.rs"),
+                acceptance_criteria: vec![
+                    "criterion one: the flow records a transaction".into(),
+                    format!("criterion two: {}", "long acceptance detail ".repeat(30)),
+                ],
+                source_constraints: vec!["preserve the atomic boundary".into()],
+                verification_expectations: vec!["flow integration test".into()],
+                non_goals: vec!["NON_GOAL_MARKER: do not reimplement sibling primitives".into()],
+                prerequisites: vec!["fallback-record-tx".into(), "source:7".into()],
+            },
+        ]
+    }
+
+    #[test]
+    fn planned_child_classifier_input_keeps_whole_contract_and_resolves_dependencies() {
+        let proposal = composition_child_fixture();
+        assert!(proposal[1].implementation_delta.chars().count() > 2_000);
+        let source_titles = HashMap::from([(7_i64, "Source prerequisite seven".to_string())]);
+        let tasks = proposed_classifier_tasks(&proposal, &source_titles);
+        let prompt = quorum_core::classify::build_prompt(&tasks, &[]);
+
+        // The whole planner-written delta reaches the classifier, not a
+        // 2000-character prefix of an alphabetized JSON object.
+        assert!(
+            prompt.contains(&proposal[1].implementation_delta),
+            "{prompt}"
+        );
+        assert!(prompt.contains("NON_GOAL_MARKER: do not reimplement sibling primitives"));
+        assert!(prompt.contains("criterion two: long acceptance detail"));
+        assert!(prompt.contains("fallback-record-tx — Record fallback transactions in storage"));
+        assert!(prompt.contains("source:7 — Source prerequisite seven"));
+
+        // Sizing-relevant fields precede the criteria in the body.
+        let body = tasks[1].body.as_deref().unwrap();
+        let position = |key: &str| body.find(&format!("\"{key}\":")).unwrap();
+        assert!(position("implementation_delta") < position("affected_paths"));
+        assert!(position("affected_paths") < position("deliverables"));
+        assert!(position("deliverables") < position("non_goals"));
+        assert!(position("non_goals") < position("observable_outcome"));
+        assert!(position("observable_outcome") < position("acceptance_criteria"));
+        assert!(position("acceptance_criteria") < position("source_constraints"));
+        assert!(position("source_constraints") < position("verification_expectations"));
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            parsed["implementation_delta"],
+            proposal[1].implementation_delta
+        );
+        assert_eq!(
+            tasks[1].body_char_limit,
+            quorum_core::classify::PLANNED_CHILD_BODY_CHAR_LIMIT
+        );
+
+        // An unknown source task keeps its raw reference.
+        let unresolved = proposed_classifier_tasks(&proposal, &HashMap::new());
+        assert_eq!(
+            unresolved[1].dependencies,
+            vec![
+                "fallback-record-tx — Record fallback transactions in storage".to_string(),
+                "source:7".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_child_classifier_input_bounds_each_field_separately() {
+        let mut proposal = composition_child_fixture();
+        proposal[1].implementation_delta =
+            "D".repeat(PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES + 500);
+        proposal[1].acceptance_criteria = (0..40)
+            .map(|index| format!("criterion-{index}-{}", "c".repeat(200)))
+            .collect();
+        let tasks = proposed_classifier_tasks(&proposal, &HashMap::new());
+        let body = tasks[1].body.as_deref().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        let delta = parsed["implementation_delta"].as_str().unwrap();
+        assert!(delta.len() <= PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES);
+        assert!(delta.ends_with('…'));
+        let criteria = parsed["acceptance_criteria"].as_array().unwrap();
+        let criteria_bytes: usize = criteria
+            .iter()
+            .map(|value| value.as_str().unwrap().len())
+            .sum();
+        assert!(criteria_bytes <= PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES + "…".len());
+        assert!(criteria.len() < 40);
+        assert!(criteria.last().unwrap().as_str().unwrap().ends_with('…'));
+        // Later fields survive the oversized earlier ones.
+        assert_eq!(
+            parsed["non_goals"][0],
+            "NON_GOAL_MARKER: do not reimplement sibling primitives"
+        );
+        assert_eq!(
+            parsed["verification_expectations"][0],
+            "flow integration test"
+        );
+        assert!(body.chars().count() <= quorum_core::classify::PLANNED_CHILD_BODY_CHAR_LIMIT);
+
+        // Worst case: every text and list field over the per-field cap, with
+        // escape-heavy content, and 32 deliverables at the planner's 8 KiB
+        // path bound. The last field still survives and the body still fits
+        // the classifier envelope.
+        let over = PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES + 700;
+        let heavy = |seed: &str| format!("\"{}\n", seed).repeat(over / (seed.len() + 3) + 1);
+        let heavy_list = |seed: &str| (0..40).map(|i| heavy(&format!("{seed}{i}"))).collect();
+        let mut worst = composition_child_fixture();
+        let child = &mut worst[1];
+        child.implementation_delta = heavy("delta");
+        child.affected_paths = heavy_list("path");
+        child.deliverables = quorum_core::decomposition::ChildDeliverables(
+            (0..32)
+                .map(|i| quorum_core::decomposition::ChildDeliverable::Write {
+                    path: format!("src/{i}/{}", "p".repeat(8 * 1024 - 8)),
+                })
+                .collect(),
+        );
+        child.non_goals = heavy_list("non-goal");
+        child.observable_outcome = heavy("outcome");
+        child.acceptance_criteria = heavy_list("criterion");
+        child.source_constraints = heavy_list("constraint");
+        child.verification_expectations = {
+            let mut items: Vec<String> = heavy_list("verify");
+            items.insert(0, "VERIFY_MARKER survives the worst case".into());
+            items
+        };
+        let tasks = proposed_classifier_tasks(&worst, &HashMap::new());
+        let body = tasks[1].body.as_deref().unwrap();
+        assert!(
+            body.chars().count() <= quorum_core::classify::PLANNED_CHILD_BODY_CHAR_LIMIT,
+            "{} chars",
+            body.chars().count()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            parsed["verification_expectations"][0],
+            "VERIFY_MARKER survives the worst case"
+        );
+        let deliverables = parsed["deliverables"].as_array().unwrap();
+        assert!(deliverables.len() < 32);
+        let deliverable_bytes: usize = deliverables
+            .iter()
+            .map(|value| value["path"].as_str().unwrap().len())
+            .sum();
+        assert!(deliverable_bytes <= PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES + "…".len());
+        // The rendered prompt is the body, not a truncated prefix of it.
+        let prompt = quorum_core::classify::build_prompt(&tasks, &[]);
+        assert!(prompt.contains("VERIFY_MARKER survives the worst case"));
+        assert!(prompt.contains(body));
+    }
+
+    #[tokio::test]
+    async fn planned_source_dependency_titles_are_read_from_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("titles.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let existing = tasks::create(
+            &mut conn,
+            "owner",
+            "Source prerequisite title",
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        drop(conn);
+        let mut proposal = composition_child_fixture();
+        proposal[1].prerequisites = vec![
+            "fallback-record-tx".into(),
+            format!("source:{existing}"),
+            format!("source:{}", existing + 500),
+        ];
+        let titles = planned_source_dependency_titles(&db_path, &proposal)
+            .await
+            .unwrap();
+        assert_eq!(
+            titles,
+            HashMap::from([(existing, "Source prerequisite title".to_string())])
+        );
+        let tasks = proposed_classifier_tasks(&proposal, &titles);
+        assert_eq!(
+            tasks[1].dependencies[1],
+            format!("source:{existing} — Source prerequisite title")
+        );
+        assert_eq!(
+            tasks[1].dependencies[2],
+            format!("source:{}", existing + 500)
+        );
+        assert!(planned_source_dependency_titles(&db_path, &proposal[..1])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn child_preclassification_uses_the_shared_size_policy_and_records_complexity() {
+        let proposal = composition_child_fixture();
+        let verdict = |size: &str, cx_est: i64| quorum_core::classify::TaskClassification {
+            task_id: -2,
+            cx_est,
+            size: size.into(),
+            size_reason: "composition over delivered sibling seams".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        };
+        for (size, cx_est) in [("S", 5), ("M", 5), ("L", 1), ("L", 3)] {
+            assert!(
+                child_preclassification_rejection_detail(&proposal[1], &verdict(size, cx_est))
+                    .is_none(),
+                "{size}/{cx_est} must be accepted"
+            );
+        }
+        for (size, cx_est) in [("L", 4), ("L", 5), ("XL", 1), ("XL", 5)] {
+            let detail =
+                child_preclassification_rejection_detail(&proposal[1], &verdict(size, cx_est))
+                    .unwrap();
+            assert!(
+                detail.starts_with(&format!("size={size} cx_est={cx_est} (size_reason: ")),
+                "{detail}"
+            );
+        }
+        let detail =
+            child_preclassification_rejection_detail(&proposal[1], &verdict("L", 4)).unwrap();
+        assert!(detail.contains("cx_est=4"));
+        // The planner sees the complete rejected delta and paths, not a
+        // 128-byte prefix.
+        assert!(detail.contains(&format!(
+            "rejected_delta={}; affected_paths=[src/flow/compose.rs]",
+            proposal[1].implementation_delta
+        )));
+        assert!(detail.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
+        let summary = child_preclassification_rejection(&proposal[1], &verdict("L", 4)).unwrap();
+        assert!(summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
+        assert!(summary.contains(&proposal[1].implementation_delta));
     }
 
     #[test]
@@ -35601,6 +36457,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             task_id: -1,
             cx_est: 5,
             size: "XL".into(),
+            size_reason: format!(
+                "{} and {}",
+                "cross-component execution surfaces ".repeat(64),
+                "independently deliverable storage and daemon seams"
+            ),
             ready: false,
             not_ready_reason: Some("é".repeat(4_096)),
             duplicate_of: (1..=1_000).collect(),
@@ -35611,7 +36472,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
         assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
         assert!(summary.contains("ready=false (not_ready_reason: é"));
-        assert!(summary.contains("…); size=XL; duplicate_of=[1, 2"));
+        assert!(summary.contains("…); size=XL cx_est=5 (size_reason: cross-component"));
+        assert!(summary.contains("…); duplicate_of=[1, 2"));
         assert!(summary.contains("rejected_delta=change the bounded planner seam"));
         assert!(
             summary.ends_with("affected_paths=[src/bounded.rs]"),
@@ -35631,6 +36493,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             prompt.ends_with(&format!("PRIOR_REJECTIONS={retry_json}")),
             "planner retry feedback altered the bounded rejection summary: {prompt}"
         );
+        assert!(prompt.contains("size_reason"));
+        assert!(prompt.contains("Renaming or paraphrasing the rejected child is not a correction"));
     }
 
     #[test]
@@ -35650,6 +36514,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             task_id: -1,
             cx_est: 2,
             size: "S".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: false,
             not_ready_reason: Some("owner must select the storage format".into()),
             duplicate_of: vec![],
@@ -35708,6 +36573,256 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 "child readiness rejected by preclassification: ready=false (not_ready_reason: owner must select the storage format)".into(),
             )
         );
+    }
+
+    #[test]
+    fn proposal_size_verdict_reason_is_durable_planner_retry_context() {
+        let proposal = vec![
+            planner::ProposedTask {
+                key: "storage-child".into(),
+                title: "storage child".into(),
+                implementation_delta: "change storage and daemon orchestration".into(),
+                affected_paths: vec![
+                    "quorum-core/src/schema.sql".into(),
+                    "quorum/src/serve/mod.rs".into(),
+                ],
+                observable_outcome: "the broad storage behavior works".into(),
+                deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                    quorum_core::decomposition::ChildDeliverable::Write {
+                        path: "quorum-core/src/schema.sql".into(),
+                    },
+                    quorum_core::decomposition::ChildDeliverable::Write {
+                        path: "quorum/src/serve/mod.rs".into(),
+                    },
+                ]),
+                acceptance_criteria: vec!["broad storage behavior is atomic".into()],
+                source_constraints: vec!["preserve atomicity".into()],
+                verification_expectations: vec!["real DB test".into()],
+                prerequisites: vec![],
+                ..Default::default()
+            },
+            planner::ProposedTask {
+                key: "provider-child".into(),
+                title: "provider child".into(),
+                implementation_delta: "change provider launch and restart reconstruction".into(),
+                affected_paths: vec![
+                    "quorum/src/serve/agent.rs".into(),
+                    "quorum/src/serve/restart.rs".into(),
+                ],
+                observable_outcome: "the broad provider behavior works".into(),
+                deliverables: quorum_core::decomposition::ChildDeliverables(vec![
+                    quorum_core::decomposition::ChildDeliverable::Write {
+                        path: "quorum/src/serve/agent.rs".into(),
+                    },
+                    quorum_core::decomposition::ChildDeliverable::Write {
+                        path: "quorum/src/serve/restart.rs".into(),
+                    },
+                ]),
+                acceptance_criteria: vec!["provider attempts reconstruct exactly".into()],
+                source_constraints: vec!["preserve launch attribution".into()],
+                verification_expectations: vec!["restart test".into()],
+                prerequisites: vec![],
+                ..Default::default()
+            },
+        ];
+        let classifications = vec![
+            quorum_core::classify::TaskClassification {
+                task_id: -1,
+                cx_est: 4,
+                size: "L".into(),
+                size_reason: "independently deliverable storage and daemon orchestration seams"
+                    .into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            },
+            quorum_core::classify::TaskClassification {
+                task_id: -2,
+                cx_est: 5,
+                size: "XL".into(),
+                size_reason:
+                    "independently deliverable provider launch and restart reconstruction seams"
+                        .into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            },
+        ];
+        let summary = planned_children(&proposal, &classifications).unwrap_err();
+        assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
+        assert!(summary.contains(
+            "child storage-child: size=L cx_est=4 (size_reason=independently deliverable storage and daemon orchestration seams)"
+        ));
+        assert!(summary.contains(
+            "child provider-child: size=XL cx_est=5 (size_reason=independently deliverable provider launch and restart reconstruction seams)"
+        ));
+        assert!(summary.contains("rejected_delta=change storage and daemon orchestration"));
+        assert!(
+            summary.contains("rejected_delta=change provider launch and restart reconstruction")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("size-reason.db")).unwrap();
+        let source = tasks::create(
+            &mut conn,
+            "owner",
+            "source",
+            Some("source outcome"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "claude",
+                model: "opus",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph,
+            "proposal",
+            "child-preclassification",
+            &summary,
+            3,
+        )
+        .unwrap();
+
+        let snapshot = load_planning_snapshot(&conn).unwrap().unwrap();
+        assert_eq!(snapshot.rejection_summaries, vec![summary.clone()]);
+        let prompt = bounded_planning_prompt(&snapshot).unwrap();
+        let retry_json = serde_json::to_string(&vec![summary.clone()]).unwrap();
+        assert!(prompt.ends_with(&format!("PRIOR_REJECTIONS={retry_json}")));
+        assert!(prompt.contains("independently deliverable storage and daemon orchestration"));
+        assert!(prompt.contains("independently deliverable provider launch and restart"));
+        assert!(prompt.contains("redistribute those named surfaces"));
+    }
+
+    #[test]
+    fn maximum_batch_preserves_every_failed_dimension_through_planner_retry() {
+        let mut proposal = Vec::new();
+        let mut classifications = Vec::new();
+        let mut keys = Vec::new();
+        for index in 0..8 {
+            let key = format!("child-{index}-{}", "k".repeat(56));
+            assert_eq!(key.len(), MAX_PLANNED_CHILD_KEY_BYTES);
+            proposal.push(planner::ProposedTask {
+                key: key.clone(),
+                title: format!("child {index}"),
+                implementation_delta: format!("delta-{index}-{}", "d".repeat(160)),
+                affected_paths: vec![format!("src/path-{index}.rs")],
+                observable_outcome: format!("outcome {index}"),
+                deliverables: writable_deliverables(&format!("src/path-{index}.rs")),
+                acceptance_criteria: vec![format!("criterion {index}")],
+                source_constraints: vec!["preserve atomicity".into()],
+                verification_expectations: vec![format!("test {index}")],
+                prerequisites: vec![],
+                ..Default::default()
+            });
+            classifications.push(quorum_core::classify::TaskClassification {
+                task_id: -(index as i64) - 1,
+                cx_est: 5,
+                size: if index % 2 == 0 { "L" } else { "XL" }.into(),
+                size_reason: format!("size-seam-{index}-{}", "s".repeat(160)),
+                ready: false,
+                not_ready_reason: Some(format!("ready-{index}-{}", "r".repeat(160))),
+                duplicate_of: vec![700 + index as i64],
+            });
+            keys.push(key);
+        }
+
+        let summary = planned_children(&proposal, &classifications).unwrap_err();
+        assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
+        for (index, key) in keys.iter().enumerate() {
+            let line = summary
+                .lines()
+                .find(|line| line.starts_with(&format!("child {key}:")))
+                .unwrap_or_else(|| panic!("missing child {key} in {summary}"));
+            assert!(
+                line.contains(&format!("not_ready_reason=ready-{index}-")),
+                "{line}"
+            );
+            let size = if index % 2 == 0 { "L" } else { "XL" };
+            assert!(line.contains(&format!("size={size}")), "{line}");
+            assert!(
+                line.contains(&format!("size_reason=size-seam-{index}-")),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("duplicate_of={}", 700 + index)),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("rejected_delta=delta-{index}-")),
+                "{line}"
+            );
+            assert!(
+                line.contains(&format!("affected_paths=[src/path-{index}")),
+                "{line}"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("maximum-batch.db")).unwrap();
+        let source = tasks::create(
+            &mut conn,
+            "owner",
+            "source",
+            Some("source outcome"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "claude",
+                model: "opus",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph,
+            "proposal",
+            "child-preclassification",
+            &summary,
+            3,
+        )
+        .unwrap();
+
+        let snapshot = load_planning_snapshot(&conn).unwrap().unwrap();
+        assert_eq!(snapshot.rejection_summaries, vec![summary.clone()]);
+        let prompt = bounded_planning_prompt(&snapshot).unwrap();
+        let retry_json = serde_json::to_string(&vec![summary]).unwrap();
+        assert!(prompt.ends_with(&format!("PRIOR_REJECTIONS={retry_json}")));
+        for index in 0..8 {
+            assert!(prompt.contains(&format!("ready-{index}-")));
+            assert!(prompt.contains(&format!("size-seam-{index}-")));
+            assert!(prompt.contains(&format!("duplicate_of={}", 700 + index)));
+            assert!(prompt.contains(&format!("delta-{index}-")));
+            assert!(prompt.contains(&format!("src/path-{index}")));
+        }
     }
 
     #[tokio::test]
@@ -35911,8 +37026,29 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         ]
     }
 
+    // The classifier batch that admits `arbiter_gate_proposal()`: both children
+    // small and admission-ready, keyed on the proposal's positional ids.
+    fn arbiter_gate_classifications() -> Vec<quorum_core::classify::TaskClassification> {
+        [(-1, "one core seam"), (-2, "one verification file")]
+            .into_iter()
+            .map(
+                |(task_id, reason)| quorum_core::classify::TaskClassification {
+                    task_id,
+                    cx_est: 2,
+                    size: "S".into(),
+                    size_reason: reason.into(),
+                    ready: true,
+                    not_ready_reason: None,
+                    duplicate_of: vec![],
+                },
+            )
+            .collect()
+    }
+
     // Drive a source to a freeze-owning graph in `validating` state with the
-    // given proposal durably accepted, mirroring the escaping-child fixture.
+    // given proposal durably accepted and its classifier batch durably accepted
+    // (the lifecycle order is planning -> preclassifying -> validating), so the
+    // Arbiter gate is the next phase. Mirrors the escaping-child fixture.
     fn arbiter_validating_graph(
         db_path: &Path,
         title: &str,
@@ -35951,7 +37087,47 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             quorum_core::decomposition::accept_proposal(&mut conn, graph, &proposal_json, 4)
                 .unwrap()
         );
+        let classifications_json = serde_json::to_string(&arbiter_gate_classifications()).unwrap();
+        assert!(quorum_core::decomposition::accept_classifications(
+            &mut conn,
+            graph,
+            &classifications_json,
+            5,
+        )
+        .unwrap());
         (source, graph)
+    }
+
+    fn arbiter_gate_accepted_columns(
+        db_path: &Path,
+        graph: i64,
+    ) -> (Option<String>, Option<String>) {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT accepted_proposal_json,accepted_classifications_json
+             FROM task_decompositions WHERE id=?1",
+            [graph],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Every materialized child's classification refs, keyed by local key.
+    fn arbiter_gate_child_refs(db_path: &Path, graph: i64) -> Vec<(String, serde_json::Value)> {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.local_key,t.refs FROM task_graph_members m JOIN tasks t ON t.id=m.task_id
+                 WHERE m.graph_id=?1 AND m.active=1 ORDER BY m.local_key",
+            )
+            .unwrap();
+        stmt.query_map([graph], |row| {
+            let refs: String = row.get(1)?;
+            Ok((row.get(0)?, serde_json::from_str(&refs).unwrap()))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
     }
 
     fn arbiter_gate_state(db_path: &Path, graph: i64) -> (String, i64, Option<String>, String) {
@@ -36054,31 +37230,47 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[tokio::test]
-    async fn arbiter_approve_advances_to_preclassifying_exactly_once() {
+    async fn arbiter_approve_materializes_the_classified_proposal_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("approve.db");
         let proposal = arbiter_gate_proposal();
+        let classifications = arbiter_gate_classifications();
         let (source, graph) =
             arbiter_validating_graph(&db_path, "large", Some("split me"), &proposal);
         let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
 
-        let advanced = apply_arbiter_verdict(
+        let materialized = apply_arbiter_verdict(
             &config,
             graph,
             arbiter_done(arbiter::ArbiterVerdict::Approve),
+            &proposal,
+            &classifications,
         )
         .await
         .unwrap();
         assert!(
-            advanced,
-            "approve keeps the proposal for the classifier stage"
+            materialized,
+            "approve materializes from the classification accepted before the Arbiter ran"
         );
 
         let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
-        assert_eq!(state, "preclassifying");
+        assert_eq!(state, "active");
         assert_eq!(attempts, 0);
         assert!(hold.is_none());
-        assert_eq!(status, "planning");
+        assert_eq!(status, "decomposed");
+        assert_eq!(
+            arbiter_gate_accepted_columns(&db_path, graph),
+            (None, None),
+            "materialization retires both durable inputs"
+        );
+        let refs = arbiter_gate_child_refs(&db_path, graph);
+        assert_eq!(refs.len(), 2);
+        for ((key, refs), verdict) in refs.iter().zip(classifications.iter()) {
+            assert_eq!(refs["cx_size"], "S", "{key}");
+            assert_eq!(refs["cx_est"], 2, "{key}");
+            assert_eq!(refs["cx_ready"], true, "{key}");
+            assert_eq!(refs["cx_size_reason"], verdict.size_reason, "{key}");
+        }
         assert_eq!(
             arbiter_gate_attempts(&db_path, graph),
             vec![("verdict".to_string(), "arbiter-approve".to_string())]
@@ -36097,19 +37289,35 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(summary["provider"], "codex");
         assert_eq!(summary["model"], "gpt-test");
         assert_eq!(summary["effort"], "high");
-        assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
+        assert_eq!(arbiter_gate_child_count(&db_path, source), (2, 2));
 
-        // A restart that re-polls a fresh Arbiter cannot double-advance: the
-        // guarded transition is keyed on state='validating'.
-        let again = advance_validating_to_preclassifying(&config, graph)
-            .await
-            .unwrap();
+        // A restart that re-polls a fresh Arbiter cannot double-materialize:
+        // the guarded materialization is keyed on the frozen planning phase
+        // and the one-active-graph index, and no budget-bearing row is
+        // recorded against an active graph.
+        let again = apply_arbiter_verdict(
+            &config,
+            graph,
+            arbiter_done(arbiter::ArbiterVerdict::Approve),
+            &proposal,
+            &classifications,
+        )
+        .await
+        .unwrap();
         assert!(
             !again,
-            "second advance from preclassifying is a clean no-op"
+            "second approve against an active graph is a clean no-op"
         );
-        assert_eq!(arbiter_gate_state(&db_path, graph).0, "preclassifying");
-        assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
+        assert_eq!(arbiter_gate_state(&db_path, graph).0, "active");
+        assert_eq!(arbiter_gate_child_count(&db_path, source), (2, 2));
+        assert_eq!(
+            arbiter_gate_attempts(&db_path, graph),
+            vec![
+                ("verdict".to_string(), "arbiter-approve".to_string()),
+                ("verdict".to_string(), "arbiter-approve".to_string()),
+            ],
+            "only the observational verdict row repeats; no blocker or proposal row"
+        );
     }
 
     #[tokio::test]
@@ -36140,11 +37348,18 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         drop(conn);
 
         assert!(
-            !apply_arbiter_verdict(&config, graph, outcome)
-                .await
-                .unwrap(),
-            "cancellation wins the guarded validating -> preclassifying transition"
+            !apply_arbiter_verdict(
+                &config,
+                graph,
+                outcome,
+                &proposal,
+                &arbiter_gate_classifications()
+            )
+            .await
+            .unwrap(),
+            "cancellation wins the guarded materialization"
         );
+        assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
         let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
         assert_eq!(state, "cancelled");
         assert_eq!(attempts, 0);
@@ -36174,16 +37389,22 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 child_key: "core".into(),
             }],
         };
-        let advanced = apply_arbiter_verdict(&config, graph, arbiter_done(verdict))
-            .await
-            .unwrap();
-        assert!(advanced);
-        assert_eq!(arbiter_gate_state(&db_path, graph).0, "preclassifying");
+        let materialized = apply_arbiter_verdict(
+            &config,
+            graph,
+            arbiter_done(verdict),
+            &proposal,
+            &arbiter_gate_classifications(),
+        )
+        .await
+        .unwrap();
+        assert!(materialized);
+        assert_eq!(arbiter_gate_state(&db_path, graph).0, "active");
         assert_eq!(
             arbiter_gate_attempts(&db_path, graph),
             vec![("verdict".to_string(), "arbiter-changes".to_string())]
         );
-        assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
+        assert_eq!(arbiter_gate_child_count(&db_path, source), (2, 2));
     }
 
     #[tokio::test]
@@ -36201,15 +37422,29 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 child_key: "core".into(),
             }],
         };
-        let advanced = apply_arbiter_verdict(&config, graph, arbiter_done(verdict))
-            .await
-            .unwrap();
-        assert!(!advanced, "a blocking changes verdict does not advance");
+        let materialized = apply_arbiter_verdict(
+            &config,
+            graph,
+            arbiter_done(verdict),
+            &proposal,
+            &arbiter_gate_classifications(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !materialized,
+            "a blocking changes verdict does not materialize"
+        );
 
         let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
         assert_eq!(
             state, "planning",
             "the planner re-proposes against the findings"
+        );
+        assert_eq!(
+            arbiter_gate_accepted_columns(&db_path, graph),
+            (None, None),
+            "the rejected proposal's classification is discarded with it"
         );
         assert_eq!(attempts, 1);
         assert!(hold.is_none());
@@ -36257,6 +37492,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     (4 + round) as i64,
                 )
                 .unwrap());
+                // The classifier runs (and accepts) before every Arbiter round.
+                assert!(quorum_core::decomposition::accept_classifications(
+                    &mut conn,
+                    graph,
+                    &serde_json::to_string(&arbiter_gate_classifications()).unwrap(),
+                    (5 + round) as i64,
+                )
+                .unwrap());
             }
             let verdict = arbiter::ArbiterVerdict::Changes {
                 findings: vec![arbiter::ArbiterFinding {
@@ -36265,9 +37508,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     child_key: String::new(),
                 }],
             };
-            apply_arbiter_verdict(&config, graph, arbiter_done(verdict))
-                .await
-                .unwrap();
+            apply_arbiter_verdict(
+                &config,
+                graph,
+                arbiter_done(verdict),
+                &proposal,
+                &arbiter_gate_classifications(),
+            )
+            .await
+            .unwrap();
         }
 
         let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
@@ -36327,10 +37576,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             reason: "source is too underspecified to split safely".into(),
             required_decision: "owner must choose a storage format".into(),
         };
-        let advanced = apply_arbiter_verdict(&config, graph, arbiter_done(verdict))
-            .await
-            .unwrap();
-        assert!(!advanced);
+        let materialized = apply_arbiter_verdict(
+            &config,
+            graph,
+            arbiter_done(verdict),
+            &proposal,
+            &arbiter_gate_classifications(),
+        )
+        .await
+        .unwrap();
+        assert!(!materialized);
 
         let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
         assert_eq!(state, "held");
@@ -36355,14 +37610,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let (source, graph) = arbiter_validating_graph(&db_path, "large", None, &proposal);
         let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
 
-        let advanced = apply_arbiter_verdict(
+        let materialized = apply_arbiter_verdict(
             &config,
             graph,
             arbiter_provider_failure("malformed verdict"),
+            &proposal,
+            &arbiter_gate_classifications(),
         )
         .await
         .unwrap();
-        assert!(!advanced);
+        assert!(!materialized);
 
         let (state, attempts, _hold, _status) = arbiter_gate_state(&db_path, graph);
         assert_eq!(state, "provider-backoff");
@@ -36411,6 +37668,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut coordinator = DecompositionCoordinator {
             graph_id: Some(graph),
             proposal: Some(proposal),
+            classifications: Some(arbiter_gate_classifications()),
             ..DecompositionCoordinator::default()
         };
         tick_decomposition(
@@ -36440,6 +37698,659 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "no literal-specific rejection may occur: {attempts:?}"
         );
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
+    }
+
+    /// One classifier batch admitting `arbiter_gate_proposal()` in the wire
+    /// shape the daemon parses, with the second child's size selectable so a
+    /// test can make the batch reject the proposal.
+    fn live_classifier_batch(verify_size: &str, reason: &str) -> String {
+        serde_json::json!({"tasks":[
+            {"task_id":-1,"complexity":2,"size":"S","size_reason":reason,
+             "ready":true,"not_ready_reason":null},
+            {"task_id":-2,"complexity":2,"size":verify_size,"size_reason":reason,
+             "ready":true,"not_ready_reason":null}
+        ]})
+        .to_string()
+    }
+
+    #[cfg(unix)]
+    fn codex_transcript(text: &str) -> String {
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{"type":"agent_message","id":"response","text":text}
+            }),
+            serde_json::json!({
+                "type":"turn.completed",
+                "usage":{"input_tokens":10,"cached_input_tokens":0,"cache_write_input_tokens":0,
+                         "output_tokens":2,"reasoning_output_tokens":0}
+            })
+        )
+    }
+
+    /// Live-process harness for the planning lifecycle order. One fake Codex
+    /// binary dispatches on how the daemon spawns it: a planner carries its run
+    /// envelope (`QUORUM_RUN_ID`) and stays live; the Arbiter runs inside the
+    /// frozen repository view (where `src/core.rs` exists); the classifier
+    /// runs in an empty isolation directory. The graph starts in `planning`
+    /// bound to the repository's real HEAD so frozen views can be built.
+    #[cfg(unix)]
+    struct LifecycleHarness {
+        _dir: tempfile::TempDir,
+        db_path: PathBuf,
+        config: ServeConfig,
+        source: i64,
+        graph: i64,
+        classifier_output: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn lifecycle_harness(name: &str) -> LifecycleHarness {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(format!("{name}.db"));
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("tests")).unwrap();
+        std::fs::write(repo_dir.join("src/core.rs"), "pub fn core() {}\n").unwrap();
+        std::fs::write(repo_dir.join("tests/core.rs"), "#[test] fn core() {}\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "frozen"]);
+        let frozen_base_sha = git(&["rev-parse", "HEAD"]);
+
+        let arbiter_output = dir.path().join("arbiter.jsonl");
+        let classifier_output = dir.path().join("classifier.jsonl");
+        std::fs::write(
+            &arbiter_output,
+            codex_transcript(r#"{"outcome":"approve"}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            &classifier_output,
+            codex_transcript(&live_classifier_batch("S", "live classifier")),
+        )
+        .unwrap();
+        let runner = dir.path().join("codex");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\n\
+                 if [ -n \"$QUORUM_RUN_ID\" ]; then exec /bin/sleep 30; fi\n\
+                 if [ -f src/core.rs ]; then exec /bin/cat '{}'; fi\n\
+                 exec /bin/cat '{}'\n",
+                arbiter_output.display(),
+                classifier_output.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (source, graph) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source = tasks::create(
+                &mut conn,
+                "owner",
+                "split source",
+                Some("split this safely"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id: source,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "gpt-5.6-sol",
+                    frozen_base_sha: &frozen_base_sha,
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph,
+                "freeze-requested",
+                "draining",
+                None,
+                3,
+            )
+            .unwrap();
+            assert!(
+                quorum_core::decomposition::bind_frozen_base_and_enter_planning(
+                    &mut conn,
+                    graph,
+                    &frozen_base_sha,
+                    4,
+                )
+                .unwrap()
+            );
+            (source, graph)
+        };
+
+        let mut config = pre_review_checks_config(db_path.clone(), repo_dir);
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "test".to_string(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: planner::CODEX_PLANNER_MODEL.into(),
+                effort: planner::PLANNER_EFFORT.into(),
+            },
+        )]);
+        config.agent_bin = Some(runner.to_string_lossy().into_owned());
+        LifecycleHarness {
+            _dir: dir,
+            db_path,
+            config,
+            source,
+            graph,
+            classifier_output,
+        }
+    }
+
+    #[cfg(unix)]
+    impl LifecycleHarness {
+        fn accept_proposal(&self, now: i64) {
+            let mut conn = quorum_core::db::open(&self.db_path).unwrap();
+            let proposal_json = serde_json::to_string(&arbiter_gate_proposal()).unwrap();
+            assert!(quorum_core::decomposition::accept_proposal(
+                &mut conn,
+                self.graph,
+                &proposal_json,
+                now,
+            )
+            .unwrap());
+        }
+
+        fn accept_classifications(&self, reason: &str, now: i64) {
+            let mut conn = quorum_core::db::open(&self.db_path).unwrap();
+            let mut batch = arbiter_gate_classifications();
+            for verdict in &mut batch {
+                verdict.size_reason = reason.into();
+            }
+            assert!(quorum_core::decomposition::accept_classifications(
+                &mut conn,
+                self.graph,
+                &serde_json::to_string(&batch).unwrap(),
+                now,
+            )
+            .unwrap());
+        }
+
+        /// Journal rows per decomposition role and the Arbiter role assignments:
+        /// the durable footprint an Arbiter spawn cannot avoid leaving.
+        fn spawn_footprint(&self) -> (i64, i64, i64) {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            conn.query_row(
+                "SELECT (SELECT count(*) FROM journal WHERE role='arbiter'),
+                        (SELECT count(*) FROM journal WHERE role='classifier'),
+                        (SELECT count(*) FROM role_assignments WHERE role='arbiter')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        }
+
+        async fn tick(&self, coordinator: &mut DecompositionCoordinator) -> bool {
+            tick_decomposition(
+                &self.config,
+                coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Tick until the given slot predicate clears; the fake provider's exit
+        /// is observed by the poll, not by a tick count.
+        async fn tick_until(
+            &self,
+            coordinator: &mut DecompositionCoordinator,
+            done: impl Fn(&DecompositionCoordinator) -> bool,
+        ) {
+            for _ in 0..200 {
+                self.tick(coordinator).await;
+                if done(coordinator) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the live decomposition fixture never reached the expected slot state");
+        }
+
+        async fn settle(&self, coordinator: &mut DecompositionCoordinator) {
+            reap_decomposition_planner_with_usage(&self.db_path, coordinator).await;
+            reap_decomposition_arbiter_with_usage(&self.db_path, coordinator).await;
+            reap_decomposition_classifier_with_usage(&self.db_path, coordinator).await;
+        }
+    }
+
+    /// A classifier rejection returns the proposal to the planner retry path
+    /// from `preclassifying`: the Arbiter is never assigned, journalled, or
+    /// spawned for that proposal, and no verdict row exists.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn classifier_rejection_replans_without_ever_spawning_an_arbiter() {
+        let harness = lifecycle_harness("classifier-rejects");
+        // XL is never child-dispatchable under the shared size policy (L is
+        // admitted at low complexity), so this batch rejects the proposal.
+        std::fs::write(
+            &harness.classifier_output,
+            codex_transcript(&live_classifier_batch("XL", "verify spans the suite")),
+        )
+        .unwrap();
+        harness.accept_proposal(5);
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "preclassifying"
+        );
+
+        // A fresh coordinator (as after a restart) reloads the proposal.
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        assert!(coordinator.classifier_slot.is_some());
+        assert!(coordinator.arbiter_slot.is_none());
+        assert_eq!(harness.spawn_footprint(), (0, 1, 0));
+
+        harness
+            .tick_until(&mut coordinator, |c| c.classifier_slot.is_none())
+            .await;
+
+        let (state, attempts, hold, status) = arbiter_gate_state(&harness.db_path, harness.graph);
+        assert_eq!(
+            state, "planning",
+            "the rejected proposal returns to planning"
+        );
+        assert_eq!(attempts, 1);
+        assert!(hold.is_none());
+        assert_eq!(status, "planning");
+        assert_eq!(
+            arbiter_gate_accepted_columns(&harness.db_path, harness.graph),
+            (None, None)
+        );
+        let attempts = arbiter_gate_attempts(&harness.db_path, harness.graph);
+        assert_eq!(
+            attempts,
+            vec![(
+                "proposal".to_string(),
+                "child-preclassification".to_string()
+            )],
+            "no verdict/provider row: the Arbiter never ran"
+        );
+        assert!(arbiter_gate_verdicts(&harness.db_path, harness.graph).is_empty());
+        assert!(coordinator.arbiter_slot.is_none());
+        assert!(coordinator.classifications.is_none());
+        assert_eq!(
+            harness.spawn_footprint().0,
+            0,
+            "no Arbiter journal row was ever written"
+        );
+        assert_eq!(harness.spawn_footprint().2, 0, "no Arbiter role assignment");
+        assert!(
+            coordinator.planner_slot.is_some(),
+            "the retry path resumed the planner in the same tick"
+        );
+        assert_eq!(
+            arbiter_gate_child_count(&harness.db_path, harness.source),
+            (0, 0)
+        );
+        harness.settle(&mut coordinator).await;
+    }
+
+    /// An Arbiter rejection returns to the planner retry path; the next
+    /// proposal is classified again before the Arbiter runs, and the approved
+    /// proposal materializes from the classification the Arbiter reviewed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn arbiter_rejection_then_retry_classifies_before_the_next_arbiter_run() {
+        let harness = lifecycle_harness("arbiter-changes-then-retry");
+        harness.accept_proposal(5);
+        harness.accept_classifications("first round", 6);
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "validating"
+        );
+
+        let verdict = arbiter::ArbiterVerdict::Changes {
+            findings: vec![arbiter::ArbiterFinding {
+                blocking: true,
+                summary: "dropped a load-bearing source constraint".into(),
+                child_key: "core".into(),
+            }],
+        };
+        assert!(!apply_arbiter_verdict(
+            &harness.config,
+            harness.graph,
+            arbiter_done(verdict),
+            &arbiter_gate_proposal(),
+            &arbiter_gate_classifications(),
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "planning"
+        );
+        assert_eq!(
+            arbiter_gate_accepted_columns(&harness.db_path, harness.graph),
+            (None, None)
+        );
+
+        // The planner re-proposes (durably, as the endpoint records it).
+        harness.accept_proposal(7);
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "preclassifying",
+            "a re-proposal is classified before the Arbiter sees it"
+        );
+
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        assert!(coordinator.classifier_slot.is_some());
+        assert!(coordinator.arbiter_slot.is_none());
+        assert_eq!(harness.spawn_footprint(), (0, 1, 0));
+
+        harness
+            .tick_until(&mut coordinator, |c| c.classifier_slot.is_none())
+            .await;
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "validating"
+        );
+        let (proposal, classifications) =
+            arbiter_gate_accepted_columns(&harness.db_path, harness.graph);
+        assert!(proposal.is_some());
+        assert!(
+            classifications
+                .as_deref()
+                .is_some_and(|json| json.contains("live classifier")),
+            "the live classifier batch is persisted next to the proposal: {classifications:?}"
+        );
+        assert!(
+            coordinator.arbiter_slot.is_some(),
+            "the Arbiter spawns only once the classification is durable"
+        );
+        assert_eq!(harness.spawn_footprint(), (1, 0, 1));
+
+        harness
+            .tick_until(&mut coordinator, |c| c.arbiter_slot.is_none())
+            .await;
+        let (state, attempts, _hold, status) = arbiter_gate_state(&harness.db_path, harness.graph);
+        assert_eq!(state, "active");
+        assert_eq!(
+            attempts, 1,
+            "only the Arbiter rejection consumed proposal budget"
+        );
+        assert_eq!(status, "decomposed");
+        assert_eq!(
+            arbiter_gate_attempts(&harness.db_path, harness.graph),
+            vec![
+                ("verdict".to_string(), "arbiter-changes".to_string()),
+                ("proposal".to_string(), "arbiter-changes".to_string()),
+                ("verdict".to_string(), "arbiter-approve".to_string()),
+            ]
+        );
+        assert_eq!(
+            arbiter_gate_accepted_columns(&harness.db_path, harness.graph),
+            (None, None)
+        );
+        let refs = arbiter_gate_child_refs(&harness.db_path, harness.graph);
+        assert_eq!(refs.len(), 2);
+        for (key, refs) in &refs {
+            assert_eq!(refs["cx_size"], "S", "{key}");
+            assert_eq!(refs["cx_est"], 2, "{key}");
+            assert_eq!(
+                refs["cx_size_reason"], "live classifier",
+                "{key} materialized from the reviewed classification"
+            );
+        }
+        harness.settle(&mut coordinator).await;
+    }
+
+    /// A restart inside `preclassifying` resumes the classifier, never the
+    /// Arbiter; a restart inside `validating` resumes the Arbiter from the
+    /// persisted classification without re-running the classifier, and the
+    /// materialized children carry that persisted classification.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_resumes_the_phase_it_interrupted_without_double_spend() {
+        // preclassifying: classifier resumes, no Arbiter footprint.
+        let harness = lifecycle_harness("restart-preclassifying");
+        harness.accept_proposal(5);
+        let mut coordinator = DecompositionCoordinator::default();
+        assert_eq!(
+            reconcile_decomposition_startup(&harness.config, &mut coordinator)
+                .await
+                .unwrap(),
+            StartupDecompositionState::Frozen
+        );
+        assert!(coordinator.proposal.is_some());
+        assert!(coordinator.classifications.is_none());
+        assert!(harness.tick(&mut coordinator).await);
+        assert!(coordinator.classifier_slot.is_some());
+        assert!(coordinator.arbiter_slot.is_none());
+        assert_eq!(harness.spawn_footprint(), (0, 1, 0));
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "preclassifying"
+        );
+        assert!(arbiter_gate_attempts(&harness.db_path, harness.graph).is_empty());
+        harness.settle(&mut coordinator).await;
+
+        // validating: Arbiter resumes from the persisted batch; the classifier
+        // never runs again, and the children prove which batch was used.
+        let harness = lifecycle_harness("restart-validating");
+        harness.accept_proposal(5);
+        harness.accept_classifications("persisted before restart", 6);
+        let mut coordinator = DecompositionCoordinator::default();
+        assert_eq!(
+            reconcile_decomposition_startup(&harness.config, &mut coordinator)
+                .await
+                .unwrap(),
+            StartupDecompositionState::Frozen
+        );
+        assert!(
+            coordinator.classifications.is_some(),
+            "startup rehydrates the accepted classification with the proposal"
+        );
+        assert!(harness.tick(&mut coordinator).await);
+        assert!(coordinator.arbiter_slot.is_some());
+        assert!(coordinator.classifier_slot.is_none());
+        assert_eq!(harness.spawn_footprint(), (1, 0, 1));
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "validating"
+        );
+
+        harness
+            .tick_until(&mut coordinator, |c| c.arbiter_slot.is_none())
+            .await;
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "active"
+        );
+        assert_eq!(
+            harness.spawn_footprint().1,
+            0,
+            "no classifier ran across the restart"
+        );
+        let refs = arbiter_gate_child_refs(&harness.db_path, harness.graph);
+        assert_eq!(refs.len(), 2);
+        for (key, refs) in &refs {
+            assert_eq!(
+                refs["cx_size_reason"], "persisted before restart",
+                "{key} must carry the classification the Arbiter reviewed, not a re-run"
+            );
+        }
+        assert_eq!(
+            arbiter_gate_attempts(&harness.db_path, harness.graph),
+            vec![("verdict".to_string(), "arbiter-approve".to_string())]
+        );
+        harness.settle(&mut coordinator).await;
+    }
+
+    /// A `validating` row without an accepted classification (written by a
+    /// binary that ran the Arbiter first) steps back to `preclassifying` so
+    /// the classifier runs before any Arbiter spawn. Nothing is charged, and
+    /// the proposal is kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validating_without_a_classification_steps_back_to_the_classifier() {
+        let harness = lifecycle_harness("legacy-validating");
+        harness.accept_proposal(5);
+        {
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            assert!(quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                harness.graph,
+                "preclassifying",
+                "validating",
+                None,
+                6,
+            )
+            .unwrap());
+        }
+        let mut coordinator = DecompositionCoordinator::default();
+        assert_eq!(
+            reconcile_decomposition_startup(&harness.config, &mut coordinator)
+                .await
+                .unwrap(),
+            StartupDecompositionState::Frozen
+        );
+        assert!(coordinator.classifications.is_none());
+
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "preclassifying",
+            "the Arbiter phase is unreachable without an accepted classification"
+        );
+        assert!(coordinator.arbiter_slot.is_none());
+        assert!(coordinator.classifier_slot.is_none());
+        assert_eq!(harness.spawn_footprint(), (0, 0, 0));
+        assert!(arbiter_gate_attempts(&harness.db_path, harness.graph).is_empty());
+        let (proposal, classifications) =
+            arbiter_gate_accepted_columns(&harness.db_path, harness.graph);
+        assert!(proposal.is_some(), "the proposal survives the step back");
+        assert!(classifications.is_none());
+
+        assert!(harness.tick(&mut coordinator).await);
+        assert!(coordinator.classifier_slot.is_some());
+        assert!(coordinator.arbiter_slot.is_none());
+        assert_eq!(harness.spawn_footprint(), (0, 1, 0));
+        harness.settle(&mut coordinator).await;
+    }
+
+    /// An Arbiter verdict polled while the coordinator holds a proposal but no
+    /// classification is a daemon invariant failure: the tick errors and
+    /// records nothing, so the planner budget is never charged for a batch
+    /// that was never rejected and no children materialize.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn arbiter_verdict_without_a_classification_is_a_loud_error_not_a_rejection() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("unclassified-verdict.db");
+        let proposal = arbiter_gate_proposal();
+        let (source, graph) = arbiter_validating_graph(&db_path, "large", None, &proposal);
+        let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+
+        let output = dir.path().join("arbiter.jsonl");
+        std::fs::write(&output, codex_transcript(r#"{"outcome":"approve"}"#)).unwrap();
+        let runner = dir.path().join("arbiter-codex");
+        std::fs::write(
+            &runner,
+            format!("#!/bin/sh\nexec /bin/cat '{}'\n", output.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let slot = arbiter::spawn_arbiter(
+            runner::AgentKind::Codex,
+            planner::CODEX_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let mut coordinator = DecompositionCoordinator {
+            graph_id: Some(graph),
+            proposal: Some(proposal),
+            classifications: None,
+            arbiter_slot: Some(slot),
+            arbiter_source_task_id: Some(source),
+            ..DecompositionCoordinator::default()
+        };
+
+        let mut error = None;
+        for _ in 0..200 {
+            match tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            {
+                Ok(_) if coordinator.arbiter_slot.is_some() => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(_) => panic!("an unclassified Arbiter verdict must not be applied"),
+                Err(failure) => {
+                    error = Some(failure);
+                    break;
+                }
+            }
+        }
+        let error = error.expect("the Arbiter fixture never reached its terminal path");
+        assert!(
+            matches!(&error, QuorumError::Io(message)
+                if message == "arbiter verdict for an unclassified proposal"),
+            "{error:?}"
+        );
+        assert!(coordinator.arbiter_slot.is_none());
+
+        let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
+        assert_eq!(
+            state, "validating",
+            "the graph keeps its phase for a fresh poll"
+        );
+        assert_eq!(attempts, 0, "no proposal budget is charged");
+        assert!(hold.is_none());
+        assert_eq!(status, "planning");
+        assert!(
+            arbiter_gate_attempts(&db_path, graph).is_empty(),
+            "nothing is recorded: no proposal, provider, blocker, or verdict row"
+        );
+        assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
+        let (durable_proposal, durable_batch) = arbiter_gate_accepted_columns(&db_path, graph);
+        assert!(durable_proposal.is_some() && durable_batch.is_some());
     }
 
     #[test]
@@ -36675,18 +38586,20 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     },
                 ])
                 .unwrap();
-                quorum_core::decomposition::accept_proposal(&mut conn, graph, &proposal, 5)
-                    .unwrap();
-                if phase == "preclassifying" {
-                    quorum_core::decomposition::set_frozen_phase(
+                // Acceptance enters `preclassifying`; the accepted classifier
+                // batch is what carries the graph into `validating`.
+                assert!(quorum_core::decomposition::accept_proposal(
+                    &mut conn, graph, &proposal, 5
+                )
+                .unwrap());
+                if phase == "validating" {
+                    assert!(quorum_core::decomposition::accept_classifications(
                         &mut conn,
                         graph,
-                        "validating",
-                        "preclassifying",
-                        None,
+                        &serde_json::to_string(&arbiter_gate_classifications()).unwrap(),
                         6,
                     )
-                    .unwrap();
+                    .unwrap());
                 }
             }
             for _ in 0..5 {
@@ -36771,24 +38684,26 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     4 + attempt * 2,
                 )
                 .unwrap();
-                quorum_core::decomposition::reject_frozen_proposal(
+                assert!(quorum_core::decomposition::reject_frozen_proposal(
                     &mut conn,
                     graph,
-                    "validating",
+                    "preclassifying",
                     "prior-semantic-rejection",
                     "proposal rejected by the prior binary",
                     5 + attempt * 2,
                 )
-                .unwrap();
+                .unwrap());
             }
             quorum_core::decomposition::accept_proposal(&mut conn, graph, &legacy.to_string(), 10)
                 .unwrap();
-            if phase == "preclassifying" {
+            if phase == "validating" {
+                // A legacy row that reached the Arbiter phase without any
+                // classification: the compatibility reset must still win.
                 quorum_core::decomposition::set_frozen_phase(
                     &mut conn,
                     graph,
-                    "validating",
                     "preclassifying",
+                    "validating",
                     None,
                     11,
                 )
@@ -36869,6 +38784,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 body: None,
                 dependencies: vec![],
                 recovery_notes: vec![],
+                body_char_limit: quorum_core::classify::BODY_CHAR_LIMIT,
             },
             quorum_core::classify::TaskForClassification {
                 id: -2,
@@ -36877,6 +38793,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 body: None,
                 dependencies: vec![],
                 recovery_notes: vec![],
+                body_char_limit: quorum_core::classify::BODY_CHAR_LIMIT,
             },
         ];
         let first_identity = DecompositionClassifierResponsibility {
@@ -36973,6 +38890,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: quorum_core::classify::BODY_CHAR_LIMIT,
         }];
         let mut classifier_slot = classifier::spawn_classifier_configured(
             &classifier_tasks,
@@ -37026,6 +38944,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             planner_source_task_id: None,
             planner_run_id: None,
             classifier_slot: Some(classifier_slot),
+            classifications: None,
             arbiter_slot: None,
             arbiter_source_task_id: None,
             planner_view: None,
@@ -37081,6 +39000,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: quorum_core::classify::BODY_CHAR_LIMIT,
         }];
         let slot = classifier::spawn_classifier_configured(
             &tasks,
@@ -37174,12 +39094,29 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 "usage":{"input_tokens":70,"cached_input_tokens":50,"cache_write_input_tokens":7,"output_tokens":4,"reasoning_output_tokens":2}
             })
         );
+        let classifier_output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{"type":"agent_message","id":"classifier-response",
+                        "text":live_classifier_batch("S", "live classifier")}
+            }),
+            serde_json::json!({
+                "type":"turn.completed",
+                "usage":{"input_tokens":30,"cached_input_tokens":20,"cache_write_input_tokens":3,"output_tokens":6,"reasoning_output_tokens":1}
+            })
+        );
         let planner_output_path = dir.path().join("planner.jsonl");
         let arbiter_output_path = dir.path().join("arbiter.jsonl");
+        let classifier_output_path = dir.path().join("classifier.jsonl");
         std::fs::write(&planner_output_path, planner_output).unwrap();
         std::fs::write(&arbiter_output_path, arbiter_output).unwrap();
+        std::fs::write(&classifier_output_path, classifier_output).unwrap();
         let planner_runner = dir.path().join("planner-codex");
-        let arbiter_runner = dir.path().join("arbiter-codex");
+        // The daemon spawns both post-planner roles through the configured
+        // binary: the Arbiter inside the frozen repository view (where
+        // `src/core.rs` exists) and the classifier in an empty isolation dir.
+        let lifecycle_runner = dir.path().join("lifecycle-codex");
         std::fs::write(
             &planner_runner,
             format!(
@@ -37189,14 +39126,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         )
         .unwrap();
         std::fs::write(
-            &arbiter_runner,
+            &lifecycle_runner,
             format!(
-                "#!/bin/sh\nexec /bin/cat '{}'\n",
-                arbiter_output_path.display()
+                "#!/bin/sh\nif [ -f src/core.rs ]; then exec /bin/cat '{}'; fi\nexec /bin/cat '{}'\n",
+                arbiter_output_path.display(),
+                classifier_output_path.display()
             ),
         )
         .unwrap();
-        for runner in [&planner_runner, &arbiter_runner] {
+        for runner in [&planner_runner, &lifecycle_runner] {
             std::fs::set_permissions(runner, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
@@ -37297,7 +39235,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 effort: planner::PLANNER_EFFORT.into(),
             },
         )]);
-        config.agent_bin = Some(arbiter_runner.to_string_lossy().into_owned());
+        config.agent_bin = Some(lifecycle_runner.to_string_lossy().into_owned());
         let mut coordinator = DecompositionCoordinator {
             graph_id: Some(graph_id),
             planner_slot: Some(planner_slot),
@@ -37343,7 +39281,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(planner_run.usage.output_tokens, 5);
         assert_eq!(
             load_planning_snapshot(&conn).unwrap().unwrap().state,
-            "validating",
+            "preclassifying",
             "planner usage is visible only after its durable proposal acceptance"
         );
         assert!(
@@ -37357,9 +39295,53 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
         assert!(coordinator.planner_run_id.is_none());
         drop(conn);
-        assert!(coordinator.arbiter_slot.is_some());
+        assert!(
+            coordinator.classifier_slot.is_some(),
+            "the classifier runs before any Arbiter spawn"
+        );
+        assert!(coordinator.arbiter_slot.is_none());
 
-        for _ in 0..3 {
+        for _ in 0..200 {
+            tick_decomposition(
+                &config,
+                &mut coordinator,
+                &[],
+                &[],
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap();
+            if coordinator.classifier_slot.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            coordinator.classifier_slot.is_none(),
+            "classifier fixture did not reach its terminal path"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let classifier_run = quorum_core::token_usage::for_task(&conn, source_task_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.purpose == "classifier")
+            .expect("classifier usage is recorded after the classification lifecycle write");
+        assert_eq!(classifier_run.usage.uncached_input_tokens, 10);
+        assert_eq!(classifier_run.usage.cached_input_tokens, 20);
+        assert_eq!(classifier_run.usage.output_tokens, 6);
+        assert_eq!(
+            load_planning_snapshot(&conn).unwrap().unwrap().state,
+            "validating",
+            "an accepted classification carries the proposal into the Arbiter phase"
+        );
+        drop(conn);
+        assert!(
+            coordinator.arbiter_slot.is_some(),
+            "the Arbiter is spawned once the classification is durable"
+        );
+
+        for _ in 0..200 {
             tick_decomposition(
                 &config,
                 &mut coordinator,
@@ -37372,7 +39354,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             if coordinator.arbiter_slot.is_none() {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(
             coordinator.arbiter_slot.is_none(),
@@ -37393,10 +39375,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(arbiter_run.usage.cache_write_input_tokens, 7);
         assert_eq!(arbiter_run.usage.output_tokens, 4);
         assert_eq!(
-            load_planning_snapshot(&conn).unwrap().unwrap().state,
-            "preclassifying",
-            "Arbiter usage is visible only after durable approval"
+            arbiter_gate_state(&db_path, graph_id).0,
+            "active",
+            "Arbiter usage is visible only after durable approval materialized the graph"
         );
+        assert_eq!(arbiter_gate_child_count(&db_path, source_task_id), (2, 2));
     }
 
     /// End-to-end cutover contract, driven by a real planner process against a
@@ -37668,7 +39651,8 @@ exec /bin/cat '{stdout}'
             let conn = quorum_core::db::open(&db_path).unwrap();
             assert_eq!(
                 load_planning_snapshot(&conn).unwrap().unwrap().state,
-                "validating"
+                "preclassifying",
+                "an accepted plan is classified before the Arbiter reviews it"
             );
             assert!(
                 conn.query_row(
@@ -37681,8 +39665,9 @@ exec /bin/cat '{stdout}'
             );
         }
         assert!(coordinator.planner_run_id.is_none());
+        assert!(coordinator.arbiter_slot.is_none());
 
-        reap_decomposition_arbiter_with_usage(&db_path, &mut coordinator).await;
+        reap_decomposition_classifier_with_usage(&db_path, &mut coordinator).await;
         endpoint.shutdown().await;
     }
 

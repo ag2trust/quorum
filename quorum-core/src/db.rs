@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 64;
+pub const SCHEMA_VERSION: i64 = 68;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1215,6 +1215,80 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                  END;",
             )?;
         }
+        // v65 stores the configured route actually used by an alternate agent
+        // run. Original-route and historical rows intentionally remain NULL;
+        // the guarded attribution API that writes these fields lands separately.
+        if current < 65 {
+            if !column_exists(conn, "agent_runs", "configured_profile_id")? {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN configured_profile_id TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "agent_runs", "configured_provider")? {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN configured_provider TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "agent_runs", "configured_model")? {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN configured_model TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "agent_runs", "configured_effort")? {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN configured_effort TEXT",
+                    [],
+                )?;
+            }
+        }
+        // v66 enforces at most one attributed alternate agent_run per
+        // (role_assignment_id, configured_profile_id). Partial `WHERE
+        // configured_profile_id IS NOT NULL` leaves every historical and
+        // original-route row (all NULL today) outside the index, so the migration
+        // is a no-op for existing rows. `CREATE UNIQUE INDEX IF NOT EXISTS` is
+        // idempotent for re-run under the same migration transaction and matches
+        // the shape SCHEMA_SQL applies to a fresh DB.
+        if current < 66 {
+            conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_configured_route
+                     ON agent_runs(role_assignment_id, configured_profile_id)
+                     WHERE configured_profile_id IS NOT NULL",
+            )?;
+        }
+        // v67 binds a freshly issued fallback capability to exactly one
+        // attributed agent run. Legacy and ordinary capabilities intentionally
+        // retain NULL, so this additive link neither rewrites history nor
+        // changes their existing resolver behavior.
+        if current < 67 {
+            if !column_exists(conn, "run_capabilities", "agent_run_id")? {
+                conn.execute(
+                    "ALTER TABLE run_capabilities
+                     ADD COLUMN agent_run_id INTEGER REFERENCES agent_runs(id)",
+                    [],
+                )?;
+            }
+            conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS run_capabilities_agent_run
+                     ON run_capabilities(agent_run_id)
+                     WHERE agent_run_id IS NOT NULL",
+            )?;
+        }
+        // v68 persists the classifier's accepted verdicts alongside the accepted
+        // proposal so the Arbiter phase (which now follows classification) and a
+        // restart inside it materialize from the classification that was actually
+        // reviewed, never a re-run. Plain nullable TEXT like v37; the write bound
+        // is enforced by `decomposition::accept_classifications`.
+        if current < 68
+            && !column_exists(conn, "task_decompositions", "accepted_classifications_json")?
+        {
+            conn.execute(
+                "ALTER TABLE task_decompositions ADD COLUMN accepted_classifications_json TEXT",
+                [],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1332,10 +1406,348 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1);
+        for column in [
+            "configured_profile_id",
+            "configured_provider",
+            "configured_model",
+            "configured_effort",
+        ] {
+            assert!(column_exists(&c, "agent_runs", column).unwrap());
+        }
+        assert!(column_exists(&c, "run_capabilities", "agent_run_id").unwrap());
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v64_to_v65_adds_nullable_configured_route_snapshot_without_rewriting_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v64-configured-route.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at)
+                 VALUES (7,'legacy','worker','opus','high','claude',1)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            // Drop the v62 partial index before removing its columns; SQLite
+            // refuses a DROP COLUMN that leaves a live index referencing it.
+            raw.execute_batch(
+                "DROP INDEX IF EXISTS agent_runs_configured_route;
+                 ALTER TABLE agent_runs DROP COLUMN configured_effort;
+                 ALTER TABLE agent_runs DROP COLUMN configured_model;
+                 ALTER TABLE agent_runs DROP COLUMN configured_provider;
+                 ALTER TABLE agent_runs DROP COLUMN configured_profile_id;
+                 PRAGMA user_version=64;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = open(&path).unwrap();
+        for column in [
+            "configured_profile_id",
+            "configured_provider",
+            "configured_model",
+            "configured_effort",
+        ] {
+            assert!(column_exists(&upgraded, "agent_runs", column).unwrap());
+        }
+        let legacy = crate::agent_runs::latest_for_task(&upgraded, 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.agent, "legacy");
+        assert_eq!(legacy.provider.as_deref(), Some("claude"));
+        assert_eq!(legacy.model, "opus");
+        assert_eq!(legacy.effort, "high");
+        assert_eq!(legacy.role_assignment_id, None);
+        assert_eq!(legacy.configured_profile_id, None);
+        assert_eq!(legacy.configured_provider, None);
+        assert_eq!(legacy.configured_model, None);
+        assert_eq!(legacy.configured_effort, None);
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            crate::agent_runs::latest_for_task(&reopened, 7)
+                .unwrap()
+                .unwrap()
+                .configured_profile_id,
+            None
+        );
+    }
+
+    #[test]
+    fn v65_to_v66_adds_configured_route_unique_partial_index_without_touching_null_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v61-configured-route-index.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (7,'migration fixture','working','test',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,role,complexity,profile_id,provider,runner,
+                     model,effort,pool_key,policy_generation,created_at)
+                 VALUES (42,'worker:task:7',7,'worker','M','opus','claude','claude',
+                         'opus','high','worker.M','gen-1',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at,
+                     role_assignment_id)
+                 VALUES (7,'legacy','worker','opus','high','claude',1,NULL),
+                        (7,'original','worker','opus','high','claude',2,42)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "DROP INDEX IF EXISTS agent_runs_configured_route;
+                 PRAGMA user_version=65;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = open(&path).unwrap();
+        assert_eq!(
+            upgraded
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let index_exists: i64 = upgraded
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='index' AND name='agent_runs_configured_route'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT count(*) FROM agent_runs WHERE configured_profile_id IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2,
+            "NULL configured routes must remain readable after the migration"
+        );
+
+        // A second run is a no-op: idempotent.
+        drop(upgraded);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        // Original-route rows (NULL configured_profile_id) can coexist without
+        // conflict; the partial index only spans populated rows.
+        reopened
+            .execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at,
+                     role_assignment_id)
+                 VALUES (7,'another-original','worker','opus','high','claude',3,42)",
+                [],
+            )
+            .unwrap();
+
+        // A duplicate populated configured route for the same assignment is
+        // rejected by the partial UNIQUE index.
+        reopened
+            .execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at,
+                     role_assignment_id,configured_profile_id,configured_provider,
+                     configured_model,configured_effort)
+                 VALUES (7,'alt-1','worker','sol','high','codex',4,42,
+                         'sol','codex','sol','high')",
+                [],
+            )
+            .unwrap();
+        let dup = reopened.execute(
+            "INSERT INTO agent_runs(
+                 task_id,agent_name,role,model,effort,provider,spawned_at,
+                 role_assignment_id,configured_profile_id,configured_provider,
+                 configured_model,configured_effort)
+             VALUES (7,'alt-2','worker','sol','high','codex',5,42,
+                     'sol','codex','sol','high')",
+            [],
+        );
+        assert!(dup.is_err(), "duplicate configured route must fail closed");
+    }
+
+    #[test]
+    fn v66_to_v67_adds_nullable_capability_run_link_without_rewriting_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v62-attributed-capability.db");
+        {
+            let mut conn = open(&path).unwrap();
+            crate::capabilities::issue(&mut conn, "legacy-cap", 7, "Legacy", "worker", 1).unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "CREATE TABLE run_capabilities_v62 (
+                     run_id      TEXT PRIMARY KEY,
+                     task_id     INTEGER NOT NULL,
+                     agent       TEXT NOT NULL,
+                     role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','planner')),
+                     created_at  INTEGER NOT NULL,
+                     revoked_at  INTEGER
+                 );
+                 INSERT INTO run_capabilities_v62
+                     SELECT run_id,task_id,agent,role,created_at,revoked_at
+                     FROM run_capabilities;
+                 DROP TABLE run_capabilities;
+                 ALTER TABLE run_capabilities_v62 RENAME TO run_capabilities;
+                 CREATE INDEX run_capabilities_agent
+                     ON run_capabilities(agent) WHERE revoked_at IS NULL;
+                 PRAGMA user_version=66;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = open(&path).unwrap();
+        assert!(column_exists(&upgraded, "run_capabilities", "agent_run_id").unwrap());
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT agent_run_id FROM run_capabilities WHERE run_id='legacy-cap'",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap(),
+            None,
+            "legacy capabilities must remain unlinked rather than being inferred"
+        );
+        let index_exists: i64 = upgraded
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='index' AND name='run_capabilities_agent_run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn v67_to_v68_adds_nullable_accepted_classifications_without_touching_proposals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v63-accepted-classifications.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','planning','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                    source_task_id,state,freeze_active,planned_source_revision,
+                    accepted_proposal_json,created_at,updated_at)
+                 VALUES (1,'validating',1,1,'[]',2,2)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE task_decompositions DROP COLUMN accepted_classifications_json;
+                 PRAGMA user_version=67;",
+            )
+            .unwrap();
+        }
+
+        let mut upgraded = open(&path).unwrap();
+        assert!(column_exists(
+            &upgraded,
+            "task_decompositions",
+            "accepted_classifications_json"
+        )
+        .unwrap());
+        let preserved: (String, Option<String>, Option<String>) = upgraded
+            .query_row(
+                "SELECT state,accepted_proposal_json,accepted_classifications_json
+                 FROM task_decompositions WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("validating".into(), Some("[]".into()), None),
+            "a pre-v64 validating row keeps its proposal and gains no inferred classification"
+        );
+
+        // The write bound is enforced by the guarded core write, mirroring v37.
+        upgraded
+            .execute(
+                "UPDATE task_decompositions SET state='preclassifying' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        let exact = format!("\"{}\"", "a".repeat(65_534));
+        assert_eq!(exact.len(), 65_536);
+        assert!(crate::decomposition::accept_classifications(&mut upgraded, 1, &exact, 3).unwrap());
+        upgraded
+            .execute(
+                "UPDATE task_decompositions
+                 SET state='preclassifying',accepted_classifications_json=NULL WHERE id=1",
+                [],
+            )
+            .unwrap();
+        let over = format!("\"{}\"", "é".repeat(32_768));
+        assert!(over.len() > 65_536);
+        assert!(crate::decomposition::accept_classifications(&mut upgraded, 1, &over, 4).is_err());
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
     }
 
     #[test]
