@@ -47,6 +47,22 @@ pub fn retire(conn: &mut Connection, input: &FallbackRetireInput<'_>) -> Result<
         .task_id
         .expect("validated task-scoped assignment");
     let tx = quorum_core::db::begin_immediate(conn)?;
+    if !quorum_core::capabilities::attributed_retirement_target_tx(
+        &tx,
+        &quorum_core::capabilities::AttributedRetirementTarget {
+            capability_run_id: input.failed_run.capability_run_id,
+            agent_run_id: input.failed_run.agent_run_id,
+            agent: input.failed_run.agent,
+            assignment: input.assignment,
+            failed_route: input.failed_route,
+            ended_at: input.failed_run.ended_at,
+            end_reason: input.failed_run.end_reason,
+        },
+    )? {
+        return Err(QuorumError::Usage(
+            "fallback retirement run authority does not match immutable evidence".into(),
+        ));
+    }
     routing_attempts::record_tx(
         &tx,
         &RecordRoutingAttempt {
@@ -196,26 +212,26 @@ mod tests {
         let assignment = quorum_core::role_assignments::get(&conn, conn.last_insert_rowid())
             .unwrap()
             .unwrap();
-        let agent_run_id = quorum_core::agent_runs::insert_worker_with_assignment(
-            &conn,
-            task_id,
-            "Wedge-gnua",
-            &assignment.responsibility_key,
-            &route.model,
-            &route.effort,
-            &route.provider,
-            &route.runner,
-            Some(assignment.id),
-            2,
+        conn.execute(
+            "INSERT INTO agent_runs(
+                 task_id,agent_name,role,model,effort,provider,role_assignment_id,spawned_at,
+                 configured_profile_id,configured_provider,configured_model,configured_effort)
+             VALUES (?1,'Wedge-gnua','worker',?2,?3,?4,?5,2,?6,?4,?2,?3)",
+            params![
+                task_id,
+                route.model,
+                route.effort,
+                route.provider,
+                assignment.id,
+                route.id,
+            ],
         )
         .unwrap();
-        quorum_core::capabilities::issue(
-            &mut conn,
-            "managed-run-1",
-            task_id,
-            "Wedge-gnua",
-            "worker",
-            2,
+        let agent_run_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at,agent_run_id)
+             VALUES ('managed-run-1',?1,'Wedge-gnua','worker',2,?2)",
+            [task_id, agent_run_id],
         )
         .unwrap();
         (dir, conn, assignment, pool, agent_run_id)
@@ -379,6 +395,76 @@ mod tests {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn mismatched_capability_run_binding_rolls_back_every_retirement_mutation() {
+        let (_dir, mut conn, assignment, pool, agent_run_id) = fixture();
+        let unrelated_run = quorum_core::agent_runs::insert(
+            &conn,
+            assignment.task_id.unwrap(),
+            "Wedge-gnua",
+            "worker",
+            "unrelated-model",
+            "low",
+            "codex",
+            3,
+        )
+        .unwrap();
+        let before = conn
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM routing_attempts),
+                     (SELECT recovery_attempts FROM tasks WHERE id=?1),
+                     (SELECT rework_round FROM tasks WHERE id=?1),
+                     (SELECT count(*) FROM agent_runs WHERE id IN (?2,?3) AND ended_at IS NOT NULL),
+                     (SELECT revoked_at IS NOT NULL FROM run_capabilities
+                      WHERE run_id='managed-run-1')",
+                params![assignment.task_id.unwrap(), agent_run_id, unrelated_run],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, bool>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert!(retire(
+            &mut conn,
+            &input(
+                &assignment,
+                &pool,
+                unrelated_run,
+                FailureDisposition::ProviderUnavailable,
+            ),
+        )
+        .is_err());
+        let after = conn
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM routing_attempts),
+                     (SELECT recovery_attempts FROM tasks WHERE id=?1),
+                     (SELECT rework_round FROM tasks WHERE id=?1),
+                     (SELECT count(*) FROM agent_runs WHERE id IN (?2,?3) AND ended_at IS NOT NULL),
+                     (SELECT revoked_at IS NOT NULL FROM run_capabilities
+                      WHERE run_id='managed-run-1')",
+                params![assignment.task_id.unwrap(), agent_run_id, unrelated_run],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, bool>(4)?,
                     ))
                 },
             )
