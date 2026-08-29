@@ -977,6 +977,17 @@ from comment text. Concretely:
   reviewer signals `changes`. This is lifecycle authority, not the findings ledger;
   the reviewer's inline and summary comments remain the source of truth.
 
+**Iterative verdict-context contract.** Any bounded Quorum loop in which one role produces an
+artifact and another role reviews it preserves three distinct things across every permitted
+iteration: the authoritative artifact identity (including its revision or SHA), the closed
+verdict, and a bounded artifact-specific rationale explaining that verdict. The rationale is
+review feedback, never lifecycle authority. The next producer iteration receives the applicable
+rationale tied to the reviewed artifact, and a new review judges the new artifact rather than
+silently reusing an old verdict. The authoritative ledger remains workflow-specific: GitHub PR
+discussion is authoritative for worker/reviewer findings, while `decomposition_attempts` is the
+durable planner/classifier/Arbiter iteration ledger. Sharing this contract does not require one
+generic backing store or permit a lifecycle signal to become a second findings ledger.
+
 This preserves #206 verdict attestation, reviewer separation, the rework cap, sticky
 reviewer, the stale-SHA gate, and R1/R2 lifecycle. It shifts only who writes to the PR:
 agents author the content and the daemon publishes it through run-scoped operations.
@@ -2237,6 +2248,11 @@ Every child must be
 admission-ready, nonduplicate, and size S or M under the same execution-size rubric given to the
 planner. Admission readiness means the scope is sufficiently clear for delivery; it is distinct
 from runtime readiness, which still requires dependencies to be done.
+Every classifier verdict also carries a bounded `size_reason` tied to the exact classified child.
+A completed batch preserves every rejected child's rationale with its child key and bounded
+implementation context in one deterministic, globally bounded `decomposition_attempts` summary;
+the next fresh planner attempt receives the complete applicable batch as structured rejection
+feedback. Renaming or paraphrasing a rejected child is not scope reduction.
 
 **Arbiter plan-review gate.** Between deterministic validation and materialization the daemon
 gates every structurally valid proposal on a single-shot, stateless **Arbiter** — a model
@@ -2463,6 +2479,12 @@ labels are ignored.
   refs. A false readiness result carries a concrete `cx_not_ready_reason`; missing,
   partial, or malformed classification never falls back to worker or reviewer
   provisioning.
+- Every newly accepted v3 classifier result also requires a nonempty, NUL-free, bounded
+  `cx_size_reason` that identifies the concrete execution surfaces supporting its size verdict.
+  The reason is preserved in refs for inspection and in generated-child refs after successful
+  preclassification. Historical v2 classifications remain dispatch-compatible; absence of a
+  reason on such a row means the older contract did not guarantee one, not that the daemon
+  synthesized a rationale.
 - The classifier is closed-book: it receives bounded task/dependency/recovery context but
   does not inspect source, Git, CI, or external systems. Readiness is permissive: ordinary
   repository discovery and bounded engineering choices are execution work, not a reason to

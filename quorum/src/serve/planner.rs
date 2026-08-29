@@ -34,7 +34,7 @@ pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigne
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
-pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
+pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 2048;
 // A clean terminal provider line followed by no accepted `submit_plan` emits
 // one terminal response and four closure records. Provider failures and their
 // final outcome share this fixed reserve.
@@ -210,7 +210,12 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          without an accepted `submit_plan` call is a failed attempt. {RESPONSE_SHAPES} \
          PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
          to {MAX_REJECTION_SUMMARY_BYTES} bytes. On retry, use only those summaries to correct \
-         the cited semantic defect; do not discuss them or request more context.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
+         the cited semantic defect; do not discuss them or request more context. A classifier \
+         `size_reason` is artifact-specific verdict rationale: when it identifies an L/XL child's \
+         broad or compound surfaces, the next plan must redistribute those named surfaces across \
+         independently deliverable children. Renaming or paraphrasing the rejected child is not \
+         a correction; if the stated atomic boundary makes that split unsafe, return the \
+         `no_safe_split` BLOCKER with concrete evidence.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
     )
 }
 
@@ -3648,10 +3653,11 @@ mod tests {
 
     #[test]
     fn retry_summary_truncation_preserves_utf8_at_the_byte_limit() {
-        let summary = "😀".repeat(300);
+        let chars_at_limit = MAX_REJECTION_SUMMARY_BYTES / "😀".len();
+        let summary = "😀".repeat(chars_at_limit + 1);
         let truncated = truncate_utf8(&summary, MAX_REJECTION_SUMMARY_BYTES);
         assert!(truncated.is_char_boundary(truncated.len()));
         assert!(truncated.len() <= MAX_REJECTION_SUMMARY_BYTES);
-        assert_eq!(truncated, "😀".repeat(256));
+        assert_eq!(truncated, "😀".repeat(chars_at_limit));
     }
 }

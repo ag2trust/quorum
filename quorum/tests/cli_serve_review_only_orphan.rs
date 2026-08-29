@@ -386,6 +386,7 @@ fn seed_review_only_task(home: &std::path::Path, pr: i64) -> i64 {
             task_id: id,
             cx_est: 3,
             size: "M".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
@@ -425,6 +426,7 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
             task_id: id,
             cx_est: 3,
             size: "M".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
@@ -473,7 +475,7 @@ fn record_closed_run(home: &std::path::Path, task_id: i64, agent: &str, role: &s
 }
 
 #[test]
-fn orphan_reviewer_waits_for_complete_v2_classification() {
+fn orphan_reviewer_waits_for_complete_v3_classification() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -527,7 +529,7 @@ fn orphan_reviewer_waits_for_complete_v2_classification() {
         .lines
         .iter()
         .position(|line| line.contains("classifier: stored 1 classification"))
-        .expect("v2 classification was not persisted");
+        .expect("v3 classification was not persisted");
     let spawned = handle
         .lines
         .iter()
@@ -535,15 +537,19 @@ fn orphan_reviewer_waits_for_complete_v2_classification() {
         .expect("reviewer spawn log missing");
     assert!(
         gated < classified && classified < spawned,
-        "reviewer must not spawn before v2 classification: {:?}",
+        "reviewer must not spawn before v3 classification: {:?}",
         handle.lines
     );
 
     let task = get_task(home.path(), task_id);
     let refs: serde_json::Value =
         serde_json::from_str(task.refs.as_deref().expect("classified refs")).unwrap();
-    assert_eq!(refs["cx_by"], "claude-opus-4-6:v2");
+    assert_eq!(refs["cx_by"], "claude-opus-4-6:v3");
     assert_eq!(refs["cx_size"], "S");
+    assert_eq!(
+        refs["cx_size_reason"],
+        "test fixture is one focused execution seam"
+    );
     assert_eq!(refs["cx_ready"], true);
     drop(handle);
 }

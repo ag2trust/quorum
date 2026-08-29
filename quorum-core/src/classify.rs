@@ -15,6 +15,10 @@ pub struct TaskClassification {
     #[serde(rename = "complexity", alias = "cx_est")]
     pub cx_est: i64,
     pub size: String,
+    /// Bounded, artifact-specific rationale for the selected execution size.
+    /// Required for every v3 verdict so a later planning iteration can correct
+    /// the concrete breadth the classifier observed.
+    pub size_reason: String,
     pub ready: bool,
     pub not_ready_reason: Option<String>,
     #[serde(default, alias = "cx_dup_of")]
@@ -68,6 +72,7 @@ pub fn classification_inputs(tasks: &[TaskForClassification]) -> Vec<Classificat
 }
 
 const VALID_SIZES: &[&str] = &["S", "M", "L", "XL"];
+pub const MAX_SIZE_REASON_BYTES: usize = 1024;
 pub const CLASSIFICATION_BATCH_LIMIT: usize = 20;
 pub const DUP_CONTEXT_LIMIT: usize = 60;
 const TITLE_CHAR_LIMIT: usize = 300;
@@ -482,6 +487,7 @@ fn sanitize(result: &TaskClassification) -> TaskClassification {
         task_id: result.task_id,
         cx_est: result.cx_est.clamp(1, 5),
         size: result.size.clone(),
+        size_reason: result.size_reason.trim().to_string(),
         ready: result.ready,
         not_ready_reason: result
             .not_ready_reason
@@ -494,6 +500,9 @@ fn sanitize(result: &TaskClassification) -> TaskClassification {
 pub fn valid(result: &TaskClassification) -> bool {
     (1..=5).contains(&result.cx_est)
         && VALID_SIZES.contains(&result.size.as_str())
+        && !result.size_reason.trim().is_empty()
+        && result.size_reason.len() <= MAX_SIZE_REASON_BYTES
+        && !result.size_reason.contains('\0')
         && if result.ready {
             result.not_ready_reason.is_none()
         } else {
@@ -583,6 +592,10 @@ fn merge_cx_into_refs(
         .expect("classifier refs normalized to an object");
     map.insert("cx_est".into(), serde_json::json!(result.cx_est));
     map.insert("cx_size".into(), serde_json::json!(result.size));
+    map.insert(
+        "cx_size_reason".into(),
+        serde_json::json!(result.size_reason),
+    );
     map.insert("cx_ready".into(), serde_json::json!(result.ready));
     map.insert(
         "cx_not_ready_reason".into(),
@@ -718,23 +731,24 @@ The active daemon's operational routing policy for these levels is:
 {recommendations}
 This is not a cross-vendor benchmark and does not change the required output.
 2. **size**: execution surface only: S focused/local; M bounded coherent work; L broad cross-component coherent delivery; XL compound work needing decomposition. Do not estimate human time.
-3. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. Declared dependencies are scheduler-enforced assumptions whose required outcomes will be satisfied before execution. Use their bounded context to understand assumed outcomes, scope, complexity, and duplication, but never return ready=false merely because a dependency is currently incomplete; dependency ordering is not classifier authority. If false, provide a concrete **not_ready_reason**; if true, it must be null.
-4. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
+3. **size_reason**: a required, concrete rationale of at most {MAX_SIZE_REASON_BYTES} UTF-8 bytes tied to this exact task artifact. Name the implementation surfaces or responsibilities that make the selected size fit better than the adjacent sizes; do not merely restate the rubric or task title. For L/XL, identify independently deliverable seams that make the artifact broad or compound. For S/M, identify the focused or bounded coherent seam. This rationale is durable review feedback for a later planning iteration.
+4. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. Declared dependencies are scheduler-enforced assumptions whose required outcomes will be satisfied before execution. Use their bounded context to understand assumed outcomes, scope, complexity, and duplication, but never return ready=false merely because a dependency is currently incomplete; dependency ordering is not classifier authority. If false, provide a concrete **not_ready_reason**; if true, it must be null.
+5. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
 
 You are closed-book: use only this prompt, do not inspect the repository, Git history, diffs, CI, or external systems.
 
 Output format (JSON array wrapped in an object):
-{{"tasks": [{{"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null, "duplicate_of": []}}]}}"#
+{{"tasks": [{{"task_id": 1, "complexity": 3, "size": "M", "size_reason": "The change is one bounded storage seam with focused callers and tests.", "ready": true, "not_ready_reason": null, "duplicate_of": []}}]}}"#
     )
 }
 
 /// Stable classifier provenance string for `cx_by`.
 ///
 /// The model is part of the identifier so classification quality can be grouped
-/// by the model that actually produced it. `v2` identifies the explicit
-/// complexity/size/readiness contract.
+/// by the model that actually produced it. `v3` adds the required bounded
+/// rationale for the size verdict to the explicit classification contract.
 pub fn classifier_provenance(model: &str) -> String {
-    format!("{model}:v2")
+    format!("{model}:v3")
 }
 
 #[cfg(test)]
@@ -746,6 +760,7 @@ mod tests {
             task_id,
             cx_est,
             size: "M".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
@@ -760,6 +775,7 @@ mod tests {
         assert_eq!(v["cx_est"], 3);
         assert_eq!(v["cx_by"], "haiku-45:v1");
         assert_eq!(v["cx_size"], "M");
+        assert_eq!(v["cx_size_reason"], "bounded test classification rationale");
         assert_eq!(v["cx_ready"], true);
     }
 
@@ -775,8 +791,8 @@ mod tests {
 
     #[test]
     fn classifier_provenance_identifies_the_model() {
-        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v2");
-        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v2");
+        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v3");
+        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v3");
     }
 
     #[test]
@@ -786,6 +802,14 @@ mod tests {
         result.not_ready_reason = Some("  outcome ambiguous  ".into());
         let clean = sanitize(&result);
         assert_eq!(clean.not_ready_reason.as_deref(), Some("outcome ambiguous"));
+    }
+
+    #[test]
+    fn sanitize_trims_size_reason() {
+        let mut result = classified(1, 3);
+        result.size_reason = "  one bounded storage seam  ".into();
+        let clean = sanitize(&result);
+        assert_eq!(clean.size_reason, "one bounded storage seam");
     }
 
     #[test]
@@ -809,7 +833,7 @@ mod tests {
 
     #[test]
     fn parse_classifier_response() {
-        let json = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size":"M", "ready":true, "not_ready_reason":null, "duplicate_of":[]}]}"#;
+        let json = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size":"M", "size_reason":"one bounded seam", "ready":true, "not_ready_reason":null, "duplicate_of":[]}]}"#;
         let resp: ClassifierResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.tasks.len(), 1);
         assert_eq!(resp.tasks[0].cx_est, 3);
@@ -1576,8 +1600,8 @@ mod tests {
         };
         let luna_by = cx_by(luna_task);
         let terra_by = cx_by(terra_task);
-        assert_eq!(luna_by, "gpt-5.6-luna:v2");
-        assert_eq!(terra_by, "gpt-5.6-terra:v2");
+        assert_eq!(luna_by, "gpt-5.6-luna:v3");
+        assert_eq!(terra_by, "gpt-5.6-terra:v3");
         assert_ne!(luna_by, terra_by);
     }
 
@@ -1794,6 +1818,7 @@ mod tests {
         for key in [
             "cx_est",
             "cx_size",
+            "cx_size_reason",
             "cx_ready",
             "cx_not_ready_reason",
             "cx_by",
@@ -1841,6 +1866,28 @@ mod tests {
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["daemon_parked"], true);
         assert!(refs.get("classifier_policy_parked").is_none());
+    }
+
+    #[test]
+    fn legacy_v2_classification_without_size_reason_remains_dispatch_compatible() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "legacy v2", 1);
+        let refs = r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"gpt-5.6-luna:v2"}"#;
+        conn.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            params![task_id, refs],
+        )
+        .unwrap();
+
+        assert!(!unclassified_tasks(&conn)
+            .unwrap()
+            .iter()
+            .any(|task| task.id == task_id));
+        assert!(crate::tasks::classification_is_dispatchable(
+            &Some(refs.into()),
+            false,
+            None
+        ));
     }
 
     #[test]
@@ -1958,6 +2005,7 @@ mod redesigned_tests {
             task_id: 1,
             cx_est,
             size: size.into(),
+            size_reason: "bounded test classification rationale".into(),
             ready,
             not_ready_reason: reason.map(str::to_string),
             duplicate_of: vec![],
@@ -1970,6 +2018,18 @@ mod redesigned_tests {
         assert!(valid(&result(4, "M", false, Some("outcome is ambiguous"))));
         assert!(!valid(&result(4, "M", false, None)));
         assert!(!valid(&result(4, "bad", true, None)));
+
+        let mut missing_size_reason = result(4, "M", true, None);
+        missing_size_reason.size_reason = "  ".into();
+        assert!(!valid(&missing_size_reason));
+
+        let mut nul_size_reason = result(4, "M", true, None);
+        nul_size_reason.size_reason = "storage\0seam".into();
+        assert!(!valid(&nul_size_reason));
+
+        let mut oversized_size_reason = result(4, "M", true, None);
+        oversized_size_reason.size_reason = "é".repeat(MAX_SIZE_REASON_BYTES);
+        assert!(!valid(&oversized_size_reason));
     }
 
     #[test]
@@ -1992,5 +2052,8 @@ mod redesigned_tests {
             "never return ready=false merely because a dependency is currently incomplete"
         ));
         assert!(p.contains("intended outcome cannot be determined"));
+        assert!(p.contains("size_reason"));
+        assert!(p.contains("independently deliverable seams"));
+        assert!(p.contains("durable review feedback"));
     }
 }
