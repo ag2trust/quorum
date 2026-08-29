@@ -6568,7 +6568,10 @@ async fn tick_decomposition(
                         QuorumError::Io(format!("validation phase join: {error}"))
                     })??;
                     if moved {
+                        // A new proposal always starts unclassified: the
+                        // classifier runs on it before the Arbiter.
                         coordinator.proposal = Some(tasks);
+                        coordinator.classifications = None;
                     }
                 }
             }
