@@ -382,15 +382,23 @@ or a planner self-attestation check.
 
 All proposed children are classified together before any child row exists. Classification uses
 temporary proposal keys, not task IDs. Every result must be present, admission-ready,
-implementation work, nonduplicate, size S or M, and carry a nonempty, NUL-free `size_reason`
-bounded to 1 KiB. The reason names the concrete execution surfaces supporting the selected size;
-for L/XL it identifies independently deliverable seams rather than merely repeating the rubric.
+implementation work, nonduplicate, dispatchable under the shared size policy (S/M at any
+complexity, or L at complexity 3 or lower), and carry a nonempty, NUL-free `size_reason` bounded
+to 1 KiB. The reason names the concrete execution surfaces supporting the selected size; for
+L/XL it identifies independently deliverable seams rather than merely repeating the rubric.
+Complexity and size are orthogonal agent-facing dimensions. Complexity measures the hardest
+reasoning problem without using file count or component breadth as proxies. Size measures the
+serial implementation and verification surface owned by one managed AI coding agent, not a human
+time estimate or a translated human project size. Declared dependency outcomes and read-only
+context do not add to a child's execution surface. File and requirement counts are supporting
+evidence only: a subtle local invariant may be S/4, while a straightforward propagation across
+several owned layers may be L/3.
 Runtime readiness is deliberately not required: a child may wait for another generated
-prerequisite. Any missing, malformed, L/XL, not-ready, duplicate, or extra classification rejects
-the entire plan as a semantic proposal. A completed batch records every rejected child's bounded
-key, verdict, size rationale, implementation delta, and affected paths in one deterministic,
-globally bounded proposal-attempt summary, and the next planner attempt receives that complete
-applicable rejection context.
+prerequisite. Any missing, malformed, non-dispatchable, not-ready, duplicate, or extra
+classification rejects the entire plan as a semantic proposal. A completed batch records every
+rejected child's bounded key, verdict, size rationale, implementation delta, and affected paths in
+one deterministic, globally bounded proposal-attempt summary, and the next planner attempt
+receives that complete applicable rejection context.
 
 Semantic rejection increments only `proposal_attempts`; provider/protocol/sandbox failure
 increments only `provider_failures`. Each cap is three per unchanged source revision. A valid

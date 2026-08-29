@@ -82,11 +82,11 @@ the outset.
 
 The classifier uses this shared complexity rubric:
 
-- 1: Trivial — config tweak, typo fix, simple rename
-- 2: Simple — single-file change, clear spec
-- 3: Moderate — multi-file change, some design decisions
-- 4: Complex — cross-cutting change, multiple components
-- 5: Very complex — architectural change, new subsystem
+- 1: Trivial — mechanical change with no meaningful reasoning choice
+- 2: Simple — established pattern with one clear implementation path
+- 3: Moderate — bounded design choices across known behavior and invariants
+- 4: Complex — subtle interaction among multiple invariants or failure modes
+- 5: Very complex — new architectural boundary or subsystem with novel interface tradeoffs
 
 Do not encode PR workflow or lifecycle authority in generic `refs`, titles, labels, or task
 body. In particular, this shipped CLI has no public successor-task creation interface for
