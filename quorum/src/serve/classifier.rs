@@ -406,6 +406,7 @@ mod tests {
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: classify::BODY_CHAR_LIMIT,
         }];
         let slot = spawn_classifier_configured(
             &tasks,
@@ -621,6 +622,7 @@ mod tests {
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: classify::BODY_CHAR_LIMIT,
         }];
         let mut slot = spawn_classifier_configured(
             &tasks,
@@ -668,6 +670,7 @@ mod tests {
                 body: Some("🦀".repeat(2_000)),
                 dependencies: vec![],
                 recovery_notes: vec![],
+                body_char_limit: classify::BODY_CHAR_LIMIT,
             })
             .collect::<Vec<_>>();
 
@@ -735,6 +738,7 @@ mod tests {
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: classify::BODY_CHAR_LIMIT,
         }];
         let mut slot = spawn_classifier_configured(
             &tasks,
@@ -813,6 +817,7 @@ mod tests {
             body: None,
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: classify::BODY_CHAR_LIMIT,
         }];
         let mut slot = spawn_classifier_configured(
             &tasks,

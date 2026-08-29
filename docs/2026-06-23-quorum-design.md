@@ -2247,8 +2247,15 @@ literal match. Once deterministic validation passes, the complete proposal is cl
 closed-book batch (`preclassifying`) *before* the Arbiter reviews it (`validating`): the
 classifier is cheap and rejects most oversized plans, so the expensive Arbiter run is spent only
 on classifier-accepted proposals. Every child must be
-admission-ready, nonduplicate, and size S or M under the same execution-size rubric given to the
-planner. Admission readiness means the scope is sufficiently clear for delivery; it is distinct
+admission-ready, nonduplicate, and sized within the same implementation-size policy that
+dispatches root tasks directly: S or M at any complexity, or L at `cx_est` 1–3. One Rust
+predicate and one SQL fragment define that policy for dispatch, sync, materialization, and child
+preclassification, so the daemon cannot reject a child it would have dispatched as a root. The
+classifier receives each planned child's whole contract in a stable order (delta, paths,
+deliverables, non-goals, outcome, criteria, constraints, verification), bounded per field rather
+than truncated as one blob, with every prerequisite rendered as its sibling or source title so
+responsibilities delivered by dependencies are not counted against the child's own surface.
+Admission readiness means the scope is sufficiently clear for delivery; it is distinct
 from runtime readiness, which still requires dependencies to be done.
 Every classifier verdict also carries a bounded `size_reason` tied to the exact classified child.
 A completed batch preserves every rejected child's rationale with its child key and bounded

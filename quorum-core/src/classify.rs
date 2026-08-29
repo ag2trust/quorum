@@ -32,7 +32,7 @@ pub struct ClassifierResponse {
 }
 
 /// Minimal task info needed for classification input.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskForClassification {
     pub id: i64,
     #[serde(skip)]
@@ -41,6 +41,19 @@ pub struct TaskForClassification {
     pub body: Option<String>,
     pub dependencies: Vec<String>,
     pub recovery_notes: Vec<String>,
+    /// Character bound applied to `body` when the prompt is rendered.
+    /// DB-sourced tasks use [`BODY_CHAR_LIMIT`]; planned decomposition
+    /// children carry the larger [`PLANNED_CHILD_BODY_CHAR_LIMIT`] because
+    /// their body is the complete planner-written child contract, not free
+    /// text. The prompt is fingerprinted from `body` itself, so the bound is
+    /// not part of the identity, and a deserialized value defaults to the
+    /// root bound rather than to zero.
+    #[serde(skip, default = "default_body_char_limit")]
+    pub body_char_limit: usize,
+}
+
+fn default_body_char_limit() -> usize {
+    BODY_CHAR_LIMIT
 }
 
 /// An internally-derived identity for the exact bounded task input given to a
@@ -76,8 +89,26 @@ pub const MAX_SIZE_REASON_BYTES: usize = 1024;
 pub const CLASSIFICATION_BATCH_LIMIT: usize = 20;
 pub const DUP_CONTEXT_LIMIT: usize = 60;
 const TITLE_CHAR_LIMIT: usize = 300;
-const BODY_CHAR_LIMIT: usize = 2_000;
-const DEPENDENCY_TITLE_CHAR_LIMIT: usize = 240;
+/// Prompt body bound for DB-sourced root tasks.
+pub const BODY_CHAR_LIMIT: usize = 2_000;
+/// Per-field byte bound the daemon applies to each of a planned child's
+/// contract fields (text, list, and deliverable paths, cumulatively per
+/// field) before assembling the classifier body.
+pub const PLANNED_CHILD_FIELD_MAX_BYTES: usize = 4 * 1024;
+/// Number of bounded fields in a planned child's classifier body: delta,
+/// paths, deliverables, non-goals, outcome, criteria, constraints,
+/// verification.
+pub const PLANNED_CHILD_BODY_FIELDS: usize = 8;
+/// Prompt body bound for planned decomposition children, derived from the
+/// per-field bound so a fully loaded child never reaches the whole-body
+/// truncation: every field at its cap, doubled for JSON escaping of quotes and
+/// newlines, plus structure (keys, punctuation, deliverable `kind` tags).
+pub const PLANNED_CHILD_BODY_CHAR_LIMIT: usize =
+    2 * PLANNED_CHILD_BODY_FIELDS * PLANNED_CHILD_FIELD_MAX_BYTES + 2 * 1024;
+pub const DEPENDENCY_TITLE_CHAR_LIMIT: usize = 240;
+/// Rendered dependency bound: a `#id ` or `<local-key> — ` prefix (planned
+/// child keys are at most 64 bytes) followed by a bounded title.
+const DEPENDENCY_RENDER_CHAR_LIMIT: usize = DEPENDENCY_TITLE_CHAR_LIMIT + 96;
 const DEPENDENCY_LIMIT: usize = 8;
 const RECOVERY_NOTE_CHAR_LIMIT: usize = 600;
 const RECOVERY_NOTE_LIMIT: usize = 4;
@@ -136,6 +167,7 @@ pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification
                     body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
+                    body_char_limit: BODY_CHAR_LIMIT,
                 })
             },
         )?
@@ -222,6 +254,7 @@ pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskFor
                 body: row.get(3)?,
                 dependencies: vec![],
                 recovery_notes: vec![],
+                body_char_limit: BODY_CHAR_LIMIT,
             })
         },
     )
@@ -248,6 +281,7 @@ fn classifier_input_for_task(
                     body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
+                    body_char_limit: BODY_CHAR_LIMIT,
                 })
             },
         )
@@ -278,6 +312,7 @@ pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>
                     body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
+                    body_char_limit: BODY_CHAR_LIMIT,
                 })
             },
         )?
@@ -310,6 +345,7 @@ pub fn tasks_missing_cx_all(conn: &Connection) -> Result<Vec<TaskForClassificati
                     body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
+                    body_char_limit: BODY_CHAR_LIMIT,
                 })
             },
         )?
@@ -669,7 +705,7 @@ pub fn build_prompt_with_recommendations(
             truncate(&t.title, TITLE_CHAR_LIMIT)
         ));
         if let Some(body) = &t.body {
-            let truncated = truncate(body, BODY_CHAR_LIMIT);
+            let truncated = truncate(body, t.body_char_limit);
             prompt.push_str(&format!("**Body:**\n{truncated}\n"));
         }
         prompt.push('\n');
@@ -679,7 +715,7 @@ pub fn build_prompt_with_recommendations(
                 t.dependencies
                     .iter()
                     .take(DEPENDENCY_LIMIT)
-                    .map(|dependency| truncate(dependency, DEPENDENCY_TITLE_CHAR_LIMIT + 32))
+                    .map(|dependency| truncate(dependency, DEPENDENCY_RENDER_CHAR_LIMIT))
                     .collect::<Vec<_>>()
                     .join("; ")
             ));
@@ -730,7 +766,7 @@ fn classifier_rubric(recommendations: &str) -> String {
 The active daemon's operational routing policy for these levels is:
 {recommendations}
 This is not a cross-vendor benchmark and does not change the required output.
-2. **size**: execution surface only: S focused/local; M bounded coherent work; L broad cross-component coherent delivery; XL compound work needing decomposition. Do not estimate human time.
+2. **size**: execution surface only: S focused/local; M bounded coherent work; L broad cross-component coherent delivery; XL compound work needing decomposition. Do not estimate human time. Size the artifact's own write deliverables; responsibilities delivered by its declared dependencies are not part of this artifact's surface, so a composition over already-delivered dependency primitives is sized by what it writes, not by the breadth of what it composes.
 3. **size_reason**: a required, concrete rationale of at most {MAX_SIZE_REASON_BYTES} UTF-8 bytes tied to this exact task artifact. Name the implementation surfaces or responsibilities that make the selected size fit better than the adjacent sizes; do not merely restate the rubric or task title. For L/XL, identify independently deliverable seams that make the artifact broad or compound. For S/M, identify the focused or bounded coherent seam. This rationale is durable review feedback for a later planning iteration.
 4. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. Declared dependencies are scheduler-enforced assumptions whose required outcomes will be satisfied before execution. Use their bounded context to understand assumed outcomes, scope, complexity, and duplication, but never return ready=false merely because a dependency is currently incomplete; dependency ordering is not classifier authority. If false, provide a concrete **not_ready_reason**; if true, it must be null.
 5. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
@@ -848,6 +884,7 @@ mod tests {
             body: Some("Fix the thing".into()),
             dependencies: vec!["#3 Establish prerequisite".into()],
             recovery_notes: vec![],
+            body_char_limit: BODY_CHAR_LIMIT,
         }];
         let ctx = vec![TaskForClassification {
             id: 2,
@@ -856,6 +893,7 @@ mod tests {
             body: Some("Do something".into()),
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: BODY_CHAR_LIMIT,
         }];
         let prompt = build_prompt(&tasks, &ctx);
         assert!(prompt.contains("Task #1"));
@@ -2055,5 +2093,64 @@ mod redesigned_tests {
         assert!(p.contains("size_reason"));
         assert!(p.contains("independently deliverable seams"));
         assert!(p.contains("durable review feedback"));
+        assert!(p.contains("Size the artifact's own write deliverables"));
+        assert!(p.contains(
+            "responsibilities delivered by its declared dependencies are not part of this artifact's surface"
+        ));
+    }
+
+    #[test]
+    fn deserialized_task_keeps_a_nonzero_body_bound() {
+        let task = TaskForClassification {
+            id: 1,
+            revision: 1,
+            title: "root".into(),
+            body: Some("body".into()),
+            dependencies: vec![],
+            recovery_notes: vec![],
+            body_char_limit: PLANNED_CHILD_BODY_CHAR_LIMIT,
+        };
+        let round_tripped: TaskForClassification =
+            serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+        assert_eq!(round_tripped.body_char_limit, BODY_CHAR_LIMIT);
+        assert!(round_tripped.body_char_limit > 0);
+        assert!(build_prompt(&[round_tripped], &[]).contains("body"));
+    }
+
+    #[test]
+    fn prompt_body_bound_is_per_task() {
+        let long_body = "B".repeat(BODY_CHAR_LIMIT + 500);
+        let root = TaskForClassification {
+            id: 1,
+            revision: 1,
+            title: "root".into(),
+            body: Some(long_body.clone()),
+            dependencies: vec![],
+            recovery_notes: vec![],
+            body_char_limit: BODY_CHAR_LIMIT,
+        };
+        let planned = TaskForClassification {
+            id: -1,
+            revision: 1,
+            title: "planned child".into(),
+            body: Some(long_body.clone()),
+            dependencies: vec![format!("sibling-key — {}", "T".repeat(300))],
+            recovery_notes: vec![],
+            body_char_limit: PLANNED_CHILD_BODY_CHAR_LIMIT,
+        };
+        assert!(!build_prompt(std::slice::from_ref(&root), &[]).contains(&long_body));
+        let planned_prompt = build_prompt(std::slice::from_ref(&planned), &[]);
+        assert!(planned_prompt.contains(&long_body));
+        // A local key plus a title at the dependency bound survives rendering.
+        assert!(planned_prompt.contains(&format!(
+            "sibling-key — {}",
+            "T".repeat(DEPENDENCY_TITLE_CHAR_LIMIT)
+        )));
+        let oversized = TaskForClassification {
+            body: Some("B".repeat(PLANNED_CHILD_BODY_CHAR_LIMIT + 10)),
+            ..planned
+        };
+        assert!(!build_prompt(std::slice::from_ref(&oversized), &[])
+            .contains(&"B".repeat(PLANNED_CHILD_BODY_CHAR_LIMIT + 10)));
     }
 }

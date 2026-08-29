@@ -34,7 +34,11 @@ pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigne
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
-pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 2048;
+// Retry feedback is bounded by the durable attempt-summary cap so a complete
+// child rejection (readiness reason, size verdict with its rationale, the
+// rejected delta, and affected paths) reaches the next planning turn intact.
+pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize =
+    quorum_core::decomposition::ATTEMPT_SUMMARY_MAX_BYTES;
 // A clean terminal provider line followed by no accepted `submit_plan` emits
 // one terminal response and four closure records. Provider failures and their
 // final outcome share this fixed reserve.
@@ -176,7 +180,9 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
     .expect("rejection summaries serialize");
     format!(
         "You are Quorum's repository-grounded implementation-boundary planner. Produce one \
-         closed DAG of 2-8 independently deliverable implementation tasks, each size S or M. \
+         closed DAG of 2-8 independently deliverable implementation tasks. A child is accepted \
+         when the classifier sizes it S or M at any complexity, or L at complexity 3 or lower; \
+         aim for S or M. \
          Identify concrete implementation deltas and split at real code or ownership seams; do \
          not turn each desired product outcome into a separate task. Preserved behavior, \
          compatibility requirements, and regression-only expectations belong in acceptance \
@@ -215,7 +221,10 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          broad or compound surfaces, the next plan must redistribute those named surfaces across \
          independently deliverable children. Renaming or paraphrasing the rejected child is not \
          a correction; if the stated atomic boundary makes that split unsafe, return the \
-         `no_safe_split` BLOCKER with concrete evidence.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
+         `no_safe_split` BLOCKER with concrete evidence. A single-file composition child that \
+         wires together primitives delivered by its sibling prerequisites is expected, not a \
+         defect: its size is its own write surface, so do not split it against a stated atomic \
+         boundary merely because it composes many delivered seams.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
     )
 }
 
@@ -3618,6 +3627,15 @@ mod tests {
         );
         assert!(prompt.len() < MAX_PROMPT_BYTES);
         assert!(prompt.contains("cycle detected"));
+        assert!(prompt.contains(
+            "A child is accepted when the classifier sizes it S or M at any complexity, or L at \
+             complexity 3 or lower"
+        ));
+        assert!(prompt.contains(
+            "A single-file composition child that wires together primitives delivered by its \
+             sibling prerequisites is expected, not a defect"
+        ));
+        assert!(!prompt.contains("each size S or M"));
         assert!(!prompt.contains(&"x".repeat(MAX_REJECTION_SUMMARY_BYTES + 1)));
         assert!(!prompt.contains("must not be included"));
         assert!(prompt.contains(&format!(
