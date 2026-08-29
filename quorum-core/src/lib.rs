@@ -25,6 +25,7 @@ pub mod drift;
 pub mod errlog;
 pub mod error;
 pub mod events;
+pub mod fallback_launch;
 pub mod feed;
 pub mod github_operations;
 pub mod inspect;

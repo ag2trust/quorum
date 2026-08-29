@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 64). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 69). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -965,6 +965,37 @@ CREATE TABLE IF NOT EXISTS run_capabilities (
     agent_run_id INTEGER REFERENCES agent_runs(id)
 );
 CREATE INDEX IF NOT EXISTS run_capabilities_agent ON run_capabilities(agent) WHERE revoked_at IS NULL;
+
+-- v69: a fallback launch is made durable before the daemon contacts the
+-- alternate provider. It records the exact bounded replay descriptor and
+-- references the already-attributed fallback run/capability rather than
+-- duplicating route-attribution evidence. The pending turn JSON deliberately
+-- rejects a continuation_id: a failed provider's continuation is never valid
+-- authority for a fresh alternate-provider launch.
+CREATE TABLE IF NOT EXISTS fallback_launch_intents (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    responsibility_key  TEXT NOT NULL
+                        CHECK(length(CAST(responsibility_key AS BLOB)) BETWEEN 1 AND 1024),
+    routing_attempt_id  INTEGER NOT NULL REFERENCES routing_attempts(id),
+    task_id             INTEGER NOT NULL REFERENCES tasks(id),
+    role                TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    worktree            TEXT NOT NULL
+                        CHECK(length(CAST(worktree AS BLOB)) BETWEEN 1 AND 4096),
+    pr_number           INTEGER,
+    head_sha            TEXT,
+    pending_turn_json   TEXT NOT NULL
+                        CHECK(json_valid(pending_turn_json)
+                              AND length(CAST(pending_turn_json AS BLOB)) <= 65536
+                              AND json_type(pending_turn_json, '$.continuation_id') IS NULL),
+    agent_run_id        INTEGER NOT NULL REFERENCES agent_runs(id),
+    capability_run_id   TEXT NOT NULL REFERENCES run_capabilities(run_id),
+    created_at          INTEGER NOT NULL,
+    CHECK((pr_number IS NULL AND head_sha IS NULL)
+          OR (pr_number > 0 AND head_sha IS NOT NULL)),
+    UNIQUE(responsibility_key, routing_attempt_id)
+);
+CREATE INDEX IF NOT EXISTS fallback_launch_intents_task
+    ON fallback_launch_intents(task_id);
 
 -- v27: prospective-only boundary for PR-interaction performance analytics
 -- (#158). Single row (id=1) recording the unix timestamp at which
