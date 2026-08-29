@@ -17,6 +17,8 @@ pub mod collector;
 pub mod doctor;
 #[allow(dead_code)] // The gate is intentionally unwired until fallback activation.
 pub mod fallback_preflight;
+#[allow(dead_code)] // The retire step is intentionally unwired until fallback activation.
+pub mod fallback_retire;
 pub mod grok_agent;
 pub mod merge;
 pub mod merged_continuation;

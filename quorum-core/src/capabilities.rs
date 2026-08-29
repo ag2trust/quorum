@@ -7,6 +7,7 @@
 
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
+use crate::role_assignments::{ModelProfile, RoleAssignment};
 use crate::routing_attempts::{exclusions, ValidatedFallbackAttribution};
 use crate::runner_state::{self, ContinuationSlot, PendingTurn};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -23,6 +24,19 @@ pub struct RunCapability {
     /// Exact fallback-run linkage. NULL is retained for legacy and ordinary
     /// managed capabilities that predate this narrower authority evidence.
     pub agent_run_id: Option<i64>,
+}
+
+/// Immutable evidence that identifies one attributed managed run for
+/// authority retirement.
+#[derive(Debug, Clone, Copy)]
+pub struct AttributedRetirementTarget<'a> {
+    pub capability_run_id: &'a str,
+    pub agent_run_id: i64,
+    pub agent: &'a str,
+    pub assignment: &'a RoleAssignment,
+    pub failed_route: &'a ModelProfile,
+    pub ended_at: i64,
+    pub end_reason: &'a str,
 }
 
 /// Immutable daemon-captured reviewer target supplied while issuing an
@@ -987,7 +1001,7 @@ pub(crate) fn managed_run_is_active_tx(
 }
 
 /// Revoke one exact managed-run capability within a caller-owned transaction.
-pub(crate) fn revoke_managed_run_tx(
+pub fn revoke_managed_run_tx(
     tx: &Transaction<'_>,
     run_id: &str,
     agent: &str,
@@ -999,6 +1013,93 @@ pub(crate) fn revoke_managed_run_tx(
     // revoked. Idempotent cleanup must not gain authority through a name match.
     let _ = managed_run_is_active_tx(tx, run_id, agent, task_id, role)?;
     revoke_tx(tx, run_id, now)
+}
+
+/// Re-prove that an attributed capability names exactly one managed run that
+/// may be retired for the supplied immutable assignment and actual route.
+///
+/// A previously retired row remains a valid replay target only when its exact
+/// terminal evidence matches. This lets authority cleanup be idempotent
+/// without allowing a caller to substitute a different historical run.
+pub fn attributed_retirement_target_tx(
+    tx: &Transaction<'_>,
+    target: &AttributedRetirementTarget<'_>,
+) -> Result<bool> {
+    let assignment = target.assignment;
+    let Some(task_id) = assignment.task_id else {
+        return Ok(false);
+    };
+    let sub_role = match (assignment.role.as_str(), assignment.review_stage.as_deref()) {
+        ("worker", None) | ("reviewer", Some("r1")) => None,
+        ("reviewer", Some("r2")) => Some("r2"),
+        _ => return Ok(false),
+    };
+    if target.capability_run_id.is_empty()
+        || target.capability_run_id.contains('\0')
+        || target.agent_run_id <= 0
+        || target.agent.is_empty()
+        || target.agent.contains('\0')
+        || target.ended_at < 0
+        || target.end_reason.is_empty()
+        || target.end_reason.contains('\0')
+        || crate::role_assignments::get(tx, assignment.id)?.as_ref() != Some(assignment)
+    {
+        return Ok(false);
+    }
+
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM run_capabilities AS capability
+             JOIN agent_runs AS run ON run.id=capability.agent_run_id
+             JOIN role_assignments AS stored_assignment ON stored_assignment.id=run.role_assignment_id
+             WHERE capability.run_id=?1
+               AND capability.agent_run_id=?2
+               AND capability.task_id=?3
+               AND capability.agent=?4
+               AND capability.role=?5
+               AND run.id=?2
+               AND run.task_id=?3
+               AND run.agent_name=?4
+               AND run.role=?5
+               AND run.sub_role IS ?6
+               AND (run.ended_at IS NULL OR (run.ended_at=?7 AND run.end_reason=?8))
+               AND run.role_assignment_id=?9
+               AND run.configured_profile_id=?10
+               AND run.configured_provider=?11
+               AND run.configured_model=?12
+               AND run.configured_effort=?13
+               AND run.provider=?11
+               AND run.model=?12
+               AND run.effort=?13
+               AND stored_assignment.id=?9
+               AND stored_assignment.task_id IS ?3
+               AND stored_assignment.responsibility_key=?14
+               AND stored_assignment.role=?5
+               AND stored_assignment.pr_number IS ?15
+               AND stored_assignment.review_stage IS ?16
+         )",
+        params![
+            target.capability_run_id,
+            target.agent_run_id,
+            task_id,
+            target.agent,
+            assignment.role,
+            sub_role,
+            target.ended_at,
+            target.end_reason,
+            assignment.id,
+            target.failed_route.id,
+            target.failed_route.provider,
+            target.failed_route.model,
+            target.failed_route.effort,
+            assignment.responsibility_key,
+            assignment.pr_number,
+            assignment.review_stage,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 /// Revoke all active capabilities for an agent. Used on agent death/recovery.
