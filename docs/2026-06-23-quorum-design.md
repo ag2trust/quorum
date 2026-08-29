@@ -2249,9 +2249,10 @@ admission-ready, nonduplicate, and size S or M under the same execution-size rub
 planner. Admission readiness means the scope is sufficiently clear for delivery; it is distinct
 from runtime readiness, which still requires dependencies to be done.
 Every classifier verdict also carries a bounded `size_reason` tied to the exact classified child.
-An L/XL preclassification rejection preserves that rationale with the child key and bounded
-implementation context in `decomposition_attempts`; the next fresh planner attempt receives it as
-structured rejection feedback. Renaming or paraphrasing the rejected child is not scope reduction.
+A completed batch preserves every rejected child's rationale with its child key and bounded
+implementation context in one deterministic, globally bounded `decomposition_attempts` summary;
+the next fresh planner attempt receives the complete applicable batch as structured rejection
+feedback. Renaming or paraphrasing a rejected child is not scope reduction.
 
 **Arbiter plan-review gate.** Between deterministic validation and materialization the daemon
 gates every structurally valid proposal on a single-shot, stateless **Arbiter** — a model
