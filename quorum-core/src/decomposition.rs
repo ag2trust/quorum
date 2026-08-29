@@ -17,6 +17,10 @@ pub const MAX_PROVIDER_FAILURES: i64 = 3;
 pub const MAX_OPERATOR_RETRIES: i64 = 2;
 pub const MIN_CHILDREN: usize = 2;
 pub const MAX_CHILDREN: usize = 8;
+/// Upper bound on one durable decomposition attempt or recovery summary. The
+/// planner's retry feedback (`MAX_REJECTION_SUMMARY_BYTES`) is derived from
+/// this bound so a complete child rejection is never dropped at persistence.
+pub const ATTEMPT_SUMMARY_MAX_BYTES: usize = 8 * 1024;
 const MAX_CLEANUP_ARTIFACT_BYTES: usize = 4096;
 
 /// The explicit file-level contract attached to one generated child.  This is
@@ -864,7 +868,10 @@ pub fn record_attempt(
     summary: &str,
     now: i64,
 ) -> Result<Option<i64>> {
-    if summary.len() > 2048 || reason_code.is_empty() || reason_code.len() > 128 {
+    if summary.len() > ATTEMPT_SUMMARY_MAX_BYTES
+        || reason_code.is_empty()
+        || reason_code.len() > 128
+    {
         return Err(QuorumError::Usage(
             "invalid bounded decomposition attempt".into(),
         ));
@@ -994,7 +1001,10 @@ pub fn reject_frozen_proposal(
             "invalid proposal rejection phase".into(),
         ));
     }
-    if summary.len() > 2048 || reason_code.is_empty() || reason_code.len() > 128 {
+    if summary.len() > ATTEMPT_SUMMARY_MAX_BYTES
+        || reason_code.is_empty()
+        || reason_code.len() > 128
+    {
         return Err(QuorumError::Usage(
             "invalid bounded decomposition attempt".into(),
         ));
@@ -1240,7 +1250,10 @@ pub fn accept_proposal(
     Ok(changed == 1)
 }
 
-fn classification_is_small_dispatchable(raw: &str) -> bool {
+/// A generated child may materialize only when it is ready, not a duplicate,
+/// and its size verdict satisfies the same implementation-size policy that
+/// dispatches root tasks ([`crate::tasks::size_is_dispatchable`]).
+fn classification_is_child_dispatchable(raw: &str) -> bool {
     let owned = Some(raw.to_owned());
     if !crate::tasks::classification_is_complete(&owned) {
         return false;
@@ -1249,12 +1262,17 @@ fn classification_is_small_dispatchable(raw: &str) -> bool {
         return false;
     };
     let size = value.get("cx_size").and_then(|v| v.as_str());
+    let cx_est = value.get("cx_est").and_then(|v| v.as_i64());
     let ready = value.get("cx_ready").and_then(|v| v.as_bool());
     let duplicate = value
         .get("cx_dup_of")
         .and_then(|v| v.as_array())
         .is_some_and(|values| !values.is_empty());
-    matches!(size, Some("S" | "M")) && ready == Some(true) && !duplicate
+    let size_ok = match (size, cx_est) {
+        (Some(size), Some(cx_est)) => crate::tasks::size_is_dispatchable(size, cx_est),
+        _ => false,
+    };
+    size_ok && ready == Some(true) && !duplicate
 }
 
 /// Atomically create every generated task and member. The returned IDs follow
@@ -1279,7 +1297,7 @@ pub fn materialize_graph(
         || children.iter().any(|child| {
             child.local_key.is_empty()
                 || child.title.trim().is_empty()
-                || !classification_is_small_dispatchable(&child.classification_refs)
+                || !classification_is_child_dispatchable(&child.classification_refs)
                 || child
                     .prerequisite_keys
                     .iter()
@@ -2818,7 +2836,7 @@ pub fn recovery_reset(
     summary: &str,
     now: i64,
 ) -> Result<bool> {
-    if summary.is_empty() || summary.len() > 2048 {
+    if summary.is_empty() || summary.len() > ATTEMPT_SUMMARY_MAX_BYTES {
         return Err(QuorumError::Usage(
             "invalid bounded recovery summary".into(),
         ));
@@ -3382,6 +3400,94 @@ mod tests {
             prerequisite_keys: deps.iter().map(|s| (*s).into()).collect(),
             source_dependency_ids: vec![],
         }
+    }
+
+    fn sized_child(key: &str, size: &str, cx_est: i64) -> PlannedChild {
+        let mut child = child(key, &[]);
+        child.classification_refs = format!(
+            r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}}"#
+        );
+        child
+    }
+
+    #[test]
+    fn materialize_graph_applies_the_shared_size_policy_to_children() {
+        let (_dir, mut conn) = file_setup();
+        let graph = begin(&mut conn);
+        for (size, cx_est) in [("L", 4), ("L", 5), ("XL", 2)] {
+            let error = materialize_graph(
+                &mut conn,
+                graph,
+                1,
+                &[child("a", &[]), sized_child("b", size, cx_est)],
+                4,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid or unclassified decomposition children"),
+                "{size}/{cx_est}: {error}"
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM task_graph_members WHERE graph_id=?1",
+                [graph],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), sized_child("b", "L", 3)],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ids.len(), 2);
+        let refs = crate::tasks::get(&conn, ids[1]).unwrap().unwrap().refs;
+        assert!(crate::tasks::classification_is_dispatchable(
+            &refs, false, None
+        ));
+    }
+
+    #[test]
+    fn attempt_summaries_are_bounded_by_the_shared_cap() {
+        let (_dir, mut conn) = file_setup();
+        let graph = begin(&mut conn);
+        let at_cap = "s".repeat(ATTEMPT_SUMMARY_MAX_BYTES);
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "classifier-provider",
+            &at_cap,
+            5
+        )
+        .unwrap()
+        .is_some());
+        let over = "s".repeat(ATTEMPT_SUMMARY_MAX_BYTES + 1);
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "classifier-provider",
+            &over,
+            6
+        )
+        .is_err());
+        let stored: String = conn
+            .query_row(
+                "SELECT summary FROM decomposition_attempts WHERE graph_id=?1 AND reason_code='classifier-provider'",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.len(), ATTEMPT_SUMMARY_MAX_BYTES);
     }
 
     fn make_reviewable_graph(conn: &mut Connection) -> (i64, Vec<i64>) {

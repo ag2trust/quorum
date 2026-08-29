@@ -369,18 +369,34 @@ const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
       )
 ))";
 
-// SQL counterpart of the implementation branch in
-// `classification_is_dispatchable`. Callers that need implementation work
-// additionally require `review_only=0`; continuation tasks remain eligible at
-// every classified size, just as they are in the Rust policy.
-const DIRECT_DISPATCH_CLAUSE: &str = "(review_only=1 OR continue_pr IS NOT NULL OR (
+/// SQL counterpart of [`size_is_dispatchable`] over the `refs` column of the
+/// enclosing `tasks` row. This is the single implementation-size policy:
+/// `S`/`M` at any complexity, or `L` at complexity 3 or lower. Every query that
+/// gates implementation work on classified size must interpolate this fragment
+/// instead of restating it, so the SQL and Rust policies cannot drift.
+macro_rules! size_dispatch_policy_sql {
+    () => {
+        "(
     (json_extract(refs, '$.cx_size') IN ('S','M') OR (
         json_extract(refs, '$.cx_size')='L'
         AND json_extract(refs, '$.cx_est') <= 3
     ))
     AND NOT (json_extract(refs, '$.cx_est')=5
              AND json_extract(refs, '$.cx_size')='L')
-))";
+)"
+    };
+}
+pub(crate) const SIZE_DISPATCH_POLICY_SQL: &str = size_dispatch_policy_sql!();
+
+// SQL counterpart of the implementation branch in
+// `classification_is_dispatchable`. Callers that need implementation work
+// additionally require `review_only=0`; continuation tasks remain eligible at
+// every classified size, just as they are in the Rust policy.
+const DIRECT_DISPATCH_CLAUSE: &str = concat!(
+    "(review_only=1 OR continue_pr IS NOT NULL OR ",
+    size_dispatch_policy_sql!(),
+    ")"
+);
 
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -1090,14 +1106,7 @@ pub fn claim_provider_retry_rework(
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                AND json_type(refs, '$.cx_size')='text'
                AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
-               AND (review_only=1 OR continue_pr IS NOT NULL OR (
-                   (json_extract(refs, '$.cx_size') IN ('S','M') OR (
-                       json_extract(refs, '$.cx_size')='L'
-                       AND json_extract(refs, '$.cx_est') <= 3
-                   ))
-                   AND NOT (json_extract(refs, '$.cx_est')=5
-                            AND json_extract(refs, '$.cx_size')='L')
-               ))
+               AND {DIRECT_DISPATCH_CLAUSE}
                AND json_type(refs, '$.cx_ready')='true'
                AND json_type(refs, '$.cx_not_ready_reason')='null'
                AND (
@@ -1269,7 +1278,8 @@ pub fn claim_remediation_rework_with_feedback(
         .optional()?;
 
     let policy_parked: bool = tx.query_row(
-        "SELECT EXISTS(
+        &format!(
+            "SELECT EXISTS(
              SELECT 1 FROM tasks
              WHERE id=?1 AND (NOT json_valid(refs)
                  OR json_type(refs, '$.cx_est') IS NOT 'integer'
@@ -1278,15 +1288,9 @@ pub fn claim_remediation_rework_with_feedback(
                  OR COALESCE(json_extract(refs, '$.cx_size'), '') NOT IN ('S','M','L','XL')
                  OR json_type(refs, '$.cx_ready') IS NOT 'true'
                  OR json_type(refs, '$.cx_not_ready_reason') IS NOT 'null'
-                 OR NOT (review_only=1 OR continue_pr IS NOT NULL OR (
-                     (json_extract(refs, '$.cx_size') IN ('S','M') OR (
-                         json_extract(refs, '$.cx_size')='L'
-                         AND json_extract(refs, '$.cx_est') <= 3
-                     ))
-                     AND NOT (json_extract(refs, '$.cx_est')=5
-                              AND json_extract(refs, '$.cx_size')='L')
-                 )))
-         )",
+                 OR NOT {DIRECT_DISPATCH_CLAUSE})
+         )"
+        ),
         params![id],
         |row| row.get(0),
     )?;
@@ -1378,7 +1382,8 @@ pub fn reserve_reviewer_provision(
     }
     let tx = begin_immediate(conn)?;
     let eligible: bool = tx.query_row(
-        "SELECT EXISTS(
+        &format!(
+            "SELECT EXISTS(
              SELECT 1 FROM tasks t
              WHERE t.id=?1
                AND ?2 IN ('r1','r2') AND t.status='in-review'
@@ -1387,18 +1392,12 @@ pub fn reserve_reviewer_provision(
                AND json_extract(t.refs,'$.cx_est') BETWEEN 1 AND 5
                AND json_type(t.refs,'$.cx_size')='text'
                AND json_extract(t.refs,'$.cx_size') IN ('S','M','L','XL')
-               AND (t.review_only=1 OR t.continue_pr IS NOT NULL OR (
-                   (json_extract(t.refs,'$.cx_size') IN ('S','M') OR (
-                       json_extract(t.refs,'$.cx_size')='L'
-                       AND json_extract(t.refs,'$.cx_est') <= 3
-                   ))
-                   AND NOT (json_extract(t.refs,'$.cx_est')=5
-                            AND json_extract(t.refs,'$.cx_size')='L')
-               ))
+               AND {DIRECT_DISPATCH_CLAUSE}
                AND json_type(t.refs,'$.cx_ready')='true'
                AND json_type(t.refs,'$.cx_not_ready_reason')='null'
                AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations WHERE task_id=t.id)
-         )",
+         )"
+        ),
         params![task_id, role],
         |row| row.get(0),
     )?;
@@ -3566,10 +3565,16 @@ pub fn classification_is_dispatchable(
     let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
     ready
         && (1..=5).contains(&cx)
-        && (review_only
-            || continue_pr.is_some()
-            || matches!(size, "S" | "M")
-            || (size == "L" && cx <= 3))
+        && (review_only || continue_pr.is_some() || size_is_dispatchable(size, cx))
+}
+
+/// The single implementation-size dispatch policy shared by root-task dispatch
+/// and decomposition child preclassification: `S`/`M` at any complexity, or
+/// `L` at complexity 3 or lower. `L` at complexity 4 or 5 and every `XL`
+/// classification stay outside automatic implementation dispatch.
+/// [`SIZE_DISPATCH_POLICY_SQL`] is the SQL counterpart.
+pub fn size_is_dispatchable(size: &str, cx_est: i64) -> bool {
+    matches!(size, "S" | "M") || (size == "L" && cx_est <= 3)
 }
 
 pub(crate) fn park_classified_task_tx(
@@ -12854,6 +12859,52 @@ mod tests {
     /// so a stale `daemon_parked_unsatisfiable=true` from any prior path
     /// would persist across the retry and keep a false unsatisfiable row
     /// in status BLOCKED. The policy branch must strip the marker.
+    #[test]
+    fn size_policy_table_agrees_between_rust_and_sql() {
+        let table: &[(&str, i64, bool)] = &[
+            ("S", 1, true),
+            ("S", 5, true),
+            ("M", 1, true),
+            ("M", 5, true),
+            ("L", 1, true),
+            ("L", 3, true),
+            ("L", 4, false),
+            ("L", 5, false),
+            ("XL", 1, false),
+            ("XL", 3, false),
+            ("XL", 5, false),
+        ];
+        let conn = Connection::open_in_memory().unwrap();
+        let sql = format!("SELECT {SIZE_DISPATCH_POLICY_SQL} FROM (SELECT ?1 AS refs)");
+        for (size, cx_est, expected) in table {
+            assert_eq!(
+                size_is_dispatchable(size, *cx_est),
+                *expected,
+                "rust policy for {size}/{cx_est}"
+            );
+            let refs = format!(
+                r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null}}"#
+            );
+            let sql_verdict: bool = conn
+                .query_row(&sql, params![refs], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sql_verdict, *expected, "sql policy for {size}/{cx_est}");
+            assert_eq!(
+                classification_is_dispatchable(&Some(refs.clone()), false, None),
+                *expected,
+                "root dispatch policy for {size}/{cx_est}"
+            );
+            // Review-only and continuation work stay eligible at every size.
+            assert!(classification_is_dispatchable(
+                &Some(refs.clone()),
+                true,
+                None
+            ));
+            assert!(classification_is_dispatchable(&Some(refs), false, Some(9)));
+        }
+        assert!(DIRECT_DISPATCH_CLAUSE.contains(SIZE_DISPATCH_POLICY_SQL));
+    }
+
     #[test]
     fn retry_parked_policy_branch_clears_unsatisfiable_marker() {
         let (_d, mut c) = open_tmp();
