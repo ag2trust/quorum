@@ -752,6 +752,70 @@ pub fn active_pr_owner_in(
         .optional()?)
 }
 
+/// Return the id of a task that still holds a live reference to `pr`, if any.
+///
+/// "Live" means non-terminal, or a `failed`/parked task with a retryable
+/// `daemon_resume_status` — such a task is a `task-retry` away from resuming
+/// publication against the same PR, so the daemon must not tear down the PR's
+/// remote head branch out from under it. Callers pass the cancelled task's own
+/// id in `excluding_task` so they never self-match.
+pub fn live_pr_reference(
+    conn: &Connection,
+    pr: i64,
+    excluding_task: Option<i64>,
+) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM tasks
+             WHERE (?2 IS NULL OR id != ?2)
+               AND (continue_pr = ?1 OR (
+                    json_valid(COALESCE(refs, '{}'))
+                    AND (json_extract(refs, '$.pr') = ?1
+                         OR json_extract(refs, '$.pr') = CAST(?1 AS TEXT))))
+               AND (
+                   status NOT IN ('done', 'cancelled', 'failed')
+                   OR (
+                       status = 'failed'
+                       AND json_valid(refs)
+                       AND json_extract(refs, '$.daemon_parked') = 1
+                       AND json_extract(refs, '$.daemon_resume_status') IS NOT NULL
+                   )
+               )
+             ORDER BY id LIMIT 1",
+            params![pr, excluding_task],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Return the PR number a task currently references, preferring
+/// `continue_pr` and falling back to `refs.pr`.
+pub fn task_pr_reference(conn: &Connection, id: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT continue_pr,
+                    CASE WHEN json_valid(COALESCE(refs, '{}'))
+                         THEN json_extract(refs, '$.pr')
+                    END
+             FROM tasks WHERE id=?1",
+            params![id],
+            |row| {
+                let cont: Option<i64> = row.get(0)?;
+                if let Some(pr) = cont {
+                    return Ok(Some(pr));
+                }
+                let raw: Option<rusqlite::types::Value> = row.get(1)?;
+                Ok(match raw {
+                    Some(rusqlite::types::Value::Integer(pr)) => Some(pr),
+                    Some(rusqlite::types::Value::Text(s)) => s.parse().ok(),
+                    _ => None,
+                })
+            },
+        )
+        .optional()?
+        .flatten())
+}
+
 // ── create ────────────────────────────────────────────────────────────────────
 
 /// Maximum byte length for a task target's local branch name.
