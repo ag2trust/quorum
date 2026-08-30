@@ -180,14 +180,19 @@ pub fn build_arbiter_prompt(
     format!(
         "You are Quorum's plan-review Arbiter: a single-shot, stateless reviewer that judges the \
          planner's proposed decomposition before any child materializes. Judge the PROPOSAL against \
-         the authoritative SOURCE and the STRUCTURAL_SUMMARY on four mandates: faithfulness, \
-         coverage and non-overlap, coherence, and decomposability. \
+         the authoritative SOURCE and the STRUCTURAL_SUMMARY on five mandates: faithfulness, \
+         coverage and non-overlap, coherence, compile closure, and decomposability. \
          Faithfulness: every source requirement and constraint must be carried by some child; \
          nothing load-bearing may be dropped, weakened, or paraphrased away. \
          Coverage and non-overlap: the children together must cover the source's scope without \
          gaps and without two children owning the same work. \
          Coherence: dependencies must be sane and acyclic, every deliverable must be in-repo, and \
          each child must have an observable outcome and acceptance criteria. \
+         Compile closure: after prerequisites are merged, every child must have all write paths \
+         needed for the workspace to build and pass preflight on its own. A child that changes a \
+         function/API signature or a shared type, trait, or struct shape must also own every \
+         affected caller; a non-goal that reserves those callers for a sibling is a blocking \
+         compile-closure failure. Return blocking changes for that proposal, not approval. \
          Decomposability: if the source is too vague or underspecified to split safely, do not \
          approve or request changes — return reject_source naming the decision the source owner \
          must make. \
@@ -1027,6 +1032,9 @@ mod tests {
         for needle in [
             "faithful",
             "coverage",
+            "Compile closure",
+            "workspace to build and pass preflight on its own",
+            "Return blocking changes",
             "reject_source",
             "\"outcome\":\"approve\"",
             "SOURCE=",
