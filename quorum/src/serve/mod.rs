@@ -15,6 +15,8 @@ pub mod codex_agent;
 pub mod codex_stream;
 pub mod collector;
 pub mod doctor;
+#[allow(dead_code)] // The establish step is intentionally unwired until fallback activation.
+pub mod fallback_establish;
 #[allow(dead_code)] // The gate is intentionally unwired until fallback activation.
 pub mod fallback_preflight;
 #[allow(dead_code)] // The retire step is intentionally unwired until fallback activation.
