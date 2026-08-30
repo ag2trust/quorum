@@ -48,6 +48,11 @@ pub const PUBLICATION_FAILURE_KIND_REF: &str = "daemon_publication_failure_kind"
 /// pins a dead PR/branch and retry must abandon it so the next publication
 /// attempt mints a fresh branch/PR.
 pub const PUBLICATION_FAILURE_KIND_PR_CLOSED: &str = "pr-closed";
+/// Publication observed the pinned PR in `MERGED` state. Delivery evidence:
+/// the park is terminal and `retry_parked` refuses to restore it. Recorded as
+/// a distinct kind so retry stays a pure DB decision (no reason-string parse,
+/// no network) and cannot re-park a merged-PR task.
+pub const PUBLICATION_FAILURE_KIND_PR_MERGED: &str = "pr-merged";
 /// Bounded audit trail written when `retry_parked` abandons a pinned
 /// publication intent. Preserves `{pr, branch, local_sha}` so the orphaned
 /// PR/branch remains traceable after the daemon mints a fresh delivery.
@@ -3993,6 +3998,7 @@ pub fn park_publication_failure(
 ) -> Result<Option<Task>> {
     let kind_str = match kind {
         PublicationFailureKind::PrClosed => Some(PUBLICATION_FAILURE_KIND_PR_CLOSED),
+        PublicationFailureKind::PrMerged => Some(PUBLICATION_FAILURE_KIND_PR_MERGED),
         PublicationFailureKind::Other => None,
     };
     park_inner(conn, id, reason, resume_status, kind_str, now)
@@ -4063,6 +4069,10 @@ pub enum PublicationFailureKind {
     /// The pinned PR is closed unmerged; safe to abandon the intent on retry
     /// so the next publication attempt mints a fresh branch/PR.
     PrClosed,
+    /// The pinned PR is already merged. This is delivery evidence: the park
+    /// is terminal and `retry_parked` refuses to restore it. The operator
+    /// must investigate manually — a merged PR cannot be relaunched.
+    PrMerged,
     /// Every other publication failure. Retry preserves the existing intent
     /// exactly as before.
     Other,
@@ -4472,6 +4482,24 @@ pub fn retry_parked(
         tx.commit()?;
         return Ok(None);
     }
+    // A publication parked because the pinned PR was observed MERGED (#186)
+    // is delivery evidence — it must stay terminal. Refuse to restore so the
+    // CLI returns the clean negative and no new worker is provisioned. The
+    // daemon persisted this classification at park time, keeping the retry
+    // decision pure DB (no reason-string parse, no network).
+    let pr_merged_parked: bool = tx.query_row(
+        "SELECT COALESCE(
+             json_extract(refs, '$.daemon_publication_failure_kind')=?2,
+             0
+         )
+         FROM tasks WHERE id=?1",
+        params![id, PUBLICATION_FAILURE_KIND_PR_MERGED],
+        |row| row.get(0),
+    )?;
+    if pr_merged_parked {
+        tx.commit()?;
+        return Ok(None);
+    }
     let policy_parked: bool = tx.query_row(
         "SELECT COALESCE(
              json_valid(refs)
@@ -4581,13 +4609,18 @@ pub fn retry_parked(
     // time so this decision stays pure DB — no reason-string parse, no
     // network. Pinned PR must be non-null (a null pr is the rejected-initial
     // case above). Retry abandons the dead intent and mints a fresh branch/PR
-    // on the next publication attempt; the abandoned {pr,branch,local_sha} is
-    // preserved as a bounded audit ref so the orphaned PR stays traceable.
+    // on the next publication attempt; the abandoned
+    // `{pr,branch,local_sha,continue_pr}` is preserved as a bounded audit ref
+    // so the orphaned PR stays traceable. `continue_pr` is retired atomically
+    // in the same UPDATE below when it names the same dead PR, so the next
+    // dispatch cannot re-resolve the closed continuation authority and
+    // re-park (Task #182 loop path).
     let pr_closed_audit: Option<serde_json::Value> = tx
         .query_row(
             "SELECT json_extract(refs, '$.daemon_publication.pr'),
                     json_extract(refs, '$.daemon_publication.branch'),
-                    json_extract(refs, '$.daemon_publication.local_sha')
+                    json_extract(refs, '$.daemon_publication.local_sha'),
+                    continue_pr
              FROM tasks
              WHERE id=?1
                AND COALESCE(json_extract(refs, '$.daemon_publication_failure_kind'), '')
@@ -4599,23 +4632,36 @@ pub fn retry_parked(
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
                 ))
             },
         )
         .optional()?
-        .map(|(pr, branch, local_sha)| {
-            serde_json::json!({
+        .map(|(pr, branch, local_sha, continue_pr)| {
+            let mut audit = serde_json::json!({
                 "pr": pr,
                 "branch": branch,
                 "local_sha": local_sha,
-            })
+            });
+            // Only record the continuation authority we are actually retiring
+            // in the same transaction. A continue_pr pointing elsewhere is
+            // preserved, so it is not part of this abandonment record.
+            if continue_pr == Some(pr) {
+                audit["continue_pr"] = serde_json::json!(pr);
+            }
+            audit
         });
+    let retire_closed_continuation = pr_closed_audit
+        .as_ref()
+        .and_then(|audit| audit.get("continue_pr"))
+        .is_some();
     let reset_publication = fresh_initial_delivery || pr_closed_audit.is_some();
     let updated = tx.execute(
         "UPDATE tasks
          SET status=?2,
              assignee=NULL,
              author=CASE WHEN ?6 THEN NULL ELSE author END,
+             continue_pr=CASE WHEN ?7 THEN NULL ELSE continue_pr END,
              recovery_attempts=CASE WHEN ?5 THEN 0 ELSE recovery_attempts END,
              refs=CASE
                   WHEN ?6
@@ -4685,6 +4731,7 @@ pub fn retry_parked(
             resume_status,
             reset_recovery_budget,
             reset_publication,
+            retire_closed_continuation,
         ],
     )?;
     if updated == 0 {
@@ -13650,6 +13697,282 @@ mod tests {
                 "non-pr-closed retry must not write an audit ref ({title}): {refs}"
             );
         }
+    }
+
+    /// Task #186 (R2 blocker #1): a task originally created with
+    /// `--continue-pr=752` whose daemon publication parks with
+    /// `PublicationFailureKind::PrClosed` (pinned PR is closed unmerged) must
+    /// atomically retire `tasks.continue_pr` in the same retry transaction.
+    /// Without this, the next dispatch resolves the same closed PR via
+    /// `spawn_worker`'s continuation branch and re-parks — the observed
+    /// Task #182 unrecoverable loop. Retirement is recorded on the
+    /// `abandoned_publication` audit ref so the orphaned continuation
+    /// authority stays traceable.
+    #[test]
+    fn retry_parked_pr_closed_retires_matching_continue_pr() {
+        let (_d, mut c) = open_tmp();
+        let id = create_with_continue_pr(
+            &mut c,
+            "owner",
+            "pr-closed retry with continuation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some(752),
+            1000,
+        )
+        .unwrap();
+        let intent = serde_json::json!({
+            "daemon_publication": {
+                "branch": "daemon/pr-closed-cont-t182",
+                "local_sha": "sha-parked",
+                "pr": 752,
+                "stage": "intent",
+                "expected_remote_sha": "sha-remote",
+            },
+        });
+        update_refs_daemon(&mut c, id, &intent.to_string(), 1001).unwrap();
+        c.execute(
+            "UPDATE tasks
+             SET status='working', assignee='FirstWorker', author='FirstWorker'
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        park_publication_failure(
+            &mut c,
+            id,
+            "daemon-owned publication failed: PR #752 is closed (unmerged)",
+            "open",
+            PublicationFailureKind::PrClosed,
+            1004,
+        )
+        .unwrap()
+        .expect("park must succeed");
+        // The park does not touch continue_pr — it is retirement at retry
+        // time that atomically retires the dead continuation authority.
+        let continue_pr_at_park: Option<i64> = c
+            .query_row(
+                "SELECT continue_pr FROM tasks WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(continue_pr_at_park, Some(752));
+
+        let retried = retry_parked(&mut c, id, "operator", true, 1005)
+            .unwrap()
+            .expect("parked task must retry");
+        assert_eq!(retried.status, "open");
+        assert_eq!(
+            retried.continue_pr, None,
+            "pr-closed retry must retire the matching continue_pr so \
+             spawn_worker cannot re-resolve the dead PR"
+        );
+        // Persisted row matches the returned Task, guarding against a
+        // return-value drift regression.
+        let stored_continue_pr: Option<i64> = c
+            .query_row(
+                "SELECT continue_pr FROM tasks WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_continue_pr, None);
+        let refs: serde_json::Value =
+            serde_json::from_str(retried.refs.as_deref().unwrap_or("{}")).unwrap();
+        let audit = refs
+            .get(ABANDONED_PUBLICATION_REF)
+            .expect("pr-closed retry must record an abandoned_publication audit ref");
+        assert_eq!(audit["pr"], 752);
+        assert_eq!(
+            audit["continue_pr"], 752,
+            "audit ref must preserve the retired continuation authority: {audit}"
+        );
+    }
+
+    /// Task #186 (R2 blocker #1): a pr-closed retry whose `tasks.continue_pr`
+    /// points at a DIFFERENT PR must not retire it. The abandonment record
+    /// only names the dead PR; unrelated continuation authority is preserved
+    /// exactly.
+    #[test]
+    fn retry_parked_pr_closed_preserves_unrelated_continue_pr() {
+        let (_d, mut c) = open_tmp();
+        let id = create_with_continue_pr(
+            &mut c,
+            "owner",
+            "pr-closed retry with unrelated continuation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some(999),
+            1000,
+        )
+        .unwrap();
+        let intent = serde_json::json!({
+            "daemon_publication": {
+                "branch": "daemon/pr-closed-other",
+                "local_sha": "sha-parked",
+                "pr": 752,
+                "stage": "intent",
+                "expected_remote_sha": "sha-remote",
+            },
+        });
+        update_refs_daemon(&mut c, id, &intent.to_string(), 1001).unwrap();
+        park_publication_failure(
+            &mut c,
+            id,
+            "daemon-owned publication failed: PR #752 is closed (unmerged)",
+            "open",
+            PublicationFailureKind::PrClosed,
+            1004,
+        )
+        .unwrap()
+        .expect("park must succeed");
+
+        let retried = retry_parked(&mut c, id, "operator", true, 1005)
+            .unwrap()
+            .expect("parked task must retry");
+        assert_eq!(
+            retried.continue_pr,
+            Some(999),
+            "pr-closed retry must preserve continue_pr that names a different PR"
+        );
+        let refs: serde_json::Value =
+            serde_json::from_str(retried.refs.as_deref().unwrap_or("{}")).unwrap();
+        let audit = refs.get(ABANDONED_PUBLICATION_REF).unwrap();
+        assert!(
+            audit.get("continue_pr").is_none(),
+            "audit ref must not name an untouched continuation authority: {audit}"
+        );
+    }
+
+    /// Task #186 (R2 blocker #2): a publication parked with
+    /// `PublicationFailureKind::PrMerged` is delivery evidence and stays
+    /// terminal. `retry_parked` returns `Ok(None)`, the task remains
+    /// `status='failed'`, and no restore side effects fire (no branch
+    /// deallocation, no `runner_continuation` mutation, no events).
+    #[test]
+    fn retry_parked_pr_merged_kind_stays_terminal() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "owner",
+            "pr-merged terminal retry",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let intent = serde_json::json!({
+            "daemon_publication": {
+                "branch": "daemon/pr-merged-t99",
+                "local_sha": "sha-parked",
+                "pr": 900,
+                "stage": "intent",
+                "expected_remote_sha": "sha-remote",
+            },
+            "runner_continuation": {"provider": "codex", "id": "final-turn"},
+        });
+        update_refs_daemon(&mut c, id, &intent.to_string(), 1001).unwrap();
+        c.execute(
+            "UPDATE tasks
+             SET status='in-review', assignee='FirstWorker', author='FirstWorker'
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at)
+             VALUES (?1,?2,?3,'FirstWorker',1001)",
+            params![id, "daemon/pr-merged-t99", "/tmp/pr-merged-t99"],
+        )
+        .unwrap();
+        park_publication_failure(
+            &mut c,
+            id,
+            "daemon-owned publication failed: PR #900 is already merged; delivery evidence — investigate manually",
+            "in-review",
+            PublicationFailureKind::PrMerged,
+            1004,
+        )
+        .unwrap()
+        .expect("park must succeed");
+        let parked_refs: serde_json::Value = c
+            .query_row("SELECT refs FROM tasks WHERE id=?1", params![id], |r| {
+                r.get::<_, String>(0)
+            })
+            .map(|s| serde_json::from_str(&s).unwrap())
+            .unwrap();
+        assert_eq!(
+            parked_refs[PUBLICATION_FAILURE_KIND_REF], "pr-merged",
+            "park must record the terminal pr-merged classification: {parked_refs}"
+        );
+
+        let outcome = retry_parked(&mut c, id, "operator", true, 1005).unwrap();
+        assert!(
+            outcome.is_none(),
+            "pr-merged park is delivery evidence — retry must not restore: {outcome:?}"
+        );
+
+        let (status, refs): (String, String) = c
+            .query_row(
+                "SELECT status, refs FROM tasks WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "pr-merged park must stay failed after a rejected retry"
+        );
+        let refs_json: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(
+            refs_json[PUBLICATION_FAILURE_KIND_REF], "pr-merged",
+            "pr-merged marker must survive a rejected retry: {refs_json}"
+        );
+        assert!(
+            refs_json.get("daemon_publication").is_some(),
+            "pr-merged park must retain the intent for auditing: {refs_json}"
+        );
+        assert!(
+            refs_json.get(ABANDONED_PUBLICATION_REF).is_none(),
+            "pr-merged rejected retry must not write an abandonment audit: {refs_json}"
+        );
+        let branch_allocations: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM task_branches WHERE task_id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            branch_allocations, 1,
+            "pr-merged rejected retry must not deallocate the branch"
+        );
+        let event_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE kind IN ('task_retry','task_publication_abandoned')
+                   AND subject=?1",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            event_count, 0,
+            "pr-merged rejected retry must not emit retry or abandonment events"
+        );
     }
 
     /// Task #473 R4 defense: `retry_parked`'s policy branch keeps

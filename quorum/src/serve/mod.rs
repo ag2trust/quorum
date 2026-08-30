@@ -891,6 +891,11 @@ const PR_STATE_MERGED: &str = "MERGED";
 /// case. Used at the daemon publication-park site to classify the failure as
 /// `PublicationFailureKind::PrClosed` (#186).
 const PUBLICATION_PR_CLOSED_MARKER: &str = "is closed (unmerged)";
+/// Substring emitted by `existing_pr_lease_baseline` for the MERGED case.
+/// The daemon must classify this as `PublicationFailureKind::PrMerged` so
+/// the park records a distinct terminal disposition and `retry_parked`
+/// refuses to restore a task whose delivery evidence has landed (#186).
+const PUBLICATION_PR_MERGED_MARKER: &str = "is already merged";
 
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -908,7 +913,12 @@ struct PrTarget {
 /// with framing prefixes ("daemon-owned publication failed: …"), so match by
 /// substring against the shape produced in `existing_pr_lease_baseline`.
 fn publication_failure_kind_from_error(error: &str) -> tasks::PublicationFailureKind {
-    if error.contains(PUBLICATION_PR_CLOSED_MARKER) {
+    // MERGED must be checked first because the merged-shape error also names
+    // the PR and could otherwise be misread. Neither marker appears in the
+    // other classification's error text; the ordering is defense in depth.
+    if error.contains(PUBLICATION_PR_MERGED_MARKER) {
+        tasks::PublicationFailureKind::PrMerged
+    } else if error.contains(PUBLICATION_PR_CLOSED_MARKER) {
         tasks::PublicationFailureKind::PrClosed
     } else {
         tasks::PublicationFailureKind::Other
@@ -32146,8 +32156,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             publication_failure_kind_from_error(&format!(
                 "daemon-owned publication failed: {merged}"
             )),
-            tasks::PublicationFailureKind::Other,
-            "MERGED is delivery evidence — must never classify as PrClosed"
+            tasks::PublicationFailureKind::PrMerged,
+            "MERGED is delivery evidence — must persist a distinct terminal kind so \
+             retry_parked refuses to restore it"
         );
         assert_eq!(
             publication_failure_kind_from_error(
