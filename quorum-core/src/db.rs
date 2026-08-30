@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 69;
+pub const SCHEMA_VERSION: i64 = 70;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1293,6 +1293,13 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
         // append-only table, so SCHEMA_SQL's idempotent CREATE TABLE handles
         // both fresh databases and upgrades from v68 without backfilling or
         // inferring any historical provider continuation.
+        // v70 = nullable instance_id on daemon_lock. CREATE TABLE IF NOT EXISTS
+        // is a no-op for an existing table, so the column must be ALTERed in.
+        // Existing rows stay NULL (no backfill); the column_exists guard keeps
+        // the ALTER idempotent under the migrate_txn write lock.
+        if current < 70 && !column_exists(conn, "daemon_lock", "instance_id")? {
+            conn.execute("ALTER TABLE daemon_lock ADD COLUMN instance_id TEXT", [])?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1420,6 +1427,7 @@ mod tests {
             assert!(column_exists(&c, "agent_runs", column).unwrap());
         }
         assert!(column_exists(&c, "run_capabilities", "agent_run_id").unwrap());
+        assert!(column_exists(&c, "daemon_lock", "instance_id").unwrap());
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
@@ -1806,6 +1814,78 @@ mod tests {
             SCHEMA_VERSION,
             "a second migration-open must be a no-op"
         );
+    }
+
+    #[test]
+    fn v69_to_v70_adds_nullable_daemon_lock_instance_id_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v69-daemon-lock-instance-id.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO daemon_lock(id, pid, heartbeat_at) VALUES (1, 1234, 100)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE daemon_lock DROP COLUMN instance_id;
+                 PRAGMA user_version=69;",
+            )
+            .unwrap();
+            assert!(
+                !column_exists(&raw, "daemon_lock", "instance_id").unwrap(),
+                "pre-upgrade fixture must lack instance_id"
+            );
+            let version: i64 = raw
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 69);
+        }
+
+        let upgraded = open(&path).unwrap();
+        assert!(column_exists(&upgraded, "daemon_lock", "instance_id").unwrap());
+        let (pid, heartbeat_at, instance_id): (i64, i64, Option<String>) = upgraded
+            .query_row(
+                "SELECT pid, heartbeat_at, instance_id FROM daemon_lock WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, 1234);
+        assert_eq!(heartbeat_at, 100);
+        assert_eq!(
+            instance_id, None,
+            "legacy pre-upgrade rows must retain NULL instance_id"
+        );
+        assert_eq!(
+            upgraded
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(upgraded);
+
+        // Re-running migrate is a no-op: column stays, version stays, row stays NULL.
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "daemon_lock", "instance_id").unwrap());
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION,
+            "a second migration-open must be a no-op"
+        );
+        let still_null: Option<String> = reopened
+            .query_row(
+                "SELECT instance_id FROM daemon_lock WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_null, None);
     }
 
     #[test]

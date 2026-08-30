@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 69). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 70). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -457,7 +457,10 @@ CREATE TABLE IF NOT EXISTS reviewer_provision_attempts (
 CREATE TABLE IF NOT EXISTS daemon_lock (
     id            INTEGER PRIMARY KEY CHECK (id = 1),
     pid           INTEGER NOT NULL,
-    heartbeat_at  INTEGER NOT NULL
+    heartbeat_at  INTEGER NOT NULL,
+    -- v70: opaque instance identity for the holding daemon. Nullable so
+    -- legacy pre-upgrade rows remain NULL rather than being backfilled.
+    instance_id   TEXT
 );
 
 -- v42: one immutable executable routing decision per managed responsibility.
