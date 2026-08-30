@@ -17,6 +17,12 @@ Write only inside the assigned managed worktree and repository. You may read ano
 as context, but a sibling or outside-repository change is not a managed deliverable. Leave it
 to the owner interactively, or create a separately scoped task for the repository that owns it.
 
+The same boundary applies inside a decomposition graph: if the task cannot compile or pass
+preflight without editing files its non-goals reserve for a sibling task, the plan is wrong.
+Signal `blocked` with that contradiction instead of expanding scope. An out-of-boundary
+delivery is a graph-blocker: it fails the task, ends the review, and freezes the entire graph.
+Never submit with a failing preflight; report the failure instead.
+
 If blocked, failed, or awaiting input, signal the daemon:
 
 ```sh
@@ -110,6 +116,25 @@ rework context; it is not a general retry button for terminal failures:
 ```sh
 quorum task-retry --task-id <N> --by <You>
 ```
+
+Retrying a failed generated graph child whose graph is blocked with `generated-child-failed`
+also reactivates that graph in the same transaction; held siblings resume on the next tick.
+
+A graph blocked by a reviewer graph-blocker hold (for example `boundary-violation`) is not
+retryable and no CLI reactivates it directly. The supported recovery is to cancel the source
+task, which atomically cancels the graph and its children, then create one replacement task
+that owns the combined scope. Cancellation requires the source's creator or assignee identity
+and, for a decomposed source, `--expected-revision`:
+
+```sh
+quorum task-update --agent <creator> --task-id <source> --status cancelled \
+  --expected-revision <rev> --note-file <why>
+quorum task-create --created-by <You> --continue-pr <PR> --title "<combined outcome>" --body-stdin
+```
+
+Cancelling deletes the cancelled children's remote branches, which closes their PRs. If the
+replacement continues from a child's PR, restore that branch and reopen the PR before the
+daemon attempts publication (or before creating the `--continue-pr` task).
 
 For a failed generated graph child, do not infer equivalence from matching text or a shared PR.
 Only after the exact managed continuation is completed and merged may an operator adopt that
