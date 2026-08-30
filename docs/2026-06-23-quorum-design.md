@@ -542,11 +542,15 @@ even when the stored numeric PID happens to collide with an unrelated live proce
 On clean shutdown the lease is released, guarded by the calling instance identity so a
 superseded process cannot delete the current holder's row. A crash leaves the row
 behind with the crashed instance identity. The consequence of dropping PID liveness
-from the admission gate: a `SIGKILL` followed by an immediate restart within the
-30s stale window fails closed under the new (different) instance identity and exits 2
-until the stored heartbeat expires — the `serve-supervisor.sh` wrapper is expected to
-retry through this brief window. This trades a small self-recovery delay for the
-guarantee that no PID collision or PID-namespace edge case can ever bypass the guard.
+from the admission gate: a `SIGKILL` followed by an immediate restart within the 30s
+stale window fails closed under the new (different) instance identity and exits 2
+until the stored heartbeat expires. `scripts/serve-supervisor.sh` does not retry this
+condition — the wrapper only loops on the drain/self-update exit code (75) and
+propagates every other status, so `Held` (exit 2) causes the wrapper itself to exit.
+The supported recovery is an external restart after the 30s heartbeat goes stale, at
+which point the fresh process takes over the abandoned lease via UPSERT. This trades a
+small self-recovery delay for the guarantee that no PID collision or PID-namespace
+edge case can ever bypass the guard.
 
 ### Daemon limits and stall detection
 
