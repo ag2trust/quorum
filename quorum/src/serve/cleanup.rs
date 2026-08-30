@@ -691,6 +691,23 @@ async fn cleanup_branch_delete(
     if expected.tombstone_ref != tombstone {
         return Err("branch delete tombstone identity mismatch".into());
     }
+    // GitHub auto-closes an open PR whose head branch is deleted. Skip the
+    // deletion when the cancelled task's PR is still held by a live task
+    // (e.g. a continue-pr recovery), so that lifecycle survives destructive
+    // graph teardown. The retire-tombstone pass tolerates a missing tombstone,
+    // so a skipped delete settles cleanly without breaking retirement invariants.
+    if let Some(guard) = branch_delete_pr_guard(config, work.key.task_id).await? {
+        emit_branch_delete_skipped(
+            &config.db_path,
+            work.key.graph_id,
+            work.key.task_id,
+            &expected.name,
+            guard.pr,
+            guard.referencing_task,
+        )
+        .await?;
+        return Ok(());
+    }
     wt.delete_branch_with_tombstone(
         &config.repo_dir,
         &configured_remote_url(&config.repo),
@@ -699,6 +716,66 @@ async fn cleanup_branch_delete(
         &expected.tombstone_ref,
     )
     .await
+}
+
+struct BranchDeleteGuard {
+    pr: i64,
+    referencing_task: i64,
+}
+
+async fn branch_delete_pr_guard(
+    config: &ServeConfig,
+    task_id: i64,
+) -> std::result::Result<Option<BranchDeleteGuard>, String> {
+    let path = config.db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&path)?;
+        let Some(pr) = quorum_core::tasks::task_pr_reference(&conn, task_id)? else {
+            return Ok::<Option<BranchDeleteGuard>, QuorumError>(None);
+        };
+        let Some(other) = quorum_core::tasks::live_pr_reference(&conn, pr, Some(task_id))? else {
+            return Ok(None);
+        };
+        Ok(Some(BranchDeleteGuard {
+            pr,
+            referencing_task: other,
+        }))
+    })
+    .await
+    .map_err(|e| format!("branch delete guard join: {e}"))?
+    .map_err(|e| e.to_string())
+}
+
+async fn emit_branch_delete_skipped(
+    db_path: &Path,
+    graph_id: i64,
+    task_id: i64,
+    branch: &str,
+    pr: i64,
+    referencing_task: i64,
+) -> std::result::Result<(), String> {
+    let path = db_path.to_path_buf();
+    let branch = branch.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let subject = format!("task#{task_id}");
+        let body = format!(
+            "branch delete skipped: branch {branch} backs PR #{pr}, still referenced by live task#{referencing_task} (graph#{graph_id})"
+        );
+        quorum_core::events::emit(
+            &tx,
+            "branch_delete_skipped",
+            &subject,
+            &body,
+            quorum_core::clock::now(),
+        )?;
+        tx.commit()?;
+        Ok::<_, QuorumError>(())
+    })
+    .await
+    .map_err(|e| format!("branch delete skip emit join: {e}"))?
+    .map_err(|e| e.to_string())
 }
 
 async fn task_branch_binding(
@@ -1335,6 +1412,268 @@ mod tests {
             .unwrap()
             .status
             .success());
+    }
+
+    async fn setup_branch_delete_fixture(
+        dir: &tempfile::TempDir,
+    ) -> (ServeConfig, WorktreeManager, PathBuf, PathBuf, String) {
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let worktree_base = dir.path().join("worktrees");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&worktree_base).unwrap();
+        git(dir.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README"), "base\n").unwrap();
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "base"]);
+        git(&repo, &["branch", "daemon/task-2"]);
+        let worker_tree = worktree_base.join("task-2");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                worker_tree.to_str().unwrap(),
+                "daemon/task-2",
+            ],
+        );
+        std::fs::write(worker_tree.join("result"), "finished\n").unwrap();
+        git(&worker_tree, &["add", "result"]);
+        git(&worker_tree, &["commit", "-m", "finished result"]);
+        let worker_sha = git(&worker_tree, &["rev-parse", "HEAD"]);
+        git(
+            &repo,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", remote.display()),
+                "https://github.com/owner/repo.git",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "push",
+                "https://github.com/owner/repo.git",
+                &format!("{worker_sha}:refs/heads/daemon/task-2"),
+            ],
+        );
+        let db_path = dir.path().join("quorum.db");
+        let config = restart_config(db_path, repo.clone(), worktree_base);
+        let manager = WorktreeManager::new();
+        (config, manager, repo, remote, worker_sha)
+    }
+
+    fn seed_cancelled_child_with_pr(
+        conn: &mut rusqlite::Connection,
+        cancelled_task: i64,
+        pr: i64,
+        branch: &str,
+        worker_tree: &Path,
+        worker_sha: &str,
+    ) -> i64 {
+        let refs = serde_json::json!({"pr": pr}).to_string();
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs)
+             VALUES (1,'source','cancelled','owner',1,10,NULL),
+                    (?1,'cancelled child','cancelled','owner',1,10,?2)",
+            rusqlite::params![cancelled_task, refs],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,planned_source_revision,created_at,updated_at)
+             VALUES (1,1,'cancelled',0,0,1,1,10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (1,?1,'child',1,0)",
+            rusqlite::params![cancelled_task],
+        )
+        .unwrap();
+        conn.query_row(
+            "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at,provenance_sha)
+             VALUES (?1,?2,?3,'daemon',2,?4) RETURNING id",
+            rusqlite::params![cancelled_task, branch, worker_tree.to_string_lossy(), worker_sha],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    }
+
+    async fn run_branch_delete(
+        config: &ServeConfig,
+        manager: &WorktreeManager,
+        task_id: i64,
+        allocation_id: i64,
+        branch: &str,
+        worker_sha: &str,
+    ) -> std::result::Result<(), String> {
+        let tombstone = format!("refs/quorum/cleanup/1/{task_id}/{allocation_id}");
+        let artifact = serde_json::json!({
+            "allocation_id": allocation_id,
+            "expected_sha": worker_sha,
+            "name": branch,
+            "tombstone_ref": tombstone,
+        })
+        .to_string();
+        let work = CleanupWork {
+            key: CleanupKey {
+                graph_id: 1,
+                task_id,
+                artifact_kind: "branch-delete".into(),
+                artifact_ref: artifact,
+            },
+            attempt: 1,
+        };
+        cleanup_branch_delete(config, manager, &work).await
+    }
+
+    fn remote_has_branch(remote: &Path, branch: &str) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(remote)
+            .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    #[tokio::test]
+    async fn branch_delete_skips_when_live_task_still_references_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, manager, _repo, remote, worker_sha) = setup_branch_delete_fixture(&dir).await;
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let allocation_id = seed_cancelled_child_with_pr(
+            &mut conn,
+            2,
+            42,
+            "daemon/task-2",
+            &config.worktree_base.join("task-2"),
+            &worker_sha,
+        );
+        // A live continue-pr recovery task holds the same PR.
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,continue_pr)
+             VALUES (99,'continuation','open','owner',11,11,42)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        run_branch_delete(
+            &config,
+            &manager,
+            2,
+            allocation_id,
+            "daemon/task-2",
+            &worker_sha,
+        )
+        .await
+        .expect("guard must settle skip as Ok so the intent settles done");
+
+        assert!(
+            remote_has_branch(&remote, "daemon/task-2"),
+            "remote branch must survive so PR stays open"
+        );
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (kind, subject, body): (String, String, String) = conn
+            .query_row(
+                "SELECT kind,subject,body FROM events WHERE kind='branch_delete_skipped'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("skip event must be emitted");
+        assert_eq!(kind, "branch_delete_skipped");
+        assert_eq!(subject, "task#2");
+        assert!(body.contains("PR #42"), "body must name the PR: {body}");
+        assert!(
+            body.contains("task#99"),
+            "body must name the referencing task: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_delete_still_removes_branch_when_no_live_task_references_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, manager, _repo, remote, worker_sha) = setup_branch_delete_fixture(&dir).await;
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let allocation_id = seed_cancelled_child_with_pr(
+            &mut conn,
+            2,
+            42,
+            "daemon/task-2",
+            &config.worktree_base.join("task-2"),
+            &worker_sha,
+        );
+        drop(conn);
+
+        run_branch_delete(
+            &config,
+            &manager,
+            2,
+            allocation_id,
+            "daemon/task-2",
+            &worker_sha,
+        )
+        .await
+        .expect("no live reference must not block deletion");
+
+        assert!(
+            !remote_has_branch(&remote, "daemon/task-2"),
+            "remote branch must be deleted when no live task references the PR"
+        );
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM events WHERE kind='branch_delete_skipped'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "skip event must not fire on the positive path"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_delete_skips_when_failed_parked_task_still_references_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, manager, _repo, remote, worker_sha) = setup_branch_delete_fixture(&dir).await;
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let allocation_id = seed_cancelled_child_with_pr(
+            &mut conn,
+            2,
+            42,
+            "daemon/task-2",
+            &config.worktree_base.join("task-2"),
+            &worker_sha,
+        );
+        // A retryable failed-and-parked task with the same PR: `task-retry` will
+        // resume publication against PR #42.
+        let parked_refs = r#"{"pr":42,"daemon_parked":1,"daemon_resume_status":"open"}"#;
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs)
+             VALUES (77,'parked continuation','failed','owner',12,12,?1)",
+            [parked_refs],
+        )
+        .unwrap();
+        drop(conn);
+
+        run_branch_delete(
+            &config,
+            &manager,
+            2,
+            allocation_id,
+            "daemon/task-2",
+            &worker_sha,
+        )
+        .await
+        .expect("retryable parked task must also gate branch delete");
+        assert!(remote_has_branch(&remote, "daemon/task-2"));
     }
 
     #[test]
