@@ -24,16 +24,6 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
 }
 
-/// Erase any surviving `daemon_lock` row from a SIGKILLed previous run.
-/// Instance-identity authority (task #179) rejects fresh rows from a different
-/// instance even when the numeric PID is dead, so a hard-crash simulation must
-/// clear the lock before the next `start_serve`.
-fn clear_daemon_lock(db_path: &std::path::Path) {
-    let conn = quorum_core::db::open(db_path).unwrap();
-    conn.execute("DELETE FROM daemon_lock WHERE id = 1", [])
-        .unwrap();
-}
-
 fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
     let db = home.join("repos").join("test__repo").join("quorum.db");
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -964,7 +954,7 @@ fn consecutive_restarts_accumulate_recovery_count() {
     // semantics (a live-daemon spoof in another namespace would look
     // identical). A real supervisor either waits stale_secs or clears the
     // lock explicitly; the test does the latter to keep runtime tight.
-    clear_daemon_lock(db_path);
+    common::clear_daemon_lock(db_path);
 
     let task = env.task(task_id);
     assert_eq!(

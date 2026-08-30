@@ -819,6 +819,8 @@ fn reviewer_run_insert_error_never_attaches_and_restart_recovers() {
             .unwrap();
     }
 
+    // SIGKILL + immediate restart is Held until stale or cleared (instance-id
+    // authority); tests clear the leftover row instead of waiting stale_secs.
     common::clear_daemon_lock(&db_path(home.path()));
     let retry_wt_base = tempfile::tempdir().unwrap();
     let mut recovered = ServeHandle::start(

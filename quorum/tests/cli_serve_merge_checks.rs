@@ -1005,6 +1005,8 @@ fn pre_review_pending_survives_daemon_restart() {
         first.lines
     );
     first.crash();
+    // SIGKILL + immediate restart is Held until stale or cleared (instance-id
+    // authority); tests clear the leftover row instead of waiting stale_secs.
     common::clear_daemon_lock(&home.path().join("repos/test__repo/quorum.db"));
 
     std::fs::write(&checks_state, "ready").unwrap();

@@ -33,16 +33,12 @@ pub enum AcquireResult {
 
 /// Mint a fresh opaque instance identifier for a new daemon lifetime.
 ///
-/// Backed by SQLite's cryptographic RNG (`randomblob`) so quorum-core does not
-/// pull in a random-number dependency. 128 bits of entropy is collision-
-/// resistant across any realistic number of concurrent daemon lifetimes; the
-/// value is hex-encoded so it round-trips through the TEXT column and JSON
-/// status output without escaping surprises.
+/// A UUID v4 (128 bits of entropy, hex-encoded without hyphens) is
+/// collision-resistant across any realistic number of concurrent daemon
+/// lifetimes and round-trips through the TEXT column and JSON status output
+/// without escaping surprises. Generation does not open a SQLite connection.
 pub fn new_instance_id() -> String {
-    let conn =
-        Connection::open_in_memory().expect("open :memory: connection for instance id generation");
-    conn.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))
-        .expect("randomblob instance id generation")
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// Atomically check and acquire the daemon lock in a single transaction.

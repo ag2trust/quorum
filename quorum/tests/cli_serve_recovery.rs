@@ -470,6 +470,8 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
         .join("repos")
         .join("test__repo")
         .join("quorum.db");
+    // SIGKILL + immediate restart is Held until stale or cleared (instance-id
+    // authority); tests clear the leftover row instead of waiting stale_secs.
     common::clear_daemon_lock(&db_path);
 
     // ── Relaunch the daemon. ──
@@ -639,6 +641,8 @@ fn double_restart_in_review_stays_in_review() {
         handle.lines
     );
     handle.sigkill();
+    // SIGKILL + immediate restart is Held until stale or cleared (instance-id
+    // authority); tests clear the leftover row instead of waiting stale_secs.
     common::clear_daemon_lock(&db_path);
 
     // Second daemon start — recovery again, task still in-review.
