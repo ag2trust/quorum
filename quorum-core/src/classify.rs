@@ -4,7 +4,7 @@
 use crate::complexity;
 use crate::db::begin_immediate;
 use crate::error::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -15,6 +15,10 @@ pub struct TaskClassification {
     #[serde(rename = "complexity", alias = "cx_est")]
     pub cx_est: i64,
     pub size: String,
+    /// Bounded, artifact-specific rationale for the selected execution size.
+    /// Required for every v3 verdict so a later planning iteration can correct
+    /// the concrete breadth the classifier observed.
+    pub size_reason: String,
     pub ready: bool,
     pub not_ready_reason: Option<String>,
     #[serde(default, alias = "cx_dup_of")]
@@ -28,7 +32,7 @@ pub struct ClassifierResponse {
 }
 
 /// Minimal task info needed for classification input.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskForClassification {
     pub id: i64,
     #[serde(skip)]
@@ -37,6 +41,19 @@ pub struct TaskForClassification {
     pub body: Option<String>,
     pub dependencies: Vec<String>,
     pub recovery_notes: Vec<String>,
+    /// Character bound applied to `body` when the prompt is rendered.
+    /// DB-sourced tasks use [`BODY_CHAR_LIMIT`]; planned decomposition
+    /// children carry the larger [`PLANNED_CHILD_BODY_CHAR_LIMIT`] because
+    /// their body is the complete planner-written child contract, not free
+    /// text. The prompt is fingerprinted from `body` itself, so the bound is
+    /// not part of the identity, and a deserialized value defaults to the
+    /// root bound rather than to zero.
+    #[serde(skip, default = "default_body_char_limit")]
+    pub body_char_limit: usize,
+}
+
+fn default_body_char_limit() -> usize {
+    BODY_CHAR_LIMIT
 }
 
 /// An internally-derived identity for the exact bounded task input given to a
@@ -59,7 +76,7 @@ pub fn classification_inputs(tasks: &[TaskForClassification]) -> Vec<Classificat
             revision: task.revision,
             // `TaskForClassification` is a struct (not a map), so serde emits
             // a stable field order.  Keep the entire bounded prompt input,
-            // including dependency titles/statuses and recovery notes, in the
+            // including stable dependency context and recovery notes, in the
             // identity rather than relying on generic `updated_at`.
             fingerprint: serde_json::to_string(task)
                 .expect("TaskForClassification always serializes"),
@@ -68,11 +85,30 @@ pub fn classification_inputs(tasks: &[TaskForClassification]) -> Vec<Classificat
 }
 
 const VALID_SIZES: &[&str] = &["S", "M", "L", "XL"];
+pub const MAX_SIZE_REASON_BYTES: usize = 1024;
 pub const CLASSIFICATION_BATCH_LIMIT: usize = 20;
 pub const DUP_CONTEXT_LIMIT: usize = 60;
 const TITLE_CHAR_LIMIT: usize = 300;
-const BODY_CHAR_LIMIT: usize = 2_000;
-const DEPENDENCY_TITLE_CHAR_LIMIT: usize = 240;
+/// Prompt body bound for DB-sourced root tasks.
+pub const BODY_CHAR_LIMIT: usize = 2_000;
+/// Per-field byte bound the daemon applies to each of a planned child's
+/// contract fields (text, list, and deliverable paths, cumulatively per
+/// field) before assembling the classifier body.
+pub const PLANNED_CHILD_FIELD_MAX_BYTES: usize = 4 * 1024;
+/// Number of bounded fields in a planned child's classifier body: delta,
+/// paths, deliverables, non-goals, outcome, criteria, constraints,
+/// verification.
+pub const PLANNED_CHILD_BODY_FIELDS: usize = 8;
+/// Prompt body bound for planned decomposition children, derived from the
+/// per-field bound so a fully loaded child never reaches the whole-body
+/// truncation: every field at its cap, doubled for JSON escaping of quotes and
+/// newlines, plus structure (keys, punctuation, deliverable `kind` tags).
+pub const PLANNED_CHILD_BODY_CHAR_LIMIT: usize =
+    2 * PLANNED_CHILD_BODY_FIELDS * PLANNED_CHILD_FIELD_MAX_BYTES + 2 * 1024;
+pub const DEPENDENCY_TITLE_CHAR_LIMIT: usize = 240;
+/// Rendered dependency bound: a `#id ` or `<local-key> — ` prefix (planned
+/// child keys are at most 64 bytes) followed by a bounded title.
+const DEPENDENCY_RENDER_CHAR_LIMIT: usize = DEPENDENCY_TITLE_CHAR_LIMIT + 96;
 const DEPENDENCY_LIMIT: usize = 8;
 const RECOVERY_NOTE_CHAR_LIMIT: usize = 600;
 const RECOVERY_NOTE_LIMIT: usize = 4;
@@ -131,6 +167,7 @@ pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification
                     body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
+                    body_char_limit: BODY_CHAR_LIMIT,
                 })
             },
         )?
@@ -154,7 +191,7 @@ fn enrich_task(
     )?;
     if let Some(deps) = deps {
         let mut stmt = conn.prepare(
-            "SELECT id, substr(title, 1, ?2), status FROM tasks
+            "SELECT id, substr(title, 1, ?2) FROM tasks
              WHERE id IN (SELECT value FROM json_each(?1))
              ORDER BY id LIMIT ?3",
         )?;
@@ -167,10 +204,9 @@ fn enrich_task(
                 ],
                 |r| {
                     Ok(format!(
-                        "#{} {} ({})",
+                        "#{} {}",
                         r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?
+                        r.get::<_, String>(1)?
                     ))
                 },
             )?
@@ -218,6 +254,7 @@ pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskFor
                 body: row.get(3)?,
                 dependencies: vec![],
                 recovery_notes: vec![],
+                body_char_limit: BODY_CHAR_LIMIT,
             })
         },
     )
@@ -244,6 +281,7 @@ fn classifier_input_for_task(
                     body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
+                    body_char_limit: BODY_CHAR_LIMIT,
                 })
             },
         )
@@ -274,6 +312,7 @@ pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>
                     body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
+                    body_char_limit: BODY_CHAR_LIMIT,
                 })
             },
         )?
@@ -306,6 +345,7 @@ pub fn tasks_missing_cx_all(conn: &Connection) -> Result<Vec<TaskForClassificati
                     body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
+                    body_char_limit: BODY_CHAR_LIMIT,
                 })
             },
         )?
@@ -348,6 +388,53 @@ pub fn store_classifications_for_inputs(
     now: i64,
 ) -> Result<usize> {
     let tx = begin_immediate(conn)?;
+    let stored = store_classifications_tx(
+        &tx,
+        results,
+        expected_inputs,
+        classifier_provenance,
+        now,
+        None,
+    )?;
+    tx.commit()?;
+    Ok(stored)
+}
+
+/// Atomic variant used by the daemon: accepts each classification and stamps the
+/// per-task rework ceiling in the *same* transaction. Classification acceptance is
+/// the earliest per-task adoption point, so the immutable adoption-time cap must
+/// land or roll back with the accepted refs — a crash between two separate
+/// transactions would leave the task dispatchable at the compiled default despite
+/// a configured `max_rework`.
+pub fn store_classifications_and_stamp_rework_cap(
+    conn: &mut Connection,
+    results: &[TaskClassification],
+    expected_inputs: &[ClassificationInput],
+    classifier_provenance: &str,
+    now: i64,
+    rework_cap: u32,
+) -> Result<usize> {
+    let tx = begin_immediate(conn)?;
+    let stored = store_classifications_tx(
+        &tx,
+        results,
+        expected_inputs,
+        classifier_provenance,
+        now,
+        Some(rework_cap),
+    )?;
+    tx.commit()?;
+    Ok(stored)
+}
+
+fn store_classifications_tx(
+    tx: &Transaction<'_>,
+    results: &[TaskClassification],
+    expected_inputs: &[ClassificationInput],
+    classifier_provenance: &str,
+    now: i64,
+    rework_cap: Option<u32>,
+) -> Result<usize> {
     let mut stored = 0;
     let expected: std::collections::HashMap<i64, (i64, &str)> = expected_inputs
         .iter()
@@ -377,7 +464,7 @@ pub fn store_classifications_for_inputs(
             continue;
         };
 
-        let Some(current_input) = classifier_input_for_task(&tx, result.task_id)? else {
+        let Some(current_input) = classifier_input_for_task(tx, result.task_id)? else {
             continue;
         };
         if classification_inputs(std::slice::from_ref(&current_input))[0].fingerprint
@@ -404,20 +491,30 @@ pub fn store_classifications_for_inputs(
                     params![result.task_id, now, note],
                 )?;
             }
-            let review_only: bool = tx.query_row(
-                "SELECT review_only FROM tasks WHERE id=?1",
+            let (review_only, continue_pr): (bool, Option<i64>) = tx.query_row(
+                "SELECT review_only, continue_pr FROM tasks WHERE id=?1",
                 params![result.task_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            if let Some(reason) = parking_reason(&sanitized, review_only) {
-                crate::tasks::park_classified_task_tx(&tx, result.task_id, reason, now)?;
+            if let Some(reason) = parking_reason(&sanitized, review_only, continue_pr.is_some()) {
+                crate::tasks::park_classified_task_tx(tx, result.task_id, reason, now)?;
             } else {
-                crate::tasks::restore_classified_task_tx(&tx, result.task_id, now)?;
+                crate::tasks::restore_classified_task_tx(tx, result.task_id, now)?;
+            }
+
+            // Stamp the immutable adoption-time rework ceiling in the same
+            // transaction as the accepted classification: both must land or
+            // roll back together.
+            if let Some(cap) = rework_cap {
+                tx.execute(
+                    "UPDATE tasks SET rework_cap = ?2, updated_at = ?3 \
+                     WHERE id = ?1 AND rework_cap IS NULL",
+                    params![result.task_id, i64::from(cap), now],
+                )?;
             }
         }
     }
 
-    tx.commit()?;
     Ok(stored)
 }
 
@@ -426,6 +523,7 @@ fn sanitize(result: &TaskClassification) -> TaskClassification {
         task_id: result.task_id,
         cx_est: result.cx_est.clamp(1, 5),
         size: result.size.clone(),
+        size_reason: result.size_reason.trim().to_string(),
         ready: result.ready,
         not_ready_reason: result
             .not_ready_reason
@@ -438,6 +536,9 @@ fn sanitize(result: &TaskClassification) -> TaskClassification {
 pub fn valid(result: &TaskClassification) -> bool {
     (1..=5).contains(&result.cx_est)
         && VALID_SIZES.contains(&result.size.as_str())
+        && !result.size_reason.trim().is_empty()
+        && result.size_reason.len() <= MAX_SIZE_REASON_BYTES
+        && !result.size_reason.contains('\0')
         && if result.ready {
             result.not_ready_reason.is_none()
         } else {
@@ -490,19 +591,16 @@ pub fn validate_batch(
     Ok(())
 }
 
-fn parking_reason(result: &TaskClassification, review_only: bool) -> Option<&str> {
+fn parking_reason(
+    result: &TaskClassification,
+    review_only: bool,
+    continue_pr: bool,
+) -> Option<&str> {
     if !result.ready {
         return result.not_ready_reason.as_deref();
     }
-    if review_only && result.size == "XL" {
-        return Some(
-            "review-only size XL cannot be decomposed automatically; split or rescope externally",
-        );
-    }
-    if review_only && result.size == "L" {
-        return Some(
-            "review-only size L cannot be decomposed automatically; split or rescope externally",
-        );
+    if !review_only && !continue_pr && result.size == "XL" && result.cx_est <= 3 {
+        return Some(crate::tasks::LOW_COMPLEXITY_XL_PARK_REASON);
     }
     None
 }
@@ -530,6 +628,10 @@ fn merge_cx_into_refs(
         .expect("classifier refs normalized to an object");
     map.insert("cx_est".into(), serde_json::json!(result.cx_est));
     map.insert("cx_size".into(), serde_json::json!(result.size));
+    map.insert(
+        "cx_size_reason".into(),
+        serde_json::json!(result.size_reason),
+    );
     map.insert("cx_ready".into(), serde_json::json!(result.ready));
     map.insert(
         "cx_not_ready_reason".into(),
@@ -603,17 +705,17 @@ pub fn build_prompt_with_recommendations(
             truncate(&t.title, TITLE_CHAR_LIMIT)
         ));
         if let Some(body) = &t.body {
-            let truncated = truncate(body, BODY_CHAR_LIMIT);
+            let truncated = truncate(body, t.body_char_limit);
             prompt.push_str(&format!("**Body:**\n{truncated}\n"));
         }
         prompt.push('\n');
         if !t.dependencies.is_empty() {
             prompt.push_str(&format!(
-                "**Dependencies:** {}\n",
+                "**Dependencies (scheduler-enforced assumptions):** {}\n",
                 t.dependencies
                     .iter()
                     .take(DEPENDENCY_LIMIT)
-                    .map(|dependency| truncate(dependency, DEPENDENCY_TITLE_CHAR_LIMIT + 32))
+                    .map(|dependency| truncate(dependency, DEPENDENCY_RENDER_CHAR_LIMIT))
                     .collect::<Vec<_>>()
                     .join("; ")
             ));
@@ -664,24 +766,25 @@ fn classifier_rubric(recommendations: &str) -> String {
 The active daemon's operational routing policy for these levels is:
 {recommendations}
 This is not a cross-vendor benchmark and does not change the required output.
-2. **size**: execution surface only: S focused/local; M bounded coherent work; L broad cross-component coherent delivery; XL compound work needing decomposition. Do not estimate human time.
-3. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. If false, provide a concrete **not_ready_reason**; if true, it must be null.
-4. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
+2. **size**: execution surface only: S focused/local; M bounded coherent work; L broad cross-component coherent delivery; XL compound work needing decomposition. Do not estimate human time. Size the artifact's own write deliverables; responsibilities delivered by its declared dependencies are not part of this artifact's surface, so a composition over already-delivered dependency primitives is sized by what it writes, not by the breadth of what it composes.
+3. **size_reason**: a required, concrete rationale of at most {MAX_SIZE_REASON_BYTES} UTF-8 bytes tied to this exact task artifact. Name the implementation surfaces or responsibilities that make the selected size fit better than the adjacent sizes; do not merely restate the rubric or task title. For L/XL, identify independently deliverable seams that make the artifact broad or compound. For S/M, identify the focused or bounded coherent seam. This rationale is durable review feedback for a later planning iteration.
+4. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. Declared dependencies are scheduler-enforced assumptions whose required outcomes will be satisfied before execution. Use their bounded context to understand assumed outcomes, scope, complexity, and duplication, but never return ready=false merely because a dependency is currently incomplete; dependency ordering is not classifier authority. If false, provide a concrete **not_ready_reason**; if true, it must be null.
+5. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
 
 You are closed-book: use only this prompt, do not inspect the repository, Git history, diffs, CI, or external systems.
 
 Output format (JSON array wrapped in an object):
-{{"tasks": [{{"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null, "duplicate_of": []}}]}}"#
+{{"tasks": [{{"task_id": 1, "complexity": 3, "size": "M", "size_reason": "The change is one bounded storage seam with focused callers and tests.", "ready": true, "not_ready_reason": null, "duplicate_of": []}}]}}"#
     )
 }
 
 /// Stable classifier provenance string for `cx_by`.
 ///
 /// The model is part of the identifier so classification quality can be grouped
-/// by the model that actually produced it. `v2` identifies the explicit
-/// complexity/size/readiness contract.
+/// by the model that actually produced it. `v3` adds the required bounded
+/// rationale for the size verdict to the explicit classification contract.
 pub fn classifier_provenance(model: &str) -> String {
-    format!("{model}:v2")
+    format!("{model}:v3")
 }
 
 #[cfg(test)]
@@ -693,6 +796,7 @@ mod tests {
             task_id,
             cx_est,
             size: "M".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
@@ -707,6 +811,7 @@ mod tests {
         assert_eq!(v["cx_est"], 3);
         assert_eq!(v["cx_by"], "haiku-45:v1");
         assert_eq!(v["cx_size"], "M");
+        assert_eq!(v["cx_size_reason"], "bounded test classification rationale");
         assert_eq!(v["cx_ready"], true);
     }
 
@@ -722,8 +827,8 @@ mod tests {
 
     #[test]
     fn classifier_provenance_identifies_the_model() {
-        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v2");
-        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v2");
+        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v3");
+        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v3");
     }
 
     #[test]
@@ -733,6 +838,14 @@ mod tests {
         result.not_ready_reason = Some("  outcome ambiguous  ".into());
         let clean = sanitize(&result);
         assert_eq!(clean.not_ready_reason.as_deref(), Some("outcome ambiguous"));
+    }
+
+    #[test]
+    fn sanitize_trims_size_reason() {
+        let mut result = classified(1, 3);
+        result.size_reason = "  one bounded storage seam  ".into();
+        let clean = sanitize(&result);
+        assert_eq!(clean.size_reason, "one bounded storage seam");
     }
 
     #[test]
@@ -756,7 +869,7 @@ mod tests {
 
     #[test]
     fn parse_classifier_response() {
-        let json = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size":"M", "ready":true, "not_ready_reason":null, "duplicate_of":[]}]}"#;
+        let json = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size":"M", "size_reason":"one bounded seam", "ready":true, "not_ready_reason":null, "duplicate_of":[]}]}"#;
         let resp: ClassifierResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.tasks.len(), 1);
         assert_eq!(resp.tasks[0].cx_est, 3);
@@ -769,8 +882,9 @@ mod tests {
             revision: 1,
             title: "Fix bug".into(),
             body: Some("Fix the thing".into()),
-            dependencies: vec![],
+            dependencies: vec!["#3 Establish prerequisite".into()],
             recovery_notes: vec![],
+            body_char_limit: BODY_CHAR_LIMIT,
         }];
         let ctx = vec![TaskForClassification {
             id: 2,
@@ -779,10 +893,13 @@ mod tests {
             body: Some("Do something".into()),
             dependencies: vec![],
             recovery_notes: vec![],
+            body_char_limit: BODY_CHAR_LIMIT,
         }];
         let prompt = build_prompt(&tasks, &ctx);
         assert!(prompt.contains("Task #1"));
         assert!(prompt.contains("Fix bug"));
+        assert!(prompt.contains("Dependencies (scheduler-enforced assumptions)"));
+        assert!(prompt.contains("#3 Establish prerequisite"));
         assert!(prompt.contains("#2: Other task"));
     }
 
@@ -880,6 +997,29 @@ mod tests {
         .unwrap()
     }
 
+    fn create_dependent_task(
+        conn: &mut rusqlite::Connection,
+        title: &str,
+        body: &str,
+        dependency: i64,
+        seq: i64,
+    ) -> i64 {
+        let dependencies = serde_json::json!([dependency]).to_string();
+        crate::tasks::create(
+            conn,
+            "test-agent",
+            title,
+            Some(body),
+            5,
+            None,
+            None,
+            Some(&dependencies),
+            None,
+            1_000_000 + seq,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn store_and_query_classification() {
         let (_dir, mut conn) = open_tmp();
@@ -907,6 +1047,139 @@ mod tests {
             .unwrap()
             .notes;
         assert_eq!(notes.len(), 0);
+    }
+
+    #[test]
+    fn ready_classification_with_open_dependency_remains_dependency_gated() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create_task(&mut conn, "Establish stable prerequisite", 1);
+        let task_id = create_dependent_task(
+            &mut conn,
+            "Implement the dependent behavior",
+            "Observed: behavior is absent. Expected: add the specified behavior and focused regression coverage.",
+            dependency,
+            2,
+        );
+
+        assert_eq!(
+            store_classifications(&mut conn, &[classified(task_id, 3)], "test:v2", 2_000_000,)
+                .unwrap(),
+            1
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["cx_ready"], true);
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 2_000_001)
+                .unwrap()
+                .is_none(),
+            "open dependency must remain the scheduling authority"
+        );
+
+        conn.execute(
+            "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
+            params![dependency, 2_000_001],
+        )
+        .unwrap();
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 2_000_002)
+                .unwrap()
+                .is_some(),
+            "completed dependency must release the already-ready task"
+        );
+    }
+
+    #[test]
+    fn dependency_lifecycle_changes_do_not_stale_or_invalidate_classification() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create_task(&mut conn, "Produce prerequisite outcome", 1);
+        let task_id = create_dependent_task(
+            &mut conn,
+            "Consume prerequisite outcome",
+            "Use the prerequisite outcome to implement the fully specified consumer behavior.",
+            dependency,
+            2,
+        );
+
+        let before_task = unclassified_tasks(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        assert_eq!(
+            before_task.dependencies,
+            vec![format!("#{dependency} Produce prerequisite outcome")]
+        );
+        let before = classification_inputs(std::slice::from_ref(&before_task));
+
+        conn.execute(
+            "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
+            params![dependency, 2_000_000],
+        )
+        .unwrap();
+        let after_task = unclassified_tasks(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        let after = classification_inputs(std::slice::from_ref(&after_task));
+        assert_eq!(before[0].fingerprint, after[0].fingerprint);
+        assert_eq!(
+            store_classifications_for_inputs(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &before,
+                "test:v2",
+                2_000_000,
+            )
+            .unwrap(),
+            1,
+            "dependency completion during a classifier turn must not stale its result"
+        );
+
+        conn.execute(
+            "UPDATE tasks SET status='open', updated_at=?2 WHERE id=?1",
+            params![dependency, 2_000_001],
+        )
+        .unwrap();
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(crate::tasks::classification_is_complete(&task.refs));
+        assert!(!unclassified_tasks(&conn)
+            .unwrap()
+            .iter()
+            .any(|task| task.id == task_id));
+    }
+
+    #[test]
+    fn ambiguous_task_with_done_dependency_remains_not_ready() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create_task(&mut conn, "Finished prerequisite", 1);
+        conn.execute(
+            "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
+            params![dependency, 2_000_000],
+        )
+        .unwrap();
+        let task_id = create_dependent_task(
+            &mut conn,
+            "Change product behavior",
+            "Change the behavior, but no desired outcome or decision is specified.",
+            dependency,
+            2,
+        );
+        let reason = "desired product behavior is not specified";
+        let mut result = classified(task_id, 2);
+        result.ready = false;
+        result.not_ready_reason = Some(reason.into());
+
+        assert_eq!(
+            store_classifications(&mut conn, &[result], "test:v2", 2_000_000).unwrap(),
+            1
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["cx_ready"], false);
+        assert_eq!(refs["cx_not_ready_reason"], reason);
+        assert_eq!(task.status, "failed");
     }
 
     #[test]
@@ -1092,6 +1365,109 @@ mod tests {
     }
 
     #[test]
+    fn store_and_stamp_rework_cap_persists_cap_with_accepted_classification() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "stamped adoption", 1);
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            store_classifications_and_stamp_rework_cap(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &pending,
+                "test:v2",
+                2_000_000,
+                10,
+            )
+            .unwrap(),
+            1
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(crate::tasks::classification_is_complete(&task.refs));
+        // Adoption-time cap landed with the accepted refs in one write.
+        assert_eq!(task.rework_cap, Some(10));
+    }
+
+    #[test]
+    fn store_and_stamp_rework_cap_leaves_cap_unset_when_classification_rejected() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "rejected refs", 1);
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+
+        // Invalidate the snapshot so the classifier result is rejected.
+        crate::tasks::update(
+            &mut conn,
+            "test-agent",
+            task_id,
+            &crate::tasks::TaskUpdate {
+                body: Some("materially changed"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            2_000_001,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store_classifications_and_stamp_rework_cap(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &pending,
+                "test:v2",
+                2_000_002,
+                10,
+            )
+            .unwrap(),
+            0
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        // Neither the refs nor the cap moved: they land or roll back together.
+        assert!(!crate::tasks::classification_is_complete(&task.refs));
+        assert_eq!(task.rework_cap, None);
+    }
+
+    #[test]
+    fn store_and_stamp_rework_cap_preserves_first_stamped_value() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "cap already stamped", 1);
+        // Pre-stamp with 7, mimicking a task adopted under an earlier config.
+        assert!(crate::tasks::stamp_rework_cap(&mut conn, task_id, 7, 2_000_000).unwrap());
+
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            store_classifications_and_stamp_rework_cap(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &pending,
+                "test:v2",
+                2_000_001,
+                10,
+            )
+            .unwrap(),
+            1
+        );
+        // Immutable-once: the WHERE rework_cap IS NULL guard preserves the
+        // earlier adoption-time value even when reconstructing classification
+        // under a newer config.
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.rework_cap, Some(7));
+    }
+
+    #[test]
     fn older_concurrent_attempt_cannot_overwrite_newer_accepted_result() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "concurrent attempts", 1);
@@ -1262,23 +1638,23 @@ mod tests {
         };
         let luna_by = cx_by(luna_task);
         let terra_by = cx_by(terra_task);
-        assert_eq!(luna_by, "gpt-5.6-luna:v2");
-        assert_eq!(terra_by, "gpt-5.6-terra:v2");
+        assert_eq!(luna_by, "gpt-5.6-luna:v3");
+        assert_eq!(terra_by, "gpt-5.6-terra:v3");
         assert_ne!(luna_by, terra_by);
     }
 
     #[test]
-    fn large_review_only_classification_atomically_parks_without_run_or_error() {
+    fn large_review_only_classification_remains_in_review_without_parking() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "Architectural task", 1);
         conn.execute(
-            "UPDATE tasks SET review_only=1 WHERE id=?1",
+            "UPDATE tasks SET review_only=1, status='in-review' WHERE id=?1",
             params![task_id],
         )
         .unwrap();
-        let mut parked = classified(task_id, 5);
-        parked.size = "L".into();
-        let results = vec![parked];
+        let mut classified_large = classified(task_id, 2);
+        classified_large.size = "XL".into();
+        let results = vec![classified_large];
 
         assert_eq!(
             store_classifications(&mut conn, &results, "gpt-5.6-luna:v2", 2_000_000).unwrap(),
@@ -1287,16 +1663,16 @@ mod tests {
 
         let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(task.status, "failed");
+        assert_eq!(task.status, "in-review");
         assert_eq!(task.assignee, None);
-        assert_eq!(refs["cx_est"], 5);
+        assert_eq!(refs["cx_est"], 2);
         assert_eq!(refs["cx_by"], "gpt-5.6-luna:v2");
-        assert_eq!(refs["daemon_parked"], true);
-        assert_eq!(refs["daemon_resume_status"], "open");
-        assert!(refs["daemon_parked_reason"]
-            .as_str()
-            .unwrap()
-            .contains("review-only size L"));
+        assert!(refs.get("daemon_parked").is_none());
+        assert!(crate::tasks::classification_is_dispatchable(
+            &task.refs,
+            task.review_only,
+            task.continue_pr
+        ));
         let active_claims: i64 = conn
             .query_row(
                 "SELECT count(*) FROM claims WHERE target=?1 AND active=1",
@@ -1324,33 +1700,7 @@ mod tests {
         assert_eq!(active_claims, 0);
         assert_eq!(runs, 0);
         assert_eq!(errors, 0);
-        assert_eq!(parked_events, 1);
-        let retried = crate::tasks::retry_parked(&mut conn, task_id, "operator", true, 2_000_001)
-            .unwrap()
-            .expect("policy retry must be accepted for reclassification");
-        assert_eq!(retried.status, "failed");
-        assert!(
-            unclassified_tasks(&conn)
-                .unwrap()
-                .iter()
-                .any(|task| task.id == task_id),
-            "accepted retry must await a fresh classifier result"
-        );
-        assert!(
-            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 2_000_002)
-                .unwrap()
-                .is_none(),
-            "awaiting reclassification must not enter worker dispatch"
-        );
-        assert_eq!(
-            store_classifications(&mut conn, &results, "gpt-5.6-luna:v2", 2_000_003).unwrap(),
-            1
-        );
-        assert_eq!(
-            crate::tasks::get(&conn, task_id).unwrap().unwrap().status,
-            "failed",
-            "an unchanged category-5 result must remain policy-parked"
-        );
+        assert_eq!(parked_events, 0);
     }
 
     #[test]
@@ -1480,13 +1830,10 @@ mod tests {
     fn retry_requests_reclassification_and_dispatchable_result_restores_status() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "rescope", 1);
-        conn.execute(
-            "UPDATE tasks SET review_only=1 WHERE id=?1",
-            params![task_id],
-        )
-        .unwrap();
         let mut parked = classified(task_id, 5);
         parked.size = "L".into();
+        parked.ready = false;
+        parked.not_ready_reason = Some("outcome needs clarification".into());
         parked.duplicate_of = vec![99];
         store_classifications(&mut conn, &[parked], "test:v2", 10).unwrap();
         let parked_task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
@@ -1509,6 +1856,7 @@ mod tests {
         for key in [
             "cx_est",
             "cx_size",
+            "cx_size_reason",
             "cx_ready",
             "cx_not_ready_reason",
             "cx_by",
@@ -1559,6 +1907,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v2_classification_without_size_reason_remains_dispatch_compatible() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "legacy v2", 1);
+        let refs = r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"gpt-5.6-luna:v2"}"#;
+        conn.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            params![task_id, refs],
+        )
+        .unwrap();
+
+        assert!(!unclassified_tasks(&conn)
+            .unwrap()
+            .iter()
+            .any(|task| task.id == task_id));
+        assert!(crate::tasks::classification_is_dispatchable(
+            &Some(refs.into()),
+            false,
+            None
+        ));
+    }
+
+    #[test]
     fn malformed_v2_refs_remain_candidates_for_live_and_backfill_queries() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "malformed v2", 1);
@@ -1573,7 +1943,9 @@ mod tests {
         assert_eq!(unclassified_tasks(&conn).unwrap()[0].id, task_id);
         assert_eq!(tasks_missing_cx_all(&conn).unwrap()[0].id, task_id);
         let refs = crate::tasks::get(&conn, task_id).unwrap().unwrap().refs;
-        assert!(!crate::tasks::classification_is_dispatchable(&refs));
+        assert!(!crate::tasks::classification_is_dispatchable(
+            &refs, false, None
+        ));
     }
 
     #[test]
@@ -1671,6 +2043,7 @@ mod redesigned_tests {
             task_id: 1,
             cx_est,
             size: size.into(),
+            size_reason: "bounded test classification rationale".into(),
             ready,
             not_ready_reason: reason.map(str::to_string),
             duplicate_of: vec![],
@@ -1683,16 +2056,28 @@ mod redesigned_tests {
         assert!(valid(&result(4, "M", false, Some("outcome is ambiguous"))));
         assert!(!valid(&result(4, "M", false, None)));
         assert!(!valid(&result(4, "bad", true, None)));
+
+        let mut missing_size_reason = result(4, "M", true, None);
+        missing_size_reason.size_reason = "  ".into();
+        assert!(!valid(&missing_size_reason));
+
+        let mut nul_size_reason = result(4, "M", true, None);
+        nul_size_reason.size_reason = "storage\0seam".into();
+        assert!(!valid(&nul_size_reason));
+
+        let mut oversized_size_reason = result(4, "M", true, None);
+        oversized_size_reason.size_reason = "é".repeat(MAX_SIZE_REASON_BYTES);
+        assert!(!valid(&oversized_size_reason));
     }
 
     #[test]
     fn policy_allows_focused_complexity_five() {
-        assert!(parking_reason(&result(5, "S", true, None), false).is_none());
-        assert!(parking_reason(&result(5, "M", true, None), false).is_none());
-        assert!(parking_reason(&result(5, "L", true, None), false).is_none());
-        assert!(parking_reason(&result(2, "XL", true, None), false).is_none());
-        assert!(parking_reason(&result(5, "L", true, None), true).is_some());
-        assert!(parking_reason(&result(2, "XL", true, None), true).is_some());
+        assert!(parking_reason(&result(5, "S", true, None), false, false).is_none());
+        assert!(parking_reason(&result(5, "M", true, None), false, false).is_none());
+        assert!(parking_reason(&result(5, "L", true, None), false, false).is_none());
+        assert!(parking_reason(&result(2, "XL", true, None), false, false).is_some());
+        assert!(parking_reason(&result(2, "XL", true, None), false, true).is_none());
+        assert!(parking_reason(&result(2, "XL", true, None), true, false).is_none());
     }
 
     #[test]
@@ -1700,5 +2085,72 @@ mod redesigned_tests {
         let p = classifier_rubric("");
         assert!(p.contains("closed-book"));
         assert!(p.contains("Never reject merely because files"));
+        assert!(p.contains("Declared dependencies are scheduler-enforced assumptions"));
+        assert!(p.contains(
+            "never return ready=false merely because a dependency is currently incomplete"
+        ));
+        assert!(p.contains("intended outcome cannot be determined"));
+        assert!(p.contains("size_reason"));
+        assert!(p.contains("independently deliverable seams"));
+        assert!(p.contains("durable review feedback"));
+        assert!(p.contains("Size the artifact's own write deliverables"));
+        assert!(p.contains(
+            "responsibilities delivered by its declared dependencies are not part of this artifact's surface"
+        ));
+    }
+
+    #[test]
+    fn deserialized_task_keeps_a_nonzero_body_bound() {
+        let task = TaskForClassification {
+            id: 1,
+            revision: 1,
+            title: "root".into(),
+            body: Some("body".into()),
+            dependencies: vec![],
+            recovery_notes: vec![],
+            body_char_limit: PLANNED_CHILD_BODY_CHAR_LIMIT,
+        };
+        let round_tripped: TaskForClassification =
+            serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+        assert_eq!(round_tripped.body_char_limit, BODY_CHAR_LIMIT);
+        assert!(round_tripped.body_char_limit > 0);
+        assert!(build_prompt(&[round_tripped], &[]).contains("body"));
+    }
+
+    #[test]
+    fn prompt_body_bound_is_per_task() {
+        let long_body = "B".repeat(BODY_CHAR_LIMIT + 500);
+        let root = TaskForClassification {
+            id: 1,
+            revision: 1,
+            title: "root".into(),
+            body: Some(long_body.clone()),
+            dependencies: vec![],
+            recovery_notes: vec![],
+            body_char_limit: BODY_CHAR_LIMIT,
+        };
+        let planned = TaskForClassification {
+            id: -1,
+            revision: 1,
+            title: "planned child".into(),
+            body: Some(long_body.clone()),
+            dependencies: vec![format!("sibling-key — {}", "T".repeat(300))],
+            recovery_notes: vec![],
+            body_char_limit: PLANNED_CHILD_BODY_CHAR_LIMIT,
+        };
+        assert!(!build_prompt(std::slice::from_ref(&root), &[]).contains(&long_body));
+        let planned_prompt = build_prompt(std::slice::from_ref(&planned), &[]);
+        assert!(planned_prompt.contains(&long_body));
+        // A local key plus a title at the dependency bound survives rendering.
+        assert!(planned_prompt.contains(&format!(
+            "sibling-key — {}",
+            "T".repeat(DEPENDENCY_TITLE_CHAR_LIMIT)
+        )));
+        let oversized = TaskForClassification {
+            body: Some("B".repeat(PLANNED_CHILD_BODY_CHAR_LIMIT + 10)),
+            ..planned
+        };
+        assert!(!build_prompt(std::slice::from_ref(&oversized), &[])
+            .contains(&"B".repeat(PLANNED_CHILD_BODY_CHAR_LIMIT + 10)));
     }
 }

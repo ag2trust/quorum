@@ -17,6 +17,13 @@ pub fn short_version() -> &'static str {
     env!("QUORUM_GIT_DESCRIBE")
 }
 
+/// Commit SHA embedded independently of the human-readable version string.
+/// `git describe` is just a tag for an exact-tag release, so it cannot be the
+/// sole source of the running build's identity.
+pub fn build_sha_short() -> &'static str {
+    env!("QUORUM_GIT_SHA_SHORT")
+}
+
 #[derive(Parser)]
 #[command(
     name = "quorum",
@@ -69,6 +76,9 @@ pub enum Command {
         /// the daemon provisions the worker from this PR rather than the configured base.
         #[arg(long = "continue-pr", conflicts_with = "review_pr")]
         continue_pr: Option<i64>,
+        /// Local branch to target. Defaults to this repository's configured daemon base branch.
+        #[arg(long = "base-branch")]
+        base_branch: Option<String>,
         #[arg(long = "body-stdin")]
         body_stdin: bool,
         #[arg(long = "body-file")]
@@ -93,7 +103,9 @@ pub enum Command {
     ///
     /// `--note-stdin`/`--note-file` appends a breadcrumb to the task's note history. Notes
     /// have **no assignee guard** (any agent can leave one) and can be combined with the
-    /// other field updates in the same call.
+    /// other field updates in the same call. A daemon-managed run may use only this
+    /// note operation; its task and agent are derived from the run capability and must
+    /// agree with the required flags.
     ///
     /// Verdict transitions are daemon-managed only — use `quorum submit --verdict`.
     TaskUpdate {
@@ -322,8 +334,8 @@ pub enum Command {
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
     },
-    /// Signal a non-terminal agent state to the daemon. The daemon tracks
-    /// the state and surfaces it via `quorum status`.
+    /// Signal a non-terminal agent state to the daemon. Managed calls are
+    /// forwarded to the daemon endpoint, which derives the authoritative task.
     React {
         #[arg(long)]
         agent: String,
@@ -336,8 +348,12 @@ pub enum Command {
         #[arg(long = "run-id")]
         run_id: Option<String>,
     },
+    /// Run the credentialless, tools-only managed-agent MCP server over stdio.
+    #[command(name = "agent-mcp")]
+    AgentMcp,
     /// Signal task completion (worker) or emit a review verdict (reviewer).
-    /// Writes a mailbox row for the daemon to consume.
+    /// The daemon endpoint writes the mailbox row after deriving authority from
+    /// the run capability; CLI task, PR, and identity flags are compatibility inputs.
     ///
     /// Requires daemon run identity: `--run-id` flag or `QUORUM_RUN_ID` env var.
     /// Identity is validated against the capability — `--agent` must match.
@@ -371,6 +387,25 @@ pub enum Command {
         #[arg(long)]
         blocking: Option<u32>,
         /// Daemon-issued run capability token. Falls back to QUORUM_RUN_ID env var.
+        #[arg(long = "run-id")]
+        run_id: Option<String>,
+    },
+    /// Send a non-authoritative blocking-review draft to the daemon. This is
+    /// continuation context only: it never records a verdict or changes task lifecycle.
+    ///
+    /// Requires daemon reviewer run identity: `--run-id` flag or `QUORUM_RUN_ID` env var.
+    ReviewDraft {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        pr: i64,
+        /// Positive count of BLOCKING findings in the draft.
+        #[arg(long)]
+        blocking: u32,
+        /// Read the bounded continuation summary from a text file.
+        #[arg(long = "feedback-file")]
+        feedback_file: PathBuf,
+        /// Daemon-issued reviewer run capability token. Falls back to QUORUM_RUN_ID env var.
         #[arg(long = "run-id")]
         run_id: Option<String>,
     },
@@ -427,10 +462,12 @@ pub enum Command {
         /// credentials (e.g. ANTHROPIC_API_KEY) in the daemon environment.
         #[arg(long)]
         no_bare_agent: bool,
-        /// Max tokens (input+output) per single turn. Exceeding kills the agent.
+        /// Max tokens per single turn using the serve file token_limit_basis
+        /// (raw input+output by default). Exceeding kills the agent.
         #[arg(long)]
         max_turn_tokens: Option<i64>,
-        /// Max cumulative tokens (input+output) per task. Exceeding kills the agent.
+        /// Max cumulative tokens per task using the serve file token_limit_basis
+        /// (raw input+output by default). Exceeding kills the agent.
         #[arg(long)]
         max_task_tokens: Option<i64>,
         /// Max USD cost per single turn (delta from session-cumulative total_cost_usd).
@@ -439,14 +476,16 @@ pub enum Command {
         /// Max cumulative USD cost per task.
         #[arg(long)]
         max_task_cost_usd: Option<f64>,
-        /// Max wall-clock seconds per single turn.
+        /// Deprecated alias for --max-idle-secs.
         #[arg(long)]
         max_turn_wall_secs: Option<u64>,
+        /// Max seconds an active worker/reviewer may go without emitting an event.
+        #[arg(long)]
+        max_idle_secs: Option<u64>,
         /// Max wall-clock seconds per task (across all turns).
         #[arg(long)]
         max_task_wall_secs: Option<u64>,
-        /// Max seconds a worker/reviewer may sit idle between turns before
-        /// the watchdog kills it (default: 300). Catches zombies.
+        /// Legacy idle limit. Prefer max_idle_secs (default: 900).
         #[arg(long)]
         idle_timeout_secs: Option<u64>,
         /// Comma-separated tool allowlist for spawned agents (overrides built-in default).
@@ -457,8 +496,9 @@ pub enum Command {
         #[arg(long)]
         log_dir: Option<String>,
         /// Enable self-update drain mode. When the daemon merges a PR for its
-        /// own repo (or detects the base branch advancing via git ls-remote), it drains
-        /// in-flight agents and exits 75 so a supervisor can rebuild and relaunch.
+        /// own repo (or detects the configured self-update branch advancing via git
+        /// ls-remote), it drains in-flight agents and exits 75 so a supervisor can
+        /// rebuild and relaunch.
         #[arg(long)]
         self_update_drain: bool,
         /// Seconds to wait for in-flight agents to finish before force-killing
@@ -469,7 +509,7 @@ pub enum Command {
         /// Default: derived from --repo-dir's origin remote via `gh repo view`.
         #[arg(long)]
         self_repo: Option<String>,
-        /// Interval between git ls-remote sha polls in seconds (default: 60).
+        /// Interval between git ls-remote build-staleness checks in seconds (default: 600).
         #[arg(long, hide = true)]
         sha_poll_interval_secs: Option<u64>,
         /// Repo this daemon manages (e.g. "ag2trust/quorum"). Required
@@ -477,10 +517,14 @@ pub enum Command {
         /// and sets QUORUM_REPO for all spawned workers/reviewers.
         #[arg(long)]
         repo: Option<String>,
-        /// Base branch name for sha-polling, worktree provisioning, and merge
-        /// targeting. Use "master" for repos whose trunk is master (default: main).
+        /// Task/PR base branch for worktree provisioning, PR publication,
+        /// validation, and merge targeting (default: main).
         #[arg(long)]
         base_branch: Option<String>,
+        /// Branch to poll for daemon self-updates. Defaults to the resolved
+        /// --base-branch value when omitted.
+        #[arg(long)]
+        self_update_branch: Option<String>,
         /// Path to a sentinel file. When set, serve polls for this file's
         /// existence every tick and initiates shutdown when it disappears.
         /// Used by test fixtures to self-terminate when the parent test
@@ -525,6 +569,13 @@ pub enum Command {
         /// Backfill all tasks (any status) that lack a complete classification.
         #[arg(long)]
         backfill: bool,
+        /// Path to the same TOML config the daemon consumes. When present,
+        /// backfill stamps `rework_cap` from this file. Default:
+        /// `~/.quorum/serve/<owner>__<repo>.toml` if present, mirroring
+        /// `serve`. Pass the daemon's `--config` value to guarantee the
+        /// stamped cap matches the daemon's `max_rework` policy.
+        #[arg(long)]
+        config: Option<String>,
         /// Override the agent binary (default: "claude").
         #[arg(long)]
         agent_bin: Option<String>,
@@ -577,11 +628,28 @@ pub enum Command {
         #[arg(long = "reason-file")]
         reason_file: Option<PathBuf>,
     },
-    /// Explicitly retry a task parked by the daemon after a bounded failure.
+    /// Explicitly retry a daemon park, provider block, or eligible exhausted decomposition plan.
     TaskRetry {
         #[arg(long = "task-id")]
         task_id: i64,
         /// Operator identity recorded in the audit event.
+        #[arg(long)]
+        by: String,
+    },
+    /// Explicitly adopt one completed managed continuation as the exact
+    /// delivery of the final failed member of an active decomposition. This
+    /// operator-only incident recovery requires durable publication, managed
+    /// approval, exact approved-head, and merge evidence; it never infers a
+    /// relationship from task text or a shared PR alone. Replay or any
+    /// mismatched evidence is a clean negative (exit 1).
+    DecompositionAdoptRecovery {
+        /// Exact failed generated child to complete.
+        #[arg(long = "original-child-id")]
+        original_child_id: i64,
+        /// Exact completed continuation whose delivery is being adopted.
+        #[arg(long = "recovery-task-id")]
+        recovery_task_id: i64,
+        /// Coordinator/operator identity recorded in durable recovery provenance.
         #[arg(long)]
         by: String,
     },
@@ -704,15 +772,21 @@ pub enum Command {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Command};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn classify_defaults_to_operator_login_and_allows_explicit_bare_auth() {
         let default = Cli::try_parse_from(["quorum", "classify", "--backfill"]).unwrap();
-        let Command::Classify { no_bare_agent, .. } = default.command else {
+        let Command::Classify {
+            no_bare_agent,
+            config,
+            ..
+        } = default.command
+        else {
             panic!("expected classify command");
         };
         assert!(no_bare_agent);
+        assert!(config.is_none());
 
         let explicit_bare =
             Cli::try_parse_from(["quorum", "classify", "--backfill", "--no-bare-agent=false"])
@@ -721,5 +795,35 @@ mod tests {
             panic!("expected classify command");
         };
         assert!(!no_bare_agent);
+    }
+
+    #[test]
+    fn classify_accepts_explicit_config_path_mirroring_serve() {
+        let parsed = Cli::try_parse_from([
+            "quorum",
+            "classify",
+            "--backfill",
+            "--config",
+            "/tmp/explicit.toml",
+        ])
+        .unwrap();
+        let Command::Classify { config, .. } = parsed.command else {
+            panic!("expected classify command");
+        };
+        assert_eq!(config.as_deref(), Some("/tmp/explicit.toml"));
+    }
+
+    #[test]
+    fn serve_token_ceiling_help_names_the_selected_config_basis() {
+        let mut command = Cli::command();
+        let serve = command
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand");
+        let help = serve.render_long_help().to_string();
+        assert!(help.contains("token_limit_basis"), "serve help: {help}");
+        assert!(
+            help.contains("raw input+output by default"),
+            "serve help: {help}"
+        );
     }
 }

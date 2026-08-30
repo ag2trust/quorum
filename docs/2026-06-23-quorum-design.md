@@ -1,6 +1,6 @@
 # Quorum — Design Spec
 
-**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, no-CI contract 2026-07-23, coding-runner boundary 2026-07-24, explicit-cancellation contract 2026-07-26)
+**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, no-CI contract 2026-07-23, coding-runner boundary 2026-07-24, explicit-cancellation contract 2026-07-26, source-cancellation escape hatch 2026-08-20)
 **Status:** Implemented (v1) · CLI + daemon · lifecycle state machine (`lifecycle.rs`)
 · v2 boundary specified (§ Daemon-only execution; corrected — supersedes PR #375)
 **Repo:** `~/dev/quorum`
@@ -28,6 +28,13 @@ additive fields for live, queue, blocked, and pipeline rows. Live and pipeline v
 come from persisted `agent_runs`; queue/blocked rows without an explicit task tier use
 the explicit `pending` marker because a read-only status process does not invent the
 daemon's configured provider default. Complexity is task metadata, never a model value.
+
+Status also attaches a live, additive `resources` object containing sampled-at time,
+OS-available memory, swap use, and raw total/available bytes for the database and configured
+worktree-base filesystems. Filesystems are deduplicated by device identity. Sampling is
+non-persistent and fail-open; partial values and bounded sampling errors remain visible. A
+warning or critical resource sample promotes only `OnTrack` to `Attention`, never replaces
+`Stalled`, and never throttles, kills, or transitions managed work.
 
 ### Product boundary: opinionated Git delivery
 
@@ -71,13 +78,25 @@ and verification evidence, not normative product language.
 DB path: `~/.quorum/repos/<owner>__<name>/quorum.db`. Repo identity is resolved from
 `QUORUM_REPO` env var (set by the daemon for workers) > cwd git detection (parse the
 `origin` remote URL) > loud error (exit 2). No daemon required for CLI commands. No
-server. No network. No MCP. Agents invoke `quorum <subcommand>` as ordinary shell
-commands (via the Bash tool), exactly as they already drive `gh`, `git`, and `rtk`.
+general network server. Agents invoke lifecycle-safe `quorum <subcommand>` operations as
+ordinary shell commands. Managed PR collaboration additionally uses a credentialless
+`quorum agent-mcp` stdio process injected by the daemon and scoped to the managed provider
+process; persistent providers retain that MCP process across their stdin-fed turns. It writes
+bounded, run-authorized GitHub operation requests through a narrow local daemon endpoint, and the
+daemon alone writes SQLite and performs the remote operation. The MCP process never receives the
+Quorum database, GitHub credentials, or lifecycle authority.
 
-Each invocation is a **complete, self-contained, short-lived process**: open the DB,
-perform one atomic op, print JSON to stdout, exit with a meaningful code. There is **no
-state between invocations** — the SQLite file is the sole source of truth. The model is
-`git`-like: every command reconciles current on-disk state and executes atomically.
+For contained runs, the same local endpoint carries the existing run-scoped `submit` and `react`
+signals and the closed established public-command family, so those commands need neither a
+database mount nor a broader daemon API. They retain their current semantics and are not exposed
+as MCP tools. Admin commands remain unavailable inside the contained managed runner and use
+direct short-lived SQLite operations only outside it.
+
+Each ordinary CLI invocation is a **complete, self-contained, short-lived process**: direct mode
+opens the DB, while contained public/run-scoped mode performs one bounded endpoint exchange; both
+execute one operation, print JSON to stdout, and exit with a meaningful code. There is **no state
+between CLI invocations** — the SQLite file is the sole durable source of truth. The model is
+`git`-like: every command reconciles current persisted state and executes atomically.
 
 ## Motivation
 
@@ -88,22 +107,29 @@ reads (re-read "last N comments" every poll), no atomic claim (the semaphore nee
 10s wait → full rescan → tiebreak-by-comment-id, and still races).
 
 Quorum replaces the *coordination* layer (chatter + claims + task queue). **PRs and code
-review stay on GitHub** — inherently tied to git/GitHub and out of scope.
+review stay authoritative on GitHub**; managed agents author that conversation through
+Quorum-mediated collaboration operations.
 
-## Why CLI-first over an HTTP/MCP daemon
+## CLI-first coordination plus managed-agent MCP
 
-| | CLI-first (chosen) | HTTP/MCP daemon (rejected for v1) |
-|---|---|---|
-| To build | binary + file | + transport + server + daemon lifecycle |
-| To operate | nothing | daemon, port, launchd, per-agent MCP config |
-| Atomicity | free (SQLite cross-process locking) | same, but mediated by the daemon |
-| Context cost | zero until invoked | ~all tool schemas loaded every turn |
-| Discovery | `--help` / `quorum help-agent` + CLAUDE.md | auto-listed typed tools |
-| Failure modes | fewer (no daemon to be down) | daemon down ⇒ agents blocked |
+General coordination stays CLI-first. Outside a contained managed runner, each short-lived
+command opens SQLite, performs one atomic operation, emits JSON, and exits; inside one, the same
+public CLI surface uses the closed local endpoint exchange above. Quorum does not add a general
+HTTP daemon, remote MCP listener, OAuth surface, port, or second source of coordination state.
 
-The only real loss is auto tool-discovery, mitigated by `quorum help-agent` + a CLAUDE.md
-snippet. **Not a one-way door:** an MCP shim over the same `quorum-core` lib can be added
-later if discovery ever proves worth the weight.
+Managed GitHub collaboration is the narrow exception because direct Repository Service
+credentials and shell-composed Markdown are the wrong boundary for an untrusted coding run. The
+daemon injects one tools-only stdio MCP whose inventory is derived from the exact live run role.
+The adapter lifetime follows the managed provider process: turn-oriented providers receive a
+fresh adapter, while a persistent Claude child retains one adapter and authenticated local-endpoint
+session across its stdin-fed turns. That persistent adapter keeps only bounded, opaque session
+state for the current attempt/lifecycle/inventory descriptor and invalidates it through the
+daemon-authorized phase handoff; the adapter is neither durable authority nor a second source of
+coordination state. It forwards closed typed requests to a narrow local daemon endpoint, SQLite
+holds every durable operation request and binding, and `quorum serve` executes remote GitHub work
+outside transactions. Restricted internal model roles receive no MCP. The separate
+outside/task-creator MCP requires its own authentication and remote-transport design and is not
+implied by this agent interface.
 
 ## Concurrency & atomicity (no daemon required)
 
@@ -155,9 +181,11 @@ the WAL self-truncates in normal operation. **The one footgun:** a long-lived re
 an open transaction blocks checkpointing entirely (verified: `-wal` grew to 8.5 MB and
 climbing with one held reader during 2000 writes). The only long-lived reader is
 `status --watch` → it **must open a fresh short read per tick** (connect → read → close),
-never hold a transaction across polls. `quorum sweep` runs `PRAGMA wal_checkpoint(TRUNCATE)`
-as the explicit recovery escape hatch. WAL maintenance is optional **only given** the
-short-connection invariant — stated, not assumed.
+then sample host resources only after that connection closes, and never hold a transaction
+across polls. One-shot status uses the same read-then-sample path and does not depend on daemon
+liveness. `quorum sweep` runs `PRAGMA wal_checkpoint(TRUNCATE)` as the explicit recovery escape
+hatch. WAL maintenance is optional **only given** the short-connection invariant — stated, not
+assumed.
 
 ## Schema versioning & migration (BLOCKER — must exist)
 
@@ -207,14 +235,68 @@ INTEGER NOT NULL DEFAULT 0 · `labels` TEXT (json) · `assignee` TEXT · `create
 NULL · `created_at` · `updated_at` · `refs` TEXT (json) · `author` TEXT · `reviewer` TEXT ·
 `rework_round` INTEGER NOT NULL DEFAULT 0 · `review_only` INTEGER NOT NULL DEFAULT 0 ·
 `continue_pr` INTEGER NULL (authoritative existing-PR implementation entry; never inferred
-from `refs.pr`) ·
-`depends_on` TEXT (json array of task IDs).
+from `refs.pr`) · `completion_provenance` TEXT NULL (`merged`/`manual`; NULL is
+legacy or unknown and is never inferred from status or `refs.pr`) ·
+`depends_on` TEXT (json array of task IDs) ·
+`target_branch` TEXT NULL (authoritative PR base branch; NULL for legacy tasks.
+`task-create` persists its validated `--base-branch` or the configured base at
+creation; legacy rows resolve once before execution. Immutable once populated and
+used for worktree provisioning, publication, review validation, remediation, and merge;
+only genuinely targetless legacy rows fall back to the configured base).
 
 ### `errors` — observable *abnormal* failures
 `id` INTEGER PK · `ts` · `source` TEXT · `detail` TEXT · `expires_at` INTEGER NOT NULL.
 Appended **only on genuinely abnormal failures** (DB error, post-timeout `BUSY`, bad input,
 migration refusal). **Normal lost-races / not-holder (exit 1) are NOT logged** — they are
 expected operation, and logging them would add hot-path write contention + noise.
+
+### `token_usage_runs` — durable per-invocation token telemetry
+
+One row per managed worker/reviewer run or daemon-internal classifier/collector
+invocation. The row preserves uncached input, cached input, cache-write input,
+output, and reasoning tokens separately, plus purpose, provider, model, effort,
+optional PR, and optional `agent_run_id`. `token_usage_run_tasks` maps one usage
+row to one or more tasks because the classifier handles batches.
+
+This is separate from `agent_runs`: classifier and collector invocations are not
+managed agents, and cost history must remain queryable after task/agent-run sweep.
+There are no foreign keys; numeric identities are historical attribution, not
+delete authority. Usage history has a 30-day retention window, deliberately
+longer than the 7-day completed-task window: sweep-on-write deletes at most 100
+expired usage runs (and their task mappings) per mutation, while explicit sweep
+deletes all expired usage. Cumulative snapshots for still-active managed runs
+are retained until run closure so dormant recovery cannot lose required state.
+Usage writes are instrumentation-only and best-effort.
+A failed usage write is logged and ignored after the lifecycle/run-close write,
+so it cannot fail a verdict, merge, collection result, or teardown.
+Provider-error collector turns retain and record any usage reported by the
+terminal event before the collection failure is persisted and returned.
+Managed teardown likewise normalizes usage from unread terminal provider output
+before snapshotting the durable row; terminal output remains lifecycle-inert.
+Each managed terminal turn also upserts the cumulative split against its
+`agent_run_id`, and dormant Codex/Grok recovery reloads that snapshot before
+continuing the same run identity. Ordinary and decomposition classifiers reap
+and record bounded terminal usage on normal completion, removal, and every
+daemon shutdown path; decomposition classifier rows are attributed to their
+source task. Open, write, and join failures on these best-effort paths are
+logged without changing lifecycle outcomes.
+
+Provider normalization keeps the source semantics explicit. Claude
+`input_tokens`, `cache_read_input_tokens`, and
+`cache_creation_input_tokens` remain separate. Codex `input_tokens` includes
+cached input, so durable uncached input is `input_tokens -
+cached_input_tokens` (saturating at zero); its cached, cache-write, output, and
+reasoning-output values are retained independently.
+
+Managed worker and reviewer token watchdog ceilings are a repository serve
+policy. `token_limit_basis = "raw"` is the default and preserves the legacy
+meaning of both `max_turn_tokens` and `max_task_tokens`: provider-reported
+`input_tokens + output_tokens`. An explicit `token_limit_basis = "uncached"`
+uses normalized `uncached_input_tokens + output_tokens`, with saturating
+arithmetic; it never falls back to raw input when normalized telemetry is
+required. The resolved basis is shown at daemon startup and included in token
+ceiling breach diagnostics. Unknown bases and non-positive token ceilings are
+usage errors.
 
 ## TTL — self-expiring data (no manual pruning, ever)
 
@@ -236,6 +318,7 @@ command's txn pathologically long). `quorum sweep` does an unbounded sweep +
 | messages | 48h | no |
 | claims | 45 min lease | yes (`renew`, ~every 15 min) |
 | done tasks | swept 7d after `done` | n/a |
+| token usage history | swept 30d after recording | n/a |
 | errors | 7d | n/a |
 | presence (display) | `offline` once `last_seen` older than online window (default 5 min) | via any write (implicit `touch`) |
 
@@ -300,35 +383,52 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   `review_only=true`, `refs.pr=N`). Skips `open`/`working` entirely.
 - `quorum task-create ... --continue-pr <N>` → implementation task (status: `open`,
   `continue_pr=N`) rooted at the exact head of an open same-repository PR. It follows the
-  normal worker/review/rework/merge lifecycle and publishes back to that PR under lease.
-  `--continue-pr` and `--review-pr` are mutually exclusive.
+  normal worker/review/rework/merge lifecycle, dispatches directly regardless of classified
+  size, and publishes back to that PR under lease. It is never a decomposition source because
+  generated children cannot inherit the continuation publication authority. `--continue-pr`
+  and `--review-pr` are mutually exclusive. Continuation authority is retained on retry except
+  in one narrow case: a publication or provisioning failure classified as `pr-closed` (the
+  pinned PR is closed unmerged) — `retry_parked` retires the matching `continue_pr` in the
+  same atomic UPDATE, records `refs.abandoned_publication={pr,branch,local_sha,continue_pr}`
+  as a bounded audit trail so the orphaned PR stays traceable, and the next dispatch mints a
+  fresh branch/PR. A `pr-merged` classification is delivery evidence: the park is terminal
+  and retry refuses to restore it (§ Explicit cancellation and durable parking).
 - ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
   `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
   dependency gating, and reviewer attachment are all preserved as internal functions.
 - `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Creator/agent updates may not add, replace, or remove `refs.pr`; that association is daemon-owned. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through run-scoped `submit`. See § Daemon-only execution.)**
 - `quorum task-close --agent <id> --task-id <n> --reason-stdin|--reason-file` → explicit
   manual/external terminal close (merged by hand, fixed elsewhere, obsolete). From any
-  state except `done`/`cancelled` — `failed` is included, because a task whose PR landed
-  outside the managed lifecycle has no other route to `done` and its dependents stay
-  parked until it gets there (`compute_ready` counts only `done`). Reason REQUIRED.
-  Sets `done` but emits `task_closed_manual` event
+  state except `done`/`cancelled`, but never an active decomposition source, which must use
+  graph cancellation — `failed` is included, because a task whose PR landed outside the
+  managed lifecycle has no other route to `done` and its dependents stay parked until it
+  gets there (`compute_ready` counts only `done`). Closing a generated child performs final
+  graph/source reconciliation in the same transaction. Reason REQUIRED. Sets `done` but
+  records `completion_provenance=manual` without removing `refs.pr`, and emits
+  `task_closed_manual` event
   (never `task_done`) — the audit log distinction is the guardrail. Owner/manual use;
   agents finishing work must use `quorum submit` (`quorum done` is a deprecated alias).
 - `quorum task-retry --task-id <n> --by <operator>` → operator retry for a task
   durably parked after an automatic bounded failure. General daemon parks restore
   their recorded lifecycle stage as specified in § Explicit cancellation and durable
-  parking, except that a parked merge restores `in-review` so a fresh approval can
-  safely drive the next merge attempt. Provider/auth/quota/protocol parks atomically
-  require and clear their
-  provider-block marker. A provider-parked
+  parking. A parked merge restores `merging` with one durable daemon-owned replay intent;
+  the daemon revalidates the exact persisted PR target, base, head, required role approvals,
+  sampled-R2 decision, and CI before making at most one approval/merge call. Invalid or
+  incomplete authority returns to `in-review` for the first missing role. A missing or
+  differently-task-bound sampling decision invalidates the R1 sampling anchor and decision
+  together, preserving an exact R2 while a fresh R1 recreates the decision. An invalid extra
+  R2 row for a durable sampled skip is removed under the existing one-shot attempt and the
+  complete authority is reread once before any merge call.
+  Provider/auth/quota/protocol parks atomically require and clear their provider-block marker.
+  A provider-parked
   `working` task returns to `open`; a true `rework` task remains unassigned in
   `rework` and is atomically reattached through a dedicated replacement-worker
   claim. Both paths carry the exact persisted failed turn. `in-review` is
   rejected; Codex R1/R2 belongs to the later reviewer-provider phase.
   Before teardown, Quorum stores the pending raw prompt, turn kind, exact
-  model/effort, and provider thread ID (when issued) in task refs. Provisioning
-  reuses the task branch and PR, resumes that thread when present (fresh
-  `exec` only before a thread exists), and never substitutes the generic
+  model/effort, and opaque provider continuation ID (when issued) in task refs.
+  Provisioning reuses the task branch and PR, resumes that identity when present
+  (a fresh turn only before an identity exists), and never substitutes the generic
   initial task prompt. Provider events do not consume retry metadata. It is
   removed atomically with the successful worker submit transition into
   `in-review`, so any crash while implementation remains active restarts from
@@ -341,9 +441,11 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 ### Ops
 - `quorum status [--watch]` → read-only health snapshot. Alerts and critical messages are
   displayed and affect health only for 12 hours; they remain available through the feed until
-  their normal message TTL expires. **`--watch` opens a fresh short read
-  per ~1–2s tick (connect→read→close) — never holds a transaction across ticks** (else it
-  pins the WAL; verified). Read-only; never blocks writers under WAL.
+  their normal message TTL expires. Live memory/swap and deduplicated DB/worktree filesystem
+  capacity are sampled without persistence and appear in both the cockpit and additive JSON.
+  **`--watch` opens a fresh short read per ~1–2s tick (connect→read→close), then performs the OS
+  sample — never holds a transaction across ticks or resource syscalls** (else it pins the WAL;
+  verified). Read-only; never blocks writers under WAL.
 - `quorum sweep` → unbounded physical reclamation + `wal_checkpoint(TRUNCATE)` (optional;
   sweep-on-write covers normal use)
 - `quorum init` → create `~/.quorum/`, DB, default config; open + migrate (idempotent)
@@ -373,7 +475,8 @@ for v1.)
 
 Single Cargo crate (workspace-ready) in `~/dev/quorum`:
 - `quorum-core` (lib): store + domain logic + PRAGMA setup + migrations; fully testable
-  without any I/O harness. A future MCP shim wraps this.
+  without any I/O harness. The credentialless agent MCP wraps its run-capability and durable
+  GitHub-operation boundaries.
 - `quorum` (bin): clap arg parsing, stdin/file input, JSON output, exit-code mapping,
   `status`/`watch`/`sweep`/`help-agent`.
 
@@ -414,15 +517,67 @@ to the same per-repo DB without relying on cwd.
 ### Single-daemon-per-DB guard
 
 On startup, `quorum serve` acquires an exclusive lease in the `daemon_lock` table
-(one-row, stores pid + heartbeat timestamp). The heartbeat is refreshed on every tick.
-A second daemon on the same DB:
+(one-row, stores pid + heartbeat timestamp + opaque instance identity). The instance
+identity is a fresh UUID minted at daemon startup (`daemon_lock::new_instance_id`, 128
+bits of entropy) and is the sole authority: `try_acquire`, `refresh`, and `release` are
+all guarded by it. The stored PID is a human-readable diagnostic only — it is never
+consulted for admission or ownership. The heartbeat is refreshed on every tick.
 
-- **Live holder** (heartbeat fresh within 30s AND pid alive via `kill(pid, 0)`) → exit 2
-  with error naming the holder pid. Never a silent second daemon.
-- **Stale holder** (heartbeat old OR pid dead) → take over the lease, log it.
+The check-and-acquire runs inside a single `BEGIN IMMEDIATE` transaction so two daemons
+starting simultaneously can never both write. A second daemon on the same DB:
 
-On clean shutdown the lease is released (row deleted). A crash leaves a stale row that
-the next daemon takes over.
+- **Live holder** (heartbeat fresh within 30s) under a **different instance identity**
+  → exit 2 with error naming the stored holder PID for diagnostics. This holds even
+  when the incoming numeric PID equals the stored one (PID namespaces, container
+  restart, PID wraparound) and even when the stored PID is not locally visible
+  (containers, remote host). Never a silent second daemon.
+- **Live holder** under the **same instance identity** → idempotent reacquire (also
+  refreshes the heartbeat). This is the normal restart of the same lifetime.
+- **Stale holder** (heartbeat older than 30s) → take over the lease via UPSERT
+  overwriting pid + instance, log it. Legacy pre-v70 rows with `instance_id IS NULL`
+  fall through the same paths: fresh legacy rows fail closed (unknown identity), and
+  stale legacy rows are treated as abandoned and taken over without manual edit.
+
+The heartbeat freshness gate is the sole liveness input. `status` reports `Alive` while
+the heartbeat is within `stale_secs` and `Stale` once it expires; a `pid_dead` flag
+(populated by `kill(pid, 0)`) is surfaced on `Stale` verdicts as a diagnostic only and
+never influences the verdict. This is namespace-safe: a live daemon whose PID is
+locally invisible still reads `Alive`, and an expired heartbeat still reads `Stale`
+even when the stored numeric PID happens to collide with an unrelated live process.
+
+On clean shutdown the lease is released, guarded by the calling instance identity so a
+superseded process cannot delete the current holder's row. A crash leaves the row
+behind with the crashed instance identity. The consequence of dropping PID liveness
+from the admission gate: a `SIGKILL` followed by an immediate restart within the 30s
+stale window fails closed under the new (different) instance identity and exits 2
+until the stored heartbeat expires. `scripts/serve-supervisor.sh` does not retry this
+condition — the wrapper only loops on the drain/self-update exit code (75) and
+propagates every other status, so `Held` (exit 2) causes the wrapper itself to exit.
+The supported recovery is an external restart after the 30s heartbeat goes stale, at
+which point the fresh process takes over the abandoned lease via UPSERT. This trades a
+small self-recovery delay for the guarantee that no PID collision or PID-namespace
+edge case can ever bypass the guard.
+
+### Daemon limits and stall detection
+
+Managed worker and reviewer processes use an idle-based stall guard. `max_idle_secs` is
+the maximum time an active process may go without emitting an observable runner event;
+each provider event resets the idle clock. The default is 900 seconds (15 minutes).
+When the limit is exceeded, the daemon kills and reaps the process group, releases the
+task authority, and handles the resulting failure through the normal lifecycle recovery
+path. This detects a genuinely stalled process without treating a long, active turn as
+stalled.
+
+`max_task_wall_secs` remains an optional hard wall-clock cap for one live worker,
+reviewer, or remediation slot. It spans all turns and continuations handled by that
+slot and is independent of event activity: a slot that continues emitting events still
+fails when this ceiling is exceeded. The in-memory clock resets when the slot is
+replaced, when the lifecycle moves to another slot, or when the daemon restarts, so this
+setting is not an end-to-end wall-clock cap for the full task lifecycle.
+
+`max_turn_wall_secs` is deprecated and is no longer enforced as a per-turn wall-clock
+limit. Existing configurations may retain it as a compatibility alias for the idle
+setting, but new configurations must use `max_idle_secs`.
 
 ### Cutover recipe (lifecycle refactor)
 
@@ -525,7 +680,7 @@ only through an explicit outside request)
 - `ChecksFailed` → Rework · effects: IncrementReworkRound, ResumeWorker
 - `VerdictChanges` (review_only=true) → Rework · effects: IncrementReworkRound,
   ResumeWorker (at the rework cap → Failed · effects: NotifyOwner, ReleaseLease)
-- `VerdictChanges` (rework_round ≥ REWORK_CAP) → Failed · effects: NotifyOwner, ReleaseLease
+- `VerdictChanges` (rework_round ≥ the task's stamped rework cap) → Failed · effects: NotifyOwner, ReleaseLease
 - `AgentFailed` → InReview (**sticky**) · effects: ReleaseLease, NotifyOwner, SpawnReviewer
 - `LeaseExpired` → InReview (**sticky**) · effects: ReleaseLease, SpawnReviewer
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
@@ -555,20 +710,85 @@ only through an explicit outside request)
 
 - **Author/reviewer separation:** ReviewerAttached is rejected if the agent is the author.
   The daemon enforces #206: the deliverer (who signaled `submit`) cannot review.
-- **Rework cap:** `REWORK_CAP = 5`. When `rework_round >= 5` and VerdictChanges fires,
-  the task goes to Failed (not Rework). Rounds are consumed only by review verdicts,
-  CI failures, and merge conflicts on delivered work — never by infrastructure
+- **Author-side preflight cache:** A full `preflight.sh` invocation always runs the
+  branch-base gate, because it fetches and checks the moving `origin/main` reference.
+  Gates 2–4 may instead use a task-local green cache at
+  `target/preflight-timing/last-green.json`. Its deterministic fingerprint covers HEAD,
+  porcelain status, the binary diff from HEAD, and the paths, modes, and contents of
+  untracked inputs (including ignored inputs outside generated `target/`). Only an exact
+  `{ fingerprint, exit: 0 }` record written after a green, unchanged gates-2–4 run may
+  skip those gates. Missing, malformed, or unreadable cache entries and every fingerprint
+  error are cache misses. Fingerprinting never writes the index or uses the network; the
+  daemon does not use this optimization and merge CI remains the full backstop.
+- **Author-side per-binary test cache:** When the whole-tree cache misses, fmt, clippy,
+  and compile/no-run still run in full. Before direct test-binary execution, the collector
+  hashes each produced executable's contents with SHA-256 and looks up the per-worktree,
+  uncommitted `target/preflight-timing/test-results.json` cache. It maps a digest to exact
+  `{ "exit": 0, "target_name": "..." }` green records. Only completed direct executions
+  with exit zero and complete cleanup are atomically published (temporary file plus
+  `os.replace`); failed, timed-out, interrupted, cancelled, incomplete-cleanup, and
+  unlaunched binaries are never cached. Missing, malformed, unreadable, or invalid cache
+  data and executable-hash failures are cache misses, so the binary runs; a write failure
+  leaves no durable result and the next run executes it again. A cache hit is evidence, not
+  an execution: its `timing.json` binary entry has `cached: true`, `cached_pass`, zero
+  duration, and no cleanup object. `test_execution` and the summary/final full-pass line
+  report executed versus cached counts (and `not_run` for partial fail-fast output). The
+  key is the produced file, not inputs or build paths, so a changed executable always runs
+  even through sccache. This deliberately reduces repeat concurrency-canary coverage for
+  unchanged binaries; delete `target/preflight-timing/test-results.json` to force a full
+  binary-execution pass. The daemon does not use this optimization and merge CI remains the
+  full backstop.
+- **Author-side inert diffs:** After a cache miss, the ordinary single-base author path
+  still runs `cargo fmt`, but skips clippy and tests only when the union of
+  `BASE_REF...HEAD` changed paths and porcelain working-tree paths is non-empty and every
+  path is `docs/**`, a root-level `*.md`, `LICENSE*`, `README*`, or `.github/**`.
+  Any `*.rs` path or `Cargo.toml`/`Cargo.lock` basename is a build input and overrides
+  those directory/root patterns, retaining the full suite.
+  Continuation and integration bases are deliberately ineligible because they compare
+  compound histories. Any unresolved base, Git error, malformed path listing, or path
+  outside that allowlist runs the full suite. In particular, this is not a broad
+  `**/*.md` or `.claude/**` rule: `.claude/skills/quorum/SKILL.md`, `schema.sql`, and the
+  served web assets are `include_str!` build inputs. The daemon's CI remains the
+  unconditional full-suite backstop.
+- **Rework cap:** per-task, configured, and frozen at daemon adoption. The serve
+  config knob `max_rework` (validated `>= 1`; unset falls back to the compiled
+  default `REWORK_CAP = 7`) is stamped onto each task inside the *same* write
+  transaction that accepts its classification, so the accepted refs and the
+  immutable adoption-time cap land or roll back together. All supported
+  classification writers (the daemon classifier and `quorum classify --backfill`)
+  stamp; the immutable-once `WHERE rework_cap IS NULL` guard means a later config
+  change only affects newly-adopted tasks. Legacy rows that predate the migration
+  and never re-enter classification stay `NULL` and resolve to the compiled
+  default. When `rework_round >= <the task's stamped cap>` and an actionable
+  rework event (VerdictChanges, ChecksFailed, or MergeConflict) fires, the task
+  goes to Failed (not Rework). Rounds are consumed only by review verdicts, CI
+  failures, and merge conflicts on delivered work — never by infrastructure
   failures (provisioning, worker death, lease lapse), which park the task instead.
 - **Review-only entry:** `task-create --review-pr N` creates a task directly in `in-review`
   with `review_only=true`. A blocking verdict enters normal bounded rework; it never falls
   through to generic implementation-worker provisioning, because remediation must retain
-  the adopted PR target.
+  the adopted PR target. Before reviewer provisioning, the daemon validates the live PR base
+  against the task's immutable target branch, with configured-base fallback only for legacy
+  targetless tasks. The daemon revalidates the live base before every reviewer feed and again
+  before formal approval and merge, including restart recovery and policy retries. Review-only
+  remediation integrates that same task target. Storage failures while resolving task authority
+  remain abnormal daemon errors rather than ordinary target rejections or parked remediation.
 - **Existing-PR implementation entry:** `task-create --continue-pr N` creates an `open`
   implementation intent and atomically rejects an already-owned PR. Before provisioning,
   the daemon resolves an open, same-repository, non-fork PR, rechecks exclusive nonterminal
-  ownership, and persists its exact head branch and SHA. The worker starts from that commit,
-  and later publication targets only that branch under the recorded SHA lease. Ownership ambiguity, closure,
-  branch replacement, or SHA movement fails closed; Quorum neither rebases onto the new
+  ownership, and persists its exact head branch and SHA. The daemon checks out and verifies
+  that exact commit, then merges the freshly fetched configured base into the continuation
+  branch before worker launch. The daemon explicitly overrides `merge.ff=only` for this operation;
+  Git completes a clean integration (creating a merge commit when histories diverge), while a
+  conflicting merge remains in progress for the worker to resolve and commit. This preserves the
+  recorded PR head as an ancestor so later publication is
+  fast-forward-only. The daemon supplies the configured base identity at the push boundary, and
+  the publication gate attributes sessions only to commits reachable from the proposed tip but
+  from neither the recorded PR head nor that freshly fetched base; inherited base commits do not
+  become worker-owned. Before publication, the daemon revalidates the live PR as open and still
+  targeting the configured base, then targets only its recorded branch under the recorded SHA
+  lease. Ownership ambiguity, closure, base retargeting, branch replacement, or SHA movement fails
+  closed; Quorum neither rebases onto the new
   head nor silently falls back to fresh implementation or a new PR. Existing same-task
   rework continues through the established PR association and does not create a new entry.
 - **Entry authority:** task creators select exactly one of fresh implementation (neither
@@ -585,6 +805,14 @@ only through an explicit outside request)
   finding requires `--verdict changes --feedback`. Unattested approvals are demoted to
   changes by the daemon.
 - **Dependency gating:** tasks with `depends_on` are only claimable when all deps are `done`.
+  A daemon-observed merge also records GitHub's immutable merge commit in
+  `refs.merge_commit_sha`. Before allocating a dependent task's branch or worktree, the
+  daemon fetches its authoritative target branch and requires every dependency's recorded
+  merge commit to be an ancestor of that fetched base SHA; that exact verified SHA is the
+  allocation provenance. A just-merged commit absent from the fetched ref is a bounded,
+  claim-free deferral (logged once); after three attempts, or when a completed dependency
+  lacks its merge SHA, the task parks loudly with the named commit/dependency. The daemon
+  never cuts the dependent branch from an unverifiable base.
 - **Concurrency cap:** `--cap N` limits the daemon to N concurrent tasks (≤ 2N agents:
   one worker + one reviewer per task).
 - **No passive execution (v2).** External/interactive agents cannot claim, execute,
@@ -616,20 +844,108 @@ a durable parked state. Parking atomically:
 This applies to exhausted crash recovery, repeated instant worker death, merge-policy
 blocks, reviewer repository mismatch, reviewer provision exhaustion, and terminal
 not-done dependencies. The dependency cascade parks the dependent with resume status
-`open`; readiness remains false until all dependencies are `done`.
+`open`; readiness remains false until all dependencies are `done`. The cascade also
+distinguishes a merely-`failed` dependency (recoverable — the dep itself may still
+retry to `done`) from a `cancelled` dependency (terminal-terminal — no path exists
+back to `done` without a `depends_on` edit or closing the dependent). The park reason
+names the specific failing dep — a `cancelled` dep is preferred over a `failed`
+sibling because it drives the operator disposition — and the durable
+`daemon_parked_unsatisfiable=true` bit records the distinction in refs. Every other
+park path (`set_parked_refs`) clears any stale value so the marker is authoritative
+for the current park only. `quorum status` includes `daemon_parked_unsatisfiable=1`
+rows in the BLOCKED section with the cancelled dep in `deadlocked_on`, so the
+operator sees the disposition queue without DB inspection.
+
+Convergence when a dep transitions to `cancelled` runs in two coordinated
+layers:
+
+1. **Atomic at the cancellation:** `tasks::update` calls
+   `converge_parked_dependents_of_cancelled` inside the cancel transaction.
+   The transaction durably enqueues the cancelled task and examines one
+   primary-key-ordered page of raw task rows. Matching non-classifier-policy
+   daemon parks have their marker and reason upgraded before commit. The raw
+   page bound, rather than a post-filter result limit, bounds examined history.
+2. **Read-side inference in `stats::blocked_tasks`:** the BLOCKED section
+   surfaces every `status='failed'` daemon-parked task whose `depends_on`
+   currently contains any `cancelled` dep, regardless of the durable marker.
+   This covers cancellation paths that do not route through `tasks::update`
+   (decomposition-triggered cancels, direct test mutations, upgrade timing),
+   and covers queued rows awaiting durable reconciliation and
+   classifier-policy parks whose refs must not be overwritten
+   (their durable `daemon_parked_reason` stays "classifier declined").
+
+Bounded opportunistic write-sweeps advance one durable reconciliation cursor;
+explicit `sweep_all` drains the queue. Thus dependents beyond the cancellation-
+time page eventually receive durable refs through production paths. The v50
+migration performs the same durable repair at upgrade time on
+installed databases so pre-existing parks join the disposition queue
+immediately. Both the migration and the runtime convergence skip
+classifier-policy parks so the classifier cause is preserved; those rows
+still surface via the read-side inference. Convergence emits
+`task_parked_upgraded` and a task note; it does not duplicate the original
+owner alert. Each periodic pass examines at most one indexed raw-ID page, so
+mutation work is independent of retained failed-task history.
 
 `quorum task-retry --task-id N --by <operator>` is the sole resume operation for a
-daemon-parked task. It atomically validates the marker, clears it, resets only the crash
-recovery counter, and emits `task_retry`. `open`, `rework`, and `in-review` restore
-directly. A `rework` retry also records `daemon_rework_retry_requested=true`; startup
-recovery preserves it and the next daemon tick atomically claims and spawns a replacement
-worker on the same task and branch. A parked `merging` task restores to `in-review`
-because the original approval mailbox row and agents were consumed during teardown;
-the orphan-review reconciler obtains fresh R1/R2 approval before the next merge attempt.
-Retry does not change PR identity, approvals,
-dependencies, author/reviewer provenance, or rework count. An unparked or terminal task
-is a clean negative (exit 1). This explicit gate prevents hot respawn/provision loops:
-daemon ticks cannot retry a parked task until the operator requests it.
+daemon-parked task, a worker provider block, or the narrowly eligible exhausted
+decomposition-planning state described below. For a daemon park it atomically validates
+the marker, clears it (including the
+unsatisfiable bit), resets only the crash recovery counter, and emits `task_retry`.
+`open`, `rework`, and `in-review` restore directly. A `rework` retry also records
+`daemon_rework_retry_requested=true`; startup recovery preserves it and the next
+daemon tick atomically claims and spawns a replacement worker on the same task and
+branch. A parked `merging` task restores to `merging` and records
+`daemon_merge_retry=requested`. The daemon atomically advances one such intent to
+`attempting` before network work, then revalidates the immutable task/PR association,
+persisted target tuple, expected base, live head, exact task/role/SHA approvals, durable R2
+sampling decision, and CI. Valid authority performs one merge replay without allocating a
+reviewer; missing or stale authority is invalidated narrowly and returns to `in-review` for
+the first missing role. Missing or task-mismatched sampling evidence cannot be replaced by
+otherwise-valid R1/R2 rows: the daemon atomically removes that decision and R1, then normal
+review recreates the decision from a fresh R1 while retaining an exact R2. If a durable skip
+makes R2 optional but a stale extra R2 row exists, the daemon atomically removes only that row
+and rereads the complete authority once under the same `attempting` marker; it never issues
+more than the one merge call authorized by the owner retry. The exact approved head is carried
+through the merge-executor boundary: the production executor rechecks it immediately before
+formal approval and again afterward, then invokes GitHub merge with that SHA as the required
+head. A force-push in the remaining call window is therefore rejected and returns to review
+with stale approvals invalidated. Legacy tasks without an immutable `target_branch` cannot
+directly replay approval; their approvals are invalidated and review is rebuilt against a
+persisted base. A repeated policy/infrastructure failure parks again with approvals intact. A
+worker-fixable replay result atomically consumes the `attempting` marker, invalidates approval
+rows, records bounded remediation feedback, and transitions directly from `merging` to
+`rework`; no intermediate `in-review` state can allocate a replacement reviewer or lose the
+actionable turn. The ordinary live reviewed path also writes `attempting` immediately before
+its first remote merge call, and must durably park a policy outcome before tearing down its
+worker/reviewer. Final-role verdict persistence uses the head already validated against the
+reviewer's launch SHA; it never refetches and binds the verdict to a later force-pushed head.
+Startup never auto-replays a parked task; any interrupted `attempting` marker is parked for
+another owner retry rather than issuing an uncertain duplicate call. A policy failure during
+startup approval replay is likewise parked with exact-head approvals retained before generic
+recovery, while a worker-fixable result invalidates those approvals, records
+`daemon_rework_retry_requested=true`, and returns to rework. This marker survives the immediately
+following generic recovery even when no worker journal or continuation exists, so the daemon
+provisions the actionable remediation turn rather than resetting the task to `open`.
+Retry does not change PR identity, approvals, dependencies, author/reviewer provenance, or
+rework count, with one narrow exception recorded at park time as a structured
+`daemon_publication_failure_kind` (pure DB decision — no reason-string parse, no network):
+a `pr-closed` park (the pinned publication PR is closed unmerged, observed either at the
+publication call or when the daemon re-provisions a retained rework intent whose live PR
+has since closed) causes `retry_parked` to abandon the pinned `daemon_publication` intent in
+the same UPDATE, retire a matching `continue_pr`, deallocate the branch, and write
+`refs.abandoned_publication={pr,branch,local_sha,continue_pr}` so the orphaned PR remains
+traceable; the next publication attempt mints a fresh branch/PR. A `pr-merged` park is
+delivery evidence: `retry_parked` returns the clean-negative (`Ok(None)`, status stays
+`failed`, no branch deallocation, no retry event) — the operator must investigate manually.
+An unparked or terminal task is a clean negative (exit 1). One additional clean negative
+(exit 1) fires when the parked task's `depends_on` still contains any `cancelled`
+task id: silently restoring the dependent would just have the sweep re-park it on
+the next tick while leaving the operator with no disposition signal. The CLI names
+the cancelled dep(s) in the JSON payload; the operator resolves it by editing
+`depends_on` (existing task-update guarded path) or closing the dependent. No
+automatic cancellation cascade is added. This explicit gate prevents hot
+respawn/provision loops: daemon ticks cannot retry a parked task until the operator
+requests it.
 
 Daemon startup also reconciles bounded batches of legacy/corrupt terminal rows carrying
 runnable remediation retry markers. `failed` parks retain their reason and explicit
@@ -637,32 +953,73 @@ owner-retry target but lose automatic retry/head-check authority; `done` and `ca
 rows lose all park/resume authority. The cleanup writes one audit note and is idempotent.
 Before reconciliation, `quorum status` surfaces these rows as critical health alerts.
 
-### Review responsibility boundary (agents own PR collaboration)
+### Review responsibility boundary (agents author; Quorum mediates)
 
 For PR-backed tasks, the GitHub PR is the source of truth for the review conversation:
 findings (BLOCKING and advisory), advisory suggestions, author responses/pushback,
 reviewer resolution of prior findings, and evidence. Quorum coordinates lifecycle,
-provisioning, the final formal APPROVE, and merge — it does **not** proxy the review
-conversation. Concretely:
+provisioning, validated publication, the final formal APPROVE, and merge. Agents author the
+conversation through the run-bound GitHub collaboration MCP; Quorum preserves their Markdown,
+anchors contributions to the authorized PR/revision, and never derives lifecycle transitions
+from comment text. Concretely:
 
 - **Reviewer agents** complete their planned audit for the reviewed SHA before
   submitting a verdict: discovering one blocker does not end exploration. They
   post the complete discovered blocking and advisory set to one PR review
   summary (with inline comments where a specific file/line applies), and the
-  `--blocking` count covers that complete blocker set. For cross-cutting work,
-  they derive a small affected-path matrix from the PR scope to check relevant
-  sibling and negative paths together; this does not require speculative
-  findings or exhaustive proof over unrelated code. Re-reviews verify prior
-  fixes and re-audit the full current diff and relevant sibling paths, rather
-  than only the most recent remediation commit. Reviewers respond to author
-  pushback on the PR itself.
-  Encouraged GitHub operations are normal comments, inline comments, and review
-  summary comments. Formal APPROVE and REQUEST_CHANGES reviews remain daemon-owned
+  `--blocking` count covers that complete blocker set. Before a verdict,
+  reviewers derive a bounded, task-specific affected-path model from the
+  embedded managed-task contract when provided and the mechanisms changed by
+  the PR. They choose a useful representation — a short matrix, checklist,
+  state/event map, or equivalent — to review applicable related lifecycle and
+  compatibility paths together and determine whether the proposed remedy
+  closes each relevant path. This does not prescribe a fixed format, require
+  speculative findings, or demand exhaustive proof over unrelated code.
+  Re-reviews verify prior fixes and re-audit the full current diff and relevant
+  sibling paths, rather than only the most recent remediation commit. A new
+  blocker in unchanged behavior must explain why it was not reasonably
+  discoverable in the prior complete audit. Reviewers respond to author
+  pushback on the PR itself. Each re-review publishes a cumulative disposition
+  section that lists prior BLOCKING findings, the author's claimed remedy or
+  response, and the current reviewer's independently determined disposition:
+  fixed, reaffirmed, downgraded/follow-up, overridden/accepted, or unresolved.
+  Findings first discovered in the current review are listed separately and
+  retain the late-blocker explanation requirement above. Because Quorum does
+  not currently have reliable structured extraction of PR review threads, the
+  daemon requires this standardized section rather than synthesizing finding
+  status. A daemon-provided ledger may later serve only as navigation context;
+  the PR discussion remains authoritative, and neither a pushed commit nor an
+  author's claim resolves a finding without the reviewer's current disposition.
+  Both prior and new sections have fixed entry limits, and each field has a
+  fixed Unicode-scalar limit. Explicit entry and field truncation directs the
+  reader to the PR for omitted authoritative history; omitted current blockers
+  still count in the verdict.
+  Encouraged GitHub operations are the injected MCP's normal comments, pending COMMENT review,
+  inline comments, review summary, thread replies, and reviewer-only thread resolution. Formal
+  APPROVE and REQUEST_CHANGES reviews remain daemon-owned
   because managed reviewers use the same GitHub account as PR authors.
+  Reviewers classify technical impact independently from merge disposition. A
+  concrete finding is BLOCKING only when merging the exact change would leave
+  the assigned primary outcome false, violate an applicable repository
+  invariant, or introduce/materially worsen supported behavior, and its
+  assumptions fit the established operating/threat model. Each blocking finding
+  explains why the PR cannot merge, names the exact repository invariant it
+  violates (or the precise assigned outcome left false or supported behavior
+  materially worsened), and describes the broader affected path left unsafe
+  rather than only its local symptom. Real pre-existing,
+  adjacent, defense-in-depth, future, or stronger-threat-model concerns are
+  FOLLOW-UP unless an explicit current contract makes them blocking. For
+  documentation changes, reviewers require the smallest accurate statement of
+  supported behavior rather than an exhaustive inventory of implementation
+  exceptions; pre-existing edge behavior merely revealed by the change stays
+  FOLLOW-UP when the primary outcome can remain accurate without cataloguing or
+  fixing it. Follow-ups are recorded on the PR but never increase `--blocking`
+  or prevent an otherwise valid approval.
 - **Author/rework agents** address findings on the PR. If disagreeing with a finding,
   the author replies to it on the PR with concrete evidence rather than silently
   ignoring it. The final PR history must let a later collector determine, for each
-  finding: fixed, accepted, overridden with evidence, or unaddressed.
+  finding: fixed, accepted, overridden with evidence, or unaddressed. Replies use the
+  referenced review thread rather than creating unrelated top-level comments.
 - **Lifecycle signal only:** reviewers signal state with
   `quorum submit --verdict approved|changes --blocking N [--feedback ...]`. The
   submit payload is a lifecycle signal, not a second review ledger — the ledger is
@@ -674,9 +1031,25 @@ conversation. Concretely:
   reviewer signals `changes`. This is lifecycle authority, not the findings ledger;
   the reviewer's inline and summary comments remain the source of truth.
 
+**Iterative verdict-context contract.** Any bounded Quorum loop in which one role produces an
+artifact and another role reviews it preserves three distinct things across every permitted
+iteration: the authoritative artifact identity (including its revision or SHA), the closed
+verdict, and a bounded artifact-specific rationale explaining that verdict. The rationale is
+review feedback, never lifecycle authority. The next producer iteration receives the applicable
+rationale tied to the reviewed artifact, and a new review judges the new artifact rather than
+silently reusing an old verdict. The authoritative ledger remains workflow-specific: GitHub PR
+discussion is authoritative for worker/reviewer findings, while `decomposition_attempts` is the
+durable planner/classifier/Arbiter iteration ledger. Sharing this contract does not require one
+generic backing store or permit a lifecycle signal to become a second findings ledger.
+
 This preserves #206 verdict attestation, reviewer separation, the rework cap, sticky
 reviewer, the stale-SHA gate, and R1/R2 lifecycle. It shifts only who writes to the PR:
-agents, directly.
+agents author the content and the daemon publishes it through run-scoped operations.
+
+Initial daemon-created PRs render stable Outcome, Changes, Verification, Task, and optional
+Notes sections. Task identity, accepted title, and accepted body come from daemon-owned task
+state. Bounded worker delivery evidence fills the other sections; absent evidence is stated
+explicitly. Existing-PR continuation and review-only entry do not overwrite an external body.
 
 ### R2 pre-merge review gate (#159, configurable sampling)
 
@@ -689,12 +1062,15 @@ coverage floor. A negative floor or probability outside `0.0..=1.0` is a usage
 error; values are never clamped. `r2_enabled = false` disables sampling, not the
 R2 safety gate, and therefore also leaves R2 mandatory.
 
-R2 is skipped when R1 approves after `rework_round` has reached `REWORK_CAP`
-and that PR head has no prior decision. At that point no bounded rework round
-remains for an R2 changes verdict, so R1 approval is the final review gate. The
-skip is recorded for that PR head through the same daemon-owned sampling-decision
-mechanism. A prior decision requiring R2 remains authoritative if the branch
-later returns to that head.
+R2 is skipped when R1 approves after `rework_round` has reached that task's
+stamped rework cap (see the Rework cap bullet earlier in this document —
+configured via `max_rework`, frozen per-task at daemon adoption, and falling
+back to the compiled default only for legacy unstamped rows) and that PR head
+has no prior decision. At that point no bounded rework round remains for an R2
+changes verdict, so R1 approval is the final review gate. The skip is recorded
+for that PR head through the same daemon-owned sampling-decision mechanism. A
+prior decision requiring R2 remains authoritative if the branch later returns
+to that head.
 
 When R1 approves, Quorum records a sampling decision in a daemon-owned table,
 keyed by both PR number and head SHA; it is not task refs because task refs are
@@ -744,9 +1120,15 @@ approval path merges; when it requires R2, the following dual-review flow applie
 
 No new lifecycle states were added. R2 uses the existing `InReview ⇄ Rework` transitions.
 
-**Severity contract** — both R1 and R2 prompts enforce that concrete failure classes
-(resource exhaustion, unbounded growth, network calls in DB txns, data loss, stuck paths)
-are BLOCKING unless evidence disproves the failure.
+**Severity and disposition contract** — both R1 and R2 prompts classify
+technical impact separately from merge disposition using the reviewer
+classification contract above: a finding is BLOCKING only when merging the
+exact change would leave the assigned primary outcome false, violate an
+applicable repository invariant, or introduce/materially worsen supported
+behavior. Concrete resource exhaustion, unbounded growth, network calls in
+DB transactions, data loss, corruption, security-boundary failures, and
+stuck paths are presumptively major or critical impact, but their category
+alone never decides merge disposition.
 
 ### Daemon-owned pre-review CI gate
 
@@ -792,7 +1174,9 @@ after reviewer provisioning.
 After VerdictApprove (InReview → Merging):
 1. Check stale SHA — if reviewer recorded a head SHA and it differs from current, fire
    MergeFailed → rework cycle (prevents stale approval from authorizing a changed diff).
-2. Check mergeability — if conflicting, MergeConflict → rework cycle (worker rebases).
+2. Check mergeability — if conflicting, MergeConflict → rework cycle. The daemon checks out
+   the exact published PR head and merges the current base before worker launch; a conflicting
+   merge remains in progress for the worker to resolve and commit. The worker never rebases.
 3. Wait for CI checks — outcome classified into Ready / Failed / TimedOut. See
    § Merge-wait vs. actionable-rework contract (#173) below for the full disposition.
 4. Persist approval record (instance-independent, survives restart).
@@ -800,8 +1184,9 @@ After VerdictApprove (InReview → Merging):
    the merge attempt — the window from step 2 through the master-CI gate can span minutes.
    If conflicting, fire MergeConflict → rework cycle. If mergeable, proceed.
 6. Execute `gh pr merge` — success → Done; policy-blocked → Failed with a durable
-   `merging` resume marker (explicit retry restores `in-review` and re-drives approval);
-   retryable failure → rework.
+   `merging` resume marker while retaining the exact-SHA durable approvals (explicit retry
+   consumes one daemon-owned replay intent after live revalidation); retryable failure →
+   invalidate approvals and enter rework.
 7. Self-update drain: if enabled, a successful merge triggers drain mode →
    exit 75 for the supervisor to rebuild and relaunch.
 8. **Post-merge analytics collector** (#125) — fire-and-forget `tokio::spawn` runs
@@ -833,7 +1218,7 @@ retry autonomously.
 |---|---|---|---|
 | `Ready` | any | actionable (proceed) | Continue to step 4 (persist approval) and merge |
 | `Failed { checks }` | any | actionable (code broken) | `MergeFailed` → InReview, then `VerdictChanges` → Rework (rework cap applies). Worker gets failing check names. |
-| `TimedOut` | `Conflicting` | actionable (conflict) | `MergeConflict` → Rework directly (rework cap applies). Worker rebases. |
+| `TimedOut` | `Conflicting` | actionable (conflict) | `MergeConflict` → Rework directly (rework cap applies). Daemon prepares an ancestry-preserving base merge for the worker to resolve. |
 | `TimedOut` | `Mergeable` | **infrastructure-pending** | **Durable merge-wait** — no VerdictChanges, no AgentFailed, no rework budget consumed. See retry/backoff below. |
 | `TimedOut` | `AlreadyMerged` | resolved externally | `PrFoundMerged` → Done |
 | `TimedOut` | `Closed` | resolved externally | `PrFoundClosed` → Failed |
@@ -914,8 +1299,9 @@ These are negative invariants — violation of any one is a regression:
 4. **Must NOT allocate or spawn a worker/reviewer** — nothing for them to do.
 5. **Must NOT consume the mailbox row** until the wait resolves (merged, reworked, or
    ceiling-exceeded). The unconsumed row is the durable record that a merge is pending.
-6. **Must NOT delete the approval record** until the merge attempt completes (success or
-   failure). Premature deletion causes restart recovery to re-work instead of re-merge.
+6. **Must NOT delete the approval record** for a policy, credential, infrastructure, or
+   pending failure. Delete it only when the merge succeeds or worker-fixable remediation
+   invalidates the reviewed code boundary.
 
 #### Preserved state during merge-wait
 
@@ -924,27 +1310,63 @@ The following must remain intact throughout the wait and across restarts:
 | State | Location | Why |
 |---|---|---|
 | PR number | `tasks.pr` column | Identifies the merge target |
-| Both durable approvals (R1 + R2) | `approvals` table | Restart recovery reconstructs "merge this PR" |
+| Required durable role approvals | `approvals` table | Restart recovery reconstructs exact-head review authority |
+| Durable sampled-R2 decision | `r2_sampling_decisions` table | Proves whether R2 is required for this task/PR/head |
 | Reviewed head SHA | `approvals.approved_head_sha` | Head-change detection (step 4b above) |
 | Branch provenance | `tasks.branch`, journal row | Worker/remediation needs the branch |
 | Dependency blocking | `tasks.depends_on` | Already-done deps stay done; blocked deps stay blocked |
 | Task status = `merging` | `tasks.status` column | Restart recovery recognizes this as merge-pending |
-| Mailbox row (unconsumed) | `mailbox` table | Restart re-enters merge flow from unconsumed approval |
+| Mailbox row (if still unconsumed) | `mailbox` table | Recoverable delivery signal only; durable approvals remain authoritative without it |
+| Explicit retry intent | `tasks.refs.daemon_merge_retry` | Bounds an owner retry to one daemon attempt |
 
 #### Restart reconciliation
 
-On daemon startup, before stateless recovery:
+On daemon startup, before generic crash recovery:
 
 1. **#228 approval recovery** runs first: scans `approvals` table, validates each role's
-   verdict against the current PR head SHA via `next_missing_review_role(conn, pr, sha)`.
+   verdict against the current PR head SHA via `next_missing_review_role(conn, pr, sha)`, and
+   requires an exact task/PR/head row in `r2_sampling_decisions` before merge admission.
    If all roles approved for the current SHA → merge. If any role is missing or stale →
    defer to generic recovery (the approval is preserved or dropped per disposition).
+   Before any network call the complete PR-wide row set must name one exact task and immutable
+   author; mixed-task or mixed-author evidence is deferred fail-closed. Parked tasks and tasks
+   carrying a merge-attempt marker are excluded: the former require owner authority, while the
+   latter are handled by the bounded live retry reconciler or uncertain-attempt park. A policy
+   failure from an unmarked startup replay is durably parked before recovery can run again;
+   repeated starts therefore cannot create a merge loop. A worker-fixable replay result consumes
+   its admitted boundary, invalidates approvals, and enters actionable rework with the durable
+   remediation-retry marker that generic recovery preserves. Missing or differently-task-bound
+   sampling evidence cannot be replaced by R1+R2 rows: startup atomically removes R1 plus the
+   stale sampling row and returns a `merging` task to `in-review` for a fresh R1.
 2. **Generic recovery** handles `merging` tasks: stays in `merging` only when
    `dual_approved()` confirms all required roles are approved for the same head SHA.
    Incomplete approval (e.g. R1 approved, R2 missing) resets the task to `in-review` via
-   `AgentFailed`, so the tick loop provisions the first missing role (#191).
+   `AgentFailed`, so the tick loop provisions the first missing role (#191). The exception is a
+   durable `daemon_merge_retry=requested`: generic recovery preserves `merging` even with
+   incomplete evidence so the live reconciler can atomically consume the request, invalidate
+   only stale evidence, and return to the first missing role without stranding the marker.
 3. **Phase 5b** (orphan in-review tasks) checks for existing valid R1 approvals: if R1 is
    approved for the current PR SHA, it spawns R2 directly instead of re-running R1 (#191).
+   Reviewer verdict persistence uses the task's durable author when no worker is live. When a
+   repaired R1 returns and an exact task/author/head-bound R2 row was retained, that R2 is reused
+   rather than provisioned again. Every persisted role remains bound to the launch-validated
+   head even if the PR moves between that validation and the persistence write. Adoption of a
+   stranded mailbox verdict likewise requires one unambiguous daemon-written `agent_runs`
+   launch for the exact reviewer/task/PR and binds only to its immutable launch head; the current
+   PR head is comparison input, never the SHA assigned to the approval.
+4. **Explicit merge replay** atomically claims at most one `requested` marker per tick. A
+   valid replay needs no live reviewer, mailbox row, or roster entry. Graceful shutdown lets
+   an admitted call settle; startup parks an uncertain `attempting` marker without a second
+   GitHub call and preserves its approvals for another explicit retry.
+
+A delivered respawn-per-turn worker is not an orphan while its review is pending. Its
+`awaiting-review` journal row has no PID and durably binds the agent/task, provider and exact
+continuation, worktree, local and publication branches, and PR. Startup preserves that row and
+worktree, verifies the task ownership plus task/run/capability/publication bindings, atomically
+restores an expired lease when no competing live holder exists, reserves the same name, and
+reconstructs a dormant capacity slot without launching a provider turn. Missing or mismatched
+identity is fatal recovery corruption; the row and name authority are not converted into a fresh
+worker assignment. Startup accepts PID omission only for this explicit dormant shape.
 
 Head-SHA invalidation on restart: the approval record stores `approved_head_sha`. On
 re-entry, `head_sha()` is queried and compared. If different, the approval is stale —
@@ -1005,7 +1427,7 @@ fail-closed and leaves the parked task for explicit operator action.
 | Concept | Location |
 |---|---|
 | `ChecksOutcome` enum (Ready/Failed/TimedOut) | `quorum/src/serve/merge.rs:67-74` |
-| `MergeFailureKind` enum (Retryable/PolicyPending/PolicyBlocked) | `quorum/src/serve/merge.rs:16-24` |
+| `MergeFailureKind` enum (StaleAuthority/Retryable/PolicyPending/PolicyBlocked) | `quorum/src/serve/merge.rs` |
 | Checks-wait timeout handling (current: fires rework) | `quorum/src/serve/mod.rs:2073` |
 | Failed-checks rework path | `quorum/src/serve/mod.rs:1932` |
 | PolicyPending retry loop | `quorum/src/serve/mod.rs:2638` |
@@ -1096,10 +1518,13 @@ Each invariant below requires both a positive and a negative test. Tests marked
     `rework_round` incremented.
 
 11. `conflict_during_checks_triggers_rework` — checks return `TimedOut`, mergeability
-    is `Conflicting`. Assert: `MergeConflict` → Rework, worker rebases.
+    is `Conflicting`. Assert: `MergeConflict` → Rework, daemon-prepared base merge preserves
+    the published PR head, and the worker resolves it without rebasing.
 
 12. `retryable_merge_failure_triggers_rework` — merge attempt fails with
-    `MergeFailureKind::Retryable`. Assert: `MergeFailed` + `VerdictChanges` → Rework.
+    `MergeFailureKind::Retryable`. Assert: one atomic `merging` → `rework` transition
+    consumes the attempt marker and approvals while persisting actionable feedback; no
+    intermediate `in-review` event is visible.
 
 13. `rework_no_worker_spawns_remediation` — actionable rework fires but no live worker.
     Assert: remediation worker spawned on existing PR branch. If spawn fails,
@@ -1141,13 +1566,16 @@ Each invariant below requires both a positive and a negative test. Tests marked
     transient-empty-after-push (#3583). Verified by unit test structure; E2E
     coverage deferred (requires gh-shim, see #181 PR review discussion).
 
-### Post-merge review-analytics collector (#125)
+### Post-merge review interpretation and follow-up planning (#125)
 
 Every successful merge kicks off a detached `serve::collector::run_collection` task
-that classifies the finished PR into structured `review_findings`. The collector
-runs **after** `MergeSucceeded` fires — the task is already `done`, the verdict is
-already final — so its results are retrospective analytics only. Nothing it does
-can undo the merge or change the task.
+that classifies the finished PR into structured `review_findings` and an immutable
+set of evidence-backed Follow-up Artifacts. The collector runs **after**
+`MergeSucceeded` fires — the task is already `done` and the verdict is final — so
+nothing it does can undo the merge or change the originating task or Task Graph.
+Follow-up Artifacts may later produce separate future Managed Tasks through the
+Planning Agent and daemon-owned materialization described in
+`docs/2026-08-07-review-followup-planning-technical-spec.md`.
 
 **Pipeline:**
 1. **Deterministic input assembly** (Rust code, not the model): fetches PR
@@ -1174,15 +1602,19 @@ can undo the merge or change the task.
 2. **Bounded classifier turn** — a Haiku-class agent (`CLASSIFIER_MODEL` /
    `CLASSIFIER_EFFORT`) is spawned with an EMPTY tool allowlist (no Bash,
    Read, Write, Edit, gh — response-only). 3-minute wall-clock cap.
-3. **Structured output** — response must be `{"findings":[...]}` with each
+3. **Structured output** — response must be
+   `{"findings":[...],"followup_artifacts":[...]}` with each
    finding carrying `kind` (blocking/suggestion), `author_pushback`,
    `pushback_accepted` (true/false/null), `addressed_status`
    (addressed/unaddressed/partial/unclear), and an `evidence` array of
-   `{kind,id}` pointers to GitHub review/comment ids. Prose-only findings
-   are rejected by contract.
-4. **Idempotent write** — `replace_for_pr` deletes and re-inserts all findings
-   for the PR; `record_run` UPSERTs a single row in `review_collection_runs`
-   keyed on `pr_number`. Retrying overwrites; there is no history bloat.
+   `{kind,id}` pointers to GitHub review/comment ids. Each artifact carries
+   technical impact, scope relationship, concrete concern, non-blocking reason,
+   affected behavior, desired outcome, verification expectations, and evidence.
+   Prose-only or evidence-free findings/artifacts are rejected by contract.
+4. **Atomic idempotent write** — one transaction replaces analytics, inserts the
+   PR's immutable artifact batch only when absent, and UPSERTs the successful
+   `review_collection_runs` row. Re-interpretation may refresh analytics but
+   never rewrites, duplicates, or resurrects an existing artifact batch.
 5. **Loud failure surface** — any pipeline error (fetch, classifier timeout,
    classifier `is_error=true`, unparseable response, DB write) records a
    `review_collection_runs` row with `status='failed'` + error text and logs
@@ -1197,6 +1629,26 @@ can undo the merge or change the task.
   don't interfere.
 - `collector_model` and `collector_version` are stamped on every row so future
   analyses can filter by generation and re-interpretation replaces atomically.
+- Collection and follow-up planning never change the originating review verdict,
+  merge, task, or graph state. Reviewers and Planning Agents never create tasks;
+  only the daemon may apply a complete validated Follow-up Assessment.
+
+**Follow-up assessment:** ordinary merged tasks become eligible after successful
+interpretation. Eligibility requires daemon-owned `completion_provenance=merged`; a
+manual close or legacy/unknown NULL provenance remains ineligible even when `done` retains
+`refs.pr`. `MergeSucceeded`, externally observed `PrFoundMerged`, and authoritative
+merge-recovery closure are the only merged-provenance writers; migration performs no
+speculative backfill. Generated-child artifacts wait and are assessed together only
+after the Task Graph completes, or after cancellation preserves a merged subset,
+and every merged PR in the batch has successful interpretation. A fresh bounded
+Planning Agent turn receives durable Planning Lineage, all active tasks, bounded
+related completed work, current instructions, and a read-only repository view. It
+must create, link, dismiss, or defer every artifact exactly once. There is no
+semantic fingerprint table: grouping and comparison are planner judgments, and
+ordinary task classification provides a second duplicate/readiness assessment.
+The daemon applies all dispositions and task creations atomically; any failure
+creates nothing. Detailed storage, retry, recovery, and evidence contracts are in
+the focused technical specification.
 
 **Retry surface:** `quorum review-interpret --pr N [--task-id N] [--repo owner/name]`
 re-runs the same pipeline manually. It calls `serve::collector::run_collection`
@@ -1220,17 +1672,20 @@ restarts and binary upgrades (persisted in SQLite, read on every `perf` call).
 Historical collector artifacts (collection runs, findings, errors) created by a
 prior backfill are retained as audit data but do not affect the default report.
 
-## Built-in coding runners: Claude and Codex
+## Built-in coding runners: Claude, Codex, and Grok Build
 
-**Date:** 2026-07-24
-**Status:** Approved design; implementation pending.
+**Date:** 2026-07-24 (provider-neutral launch and recovery state 2026-08-05)
+**Status:** Approved design; Claude and Codex managed lifecycle active; Grok Build
+is enabled for managed workers only. Planner and reviewer roles remain gated.
 
 ### Decision and boundary
 
-Quorum supports exactly two built-in coding runners in this design:
+Quorum supports exactly three explicit built-in coding runners in this design:
 
 - `claude` preserves the existing persistent Claude Code stream-json behavior.
 - `codex` uses the stable non-interactive Codex CLI JSONL interface.
+- `grok` uses the official Grok Build CLI's native headless `streaming-json`
+  interface for managed workers only. Planner and reviewer roles remain gated.
 
 This is a closed Rust enum, not a public provider trait or plugin API:
 
@@ -1238,6 +1693,7 @@ This is a closed Rust enum, not a public provider trait or plugin API:
 enum AgentKind {
     Claude,
     Codex,
+    Grok,
 }
 ```
 
@@ -1257,17 +1713,23 @@ done, or redefine review policy.
 
 ### Internal run contract
 
-Use the smallest normalized model consumed by the daemon:
+Role orchestration starts a turn with the smallest provider-neutral request consumed by
+the runner boundary:
 
 ```rust
-struct AgentSpec {
-    kind: AgentKind,
-    executable: PathBuf,
-    model: String,
-    effort: String,
-    worktree: PathBuf,
-    environment: Vec<(String, String)>,
-    session_id: Option<String>,
+enum LaunchMode {
+    Normal,
+    Restricted,
+}
+
+struct LaunchRequest<'a> {
+    model: &'a str,
+    effort: &'a str,
+    worktree: &'a Path,
+    prompt: &'a str,
+    environment: &'a [(String, String)],
+    mode: LaunchMode,
+    continuation_id: Option<&'a str>,
 }
 
 enum AgentEvent {
@@ -1279,19 +1741,93 @@ enum AgentEvent {
 }
 ```
 
-Do not mirror either CLI's complete schema. Preserve each raw JSON line in
+Before an authoritative managed-agent outcome, the runner boundary may also
+attach one closed, provider-neutral failure disposition to proved startup or
+early-exit evidence:
+
+```rust
+enum FailureDisposition {
+    ProviderUnavailable, // authentication, account credit/quota, provider outage
+    ProfileUnavailable,  // selected model/profile only
+    RetryableSameRoute,  // transport/startup interruption
+    NonFailover,         // execution/protocol boundary
+    Unclassified,        // insufficient/internal evidence; fail safe
+}
+```
+
+Provider adapters own any structured-code or bounded provider-specific message
+classification. Unknown text remains `Unclassified`; conflicting evidence also
+fails closed. Evidence is scoped to one managed turn even when Claude reuses a
+persistent child: beginning a rework or re-review turn clears the prior turn's
+success and failure observations. Once process exit is observed, the daemon
+performs a bounded stdout drain and stderr-reader join before snapshotting the
+disposition; failure to finalize either stream remains `Unclassified`. A terminal
+provider success, managed completion/submission,
+agent-reported failed/blocked/needs-info outcome, or review verdict prevents the
+taxonomy from being applied. The disposition is evidence only at this stage: it
+does not select a route, replace an assignment, consume an allocation, or change
+lifecycle/recovery accounting.
+
+The boundary resolves `model` through the closed `AgentKind` enum and explicitly
+dispatches to one built-in adapter. It does not accept a caller-selected kind/model pair,
+fall back between adapters, or expose a provider trait. Installed executable and existing
+provider settings (`bare`/tool allowlist for Claude, sandbox for Codex, and the closed
+Grok permission/sandbox profile) are adapter configuration, not part of turn identity.
+`agent.rs`, `codex_agent.rs`, and `grok_agent.rs` alone translate the neutral request
+into provider command specs, apply environment and execution mode, feed or embed the
+initial prompt, and parse raw protocol lines. Restricted mode remains an explicit adapter
+behavior: Claude uses `--setting-sources ""` to fully unload user/project settings, hooks,
+and plugins (with the repo CLAUDE.md injected explicitly via
+`--append-system-prompt-file` when present, and the planner's inline MCP server serving
+normally), Codex uses its pinned read-only invocation without the normal sandbox bypass,
+and Grok uses native `read-only` plus `dontAsk` with a reduced turn ceiling.
+
+Do not mirror any CLI's complete schema. Preserve each raw JSON line in
 `stream.jsonl`, parse only fields Quorum consumes, render a compact normalized
 transcript, and ignore unknown events without advancing lifecycle state.
 
-`journal.session_id` becomes an opaque **runner continuation ID** while retaining its
-column name for schema compatibility:
+Task refs and dormant journal rows persist an opaque **runner continuation ID**. The journal's
+`session_id` remains the daemon session identity; a dormant row uses the provider-tagged
+`provider` and `continuation_id` fields so restart never infers one from the other:
 
 - Claude receives a Quorum-generated UUID before spawn.
 - Codex issues a thread ID in `thread.started`; Quorum persists it before relying on
   continuation.
+- Grok issues a session ID in terminal `end`; Quorum emits and persists that identity
+  immediately before terminal success and passes it back only through exact `--resume`.
 
 Missing required continuation identity is an abnormal startup failure. Assistant
 prose is never task completion.
+
+A delivered turn-oriented worker remains a dormant logical slot while review is
+in flight. If review requests rework, the daemon first atomically installs a new
+task lease for that same agent, then revalidates the persisted continuation,
+model/effort, worktree, PR, journal, prior run, and capability before launching
+the next exact provider turn. Each resumed process receives a fresh agent-run row
+and run capability; the completed turn's identities are retired. Codex resumes
+only with `codex exec resume`. A missing or mismatched continuation never falls
+back to a new thread, and launch failure stores the unchanged pending turn in the
+existing durable provider-retry state before the slot is torn down.
+
+Task refs persist runner recovery state as provider-tagged JSON objects. New writes use
+`runner_continuation` (or the role-scoped `runner_reviewer_r1_continuation` /
+`runner_reviewer_r2_continuation`), `runner_provider_block`, and `runner_retry`.
+Continuation IDs are opaque. A retry records its provider, exact model and effort, raw
+pending prompt, turn kind, optional continuation ID, and whether an operator requested
+the retry. The block reason remains distinct from that pending-turn identity. A
+provider/model mismatch, absent required continuation, or partial retry fails closed;
+it never falls through to the generic initial prompt.
+
+These refs are additive metadata, so no SQLite schema migration or backfill is required.
+Readers continue accepting historical `codex_thread_id`, Codex reviewer thread keys,
+and `codex_retry_*` / `codex_provider_*` records. Neutral records, when present, are
+authoritative and must match the selected runner; historical assignments and evidence
+are never rewritten merely to adopt the neutral representation.
+Task creator APIs reject neutral `runner_*` and legacy `codex_*` provider-state refs;
+creator and assignee metadata replacement also preserves existing refs in those namespaces.
+Only the daemon-authoritative refs path may mutate or clear runner state. Managed dispatch
+independently rejects any runner in an ineligible role recovered from durable state, so stale or
+forged metadata cannot enable a planner, reviewer, classifier, or collector role.
 
 ### Claude behavior remains stable
 
@@ -1371,7 +1907,7 @@ remain `in-review` with that reviewer attached:
 - transferred ownership or an already-advanced task makes a stale process exit
   cleanup-only;
 - only a run that still owns its phase without a current submission/verdict produces
-  `AgentFailed` (or, for a blocked Codex worker, durable provider-block recovery).
+  `AgentFailed` (or, for a blocked turn-oriented worker, durable provider-block recovery).
 
 Consumed mailbox history is not sufficient while the same sticky run owns a later
 round: an old initial submission cannot excuse a missing rework push, and an old R1/R2
@@ -1379,7 +1915,7 @@ verdict cannot excuse a missing verdict after re-review. Exit status and provide
 are retained as diagnostics, never lifecycle authority. The daemon classifies before
 using failure language or alerts. Cleanup records `completed` for a recorded outcome,
 `ownership_transferred` for a stale run, `crashed` only for a genuine owner-without-
-outcome failure, and `provider_blocked` only after durable Codex retry state is stored.
+outcome failure, and `provider_blocked` only after durable runner retry state is stored.
 
 This classification is intentionally independent of observation order. In particular,
 `submit → in-review → exit`, `submit → exit → in-review`, and
@@ -1391,22 +1927,130 @@ must not emit a second `AgentFailed`, duplicate `task_in_review`/`task_rework`, 
 the new owner's lease, or classify exit status 0 as a crash merely because the
 turn-oriented provider process ended.
 
+### Official Grok Build transport
+
+The Grok adapter uses only the official CLI's one-shot, read-only stdout protocol. It
+does not use the ACP server, internal session files, executable-name inference, or an
+emulation of Claude `allowedTools`/`bare`/hooks or Codex flags.
+
+First turn, conceptually:
+
+```text
+grok -p <prompt> --output-format streaming-json --model <grok-4.5|grok-4.6>
+  --reasoning-effort <low|medium|high>
+  --permission-mode bypassPermissions --sandbox <off|workspace>
+  --max-turns <1..256> --verbatim
+```
+
+Continuation, conceptually:
+
+```text
+grok --resume <session-id> -p <prompt> --output-format streaming-json
+  --model <grok-4.5|grok-4.6> --reasoning-effort <low|medium|high>
+  --permission-mode bypassPermissions --sandbox <off|workspace>
+  --max-turns <1..256> --verbatim
+```
+
+Exact argument order is pinned in fixtures and exercised against the installed binary.
+Restricted launches are fresh turns using `read-only`, `dontAsk`, and at most eight
+turns; restricted continuation is rejected. Normal configuration accepts only the
+verified model, effort vocabulary, permission mode, sandbox profiles, and bounded turn
+range. Unknown values and unverified safety combinations fail before spawn.
+
+Consumed events:
+
+| Grok `streaming-json` event | Normalized meaning |
+|---|---|
+| non-empty `text.data` | `AssistantText` |
+| `tool_call` | compact `Activity` using `toolName`/`rawInput` |
+| `end` with non-empty `sessionId` | continuation identity, then terminal success with complete usage/cost when available |
+| `end` without a session ID | terminal failure |
+| `error` | terminal failure with complete usage/cost when available |
+| all other, unknown, or malformed lines | preserved raw and lifecycle-inert |
+
+Every complete valid-UTF-8 stdout line at or below the one-MiB line bound is returned
+byte-for-byte apart from the line terminator and written through the existing raw JSONL
+path. An oversized line becomes an explicit truncation record. Invalid UTF-8 becomes an
+explicit `provider.stdout_invalid_utf8` record that carries only byte counts/offsets and
+is lifecycle-inert; bytes are never repaired into provider JSON. Stdout retained during
+teardown, stderr lines, and bytes within an individual stderr line are separately bounded.
+The process runs in its own process group. The adapter retains that group ID independently
+of the leader's reap state, so teardown kills descendants holding inherited pipes before it
+drains bounded output and reaps the child.
+
+An `end` event is the protocol's success marker, but managed worker success additionally
+requires exit status zero. `error`, non-zero exit,
+EOF without `end`, missing session identity, timeout, and forced termination are failure
+paths; the adapter never fabricates a terminal event from EOF or exit alone. Grok emits
+the session identity late, so no continuation may be relied on before `end`.
+
+#### Grok discovery record
+
+**Verified facts (2026-08-26):**
+
+- The installed official executable resolved to `~/.grok/bin/grok` and reported
+  `grok 1.0.5 (5115b46bc909)`. Its help exposes `-p`/`--single`,
+  `--output-format streaming-json`, `--resume`, `--model`,
+  `--reasoning-effort`, `--permission-mode`, `--sandbox`, and `--max-turns`.
+- The installed catalog exposed `grok-4.6` (default) and `grok-4.5`; its supported
+  effort choices were `low`, `medium`, and `high` (`high` default). The adapter
+  therefore treats both vocabularies as closed rather than forwarding future strings
+  optimistically.
+- Native `streaming-json` is newline-delimited, type-tagged JSON. Official source and
+  documentation define `thought`, `text`, `tool_call`, `tool_call_update`, `usage`,
+  lifecycle/activity events, terminal `end`, and `error`. The successful `end` line is
+  last and carries `sessionId` and `requestId`.
+- Official usage fields distinguish uncached input, cache-read input, cache-creation
+  input, and output tokens. The adapter reports total input as the sum of all three input
+  buckets. `usage_is_incomplete` means the aggregate is not authoritative.
+- `total_cost_usd` is emitted only when server cost is complete. Its absence means
+  unknown, never zero. `cost_is_partial` or `usage_is_incomplete` suppresses normalized
+  USD cost; Quorum does not derive prices or sum incomplete per-model rows.
+- The CLI stores interactive/device authentication itself and supports `XAI_API_KEY`.
+  Official precedence is model-specific configured key/environment key, then cached
+  interactive/OAuth credentials, then the `XAI_API_KEY` fallback. Quorum inherits the
+  CLI environment and credential state and neither stores nor prints credential values.
+- Native permission modes include `default`, `acceptEdits`, `auto`, `dontAsk`,
+  `bypassPermissions`, and `plan`. Native sandbox profiles include `off`, `workspace`,
+  `devbox`, `read-only`, and `strict`; resumed sessions reject a changed sandbox. Quorum
+  enables only the combinations above because the others have not passed lifecycle
+  canaries.
+- Isolated-home real-binary probes produced a structured `error` for missing/invalid
+  authentication, rejected an invalid permission value during argument parsing, and
+  entered the headless protocol with the pinned initial and resume placement without a
+  successful model call. Some authentication failures did not promptly terminate after
+  emitting the error, so bounded group kill/reap is part of the transport contract.
+
+**Hypotheses and deliberately unverified behavior:**
+
+- Grok has not passed attended real-CLI worker, remediation, R1, R2, restart, shutdown,
+  mailbox, or cost-limit canaries. Unit/contract coverage enables worker routing only;
+  production use remains gated on those canaries, and planner/reviewer roles remain disabled.
+- Catalog additions, new reasoning efforts, `devbox`/`strict`/custom sandboxes, and
+  permission modes other than the pinned profiles may become usable later, but are not
+  accepted based on help text alone.
+- Device login, cached interactive login, API-key success, and billable successful
+  continuation were not executed in the zero-token transport probes. The adapter relies
+  on the official CLI for those flows and makes no broader authentication or USD
+  accounting claim.
+
 ### Capabilities and safety limits
 
 Capabilities are fixed internal facts, not a negotiation framework:
 
-| Capability | Claude | Codex |
-|---|---:|---:|
-| resumable continuation | yes | yes |
-| JSON event stream | yes | yes |
-| token usage | yes | yes |
-| stream-provided USD cost | yes | no |
-| CLI tool allowlist | yes | no |
-| provider-native review skill | optional | not required |
+| Capability | Claude | Codex | Grok Build |
+|---|---:|---:|---:|
+| resumable continuation | yes | yes | yes (workers only) |
+| JSON event stream | yes | yes | yes |
+| token usage | yes | yes | when complete |
+| authoritative stream-provided USD cost | yes | no | no (not managed) |
+| Quorum-managed CLI tool allowlist | yes | no | no |
+| provider-native review skill | optional | not required | not enabled |
 
 Never fabricate missing telemetry. Token, wall-clock, task-wall, and idle limits
 continue when their data is observable. Codex does not expose reliable ChatGPT
-subscription USD cost per turn. If a Codex daemon is configured with a USD safety
+subscription USD cost per turn. Grok workers use token and wall-clock bounds; no USD
+pricing or cost accounting is enabled. If a Codex daemon is configured with a USD safety
 limit, startup fails loudly rather than ignoring it or failing every completed turn.
 
 Use the minimum Codex sandbox proven by the full lifecycle canary. Begin validation
@@ -1439,26 +2083,40 @@ the new daemon branch under a zero/nonexistent lease, creates the PR, and verifi
 binds that exact branch/SHA. Publication intent and the `intent → pushed → pr_created →
 verified` stages are durable task metadata. Startup recovery reuses an identical remote
 branch and a single existing PR, then folds the exact mailbox row only after verification.
-The publisher takes the intent's immutable source SHA and uses that object in the refspec;
-a later mutable worktree `HEAD` cannot change what is published. Before persisting the
-intent, the daemon pins that SHA under a task-scoped local Git ref, so parking may safely
-remove a failed run's worktree and run-local branch; `task-retry` and remediation retries
-still replay the exact source even when their replacement worktree starts at another
-`HEAD`. Successful worker lifecycle transitions retire the intent in the same SQLite
-transaction, including the late-mailbox fold, so a restart cannot carry SHA A into a
-later SHA B rework round; the reachability pin is removed afterward with an exact-SHA
-guard. Startup and bounded periodic reconciliation walk minimal task-id/SHA projections
-in fixed cursor batches, restore missing or mismatched intent pins, and exact-SHA-delete
-no-intent or terminal-task pins without scanning the full task history or Git ref
-namespace in one pass. A retry from `pr_created` repeats the same authoritative
+For an ordinary crash replay, the publisher takes the intent's immutable source SHA and
+uses that object in the refspec; a later mutable worktree `HEAD` cannot change what is
+published. Before persisting the intent, the daemon pins that SHA under a task-scoped
+local Git ref, so parking may safely remove the failed run's worktree and run-local branch.
+An explicit retry of a parked rework publication is a new delivery round, not an ordinary
+crash replay. Its spawn accepts only the recorded remote baseline or a live head already
+equal to the exact pinned source (the post-push verification-failure state); every third
+SHA parks. In the already-published case, one SQLite transaction advances both the
+persisted PR target and the publication intent's expected remote SHA to that exact source
+before provisioning. The replacement worktree starts from the accepted live head and
+integrates the current base. On completion, the daemon pins the replacement `HEAD` before
+overwriting the intent's source, preserving the advanced PR/head authority; a crash before
+intent persistence can only leave a harmless newer pin that reconciliation restores to
+the still-durable source. Successful existing-PR worker lifecycle transitions guard that
+the persisted PR target still equals the intent's prior lease baseline or already equals
+the exact published source, then rotate that target to the exact source and retire the
+intent in the same SQLite transaction as the lifecycle event, including the late-mailbox
+fold. This makes the newly published source the next remediation round's lease baseline
+while preserving idempotent post-push crash replay. The reachability pin is removed
+afterward with an exact-SHA guard. Startup and bounded periodic reconciliation
+walk minimal task-id/SHA projections in fixed cursor batches, restore missing or
+mismatched intent pins, and exact-SHA-delete no-intent or terminal-task pins without
+scanning the full task history or Git ref namespace in one pass. A retry from `pr_created`
+repeats the same authoritative
 branch/SHA/base validation before any push. Initial PR reconciliation
-also requires the PR base to equal the configured base branch. Rejected or ambiguous
+also requires the PR base to equal the task's immutable target branch, falling back to the
+configured base only for a legacy targetless task. Rejected or ambiguous
 publication parks the task; persisted PR target data is never authority for a publish
-retry. This is protocol ownership plus a best-effort
-worktree `pushurl` lockout, not credential isolation: an agent holding the same GitHub
-credential can still bypass local Git configuration with an explicit URL or API.
-Enforcing physical write authority requires the separate D4 credential split and is not
-claimed here.
+retry. This is protocol ownership plus a best-effort worktree `pushurl` lockout. A local
+permissive run sharing the operator's OS identity still does not claim physical credential
+isolation: an agent that can reach the operator's independent GitHub credential may bypass local
+Git configuration. The isolated-runtime profile enforces the separate credential boundary by
+giving the runner no GitHub token, authenticated CLI configuration, SSH agent, credential helper,
+or credentialed Repository Service endpoint; only the daemon/broker performs remote writes.
 
 Reviewers must inspect the full diff and relevant surrounding behavior, follow
 repository instructions, classify BLOCKING and advisory findings, put authoritative
@@ -1477,6 +2135,20 @@ Every required role then names a routing pool. Pool entries use positive integer
 that total exactly 100; fixed `agent`, `provider`, `model`, `effort`, `worker_model`,
 `review_model`, `classifier_model`, and `collector_model` selection is not accepted.
 
+The same repository serve file configures observational host-resource diagnostics:
+
+```toml
+resource_poll_secs = 30             # 5..=3600
+disk_warn_free_gib = 80
+disk_critical_free_gib = 40         # positive and less than warning
+memory_warn_available_pct = 15      # 1..=100
+memory_critical_available_pct = 8   # positive and less than warning
+```
+
+The daemon samples on this cadence outside database transactions and logs only severity
+transitions (including recovery). Sampling failures are fail-open and rate-limited. These
+settings have no admission-control or lifecycle authority.
+
 ```toml
 [model_profiles.terra]
 runner = "codex"
@@ -1492,6 +2164,8 @@ effort = "high"
 terra = 80
 opus = 20
 [routing.planner]
+opus = 100
+[routing.arbiter]
 opus = 100
 [routing.collector]
 terra = 100
@@ -1519,6 +2193,40 @@ opus = 100
 opus = 100
 ```
 
+Grok worker adapter configuration:
+
+```toml
+[grok]
+sandbox = "off"                    # off | workspace (default: off)
+permission_mode = "bypassPermissions"
+max_turns = 64                      # 1..=256
+```
+
+`sandbox = "off"` is the production-capable default. Quorum provisions every managed
+worker as a linked Git worktree, so the worker must be able to write the linked
+worktree's `.git/index.lock` and the common-dir `FETCH_HEAD`, run repository hooks and
+preflight, and invoke the scoped daemon completion endpoint. The attended task #53
+canary (2026-08-19) attempted the previous `workspace` default against the linked-worktree
+layout: the worker completed the requested README edit but its `git add`/`git commit`
+could not create the linked-worktree `index.lock`, preflight's `git fetch` could not
+write the common-dir `FETCH_HEAD`, and the generated `quorum_managed_workspace` profile
+granted only the Grok state root. The default is therefore `off`. Operators may still
+explicitly set `sandbox = "workspace"` to exercise the existing managed workspace
+profile for transport experiments; the profile, its extension of the native `workspace`
+sandbox, and the Grok state-root read/write grant are preserved for that opt-in path.
+Broader Grok lifecycle validation (remediation, R1, R2, restart, shutdown, mailbox, and
+cost-limit canaries) remains outstanding as recorded below.
+
+`grok-4.5` and `grok-4.6` may be selected only by worker routing pools. Planner,
+arbiter, reviewer, classifier, and collector Grok selections are rejected at startup. The
+`[routing.arbiter]` pool selects the plan-review Arbiter and defaults to the planner pool
+when omitted, so an existing configuration without it keeps working. The `[grok]`
+section pins the adapter safety profile for those managed worker launches.
+
+Never infer runner kind from the executable filename. Existing top-level
+`no_bare_agent` and `allowed_tools` remain backward-compatible Claude settings.
+Runner-specific configuration is scoped under `[claude]`, `[codex]`, or `[grok]`.
+
 Each pool is materialized as a randomized 100-slot epoch containing exactly the configured
 number of slots for each profile. The daemon persists the shuffled order and position before
 use. Assignment creation and position advancement occur in one `BEGIN IMMEDIATE` transaction;
@@ -1530,43 +2238,168 @@ review stage: R1 and R2 use the same reviewer eligibility pool but separate bags
 Startup fails before any claim when a profile is invalid, a required pool is absent or empty,
 a profile is duplicated in a pool, a percentage is not a positive integer, a pool does not total
 100, or legacy fixed-model routing is present. Never infer runner kind from an executable
-filename. Runner-specific process options remain scoped under `[claude]` or `[codex]`.
+filename. Runner-specific process options remain scoped under `[claude]`, `[codex]`, or
+`[grok]`.
 
 ### Bounded task decomposition
 
-An admission-ready implementation task classified size L or XL does not dispatch directly.
-After its dependencies are done, the daemon serializes decomposition per repository: it stops
-new managed delivery, lets active delivery finish, and plans against the resulting frozen base.
-S/M implementation tasks dispatch normally regardless of complexity. Review-only L/XL work is
-parked for external splitting.
+A non-continuation, admission-ready implementation task is a decomposition source only when its
+classified size is L or XL and `cx_est` is 4 or 5. After its dependencies are done, the daemon
+serializes decomposition per repository: it stops new managed delivery, lets active delivery
+finish, and plans against the resulting frozen base. S/M implementation tasks dispatch normally
+regardless of complexity; non-continuation L tasks with `cx_est` 1–3 also dispatch directly to one
+worker. Every `continue_pr` task dispatches directly because only the source task carries authority
+to publish to the bound PR. Every review-only task dispatches directly to reviewer provisioning at
+any classified size because it has no implementation work to decompose. A non-continuation XL task
+with `cx_est` 1–3 violates the classification rubric and is parked with an explicit
+reclassify-or-rescope reason.
 
 Planning uses the profile selected from the planner routing pool. The planner receives a
-read-only repository view and bounded source
-context but no network, database, coordination command, or delivery authority. A separate
-planner spawn boundary enforces those restrictions and accepts only one bounded, closed plan or
-blocker response; a provider whose transport cannot be separated from model-generated network or
-filesystem access is refused fail-closed. The view is an archive of the recorded frozen base SHA,
+read-only repository view and bounded source context but no network, database, coordination
+command, or delivery authority. Planning is source-directed: repository inspection starts from
+paths and symbols named by the source, follows observed calls by at most one hop, and has bounded
+search/read guidance. The provider process has a 600-second wall-clock limit, a 128 KiB prompt
+limit, a submitted-plan limit inside the endpoint's bounded frame, and a 16 MiB cumulative
+streamed-stdout backstop; no provider spend ceiling is set. The response remains structurally
+bounded to 8 KiB per text field and 32 list items. A separate planner spawn boundary enforces
+those restrictions and accepts only one bounded, closed plan or blocker response; a provider whose
+transport cannot be separated from model-generated network or filesystem access is refused
+fail-closed. The view is an archive of the recorded frozen base SHA,
 and source drift is rejected before launch. A valid concrete blocker parks the source immediately
 with no second opinion.
 
-Current product limitation: Codex planning is refused fail-closed because its CLI transport does
-not yet provide that isolation boundary. A repository configured to plan with Codex records a
-bounded provider failure and releases or parks the source under the normal retry policy; use the
-Claude runner for daemon-managed decomposition until an enforceable Codex boundary exists.
+The planner reports its plan by calling the daemon-owned `submit_plan` tool exactly once, over
+the same authorized agent endpoint workers and reviewers submit through; its transcript is never
+parsed. One identity covers the whole attempt: the daemon mints one run id and, in a single
+transaction before the spawn, issues that run's `planner` capability and records the same id as
+the graph's live planner session. A submission is accepted only when the capability, the graph's
+planner session, and the submitting run all agree. The endpoint validates the plan at call time
+and returns its own validation message, so the planner corrects the cited defect and resubmits
+within the same turn; rejected calls are bounded per run, the first accepted submission stands,
+and the capability is revoked when the attempt ends. On process exit the coordinator reads what
+was durably accepted: a submission is the outcome however the process then ended, and a turn that
+ends with none is a provider failure — printing a perfect plan as text delivers nothing.
 
-A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Before any
-task row is created, the complete proposal is validated for scope coverage, real delivery
-boundaries, references, cycles, and duplicates, then classified as one batch. Every child must be
-admission-ready, nonduplicate, and size S or M. Admission readiness means the scope is sufficiently
-clear for delivery; it is distinct from runtime readiness, which still requires dependencies to
-be done.
+Codex planning is supported only through its hardened planner-specific boundary: the CLI runs
+read-only without coordination authority, and a bounded JSONL terminal response remains only a
+candidate until stdout reaches EOF, final diagnostics are bounded and complete, and the process
+exits successfully. Any contradictory or incomplete terminal evidence fails the turn. Grok
+planning remains refused because Grok is enabled only for managed workers.
+
+A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Each child
+names its concrete implementation delta, affected paths, and non-goals, and carries every
+load-bearing source requirement forward faithfully in the child that owns it. Tasks follow
+independently deliverable code or ownership seams; preserved
+behavior and regression-only expectations remain criteria or non-goals rather than synthetic
+implementation work. A child that changes a function/API signature or shared type, trait, or
+struct shape must own every affected caller needed for its workspace build and preflight after
+its prerequisites merge; a definition/signature child must not reserve those callers for a
+sibling. If that compile closure cannot remain M-sized, the planner returns a `no_safe_split`
+blocker rather than manufacturing definition and wiring siblings. Before any task row is created,
+deterministic validation checks the closed shape, references, cycles, prohibited synthetic
+integration work, mechanically visible compile-atomic signature-seam reservations, and the
+structured deliverables manifest (below); it no longer requires a byte-exact echo of
+source-marked literals. Plan
+faithfulness — that every load-bearing source requirement and constraint is carried forward,
+nothing is dropped or silently weakened, the children cover the source without overlap, and the
+plan is coherent — is judged by the Arbiter plan-review gate (below), not by a deterministic
+literal match. Once deterministic validation passes, the complete proposal is classified as one
+closed-book batch (`preclassifying`) *before* the Arbiter reviews it (`validating`): the
+classifier is cheap and rejects most oversized plans, so the expensive Arbiter run is spent only
+on classifier-accepted proposals. Every child must be
+admission-ready, nonduplicate, and sized within the same implementation-size policy that
+dispatches root tasks directly: S or M at any complexity, or L at `cx_est` 1–3. One Rust
+predicate and one SQL fragment define that policy for dispatch, sync, materialization, and child
+preclassification, so the daemon cannot reject a child it would have dispatched as a root. The
+classifier receives each planned child's whole contract in a stable order (delta, paths,
+deliverables, non-goals, outcome, criteria, constraints, verification), bounded per field rather
+than truncated as one blob, with every prerequisite rendered as its sibling or source title so
+responsibilities delivered by dependencies are not counted against the child's own surface.
+Admission readiness means the scope is sufficiently clear for delivery; it is distinct
+from runtime readiness, which still requires dependencies to be done.
+Every classifier verdict also carries a bounded `size_reason` tied to the exact classified child.
+A completed batch preserves every rejected child's rationale with its child key and bounded
+implementation context in one deterministic, globally bounded `decomposition_attempts` summary;
+the next fresh planner attempt receives the complete applicable batch as structured rejection
+feedback. Renaming or paraphrasing a rejected child is not scope reduction.
+
+**Arbiter plan-review gate.** Between classification and materialization the daemon gates every
+classifier-accepted proposal on a single-shot, stateless **Arbiter** — a model
+reviewer spawned fresh per proposal in the same frozen read-only repository view the planner used,
+selected from the `[routing.arbiter]` pool (defaulting to the planner pool). The Arbiter judges the
+proposal against the authoritative source on five mandates — faithfulness, coverage and
+non-overlap, coherence, compile closure, and decomposability — and emits exactly one closed verdict, parsed with the
+planner's fail-closed discipline. The Arbiter only emits a verdict; the daemon alone transitions
+lifecycle and materializes children (lifecycle authority stays with the daemon). Verdict mapping:
+*approve* (or a *changes* verdict with no blocking finding) materializes the children directly
+from `validating`, using the classifier batch that was durably accepted when the graph left
+`preclassifying` (the classifier is never re-run after the Arbiter); *changes* with at least one
+blocking finding records a normal `proposal` attempt whose summary is the Arbiter's findings and
+returns the graph to `planning` so the planner re-proposes against those findings — the next
+proposal is classified again before any Arbiter run; *reject_source* holds the graph and fails the source for a required
+owner decision, materializing no children; and a malformed, absent, or provider/protocol-failed
+verdict records a `provider` attempt (fail closed — never a silent approval). Every terminal
+Arbiter outcome also writes exactly one additional `decomposition_attempts` row with
+`kind='verdict'`: its reason code is `arbiter-approve`, `arbiter-changes`,
+`arbiter-reject-source`, or `arbiter-provider`, and its bounded JSON summary contains the verdict,
+findings (`severity` and `summary`), blocking count, duration, response bytes, assistant-event
+and tool counts, plus provider, model, and effort. This observational verdict row neither changes
+lifecycle nor consumes a budget; only `proposal` and `provider` attempts count toward their
+existing limits. Its JSON stays valid while being reduced to the existing 2 KiB attempt-summary
+cap. A *changes* verdict consumes the existing three-per-revision proposal budget; a provider
+failure consumes the separate provider budget. Approval is keyed on the guarded materialization
+write, so a daemon restart that re-spawns and re-polls a fresh Arbiter cannot double-materialize.
+Lifecycle order: `planning` -> `preclassifying` (classifier) -> `validating` (Arbiter) ->
+`active`. A classifier rejection returns the proposal to `planning` from `preclassifying` and
+never spawns an Arbiter; the accepted classification is persisted next to the accepted proposal
+(`accepted_classifications_json`) and discarded with it on any rejection or reset. A restart
+resumes the interrupted phase: `preclassifying` re-runs only the classifier, `validating` re-runs
+only the Arbiter from the persisted classification, and a `validating` row without an accepted
+classification steps back to `preclassifying` rather than reaching the Arbiter unclassified.
+
+Each proposed child also carries a bounded structured deliverables manifest that distinguishes
+requested writes from read-only contextual references. Deterministic validation rejects a write
+using parent traversal or resolving outside the canonical managed repository, including an
+in-repository symlink escape. External read-only references remain permitted because they grant no
+write authority. Lexically external absolute writes cause no filesystem access. Required symlink
+inspection runs off the serial daemon tick on at most one dedicated OS resolver thread with no
+queued retry: a hard timeout fails closed, and the occupied resolver slot rejects later proposals
+until the filesystem call actually returns. Resolver stalls therefore cannot consume Tokio's
+shared blocking pool or delay database work. This admission check neither trusts planner
+self-attestation nor redesigns the worker filesystem sandbox.
 
 Semantic proposal rejections and provider/protocol failures have independent caps of three per
 unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
 the freeze during backoff, and retry drains again. Full prompts and transcripts are not persisted;
-only bounded structured attempts, the accepted closed proposal needed to resume validation or
-preclassification, and final reasons are durable. Restart inspection never consumes a semantic
+only bounded structured attempts, the accepted closed proposal and its accepted classification
+needed to resume preclassification or validation, and final reasons are durable. Restart inspection never consumes a semantic
 proposal attempt.
+
+Exhausting either three-attempt planning budget holds the graph and fails the source; it never
+retries automatically. `task-retry` may explicitly resume that same aggregate only while a single
+`BEGIN IMMEDIATE` transaction proves the source revision is unchanged and unassigned, the graph
+is held without active/freeze authority, the hold code and exhausted counter agree, the source is
+neither review-only nor a continuation, and no accepted plan, member/child, process, run, PR, or
+delivery/merge evidence exists. The winner restores the source to `planning`, clears only the
+retryable hold/session/base fields, resets the exhausted current-generation counter, and places the
+graph in provider backoff so the coordinator must reacquire `one_planning_freeze` through the
+ordinary guarded path. Semantic blockers, inconsistent holds, stale authority, materialization,
+delivery evidence, and racing callers are clean negatives.
+
+Coordinator snapshot selection always prioritizes the unique `freeze_active=1` aggregate before
+older provider-backoff aggregates. An explicitly retried graph therefore cannot shadow, stall, or
+consume output from a later graph that already owns the planning freeze; backoff graphs resume in
+ID order only when no freeze owner remains. A live planner or classifier slot also pins its
+in-memory graph identity: any mismatch with the durable selected graph is a loud internal failure,
+never permission to consume that process result for a different aggregate.
+
+Each graph permits at most two operator planning retries. Attempts remain append-only: their
+ordinals increase monotonically across the unchanged source revision and each row records the
+operator retry generation (historical rows are generation zero). Thus each proposal/provider
+ledger is bounded at nine rows per graph. A successful retry emits one durable
+`decomposition_planning_retry` event naming the operator and generation; cap exhaustion is an
+actionable clean negative. Status exposes the hold code, whether it is currently retryable, and the
+retry count/cap without exposing planner transcripts.
 
 Reviewer provisioning reserves task authority in `BEGIN IMMEDIATE` before external resolution or
 process creation. The same transaction checks task phase, classification, and planning freeze;
@@ -1586,18 +2419,106 @@ failed sibling or graph blocker, and fewer than two active implementation siblin
 children sort before unrelated new work, but reserve no idle capacity and never interrupt active
 unrelated work. Active siblings may finish after another child fails; no later child may start.
 
-A reviewer may submit a capability-bound, closed graph-blocker verdict for a decomposition defect.
-After validating the current run, head, membership, and evidence, the daemon atomically fails the
-affected child and blocks the graph without consuming ordinary rework. The source remains
-decomposed and the blocked graph remains active until source cancellation; recovery requires a
-replacement source, not automatic replanning after delivery has begun.
+A reviewer may submit a capability-bound, closed graph-blocker verdict only for a genuine safety
+or authority boundary violation: a change that would grant authority, break restricted-role or
+phase isolation, escape the managed repository, or expose secrets. A correct, safe change that
+requires a bounded edit outside a generated child's `write` deliverables, including a
+`read_only_reference` path, instead receives a BLOCKING `changes` verdict. That feedback names the
+specific required edit and explicitly authorizes the rework worker to make the minimal, justified
+edit in the named file or files, treating the assigned file list as advisory for that remediation.
+After validating a graph-blocker against the current run, head, membership, and evidence, the
+daemon atomically fails the affected child and blocks the graph without consuming ordinary rework.
+The source remains decomposed and the blocked graph remains active until source cancellation;
+recovery requires a replacement source, not automatic replanning after delivery has begun. The
+only exception is the explicit, evidence-bound adoption of an already merged continuation
+described below when the `boundary-violation` hold names the adopted child as its
+`affected_task`; that operation completes the already-delivered graph, but never unblocks,
+replans, or grants new execution authority.
+
+A narrow incident-recovery primitive may adopt the exact merged delivery of a done managed
+continuation task for the final failed member of an otherwise complete live graph (`state` active
+or blocked, with `active=1`). The automatic path's immediate transaction requires the same repository and PR,
+creator-selected `continue_pr`, explicit `source_task` provenance, live daemon publication and
+merge events (`expires_at > now`), immutable managed-review authority, and one consistent PR
+target/approved head SHA. It changes only the failed child and records recovery provenance while
+preserving the PR; on a blocked graph it leaves the graph blocked and active. Missing or expired
+evidence, replay, and losing concurrent callers are clean no-ops with no events; the winner emits
+bounded child-completion events once.
+
+For a coordinator/operator-selected incident pair, `quorum decomposition-adopt-recovery
+--original-child-id <child> --recovery-task-id <continuation> --by <operator>` is the sole explicit
+recovery-authority surface. The same `BEGIN IMMEDIATE` transaction rechecks active membership,
+failed/final-child state, repository and PR identity, creator-selected continuation authority,
+and exact target/head agreement. It permits absent `source_task` metadata because the caller has
+named the exact pair, but rejects conflicting metadata. Instead of expiring feed events it requires
+the durable daemon chain: the final assigned worker run is either `completed` before the persisted
+final PR target or `merged` (which may end after that target resolves), an assigned approved
+reviewer bound to that exact target head and sampling decision, and merged
+completion provenance. Success writes the operator, source, child, recovery task, PR, and head to
+the decomposition recovery ledger and child recovery projection before final-child completion. On
+an active graph this is ordinary completion. On a blocked graph it is permitted only when the hold
+is `boundary-violation` and its JSON `affected_task` exactly equals the named failed child; the
+same transaction then clears that hold, completes the graph, and completes the source after
+confirming every member is done. A block for any other child, malformed hold, or any other hold
+code remains non-adoptable. It does not discover candidates, infer equivalence, or weaken the
+automatic path's event rules. A rejected pair, replay, or concurrent loser is a clean negative
+with no provenance or lifecycle event.
+
+One legacy prepublication shape is also eligible through that exact operator surface. It exists
+only for a generated final child that an older retry reopened after daemon-owned publication had
+already failed, leaving the live graph blocked by the corresponding legacy non-JSON
+`generated-child-failed` summary. The child must be unassigned `open`, have no completion or PR
+target, and retain a task-scoped `daemon_publication` intent with no PR, remote SHA, or resolved
+target and with a valid preserved local commit SHA. The publication branch must match the exact
+daemon-authored grammar `daemon/<author-slug>-t<child-id>`, where `<author-slug>` is a non-empty
+lowercase ASCII `[a-z0-9-]+` run and `<child-id>` is the exact child ID. The hold must name that
+exact child and branch; all siblings must be done. The operator-named managed continuation must
+postdate the stale child, satisfy the ordinary durable worker, approved-head, sampling, and
+merged-provenance chain, and be merged to the decomposition source's
+immutable target branch. This is not a general open-task adoption path: any structured/current
+hold, assigned child, advanced publication state, target mismatch, stale PR row, malformed
+task-scoped branch (including non-daemon prefixes, empty slugs, nested paths, whitespace,
+uppercase letters, dots, embedded NULs, and other invalid characters) or SHA is a clean negative.
+Both branch and SHA reject embedded NULs before their length or character-class checks. Classifier duplicate hints grant no lifecycle
+authority and are neither required nor sufficient. Success
+records the preserved publication branch and SHA in both recovery audit projections, removes the
+stale publication intent, completes the child, clears only that exact legacy hold, and completes
+the graph and source in the same transaction.
+
+After graph consistency reconciliation and before generic stateless lifecycle recovery or
+provisioning, the daemon automatically discovers eligible event-backed deliveries at startup and
+on ordinary ticks. Discovery
+consumes at most eight physical rows from the durable lifecycle-event sequence in ascending `seq` order,
+then resolves explicit `source_task`, graph membership, PR targets, and live publication/merge
+evidence using short reads only. It never scans terminal-task history or performs network I/O.
+A dedicated monotonic cursor is acknowledged only after every guarded adoption call and durable
+retry-marker write in the page. If the short read observes an unfinished sibling and the core
+remains a clean negative, the daemon records one idempotent, TTL-bounded marker for the exact
+child/recovery pair. A later sibling `task_done` event drains live markers oldest-first through a
+second monotonic cursor, with at most eight candidate applications per pass. If the marker batch
+fills that capacity, the sibling trigger remains unacknowledged while the pending cursor advances,
+so later pairs receive a bounded subsequent pass. Partial graphs consume the current sibling
+trigger without advancing pending markers and wait for the next sibling completion. Every settled
+page advances, so a stalled graph cannot starve later deliveries. A crash before application or
+after the core, marker, or pending-cursor commit replays safely. Startup discovery failure is
+logged and fail-open; tick failure
+uses the ordinary tick error policy without advancing the cursor. The guarded transaction remains
+the sole adoption authority. The complete predicate is specified in the decomposition technical
+specification.
 
 The final child merge marks the source and graph done in the same transaction that marks that
-child done. Source dependents remain blocked until then. Cancelling a source atomically makes the
-graph non-runnable, cancels unfinished children, revokes authority, and records idempotent cleanup
-intents. The daemon then stops processes and closes/removes only unmerged, revocable artifacts.
-Lifecycle history, reviews, and merged delivery records remain. Direct child cancellation is
-rejected. Cleanup intent execution is a durable lease state machine
+child done. Source dependents remain blocked until then. Cancelling a source atomically makes
+the graph non-runnable, cancels unfinished children, revokes authority, and records idempotent
+cleanup intents. The daemon then stops processes and closes/removes only unmerged, revocable
+artifacts. Lifecycle history, reviews, and merged delivery records remain. Direct child
+cancellation is rejected. Source cancellation is the universal terminal escape hatch: it accepts
+any non-terminal graph state — including the pre-children planning states (`freeze-requested`,
+`draining`, `planning`, `validating`, `preclassifying`, `provider-backoff`, `held`) as well as
+`active` and `blocked` — and atomically clears any pending planner freeze/backoff/hold, tearing
+down whatever is in flight. It refuses only on authority mismatch (creator/assignee), stale
+`--expected-revision`, or an already-terminal graph (`completed`/`cancelled`); internal graph state
+is never a cancellation gate. This preserves the wider invariant that a non-terminal task is always
+cancellable by an authorized caller. Cleanup intent execution is a durable lease state machine
 (`pending -> running -> done|pending|exhausted`) with a three-attempt cap. Startup returns an
 interrupted running lease to pending below the cap and exhausts it at the cap. Claims are atomic,
 require a cancelled inactive graph and current graph membership, and preserve per-task action
@@ -1610,12 +2531,19 @@ pending classification/planning and restarts admission; stale/replayed edits do 
 fourth accepted edit is rejected. Materialized source/child scope and graph dependencies cannot be
 edited. Daemon-owned lifecycle evidence remains writable.
 
-Decomposition reconciliation runs before ordinary recovery and provisioning. A durable freeze
+Decomposition reconciliation runs before merged-continuation adoption, ordinary recovery, and
+provisioning. A durable freeze
 resumes first. Complete graphs resume without recreation. Incomplete or inconsistent graphs start
 nothing; an unstarted graph may reset and replan within budget through the normal freeze/drain
-path, while any delivery evidence requires cancellation and replacement. Read-only status exposes
-bounded membership, edges, progress, attempts, provenance, and blockers. The complete storage,
-protocol, and recovery contract is in `docs/2026-07-31-task-decomposition-technical-spec.md`.
+path, while any delivery evidence requires cancellation and replacement except for the
+evidence-complete exact-continuation case above. Its automatic daemon discovery is a bounded
+reconciliation action on a consistent live graph. On a blocked graph it may only settle that exact
+evidence-complete delivery; it leaves the graph blocked and source decomposed, grants no new work
+authority, and does not complete the graph. The core transaction remains fail-closed and does not
+broaden graph-blocker repair or replacement authority. Read-only status exposes bounded
+membership, edges, progress, attempts, provenance, and blockers. The complete storage, protocol,
+and recovery contract is in
+`docs/2026-07-31-task-decomposition-technical-spec.md`.
 
 **Classifier-owned per-run model selection.** Task creators describe the outcome,
 constraints, and verification but have no routing authority. `task-create` rejects every
@@ -1627,19 +2555,31 @@ labels are ignored.
   refs. A false readiness result carries a concrete `cx_not_ready_reason`; missing,
   partial, or malformed classification never falls back to worker or reviewer
   provisioning.
+- Every newly accepted v3 classifier result also requires a nonempty, NUL-free, bounded
+  `cx_size_reason` that identifies the concrete execution surfaces supporting its size verdict.
+  The reason is preserved in refs for inspection and in generated-child refs after successful
+  preclassification. Historical v2 classifications remain dispatch-compatible; absence of a
+  reason on such a row means the older contract did not guarantee one, not that the daemon
+  synthesized a rationale.
 - The classifier is closed-book: it receives bounded task/dependency/recovery context but
   does not inspect source, Git, CI, or external systems. Readiness is permissive: ordinary
   repository discovery and bounded engineering choices are execution work, not a reason to
   reject the task.
-- The daemon atomically parks a classification when it is not ready, size is `XL`, or it is
-  complexity 5 with size `L`. Complexity-5 `S` and `M` tasks remain dispatchable. Parking
-  writes the standard refs, note, and event with no claim, run, or error row; an explicit
-  retry requests reclassification of remaining work and a newly dispatchable result restores
-  the saved lifecycle status.
+- Direct dispatch and decomposition partition admission-ready implementation work. S/M tasks
+  dispatch directly for every valid `cx_est`; non-continuation L tasks dispatch directly at
+  `cx_est` 1–3 and decompose at 4–5; non-continuation XL tasks decompose at 4–5 and park at 1–3
+  as a rubric mismatch. A `continue_pr` task always takes the direct route and never the
+  decomposition route, regardless of classified size. A review-only task likewise always takes
+  the direct reviewer route at any classified size. The daemon atomically parks an unready
+  classification. Parking writes the standard refs, note, and event with no claim, run, or error
+  row; an explicit retry requests reclassification of remaining work and a newly dispatchable
+  result restores the saved lifecycle status.
 - A new worker assignment selects from the complexity-specific worker routing pool. Task
   creators cannot lower, raise, or choose an individual profile.
-- `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*` model)
-  or `AgentKind::Codex` (known OpenAI models including `gpt-5*`).
+- `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`
+  model), `AgentKind::Codex` (known OpenAI models including `gpt-5*`), or the exact
+  `AgentKind::Grok` models `grok-4.5` and `grok-4.6`. Managed worker resolution accepts
+  Grok; planner, arbiter, reviewer, classifier, and collector routing reject it.
 - The resolved provider, model, and effort are persisted in `agent_runs.provider`
   so continuation and recovery cannot switch providers mid-task.
 - A new R1 or R2 assignment selects from the complexity-specific reviewer pool. Review
@@ -1675,6 +2615,17 @@ review, and outcome evidence with assignment/profile identity; routing does not 
 parallel statistics subsystem. Unknown models, unavailable runners, missing continuation
 metadata, or a profile snapshot that cannot be executed fail loudly through the existing
 bounded retry or parked-task path, never by silent substitution.
+
+Each distinct configured route attempted for a responsibility may add one immutable evidence
+row linked to, but never replacing, the original role assignment. The row snapshots the exact
+profile and optionally records the closed pre-authoritative failure disposition. Replay is
+idempotent by assignment and profile, and the eligible pool bounds the total distinct rows.
+Exclusions are derived rather than separately granted: `ProviderUnavailable` excludes every
+profile on that provider for the responsibility, while `ProfileUnavailable` excludes only that
+profile. `RetryableSameRoute`, `NonFailover`, `Unclassified`, and an attempt with no classified
+runner failure grant no alternate-route authority. Recording does not advance allocation,
+`rework_round`, task recovery attempts, or lifecycle state. Alternate selection and launch are
+not yet activated.
 
 ### Verification gates
 
@@ -1750,16 +2701,30 @@ identity**.
 
 | Context | How identified | What it can do |
 |---|---|---|
-| **Daemon-managed run** | `QUORUM_RUN_ID` env var set by `quorum serve` at spawn time. Each run ID is a unique opaque token tied to exactly one `(run_id, task_id, role)` triple. The daemon records it in `agent_runs`. | `submit` and `react` for its own task only. The run ID is verified against `agent_runs` — a run can only signal on the task and role it was spawned for. All public commands are also available. |
+| **Daemon-managed run** | `QUORUM_RUN_ID` env var set by `quorum serve` at spawn time. Each run ID is a unique opaque token tied to exactly one `(run_id, task_id, role)` triple. The daemon records it in `agent_runs`. | `submit`, `react`, and progress-note append for its own task only. The run ID is verified against `agent_runs` — a run can only signal or append a note on the task and role it was spawned for. All public commands are also available. |
 | **External named caller** | Any invocation without `QUORUM_RUN_ID`. Identified by `--agent <name>`. | Public commands only (see table below). |
 | **Operator / admin** | Human or privileged script. No special token — admin commands are inherently manual and loud. | Public + admin commands. |
 
 The daemon generates a unique run ID (128-bit hex) for **each** spawned
 worker/reviewer and injects `QUORUM_RUN_ID=<id>` into its environment. The
 run ID is recorded in `agent_runs` with the associated `task_id` and `role`
-(worker/r1/r2). CLI commands that require run identity (`submit`, `react`)
-verify `QUORUM_RUN_ID` against `agent_runs` — a worker for task #5 cannot
-submit on behalf of task #7.
+(worker/r1/r2). CLI commands that require run identity (`submit`, `react`,
+and note-only `task-update`) verify `QUORUM_RUN_ID` against `agent_runs` — a
+worker for task #5 cannot submit or append a note on behalf of task #7.
+
+The daemon-owned local endpoint accepts only bounded, framed JSON operations:
+`submit`, `react`, `append_note`, and `submit_plan`. `append_note` accepts one
+non-empty, NUL-free note plus the prompt-compatible task and agent identity
+flags. Of those, a `planner` capability is honored by `submit_plan` alone; it is
+also honored by the inventory query, which answers phase `planner` with an empty
+operation list so the MCP shell advertises `submit_plan` and nothing else. Every
+other operation rejects that role, and a worker or reviewer capability cannot
+submit a plan. The
+live run capability remains authoritative, and the endpoint rejects a flag
+that does not agree with its derived task or agent. It does not expose task
+field mutation, refs, dependencies, status, SQL, or arbitrary task updates. A
+revoked, ended, unknown, mismatched, or phase-ineligible run is rejected
+without a write.
 
 **Why per-run, not per-daemon?** A shared daemon token is a process-tree
 membership proof but not an authorization boundary — it proves "the daemon
@@ -1781,6 +2746,7 @@ Their CLI surface is:
 |---|---|
 | `submit` | Signal task completion (`--pr N`) or emit review verdict (`--verdict approved\|changes`). Requires `QUORUM_RUN_ID`; verified against the run's task and role. |
 | `react` | Signal non-terminal agent state (blocked/failed/needs-info). Requires `QUORUM_RUN_ID`. |
+| `task-update --note-stdin\|--note-file` | Append one progress note through the scoped endpoint. The supplied task and agent flags are compatibility inputs, which must agree with the task and agent derived from the live run capability. |
 | `post` | Post a feed message (public command, available to all). |
 | All public commands | See table below. |
 
@@ -1986,12 +2952,75 @@ signal and cheap-poll for resume. This model is removed:
   of the target agent process, slot release, and post-mortem ladder on any
   held task. Use for zombie workers, stuck processes, or emergency abort.
 - **Self-update drain remains separate.** The `--self-update-drain` mechanism
-  (signal-triggered drain, exit 75 for supervisor rebuild) is orthogonal to
-  agent stop/kill and is unchanged.
+  is orthogonal to agent stop/kill and is unchanged. See "Self-update (exit 75
+  contract)" below for the staleness trigger and exit path.
 
 Daemon scheduling pause/resume (pausing the daemon's spawn loop without
 stopping individual agents) is **out of scope for v2** — drain covers the
 "stop spawning new work" use case.
+
+### Self-update (exit 75 contract)
+
+`quorum serve` never patches itself in place. It exits with a reserved code,
+`EXIT_SELF_UPDATE = 75`, and `scripts/serve-supervisor.sh` (or an equivalent
+supervisor) treats that code as an upgrade signal: fetch
+`origin/<self_update_branch>`, fast-forward merge, rebuild via
+`./dev-install.sh`, and relaunch. Any other exit code propagates and stops the
+supervisor loop — a crash is not an upgrade signal.
+
+`base_branch` and `self_update_branch` have separate responsibilities.
+`base_branch` selects the task/PR base used for worktree provisioning, PR
+publication and validation, and merge targeting. `self_update_branch` selects
+only the daemon build-staleness poll and the supervisor's fetch/rebuild source.
+For example, `base_branch = "develop"` with `self_update_branch = "main"`
+creates and merges task PRs against `develop` while rebuilding the daemon from
+`main`.
+
+For backward compatibility, when both the `--self-update-branch` CLI flag and
+the `self_update_branch` config key are omitted, the self-update branch is the
+fully resolved `base_branch`; a config that only sets `base_branch =
+"develop"` therefore polls `develop`. An explicit CLI
+`--self-update-branch` or config `self_update_branch` decouples the two.
+
+The bundled supervisor resolves its rebuild branch from
+`QUORUM_SELF_UPDATE_BRANCH`; it passes that branch to daemon staleness checks
+as well as fetching it after exit 75. `QUORUM_BASE_BRANCH` remains a legacy
+fallback only when `QUORUM_SELF_UPDATE_BRANCH` is unset, and `main` is used
+when neither is set. A caller-supplied `--self-update-branch` takes precedence
+over either environment variable.
+
+`EXIT_SELF_UPDATE` has three supported triggers:
+
+1. **Build staleness.** With `--self-update-drain`, the tick loop periodically
+   (`sha_poll_interval_secs`, default 600 seconds) runs bounded
+   `git ls-remote origin <self_update_branch>` outside DB work. When the
+   remote self-update SHA does not match the running build SHA, it requests a
+   self-update drain. An unavailable remote or an unidentifiable build SHA is
+   logged and leaves the daemon serving.
+2. **Schema too new.** A tick reporting `QuorumError::SchemaTooNew` means the
+   on-disk DB is newer than the binary can read. The daemon cannot safely
+   perform DB-backed cleanup, so it force-kills its in-flight
+   worker/reviewer/planner/classifier processes and exits 75 for a rebuild
+   and relaunch.
+3. **Normal-tick merge.** When both `self_update_drain` and `self_repo` are
+   configured, a successful merge performed by the normal tick merge executor
+   requests the same self-update drain immediately after `MergeSucceeded`.
+
+A self-update drain is bounded and shallow: ordinary worker/reviewer
+provisioning respects the drain state, and the daemon drains its
+worker/reviewer roster without waiting for their tasks to finish. The daemon
+exits 75 when that roster becomes empty or `drain_timeout_secs` expires; at
+timeout it force-kills the remaining worker/reviewer/planner/classifier slots.
+Restart recovery then applies the normal durable lifecycle rules. This is
+deliberately not a guarantee that every task reaches a terminal state before
+handoff.
+
+The supervisor handles exit 75 by fetching `origin/<self_update_branch>`,
+fast-forwarding the checkout, running `./dev-install.sh` (with its bounded
+build timeout), and relaunching. A failed fast-forward or build alerts and
+relaunches the existing binary; its restart-thrash guard is bounded. Other
+daemon exit codes propagate and stop the supervisor, so a crash is never
+treated as an upgrade signal.
 
 ### Run identity and capability enforcement
 
@@ -2077,10 +3106,11 @@ changes.
 
 ### Invariants (new, in addition to the existing 11)
 
-12. **Per-run capability gate.** `submit` and `react` require `QUORUM_RUN_ID`
-    matching an active row in `agent_runs` for the correct `(task_id, role)`.
-    Absent or mismatched → exit 2. The run ID is per-spawn, immutable, and
-    dies with the agent process.
+12. **Per-run capability gate.** `submit`, `react`, and note-only managed
+    `task-update` require `QUORUM_RUN_ID` matching an active row in
+    `agent_runs` for the correct `(task_id, role)`. Absent or mismatched →
+    exit 2. The run ID is per-spawn, immutable, and dies with the agent
+    process.
 13. **Message content is lifecycle-inert.** No feed message body, kind, or
     ref field triggers a lifecycle transition. Lifecycle transitions happen
     only through the mailbox (consumed by the daemon) or direct CLI commands
@@ -2109,7 +3139,7 @@ changes.
   Each request opens, reads, and closes SQLite before responding. Dashboard task and run
   pages are bounded, stream reads are byte-capped, and `--log-dir` selects the daemon's
   configured log root.
-- **Out of scope (YAGNI, v1):** auth · multi-machine · daemon/HTTP/MCP server ·
+- **Out of scope (YAGNI, v1):** general auth · multi-machine coordination · remote HTTP/MCP server ·
   message editing · threads beyond `topic` · PR/review mirroring · cross-repo bus ·
   presence-based claim eviction · arbitrary-byte (BLOB) payloads · **agent-name uniqueness
   enforcement** (v1 is caller-owned first-use-wins; same id silently merges — a v2 could

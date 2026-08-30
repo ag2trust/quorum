@@ -6,13 +6,15 @@
 //! - checks timeout → rework (recoverable, not terminal cancel)
 //! - merge is NOT attempted while checks are pending (negative path)
 
+mod common;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -59,6 +61,7 @@ struct ServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
+    gh_state: std::path::PathBuf,
     _sentinel: Option<tempfile::TempDir>,
     _gh_shim: Option<tempfile::TempDir>,
 }
@@ -119,8 +122,26 @@ elif [ "$cmd" = "pr list" ]; then
 elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  case "$*" in
+    *headRefName*)
+      if [ -f "$QUORUM_TEST_GH_STATE/fail_target" ]; then
+        printf 'target lookup unavailable\n' >&2
+        exit 1
+      fi
+      if [ -f "$QUORUM_TEST_GH_STATE/move_on_target" ]; then
+        rm "$QUORUM_TEST_GH_STATE/move_on_target"
+        git -C "$QUORUM_TEST_REPO" commit --allow-empty -m reviewer-target-moved >/dev/null
+        moved_sha="$(git -C "$QUORUM_TEST_REPO" rev-parse HEAD)"
+        git -C "$QUORUM_TEST_REPO" update-ref "refs/heads/$branch" "$moved_sha"
+        printf '%s' "$moved_sha" > "$QUORUM_TEST_GH_STATE/moved_sha"
+        if [ -f "$QUORUM_TEST_GH_STATE/checks_path" ]; then
+          printf 'pending\n' > "$(cat "$QUORUM_TEST_GH_STATE/checks_path")"
+        fi
+      fi
+      ;;
+  esac
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -188,6 +209,7 @@ fi
             child,
             rx,
             lines: Vec::new(),
+            gh_state,
             _sentinel: Some(sentinel),
             _gh_shim: Some(gh_shim),
         }
@@ -312,15 +334,34 @@ fn complete_r2_review_after(
 
 fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     let db = home.join("repos").join("test__repo").join("quorum.db");
-    let mut conn = quorum_core::db::open(&db).unwrap();
-    match quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
-        Some(cap) => cap.run_id,
-        None => {
-            let rid = format!("test-{agent}-{}", std::process::id());
-            quorum_core::capabilities::issue(&mut conn, &rid, 0, agent, role, 1000).unwrap();
-            rid
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let conn = quorum_core::db::open(&db).unwrap();
+        if let Some(cap) = quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
+            if cap.role == role
+                && quorum_core::capabilities::resolve_live_run_context(&conn, &cap.run_id, role)
+                    .is_ok()
+            {
+                return cap.run_id;
+            }
         }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for live {role} run capability for {agent}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
 }
 
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
@@ -353,6 +394,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -376,6 +418,41 @@ fn task_state(home: &std::path::Path) -> (String, i64, i64) {
         )
         .unwrap();
     (task.status, task.rework_round, reviewer_runs)
+}
+
+fn persisted_pr_target(home: &std::path::Path) -> (i64, String, String, i64, i64) {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    conn.query_row(
+        "SELECT pr_number,head_ref,head_sha,is_fork,resolved_at
+         FROM pr_targets WHERE task_id=1",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )
+    .unwrap()
+}
+
+fn reviewer_resource_counts(home: &std::path::Path) -> (i64, i64, i64) {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    conn.query_row(
+        "SELECT
+           (SELECT count(*) FROM agent_runs WHERE task_id=1 AND role='reviewer'),
+           (SELECT count(*) FROM journal WHERE task_id=1 AND role='reviewer'),
+           (SELECT count(*) FROM run_capabilities
+            WHERE task_id=1 AND role='reviewer' AND revoked_at IS NULL)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap()
 }
 
 fn drive_to_rework(home: &std::path::Path, handle: &mut ServeHandle) -> (String, String) {
@@ -447,7 +524,7 @@ fn rereview_pending_does_not_feed_then_ready_resumes_exactly_once() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     let (worker, _) = drive_to_rework(home.path(), &mut handle);
@@ -468,7 +545,7 @@ fn rereview_pending_does_not_feed_then_ready_resumes_exactly_once() {
 
     std::fs::write(&checks_state, "ready").unwrap();
     assert!(
-        handle.wait_for("ResumeReviewer: fed re-review turn", 15),
+        handle.wait_for("ResumeReviewer: fed re-review turn", 45),
         "green CI did not resume the sticky reviewer: {:?}",
         handle.lines
     );
@@ -518,7 +595,7 @@ fn rereview_failed_ci_reenters_rework_without_feeding_reviewer() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     let (worker, _) = drive_to_rework(home.path(), &mut handle);
@@ -594,7 +671,7 @@ fn head_move_during_ci_wait_discards_old_gate_before_reviewer_spawn() {
             "--merge-checks-timeout-secs",
             "2",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
@@ -603,7 +680,7 @@ fn head_move_during_ci_wait_discards_old_gate_before_reviewer_spawn() {
     quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
 
     assert!(
-        handle.wait_for("head changed", 15),
+        handle.wait_for("head moved after CI gate", 15),
         "daemon did not invalidate the old gated SHA: {:?}",
         handle.lines
     );
@@ -616,7 +693,7 @@ fn head_move_during_ci_wait_discards_old_gate_before_reviewer_spawn() {
         handle.lines
     );
     assert!(
-        handle.wait_for("spawning reviewer", 15),
+        handle.wait_for("spawning reviewer", 45),
         "new head was not gated and reviewed: {:?}",
         handle.lines
     );
@@ -645,6 +722,102 @@ fn head_move_during_ci_wait_discards_old_gate_before_reviewer_spawn() {
         String::from_utf8_lossy(&current_sha.stdout).trim(),
         "reviewer worktree must be the newly gated head"
     );
+    handle.force_stop();
+}
+
+#[test]
+fn reviewer_target_move_after_exact_head_check_preserves_durable_target() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("reviewer_target_checks");
+    std::fs::write(&checks_state, "pending\n").unwrap();
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "reviewer target TOCTOU");
+
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "30",
+        ],
+    );
+    assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+    assert!(
+        handle.wait_for("waiting for checks before reviewer provisioning", 15),
+        "initial reviewer gate did not start: {:?}",
+        handle.lines
+    );
+
+    let accepted_branch = std::fs::read_to_string(handle.gh_state.join("1")).unwrap();
+    let accepted_sha = Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "rev-parse",
+            &format!("refs/heads/{accepted_branch}"),
+        ])
+        .output()
+        .unwrap();
+    let accepted_sha = String::from_utf8_lossy(&accepted_sha.stdout)
+        .trim()
+        .to_string();
+    let db = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    quorum_core::pr_targets::upsert(&mut conn, 1, 1, &accepted_branch, &accepted_sha, false)
+        .unwrap();
+    drop(conn);
+    let accepted = persisted_pr_target(home.path());
+    std::fs::write(
+        handle.gh_state.join("checks_path"),
+        checks_state.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(handle.gh_state.join("move_on_target"), b"1").unwrap();
+    std::fs::write(&checks_state, "ready\n").unwrap();
+
+    assert!(
+        handle.wait_for("resolved target moved after CI gate", 45),
+        "target resolution did not deterministically move after the exact head check: {:?}",
+        handle.lines
+    );
+    let moved_sha = std::fs::read_to_string(handle.gh_state.join("moved_sha")).unwrap();
+    assert_ne!(accepted.2, moved_sha);
+    assert_eq!(
+        persisted_pr_target(home.path()),
+        accepted,
+        "the rejected moved target must not change any durable tuple byte"
+    );
+    assert_eq!(
+        reviewer_resource_counts(home.path()),
+        (0, 0, 0),
+        "the rejected moved target must acquire no reviewer resources"
+    );
+
     handle.force_stop();
 }
 
@@ -679,7 +852,7 @@ fn pre_review_pending_waits_without_reviewer_then_ready_spawns() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
@@ -705,7 +878,7 @@ fn pre_review_pending_waits_without_reviewer_then_ready_spawns() {
 
     std::fs::write(&checks_state, "ready").unwrap();
     assert!(
-        handle.wait_for("spawning reviewer", 15),
+        handle.wait_for("spawning reviewer", 45),
         "green checks did not release the reviewer gate: {:?}",
         handle.lines
     );
@@ -740,7 +913,7 @@ fn pre_review_failed_enters_rework_without_reviewer() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
@@ -804,7 +977,7 @@ fn pre_review_pending_survives_daemon_restart() {
         "--merge-checks-timeout-secs",
         "10",
         "--merge-checks-poll-secs",
-        "1",
+        "30",
     ];
     let mut first = ServeHandle::start(
         home.path(),
@@ -832,6 +1005,9 @@ fn pre_review_pending_survives_daemon_restart() {
         first.lines
     );
     first.crash();
+    // SIGKILL + immediate restart is Held until stale or cleared (instance-id
+    // authority); tests clear the leftover row instead of waiting stale_secs.
+    common::clear_daemon_lock(&home.path().join("repos/test__repo/quorum.db"));
 
     std::fs::write(&checks_state, "ready").unwrap();
     let mut restarted = ServeHandle::start(
@@ -882,7 +1058,7 @@ fn r2_rechecks_ci_before_spawning() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
     assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
@@ -924,7 +1100,7 @@ fn r2_rechecks_ci_before_spawning() {
 
     std::fs::write(&checks_state, "ready").unwrap();
     assert!(
-        handle.wait_for("R2: pre-merge reviewer", 15),
+        handle.wait_for("R2: pre-merge reviewer", 45),
         "R2 did not spawn after current-head CI became green: {:?}",
         handle.lines
     );
@@ -962,7 +1138,7 @@ fn checks_pass_then_merge_succeeds() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1056,7 +1232,7 @@ fn checks_fail_sends_rework() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1160,7 +1336,7 @@ fn checks_timeout_enters_merge_wait() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1301,7 +1477,7 @@ fn checks_pending_then_ready_merges_via_merge_wait() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1416,7 +1592,7 @@ fn checks_pending_then_failed_enters_rework() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1532,7 +1708,7 @@ fn checks_pending_survives_restart() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1608,7 +1784,7 @@ fn checks_pending_survives_restart() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1680,7 +1856,7 @@ fn checks_pending_then_ready_merges_after_wait() {
             "--merge-checks-timeout-secs",
             "15",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1799,7 +1975,7 @@ fn empty_checks_treated_as_pending() {
             "--merge-checks-timeout-secs",
             "15",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -1934,7 +2110,7 @@ fn policy_pending_retries_then_merges() {
             "--merge-checks-timeout-secs",
             "15",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -2062,7 +2238,7 @@ fn approved_without_pr_skips_merge() {
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -2093,7 +2269,7 @@ fn approved_without_pr_skips_merge() {
         handle.lines
     );
 
-    // Reviewer signals approved WITHOUT --pr (the bug trigger).
+    // The endpoint derives the daemon-owned PR when the reviewer omits --pr.
     quorum_done(
         home.path(),
         &[
@@ -2107,8 +2283,8 @@ fn approved_without_pr_skips_merge() {
     );
 
     assert!(
-        handle.wait_for("missing PR number", 15),
-        "expected missing-PR warning log. Lines: {:?}",
+        handle.wait_for("R2 GATE", 15),
+        "endpoint-derived PR did not reach the post-review gate. Lines: {:?}",
         handle.lines
     );
 
@@ -2117,7 +2293,7 @@ fn approved_without_pr_skips_merge() {
     });
     assert!(
         !saw_merge_attempt,
-        "merge should NOT be attempted without PR number. Lines: {:?}",
+        "the pending R2 gate must still prevent a merge. Lines: {:?}",
         handle.lines
     );
 
@@ -2174,7 +2350,7 @@ fn conflict_during_checks_wait_triggers_rework_not_cancel() {
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
             "--merge-mergeability-cmd",
             &mergeability_script,
         ],

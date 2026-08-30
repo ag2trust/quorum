@@ -7,6 +7,8 @@
 //! 3. merge failure: approved verdict but merge fails → treated as changes,
 //!    worker gets rework turn with merge error
 
+mod common;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -14,6 +16,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
+
+use common::{wait_until, WaitState};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -25,21 +29,28 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
 /// output (like the fake-agent's "Fixing…" rework response) is observed here.
 fn wait_session_log(home: &std::path::Path, needle: &str, timeout_secs: u64) -> bool {
     let logs = home.join("logs");
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        if let Ok(entries) = std::fs::read_dir(&logs) {
-            for entry in entries.flatten() {
-                let stream = entry.path().join("stream.jsonl");
-                if let Ok(content) = std::fs::read_to_string(&stream) {
-                    if content.contains(needle) {
-                        return true;
+    wait_until(
+        &format!("session log containing {needle:?}"),
+        Duration::from_secs(timeout_secs),
+        || {
+            let mut searched = 0;
+            if let Ok(entries) = std::fs::read_dir(&logs) {
+                for entry in entries.flatten() {
+                    let stream = entry.path().join("stream.jsonl");
+                    if let Ok(content) = std::fs::read_to_string(&stream) {
+                        searched += 1;
+                        if content.contains(needle) {
+                            return WaitState::Ready(true);
+                        }
                     }
                 }
             }
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
+            WaitState::Pending(format!(
+                "searched {searched} readable stream.jsonl file(s) under {}",
+                logs.display()
+            ))
+        },
+    )
 }
 
 fn wait_for_task_status(
@@ -49,21 +60,104 @@ fn wait_for_task_status(
     timeout_secs: u64,
 ) -> bool {
     let db = home.join("repos/test__repo/quorum.db");
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        if let Ok(conn) = rusqlite::Connection::open(&db) {
-            let status: Option<String> = conn
-                .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |r| {
-                    r.get(0)
-                })
-                .ok();
-            if status.as_deref() == Some(expected) {
-                return true;
+    wait_until(
+        &format!("task #{task_id} status {expected:?}"),
+        Duration::from_secs(timeout_secs),
+        || match quorum_core::db::open(&db) {
+            Ok(conn) => {
+                let status: Option<String> = conn
+                    .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |r| {
+                        r.get(0)
+                    })
+                    .ok();
+                if status.as_deref() == Some(expected) {
+                    WaitState::Ready(true)
+                } else {
+                    WaitState::Pending(format!("task #{task_id} status was {status:?}"))
+                }
             }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
+            Err(error) => WaitState::Pending(format!("could not open {}: {error}", db.display())),
+        },
+    )
+}
+
+fn wait_for_journal_absent(home: &std::path::Path, agent: &str) {
+    let db = home.join("repos/test__repo/quorum.db");
+    wait_until(
+        &format!("journal teardown for agent {agent}"),
+        Duration::from_secs(15),
+        || match quorum_core::db::open(&db) {
+            Ok(conn) => {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM journal WHERE agent=?1",
+                        [agent],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if count == 0 {
+                    WaitState::Ready(())
+                } else {
+                    WaitState::Pending(format!("journal still has {count} row(s) for {agent}"))
+                }
+            }
+            Err(error) => WaitState::Pending(format!("could not open {}: {error}", db.display())),
+        },
+    );
+}
+
+fn journal_role_count(home: &std::path::Path, role: &str) -> i64 {
+    let db = home.join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM journal WHERE role=?1",
+        [role],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn append_done_barrier(home: &std::path::Path, agent: &str) -> i64 {
+    let db = home.join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    let row = quorum_core::mailbox::MailboxRow {
+        agent: agent.to_string(),
+        kind: quorum_core::mailbox::MailboxKind::Done,
+        task_id: None,
+        pr: None,
+        verdict: None,
+        feedback: None,
+        note: None,
+        to_agent: None,
+        payload: None,
+    };
+    quorum_core::mailbox::append(&mut conn, &row).unwrap()
+}
+
+fn wait_for_mailbox_consumed(home: &std::path::Path, id: i64) {
+    let db = home.join("repos/test__repo/quorum.db");
+    wait_until(
+        &format!("mailbox barrier row {id} to be consumed"),
+        Duration::from_secs(15),
+        || match quorum_core::db::open(&db) {
+            Ok(conn) => {
+                let consumed: Option<bool> = conn
+                    .query_row(
+                        "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                match consumed {
+                    Some(true) => WaitState::Ready(()),
+                    state => WaitState::Pending(format!(
+                        "mailbox barrier row {id} consumed state was {state:?}"
+                    )),
+                }
+            }
+            Err(error) => WaitState::Pending(format!("could not open {}: {error}", db.display())),
+        },
+    );
 }
 
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
@@ -187,7 +281,15 @@ elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  force_after_view="$QUORUM_TEST_GH_STATE/force-head-after-next-view-$pr"
+  if [ -f "$force_after_view" ]; then
+    next_sha="$(cat "$force_after_view")"
+    rm "$force_after_view"
+    printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+    git -C "$QUORUM_TEST_REPO" update-ref "refs/heads/$branch" "$next_sha"
+    exit 0
+  fi
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -278,6 +380,15 @@ fi
 
     fn extract_agent_name(&self, prefix: &str) -> Option<String> {
         for line in &self.lines {
+            if let Some(rest) = line.split(prefix).nth(1) {
+                return Some(rest.split_whitespace().next().unwrap_or("").to_string());
+            }
+        }
+        None
+    }
+
+    fn latest_agent_name(&self, prefix: &str) -> Option<String> {
+        for line in self.lines.iter().rev() {
             if let Some(rest) = line.split(prefix).nth(1) {
                 return Some(rest.split_whitespace().next().unwrap_or("").to_string());
             }
@@ -378,6 +489,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -408,6 +531,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -417,6 +541,27 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
         "done failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Lifecycle-only fixtures inject a daemon-owned rework completion directly;
+/// managed CLI routing is covered by `agent_cli_endpoint.rs`.
+fn quorum_submit_existing_worker_pr(home: &std::path::Path, agent: &str, pr: &str) {
+    let mut conn = quorum_core::db::open(&home.join("repos/test__repo/quorum.db")).unwrap();
+    quorum_core::mailbox::append(
+        &mut conn,
+        &quorum_core::mailbox::MailboxRow {
+            agent: agent.into(),
+            kind: quorum_core::mailbox::MailboxKind::Done,
+            task_id: Some(1),
+            pr: Some(pr.parse().unwrap()),
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        },
+    )
+    .unwrap();
 }
 
 #[test]
@@ -1017,7 +1162,259 @@ fn merge_failure_feeds_rework_to_worker() {
 }
 
 #[test]
-fn no_verdict_done_clears_pr_no_respawn_loop() {
+fn final_boundary_head_drift_promptly_provisions_fresh_r1() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Final-boundary head drift");
+    let merge_calls = home.path().join("stale-authority-merge-calls");
+    let merge_cmd = format!(
+        "printf x >> {}; echo 'pull request head SHA does not match expected head commit' >&2; exit 1",
+        merge_calls.display()
+    );
+    let mut handle = ServeHandle::start_with_merge(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &merge_cmd,
+    );
+
+    assert!(handle.wait_for("spawning agent", 15));
+    assert!(handle.wait_for("result", 15));
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+
+    assert!(handle.wait_for("spawning reviewer", 15));
+    assert!(handle.wait_for("result", 15));
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    complete_r2_review(home.path(), &mut handle, "1");
+
+    assert!(
+        handle.wait_for("tearing down reviewer", 15),
+        "stale-authority reviewer was not settled: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("R1: reviewer", 15),
+        "fresh R1 was not provisioned promptly after final-boundary drift: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "fresh R1 did not start its review turn: {:?}",
+        handle.lines
+    );
+
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    assert!(
+        quorum_core::approvals::get_for_pr(&conn, 1)
+            .unwrap()
+            .is_empty(),
+        "head drift must invalidate the completed approval set"
+    );
+    let (r1_runs, r2_runs, live_reviewers, watchdog_failures): (i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM agent_runs
+                WHERE task_id=1 AND role='reviewer' AND sub_role IS NULL),
+               (SELECT COUNT(*) FROM agent_runs
+                WHERE task_id=1 AND role='reviewer' AND sub_role='r2'),
+               (SELECT COUNT(*) FROM journal
+                WHERE task_id=1 AND role='reviewer'),
+               (SELECT COUNT(*) FROM events
+                WHERE subject='task#1' AND kind='agent_failed')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(r1_runs, 2, "the replacement must be exactly one fresh R1");
+    assert_eq!(r2_runs, 1, "head drift must not provision another R2 first");
+    assert_eq!(live_reviewers, 1, "only the replacement R1 may remain live");
+    assert_eq!(
+        watchdog_failures, 0,
+        "review convergence must not depend on the idle watchdog"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&merge_calls).unwrap(),
+        "x",
+        "head drift must cause exactly one merge invocation"
+    );
+
+    handle.stop();
+}
+
+#[test]
+fn r2_force_push_window_never_stamps_the_unreviewed_head() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "R2 force-push persistence window");
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    assert!(handle.wait_for("spawning agent", 15));
+    assert!(handle.wait_for("result", 15));
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+    assert!(handle.wait_for("spawning reviewer", 15));
+    assert!(handle.wait_for("result", 15));
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(handle.wait_for("R2: pre-merge reviewer", 15));
+    assert!(handle.wait_for("result", 15));
+    let r2 = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("R2 reviewer name");
+
+    let branch = format!("daemon/{}-t1", worker.to_lowercase());
+    let old_head = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                &branch,
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "force-pushed head",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let new_head = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "main",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(old_head, new_head);
+    std::fs::write(
+        handle
+            ._gh_shim
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("state/force-head-after-next-view-1"),
+        &new_head,
+    )
+    .unwrap();
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r2,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(
+        handle.wait_for("STALE SHA", 15),
+        "force-pushed R2 verdict was not rejected: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("R1: reviewer", 45),
+        "fresh R1 was not provisioned for the moved head: {:?}",
+        handle.lines
+    );
+
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let approvals = quorum_core::approvals::get_for_pr(&conn, 1).unwrap();
+    assert!(
+        !approvals.is_empty(),
+        "valid old-head evidence may be retained"
+    );
+    assert!(approvals
+        .iter()
+        .all(|approval| approval.approved_head_sha == old_head));
+    assert!(approvals
+        .iter()
+        .all(|approval| approval.approved_head_sha != new_head));
+    assert_eq!(
+        quorum_core::tasks::get(&conn, 1).unwrap().unwrap().status,
+        "in-review"
+    );
+    handle.stop();
+}
+
+#[test]
+fn no_verdict_reviewer_replacement_preserves_pr_for_rework() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -1103,23 +1500,56 @@ fn no_verdict_done_clears_pr_no_respawn_loop() {
         handle.lines
     );
 
-    // Wait 2 ticks — if w.pr was NOT cleared, a second reviewer would spawn.
-    std::thread::sleep(Duration::from_secs(1));
+    // AgentFailed requests a replacement reviewer. The worker must retain its
+    // daemon-owned PR so a changes verdict from that replacement can start a
+    // valid sticky rework turn.
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "replacement reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let replacement = handle
+        .latest_agent_name("spawning reviewer ")
+        .expect("replacement reviewer name missing");
+    assert_ne!(replacement, reviewer_name);
+    assert!(
+        handle.wait_for("result", 15),
+        "replacement reviewer did not finish its turn: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &replacement,
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--feedback",
+            "Fix the replacement review finding",
+        ],
+    );
+    assert!(
+        handle.wait_for("rework #1 started", 15),
+        "replacement changes verdict did not start rework: {:?}",
+        handle.lines
+    );
+    assert!(
+        wait_session_log(home.path(), "Fixing", 15),
+        "worker rework response not seen after replacement reviewer changes"
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker rework result not seen: {:?}",
+        handle.lines
+    );
 
-    // Drain any remaining log lines
-    while let Ok(line) = handle.rx.try_recv() {
-        handle.lines.push(line);
-    }
-
-    // Count reviewer spawn messages — should be exactly 1
-    let spawn_count = handle
-        .lines
-        .iter()
-        .filter(|l| l.contains("spawning reviewer"))
-        .count();
-    assert_eq!(
-        spawn_count, 1,
-        "expected exactly 1 reviewer spawn (no respawn loop), got {spawn_count}. Lines: {:?}",
+    // The same existing PR is accepted after the failure-to-rework handoff.
+    quorum_submit_existing_worker_pr(home.path(), &worker_name, "1");
+    assert!(
+        handle.wait_for("fed re-review turn", 15),
+        "matching rework publication was not returned to review: {:?}",
         handle.lines
     );
 
@@ -1341,14 +1771,23 @@ fn rework_resignal_feeds_rereview_turn() {
         handle.lines
     );
 
-    // Worker re-signals done with PR (rework pushed)
-    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+    // Rework explicitly confirms the daemon-created PR. This used to be
+    // rejected after the sticky slot discarded its PR identity.
+    quorum_submit_existing_worker_pr(home.path(), &worker_name, "1");
 
     // ResumeReviewer feeds a re-review turn to the existing reviewer
     // (no teardown + respawn — the reviewer keeps its session context).
     assert!(
         handle.wait_for("fed re-review turn", 15),
         "reviewer not fed re-review turn after rework re-signal. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("daemon_push_rejected")),
+        "a matching rework PR must not be rejected: {:?}",
         handle.lines
     );
 
@@ -1366,6 +1805,20 @@ fn rework_resignal_feeds_rereview_turn() {
     assert_eq!(
         reviewer_spawns, 1,
         "expected 1 reviewer spawn (original only, re-review is feed_turn), got {reviewer_spawns}. Lines: {:?}",
+        handle.lines
+    );
+
+    // A later mismatched rework signal must still fail closed before it can
+    // publish to a worker-selected PR.
+    quorum_submit_existing_worker_pr(home.path(), &worker_name, "2");
+    assert!(
+        handle.wait_for("daemon publish rejected", 15),
+        "mismatched rework PR was not rejected: {:?}",
+        handle.lines
+    );
+    assert!(
+        wait_for_task_status(home.path(), 1, "failed", 15),
+        "mismatched rework PR must park the task: {:?}",
         handle.lines
     );
 
@@ -1413,6 +1866,9 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env_remove("QUORUM_AGENT")
+        .env_remove("QUORUM_RUN_ID")
+        .env_remove("QUORUM_AGENT_ENDPOINT")
         .args([
             "task-update",
             "--agent",
@@ -1430,8 +1886,18 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Worker signals done with PR (doesn't know task was cancelled)
-    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+    // A cancelled run's endpoint completion is rejected before it can enqueue
+    // a stale lifecycle signal.
+    let run_id = resolve_run_id(home.path(), &worker_name, "worker");
+    let rejected = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home.path()))
+        .env("QUORUM_RUN_ID", run_id)
+        .args(["done", "--agent", &worker_name, "--pr", "1"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
 
     // Daemon should detect the cancelled task and clean up.  Two valid
     // orderings: (a) done signal arrives first → "lifecycle rejected", or
@@ -1456,8 +1922,16 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
         handle.lines
     );
 
-    // Wait 2 ticks to confirm no reviewer spawns
-    std::thread::sleep(Duration::from_secs(1));
+    // Journal deletion happens before reviewer reconciliation in the same
+    // tick, so it is only the starting point for the negative-path barrier.
+    wait_for_journal_absent(home.path(), &worker_name);
+
+    // Phase 1 already snapshotted the tick that removed the journal row, so a
+    // barrier appended now can only be consumed by a later tick. That proves
+    // the teardown tick completed Phase 5/5b before the negative assertions.
+    let barrier = append_done_barrier(home.path(), "CancelledBarrier");
+    wait_for_mailbox_consumed(home.path(), barrier);
+    assert_eq!(journal_role_count(home.path(), "reviewer"), 0);
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }
@@ -1544,8 +2018,11 @@ fn already_merged_pr_closes_task_without_reviewer() {
         handle.lines
     );
 
-    // Wait 2 ticks to confirm no reviewer spawns
-    std::thread::sleep(Duration::from_secs(1));
+    // The merged transition and worker teardown are the durable/process
+    // barriers after which reviewer provisioning is no longer possible.
+    wait_for_task_status(home.path(), 1, "done", 15);
+    wait_for_journal_absent(home.path(), &worker_name);
+    assert_eq!(journal_role_count(home.path(), "reviewer"), 0);
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }

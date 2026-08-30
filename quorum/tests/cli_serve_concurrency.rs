@@ -1,6 +1,7 @@
 //! M3 concurrency tests: multi-worker spawn, priority ordering,
 //! independent lifecycle, SIGINT teardown with multiple workers.
 
+use rusqlite::params;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -124,7 +125,7 @@ elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -320,6 +321,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -338,6 +351,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -911,4 +925,152 @@ fn sentinel_gone_terminates_serve_and_children() {
             }
         }
     }
+}
+
+// ── #419/#472: selection and claim authority ──────────────────────────
+
+#[test]
+fn stable_graph_rejection_is_filtered_without_skip_or_spawn() {
+    // A graph member whose sibling has failed is deterministically rejected by
+    // GRAPH_IMPLEMENTATION_READY_CLAUSE. Selection shares that predicate, so
+    // repeated ticks must not attempt claims or emit race-skip/spawn logs.
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    // Task #1: decomposition source.
+    seed_task(home.path(), "Source");
+    // Task #2: graph member candidate (open).
+    seed_task(home.path(), "Graph child A");
+    // Task #3: graph member sibling (will be failed).
+    seed_task(home.path(), "Graph child B");
+
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+
+        // Classify task #2 so it passes selection.
+        quorum_core::classify::store_classifications(
+            &mut conn,
+            &[quorum_core::classify::TaskClassification {
+                task_id: 2,
+                cx_est: 3,
+                size: "M".into(),
+                size_reason: "bounded test classification rationale".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "test:v2",
+            now,
+        )
+        .unwrap();
+
+        // Source → decomposed, sibling → failed.
+        conn.execute("UPDATE tasks SET status='decomposed' WHERE id=1", [])
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=3", [])
+            .unwrap();
+
+        // Active graph (state='active', active=1, freeze_active=0).
+        let graph_id: i64 = conn
+            .query_row(
+                "INSERT INTO task_decompositions
+                     (source_task_id, state, active, freeze_active,
+                      planned_source_revision, accepted_plan_revision,
+                      created_at, updated_at)
+                 VALUES (1, 'active', 1, 0, 1, 1, ?1, ?1)
+                 RETURNING id",
+                params![now],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Graph members: task #2 (candidate) and task #3 (failed sibling).
+        conn.execute(
+            "INSERT INTO task_graph_members (graph_id, task_id, local_key, plan_revision, active)
+             VALUES (?1, 2, 'a', 1, 1)",
+            params![graph_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_graph_members (graph_id, task_id, local_key, plan_revision, active)
+             VALUES (?1, 3, 'b', 1, 1)",
+            params![graph_id],
+        )
+        .unwrap();
+    }
+
+    let mut handle =
+        ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file, 1);
+
+    // Allow several dispatch ticks and drain their output.
+    std::thread::sleep(Duration::from_secs(2));
+    handle.drain_available();
+
+    let skip_lines: Vec<_> = handle
+        .lines
+        .iter()
+        .filter(|line| line.contains("no longer claimable after selection"))
+        .collect();
+    assert!(
+        skip_lines.is_empty(),
+        "stable graph rejection must be filtered before claim: {skip_lines:?}"
+    );
+
+    // No "spawning agent" for task #2.
+    let spawn_lines: Vec<_> = handle
+        .lines
+        .iter()
+        .filter(|l| l.contains("spawning agent") && l.contains("Graph child A"))
+        .collect();
+    assert!(
+        spawn_lines.is_empty(),
+        "spawn log must not appear for a failed claim: {spawn_lines:?}"
+    );
+
+    // No authority artefacts for task #2.
+    {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let claims: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM claims WHERE target='task#2' AND active=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims, 0, "no active claim for task #2");
+
+        let runs: i64 = conn
+            .query_row("SELECT count(*) FROM agent_runs WHERE task_id=2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(runs, 0, "no agent_runs for task #2");
+
+        let errs: i64 = conn
+            .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            errs, 0,
+            "stable selection rejection must not produce errors"
+        );
+    }
+
+    handle.stop();
 }

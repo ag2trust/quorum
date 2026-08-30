@@ -1,14 +1,31 @@
 //! Deterministic production-path coverage for mixed provider lifecycle routing.
 
+mod common;
+
+use common::{wait_until, WaitState};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
+}
+
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
 }
 
 fn init_git_repo(dir: &std::path::Path) {
@@ -23,6 +40,36 @@ fn init_git_repo(dir: &std::path::Path) {
     ] {
         assert!(Command::new("git").args(args).status().unwrap().success());
     }
+}
+
+#[cfg(unix)]
+fn install_real_pre_push_hook(repo: &std::path::Path, hook_dir: &std::path::Path) {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.githooks/pre-push");
+    let installed = hook_dir.join("pre-push");
+    std::fs::copy(source, &installed).unwrap();
+    std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &repo.to_string_lossy(),
+            "config",
+            "core.hooksPath",
+            &hook_dir.to_string_lossy(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+}
+
+fn test_command_path(shim_dir: &std::path::Path) -> String {
+    let cargo_dir = std::path::Path::new(env!("CARGO"))
+        .parent()
+        .expect("cargo executable must have a parent directory");
+    format!(
+        "{}:{}:/usr/bin:/bin:/usr/sbin:/sbin",
+        shim_dir.display(),
+        cargo_dir.display()
+    )
 }
 
 fn write_names(dir: &std::path::Path) -> std::path::PathBuf {
@@ -56,6 +103,47 @@ fn routing_config(provider: &str, model: &str) -> String {
     )
 }
 
+/// Route future worker allocations to Claude while retaining the original
+/// Codex profile. An in-flight Codex worker may continue; a new worker would
+/// use the current Claude pool.
+fn rerouted_worker_config() -> String {
+    "[model_profiles.codex]\n\
+     runner = \"codex\"\n\
+     model = \"gpt-5.6-terra\"\n\
+     effort = \"high\"\n\
+     [model_profiles.claude]\n\
+     runner = \"claude\"\n\
+     model = \"claude-opus-4-6\"\n\
+     effort = \"high\"\n\
+     [routing.classifier]\n\
+     codex = 100\n\
+     [routing.planner]\n\
+     claude = 100\n\
+     [routing.collector]\n\
+     codex = 100\n\
+     [routing.worker.1]\n\
+     claude = 100\n\
+     [routing.worker.2]\n\
+     claude = 100\n\
+     [routing.worker.3]\n\
+     claude = 100\n\
+     [routing.worker.4]\n\
+     claude = 100\n\
+     [routing.worker.5]\n\
+     claude = 100\n\
+     [routing.reviewer.1]\n\
+     codex = 100\n\
+     [routing.reviewer.2]\n\
+     codex = 100\n\
+     [routing.reviewer.3]\n\
+     codex = 100\n\
+     [routing.reviewer.4]\n\
+     codex = 100\n\
+     [routing.reviewer.5]\n\
+     codex = 100\n"
+        .into()
+}
+
 fn write_dual_protocol_runner(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("dual-runner.sh");
     std::fs::write(
@@ -67,7 +155,8 @@ if [ "$1" = "exec" ]; then
   printf '{"type":"turn.started"}\n'
   printf '{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"done"}}\n'
   printf '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}\n'
-  sleep 30
+  printf 'hold-pid|%s\n' "$$" >> "$RUNNER_LOG"
+  read -r _ < "/dev/fd/$RUNNER_HOLD_FD" || true
 else
   while IFS= read -r line; do
     printf '{"type":"assistant","message":{"content":"done"}}\n'
@@ -85,11 +174,60 @@ fi
     path
 }
 
+fn runner_hold_pipe() -> (File, File) {
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+
+    // The daemon and every provider process inherit only the read end. The
+    // fixture retains the close-on-exec writer, so dropping the ServeHandle
+    // broadcasts EOF to every sticky fake provider without a timer.
+    let writer_flags = unsafe { libc::fcntl(fds[1], libc::F_GETFD) };
+    assert_ne!(writer_flags, -1);
+    assert_ne!(
+        unsafe { libc::fcntl(fds[1], libc::F_SETFD, writer_flags | libc::FD_CLOEXEC) },
+        -1
+    );
+
+    unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+}
+
+fn linux_proc_stat_state(stat: &str) -> Option<u8> {
+    // The command name is parenthesized and may itself contain `)`, so parse
+    // from the final delimiter before the one-byte process state.
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.as_bytes().first().copied())
+}
+
+fn process_has_finished_execution(pid: libc::pid_t) -> bool {
+    if unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                // The preflight test supervisor is a child subreaper. An
+                // exited provider can therefore remain here as its zombie
+                // until the test binary exits and the supervisor reaps it.
+                return matches!(linux_proc_stat_state(&stat), Some(b'Z' | b'X'));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => {}
+        }
+    }
+
+    false
+}
+
 struct ServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
     _sentinel: tempfile::TempDir,
+    runner_hold_writer: Option<File>,
 }
 
 impl Drop for ServeHandle {
@@ -98,10 +236,15 @@ impl Drop for ServeHandle {
             unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL) };
             let _ = self.child.wait();
         }
+        self.release_runner_hold();
     }
 }
 
 impl ServeHandle {
+    fn release_runner_hold(&mut self) {
+        drop(self.runner_hold_writer.take());
+    }
+
     fn wait_for(&mut self, needle: &str) {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
@@ -135,17 +278,20 @@ impl ServeHandle {
     fn stop(mut self) {
         unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) };
         assert!(self.child.wait().unwrap().success());
+        self.release_runner_hold();
     }
 
     fn stop_mut(&mut self) {
         unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) };
         assert!(self.child.wait().unwrap().success());
+        self.release_runner_hold();
     }
 
     fn crash_mut(&mut self) {
         unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL) };
         let status = self.child.wait().unwrap();
         assert!(!status.success());
+        self.release_runner_hold();
     }
 }
 
@@ -155,12 +301,46 @@ struct Case {
     _worktrees: tempfile::TempDir,
     gh_shim: tempfile::TempDir,
     runner_log: std::path::PathBuf,
+    parked_expected_sha: Option<String>,
+    parked_remote_sha: Option<String>,
     handle: ServeHandle,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParkedRemoteState {
+    ExpectedHead,
+    PublishedSource,
+    UnrelatedHead,
+}
+
+#[derive(Clone, Copy)]
+struct ParkedPublicationFixture {
+    pr: i64,
+    remote_state: ParkedRemoteState,
+    target_branch: &'static str,
 }
 
 impl Case {
     fn start(default_provider: &str, model: &str, labels: Option<&str>) -> Self {
         Self::start_with_role_config(default_provider, model, labels, None)
+    }
+
+    fn start_with_merge_metadata(
+        default_provider: &str,
+        model: &str,
+        labels: Option<&str>,
+    ) -> Self {
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            labels,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
     }
 
     fn start_with_role_config(
@@ -169,17 +349,122 @@ impl Case {
         labels: Option<&str>,
         role_config: Option<&str>,
     ) -> Self {
-        Self::start_with_pr_assignment(default_provider, model, labels, role_config, None, None)
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            labels,
+            role_config,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+    }
+
+    fn start_with_role_config_and_merge_metadata(
+        default_provider: &str,
+        model: &str,
+        labels: Option<&str>,
+        role_config: Option<&str>,
+    ) -> Self {
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            labels,
+            role_config,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+    }
+
+    fn start_with_role_config_and_checks(
+        default_provider: &str,
+        model: &str,
+        role_config: Option<&str>,
+        merge_checks_cmd: &str,
+    ) -> Self {
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            None,
+            role_config,
+            None,
+            None,
+            None,
+            Some(merge_checks_cmd),
+            false,
+        )
     }
 
     fn start_review_only(default_provider: &str, model: &str) -> Self {
-        Self::start_with_pr_assignment(default_provider, model, None, None, Some(1), None)
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            None,
+            None,
+            Some(1),
+            None,
+            None,
+            None,
+            false,
+        )
     }
 
     fn start_continue(default_provider: &str, model: &str, pr: i64) -> Self {
-        Self::start_with_pr_assignment(default_provider, model, None, None, None, Some(pr))
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            None,
+            None,
+            None,
+            Some(pr),
+            None,
+            None,
+            false,
+        )
     }
 
+    fn start_parked_publication(remote_state: ParkedRemoteState) -> Self {
+        Self::start_with_pr_assignment(
+            "codex",
+            "gpt-5.6-terra",
+            None,
+            None,
+            None,
+            None,
+            Some(ParkedPublicationFixture {
+                pr: 10,
+                remote_state,
+                target_branch: "main",
+            }),
+            None,
+            false,
+        )
+    }
+
+    fn start_targeted_parked_publication() -> Self {
+        Self::start_with_pr_assignment(
+            "codex",
+            "gpt-5.6-terra",
+            None,
+            None,
+            None,
+            None,
+            Some(ParkedPublicationFixture {
+                pr: 10,
+                remote_state: ParkedRemoteState::ExpectedHead,
+                target_branch: "develop",
+            }),
+            None,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn start_with_pr_assignment(
         default_provider: &str,
         model: &str,
@@ -187,6 +472,9 @@ impl Case {
         role_config: Option<&str>,
         review_pr: Option<i64>,
         continue_pr: Option<i64>,
+        parked_publication: Option<ParkedPublicationFixture>,
+        merge_checks_cmd: Option<&str>,
+        use_gh_merge: bool,
     ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -233,6 +521,9 @@ impl Case {
             let pr_string = pr.to_string();
             create.args(["--continue-pr", &pr_string]);
         }
+        if let Some(fixture) = parked_publication {
+            create.args(["--base-branch", fixture.target_branch]);
+        }
         assert!(create.status().unwrap().success());
         let db_path = home.path().join("repos/test__repo/quorum.db");
         let mut conn = quorum_core::db::open(&db_path).unwrap();
@@ -242,6 +533,7 @@ impl Case {
                 task_id: 1,
                 cx_est: 2,
                 size: "S".into(),
+                size_reason: "bounded test classification rationale".into(),
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: Vec::new(),
@@ -253,6 +545,219 @@ impl Case {
         if let Some(labels) = labels {
             conn.execute("UPDATE tasks SET labels = ?1 WHERE id = 1", [labels])
                 .unwrap();
+        }
+
+        let mut parked_expected_sha = None;
+        let mut parked_remote_sha = None;
+        if let Some(fixture) = parked_publication {
+            let repo_path = repo.path().to_string_lossy();
+            std::fs::copy(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../preflight.sh"),
+                repo.path().join("preflight.sh"),
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("Cargo.toml"),
+                "[package]\nname = \"parked-retry-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            std::fs::create_dir(repo.path().join("src")).unwrap();
+            std::fs::write(repo.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+            assert!(Command::new("git")
+                .args(["-C", &repo_path, "add", "."])
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("git")
+                .args(["-C", &repo_path, "commit", "-m", "add hook fixture"])
+                .status()
+                .unwrap()
+                .success());
+            if fixture.target_branch != "main" {
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "branch", fixture.target_branch])
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "fetch", "origin"])
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "checkout", fixture.target_branch])
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            let head_ref = format!("parked-pr-{}", fixture.pr);
+            assert!(Command::new("git")
+                .args(["-C", &repo_path, "checkout", "-b", &head_ref])
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("git")
+                .args([
+                    "-C",
+                    &repo_path,
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "recorded PR head",
+                ])
+                .status()
+                .unwrap()
+                .success());
+            let expected_sha = String::from_utf8(
+                Command::new("git")
+                    .args(["-C", &repo_path, "rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+            assert!(Command::new("git")
+                .args(["-C", &repo_path, "checkout", "main"])
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("git")
+                .args([
+                    "-C",
+                    &repo_path,
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "advance current base",
+                ])
+                .status()
+                .unwrap()
+                .success());
+            let stale_delivery = String::from_utf8(
+                Command::new("git")
+                    .args(["-C", &repo_path, "rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+            let remote_sha = match fixture.remote_state {
+                ParkedRemoteState::ExpectedHead => expected_sha.clone(),
+                ParkedRemoteState::PublishedSource => {
+                    assert!(Command::new("git")
+                        .args(["-C", &repo_path, "branch", "-f", &head_ref, &stale_delivery])
+                        .status()
+                        .unwrap()
+                        .success());
+                    stale_delivery.clone()
+                }
+                ParkedRemoteState::UnrelatedHead => {
+                    assert!(Command::new("git")
+                        .args(["-C", &repo_path, "checkout", &head_ref])
+                        .status()
+                        .unwrap()
+                        .success());
+                    assert!(Command::new("git")
+                        .args([
+                            "-C",
+                            &repo_path,
+                            "commit",
+                            "--allow-empty",
+                            "-m",
+                            "move remote PR head",
+                        ])
+                        .status()
+                        .unwrap()
+                        .success());
+                    let moved = String::from_utf8(
+                        Command::new("git")
+                            .args(["-C", &repo_path, "rev-parse", "HEAD"])
+                            .output()
+                            .unwrap()
+                            .stdout,
+                    )
+                    .unwrap()
+                    .trim()
+                    .to_string();
+                    assert!(Command::new("git")
+                        .args(["-C", &repo_path, "checkout", "main"])
+                        .status()
+                        .unwrap()
+                        .success());
+                    moved
+                }
+            };
+            assert!(Command::new("git")
+                .args(["-C", &repo_path, "fetch", "origin"])
+                .status()
+                .unwrap()
+                .success());
+
+            let refs = serde_json::json!({
+                "cx_est": 2,
+                "cx_size": "S",
+                "cx_ready": true,
+                "cx_not_ready_reason": null,
+                "cx_by": "test-classifier:v1",
+                "pr": fixture.pr,
+                "daemon_publication": {
+                    "branch": head_ref,
+                    "local_sha": stale_delivery,
+                    "pr": fixture.pr,
+                    "stage": "intent",
+                    "target_branch": fixture.target_branch,
+                    "expected_remote_sha": expected_sha,
+                }
+            });
+            conn.execute(
+                "UPDATE tasks
+                 SET status='rework', author='Original', rework_round=1, refs=?1
+                 WHERE id=1",
+                [refs.to_string()],
+            )
+            .unwrap();
+            quorum_core::pr_targets::upsert(
+                &mut conn,
+                1,
+                fixture.pr,
+                &head_ref,
+                &expected_sha,
+                false,
+            )
+            .unwrap();
+            quorum_core::tasks::park(&mut conn, 1, "daemon-owned publication failed", "rework", 2)
+                .unwrap()
+                .unwrap();
+            drop(conn);
+
+            let retry = Command::new(cargo_bin("quorum"))
+                .env("QUORUM_HOME", home.path())
+                .env("QUORUM_REPO", "test/repo")
+                .args(["task-retry", "--task-id", "1", "--by", "operator"])
+                .output()
+                .unwrap();
+            assert!(
+                retry.status.success(),
+                "task-retry failed: {}",
+                String::from_utf8_lossy(&retry.stderr)
+            );
+            let retried = quorum_core::tasks::get(
+                &quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap(),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+            let retried_refs: serde_json::Value =
+                serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(retried.status, "rework");
+            assert_eq!(retried_refs["daemon_rework_retry_requested"], true);
+            assert_eq!(retried_refs["daemon_publication"]["pr"], fixture.pr);
+            parked_expected_sha = Some(expected_sha);
+            parked_remote_sha = Some(remote_sha);
         }
 
         // A review-only task has no managed branch or worker. Persist the
@@ -304,6 +809,18 @@ impl Case {
             };
             std::fs::write(gh_state.join(pr.to_string()), head_ref).unwrap();
         }
+        if let Some(fixture) = parked_publication {
+            std::fs::write(
+                gh_state.join(fixture.pr.to_string()),
+                format!("parked-pr-{}", fixture.pr),
+            )
+            .unwrap();
+            std::fs::write(
+                gh_state.join(format!("base-{}", fixture.pr)),
+                fixture.target_branch,
+            )
+            .unwrap();
+        }
         let gh_path = gh_shim.path().join("gh");
         std::fs::write(
             &gh_path,
@@ -334,12 +851,41 @@ elif [ "$cmd" = "pr list" ]; then
   fi
 elif [ "$cmd" = "pr view" ]; then
   pr="$3"
+  if [ -f "$QUORUM_TEST_GH_STATE/block-pr-view" ]; then
+    : > "$QUORUM_TEST_GH_STATE/started-pr-view"
+    while [ ! -f "$QUORUM_TEST_GH_STATE/release-pr-view" ]; do /bin/sleep 0.05; done
+    rm -f "$QUORUM_TEST_GH_STATE/block-pr-view"
+  fi
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" ls-remote origin "refs/heads/$branch" | awk '{print $1}')"
   if [ -z "$sha" ]; then
     sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
   fi
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+  base=main
+  state=OPEN
+  if [ -f "$QUORUM_TEST_GH_STATE/base-$pr" ]; then
+    base="$(cat "$QUORUM_TEST_GH_STATE/base-$pr")"
+  fi
+  if [ -f "$QUORUM_TEST_GH_STATE/state-$pr" ]; then
+    state="$(cat "$QUORUM_TEST_GH_STATE/state-$pr")"
+  fi
+  case " $* " in
+    *" --json statusCheckRollup,mergeStateStatus "*)
+      printf '{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}\n'
+      exit 0
+      ;;
+    *" --json mergeCommit "*)
+      printf '{"mergeCommit":{"oid":"%s"}}\n' "$sha"
+      exit 0
+      ;;
+    *" --json headRefOid --jq .headRefOid "*)
+      printf '%s\n' "$sha"
+      exit 0
+      ;;
+  esac
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"%s","state":"%s"}\n' "$branch" "$sha" "$base" "$state"
+elif [ "$cmd" = "pr review" ] || [ "$cmd" = "pr merge" ]; then
+  exit 0
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -355,13 +901,15 @@ fi
         {
             std::fs::copy(&runner, &codex_path).unwrap();
         }
-        let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", gh_shim.path().display());
+        let path = test_command_path(gh_shim.path());
         let sentinel = tempfile::tempdir().unwrap();
+        let (runner_hold_reader, runner_hold_writer) = runner_hold_pipe();
         let mut serve = Command::new(cargo_bin("quorum"));
         serve
             .env("QUORUM_HOME", home.path())
             .env("QUORUM_REPO", "test/repo")
             .env("RUNNER_LOG", &runner_log)
+            .env("RUNNER_HOLD_FD", runner_hold_reader.as_raw_fd().to_string())
             .env("PATH", path)
             .env("QUORUM_TEST_GH_STATE", &gh_state)
             .env("QUORUM_TEST_REPO", repo.path())
@@ -377,17 +925,21 @@ fi
                 &worktrees.path().to_string_lossy(),
                 "--names-file",
                 &names.to_string_lossy(),
-                "--merge-cmd",
-                "true",
-                "--merge-checks-cmd",
-                "echo ready",
-                "--merge-checks-timeout-secs",
-                "10",
-                "--merge-checks-poll-secs",
-                "1",
                 "--exit-when-gone",
                 &sentinel.path().to_string_lossy(),
             ]);
+        if !use_gh_merge {
+            serve.args([
+                "--merge-cmd",
+                "true",
+                "--merge-checks-cmd",
+                merge_checks_cmd.unwrap_or("echo ready"),
+                "--merge-checks-timeout-secs",
+                "10",
+                "--merge-checks-poll-secs",
+                "30",
+            ]);
+        }
         serve.args(["--config", &config_path.to_string_lossy()]);
         if !config_contents.contains("runner = \"codex\"") {
             serve.args(["--agent-bin", &runner.to_string_lossy()]);
@@ -412,17 +964,50 @@ fi
             _worktrees: worktrees,
             gh_shim,
             runner_log,
+            parked_expected_sha,
+            parked_remote_sha,
             handle: ServeHandle {
                 child,
                 rx,
                 lines: Vec::new(),
                 _sentinel: sentinel,
+                runner_hold_writer: Some(runner_hold_writer),
             },
         }
     }
 
     fn db(&self) -> rusqlite::Connection {
         quorum_core::db::open(&self.home.path().join("repos/test__repo/quorum.db")).unwrap()
+    }
+
+    /// Wait until the daemon has completed at least one full scheduling tick.
+    ///
+    /// A single mailbox marker is observed in Phase 2, before reviewer and
+    /// worker provisioning. Appending the second marker only after the first
+    /// is consumed forces it into a later tick, proving that every phase of
+    /// the prior tick ran without relying on its 500ms cadence.
+    fn wait_for_completed_tick(&mut self) {
+        for marker in ["ProviderLifecycleTick0", "ProviderLifecycleTick1"] {
+            let mut conn = self.db();
+            quorum_core::mailbox::append(
+                &mut conn,
+                &quorum_core::mailbox::MailboxRow {
+                    agent: marker.into(),
+                    kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
+                    task_id: None,
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: Some("readiness barrier".into()),
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            drop(conn);
+            self.handle
+                .wait_for(&format!("consuming unmatched task_update from {marker}"));
+        }
     }
 
     fn restart(&mut self, default_provider: &str, model: &str) {
@@ -445,6 +1030,11 @@ fi
         model: &str,
         role_config: Option<&str>,
     ) {
+        // Instance-identity authority (task #179) blocks a restart against a
+        // fresh `daemon_lock` row from a different instance, so a SIGKILL-based
+        // `crash_mut` must clear the leftover row before the next process
+        // starts (matches supervisor behavior in production).
+        common::clear_daemon_lock(&self.home.path().join("repos/test__repo/quorum.db"));
         let names = self.home.path().join("names.txt");
         let runner = self.home.path().join("dual-runner.sh");
         let config_path = self.home.path().join("restart-serve.toml");
@@ -459,18 +1049,14 @@ fi
             .unwrap_or_else(|| routing_config(default_provider, model));
         std::fs::write(&config_path, &config_contents).unwrap();
         let sentinel = tempfile::tempdir().unwrap();
+        let (runner_hold_reader, runner_hold_writer) = runner_hold_pipe();
         let mut serve = Command::new(cargo_bin("quorum"));
         serve
             .env("QUORUM_HOME", self.home.path())
             .env("QUORUM_REPO", "test/repo")
             .env("RUNNER_LOG", &self.runner_log)
-            .env(
-                "PATH",
-                format!(
-                    "{}:/usr/bin:/bin:/usr/sbin:/sbin",
-                    self.gh_shim.path().display()
-                ),
-            )
+            .env("RUNNER_HOLD_FD", runner_hold_reader.as_raw_fd().to_string())
+            .env("PATH", test_command_path(self.gh_shim.path()))
             .env("QUORUM_TEST_GH_STATE", self.gh_shim.path().join("state"))
             .env("QUORUM_TEST_REPO", self._repo.path())
             .args([
@@ -492,7 +1078,7 @@ fi
                 "--merge-checks-timeout-secs",
                 "10",
                 "--merge-checks-poll-secs",
-                "1",
+                "30",
                 "--exit-when-gone",
                 &sentinel.path().to_string_lossy(),
             ]);
@@ -519,27 +1105,31 @@ fi
             rx,
             lines: Vec::new(),
             _sentinel: sentinel,
+            runner_hold_writer: Some(runner_hold_writer),
         };
     }
 
     fn done(&self, agent: &str, args: &[&str]) {
-        let mut conn = self.db();
-        let run_id = match quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
-            Some(cap) => cap.run_id,
-            None => {
-                let run_id = format!("test-{agent}-{}", std::process::id());
-                let role = if args.contains(&"--verdict") {
-                    "reviewer"
-                } else {
-                    "worker"
-                };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
-                quorum_core::capabilities::issue(&mut conn, &run_id, 1, agent, role, now).unwrap();
-                run_id
+        let role = if args.contains(&"--verdict") {
+            "reviewer"
+        } else {
+            "worker"
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let run_id = loop {
+            let conn = self.db();
+            if let Some(cap) = quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
+                if cap.role == role
+                    && quorum_core::capabilities::resolve_live_run_context(&conn, &cap.run_id, role)
+                        .is_ok()
+                {
+                    break cap.run_id;
+                }
             }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for live {role} run capability for {agent}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
         };
         let mut command = Command::new(cargo_bin("quorum"));
         let mut done_args = Vec::new();
@@ -556,6 +1146,7 @@ fi
         command
             .env("QUORUM_HOME", self.home.path())
             .env("QUORUM_REPO", "test/repo")
+            .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(self.home.path()))
             .env("QUORUM_RUN_ID", run_id)
             .args(["done", "--agent", agent])
             .args(done_args);
@@ -565,6 +1156,36 @@ fi
             "done failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Append a Done row for recovery tests that intentionally signal while
+    /// the endpoint is unavailable or the pre-restart capability is revoked.
+    fn append_done(&self, agent: &str, args: &[&str]) {
+        let value = |flag| {
+            args.iter()
+                .zip(args.iter().skip(1))
+                .find(|(key, _)| **key == flag)
+                .map(|(_, value)| *value)
+        };
+        let blocking =
+            value("--blocking").map(|raw| raw.parse::<u32>().expect("--blocking must be a number"));
+        let verdict = value("--verdict");
+        let row = quorum_core::mailbox::MailboxRow {
+            agent: agent.to_string(),
+            kind: quorum_core::mailbox::MailboxKind::Done,
+            task_id: Some(1),
+            pr: verdict
+                .is_some()
+                .then(|| value("--pr"))
+                .flatten()
+                .map(|raw| raw.parse::<i64>().expect("--pr must be a number")),
+            verdict: verdict.map(str::to_string),
+            feedback: value("--feedback").map(str::to_string),
+            note: None,
+            to_agent: None,
+            payload: blocking.map(|count| format!(r#"{{"blocking":{count}}}"#)),
+        };
+        quorum_core::mailbox::append(&mut self.db(), &row).unwrap();
     }
 
     fn retry_parked(&self) {
@@ -651,6 +1272,266 @@ fn run_routes_with_effort(
 }
 
 const CHATGPT_ONLY_ROLE_CONFIG: &str = "chatgpt-only-routing";
+
+#[cfg(unix)]
+fn assert_parked_rework_retry_publishes_from(remote_state: ParkedRemoteState) {
+    let mut case = Case::start_parked_publication(remote_state);
+    case.handle.wait_for("worktree provisioned");
+    let worker = case.handle.agent_after("spawning agent ");
+    case.handle.wait_for("turn");
+
+    let provision_base_sha = case.parked_remote_sha.as_deref().unwrap();
+    let (
+        worktree,
+        remote_branch,
+        rework_count,
+        stale_source_sha,
+        retry_requested,
+        persisted_baseline_sha,
+        publication_baseline_sha,
+    ) = {
+        let conn = case.db();
+        let journal = conn
+            .query_row(
+                "SELECT worktree,branch,rework_count
+             FROM journal WHERE task_id=1 AND role='worker'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+        (
+            journal.0,
+            journal.1,
+            journal.2,
+            refs["daemon_publication"]["local_sha"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            refs["daemon_rework_retry_requested"]
+                .as_bool()
+                .unwrap_or(false),
+            target.head_sha,
+            refs["daemon_publication"]["expected_remote_sha"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    };
+    assert!(
+        retry_requested,
+        "retry marker disappeared before worker spawn"
+    );
+    assert_eq!(
+        remote_branch, "parked-pr-10",
+        "parked retry did not select recorded PR target: {:?}",
+        case.handle.lines
+    );
+    assert_eq!(rework_count, 1);
+    assert_eq!(persisted_baseline_sha, provision_base_sha);
+    assert_eq!(publication_baseline_sha, provision_base_sha);
+    for ancestor in [provision_base_sha, "origin/main"] {
+        assert!(
+            Command::new("git")
+                .args([
+                    "-C",
+                    &worktree,
+                    "merge-base",
+                    "--is-ancestor",
+                    ancestor,
+                    "HEAD",
+                ])
+                .status()
+                .unwrap()
+                .success(),
+            "provisioned retry HEAD must descend from {ancestor}"
+        );
+    }
+
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "parked retry delivery",
+            "-m",
+            "Co-Authored-By: Retry-Worker <retry@example.invalid>",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let delivery_sha = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &worktree, "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(delivery_sha, stale_source_sha);
+
+    let hooks = tempfile::tempdir().unwrap();
+    install_real_pre_push_hook(case._repo.path(), hooks.path());
+    case.done(&worker, &[]);
+    case.handle.wait_for("PR #10 ready for review");
+
+    let remote_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "rev-parse",
+                "refs/heads/parked-pr-10",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(remote_sha, delivery_sha);
+    assert_ne!(remote_sha, stale_source_sha);
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert!(
+        refs.get("daemon_publication").is_none(),
+        "daemon publisher must retire the superseded delivery intent"
+    );
+    drop(conn);
+    case.handle.stop_mut();
+}
+
+#[cfg(unix)]
+#[test]
+fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() {
+    assert_parked_rework_retry_publishes_from(ParkedRemoteState::ExpectedHead);
+}
+
+#[cfg(unix)]
+#[test]
+fn parked_rework_publication_retry_recovers_already_published_source() {
+    assert_parked_rework_retry_publishes_from(ParkedRemoteState::PublishedSource);
+}
+
+#[cfg(unix)]
+#[test]
+fn targeted_parked_rework_retry_uses_task_target_before_worker_provisioning() {
+    let mut case = Case::start_targeted_parked_publication();
+    case.handle.wait_for("worktree provisioned");
+    case.handle.wait_for("turn");
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    assert_eq!(task.target_branch.as_deref(), Some("develop"));
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_rework_retry_requested"], true);
+    assert!(refs.get("daemon_parked").is_none());
+    let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+    assert_eq!(target.head_ref, "parked-pr-10");
+    let journal_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM journal WHERE task_id=1 AND role='worker'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        journal_rows, 1,
+        "targeted retry must reach worker provisioning"
+    );
+    drop(conn);
+    case.handle.stop_mut();
+}
+
+#[test]
+fn parked_rework_publication_retry_parks_when_remote_head_moved() {
+    let mut case = Case::start_parked_publication(ParkedRemoteState::UnrelatedHead);
+    case.handle
+        .wait_for("PR #10 head moved outside publication lease");
+    case.wait_for_completed_tick();
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_parked"], true);
+    assert_eq!(refs["daemon_resume_status"], "rework");
+    assert!(refs["daemon_parked_reason"]
+        .as_str()
+        .unwrap()
+        .contains("provisioning rejected"));
+    assert_eq!(
+        quorum_core::agent_runs::runs_for_task(&conn, 1)
+            .unwrap()
+            .len(),
+        0,
+        "head drift must fail before a worker process receives authority"
+    );
+    let journal_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM journal WHERE task_id=1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(journal_rows, 0);
+    let persisted = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+    assert_eq!(
+        persisted.head_sha,
+        case.parked_expected_sha.as_deref().unwrap(),
+        "an unrelated live head must not rotate the durable baseline"
+    );
+    assert_eq!(
+        refs["daemon_publication"]["expected_remote_sha"],
+        case.parked_expected_sha.as_deref().unwrap(),
+        "an unrelated live head must not rewrite publication authority"
+    );
+    drop(conn);
+
+    let remote_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "rev-parse",
+                "refs/heads/parked-pr-10",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(remote_sha, case.parked_remote_sha.as_deref().unwrap());
+    assert_ne!(remote_sha, case.parked_expected_sha.as_deref().unwrap());
+
+    let calls = std::fs::read_to_string(case.gh_shim.path().join("state/calls")).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("pr view 10"))
+            .count(),
+        1
+    );
+    assert!(!calls.lines().any(|line| line.starts_with("pr create")));
+    case.handle.stop_mut();
+}
 
 #[test]
 fn continuation_worker_without_pr_recovers_pre_fix_intent_with_spawn_lease() {
@@ -748,8 +1629,8 @@ fn continuation_worker_without_pr_recovers_pre_fix_intent_with_spawn_lease() {
     assert_eq!(quorum_core::tasks::extract_pr_number(&task.refs), Some(10));
     let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
     assert_eq!(
-        target.head_sha, baseline_sha,
-        "publication must retain the spawn-time lease baseline"
+        target.head_sha, published_sha,
+        "continuation publication must rotate the spawn-time lease to the exact published head"
     );
     drop(conn);
 
@@ -759,6 +1640,48 @@ fn continuation_worker_without_pr_recovers_pre_fix_intent_with_spawn_lease() {
         !gh_calls.lines().any(|line| line.starts_with("pr create")
             || (line.starts_with("pr list") && line.contains("--head"))),
         "continuation publication must never enter initial-PR routing: {gh_calls}"
+    );
+}
+
+#[test]
+fn dropping_serve_handle_releases_sticky_codex_runner() {
+    let mut case = Case::start_continue("codex", "gpt-5.6-terra", 10);
+    case.handle.wait_for("spawning agent");
+    case.handle.wait_for("turn");
+
+    let runner_pid = wait_until("sticky Codex runner PID", Duration::from_secs(5), || {
+        let log = std::fs::read_to_string(&case.runner_log).unwrap();
+        match log.lines().find_map(|line| {
+            line.strip_prefix("hold-pid|")
+                .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        }) {
+            Some(pid) => WaitState::Ready(pid),
+            None => WaitState::Pending(log),
+        }
+    });
+    assert_eq!(unsafe { libc::kill(runner_pid, 0) }, 0);
+
+    // Implicit fixture teardown hard-kills only the daemon. Closing the
+    // fixture-owned hold pipe must also let the provider process exit.
+    drop(case);
+    wait_until(
+        "sticky Codex runner cleanup after ServeHandle drop",
+        Duration::from_secs(5),
+        || {
+            if process_has_finished_execution(runner_pid) {
+                WaitState::Ready(())
+            } else {
+                WaitState::Pending(format!("runner PID {runner_pid} is still executing"))
+            }
+        },
+    );
+}
+
+#[test]
+fn linux_proc_stat_state_uses_the_final_command_delimiter() {
+    assert_eq!(
+        linux_proc_stat_state("12477 (fake) runner) Z 1 2 3"),
+        Some(b'Z')
     );
 }
 
@@ -809,7 +1732,7 @@ fn restart_recovery_retains_journal_pr_when_worker_omits_pr() {
     // Crash before the worker signal is observed. Startup must recover the
     // exact journal identity even though the durable mailbox row has no PR.
     case.handle.crash_mut();
-    case.done(&worker, &[]);
+    case.append_done(&worker, &[]);
     case.restart_after_stop("codex", "gpt-5.6-terra", None);
     case.handle.wait_for("startup worker recovery: folded");
 
@@ -938,9 +1861,94 @@ fn continuation_publication_rejects_a_head_moved_after_spawn() {
     );
 }
 
+fn assert_continuation_publication_rejects_live_target_change(
+    metadata: &str,
+    value: &str,
+    expected_error: &str,
+) {
+    let mut case = Case::start_continue("codex", "gpt-5.6-terra", 10);
+    case.handle.wait_for("spawning agent");
+    let worker = case.handle.agent_after("spawning agent ");
+    case.handle.wait_for("turn");
+
+    let (worktree, baseline_sha) = {
+        let conn = case.db();
+        let worktree: String = conn
+            .query_row(
+                "SELECT worktree FROM journal WHERE agent=?1",
+                [&worker],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+        (worktree, target.head_sha)
+    };
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "continuation work",
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    std::fs::write(
+        case.gh_shim.path().join(format!("state/{metadata}-10")),
+        value,
+    )
+    .unwrap();
+    case.done(&worker, &[]);
+    case.handle.wait_for(expected_error);
+    case.handle.wait_for("PARKED: task #1");
+
+    let remote_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "rev-parse",
+                "refs/heads/continue-pr-10",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(
+        remote_sha, baseline_sha,
+        "live PR metadata drift must prevent any remote update"
+    );
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_parked"], true);
+}
+
+#[test]
+fn continuation_publication_rejects_same_sha_base_retarget() {
+    assert_continuation_publication_rejects_live_target_change("base", "develop", "targets base");
+}
+
+#[test]
+fn continuation_publication_rejects_same_sha_closed_pr() {
+    assert_continuation_publication_rejects_live_target_change(
+        "state",
+        "CLOSED",
+        "is closed (unmerged)",
+    );
+}
+
 #[test]
 fn configurable_chatgpt_only_lifecycle_persists_role_models_and_efforts() {
-    let runs = Case::start_with_role_config(
+    let runs = Case::start_with_role_config_and_merge_metadata(
         "claude",
         "claude-opus-4-6",
         None,
@@ -961,7 +1969,7 @@ fn configurable_chatgpt_only_lifecycle_persists_role_models_and_efforts() {
 
 #[test]
 fn configurable_chatgpt_only_ignores_legacy_claude_task_tier() {
-    let runs = Case::start_with_role_config(
+    let runs = Case::start_with_role_config_and_merge_metadata(
         "claude",
         "claude-opus-4-6",
         Some(r#"["tier:opus-46"]"#),
@@ -982,7 +1990,7 @@ fn configurable_chatgpt_only_ignores_legacy_claude_task_tier() {
 
 #[test]
 fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
-    let claude = Case::start("claude", "claude-opus-4-6", None).finish();
+    let claude = Case::start_with_merge_metadata("claude", "claude-opus-4-6", None).finish();
     assert_eq!(
         run_routes(&claude),
         [
@@ -992,7 +2000,7 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
         ]
     );
 
-    let codex = Case::start("codex", "o3", None).finish();
+    let codex = Case::start_with_merge_metadata("codex", "o3", None).finish();
     assert_eq!(
         run_routes(&codex),
         [
@@ -1002,7 +2010,7 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
         ]
     );
 
-    let mixed = Case::start(
+    let mixed = Case::start_with_merge_metadata(
         "claude",
         "claude-opus-4-6",
         Some(r#"["tier:terra","effort:high"]"#),
@@ -1020,7 +2028,7 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
 
 #[test]
 fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
-    let mut case = Case::start_with_role_config(
+    let mut case = Case::start_with_role_config_and_merge_metadata(
         "codex",
         "gpt-5.6-terra",
         None,
@@ -1097,6 +2105,184 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
 }
 
 #[test]
+fn changed_worker_routing_remediation_resumes_original_worker_layout() {
+    let mut case = Case::start("codex", "gpt-5.6-terra", None);
+    case.handle.wait_for("spawning agent ");
+    let original_worker = case.handle.agent_after("spawning agent ");
+    case.handle
+        .wait_for(&format!("worker {original_worker} result"));
+    let original_thread = format!("thread-{original_worker}");
+    case.append_done(&original_worker, &["--pr", "1"]);
+
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+
+    // This restart changes all new worker allocations to Claude, while
+    // retaining the original Codex profile for the in-flight continuation.
+    case.handle.stop_mut();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "-f",
+            "daemon/agent0-t1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.restart_after_stop("claude", "claude-opus-4-6", Some(&rerouted_worker_config()));
+    case.handle.wait_for(&format!(
+        "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
+    ));
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+    case.append_done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "resume the original allocation",
+        ],
+    );
+
+    case.handle.wait_for("spawning remediation worker ");
+    let remediation = case.handle.agent_after("spawning remediation worker ");
+    case.handle
+        .wait_for(&format!("worker {remediation} result"));
+
+    let log = std::fs::read_to_string(&case.runner_log).unwrap();
+    let resume =
+        format!("{remediation}|exec resume {original_thread} --json --model gpt-5.6-terra ");
+    assert!(
+        log.lines().any(|line| line.starts_with(&resume)),
+        "changed worker routing must not reselect the remediation model: {log}"
+    );
+    assert!(
+        !log.lines().any(|line| line.starts_with(&format!(
+            "{remediation}|exec resume {original_thread} --json --model claude-opus-4-6 "
+        ))),
+        "remediation must never switch to the current Claude worker route: {log}"
+    );
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    let first_worker = quorum_core::agent_runs::first_worker(&conn, 1)
+        .unwrap()
+        .expect("initial worker snapshot");
+    assert_eq!(first_worker.agent, original_worker);
+    assert_eq!(first_worker.model, "gpt-5.6-terra");
+    assert_eq!(first_worker.effort, "high");
+    assert_eq!(first_worker.provider.as_deref(), Some("codex"));
+    let resumed_worker = quorum_core::agent_runs::runs_for_task(&conn, 1)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.role == "worker" && run.agent == remediation)
+        .expect("spawn_remediation_worker must persist resumed worker evidence");
+    assert_eq!(
+        resumed_worker.role_assignment_id, first_worker.role_assignment_id,
+        "recovery must retain the original canonical routing assignment"
+    );
+    drop(conn);
+
+    case.append_done(&remediation, &["--pr", "1"]);
+    case.handle.wait_for("lifecycle: task #1 -> in-review");
+    case.handle.stop();
+}
+
+#[test]
+fn removed_original_worker_profile_parks_remediation_and_releases_lease() {
+    let mut case = Case::start("codex", "gpt-5.6-terra", None);
+    case.handle.wait_for("spawning agent ");
+    let original_worker = case.handle.agent_after("spawning agent ");
+    case.handle
+        .wait_for(&format!("worker {original_worker} result"));
+    case.done(&original_worker, &["--pr", "1"]);
+
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+
+    // Remove the historical Codex profile after its first worker run. A
+    // continuation must fail closed rather than using a catalog-default or
+    // replacement Claude route.
+    case.handle.stop_mut();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "-f",
+            "daemon/agent0-t1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.restart_after_stop("claude", "claude-opus-4-6", None);
+    case.handle.wait_for(&format!(
+        "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
+    ));
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "do not reroute this worker",
+        ],
+    );
+    case.handle.wait_for("PARKED: task #1");
+    case.wait_for_completed_tick();
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    let reason = refs["daemon_parked_reason"]
+        .as_str()
+        .expect("explicit remediation provider park reason");
+    assert!(
+        reason.contains("remediation provider recovery failed")
+            && reason.contains("no longer configured"),
+        "the removed original provider/model must park with an actionable reason: {reason}"
+    );
+    assert!(
+        !reason.contains("historical worker run does not match durable routing assignment"),
+        "the retired current-routing equality error must not mask the park cause: {reason}"
+    );
+    let active_claims: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM claims WHERE target='task:1' AND active=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        active_claims, 0,
+        "the failed remediation lease must be released"
+    );
+    let first_worker = quorum_core::agent_runs::first_worker(&conn, 1)
+        .unwrap()
+        .expect("original worker snapshot remains durable");
+    assert_eq!(first_worker.agent, original_worker);
+    assert_eq!(first_worker.model, "gpt-5.6-terra");
+    assert_eq!(first_worker.provider.as_deref(), Some("codex"));
+    drop(conn);
+    case.handle.stop();
+}
+
+#[test]
 fn workerless_review_only_changes_start_fresh_codex_remediation_on_verified_pr() {
     let mut case = Case::start_review_only("codex", "gpt-5.6-terra");
 
@@ -1130,7 +2316,7 @@ fn workerless_review_only_changes_start_fresh_codex_remediation_on_verified_pr()
     assert_eq!(task.assignee.as_deref(), Some(remediation.as_str()));
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
     assert_eq!(
-        refs["codex_thread_id"].as_str(),
+        refs["runner_continuation"]["id"].as_str(),
         Some(format!("thread-{remediation}").as_str()),
         "the fresh remediation thread must be durable before any later continuation"
     );
@@ -1213,7 +2399,7 @@ fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop(
         ],
     );
     case.handle.wait_for("PARKED: task #1");
-    std::thread::sleep(Duration::from_millis(500));
+    case.wait_for_completed_tick();
 
     let conn = case.db();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
@@ -1615,7 +2801,7 @@ fn drain_park_of_remediation_stays_owner_gated_on_restart() {
     let runner_log_before_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     case.restart_after_stop("claude", "claude-opus-4-6", None);
     case.handle.wait_for("recovery: complete");
-    std::thread::sleep(Duration::from_millis(750));
+    case.wait_for_completed_tick();
     let runner_log_after_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     assert_eq!(
         runner_log_after_restart, runner_log_before_restart,
@@ -1713,14 +2899,14 @@ fn remediation_retry_for_implementation_task_preserves_feedback_and_codex_thread
         ],
     );
     case.handle.wait_for("PARKED: task #1");
-    std::thread::sleep(Duration::from_millis(250));
 
     let conn = case.db();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
     assert_eq!(task.status, "failed");
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
     assert_eq!(refs["remediation_feedback"], "preserve this exact blocker");
-    assert_eq!(refs["codex_thread_id"], original_thread);
+    assert_eq!(refs["runner_continuation"]["provider"], "codex");
+    assert_eq!(refs["runner_continuation"]["id"], original_thread);
     drop(conn);
 
     write_dual_protocol_runner(case.home.path());
@@ -1787,7 +2973,7 @@ fn restart_resumes_codex_reviewer_with_persisted_identity_model_and_thread() {
     let task = quorum_core::tasks::get(&case.db(), 1).unwrap().unwrap();
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
     assert_eq!(
-        refs["codex_reviewer_r1_thread_id"].as_str(),
+        refs["runner_reviewer_r1_continuation"]["id"].as_str(),
         Some(expected_thread.as_str())
     );
     let head_sha = String::from_utf8(
@@ -1850,7 +3036,7 @@ fn strict_codex_restart_does_not_resume_interrupted_claude_reviewer() {
     let runner_log_before_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     case.restart_with_role_config("codex", "gpt-5.6-terra", Some(CHATGPT_ONLY_ROLE_CONFIG));
     case.handle.wait_for("recovery: complete");
-    std::thread::sleep(Duration::from_millis(750));
+    case.wait_for_completed_tick();
 
     let runner_log_after_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     assert_eq!(
@@ -1873,6 +3059,193 @@ fn strict_codex_restart_does_not_resume_interrupted_claude_reviewer() {
     assert_eq!(
         claims, 0,
         "incompatible reviewer recovery must not retain a claim"
+    );
+    drop(conn);
+    case.handle.stop_mut();
+}
+
+#[cfg(unix)]
+#[test]
+fn consecutive_reviewer_and_ci_rework_publications_rotate_pr_head_authority() {
+    let checks = tempfile::tempdir().unwrap();
+    let checks_count = checks.path().join("count");
+    let checks_cmd = format!(
+        "n=$(cat '{}' 2>/dev/null || echo 0); n=$((n+1)); printf '%s' \"$n\" > '{}'; \
+         if [ \"$n\" -eq 2 ]; then printf 'failed\\nci-test\\n'; else printf 'ready\\n'; fi",
+        checks_count.display(),
+        checks_count.display(),
+    );
+    let mut case = Case::start_with_role_config_and_checks(
+        "codex",
+        "gpt-5.6-terra",
+        Some(CHATGPT_ONLY_ROLE_CONFIG),
+        &checks_cmd,
+    );
+    case.handle.wait_for("spawning agent");
+    let worker = case.handle.agent_after("spawning agent ");
+    case.handle.wait_for("turn");
+    case.done(&worker, &["--pr", "1"]);
+
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for("result");
+    let (worktree, branch, initial_sha) = {
+        let conn = case.db();
+        let (worktree, branch): (String, String) = conn
+            .query_row(
+                "SELECT worktree,branch FROM journal WHERE task_id=1 AND role='worker'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let target = quorum_core::pr_targets::get(&conn, 1, 1).unwrap().unwrap();
+        (worktree, branch, target.head_sha)
+    };
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "first remediation",
+        ],
+    );
+    case.handle.wait_for("rework #1 started");
+    case.handle.wait_for("turn");
+
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "first reviewer rework",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let first_rework_sha = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &worktree, "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(first_rework_sha, initial_sha);
+    // CommandMergeExecutor models the gated PR head with repo-dir HEAD. Keep
+    // that test double aligned with the just-published PR head so the failed-CI
+    // intent carries the same exact SHA that the live gh shim will resolve.
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "update-ref",
+            "HEAD",
+            &first_rework_sha
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.done(&worker, &["--pr", "1"]);
+    case.handle.wait_for("failed (ci-test) — entering rework");
+    {
+        let conn = case.db();
+        assert_eq!(
+            quorum_core::pr_targets::get(&conn, 1, 1)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            first_rework_sha,
+            "first rework settlement must rotate the durable PR head",
+        );
+    }
+    case.handle.wait_for("rework #2 (pre-review CI failure)");
+    case.handle.wait_for("turn");
+
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "second CI rework",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let second_rework_sha = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &worktree, "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(second_rework_sha, first_rework_sha);
+
+    // Publication persists its intent before resolving the authoritative live
+    // target. Block that existing provider boundary to inspect the exact
+    // second-round lease without relying on timing or worktree hook config.
+    let gh_state = case.gh_shim.path().join("state");
+    let pr_view_started = gh_state.join("started-pr-view");
+    std::fs::write(gh_state.join("block-pr-view"), "block").unwrap();
+
+    case.done(&worker, &["--pr", "1"]);
+    wait_until(
+        "second publication to resolve its live PR target",
+        Duration::from_secs(10),
+        || {
+            if pr_view_started.exists() {
+                WaitState::Ready(())
+            } else {
+                WaitState::Pending("PR target resolution has not started".into())
+            }
+        },
+    );
+    {
+        let conn = case.db();
+        let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs["daemon_publication"]["expected_remote_sha"], first_rework_sha,
+            "the second rework must lease the immediately preceding published head",
+        );
+        assert_eq!(refs["daemon_publication"]["local_sha"], second_rework_sha);
+        assert_eq!(refs["daemon_publication"]["branch"], branch);
+        assert_eq!(
+            quorum_core::pr_targets::get(&conn, 1, 1)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            first_rework_sha,
+            "authority must not rotate before the verified push settles",
+        );
+    }
+    std::fs::write(gh_state.join("release-pr-view"), "release").unwrap();
+    case.handle.wait_for("PR #1 ready for review");
+    case.handle.wait_for("checks ready");
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    assert_eq!(
+        quorum_core::pr_targets::get(&conn, 1, 1)
+            .unwrap()
+            .unwrap()
+            .head_sha,
+        second_rework_sha,
+        "the second publication must rotate authority again",
     );
     drop(conn);
     case.handle.stop_mut();

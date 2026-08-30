@@ -2,11 +2,41 @@
 
 use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 const BAG_SLOTS: usize = 100;
+
+/// Marker replaced by [`guarded_evidence_insert`] with the assignment-match
+/// predicate. The SQL before this marker must be an `INSERT ... SELECT` without
+/// a `WHERE` clause; additional `AND` predicates and clauses such as
+/// `ON CONFLICT` may follow the marker.
+pub const EVIDENCE_ASSIGNMENT_GUARD: &str = "/* quorum-role-assignment-guard */";
+
+const EVIDENCE_ASSIGNMENT_ID_PARAM: &str = ":quorum_assignment_id";
+const EVIDENCE_TASK_ID_PARAM: &str = ":quorum_assignment_task_id";
+const EVIDENCE_RESPONSIBILITY_PARAM: &str = ":quorum_assignment_responsibility";
+const EVIDENCE_ROLE_PARAM: &str = ":quorum_assignment_role";
+const EVIDENCE_PROVIDER_PARAM: &str = ":quorum_assignment_provider";
+const EVIDENCE_RUNNER_PARAM: &str = ":quorum_assignment_runner";
+const EVIDENCE_MODEL_PARAM: &str = ":quorum_assignment_model";
+const EVIDENCE_EFFORT_PARAM: &str = ":quorum_assignment_effort";
+
+const EVIDENCE_ASSIGNMENT_PREDICATE: &str = "WHERE (
+    :quorum_assignment_id IS NULL
+    OR EXISTS(
+        SELECT 1 FROM role_assignments AS assignment
+        WHERE assignment.id=:quorum_assignment_id
+          AND assignment.task_id IS :quorum_assignment_task_id
+          AND assignment.responsibility_key=:quorum_assignment_responsibility
+          AND assignment.role=:quorum_assignment_role
+          AND assignment.provider=:quorum_assignment_provider
+          AND assignment.runner=:quorum_assignment_runner
+          AND assignment.model=:quorum_assignment_model
+          AND assignment.effort=:quorum_assignment_effort
+    )
+)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelProfile {
@@ -41,6 +71,21 @@ pub struct AssignmentRequest {
     pub complexity: Option<String>,
 }
 
+/// Immutable responsibility identity supplied by a prospective evidence writer.
+///
+/// This deliberately excludes route fields: those are checked against the
+/// assignment's executable snapshot separately. Keeping the lifecycle identity
+/// together prevents a valid route from being attributed to a different task,
+/// responsibility, PR, or reviewer stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssignmentIdentity<'a> {
+    pub task_id: Option<i64>,
+    pub responsibility_key: &'a str,
+    pub role: &'a str,
+    pub pr_number: Option<i64>,
+    pub review_stage: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleAssignment {
     pub id: i64,
@@ -58,6 +103,55 @@ pub struct RoleAssignment {
     pub pool_key: String,
     pub policy_generation: String,
     pub created_at: i64,
+}
+
+impl RoleAssignment {
+    /// The immutable executable profile snapshot selected for this responsibility.
+    pub fn profile_snapshot(&self) -> ModelProfile {
+        ModelProfile {
+            id: self.profile_id.clone(),
+            provider: self.provider.clone(),
+            runner: self.runner.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        }
+    }
+
+    /// Whether a pool is the exact policy generation that created this assignment.
+    pub fn matches_pool_generation(&self, pool: &ValidatedPool) -> bool {
+        self.pool_key == pool.pool_key && self.policy_generation == pool.policy_generation
+    }
+
+    /// Whether caller-supplied lifecycle identity is the immutable identity of
+    /// this assignment.
+    pub fn matches_identity(&self, identity: &AssignmentIdentity<'_>) -> bool {
+        self.task_id == identity.task_id
+            && self.responsibility_key == identity.responsibility_key
+            && self.role == identity.role
+            && self.pr_number == identity.pr_number
+            && self.review_stage.as_deref() == identity.review_stage
+    }
+}
+
+/// Minimum semantic identity required when canonical evidence links to a role
+/// assignment.
+///
+/// `task_id` (compared NULL-safely) and `responsibility_key` jointly identify
+/// the assigned responsibility. `role`, `provider`, `runner`, `model`, and
+/// `effort` identify the executable profile. Evidence-specific fields such as a
+/// PR, review stage, or plan revision belong in the canonical responsibility
+/// key; evidence writers may enforce additional path-specific constraints.
+/// Historical evidence with a NULL `role_assignment_id` remains valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvidenceAssignmentContext<'a> {
+    pub role_assignment_id: Option<i64>,
+    pub task_id: Option<i64>,
+    pub responsibility_key: &'a str,
+    pub role: &'a str,
+    pub provider: &'a str,
+    pub runner: &'a str,
+    pub model: &'a str,
+    pub effort: &'a str,
 }
 
 impl ValidatedPool {
@@ -100,7 +194,7 @@ impl AssignmentRequest {
         validate_text("responsibility key", &self.responsibility_key)?;
         if !matches!(
             self.role.as_str(),
-            "classifier" | "planner" | "worker" | "reviewer" | "collector"
+            "classifier" | "planner" | "arbiter" | "worker" | "reviewer" | "collector"
         ) {
             return usage("invalid managed role");
         }
@@ -115,6 +209,28 @@ impl AssignmentRequest {
         }
         if let Some(complexity) = &self.complexity {
             validate_text("complexity", complexity)?;
+        }
+        Ok(())
+    }
+}
+
+impl AssignmentIdentity<'_> {
+    pub fn validate(&self) -> Result<()> {
+        validate_text("responsibility key", self.responsibility_key)?;
+        if !matches!(
+            self.role,
+            "classifier" | "planner" | "arbiter" | "worker" | "reviewer" | "collector"
+        ) {
+            return usage("invalid managed role");
+        }
+        match (self.role, self.review_stage) {
+            ("reviewer", Some("r1" | "r2")) => {}
+            ("reviewer", _) => return usage("reviewer identity requires r1 or r2 stage"),
+            (_, None) => {}
+            (_, Some(_)) => return usage("only reviewer identities may have a review stage"),
+        }
+        if self.task_id.is_some_and(|id| id <= 0) || self.pr_number.is_some_and(|id| id <= 0) {
+            return usage("assignment identity task and PR ids must be positive");
         }
         Ok(())
     }
@@ -291,6 +407,80 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<RoleAssignment>> {
     get_by_id(conn, id)
 }
 
+/// Execute a one-row canonical evidence `INSERT ... SELECT`, guarded by the
+/// minimum semantic assignment match in [`EvidenceAssignmentContext`].
+///
+/// `insert_select` must contain [`EVIDENCE_ASSIGNMENT_GUARD`] exactly once and
+/// use `:quorum_assignment_id` for the evidence row's nullable foreign key.
+/// Other values are supplied as named `parameters`; names beginning with
+/// `:quorum_assignment_` are reserved for this primitive. The guard and insert
+/// are one SQLite statement, so an existing but mismatched assignment can never
+/// become visible on the evidence row. A mismatch returns an internal error so
+/// propagation with `?` also rolls back any caller-owned lifecycle transaction.
+pub fn guarded_evidence_insert(
+    conn: &Connection,
+    evidence: &str,
+    context: &EvidenceAssignmentContext<'_>,
+    insert_select: &str,
+    parameters: &[(&str, &dyn ToSql)],
+) -> Result<()> {
+    if insert_select.matches(EVIDENCE_ASSIGNMENT_GUARD).count() != 1 {
+        return Err(QuorumError::Io(
+            "guarded evidence insert must contain exactly one assignment guard".into(),
+        ));
+    }
+    if parameters
+        .iter()
+        .any(|(name, _)| name.starts_with(":quorum_assignment_"))
+    {
+        return Err(QuorumError::Io(
+            "guarded evidence insert used a reserved assignment parameter".into(),
+        ));
+    }
+
+    let sql = insert_select.replace(EVIDENCE_ASSIGNMENT_GUARD, EVIDENCE_ASSIGNMENT_PREDICATE);
+    let assignment_parameters: [(&str, &dyn ToSql); 8] = [
+        (EVIDENCE_ASSIGNMENT_ID_PARAM, &context.role_assignment_id),
+        (EVIDENCE_TASK_ID_PARAM, &context.task_id),
+        (EVIDENCE_RESPONSIBILITY_PARAM, &context.responsibility_key),
+        (EVIDENCE_ROLE_PARAM, &context.role),
+        (EVIDENCE_PROVIDER_PARAM, &context.provider),
+        (EVIDENCE_RUNNER_PARAM, &context.runner),
+        (EVIDENCE_MODEL_PARAM, &context.model),
+        (EVIDENCE_EFFORT_PARAM, &context.effort),
+    ];
+    let mut all_parameters = Vec::with_capacity(parameters.len() + assignment_parameters.len());
+    all_parameters.extend_from_slice(parameters);
+    all_parameters.extend_from_slice(&assignment_parameters);
+
+    let mut statement = conn.prepare(&sql)?;
+    let mut names = HashSet::with_capacity(all_parameters.len());
+    for (name, _) in &all_parameters {
+        if !names.insert(*name) || statement.parameter_index(name)?.is_none() {
+            return Err(QuorumError::Io(
+                "guarded evidence insert has duplicate or unused named parameters".into(),
+            ));
+        }
+    }
+    if statement.parameter_count() != names.len() {
+        return Err(QuorumError::Io(
+            "guarded evidence insert has unbound named parameters".into(),
+        ));
+    }
+
+    let inserted = statement.execute(&all_parameters[..])?;
+    if inserted != 1 {
+        return Err(evidence_mismatch(evidence));
+    }
+    Ok(())
+}
+
+pub(crate) fn evidence_mismatch(evidence: &str) -> QuorumError {
+    QuorumError::Io(format!(
+        "role assignment does not match {evidence} evidence"
+    ))
+}
+
 fn shuffled_bag(pool: &ValidatedPool, seed: u64) -> Vec<String> {
     let mut bag = Vec::with_capacity(BAG_SLOTS);
     for entry in &pool.profiles {
@@ -396,7 +586,7 @@ fn validate_scope(request: &AssignmentRequest, pool: &ValidatedPool) -> Result<(
                 .expect("request validation pins stage");
             format!("reviewer.{complexity}.{stage}")
         }
-        "classifier" | "planner" | "collector" => {
+        "classifier" | "planner" | "arbiter" | "collector" => {
             if request.complexity.is_some() {
                 return usage("fixed-role assignment must not have complexity");
             }
@@ -462,6 +652,199 @@ mod tests {
             role: "worker".into(),
             review_stage: None,
             complexity: Some("M".into()),
+        }
+    }
+
+    const TEST_EVIDENCE_INSERT: &str = "INSERT INTO canonical_evidence(
+            role_assignment_id,payload)
+        SELECT :quorum_assignment_id,:payload
+        /* quorum-role-assignment-guard */";
+
+    const TEST_EVIDENCE_INSERT_WITH_AUTHORITY_GUARD: &str = "INSERT INTO canonical_evidence(
+            role_assignment_id,payload)
+        SELECT :quorum_assignment_id,:payload
+        /* quorum-role-assignment-guard */
+        AND EXISTS(SELECT 1 FROM lifecycle_authority WHERE allowed=1)";
+
+    fn evidence_fixture() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("evidence.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE lifecycle_state(value TEXT NOT NULL);
+             INSERT INTO lifecycle_state(value) VALUES ('before');
+             CREATE TABLE lifecycle_authority(allowed INTEGER NOT NULL);
+             INSERT INTO lifecycle_authority(allowed) VALUES (0);
+             CREATE TABLE canonical_evidence(
+                 id INTEGER PRIMARY KEY,
+                 role_assignment_id INTEGER REFERENCES role_assignments(id),
+                 payload TEXT NOT NULL
+             );
+             INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,complexity,profile_id,
+                 provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (7,'worker:task:7',7,'worker','M','profile',
+                     'codex','codex','gpt-5.6-sol','high','worker.M','g1',1);",
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn evidence_context(role_assignment_id: Option<i64>) -> EvidenceAssignmentContext<'static> {
+        EvidenceAssignmentContext {
+            role_assignment_id,
+            task_id: Some(7),
+            responsibility_key: "worker:task:7",
+            role: "worker",
+            provider: "codex",
+            runner: "codex",
+            model: "gpt-5.6-sol",
+            effort: "high",
+        }
+    }
+
+    #[test]
+    fn guarded_evidence_insert_accepts_exact_match_and_historical_null_link() {
+        let (_dir, conn) = evidence_fixture();
+        let exact = evidence_context(Some(7));
+        let exact_payload = "exact";
+        guarded_evidence_insert(
+            &conn,
+            "test",
+            &exact,
+            TEST_EVIDENCE_INSERT,
+            &[(":payload", &exact_payload)],
+        )
+        .unwrap();
+
+        let mut historical = evidence_context(None);
+        historical.task_id = None;
+        historical.responsibility_key = "historical:responsibility";
+        historical.role = "collector";
+        historical.provider = "claude";
+        historical.runner = "claude";
+        historical.model = "historical-model";
+        historical.effort = "medium";
+        let historical_payload = "historical";
+        guarded_evidence_insert(
+            &conn,
+            "test",
+            &historical,
+            TEST_EVIDENCE_INSERT,
+            &[(":payload", &historical_payload)],
+        )
+        .unwrap();
+
+        let rows: Vec<(Option<i64>, String)> = conn
+            .prepare("SELECT role_assignment_id,payload FROM canonical_evidence ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(Some(7), "exact".into()), (None, "historical".into())]
+        );
+    }
+
+    #[test]
+    fn historical_null_link_cannot_bypass_an_additional_authority_guard() {
+        let (_dir, mut conn) = evidence_fixture();
+        let historical = evidence_context(None);
+        let payload = "must not persist";
+
+        let result = (|| -> Result<()> {
+            let tx = begin_immediate(&mut conn)?;
+            tx.execute("UPDATE lifecycle_state SET value='partial'", [])?;
+            guarded_evidence_insert(
+                &tx,
+                "test",
+                &historical,
+                TEST_EVIDENCE_INSERT_WITH_AUTHORITY_GUARD,
+                &[(":payload", &payload)],
+            )?;
+            tx.commit().map_err(map_sql_err)?;
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM canonical_evidence", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT value FROM lifecycle_state", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "before"
+        );
+    }
+
+    #[test]
+    fn guarded_evidence_insert_rejects_every_semantic_mismatch_atomically() {
+        #[derive(Debug, Clone, Copy)]
+        enum Mismatch {
+            Task,
+            Responsibility,
+            Role,
+            Provider,
+            Runner,
+            Model,
+            Effort,
+        }
+
+        for mismatch in [
+            Mismatch::Task,
+            Mismatch::Responsibility,
+            Mismatch::Role,
+            Mismatch::Provider,
+            Mismatch::Runner,
+            Mismatch::Model,
+            Mismatch::Effort,
+        ] {
+            let (_dir, mut conn) = evidence_fixture();
+            let mut context = evidence_context(Some(7));
+            match mismatch {
+                Mismatch::Task => context.task_id = Some(8),
+                Mismatch::Responsibility => context.responsibility_key = "worker:task:8",
+                Mismatch::Role => context.role = "reviewer",
+                Mismatch::Provider => context.provider = "claude",
+                Mismatch::Runner => context.runner = "claude",
+                Mismatch::Model => context.model = "other-model",
+                Mismatch::Effort => context.effort = "medium",
+            }
+            let payload = "must not persist";
+            let result = (|| -> Result<()> {
+                let tx = begin_immediate(&mut conn)?;
+                tx.execute("UPDATE lifecycle_state SET value='partial'", [])?;
+                guarded_evidence_insert(
+                    &tx,
+                    "test",
+                    &context,
+                    TEST_EVIDENCE_INSERT,
+                    &[(":payload", &payload)],
+                )?;
+                tx.commit().map_err(map_sql_err)?;
+                Ok(())
+            })();
+
+            assert!(result.is_err(), "{mismatch:?} unexpectedly matched");
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM canonical_evidence", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{mismatch:?} inserted evidence"
+            );
+            assert_eq!(
+                conn.query_row("SELECT value FROM lifecycle_state", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "before",
+                "{mismatch:?} left a partial lifecycle mutation"
+            );
         }
     }
 
@@ -603,6 +986,30 @@ mod tests {
     }
 
     #[test]
+    fn assignment_identity_is_bounded_and_requires_exact_pr_stage_semantics() {
+        let valid = AssignmentIdentity {
+            task_id: Some(7),
+            responsibility_key: "reviewer:task:7:pr:12:r1",
+            role: "reviewer",
+            pr_number: Some(12),
+            review_stage: Some("r1"),
+        };
+        valid.validate().unwrap();
+        assert!(AssignmentIdentity {
+            review_stage: Some("r3"),
+            ..valid
+        }
+        .validate()
+        .is_err());
+        assert!(AssignmentIdentity {
+            task_id: Some(0),
+            ..valid
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
     fn concurrent_distinct_responsibilities_serialize_without_lost_turns() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("q.db");
@@ -675,108 +1082,5 @@ mod tests {
                 .unwrap(),
             1
         );
-    }
-
-    /// Private subprocess entrypoint for the real-process allocation canary.
-    #[test]
-    fn process_allocator_helper() {
-        let Ok(db_path) = std::env::var("QUORUM_TEST_ROUTING_DB") else {
-            return;
-        };
-        let index: usize = std::env::var("QUORUM_TEST_ROUTING_INDEX")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let same = std::env::var("QUORUM_TEST_ROUTING_SAME").unwrap() == "1";
-        let gate = std::env::var("QUORUM_TEST_ROUTING_GATE").unwrap();
-        let ready = std::env::var("QUORUM_TEST_ROUTING_READY").unwrap();
-        std::fs::write(&ready, b"ready").unwrap();
-        for _ in 0..1_000 {
-            if std::path::Path::new(&gate).exists() {
-                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
-                assign_or_get_with_seed(
-                    &mut conn,
-                    &request(if same { 0 } else { index }),
-                    &pool("g1"),
-                    index as u64,
-                    10,
-                )
-                .unwrap();
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        panic!("timed out waiting for routing process gate");
-    }
-
-    #[test]
-    fn repeated_real_process_allocations_are_atomic() {
-        use std::process::{Command, Stdio};
-
-        const ROUNDS: usize = 3;
-        const RACERS: usize = 8;
-        let test_binary = std::env::current_exe().unwrap();
-        for same in [true, false] {
-            for round in 0..ROUNDS {
-                let dir = tempfile::tempdir().unwrap();
-                let db_path = dir.path().join("quorum.db");
-                crate::db::open(&db_path).unwrap();
-                let gate = dir.path().join("go");
-                let mut children = Vec::new();
-                let mut ready_paths = Vec::new();
-                for index in 0..RACERS {
-                    let ready = dir.path().join(format!("ready-{index}"));
-                    let child = Command::new(&test_binary)
-                        .args([
-                            "--exact",
-                            "role_assignments::tests::process_allocator_helper",
-                            "--nocapture",
-                        ])
-                        .env("QUORUM_TEST_ROUTING_DB", &db_path)
-                        .env("QUORUM_TEST_ROUTING_INDEX", index.to_string())
-                        .env("QUORUM_TEST_ROUTING_SAME", if same { "1" } else { "0" })
-                        .env("QUORUM_TEST_ROUTING_GATE", &gate)
-                        .env("QUORUM_TEST_ROUTING_READY", &ready)
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .unwrap();
-                    children.push(child);
-                    ready_paths.push(ready);
-                }
-                for _ in 0..1_000 {
-                    if ready_paths.iter().all(|path| path.exists()) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                assert!(ready_paths.iter().all(|path| path.exists()));
-                std::fs::write(&gate, b"go").unwrap();
-                for child in children {
-                    let output = child.wait_with_output().unwrap();
-                    assert!(
-                        output.status.success(),
-                        "round {round}, same={same}: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                let conn = crate::db::open(&db_path).unwrap();
-                let expected = if same { 1 } else { RACERS as i64 };
-                assert_eq!(
-                    conn.query_row("SELECT count(*) FROM role_assignments", [], |row| row
-                        .get::<_, i64>(0))
-                        .unwrap(),
-                    expected,
-                    "round {round}, same={same}"
-                );
-                assert_eq!(
-                    conn.query_row("SELECT next_slot FROM routing_cursors", [], |row| row
-                        .get::<_, i64>(0))
-                        .unwrap(),
-                    expected,
-                    "round {round}, same={same}"
-                );
-            }
-        }
     }
 }

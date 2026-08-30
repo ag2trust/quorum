@@ -24,6 +24,18 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("names.txt");
     let mut f = std::fs::File::create(&path).unwrap();
@@ -125,7 +137,7 @@ elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -405,6 +417,7 @@ fn seed_task(home: &std::path::Path, title: &str) {
             task_id,
             cx_est: 3,
             size: "M".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
@@ -777,6 +790,7 @@ fn recovery_budget_resets_on_successful_replacement() {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", env.home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(env.home.path()))
         .env("QUORUM_RUN_ID", &run_id)
         .args(["done", "--agent", &agent_name])
         .output()
@@ -935,6 +949,12 @@ fn consecutive_restarts_accumulate_recovery_count() {
     // Recovery fires AgentFailed, task goes to open, counter = 1
     // SIGKILL immediately before the die-agent can do further damage
     handle.sigkill();
+    // A hard SIGKILL never runs `daemon_lock::release`, so the previous
+    // fresh row now blocks the next restart under instance-authority
+    // semantics (a live-daemon spoof in another namespace would look
+    // identical). A real supervisor either waits stale_secs or clears the
+    // lock explicitly; the test does the latter to keep runtime tight.
+    common::clear_daemon_lock(db_path);
 
     let task = env.task(task_id);
     assert_eq!(

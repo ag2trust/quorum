@@ -12,6 +12,7 @@
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 /// How many recent messages to surface on `status`. Bounded to keep the output cheap.
 pub const RECENT_MSG_LIMIT: i64 = 5;
@@ -25,6 +26,18 @@ const ALERT_DISPLAY_LIMIT: i64 = 10;
 /// Durable post-submit tasks to surface in REVIEWING. Bounded so `status --watch`
 /// remains cheap if review-only tasks accumulate.
 pub const REVIEWING_TASK_LIMIT: i64 = 20;
+/// Maximum completed milestones retained in a single task-progress projection.
+/// The projection is deliberately a recent, bounded explanation, not an event log.
+pub const TASK_PROGRESS_HISTORY_LIMIT: usize = 12;
+/// Maximum milestones (history, current stage, and future path) returned per task.
+pub const TASK_PROGRESS_MILESTONE_LIMIT: usize = 16;
+const TASK_PROGRESS_TEXT_LIMIT: usize = 160;
+const TASK_PROGRESS_DEPENDENCY_LIMIT: usize = 8;
+/// Status reads only a bounded prefix of a planner stream. The projection keeps
+/// counters, never provider payloads, and a planner's sanitized stream itself
+/// is capped at this scale.
+const PLANNER_STREAM_INSPECT_BYTES: u64 = 256 * 1024;
+const PLANNER_STREAM_INSPECT_RECORDS: usize = 512;
 
 /// Sidecar file written by the daemon per agent slot — carries live progress
 /// stats that the status reader picks up without a DB schema change.
@@ -255,6 +268,20 @@ pub struct PipelineTask {
     pub status: String,
     pub pr: Option<i64>,
     pub blocked: bool,
+    /// The newest durable Arbiter verdict for this decomposed source, if one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arbiter: Option<ArbiterVerdict>,
+}
+
+/// Compact projection of the Arbiter's terminal verdict evidence.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ArbiterVerdict {
+    pub verdict: Option<String>,
+    pub reason_code: String,
+    pub at: i64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub duration_ms: Option<i64>,
 }
 
 /// Bounded child projection for the repository's current decomposition graph.
@@ -275,10 +302,26 @@ pub struct DecompositionStatusView {
     pub source_title: String,
     pub source_status: String,
     pub graph_state: String,
+    /// Stable reason new graph-member implementation work cannot dispatch.
+    pub dispatch_hold: Option<String>,
     pub proposal_attempts: i64,
     pub provider_failures: i64,
+    pub hold_code: Option<String>,
+    pub retryable_planning_hold: bool,
+    pub operator_retry_count: i64,
+    pub operator_retry_cap: i64,
     pub planner_provider: Option<String>,
     pub planner_model: Option<String>,
+    /// Assigned planner effort, resolved from its immutable role assignment.
+    pub planner_effort: Option<String>,
+    /// Current planner attempt's session directory, if logging is configured.
+    pub planner_log_dir: Option<String>,
+    /// Age of the current planner stream's latest write.
+    pub planner_last_activity_age_secs: Option<i64>,
+    /// Bounded count of recognized activity records in the current stream.
+    pub planner_activity_count: Option<u32>,
+    /// Bounded count of recognized tool records in the current stream.
+    pub planner_tool_count: Option<u32>,
     pub accepted_plan_revision: Option<i64>,
     pub completed_children: i64,
     pub total_children: i64,
@@ -286,6 +329,94 @@ pub struct DecompositionStatusView {
     pub failed_children: Vec<i64>,
     pub reasons: Vec<String>,
     pub members: Vec<DecompositionMemberView>,
+}
+
+/// The server-owned task journey. Consumers render this projection and do not
+/// reconstruct lifecycle meaning from task status in the browser.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskJourney {
+    DirectImplementation,
+    ReviewOnly,
+    DecomposedSource,
+}
+
+/// The state of an ordered task-progress milestone.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskProgressMilestoneState {
+    Completed,
+    Current,
+    Future,
+    Terminal,
+}
+
+/// One bounded point in a task's journey. `role` is deliberately secondary to
+/// the friendly stage label: e.g. `Plan review` / `Arbiter` and `First review` / `R1`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TaskProgressMilestone {
+    pub stage: String,
+    pub role: Option<String>,
+    pub state: TaskProgressMilestoneState,
+    pub activity: Option<String>,
+}
+
+/// The task's present stage and the friendly description of the work underway.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TaskProgressStage {
+    pub label: String,
+    pub role: Option<String>,
+    pub activity: String,
+}
+
+/// An expected action. `Possible next` is used whenever an external verdict,
+/// scheduler choice, CI result, or operator decision can alter the path.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TaskProgressNextAction {
+    pub label: String,
+    pub action: String,
+}
+
+/// Bounded counters that explain planning and remediation loops.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct TaskProgressAttempts {
+    pub proposal_attempts: i64,
+    pub provider_failures: i64,
+    pub arbiter_rounds: i64,
+    pub rework_round: i64,
+    pub rework_cap: i64,
+    pub operator_retry_count: i64,
+    pub operator_retry_cap: i64,
+}
+
+/// A bounded aggregate of a decomposed source's active child graph.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TaskProgressChildren {
+    /// Friendly `N/M` representation, kept alongside numeric fields for simple renderers.
+    pub summary: String,
+    pub completed: i64,
+    pub total: i64,
+    /// Failed/cancelled child ids, bounded to [`TASK_PROGRESS_DEPENDENCY_LIMIT`].
+    pub blocking_task_ids: Vec<i64>,
+}
+
+/// Read-only, request-scoped explanation of one task's durable lifecycle journey.
+///
+/// `history` retains completed loop rounds while `milestones` contains the same
+/// completed history plus the current stage and a bounded future path. It is not
+/// a lifecycle authority and never writes or controls the daemon.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TaskProgress {
+    pub task_id: i64,
+    pub journey: TaskJourney,
+    pub milestones: Vec<TaskProgressMilestone>,
+    pub history: Vec<TaskProgressMilestone>,
+    pub stage: TaskProgressStage,
+    /// An external or blocking fact, kept separate from the stage/activity.
+    pub condition: Option<String>,
+    pub next_action: Option<TaskProgressNextAction>,
+    pub attempts: TaskProgressAttempts,
+    pub children: Option<TaskProgressChildren>,
 }
 
 /// Deduped error for the ERRORS section — groups repeated messages.
@@ -330,16 +461,28 @@ pub fn alert_due_at_retry(count: i64) -> bool {
     count == 0 || (count > 0 && (count & (count - 1)) == 0)
 }
 
-/// Daemon liveness snapshot read from `daemon_lock`.
-/// Populated by the binary crate (which owns the pid-alive syscall).
+/// Daemon liveness snapshot read from `daemon_lock`. Populated by the binary
+/// crate, which owns the platform PID-alive syscall used for the diagnostic
+/// `pid_dead` field.
+///
+/// Liveness is derived from **heartbeat freshness alone** — the daemon's
+/// namespace-safe authority — so a fresh heartbeat means Alive even when the
+/// stored PID is not visible on this host (containers, PID namespace, remote
+/// daemon), and an expired heartbeat means Stale even when the numeric PID
+/// happens to match an unrelated live local process. `pid` and `pid_dead`
+/// remain in the serialized JSON as human-readable diagnostics and MUST NOT
+/// be treated as authoritative by consumers.
 #[derive(Debug, Serialize, PartialEq, Eq, Clone, Default)]
 pub enum DaemonLiveness {
     #[default]
-    /// No row in daemon_lock — daemon has never started.
+    /// No row in `daemon_lock` — daemon has never started.
     None,
-    /// Daemon alive: heartbeat fresh AND pid exists.
+    /// Daemon alive: heartbeat is within the staleness window. `pid` is a
+    /// diagnostic snapshot of the holding process, not proof of liveness.
     Alive { pid: i64, heartbeat_age_secs: i64 },
-    /// Daemon stale: heartbeat old or pid dead.
+    /// Daemon stale: heartbeat has exceeded the staleness window. `pid_dead`
+    /// is a diagnostic derived from a best-effort local PID probe and does
+    /// not participate in the Alive/Stale decision.
     Stale {
         pid: i64,
         heartbeat_age_secs: i64,
@@ -354,6 +497,56 @@ pub enum HealthVerdict {
     OnTrack,
     Attention,
     Stalled,
+}
+
+/// Severity assigned to an observed host-resource value.
+#[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy, Default, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceSeverity {
+    #[default]
+    Normal,
+    Warning,
+    Critical,
+}
+
+/// Host memory and swap values sampled by the binary crate.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct MemoryResourceView {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub available_percent: f64,
+    pub swap_total_bytes: u64,
+    pub swap_used_bytes: u64,
+    pub severity: ResourceSeverity,
+}
+
+/// One deduplicated filesystem sampled for host-resource status.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct DiskResourceView {
+    /// Logical consumers located on this filesystem (for example `database`
+    /// and `worktrees`). Multiple consumers prove filesystem deduplication.
+    pub targets: Vec<String>,
+    /// Existing path used for the filesystem sample.
+    pub path: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub available_percent: f64,
+    pub severity: ResourceSeverity,
+}
+
+/// Live, non-persisted host-resource telemetry attached by `quorum status`.
+#[derive(Debug, Serialize, PartialEq, Clone)]
+pub struct HostResourcesView {
+    pub sampled_at: i64,
+    /// False when one or more requested samples failed. Known values remain
+    /// visible, but an incomplete sample must not prove a daemon recovery.
+    pub complete: bool,
+    pub severity: ResourceSeverity,
+    pub memory: Option<MemoryResourceView>,
+    pub disks: Vec<DiskResourceView>,
+    /// Bounded, fail-open sampling diagnostics. These are observational and
+    /// never enter the durable Quorum error feed.
+    pub errors: Vec<String>,
 }
 
 /// A point-in-time snapshot of the store.
@@ -414,6 +607,9 @@ pub struct Stats {
     pub merge_blockers: Vec<MergeBlockerView>,
     /// #115: daemon liveness from daemon_lock (populated by binary crate).
     pub daemon: DaemonLiveness,
+    /// Live host memory/swap and filesystem telemetry. Populated after the
+    /// binary closes the status read connection; never persisted in SQLite.
+    pub resources: Option<HostResourcesView>,
 }
 
 /// Gather a snapshot. Read-only.
@@ -484,7 +680,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let queue_tasks_list = queue_tasks(conn)?;
     let reviewing = reviewing_tasks(conn, &daemon_agents)?;
     let pipeline = pipeline_tasks(conn, now)?;
-    let decomposition = decomposition_status(conn)?;
+    let decomposition = decomposition_status(conn, now)?;
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
     let alerts = alert_messages(conn, now)?;
     let merge_blockers = merge_blockers(conn, now)?;
@@ -537,7 +733,1029 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         alerts,
         merge_blockers,
         daemon: DaemonLiveness::default(),
+        resources: None,
     })
+}
+
+#[derive(Debug)]
+struct ProgressGraph {
+    id: i64,
+    state: String,
+    proposal_attempts: i64,
+    provider_failures: i64,
+    operator_retry_count: i64,
+    hold_code: Option<String>,
+    hold_summary: Option<String>,
+    accepted_plan_revision: Option<i64>,
+    completed_children: i64,
+    total_children: i64,
+    blocking_child_ids: Vec<i64>,
+}
+
+#[derive(Debug)]
+struct ProgressAttempt {
+    kind: String,
+    reason_code: String,
+}
+
+#[derive(Debug)]
+struct ProgressLiveRun {
+    role: String,
+    phase: String,
+    agent_state: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct DependencyProgress {
+    blocked_ids: Vec<i64>,
+    cancelled_ids: Vec<i64>,
+}
+
+/// Build the bounded server-owned progress projection for one task. The caller
+/// supplies `now` for the same request-scoped snapshot semantics as [`stats`].
+pub fn task_progress(conn: &Connection, task_id: i64, now: i64) -> Result<Option<TaskProgress>> {
+    let Some(task) = crate::tasks::get(conn, task_id)? else {
+        return Ok(None);
+    };
+    let graph = progress_graph(conn, task_id)?;
+    let journey = if graph.is_some() || matches!(task.status.as_str(), "planning" | "decomposed") {
+        TaskJourney::DecomposedSource
+    } else if task.review_only {
+        TaskJourney::ReviewOnly
+    } else {
+        TaskJourney::DirectImplementation
+    };
+    let runs = progress_runs(conn, task_id)?;
+    let live = progress_live_runs(conn, task_id)?;
+    let dependencies = unsatisfied_dependency_ids(conn, task.depends_on.as_deref())?;
+    let r2_required = has_r2_evidence(conn, task_id, &runs)?;
+    let attempts = progress_attempts(conn, graph.as_ref())?;
+
+    let mut history = match journey {
+        TaskJourney::DecomposedSource => decomposition_history(graph.as_ref(), &attempts),
+        TaskJourney::DirectImplementation | TaskJourney::ReviewOnly => {
+            execution_history(&task, &runs)
+        }
+    };
+    history.truncate(TASK_PROGRESS_HISTORY_LIMIT);
+
+    let task_attempts = TaskProgressAttempts {
+        proposal_attempts: graph.as_ref().map_or(0, |g| g.proposal_attempts),
+        provider_failures: graph.as_ref().map_or(0, |g| g.provider_failures),
+        arbiter_rounds: attempts
+            .iter()
+            .filter(|attempt| attempt.reason_code.starts_with("arbiter-"))
+            .count() as i64,
+        rework_round: task.rework_round,
+        rework_cap: task
+            .rework_cap
+            .unwrap_or(crate::lifecycle::REWORK_CAP as i64),
+        operator_retry_count: graph.as_ref().map_or(0, |g| g.operator_retry_count),
+        operator_retry_cap: crate::decomposition::MAX_OPERATOR_RETRIES,
+    };
+    let children = graph.as_ref().map(|g| TaskProgressChildren {
+        summary: format!("{}/{}", g.completed_children, g.total_children),
+        completed: g.completed_children,
+        total: g.total_children,
+        blocking_task_ids: g.blocking_child_ids.clone(),
+    });
+
+    let (stage, condition, next_action, future) = if is_terminal_status(&task.status) {
+        terminal_progress(&task, graph.as_ref())
+    } else {
+        match journey {
+            TaskJourney::DecomposedSource => {
+                decomposition_current_progress(&task, graph.as_ref(), &attempts, &live)
+            }
+            TaskJourney::DirectImplementation | TaskJourney::ReviewOnly => {
+                execution_current_progress(&task, journey, r2_required, &runs, &live, &dependencies)
+            }
+        }
+    };
+
+    let mut milestones = history.clone();
+    milestones.push(TaskProgressMilestone {
+        stage: stage.label.clone(),
+        role: stage.role.clone(),
+        state: if is_terminal_status(&task.status) {
+            TaskProgressMilestoneState::Terminal
+        } else {
+            TaskProgressMilestoneState::Current
+        },
+        activity: Some(stage.activity.clone()),
+    });
+    milestones.extend(future);
+    milestones.truncate(TASK_PROGRESS_MILESTONE_LIMIT);
+
+    let _ = now; // Kept request-scoped for a stable public projection signature.
+    Ok(Some(TaskProgress {
+        task_id,
+        journey,
+        milestones,
+        history,
+        stage,
+        condition,
+        next_action,
+        attempts: task_attempts,
+        children,
+    }))
+}
+
+fn progress_graph(conn: &Connection, task_id: i64) -> Result<Option<ProgressGraph>> {
+    let graph = conn
+        .query_row(
+            "SELECT id,state,proposal_attempts,provider_failures,operator_retry_count,
+                    hold_code,hold_summary,accepted_plan_revision
+             FROM task_decompositions WHERE source_task_id=?1",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        id,
+        state,
+        proposal_attempts,
+        provider_failures,
+        operator_retry_count,
+        hold_code,
+        hold_summary,
+        accepted_plan_revision,
+    )) = graph
+    else {
+        return Ok(None);
+    };
+    let total_children: i64 = conn.query_row(
+        "SELECT count(*) FROM task_graph_members WHERE graph_id=?1 AND active=1",
+        [id],
+        |row| row.get(0),
+    )?;
+    let completed_children: i64 = conn.query_row(
+        "SELECT count(*) FROM task_graph_members m JOIN tasks t ON t.id=m.task_id
+         WHERE m.graph_id=?1 AND m.active=1 AND t.status='done'",
+        [id],
+        |row| row.get(0),
+    )?;
+    let blocking_child_ids = conn
+        .prepare(
+            "SELECT m.task_id FROM task_graph_members m JOIN tasks t ON t.id=m.task_id
+             WHERE m.graph_id=?1 AND m.active=1 AND t.status IN ('failed','cancelled')
+             ORDER BY m.task_id LIMIT ?2",
+        )?
+        .query_map(params![id, TASK_PROGRESS_DEPENDENCY_LIMIT as i64], |row| {
+            row.get(0)
+        })?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    Ok(Some(ProgressGraph {
+        id,
+        state,
+        proposal_attempts,
+        provider_failures,
+        operator_retry_count,
+        hold_code,
+        hold_summary,
+        accepted_plan_revision,
+        completed_children,
+        total_children,
+        blocking_child_ids,
+    }))
+}
+
+fn progress_attempts(
+    conn: &Connection,
+    graph: Option<&ProgressGraph>,
+) -> Result<Vec<ProgressAttempt>> {
+    let Some(graph) = graph else {
+        return Ok(Vec::new());
+    };
+    let mut attempts = conn
+        .prepare(
+            "SELECT kind,reason_code FROM decomposition_attempts WHERE graph_id=?1
+             ORDER BY id DESC LIMIT ?2",
+        )?
+        .query_map(
+            params![graph.id, TASK_PROGRESS_HISTORY_LIMIT as i64],
+            |row| {
+                Ok(ProgressAttempt {
+                    kind: row.get(0)?,
+                    reason_code: row.get(1)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    attempts.reverse();
+    Ok(attempts)
+}
+
+fn progress_runs(conn: &Connection, task_id: i64) -> Result<Vec<crate::agent_runs::AgentRun>> {
+    let total: i64 = conn.query_row(
+        "SELECT count(*) FROM agent_runs WHERE task_id=?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let mut runs = conn
+        .prepare(
+            "SELECT id,agent_name,role,sub_role,model,effort,provider,role_assignment_id,
+                    configured_profile_id,configured_provider,configured_model,configured_effort,
+                    spawned_at,ended_at,end_reason
+             FROM agent_runs WHERE task_id=?1 ORDER BY id DESC LIMIT ?2",
+        )?
+        .query_map(
+            params![task_id, TASK_PROGRESS_HISTORY_LIMIT as i64],
+            |row| {
+                Ok(crate::agent_runs::AgentRun {
+                    id: row.get(0)?,
+                    agent: row.get(1)?,
+                    role: row.get(2)?,
+                    sub_role: row.get(3)?,
+                    model: row.get(4)?,
+                    effort: row.get(5)?,
+                    provider: row.get(6)?,
+                    role_assignment_id: row.get(7)?,
+                    configured_profile_id: row.get(8)?,
+                    configured_provider: row.get(9)?,
+                    configured_model: row.get(10)?,
+                    configured_effort: row.get(11)?,
+                    spawned_at: row.get(12)?,
+                    ended_at: row.get(13)?,
+                    end_reason: row.get(14)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    runs.reverse();
+    if total > TASK_PROGRESS_HISTORY_LIMIT as i64 {
+        let omitted = total - TASK_PROGRESS_HISTORY_LIMIT as i64;
+        runs.insert(
+            0,
+            crate::agent_runs::AgentRun {
+                id: -omitted,
+                agent: String::new(),
+                role: "history".into(),
+                sub_role: None,
+                model: String::new(),
+                effort: String::new(),
+                provider: None,
+                role_assignment_id: None,
+                configured_profile_id: None,
+                configured_provider: None,
+                configured_model: None,
+                configured_effort: None,
+                spawned_at: 0,
+                ended_at: Some(0),
+                end_reason: Some(format!("{omitted} earlier completed runs")),
+            },
+        );
+    }
+    Ok(runs)
+}
+
+fn progress_live_runs(conn: &Connection, task_id: i64) -> Result<Vec<ProgressLiveRun>> {
+    conn.prepare(
+        "SELECT role,phase,agent_state FROM journal WHERE task_id=?1
+         ORDER BY updated_at DESC,agent LIMIT 4",
+    )?
+    .query_map([task_id], |row| {
+        Ok(ProgressLiveRun {
+            role: row.get(0)?,
+            phase: row.get(1)?,
+            agent_state: row.get(2)?,
+        })
+    })?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(Into::into)
+}
+
+fn has_r2_evidence(
+    conn: &Connection,
+    task_id: i64,
+    runs: &[crate::agent_runs::AgentRun],
+) -> Result<bool> {
+    if runs.iter().any(|run| run.sub_role.as_deref() == Some("r2")) {
+        return Ok(true);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM role_assignments
+         WHERE task_id=?1 AND role='reviewer' AND review_stage='r2')",
+        [task_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn unsatisfied_dependency_ids(conn: &Connection, raw: Option<&str>) -> Result<DependencyProgress> {
+    let dependencies = raw
+        .and_then(|json| serde_json::from_str::<Vec<i64>>(json).ok())
+        .unwrap_or_default();
+    let mut progress = DependencyProgress::default();
+    for id in dependencies
+        .into_iter()
+        .take(TASK_PROGRESS_DEPENDENCY_LIMIT)
+    {
+        let status = conn
+            .query_row("SELECT status FROM tasks WHERE id=?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        if status.as_deref() != Some("done") {
+            if status.as_deref() == Some("cancelled") {
+                progress.cancelled_ids.push(id);
+            }
+            progress.blocked_ids.push(id);
+        }
+    }
+    Ok(progress)
+}
+
+fn execution_history(
+    task: &crate::tasks::Task,
+    runs: &[crate::agent_runs::AgentRun],
+) -> Vec<TaskProgressMilestone> {
+    let mut history = Vec::new();
+    if task.status != "open" || !runs.is_empty() {
+        push_completed(&mut history, "Queued", None, "Received");
+    }
+    for run in runs {
+        if run.role == "history" {
+            push_completed(
+                &mut history,
+                "Earlier activity",
+                None,
+                run.end_reason
+                    .as_deref()
+                    .unwrap_or("Earlier completed runs"),
+            );
+            continue;
+        }
+        if run.ended_at.is_none() {
+            continue;
+        }
+        match (run.role.as_str(), run.sub_role.as_deref()) {
+            ("worker", _) => push_completed(
+                &mut history,
+                "Implementation",
+                Some("Worker"),
+                run_outcome(run.end_reason.as_deref()),
+            ),
+            ("reviewer", Some("r2")) => push_completed(
+                &mut history,
+                "Final review",
+                Some("R2"),
+                run_outcome(run.end_reason.as_deref()),
+            ),
+            ("reviewer", _) => push_completed(
+                &mut history,
+                "First review",
+                Some("R1"),
+                run_outcome(run.end_reason.as_deref()),
+            ),
+            _ => {}
+        }
+    }
+    let has_worker = history.iter().any(|m| m.stage == "Implementation");
+    if !has_worker
+        && (task.author.is_some()
+            || matches!(
+                task.status.as_str(),
+                "in-review" | "rework" | "merging" | "done"
+            ))
+    {
+        push_completed(
+            &mut history,
+            "Implementation",
+            Some("Worker"),
+            "Submitted for review",
+        );
+    }
+    let has_review = history
+        .iter()
+        .any(|m| m.stage == "First review" || m.stage == "Final review");
+    if !has_review && matches!(task.status.as_str(), "rework" | "merging" | "done") {
+        push_completed(&mut history, "First review", Some("R1"), "Review completed");
+    }
+    history
+}
+
+fn decomposition_history(
+    graph: Option<&ProgressGraph>,
+    attempts: &[ProgressAttempt],
+) -> Vec<TaskProgressMilestone> {
+    let mut history = Vec::new();
+    if graph.is_some() {
+        push_completed(
+            &mut history,
+            "Intake / classification",
+            None,
+            "Classified for planning",
+        );
+    }
+    for attempt in attempts {
+        if attempt.reason_code.starts_with("arbiter-") {
+            push_completed(
+                &mut history,
+                "Plan review",
+                Some("Arbiter"),
+                arbiter_outcome(&attempt.reason_code),
+            );
+        } else {
+            push_completed(
+                &mut history,
+                "Planning",
+                Some("Planner"),
+                planning_attempt_outcome(attempt),
+            );
+        }
+    }
+    // Materialization is durable proof that the current proposal cleared the
+    // Arbiter gate: the Arbiter phase (`validating`) follows classification
+    // (`preclassifying`) and approval materializes the children directly. A
+    // `planning` or `preclassifying` graph is intentionally never such proof.
+    if let Some(graph) = graph {
+        if matches!(graph.state.as_str(), "active" | "blocked" | "completed")
+            || graph.accepted_plan_revision.is_some()
+        {
+            let already_approved = history.iter().any(|milestone| {
+                milestone.stage == "Plan review"
+                    && milestone.activity.as_deref() == Some("Approved")
+            });
+            if !already_approved {
+                push_completed(&mut history, "Plan review", Some("Arbiter"), "Approved");
+            }
+        }
+    }
+    history
+}
+
+fn execution_current_progress(
+    task: &crate::tasks::Task,
+    journey: TaskJourney,
+    r2_required: bool,
+    runs: &[crate::agent_runs::AgentRun],
+    live: &[ProgressLiveRun],
+    dependencies: &DependencyProgress,
+) -> (
+    TaskProgressStage,
+    Option<String>,
+    Option<TaskProgressNextAction>,
+    Vec<TaskProgressMilestone>,
+) {
+    let live_worker = live.iter().find(|run| run.role == "worker");
+    let live_reviewer = live.iter().find(|run| run.role == "reviewer");
+    let r1_approved = runs.iter().rev().any(|run| {
+        run.role == "reviewer"
+            && run.sub_role.is_none()
+            && run.end_reason.as_deref() == Some("verdict:approved")
+    });
+    let dependency_condition = if !dependencies.cancelled_ids.is_empty() {
+        Some(deadlocked_by(&dependencies.cancelled_ids))
+    } else if !dependencies.blocked_ids.is_empty() {
+        Some(blocked_by("dependency tasks", &dependencies.blocked_ids))
+    } else {
+        None
+    };
+    let review_stage = if r2_required && r1_approved {
+        ("Final review", Some("R2"), "Awaiting R2 review")
+    } else {
+        ("First review", Some("R1"), "Awaiting R1 review")
+    };
+    let (stage, condition, next) = match task.status.as_str() {
+        "open" => {
+            let activity = if journey == TaskJourney::ReviewOnly {
+                "Received; awaiting review assignment"
+            } else {
+                "Waiting for worker assignment"
+            };
+            (
+                TaskProgressStage {
+                    label: "Queued".into(),
+                    role: None,
+                    activity: activity.into(),
+                },
+                dependency_condition,
+                Some(possible_next(if journey == TaskJourney::ReviewOnly {
+                    "A reviewer may be assigned"
+                } else {
+                    "A worker may be assigned"
+                })),
+            )
+        }
+        "working" | "rework" => {
+            let activity = live_worker
+                .map(|run| worker_activity(run, task.rework_round))
+                .unwrap_or_else(|| {
+                    if task.status == "rework" {
+                        format!(
+                            "Awaiting remediation for rework round {}",
+                            task.rework_round
+                        )
+                    } else {
+                        "Awaiting worker progress".into()
+                    }
+                });
+            let condition = dependency_condition.or_else(|| live_worker.and_then(live_condition));
+            (
+                TaskProgressStage {
+                    label: if journey == TaskJourney::ReviewOnly && task.status == "rework" {
+                        "Remediation".into()
+                    } else {
+                        "Implementation".into()
+                    },
+                    role: Some("Worker".into()),
+                    activity,
+                },
+                condition,
+                Some(possible_next("The worker may submit work for review")),
+            )
+        }
+        "in-review" => {
+            let activity = live_reviewer
+                .map(|run| reviewer_activity(run, review_stage.0))
+                .unwrap_or_else(|| review_stage.2.into());
+            let condition = match live_reviewer {
+                Some(run) => live_condition(run),
+                None => Some(if review_stage.1 == Some("R2") {
+                    "Awaiting R2 assignment".into()
+                } else {
+                    "Awaiting R1 assignment".into()
+                }),
+            };
+            (
+                TaskProgressStage {
+                    label: review_stage.0.into(),
+                    role: review_stage.1.map(str::to_string),
+                    activity,
+                },
+                condition,
+                Some(possible_next("The reviewer may approve or request changes")),
+            )
+        }
+        "merging" => {
+            let waiting_conflict = task
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains(crate::tasks::MERGE_BLOCKED_BODY));
+            (
+                TaskProgressStage {
+                    label: "Merge".into(),
+                    role: None,
+                    activity: "Merge is in progress".into(),
+                },
+                Some(
+                    if waiting_conflict {
+                        "Waiting for merge conflict resolution"
+                    } else {
+                        "Waiting for CI"
+                    }
+                    .into(),
+                ),
+                Some(possible_next("CI and merge policy may permit completion")),
+            )
+        }
+        _ => (
+            TaskProgressStage {
+                label: "Queued".into(),
+                role: None,
+                activity: "Awaiting lifecycle dispatch".into(),
+            },
+            dependency_condition,
+            Some(possible_next(
+                "The daemon may dispatch the next lifecycle step",
+            )),
+        ),
+    };
+    let future = execution_future(&stage.label, r2_required, journey);
+    (stage, condition, next, future)
+}
+
+fn decomposition_current_progress(
+    task: &crate::tasks::Task,
+    graph: Option<&ProgressGraph>,
+    attempts: &[ProgressAttempt],
+    live: &[ProgressLiveRun],
+) -> (
+    TaskProgressStage,
+    Option<String>,
+    Option<TaskProgressNextAction>,
+    Vec<TaskProgressMilestone>,
+) {
+    let Some(graph) = graph else {
+        // A legacy/source row can be `planning` before its aggregate is visible. It is
+        // planning, but makes no unsupported claim that an Arbiter review completed.
+        let stage = TaskProgressStage {
+            label: "Planning".into(),
+            role: Some("Planner".into()),
+            activity: "Awaiting decomposition record".into(),
+        };
+        return (
+            stage.clone(),
+            Some("Waiting for planning intake".into()),
+            Some(possible_next("The planner may begin decomposition")),
+            decomposition_future(&stage.label),
+        );
+    };
+    let arbiter_live = live.iter().find(|run| run.role == "arbiter");
+    let (stage, condition, next) = match graph.state.as_str() {
+        "validating" => (
+            TaskProgressStage {
+                label: "Plan review".into(),
+                role: Some("Arbiter".into()),
+                activity: arbiter_live
+                    .map(|_| "Arbiter is reviewing the plan".into())
+                    .unwrap_or_else(|| "Awaiting Arbiter verdict".into()),
+            },
+            arbiter_live.and_then(live_condition),
+            Some(possible_next(
+                "The Arbiter may approve, request changes, or reject the plan",
+            )),
+        ),
+        "preclassifying" => (
+            TaskProgressStage {
+                label: "Pre-classification".into(),
+                role: None,
+                activity: "Classifying proposed child work".into(),
+            },
+            None,
+            Some(possible_next(
+                "Classified work may proceed to Arbiter plan review",
+            )),
+        ),
+        "active" | "blocked" | "completed" => {
+            let condition = if !graph.blocking_child_ids.is_empty() {
+                Some(blocked_by("child tasks", &graph.blocking_child_ids))
+            } else if graph.state == "blocked" {
+                Some(planning_hold_condition(graph))
+            } else {
+                None
+            };
+            let activity = if graph.total_children == 0 && graph.state == "completed" {
+                "All child work completed".into()
+            } else {
+                format!(
+                    "{}/{} child tasks complete",
+                    graph.completed_children, graph.total_children
+                )
+            };
+            (
+                TaskProgressStage {
+                    label: "Child execution".into(),
+                    role: None,
+                    activity,
+                },
+                condition.clone(),
+                Some(if condition.is_some() {
+                    possible_next("An operator may resolve or retry blocked child tasks")
+                } else if graph.completed_children == graph.total_children {
+                    deterministic_next("The source task completes")
+                } else {
+                    possible_next("Child tasks may complete")
+                }),
+            )
+        }
+        "held" => (
+            TaskProgressStage {
+                label: "Planning".into(),
+                role: Some("Planner".into()),
+                activity: "Planning is held".into(),
+            },
+            Some(planning_hold_condition(graph)),
+            Some(possible_next(
+                "An operator may retry or resolve the planning hold",
+            )),
+        ),
+        "provider-backoff" => (
+            TaskProgressStage {
+                label: "Planning".into(),
+                role: Some("Planner".into()),
+                activity: "Waiting to retry the planner provider".into(),
+            },
+            Some("Waiting for planner provider".into()),
+            Some(possible_next("The planner provider may be retried")),
+        ),
+        _ => (
+            TaskProgressStage {
+                label: "Planning".into(),
+                role: Some("Planner".into()),
+                activity: "Preparing a bounded task plan".into(),
+            },
+            planning_condition(graph, attempts),
+            Some(possible_next("The planner may submit a proposal")),
+        ),
+    };
+    let future = decomposition_future(&stage.label);
+    let _ = task;
+    (stage, condition, next, future)
+}
+
+fn terminal_progress(
+    task: &crate::tasks::Task,
+    graph: Option<&ProgressGraph>,
+) -> (
+    TaskProgressStage,
+    Option<String>,
+    Option<TaskProgressNextAction>,
+    Vec<TaskProgressMilestone>,
+) {
+    match task.status.as_str() {
+        "done" => (
+            TaskProgressStage {
+                label: "Complete".into(),
+                role: None,
+                activity: "Task completed".into(),
+            },
+            None,
+            None,
+            Vec::new(),
+        ),
+        "cancelled" => (
+            TaskProgressStage {
+                label: "Cancelled".into(),
+                role: None,
+                activity: "Task was cancelled".into(),
+            },
+            Some("Operator cancelled the task".into()),
+            None,
+            Vec::new(),
+        ),
+        _ => {
+            let retry_eligible = retry_eligible(task, graph);
+            (
+                TaskProgressStage {
+                    label: "Failed".into(),
+                    role: None,
+                    activity: "Task failed before completion".into(),
+                },
+                Some(
+                    if retry_eligible {
+                        "Retry eligible"
+                    } else {
+                        "Operator decision required"
+                    }
+                    .into(),
+                ),
+                retry_eligible.then(|| possible_next("An operator may retry the task")),
+                Vec::new(),
+            )
+        }
+    }
+}
+
+fn execution_future(
+    current: &str,
+    r2_required: bool,
+    journey: TaskJourney,
+) -> Vec<TaskProgressMilestone> {
+    let mut labels: Vec<(&str, Option<&str>)> = match current {
+        "Queued" => vec![
+            ("Implementation", Some("Worker")),
+            ("First review", Some("R1")),
+        ],
+        "Implementation" => vec![("First review", Some("R1"))],
+        "Remediation" => vec![("First review", Some("R1"))],
+        "First review" => Vec::new(),
+        "Final review" => vec![("Merge", None), ("Complete", None)],
+        "Merge" => vec![("Complete", None)],
+        _ => Vec::new(),
+    };
+    if r2_required && current != "Final review" && current != "Merge" {
+        labels.push(("Final review", Some("R2")));
+    }
+    if current != "Merge" && current != "Final review" {
+        labels.push(("Merge", None));
+        labels.push(("Complete", None));
+    }
+    if journey == TaskJourney::ReviewOnly {
+        labels.retain(|(label, _)| *label != "Implementation");
+    }
+    future_milestones(labels)
+}
+
+fn decomposition_future(current: &str) -> Vec<TaskProgressMilestone> {
+    let labels = match current {
+        "Intake / classification" | "Planning" => vec![
+            ("Pre-classification", None),
+            ("Plan review", Some("Arbiter")),
+            ("Child execution", None),
+            ("Complete", None),
+        ],
+        "Pre-classification" => vec![
+            ("Plan review", Some("Arbiter")),
+            ("Child execution", None),
+            ("Complete", None),
+        ],
+        "Plan review" => vec![("Child execution", None), ("Complete", None)],
+        "Child execution" => vec![("Complete", None)],
+        _ => Vec::new(),
+    };
+    future_milestones(labels)
+}
+
+fn future_milestones(labels: Vec<(&str, Option<&str>)>) -> Vec<TaskProgressMilestone> {
+    labels
+        .into_iter()
+        .map(|(stage, role)| TaskProgressMilestone {
+            stage: stage.into(),
+            role: role.map(str::to_string),
+            state: TaskProgressMilestoneState::Future,
+            activity: None,
+        })
+        .collect()
+}
+
+fn push_completed(
+    history: &mut Vec<TaskProgressMilestone>,
+    stage: &str,
+    role: Option<&str>,
+    activity: &str,
+) {
+    if history.len() < TASK_PROGRESS_HISTORY_LIMIT {
+        history.push(TaskProgressMilestone {
+            stage: stage.into(),
+            role: role.map(str::to_string),
+            state: TaskProgressMilestoneState::Completed,
+            activity: Some(bounded_progress_text(activity)),
+        });
+    }
+}
+
+fn run_outcome(end_reason: Option<&str>) -> &'static str {
+    match end_reason {
+        Some("verdict:approved") => "Approved",
+        Some(reason) if reason.starts_with("verdict:changes") => "Changes requested",
+        Some("cancelled") => "Cancelled",
+        Some("drain") => "Paused for daemon drain",
+        Some(_) => "Run completed",
+        None => "Run completed",
+    }
+}
+
+fn arbiter_outcome(code: &str) -> &'static str {
+    match code {
+        "arbiter-changes" => "Changes requested",
+        "arbiter-reject-source" => "Rejected; operator decision required",
+        "arbiter-provider" => "Provider failure",
+        _ => "Arbiter outcome recorded",
+    }
+}
+
+fn planning_attempt_outcome(attempt: &ProgressAttempt) -> &'static str {
+    match attempt.kind.as_str() {
+        "provider" => "Planner provider attempt ended",
+        "blocker" => "Planning blocked",
+        _ => "Proposal returned for revision",
+    }
+}
+
+fn worker_activity(run: &ProgressLiveRun, rework_round: i64) -> String {
+    if run.phase == "working" && rework_round > 0 {
+        format!("Applying remediation for rework round {rework_round}")
+    } else if run.phase == "working" {
+        "Implementation in progress".into()
+    } else {
+        bounded_progress_text(&format!("Worker phase: {}", run.phase))
+    }
+}
+
+fn reviewer_activity(run: &ProgressLiveRun, stage: &str) -> String {
+    if run.phase == "reviewing" {
+        format!("{stage} in progress")
+    } else {
+        bounded_progress_text(&format!("Reviewer phase: {}", run.phase))
+    }
+}
+
+fn live_condition(run: &ProgressLiveRun) -> Option<String> {
+    match run.agent_state.as_deref() {
+        Some("blocked") => Some("Blocked by managed agent".into()),
+        Some("needs-info") => Some("Waiting for operator input".into()),
+        Some("failed") => Some("Managed agent failed; recovery pending".into()),
+        Some(note) if !note.is_empty() => Some(bounded_progress_text(note)),
+        _ => None,
+    }
+}
+
+fn planning_condition(graph: &ProgressGraph, attempts: &[ProgressAttempt]) -> Option<String> {
+    if graph.state == "freeze-requested" || graph.state == "draining" {
+        return Some("Waiting for planning intake".into());
+    }
+    attempts
+        .last()
+        .filter(|attempt| attempt.reason_code == "arbiter-changes")
+        .map(|_| "Planner is revising Arbiter feedback".into())
+}
+
+fn planning_hold_condition(graph: &ProgressGraph) -> String {
+    graph
+        .hold_summary
+        .as_deref()
+        .filter(|summary| !summary.is_empty())
+        .map(|summary| render_graph_hold_summary(graph.hold_code.as_deref(), summary))
+        .map(|summary| bounded_progress_text(&summary))
+        .unwrap_or_else(|| {
+            graph
+                .hold_code
+                .as_deref()
+                .map(|code| format!("Planning held: {}", bounded_progress_text(code)))
+                .unwrap_or_else(|| "Planning is held".into())
+        })
+}
+
+/// Preserve a readable status surface while graph holds retain structured
+/// identity for guarded recovery writes.
+fn render_graph_hold_summary(hold_code: Option<&str>, summary: &str) -> String {
+    if hold_code == Some("generated-child-failed") {
+        if let Some((task_id, reason)) = serde_json::from_str::<serde_json::Value>(summary)
+            .ok()
+            .and_then(|value| {
+                Some((
+                    value.get("affected_task")?.as_i64()?,
+                    value.get("reason")?.as_str()?.to_owned(),
+                ))
+            })
+        {
+            return format!("Generated child task #{task_id} failed: {reason}");
+        }
+    }
+    summary.to_owned()
+}
+
+fn retry_eligible(task: &crate::tasks::Task, graph: Option<&ProgressGraph>) -> bool {
+    let task_retry = task
+        .refs
+        .as_deref()
+        .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+        .and_then(|refs| refs.get(crate::tasks::PARKED_RESUME_STATUS_REF).cloned())
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .is_some();
+    task_retry
+        || graph.is_some_and(|graph| {
+            matches!(
+                graph.hold_code.as_deref(),
+                Some("proposal-attempts-exhausted" | "provider-attempts-exhausted")
+            ) && graph.operator_retry_count < crate::decomposition::MAX_OPERATOR_RETRIES
+        })
+}
+
+fn possible_next(action: &str) -> TaskProgressNextAction {
+    TaskProgressNextAction {
+        label: "Possible next".into(),
+        action: bounded_progress_text(action),
+    }
+}
+
+fn deterministic_next(action: &str) -> TaskProgressNextAction {
+    TaskProgressNextAction {
+        label: "Next".into(),
+        action: bounded_progress_text(action),
+    }
+}
+
+fn blocked_by(noun: &str, ids: &[i64]) -> String {
+    let ids = ids
+        .iter()
+        .take(TASK_PROGRESS_DEPENDENCY_LIMIT)
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    bounded_progress_text(&format!("Blocked by {noun} {ids}"))
+}
+
+fn deadlocked_by(ids: &[i64]) -> String {
+    let ids = ids
+        .iter()
+        .take(TASK_PROGRESS_DEPENDENCY_LIMIT)
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    bounded_progress_text(&format!("Deadlocked by cancelled dependency tasks {ids}"))
+}
+
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "done" | "failed" | "cancelled")
+}
+
+fn bounded_progress_text(text: &str) -> String {
+    let mut chars = text.chars();
+    let bounded: String = chars.by_ref().take(TASK_PROGRESS_TEXT_LIMIT).collect();
+    if chars.next().is_some() {
+        format!(
+            "{}…",
+            bounded
+                .chars()
+                .take(TASK_PROGRESS_TEXT_LIMIT.saturating_sub(1))
+                .collect::<String>()
+        )
+    } else {
+        bounded
+    }
 }
 
 /// Small, bounded pieces of the status snapshot used by the polling web dashboard.
@@ -789,11 +2007,38 @@ fn queue_by_tier(conn: &Connection) -> Result<Vec<TierQueueCount>> {
         .collect())
 }
 
-/// Open tasks blocked by unmet dependencies (#86). Returns each blocked task with the
-/// list of dep ids it's waiting on (only deps that are NOT yet `closed`).
+/// Open tasks blocked by unmet dependencies (#86) plus daemon-parked
+/// (`status='failed'`) tasks whose `depends_on` currently contains any
+/// cancelled dep. The latter are the operator disposition queue — task-retry
+/// refuses until `depends_on` is edited or the dependent is closed.
+///
+/// Deliberately infers the unsatisfiable condition from the live dep graph
+/// instead of gating on the durable `daemon_parked_unsatisfiable` marker.
+/// Reason: cancellation writes commit before any subsequent sweep would set
+/// that marker (sweep_on_write runs before the mutator writes), so a purely
+/// marker-gated read would hide the row for an unbounded interval after
+/// cancellation. Inference is authoritative regardless of when refs get
+/// refreshed by `converge_parked_dependents_of_cancelled`. Also covers
+/// classifier-policy parks (their `daemon_parked_reason` stays "classifier
+/// declined" so refs never gain the marker, but the cancelled dep is still
+/// the operator disposition and must surface).
 fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, labels, depends_on FROM tasks WHERE status='open' AND depends_on IS NOT NULL",
+        "SELECT t.id, t.title, t.labels, t.depends_on, t.status FROM tasks t
+         WHERE t.depends_on IS NOT NULL
+           AND (
+               t.status='open'
+               OR (
+                   t.status='failed'
+                   AND json_valid(t.refs)
+                   AND json_extract(t.refs, '$.daemon_parked')=1
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(t.depends_on) j
+                       JOIN tasks d ON d.id = j.value
+                       WHERE d.status = 'cancelled'
+                   )
+               )
+           )",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -801,14 +2046,19 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
             let title: String = r.get(1)?;
             let labels: Option<String> = r.get(2)?;
             let depends_on: Option<String> = r.get(3)?;
-            Ok((id, title, labels, depends_on))
+            let status: String = r.get(4)?;
+            Ok((id, title, labels, depends_on, status))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut blocked = Vec::new();
-    for (id, title, labels, depends_on) in rows {
-        let ready = crate::tasks::compute_ready(conn, &depends_on)?;
-        if ready {
-            continue;
+    for (id, title, labels, depends_on, status) in rows {
+        // Parked-unsatisfiable rows always render (they are the disposition
+        // queue). Open rows only render when they are actually blocked.
+        if status == "open" {
+            let ready = crate::tasks::compute_ready(conn, &depends_on)?;
+            if ready {
+                continue;
+            }
         }
         let waiting_on = unmet_deps(conn, &depends_on)?;
         let deadlocked_on = cancelled_deps(conn, &depends_on)?;
@@ -1045,26 +2295,31 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
         } else {
             (None, None)
         };
-        let (provider, model, effort) = e.task_id.map_or((None, None, None), |tid| {
-            conn.query_row(
-                "SELECT provider, model, effort FROM agent_runs
-                 WHERE task_id=?1 AND agent_name=?2 AND role=?3
-                 ORDER BY spawned_at DESC, id DESC LIMIT 1",
-                params![tid, e.agent, e.role],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .ok()
-            .map(|(provider, model, effort)| {
-                (
-                    // v31 added this nullable column; NULL is the documented
-                    // legacy-Claude meaning, not an unknown provider.
-                    provider.or_else(|| Some("claude".into())),
-                    Some(model),
-                    Some(effort),
+        let (provider, model, effort) = if e.role == "planner" {
+            planner_journal_identity(conn, e.task_id, &e.session_id, e.provider.as_deref())
+        } else {
+            e.task_id.map_or((None, None, None), |tid| {
+                conn.query_row(
+                    "SELECT provider, model, effort FROM agent_runs
+                     WHERE task_id=?1 AND agent_name=?2 AND role=?3
+                     ORDER BY spawned_at DESC, id DESC LIMIT 1",
+                    params![tid, e.agent, e.role],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get(1)?, r.get(2)?)),
                 )
+                .ok()
+                .map(|(provider, model, effort)| {
+                    (
+                        // v31 added this nullable column; NULL is the documented
+                        // legacy-Claude meaning, not an unknown provider.
+                        provider.or_else(|| Some("claude".into())),
+                        Some(model),
+                        Some(effort),
+                    )
+                })
+                .unwrap_or((None, None, None))
             })
-            .unwrap_or((None, None, None))
-        });
+        };
+        let stream_counters = e.log_dir.as_deref().and_then(planner_stream_counters);
         let (
             tool_count,
             now_label,
@@ -1093,7 +2348,12 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
                 ls.error_text.clone(),
             )
         } else {
-            (0, None, None, None, 0, 0, None)
+            let counters = if e.role == "planner" {
+                stream_counters.unwrap_or_default()
+            } else {
+                PlannerStreamCounters::default()
+            };
+            (counters.tool_count, None, None, None, 0, 0, None)
         };
         let display_tokens = e.cost_tokens + mid_turn_tok;
         let sub_role = if e.phase == "auditing" {
@@ -1128,6 +2388,129 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
         });
     }
     Ok(views)
+}
+
+/// Planner runs do not create `agent_runs`: their immutable executable identity
+/// belongs to the decomposition's role assignment. Match the live journal's
+/// session id so a retained graph never lends an earlier attempt its identity.
+fn planner_journal_identity(
+    conn: &Connection,
+    task_id: Option<i64>,
+    session_id: &str,
+    journal_provider: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Some(task_id) = task_id else {
+        return (journal_provider.map(str::to_owned), None, None);
+    };
+    conn.query_row(
+        "SELECT d.planner_provider, d.planner_model, a.effort
+         FROM task_decompositions d
+         LEFT JOIN role_assignments a ON a.id=d.planner_assignment_id AND a.role='planner'
+         WHERE d.source_task_id=?1 AND d.planner_session_id=?2
+         ORDER BY d.updated_at DESC, d.id DESC LIMIT 1",
+        params![task_id, session_id],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )
+    .ok()
+    .map(|(provider, model, effort)| {
+        (
+            journal_provider.map(str::to_owned).or(provider),
+            model,
+            effort,
+        )
+    })
+    .unwrap_or((journal_provider.map(str::to_owned), None, None))
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PlannerStreamCounters {
+    activity_count: u32,
+    tool_count: u32,
+}
+
+/// Derive only structural counters from a bounded prefix of a current planner
+/// stream. No field values or provider payloads leave this function. It accepts
+/// both the closed sanitized stream and the older planner JSONL shape while
+/// migration is in progress.
+fn planner_stream_counters(log_dir: &str) -> Option<PlannerStreamCounters> {
+    let path = std::path::Path::new(log_dir).join("stream.jsonl");
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(PLANNER_STREAM_INSPECT_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+
+    let mut counters = PlannerStreamCounters::default();
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .take(PLANNER_STREAM_INSPECT_RECORDS)
+    {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(event) = value.get("event").and_then(serde_json::Value::as_str) else {
+            // Legacy planner JSONL has no closed event field. Count known
+            // lifecycle/tool shapes only, and retain no provider text.
+            let event_type = value.get("type").and_then(serde_json::Value::as_str);
+            let item_type = value
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(serde_json::Value::as_str);
+            if matches!(
+                event_type,
+                Some(
+                    "thread.started"
+                        | "turn.started"
+                        | "turn.completed"
+                        | "turn.failed"
+                        | "item.started"
+                        | "item.completed"
+                )
+            ) {
+                counters.activity_count = counters.activity_count.saturating_add(1);
+            }
+            if matches!(
+                (event_type, item_type),
+                (
+                    Some("item.started" | "item.completed"),
+                    Some("command_execution" | "file_change" | "mcp_call")
+                )
+            ) {
+                counters.tool_count = counters.tool_count.saturating_add(1);
+            }
+            continue;
+        };
+        if matches!(
+            event,
+            "provider_lifecycle"
+                | "turn_lifecycle"
+                | "command_summary"
+                | "tool_summary"
+                | "assistant_message"
+                | "terminal_response"
+                | "provider_failure"
+                | "semantic_rejection"
+                | "completion"
+        ) {
+            counters.activity_count = counters.activity_count.saturating_add(1);
+        }
+        // `assistant_message` is deliberately excluded: an assistant-only turn
+        // is activity, not a tool action.
+        if matches!(event, "command_summary" | "tool_summary") {
+            counters.tool_count = counters.tool_count.saturating_add(1);
+        }
+    }
+    Some(counters)
 }
 
 /// Build a compact `tier·eff` label from a task's JSON labels array.
@@ -1356,21 +2739,62 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
             status,
             pr,
             blocked: false,
+            arbiter: arbiter_verdict(conn, id)?,
         });
     }
     Ok(result)
 }
 
+/// Read the newest verdict evidence for a decomposition source. Verdict rows are
+/// observational, so select them by insertion order rather than their per-kind ordinal.
+pub fn arbiter_verdict(conn: &Connection, source_task_id: i64) -> Result<Option<ArbiterVerdict>> {
+    let row: Option<(String, i64, String)> = conn
+        .query_row(
+            "SELECT a.reason_code,a.created_at,a.summary
+             FROM task_decompositions d
+             JOIN decomposition_attempts a ON a.graph_id=d.id
+             WHERE d.source_task_id=?1 AND a.kind='verdict'
+             ORDER BY a.id DESC LIMIT 1",
+            [source_task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(reason_code, at, summary)| {
+        let summary: serde_json::Value = serde_json::from_str(&summary).unwrap_or_default();
+        ArbiterVerdict {
+            verdict: summary
+                .get("verdict")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            reason_code,
+            at,
+            provider: summary
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            model: summary
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            duration_ms: summary
+                .get("duration_ms")
+                .and_then(serde_json::Value::as_i64),
+        }
+    }))
+}
+
 /// The schema guarantees at most one active graph/freeze. A held planning result is
 /// also useful owner-facing state, so fall back to the newest non-completed aggregate.
-fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusView>> {
+fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<DecompositionStatusView>> {
     let graph = conn
         .query_row(
-            "SELECT d.id, d.source_task_id, t.title, t.status, d.state,
+            "SELECT d.id, d.source_task_id, t.title, t.status, d.state, d.active,
                     d.proposal_attempts, d.provider_failures, d.planner_provider,
-                    d.planner_model, d.accepted_plan_revision, d.hold_summary
+                    d.planner_model, a.effort, d.accepted_plan_revision, d.hold_summary,
+                    d.hold_code,d.operator_retry_count
              FROM task_decompositions d
              JOIN tasks t ON t.id=d.source_task_id
+             LEFT JOIN role_assignments a ON a.id=d.planner_assignment_id AND a.role='planner'
              WHERE d.active=1 OR d.freeze_active=1
                 OR d.state NOT IN ('completed','cancelled')
              ORDER BY (d.active=1 OR d.freeze_active=1) DESC, d.updated_at DESC, d.id DESC
@@ -1383,12 +2807,16 @@ fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusV
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
-                    r.get::<_, i64>(5)?,
+                    r.get::<_, bool>(5)?,
                     r.get::<_, i64>(6)?,
-                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, i64>(7)?,
                     r.get::<_, Option<String>>(8)?,
-                    r.get::<_, Option<i64>>(9)?,
+                    r.get::<_, Option<String>>(9)?,
                     r.get::<_, Option<String>>(10)?,
+                    r.get::<_, Option<i64>>(11)?,
+                    r.get::<_, Option<String>>(12)?,
+                    r.get::<_, Option<String>>(13)?,
+                    r.get::<_, i64>(14)?,
                 ))
             },
         )
@@ -1399,16 +2827,34 @@ fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusV
         source_title,
         source_status,
         graph_state,
+        graph_active,
         proposal_attempts,
         provider_failures,
         planner_provider,
         planner_model,
+        planner_effort,
         accepted_plan_revision,
         hold_summary,
+        hold_code,
+        operator_retry_count,
     )) = graph
     else {
         return Ok(None);
     };
+    let retryable_planning_hold =
+        crate::decomposition::exhausted_planning_retry_is_eligible(conn, source_task_id, now)?;
+    let planner_log_dir: Option<String> = conn
+        .query_row(
+            "SELECT log_dir FROM journal
+             WHERE agent=?1 AND role='planner' AND task_id=?2
+             LIMIT 1",
+            params![format!("decomposition-planner-{graph_id}"), source_task_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let planner_counters = planner_log_dir.as_deref().and_then(planner_stream_counters);
+    let planner_last_activity_age_secs = planner_log_dir.as_deref().and_then(stream_jsonl_age_secs);
 
     let mut stmt = conn.prepare(
         "SELECT m.task_id, m.local_key, t.title, t.status, t.depends_on
@@ -1452,7 +2898,10 @@ fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusV
 
     // Keep reasons bounded independently of graph history. Summaries are already
     // length-bounded at their write boundary; no prompt or transcript is selected.
-    let mut reasons = hold_summary.into_iter().collect::<Vec<_>>();
+    let mut reasons = hold_summary
+        .into_iter()
+        .map(|summary| render_graph_hold_summary(hold_code.as_deref(), &summary))
+        .collect::<Vec<_>>();
     let mut reason_stmt = conn.prepare(
         "SELECT summary FROM decomposition_attempts WHERE graph_id=?1
          ORDER BY id DESC LIMIT 6",
@@ -1467,16 +2916,39 @@ fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusV
     }
     reasons.truncate(6);
 
+    let dispatch_hold = if graph_state != "active" || !graph_active {
+        Some(format!(
+            "implementation dispatch held: graph state={graph_state}, active={}",
+            i64::from(graph_active)
+        ))
+    } else if source_status != "decomposed" {
+        Some(format!(
+            "implementation dispatch held: source status={source_status}"
+        ))
+    } else {
+        None
+    };
+
     Ok(Some(DecompositionStatusView {
         graph_id,
         source_task_id,
         source_title,
         source_status,
         graph_state,
+        dispatch_hold,
         proposal_attempts,
         provider_failures,
+        hold_code,
+        retryable_planning_hold,
+        operator_retry_count,
+        operator_retry_cap: crate::decomposition::MAX_OPERATOR_RETRIES,
         planner_provider,
         planner_model,
+        planner_effort,
+        planner_log_dir,
+        planner_last_activity_age_secs,
+        planner_activity_count: planner_counters.map(|counters| counters.activity_count),
+        planner_tool_count: planner_counters.map(|counters| counters.tool_count),
         accepted_plan_revision,
         completed_children,
         total_children: members.len() as i64,
@@ -1763,6 +3235,50 @@ mod tests {
         (dir, c)
     }
 
+    fn progress_task(c: &mut Connection, title: &str) -> i64 {
+        crate::tasks::create(c, "owner", title, None, 0, None, None, None, None, 100).unwrap()
+    }
+
+    fn set_status(c: &Connection, task_id: i64, status: &str) {
+        c.execute(
+            "UPDATE tasks SET status=?2,updated_at=101 WHERE id=?1",
+            params![task_id, status],
+        )
+        .unwrap();
+    }
+
+    fn progress_run(
+        c: &Connection,
+        task_id: i64,
+        role: &str,
+        sub_role: Option<&str>,
+        end_reason: Option<&str>,
+    ) {
+        c.execute(
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at,
+                 sub_role,ended_at,end_reason)
+             VALUES(?1,'agent',?2,'model','high','codex',100,?3,
+                    CASE WHEN ?4 IS NULL THEN NULL ELSE 101 END,?4)",
+            params![task_id, role, sub_role, end_reason],
+        )
+        .unwrap();
+    }
+
+    fn progress_graph(c: &Connection, source_task_id: i64, state: &str) -> i64 {
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES(?1,?2,0,0,1,100,100)",
+            params![source_task_id, state],
+        )
+        .unwrap();
+        c.last_insert_rowid()
+    }
+
+    fn projection(c: &Connection, task_id: i64) -> TaskProgress {
+        task_progress(c, task_id, 200).unwrap().unwrap()
+    }
+
     fn ready_claim(
         c: &mut Connection,
         agent: &str,
@@ -1779,6 +3295,7 @@ mod tests {
                     task_id: id,
                     cx_est: 3,
                     size: "M".into(),
+                    size_reason: "bounded test classification rationale".into(),
                     ready: true,
                     not_ready_reason: None,
                     duplicate_of: vec![],
@@ -1829,6 +3346,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -2674,6 +4194,105 @@ mod tests {
         assert_eq!(b.deadlocked_on, vec![dep]);
     }
 
+    /// Task #473: a parked-unsatisfiable task (status='failed',
+    /// daemon_parked_unsatisfiable=1) surfaces in the BLOCKED section with
+    /// the cancelled dep id in `deadlocked_on`. Without this, the operator
+    /// has to spelunk the DB to find the disposition queue after the sweep
+    /// moves the task out of `status='open'`.
+    #[test]
+    fn blocked_section_surfaces_parked_unsatisfiable_tasks() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let parked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "parked-by-cancelled-dep",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![dep],
+        )
+        .unwrap();
+        // Simulate the sweep parking the dependent with unsatisfiable=true.
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_unsatisfiable', json('true'),
+                 'daemon_resume_status', 'open',
+                 'daemon_parked_reason', 'dependency #' || ?2 || ' is cancelled — unsatisfiable'
+             ) WHERE id=?1",
+            rusqlite::params![parked, dep],
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let b = s
+            .blocked
+            .iter()
+            .find(|task| task.id == parked)
+            .expect("parked-unsatisfiable task must render in the BLOCKED section");
+        assert_eq!(b.deadlocked_on, vec![dep]);
+    }
+
+    /// Task #473 R6 blocker 3: a classifier-policy park keeps its
+    /// authoritative "classifier declined" reason (retry is a
+    /// reclassification, not a dep restore), so the durable
+    /// `daemon_parked_unsatisfiable` marker is never set on it. BLOCKED
+    /// must still surface it when a dep is cancelled, otherwise the
+    /// operator disposition signal disappears after the generic alert
+    /// expires. Live dep-graph inference in `blocked_tasks` covers it.
+    #[test]
+    fn blocked_section_surfaces_policy_park_with_cancelled_dep() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let policy_parked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "policy-parked with cancelled dep",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![dep],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'classifier declined',
+                 'daemon_resume_status', 'open',
+                 'classifier_policy_parked', json('true')
+             ) WHERE id=?1",
+            rusqlite::params![policy_parked],
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let b = s
+            .blocked
+            .iter()
+            .find(|task| task.id == policy_parked)
+            .expect("policy park with cancelled dep must render in BLOCKED");
+        assert_eq!(b.deadlocked_on, vec![dep]);
+    }
+
     // -- Issue #97 scoreboard + retired list -----------------------------------
 
     #[test]
@@ -2755,6 +4374,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -2775,6 +4397,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -2825,6 +4450,9 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -3190,14 +4818,311 @@ mod tests {
             .unwrap();
         }
 
-        let graph = decomposition_status(&c).unwrap().unwrap();
+        let graph = decomposition_status(&c, 100).unwrap().unwrap();
         assert_eq!(graph.source_task_id, source);
+        assert_eq!(
+            graph.dispatch_hold.as_deref(),
+            Some("implementation dispatch held: graph state=blocked, active=1")
+        );
         assert_eq!(graph.completed_children, 0);
         assert_eq!(graph.total_children, 2);
         assert_eq!(graph.failed_children, vec![child_b]);
         assert_eq!(graph.members[1].prerequisites, vec![child_a]);
         assert_eq!(graph.reasons.len(), 6, "owner-facing reasons stay bounded");
         assert_eq!(graph.reasons[0], "child failed");
+    }
+
+    #[test]
+    fn generated_child_failure_hold_renders_as_readable_status() {
+        let summary = serde_json::json!({
+            "affected_task": 42,
+            "reason": "daemon push failed",
+        })
+        .to_string();
+        assert_eq!(
+            render_graph_hold_summary(Some("generated-child-failed"), &summary),
+            "Generated child task #42 failed: daemon push failed"
+        );
+        assert_eq!(
+            render_graph_hold_summary(Some("generated-child-failed"), "legacy child failure"),
+            "legacy child failure"
+        );
+    }
+
+    #[test]
+    fn planner_stream_counters_do_not_count_assistant_messages_as_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        // Sanitized shape: only assistant-message activity, no command or tool.
+        std::fs::write(
+            dir.path().join("stream.jsonl"),
+            concat!(
+                r#"{"event":"provider_lifecycle","provider":"codex","phase":"started"}"#,
+                "\n",
+                r#"{"event":"turn_lifecycle","turn":1,"phase":"started"}"#,
+                "\n",
+                r#"{"event":"assistant_message","details":{"summary":"structural","shape":"string","captured_bytes":8}}"#,
+                "\n",
+                r#"{"event":"assistant_message","details":{"summary":"structural","shape":"string","captured_bytes":8}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let counters = planner_stream_counters(dir.path().to_str().unwrap()).unwrap();
+        assert!(
+            counters.activity_count >= 3,
+            "assistant messages must count as activity: {counters:?}"
+        );
+        assert_eq!(
+            counters.tool_count, 0,
+            "assistant-only stream must report zero tool actions"
+        );
+    }
+
+    #[test]
+    fn planner_stream_counters_count_command_and_tool_summaries_as_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("stream.jsonl"),
+            concat!(
+                r#"{"event":"turn_lifecycle","turn":1,"phase":"started"}"#,
+                "\n",
+                r#"{"event":"assistant_message","details":{"summary":"structural","shape":"string","captured_bytes":4}}"#,
+                "\n",
+                r#"{"event":"command_summary","command":"shell","outcome":"succeeded","details":{"summary":"structural","shape":"object","captured_bytes":8}}"#,
+                "\n",
+                r#"{"event":"tool_summary","tool":"other","outcome":"started","details":{"summary":"structural","shape":"object","captured_bytes":8}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let counters = planner_stream_counters(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            counters.activity_count, 4,
+            "each sanitized activity record counts once: {counters:?}"
+        );
+        assert_eq!(
+            counters.tool_count, 2,
+            "command_summary and tool_summary count as tools; assistant_message does not"
+        );
+    }
+
+    #[test]
+    fn live_planner_status_uses_assignment_and_bounded_stream_counters() {
+        let (dir, mut c) = open_tmp();
+        let source =
+            crate::tasks::create(&mut c, "A", "source", None, 0, None, None, None, None, 100)
+                .unwrap();
+        c.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at
+             ) VALUES ('planner:task:1:revision:1',?1,'planner','planner-profile','codex',
+                 'codex','gpt-5.6-sol','high','pool','generation',100)",
+            params![source],
+        )
+        .unwrap();
+        let assignment_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 planner_provider,planner_model,planner_assignment_id,planner_session_id,
+                 created_at,updated_at
+             ) VALUES (?1,'planning',0,1,1,'codex','gpt-5.6-sol',?2,'planner-session',100,100)",
+            params![source, assignment_id],
+        )
+        .unwrap();
+        let graph_id = c.last_insert_rowid();
+        let log_dir = dir.path().join("planner-live");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("stream.jsonl"),
+            concat!(
+                r#"{"event":"turn_lifecycle","turn":1,"phase":"started"}"#,
+                "\n",
+                r#"{"event":"tool_summary","tool":"bash","outcome":"started","details":{"summary":"structural","shape":"object","captured_bytes":8}}"#,
+                "\n",
+                r#"{"type":"item.completed","item":{"type":"command_execution","command":"sk-status-must-not-leak"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: format!("decomposition-planner-{graph_id}"),
+                role: "planner".into(),
+                task_id: Some(source),
+                session_id: "planner-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "planner".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: Some(log_dir.to_string_lossy().into_owned()),
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        let status = stats(&c, 100, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let graph = status.decomposition.as_ref().unwrap();
+        assert_eq!(graph.planner_provider.as_deref(), Some("codex"));
+        assert_eq!(graph.planner_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(graph.planner_effort.as_deref(), Some("high"));
+        assert_eq!(graph.planner_log_dir.as_deref(), log_dir.to_str());
+        assert_eq!(graph.planner_activity_count, Some(3));
+        assert_eq!(graph.planner_tool_count, Some(2));
+        assert!(graph.planner_last_activity_age_secs.is_some());
+
+        let planner = status
+            .daemon_agents
+            .iter()
+            .find(|agent| agent.role == "planner")
+            .unwrap();
+        assert_eq!(planner.provider.as_deref(), Some("codex"));
+        assert_eq!(planner.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(planner.effort.as_deref(), Some("high"));
+        assert_eq!(planner.tool_count, 2);
+
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            !json.contains("sk-status-must-not-leak"),
+            "status must not expose provider payload text"
+        );
+    }
+
+    #[test]
+    fn decomposition_status_distinguishes_retryable_exhaustion_and_retry_count() {
+        let (_d, mut c) = open_tmp();
+        let source =
+            crate::tasks::create(&mut c, "A", "source", None, 0, None, None, None, None, 100)
+                .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed' WHERE id=?1",
+            params![source],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,planned_source_revision,provider_failures,
+                 operator_retry_count,hold_code,hold_summary,created_at,updated_at)
+             VALUES (?1,'held',1,3,1,'provider-attempts-exhausted',
+                     'bounded provider summary',100,100)",
+            params![source],
+        )
+        .unwrap();
+        let graph_id = c.last_insert_rowid();
+        for ordinal in 1..=6 {
+            c.execute(
+                "INSERT INTO decomposition_attempts(
+                     graph_id,source_revision,kind,ordinal,retry_generation,
+                     reason_code,summary,created_at)
+                 VALUES (?1,1,'provider',?2,?3,'provider-failure','bounded',100)",
+                params![graph_id, ordinal, i64::from(ordinal > 3)],
+            )
+            .unwrap();
+        }
+        let graph = decomposition_status(&c, 100).unwrap().unwrap();
+        assert_eq!(
+            graph.hold_code.as_deref(),
+            Some("provider-attempts-exhausted")
+        );
+        assert!(graph.retryable_planning_hold);
+        assert_eq!(graph.operator_retry_count, 1);
+        assert_eq!(graph.operator_retry_cap, 2);
+
+        c.execute(
+            "UPDATE tasks SET refs=json_object('daemon_publication',json_object(\
+                 'pr',42,'branch','daemon/source','local_sha','abc',\
+                 'expected_remote_sha','def','stage','push')) WHERE id=?1",
+            [source],
+        )
+        .unwrap();
+        assert!(
+            !decomposition_status(&c, 100)
+                .unwrap()
+                .unwrap()
+                .retryable_planning_hold
+        );
+        c.execute("UPDATE tasks SET refs=NULL WHERE id=?1", [source])
+            .unwrap();
+
+        c.execute(
+            "UPDATE task_decompositions SET provider_failures=2 WHERE id=?1",
+            [graph_id],
+        )
+        .unwrap();
+        assert!(
+            !decomposition_status(&c, 100)
+                .unwrap()
+                .unwrap()
+                .retryable_planning_hold
+        );
+
+        c.execute(
+            "UPDATE task_decompositions
+             SET provider_failures=3,accepted_proposal_json='[]' WHERE id=?1",
+            [graph_id],
+        )
+        .unwrap();
+        assert!(
+            !decomposition_status(&c, 100)
+                .unwrap()
+                .unwrap()
+                .retryable_planning_hold
+        );
+
+        c.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json=NULL WHERE id=?1",
+            [graph_id],
+        )
+        .unwrap();
+        let child = crate::tasks::create(
+            &mut c,
+            "A",
+            "materialized child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision)
+             VALUES (?1,?2,'child',1)",
+            params![graph_id, child],
+        )
+        .unwrap();
+        assert!(
+            !decomposition_status(&c, 100)
+                .unwrap()
+                .unwrap()
+                .retryable_planning_hold
+        );
+
+        c.execute(
+            "DELETE FROM task_graph_members WHERE graph_id=?1",
+            [graph_id],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE task_decompositions
+             SET hold_code='scope-blocker',operator_retry_count=0 WHERE id=?1",
+            [graph_id],
+        )
+        .unwrap();
+        let semantic = decomposition_status(&c, 100).unwrap().unwrap();
+        assert!(!semantic.retryable_planning_hold);
+        assert_eq!(semantic.hold_code.as_deref(), Some("scope-blocker"));
     }
 
     #[test]
@@ -3274,6 +5199,9 @@ mod tests {
                 pid: None,
                 pr: Some(102),
                 rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
             },
         )
         .unwrap();
@@ -3886,5 +5814,398 @@ mod tests {
         }];
         let health = compute_health(&agents, false, false);
         assert_eq!(health, HealthVerdict::OnTrack);
+    }
+
+    // ── task-progress projection ──────────────────────────────────────
+
+    #[test]
+    fn progress_direct_r1_without_live_agent_keeps_history_and_waits_for_assignment() {
+        let (_d, mut c) = open_tmp();
+        let task_id = progress_task(&mut c, "direct");
+        set_status(&c, task_id, "in-review");
+        progress_run(&c, task_id, "worker", None, Some("turn-completed"));
+
+        let progress = projection(&c, task_id);
+        assert_eq!(progress.journey, TaskJourney::DirectImplementation);
+        assert_eq!(progress.stage.label, "First review");
+        assert_eq!(progress.stage.role.as_deref(), Some("R1"));
+        assert_eq!(
+            progress.condition.as_deref(),
+            Some("Awaiting R1 assignment")
+        );
+        assert_eq!(
+            progress.next_action.as_ref().unwrap().label,
+            "Possible next"
+        );
+        assert_eq!(progress.history[0].stage, "Queued");
+        assert_eq!(progress.history[1].stage, "Implementation");
+    }
+
+    #[test]
+    fn progress_r2_uses_final_review_and_durable_r1_approval() {
+        let (_d, mut c) = open_tmp();
+        let task_id = progress_task(&mut c, "needs r2");
+        set_status(&c, task_id, "in-review");
+        progress_run(&c, task_id, "worker", None, Some("turn-completed"));
+        progress_run(&c, task_id, "reviewer", None, Some("verdict:approved"));
+        // The assigned but not live R2 run is durable evidence that this is the final gate.
+        progress_run(&c, task_id, "reviewer", Some("r2"), None);
+
+        let progress = projection(&c, task_id);
+        assert_eq!(progress.stage.label, "Final review");
+        assert_eq!(progress.stage.role.as_deref(), Some("R2"));
+        assert_eq!(
+            progress.condition.as_deref(),
+            Some("Awaiting R2 assignment")
+        );
+        assert!(progress
+            .history
+            .iter()
+            .any(|milestone| milestone.stage == "First review"
+                && milestone.activity.as_deref() == Some("Approved")));
+    }
+
+    #[test]
+    fn progress_rework_and_review_only_remediation_preserve_completed_review_rounds() {
+        let (_d, mut c) = open_tmp();
+        let direct = progress_task(&mut c, "direct rework");
+        set_status(&c, direct, "rework");
+        c.execute(
+            "UPDATE tasks SET rework_round=2,rework_cap=3 WHERE id=?1",
+            [direct],
+        )
+        .unwrap();
+        progress_run(&c, direct, "worker", None, Some("turn-completed"));
+        progress_run(&c, direct, "reviewer", None, Some("verdict:changes"));
+        let direct_progress = projection(&c, direct);
+        assert_eq!(direct_progress.stage.label, "Implementation");
+        assert_eq!(direct_progress.attempts.rework_round, 2);
+        assert_eq!(direct_progress.attempts.rework_cap, 3);
+        assert!(direct_progress
+            .history
+            .iter()
+            .any(|milestone| milestone.stage == "First review"));
+
+        let review_only = progress_task(&mut c, "review remediation");
+        c.execute(
+            "UPDATE tasks SET review_only=1,status='rework',rework_round=1 WHERE id=?1",
+            [review_only],
+        )
+        .unwrap();
+        progress_run(&c, review_only, "reviewer", None, Some("verdict:changes"));
+        let review_progress = projection(&c, review_only);
+        assert_eq!(review_progress.journey, TaskJourney::ReviewOnly);
+        assert_eq!(review_progress.stage.label, "Remediation");
+        assert!(review_progress
+            .milestones
+            .iter()
+            .any(|milestone| milestone.stage == "First review"
+                && milestone.state == TaskProgressMilestoneState::Future));
+    }
+
+    #[test]
+    fn progress_merge_wait_and_terminal_results_keep_completed_history() {
+        let (_d, mut c) = open_tmp();
+        let merge = progress_task(&mut c, "merge");
+        set_status(&c, merge, "merging");
+        progress_run(&c, merge, "worker", None, Some("turn-completed"));
+        progress_run(&c, merge, "reviewer", None, Some("verdict:approved"));
+        let merge_progress = projection(&c, merge);
+        assert_eq!(merge_progress.stage.label, "Merge");
+        assert_eq!(merge_progress.condition.as_deref(), Some("Waiting for CI"));
+        assert_eq!(
+            merge_progress.next_action.as_ref().unwrap().label,
+            "Possible next"
+        );
+
+        let failed = progress_task(&mut c, "failed after review");
+        set_status(&c, failed, "failed");
+        c.execute(
+            "UPDATE tasks SET refs=json_object('daemon_resume_status','rework') WHERE id=?1",
+            [failed],
+        )
+        .unwrap();
+        progress_run(&c, failed, "worker", None, Some("turn-completed"));
+        progress_run(&c, failed, "reviewer", None, Some("verdict:changes"));
+        let failed_progress = projection(&c, failed);
+        assert_eq!(failed_progress.stage.label, "Failed");
+        assert_eq!(failed_progress.condition.as_deref(), Some("Retry eligible"));
+        assert_eq!(
+            failed_progress.next_action.as_ref().unwrap().label,
+            "Possible next"
+        );
+        assert!(failed_progress
+            .history
+            .iter()
+            .any(|milestone| milestone.stage == "First review"));
+
+        let cancelled = progress_task(&mut c, "cancelled after work");
+        set_status(&c, cancelled, "cancelled");
+        progress_run(&c, cancelled, "worker", None, Some("turn-completed"));
+        let cancelled_progress = projection(&c, cancelled);
+        assert_eq!(cancelled_progress.stage.label, "Cancelled");
+        assert!(cancelled_progress
+            .history
+            .iter()
+            .any(|milestone| milestone.stage == "Implementation"));
+    }
+
+    #[test]
+    fn progress_planning_never_claims_arbiter_completion_from_task_status() {
+        let (_d, mut c) = open_tmp();
+        let source = progress_task(&mut c, "source");
+        set_status(&c, source, "planning");
+        let graph = progress_graph(&c, source, "planning");
+
+        let planning = projection(&c, source);
+        assert_eq!(planning.journey, TaskJourney::DecomposedSource);
+        assert_eq!(planning.stage.label, "Planning");
+        assert!(!planning
+            .history
+            .iter()
+            .any(|milestone| milestone.stage == "Plan review"));
+
+        c.execute(
+            "UPDATE task_decompositions SET state='validating' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        let reviewing = projection(&c, source);
+        assert_eq!(reviewing.stage.label, "Plan review");
+        assert_eq!(reviewing.stage.role.as_deref(), Some("Arbiter"));
+        assert_eq!(reviewing.stage.activity, "Awaiting Arbiter verdict");
+        assert_eq!(
+            reviewing.next_action.as_ref().unwrap().label,
+            "Possible next"
+        );
+    }
+
+    #[test]
+    fn progress_uses_current_journal_evidence_for_activity_and_conditions() {
+        let (_d, mut c) = open_tmp();
+        let task_id = progress_task(&mut c, "live work");
+        set_status(&c, task_id, "working");
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "worker".into(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "session".into(),
+                worktree: None,
+                branch: None,
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: Some("needs-info".into()),
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+        let progress = projection(&c, task_id);
+        assert_eq!(progress.stage.activity, "Implementation in progress");
+        assert_eq!(
+            progress.condition.as_deref(),
+            Some("Waiting for operator input")
+        );
+    }
+
+    #[test]
+    fn progress_live_reviewer_has_no_awaiting_assignment_condition() {
+        let (_d, mut c) = open_tmp();
+        let task_id = progress_task(&mut c, "live review");
+        set_status(&c, task_id, "in-review");
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "reviewer".into(),
+                role: "reviewer".into(),
+                task_id: Some(task_id),
+                session_id: "session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        let progress = projection(&c, task_id);
+        assert_eq!(progress.stage.label, "First review");
+        assert_eq!(progress.stage.activity, "First review in progress");
+        assert_eq!(progress.condition, None);
+    }
+
+    #[test]
+    fn progress_arbiter_outcomes_use_attempts_and_durable_advance() {
+        let (_d, mut c) = open_tmp();
+        let source = progress_task(&mut c, "arbiter source");
+        set_status(&c, source, "planning");
+        let graph = progress_graph(&c, source, "planning");
+        for (kind, code) in [
+            ("proposal", "arbiter-changes"),
+            ("provider", "arbiter-provider"),
+            ("blocker", "arbiter-reject-source"),
+        ] {
+            c.execute(
+                "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
+                     reason_code,summary,created_at)
+                 VALUES(?1,1,?2,(SELECT count(*)+1 FROM decomposition_attempts WHERE graph_id=?1 AND kind=?2),?3,'bounded',100)",
+                params![graph, kind, code],
+            )
+            .unwrap();
+        }
+        let changed = projection(&c, source);
+        let outcomes = changed
+            .history
+            .iter()
+            .filter(|milestone| milestone.stage == "Plan review")
+            .map(|milestone| milestone.activity.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![
+                "Changes requested",
+                "Provider failure",
+                "Rejected; operator decision required"
+            ]
+        );
+        assert_eq!(changed.attempts.arbiter_rounds, 3);
+
+        // Classification precedes the Arbiter: a `preclassifying` graph has not
+        // been reviewed yet, so it must not claim an approval.
+        c.execute(
+            "UPDATE task_decompositions SET state='preclassifying' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        let classifying = projection(&c, source);
+        assert_eq!(classifying.stage.label, "Pre-classification");
+        assert!(!classifying.history.iter().any(|milestone| {
+            milestone.stage == "Plan review" && milestone.activity.as_deref() == Some("Approved")
+        }));
+        assert_eq!(
+            classifying
+                .milestones
+                .iter()
+                .filter(|milestone| milestone.state == TaskProgressMilestoneState::Future)
+                .map(|milestone| milestone.stage.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Plan review", "Child execution", "Complete"],
+            "the Arbiter review is still ahead of a preclassifying graph"
+        );
+
+        // Materialization is the durable approval evidence.
+        c.execute(
+            "UPDATE task_decompositions SET state='active',active=1 WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        let approved = projection(&c, source);
+        assert!(approved.history.iter().any(|milestone| {
+            milestone.stage == "Plan review" && milestone.activity.as_deref() == Some("Approved")
+        }));
+    }
+
+    #[test]
+    fn progress_decomposed_children_surface_progress_and_failed_dependencies() {
+        let (_d, mut c) = open_tmp();
+        let source = progress_task(&mut c, "source");
+        set_status(&c, source, "decomposed");
+        let graph = progress_graph(&c, source, "active");
+        let done = progress_task(&mut c, "done child");
+        let failed = progress_task(&mut c, "failed child");
+        let cancelled = progress_task(&mut c, "cancelled child");
+        set_status(&c, done, "done");
+        set_status(&c, failed, "failed");
+        set_status(&c, cancelled, "cancelled");
+        for (key, child) in [("a", done), ("b", failed), ("c", cancelled)] {
+            c.execute(
+                "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision)
+                 VALUES(?1,?2,?3,1)",
+                params![graph, child, key],
+            )
+            .unwrap();
+        }
+
+        let progress = projection(&c, source);
+        assert_eq!(progress.stage.label, "Child execution");
+        assert_eq!(progress.stage.activity, "1/3 child tasks complete");
+        assert_eq!(progress.children.as_ref().unwrap().summary, "1/3");
+        assert_eq!(
+            progress.children.as_ref().unwrap().blocking_task_ids,
+            vec![failed, cancelled]
+        );
+        let expected_condition = format!("Blocked by child tasks #{failed} and #{cancelled}");
+        assert_eq!(
+            progress.condition.as_deref(),
+            Some(expected_condition.as_str())
+        );
+        assert_eq!(
+            progress.next_action.as_ref().unwrap().label,
+            "Possible next"
+        );
+    }
+
+    #[test]
+    fn progress_dependency_block_and_bounds_are_explicit() {
+        let (_d, mut c) = open_tmp();
+        let dependency = progress_task(&mut c, "dependency");
+        let task = crate::tasks::create(
+            &mut c,
+            "owner",
+            "blocked",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dependency}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        let blocked = projection(&c, task);
+        let expected_condition = format!("Blocked by dependency tasks #{dependency}");
+        assert_eq!(
+            blocked.condition.as_deref(),
+            Some(expected_condition.as_str())
+        );
+
+        set_status(&c, dependency, "cancelled");
+        let deadlocked = projection(&c, task);
+        let expected_deadlock = format!("Deadlocked by cancelled dependency tasks #{dependency}");
+        assert_eq!(
+            deadlocked.condition.as_deref(),
+            Some(expected_deadlock.as_str())
+        );
+
+        for _ in 0..(TASK_PROGRESS_HISTORY_LIMIT + 4) {
+            progress_run(&c, task, "worker", None, Some("turn-completed"));
+        }
+        let bounded = projection(&c, task);
+        assert!(bounded.history.len() <= TASK_PROGRESS_HISTORY_LIMIT);
+        assert!(bounded.milestones.len() <= TASK_PROGRESS_MILESTONE_LIMIT);
+        assert!(bounded.history.iter().all(|milestone| milestone
+            .activity
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .count()
+            <= TASK_PROGRESS_TEXT_LIMIT));
     }
 }

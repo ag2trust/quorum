@@ -3,6 +3,7 @@
 //! Used by both transcript.md appends and `quorum tail`.
 
 use super::runner::AgentEvent;
+use super::session_log::{SanitizedField, SanitizedSessionEvent};
 use super::stream::Event;
 
 /// Render a stream event into human-readable markdown text.
@@ -16,9 +17,7 @@ pub fn render_event(event: &Event) -> Option<String> {
             total_cost_usd,
             ..
         } => {
-            let tokens = usage
-                .as_ref()
-                .map_or(0, |u| u.input_tokens + u.output_tokens);
+            let tokens = usage.as_ref().map_or(0, |u| u.live_total_tokens());
             let cost_str = total_cost_usd
                 .map(|c| format!(" · ${c:.4}"))
                 .unwrap_or_default();
@@ -26,6 +25,92 @@ pub fn render_event(event: &Event) -> Option<String> {
         }
         Event::Other => None,
     }
+}
+
+/// Render one closed sanitized session event for a decomposition planner tail.
+///
+/// This deliberately renders only the event's closed categories and structural
+/// field summaries. It must never reintroduce source prompt, environment, or
+/// provider/tool payloads that the session-log boundary excluded.
+pub fn render_sanitized_session_event(event: &SanitizedSessionEvent) -> String {
+    match event {
+        SanitizedSessionEvent::ProviderLifecycle { provider, phase } => {
+            format!("> Provider {} {}\n", label(provider), label(phase))
+        }
+        SanitizedSessionEvent::TurnLifecycle { turn, phase } => {
+            format!("> Turn {turn} {}\n", label(phase))
+        }
+        SanitizedSessionEvent::CommandSummary {
+            command,
+            outcome,
+            details,
+        } => format!(
+            "> Command {} {} ({})\n",
+            label(command),
+            label(outcome),
+            sanitized_field_summary(details)
+        ),
+        SanitizedSessionEvent::ToolSummary {
+            tool,
+            outcome,
+            details,
+        } => format!(
+            "> Tool {} {} ({})\n",
+            label(tool),
+            label(outcome),
+            sanitized_field_summary(details)
+        ),
+        SanitizedSessionEvent::AssistantMessage { details } => format!(
+            "> Assistant message ({})\n",
+            sanitized_field_summary(details)
+        ),
+        SanitizedSessionEvent::TerminalResponse { status, response } => format!(
+            "> Terminal response {} ({})\n",
+            label(status),
+            sanitized_field_summary(response)
+        ),
+        SanitizedSessionEvent::ProviderFailure {
+            provider,
+            kind,
+            details,
+        } => format!(
+            "> Provider {} failed: {} ({})\n",
+            label(provider),
+            label(kind),
+            sanitized_field_summary(details)
+        ),
+        SanitizedSessionEvent::SemanticRejection { kind, details } => format!(
+            "> Rejected: {} ({})\n",
+            label(kind),
+            sanitized_field_summary(details)
+        ),
+        SanitizedSessionEvent::Completion { outcome } => {
+            format!("> Session {}\n", label(outcome))
+        }
+    }
+}
+
+fn sanitized_field_summary(field: &SanitizedField) -> String {
+    match field {
+        SanitizedField::Structural {
+            shape,
+            captured_bytes,
+            truncation,
+        } => field_summary(&label(shape), *captured_bytes, truncation.is_some()),
+        SanitizedField::Malformed {
+            captured_bytes,
+            truncation,
+        } => field_summary("malformed", *captured_bytes, truncation.is_some()),
+    }
+}
+
+fn field_summary(kind: &str, bytes: usize, truncated: bool) -> String {
+    let truncation = if truncated { ", truncated" } else { "" };
+    format!("{kind}, {bytes} bytes{truncation}")
+}
+
+fn label(value: &impl std::fmt::Debug) -> String {
+    format!("{value:?}").to_lowercase()
 }
 
 fn render_assistant(message: &serde_json::Value) -> Option<String> {
@@ -125,7 +210,7 @@ fn tool_snippet(name: &str, input: &serde_json::Value) -> Option<String> {
 pub fn render_agent_event(event: &AgentEvent) -> Option<String> {
     match event {
         AgentEvent::ThreadStarted { .. } => None,
-        AgentEvent::AssistantText { text } => {
+        AgentEvent::AssistantText { text } | AgentEvent::CompletedAssistantText { text, .. } => {
             if text.is_empty() {
                 None
             } else {
@@ -134,7 +219,7 @@ pub fn render_agent_event(event: &AgentEvent) -> Option<String> {
         }
         AgentEvent::Activity { summary, .. } => Some(format!("> {summary}")),
         AgentEvent::TurnCompleted { usage, cost_usd } => {
-            let tokens = usage.map_or(0, |u| u.input_tokens + u.output_tokens);
+            let tokens = usage.map_or(0, |u| u.live_total_tokens());
             let cost_str = cost_usd.map(|c| format!(" · ${c:.4}")).unwrap_or_default();
             Some(format!("---\n*Turn complete: {tokens} tokens{cost_str}*\n"))
         }
@@ -159,7 +244,77 @@ fn basename(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::session_log::{
+        ProviderLifecyclePhase, SanitizedCommandKind, SanitizedCompletionOutcome, SanitizedField,
+        SanitizedProvider, SanitizedProviderFailureKind, SanitizedRejectionKind,
+        SanitizedSummaryOutcome, SanitizedTerminalStatus, SanitizedToolKind, TurnLifecyclePhase,
+    };
     use serde_json::json;
+
+    #[test]
+    fn sanitized_planner_events_render_useful_redacted_progress() {
+        let secret = "sk-planner-secret-must-not-appear";
+        let events = [
+            SanitizedSessionEvent::ProviderLifecycle {
+                provider: SanitizedProvider::Codex,
+                phase: ProviderLifecyclePhase::Started,
+            },
+            SanitizedSessionEvent::TurnLifecycle {
+                turn: 3,
+                phase: TurnLifecyclePhase::Continued,
+            },
+            SanitizedSessionEvent::CommandSummary {
+                command: SanitizedCommandKind::Shell,
+                outcome: SanitizedSummaryOutcome::Succeeded,
+                details: SanitizedField::from_text(secret),
+            },
+            SanitizedSessionEvent::ToolSummary {
+                tool: SanitizedToolKind::Bash,
+                outcome: SanitizedSummaryOutcome::Failed,
+                details: SanitizedField::from_json(&json!({"credential": secret})),
+            },
+            SanitizedSessionEvent::TerminalResponse {
+                status: SanitizedTerminalStatus::Success,
+                response: SanitizedField::from_text(secret),
+            },
+            SanitizedSessionEvent::ProviderFailure {
+                provider: SanitizedProvider::Codex,
+                kind: SanitizedProviderFailureKind::Protocol,
+                details: SanitizedField::from_text(secret),
+            },
+            SanitizedSessionEvent::SemanticRejection {
+                kind: SanitizedRejectionKind::Validation,
+                details: SanitizedField::from_text(secret),
+            },
+            SanitizedSessionEvent::Completion {
+                outcome: SanitizedCompletionOutcome::Completed,
+            },
+        ];
+
+        let rendered = events
+            .iter()
+            .map(render_sanitized_session_event)
+            .collect::<String>();
+
+        for progress in [
+            "Provider codex started",
+            "Turn 3 continued",
+            "Command shell succeeded",
+            "Tool bash failed",
+            "Terminal response success",
+            "Provider codex failed: protocol",
+            "Rejected: validation",
+            "Session completed",
+        ] {
+            assert!(
+                rendered.contains(progress),
+                "missing {progress}: {rendered}"
+            );
+        }
+        assert!(rendered.contains("string, 33 bytes"));
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("credential"));
+    }
 
     #[test]
     fn assistant_array_content_renders_text() {
@@ -248,6 +403,8 @@ mod tests {
             result: json!({}),
             usage: Some(super::super::stream::Usage {
                 input_tokens: 200,
+                cache_read_input_tokens: 900,
+                cache_creation_input_tokens: 50,
                 output_tokens: 100,
             }),
             total_cost_usd: Some(0.05),
@@ -257,6 +414,7 @@ mod tests {
         };
         let rendered = render_event(&event).unwrap();
         assert!(rendered.contains("300 tokens"));
+        assert!(!rendered.contains("1250 tokens"));
         assert!(rendered.contains("$0.0500"));
     }
 
@@ -324,6 +482,7 @@ mod tests {
             usage: Some(super::super::runner::TokenUsage {
                 input_tokens: 200,
                 output_tokens: 100,
+                ..Default::default()
             }),
             cost_usd: Some(0.05),
         };

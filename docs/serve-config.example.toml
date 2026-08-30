@@ -3,7 +3,7 @@
 # Place at ~/.quorum/serve/<owner>__<repo>.toml (e.g. ag2trust__quorum.toml)
 # to load automatically, or pass --config <path> explicitly.
 #
-# CLI flags override every value here (explicit wins).
+# Corresponding CLI flags override file values; diagnostics without flags are file-only.
 # Unknown keys are rejected (exit 2) — typos fail loud.
 
 # ── identity ──────────────────────────────────────────────────────────
@@ -64,12 +64,11 @@ opus = 100
 opus = 100
 
 # ── cost ceilings ────────────────────────────────────────────────────
-# A turn longer than 45 min is almost certainly stuck; #56's auto-refeed
-# handles legitimate interruptions.
-max_turn_wall_secs = 2700       # 45 min
+max_idle_secs = 900              # 15 min without an event
 max_task_wall_secs = 14400      # 4h
 # max_turn_tokens  = 500000
 # max_task_tokens  = 2000000
+# token_limit_basis = "raw"        # raw (default): input + output; uncached: uncached input + output
 max_turn_cost_usd  = 50.0
 max_task_cost_usd  = 100.0
 
@@ -85,6 +84,15 @@ drain_timeout_secs = 900
 
 # ── misc ──────────────────────────────────────────────────────────────
 base_branch = "main"
+
+# ── observational host resources ─────────────────────────────────────
+# These values affect status severity and transition-only daemon warnings.
+# They never throttle agents or change task lifecycle.
+resource_poll_secs = 30
+disk_warn_free_gib = 80
+disk_critical_free_gib = 40
+memory_warn_available_pct = 15
+memory_critical_available_pct = 8
 
 # Claude authentication mode:
 #   no_bare_agent = true  (default) — inherit operator's Claude login; no --bare

@@ -7,6 +7,9 @@
 
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
+use crate::role_assignments::{ModelProfile, RoleAssignment};
+use crate::routing_attempts::{exclusions, ValidatedFallbackAttribution};
+use crate::runner_state::{self, ContinuationSlot, PendingTurn};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 
@@ -18,6 +21,567 @@ pub struct RunCapability {
     pub role: String,
     pub created_at: i64,
     pub revoked_at: Option<i64>,
+    /// Exact fallback-run linkage. NULL is retained for legacy and ordinary
+    /// managed capabilities that predate this narrower authority evidence.
+    pub agent_run_id: Option<i64>,
+}
+
+/// Immutable evidence that identifies one attributed managed run for
+/// authority retirement.
+#[derive(Debug, Clone, Copy)]
+pub struct AttributedRetirementTarget<'a> {
+    pub capability_run_id: &'a str,
+    pub agent_run_id: i64,
+    pub agent: &'a str,
+    pub assignment: &'a RoleAssignment,
+    pub failed_route: &'a ModelProfile,
+    pub ended_at: i64,
+    pub end_reason: &'a str,
+}
+
+/// Immutable daemon-captured reviewer target supplied while issuing an
+/// attributed fallback capability. Reviewer authority is unusable without
+/// this exact PR/head pair, so reviewers never receive a capability unless it
+/// can be bound to their one `agent_runs` row in the same transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewerLaunchEvidence<'a> {
+    pub pr: i64,
+    pub head_sha: &'a str,
+}
+
+/// The collaboration surface available to one authoritative managed run.
+///
+/// This is deliberately narrower than the task lifecycle status. A worker
+/// with no daemon-owned PR is an initial worker; once an existing or published
+/// PR is durably associated with the task, its collaboration phase is rework.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LiveRunPhase {
+    InitialWorker,
+    ReworkWorker,
+    Reviewer,
+}
+
+/// Identity and target derived from daemon-owned state for one live run.
+///
+/// Callers supply only the capability and the role required by the operation.
+/// Task, agent, PR, review revision, and phase are never request authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveRunContext {
+    pub run_id: String,
+    pub agent_run_id: i64,
+    pub task_id: i64,
+    pub agent: String,
+    pub role: String,
+    pub pr: Option<i64>,
+    pub review_revision: Option<String>,
+    pub phase: LiveRunPhase,
+}
+
+/// The clean authority outcome used by durable admission paths.
+///
+/// A missing, stale, revoked, or otherwise non-live capability is an expected
+/// negative at an endpoint boundary, rather than an internal error that should
+/// create an `errors` row. Database failures still propagate as errors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveRunContextResolution {
+    Live(LiveRunContext),
+    Rejected,
+}
+
+/// The daemon-owned lifecycle and provider-turn binding for a collaboration
+/// attempt. `run` establishes the live capability identity; the remaining
+/// fields are read from durable task/run state in the same caller transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LiveCollaborationContext {
+    pub run: LiveRunContext,
+    pub lifecycle_generation: i64,
+    pub turn_provider: String,
+    pub turn_continuation_id: Option<String>,
+    /// Canonical `runner_retry` content when a daemon has an exact pending
+    /// turn. It is intentionally opaque to collaboration callers.
+    pub pending_turn_json: Option<String>,
+}
+
+/// Clean authority outcome for collaboration attempt admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveCollaborationContextResolution {
+    Live(Box<LiveCollaborationContext>),
+    Rejected,
+}
+
+#[derive(Debug)]
+struct LiveAgentRun {
+    id: i64,
+    task_id: i64,
+    agent: String,
+    role: String,
+    ended_at: Option<i64>,
+    review_pr: Option<i64>,
+    review_revision: Option<String>,
+}
+
+#[derive(Debug)]
+struct AuthorityTask {
+    status: String,
+    assignee: Option<String>,
+    reviewer: Option<String>,
+    refs: Option<String>,
+    continue_pr: Option<i64>,
+}
+
+fn authority_error(message: impl Into<String>) -> QuorumError {
+    QuorumError::Usage(format!("run authority rejected: {}", message.into()))
+}
+
+fn task_pr(task: &AuthorityTask) -> Result<Option<i64>> {
+    let refs_pr = match task.refs.as_deref() {
+        None => None,
+        Some(raw) => {
+            let refs: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|_| authority_error("task references are invalid"))?;
+            let refs = refs
+                .as_object()
+                .ok_or_else(|| authority_error("task references are invalid"))?;
+            match refs.get("pr") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => {
+                    let pr = value
+                        .as_i64()
+                        .filter(|pr| *pr > 0)
+                        .ok_or_else(|| authority_error("task PR is invalid"))?;
+                    Some(pr)
+                }
+            }
+        }
+    };
+    if refs_pr.is_some() && task.continue_pr.is_some() && refs_pr != task.continue_pr {
+        return Err(authority_error("task PR associations disagree"));
+    }
+    Ok(refs_pr.or(task.continue_pr))
+}
+
+/// Resolve authoritative context for a capability-backed managed operation.
+///
+/// `operation_role` is a closed authorization assertion (`worker` or
+/// `reviewer`), not caller identity. The returned context is derived entirely
+/// from the capability, its matching live `agent_runs` row, and current task
+/// state. This function performs no writes and is suitable for use inside a
+/// caller-owned transaction that later admits an operation.
+pub fn resolve_live_run_context(
+    conn: &Connection,
+    run_id: &str,
+    operation_role: &str,
+) -> Result<LiveRunContext> {
+    if !matches!(operation_role, "worker" | "reviewer") {
+        return Err(authority_error("unknown operation role"));
+    }
+
+    let capability = conn
+        .query_row(
+            "SELECT run_id, task_id, agent, role, created_at, revoked_at, agent_run_id
+             FROM run_capabilities WHERE run_id=?1",
+            [run_id],
+            |row| {
+                Ok(RunCapability {
+                    run_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent: row.get(2)?,
+                    role: row.get(3)?,
+                    created_at: row.get(4)?,
+                    revoked_at: row.get(5)?,
+                    agent_run_id: row.get(6)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("unknown capability"))?;
+    if capability.revoked_at.is_some() {
+        return Err(authority_error("capability is revoked"));
+    }
+    if capability.role != operation_role {
+        return Err(authority_error("operation role does not match capability"));
+    }
+
+    let live_run = if let Some(agent_run_id) = capability.agent_run_id {
+        // Attributed fallback runs carry an exact immutable link from the
+        // capability to this one agent_runs row. Prefer it to every legacy
+        // name/timestamp inference path so a recycled participant cannot
+        // inherit another fallback run's authority.
+        conn.query_row(
+            "SELECT id,task_id,agent_name,role,ended_at,review_pr,review_head_sha
+             FROM agent_runs WHERE id=?1 AND ended_at IS NULL",
+            [agent_run_id],
+            |row| {
+                Ok(LiveAgentRun {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent: row.get(2)?,
+                    role: row.get(3)?,
+                    ended_at: row.get(4)?,
+                    review_pr: row.get(5)?,
+                    review_revision: row.get(6)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("no matching live capability-bound run"))?
+    } else if capability.role == "reviewer" {
+        conn.query_row(
+            "SELECT id,task_id,agent_name,role,ended_at,review_pr,review_head_sha
+             FROM agent_runs
+             WHERE review_cap_run_id=?1 AND role='reviewer' AND ended_at IS NULL",
+            [&capability.run_id],
+            |row| {
+                Ok(LiveAgentRun {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent: row.get(2)?,
+                    role: row.get(3)?,
+                    ended_at: row.get(4)?,
+                    review_pr: row.get(5)?,
+                    review_revision: row.get(6)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("no matching live reviewer run"))?
+    } else {
+        // Worker runs predate the reviewer-only exact launch columns. Preserve
+        // every candidate after capability issuance so an ended earlier run
+        // cannot be hidden by filtering directly to a later live row. Without
+        // an exact worker capability foreign key, any second historical or
+        // live candidate must fail closed instead of being paired by reusable
+        // agent name.
+        let active_capabilities: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM run_capabilities
+             WHERE task_id=?1 AND agent=?2 AND role='worker' AND revoked_at IS NULL",
+            params![capability.task_id, capability.agent],
+            |row| row.get(0),
+        )?;
+        if active_capabilities != 1 {
+            return Err(authority_error("worker capability is ambiguous"));
+        }
+        let mut statement = conn.prepare(
+            "SELECT id,task_id,agent_name,role,ended_at
+             FROM agent_runs
+             WHERE task_id=?1 AND agent_name=?2 AND role='worker'
+               AND spawned_at>=?3
+             ORDER BY spawned_at,id LIMIT 2",
+        )?;
+        let runs = statement
+            .query_map(
+                params![capability.task_id, capability.agent, capability.created_at],
+                |row| {
+                    Ok(LiveAgentRun {
+                        id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        agent: row.get(2)?,
+                        role: row.get(3)?,
+                        ended_at: row.get(4)?,
+                        review_pr: None,
+                        review_revision: None,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if runs.len() != 1 {
+            return Err(authority_error("worker run history is ambiguous"));
+        }
+        let run = runs.into_iter().next().expect("one worker run");
+        if run.ended_at.is_some() {
+            return Err(authority_error("matching worker run has ended"));
+        }
+        run
+    };
+
+    if live_run.task_id != capability.task_id
+        || live_run.agent != capability.agent
+        || live_run.role != capability.role
+    {
+        return Err(authority_error("capability and live run do not match"));
+    }
+
+    let task = conn
+        .query_row(
+            "SELECT status,assignee,reviewer,refs,continue_pr FROM tasks WHERE id=?1",
+            [capability.task_id],
+            |row| {
+                Ok(AuthorityTask {
+                    status: row.get(0)?,
+                    assignee: row.get(1)?,
+                    reviewer: row.get(2)?,
+                    refs: row.get(3)?,
+                    continue_pr: row.get(4)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("task does not exist"))?;
+    let durable_pr = task_pr(&task)?;
+
+    let (pr, review_revision, phase) = match operation_role {
+        "worker" => {
+            if !matches!(task.status.as_str(), "working" | "rework")
+                || task.assignee.as_deref() != Some(capability.agent.as_str())
+            {
+                return Err(authority_error(
+                    "worker does not own the current task phase",
+                ));
+            }
+            if task.status == "rework" && durable_pr.is_none() {
+                return Err(authority_error("rework task has no durable PR"));
+            }
+            let phase = if durable_pr.is_some() {
+                LiveRunPhase::ReworkWorker
+            } else {
+                LiveRunPhase::InitialWorker
+            };
+            (durable_pr, None, phase)
+        }
+        "reviewer" => {
+            if task.status != "in-review"
+                || task.reviewer.as_deref() != Some(capability.agent.as_str())
+            {
+                return Err(authority_error(
+                    "reviewer does not own the current task phase",
+                ));
+            }
+            let launch_pr = live_run
+                .review_pr
+                .filter(|pr| *pr > 0)
+                .ok_or_else(|| authority_error("reviewer launch PR is invalid"))?;
+            if durable_pr != Some(launch_pr) {
+                return Err(authority_error("reviewer launch PR does not match task"));
+            }
+            let revision = live_run
+                .review_revision
+                .as_deref()
+                .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .ok_or_else(|| authority_error("reviewer launch revision is invalid"))?
+                .to_string();
+            (Some(launch_pr), Some(revision), LiveRunPhase::Reviewer)
+        }
+        _ => unreachable!("operation role validated above"),
+    };
+
+    Ok(LiveRunContext {
+        run_id: capability.run_id,
+        agent_run_id: live_run.id,
+        task_id: capability.task_id,
+        agent: capability.agent,
+        role: capability.role,
+        pr,
+        review_revision,
+        phase,
+    })
+}
+
+/// Resolve a managed run while preserving expected authority failures as a
+/// typed clean negative. This is intentionally a thin adapter over
+/// [`resolve_live_run_context`], so every live-context predicate remains in
+/// one place.
+pub fn resolve_live_run_context_for_admission(
+    conn: &Connection,
+    run_id: &str,
+    operation_role: &str,
+) -> Result<LiveRunContextResolution> {
+    match resolve_live_run_context(conn, run_id, operation_role) {
+        Ok(context) => Ok(LiveRunContextResolution::Live(context)),
+        Err(QuorumError::Usage(_)) => Ok(LiveRunContextResolution::Rejected),
+        Err(error) => Err(error),
+    }
+}
+
+const MAX_TURN_PROVIDER_BYTES: usize = 64;
+const MAX_TURN_CONTINUATION_BYTES: usize = 1024;
+const MAX_PENDING_TURN_JSON_BYTES: usize = 64 * 1024;
+
+fn authority_text_is_valid(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.trim() == value
+        && !value.contains('\0')
+        && !value.chars().any(char::is_control)
+}
+
+fn canonical_pending_turn(turn: &PendingTurn) -> Result<String> {
+    if !authority_text_is_valid(&turn.provider, MAX_TURN_PROVIDER_BYTES)
+        || !authority_text_is_valid(&turn.model, 256)
+        || !authority_text_is_valid(&turn.effort, 64)
+        || !authority_text_is_valid(&turn.turn_kind, 64)
+        || turn.prompt.is_empty()
+        || turn.prompt.len() > MAX_PENDING_TURN_JSON_BYTES
+        || turn.prompt.contains('\0')
+        || turn
+            .continuation_id
+            .as_deref()
+            .is_some_and(|id| !authority_text_is_valid(id, MAX_TURN_CONTINUATION_BYTES))
+    {
+        return Err(authority_error("pending turn is invalid"));
+    }
+    let canonical = serde_json::to_string(turn)
+        .map_err(|_| authority_error("pending turn cannot be serialized"))?;
+    if canonical.len() > MAX_PENDING_TURN_JSON_BYTES {
+        return Err(authority_error("pending turn is oversized"));
+    }
+    Ok(canonical)
+}
+
+/// Resolve the exact durable lifecycle and provider-turn identity for a live
+/// collaboration capability. The task's rework round is the lifecycle
+/// generation; a daemon-owned requested retry, when present, supplies the
+/// complete pending-turn identity. Otherwise the role-scoped continuation is
+/// retained as the available exact provider identity.
+pub fn resolve_live_collaboration_context(
+    conn: &Connection,
+    run_id: &str,
+    operation_role: &str,
+) -> Result<LiveCollaborationContext> {
+    let run = resolve_live_run_context(conn, run_id, operation_role)?;
+    let (provider, sub_role): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT provider,sub_role FROM agent_runs
+             WHERE id=?1 AND task_id=?2 AND agent_name=?3 AND role=?4 AND ended_at IS NULL",
+            params![run.agent_run_id, run.task_id, run.agent, run.role],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("live run provider binding is absent"))?;
+    let provider = provider
+        .filter(|provider| authority_text_is_valid(provider, MAX_TURN_PROVIDER_BYTES))
+        .ok_or_else(|| authority_error("live run provider is invalid"))?;
+
+    let (lifecycle_generation, refs): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT rework_round,refs FROM tasks WHERE id=?1",
+            [run.task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("task does not exist"))?;
+    if lifecycle_generation < 0 {
+        return Err(authority_error("task lifecycle generation is invalid"));
+    }
+    let refs = match refs {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|_| authority_error("task references are invalid"))?,
+        None => serde_json::json!({}),
+    };
+    if !refs.is_object() {
+        return Err(authority_error("task references are invalid"));
+    }
+
+    let slot = match (run.role.as_str(), sub_role.as_deref()) {
+        ("worker", None) => ContinuationSlot::Worker,
+        ("reviewer", None) => ContinuationSlot::ReviewerR1,
+        ("reviewer", Some("r2")) => ContinuationSlot::ReviewerR2,
+        _ => return Err(authority_error("live run role binding is invalid")),
+    };
+    let (turn_continuation_id, pending_turn_json) = if refs.get(runner_state::RETRY_REF).is_some() {
+        let pending = runner_state::requested_retry(&refs, &provider)
+            .ok_or_else(|| authority_error("pending turn does not match live provider"))?;
+        let canonical = canonical_pending_turn(&pending)?;
+        (pending.continuation_id, Some(canonical))
+    } else {
+        let continuation =
+            runner_state::continuation(&refs, slot, &provider).map(|continuation| continuation.id);
+        if continuation
+            .as_deref()
+            .is_some_and(|id| !authority_text_is_valid(id, MAX_TURN_CONTINUATION_BYTES))
+        {
+            return Err(authority_error("provider continuation is invalid"));
+        }
+        (continuation, None)
+    };
+
+    Ok(LiveCollaborationContext {
+        run,
+        lifecycle_generation,
+        turn_provider: provider,
+        turn_continuation_id,
+        pending_turn_json,
+    })
+}
+
+/// Resolve collaboration authority while mapping expected authority failures to
+/// a typed clean negative for the caller-owned admission transaction.
+pub fn resolve_live_collaboration_context_for_admission(
+    conn: &Connection,
+    run_id: &str,
+    operation_role: &str,
+) -> Result<LiveCollaborationContextResolution> {
+    match resolve_live_collaboration_context(conn, run_id, operation_role) {
+        Ok(context) => Ok(LiveCollaborationContextResolution::Live(Box::new(context))),
+        Err(QuorumError::Usage(_)) => Ok(LiveCollaborationContextResolution::Rejected),
+        Err(error) => Err(error),
+    }
+}
+
+/// Identity and target derived from daemon-owned state for one live planner run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlannerRunContext {
+    pub run_id: String,
+    pub task_id: i64,
+    pub agent: String,
+    pub graph_id: i64,
+    pub source_revision: i64,
+}
+
+/// Resolve authoritative context for a capability-backed `SubmitPlan`
+/// operation. The capability must exist, be unrevoked, and carry
+/// `role='planner'`. The `task_decompositions` row for the capability's task
+/// must be the live frozen-planning graph (`freeze_active=1, active=0`) whose
+/// `planner_session_id` matches this run — the session id recorded by
+/// `decomposition::set_frozen_phase` at spawn. This function performs no
+/// writes and is suitable for use inside a caller-owned transaction that
+/// later admits an operation.
+pub fn resolve_planner_context(conn: &Connection, run_id: &str) -> Result<PlannerRunContext> {
+    let capability = conn
+        .query_row(
+            "SELECT run_id, task_id, agent, role, created_at, revoked_at, agent_run_id
+             FROM run_capabilities WHERE run_id=?1",
+            [run_id],
+            |row| {
+                Ok(RunCapability {
+                    run_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent: row.get(2)?,
+                    role: row.get(3)?,
+                    created_at: row.get(4)?,
+                    revoked_at: row.get(5)?,
+                    agent_run_id: row.get(6)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("unknown capability"))?;
+    if capability.revoked_at.is_some() {
+        return Err(authority_error("capability is revoked"));
+    }
+    if capability.role != "planner" {
+        return Err(authority_error("operation role does not match capability"));
+    }
+
+    let graph = conn
+        .query_row(
+            "SELECT id, planned_source_revision FROM task_decompositions
+             WHERE source_task_id=?1 AND freeze_active=1 AND active=0 AND planner_session_id=?2",
+            params![capability.task_id, capability.run_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| authority_error("planner run is not the live planner for its graph"))?;
+
+    Ok(PlannerRunContext {
+        run_id: capability.run_id,
+        task_id: capability.task_id,
+        agent: capability.agent,
+        graph_id: graph.0,
+        source_revision: graph.1,
+    })
 }
 
 /// Issue a new run capability. The daemon calls this at spawn time.
@@ -30,13 +594,267 @@ pub fn issue(
     now: i64,
 ) -> Result<()> {
     let tx = begin_immediate(conn)?;
+    issue_tx(&tx, run_id, task_id, agent, role, now)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Issue a run capability inside a caller-owned transaction, so issuance can
+/// share one serialization point with the daemon-owned state that authorizes
+/// it (see `decomposition::issue_planner_run`).
+pub fn issue_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    task_id: i64,
+    agent: &str,
+    role: &str,
+    now: i64,
+) -> Result<()> {
     tx.execute(
         "INSERT INTO run_capabilities (run_id, task_id, agent, role, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![run_id, task_id, agent, role, now],
     )?;
-    tx.commit()?;
     Ok(())
+}
+
+/// Issue and bind a capability for one already-attributed fallback run.
+///
+/// The capability is not merely named after the same agent: its immutable
+/// `agent_run_id` links to the exact `agent_runs` row that re-proves the
+/// fallback token's task, responsibility, role, PR-stage, assignment, and
+/// configured route. A clean `None` means the row, token, run id, or existing
+/// binding did not agree; no capability is written in that case.
+pub fn issue_attributed_alternate(
+    conn: &mut Connection,
+    token: &ValidatedFallbackAttribution,
+    agent_run_id: i64,
+    run_id: &str,
+    agent: &str,
+    reviewer_launch: Option<ReviewerLaunchEvidence<'_>>,
+    now: i64,
+) -> Result<Option<RunCapability>> {
+    let tx = begin_immediate(conn)?;
+    let capability = issue_attributed_alternate_tx(
+        &tx,
+        token,
+        agent_run_id,
+        run_id,
+        agent,
+        reviewer_launch,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(capability)
+}
+
+/// Transactional form of [`issue_attributed_alternate`].
+///
+/// This is deliberately composable with fallback-attempt installation: a
+/// caller can create the attributed `agent_runs` evidence and issue this
+/// capability under the same `BEGIN IMMEDIATE` transaction, before it makes
+/// any provider call.
+pub fn issue_attributed_alternate_tx(
+    tx: &Transaction<'_>,
+    token: &ValidatedFallbackAttribution,
+    agent_run_id: i64,
+    run_id: &str,
+    agent: &str,
+    reviewer_launch: Option<ReviewerLaunchEvidence<'_>>,
+    now: i64,
+) -> Result<Option<RunCapability>> {
+    let Some(task_id) = token.task_id() else {
+        return Err(QuorumError::Usage(
+            "attributed alternate capability requires a task-scoped role assignment".into(),
+        ));
+    };
+    if agent_run_id <= 0
+        || task_id <= 0
+        || run_id.is_empty()
+        || run_id.contains('\0')
+        || agent.is_empty()
+        || agent.contains('\0')
+        || now < 0
+        || !matches!(token.role(), "worker" | "reviewer")
+    {
+        return Err(QuorumError::Usage(
+            "invalid attributed alternate capability identity".into(),
+        ));
+    }
+    let sub_role = match (token.role(), token.review_stage()) {
+        ("worker", None) | ("reviewer", Some("r1")) => None,
+        ("reviewer", Some("r2")) => Some("r2"),
+        _ => return Ok(None),
+    };
+    let reviewer_launch = match (token.role(), reviewer_launch) {
+        ("worker", None) => None,
+        ("reviewer", Some(launch))
+            if token.pr_number() == Some(launch.pr)
+                && launch.pr > 0
+                && launch.head_sha.len() == 40
+                && launch.head_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Some(launch)
+        }
+        // A reviewer fallback cannot be launched with inferred, stale, or
+        // caller-mismatched target authority. It must wait for the daemon's
+        // exact PR/head capture rather than leave an unusable capability.
+        ("reviewer", _) => return Ok(None),
+        // Worker launch evidence is nonsensical and must not silently change
+        // the worker authority shape.
+        ("worker", Some(_)) => return Ok(None),
+        _ => unreachable!("role shape was validated above"),
+    };
+
+    // Expired fallback evidence cannot regain authority merely because its
+    // historical run row still exists. This mirrors the attributed-run writer
+    // and leaves that immutable history intact on clean rejection.
+    if exclusions(tx, token.responsibility_key())?.excludes(token.profile()) {
+        return Ok(None);
+    }
+
+    // Re-prove every link from the opaque token to the persisted row before
+    // capability issuance. `agent_name` is intentionally exact: participant
+    // identity belongs to the run evidence and cannot be changed by replaying
+    // a valid route for a different fallback agent.
+    let profile = token.profile();
+    let run_matches: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM agent_runs AS run
+             JOIN role_assignments AS assignment ON assignment.id=run.role_assignment_id
+             WHERE run.id=?1
+               AND run.task_id=?2
+               AND run.agent_name=?3
+               AND run.role=?4
+               AND run.sub_role IS ?5
+               AND run.ended_at IS NULL
+               AND run.role_assignment_id=?6
+               AND run.configured_profile_id=?7
+               AND run.configured_provider=?8
+               AND run.configured_model=?9
+               AND run.configured_effort=?10
+               AND run.provider=?8
+               AND run.model=?9
+               AND run.effort=?10
+               AND assignment.task_id IS ?2
+               AND assignment.responsibility_key=?11
+               AND assignment.role=?4
+               AND assignment.pr_number IS ?12
+               AND assignment.review_stage IS ?13
+               AND EXISTS(SELECT 1 FROM tasks WHERE id=?2)
+         )",
+        params![
+            agent_run_id,
+            task_id,
+            agent,
+            token.role(),
+            sub_role,
+            token.assignment_id(),
+            profile.id,
+            profile.provider,
+            profile.model,
+            profile.effort,
+            token.responsibility_key(),
+            token.pr_number(),
+            token.review_stage(),
+        ],
+        |row| row.get(0),
+    )?;
+    if !run_matches {
+        return Ok(None);
+    }
+
+    let existing = tx
+        .query_row(
+            "SELECT run_id,task_id,agent,role,created_at,revoked_at,agent_run_id
+             FROM run_capabilities WHERE run_id=?1",
+            [run_id],
+            |row| {
+                Ok(RunCapability {
+                    run_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent: row.get(2)?,
+                    role: row.get(3)?,
+                    created_at: row.get(4)?,
+                    revoked_at: row.get(5)?,
+                    agent_run_id: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        let matching_capability = existing.task_id == task_id
+            && existing.agent == agent
+            && existing.role == token.role()
+            && existing.agent_run_id == Some(agent_run_id)
+            && existing.revoked_at.is_none();
+        if !matching_capability {
+            return Ok(None);
+        }
+        if let Some(launch) = reviewer_launch {
+            let matching_launch: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM agent_runs
+                     WHERE id=?1 AND review_cap_run_id=?2 AND review_pr=?3
+                       AND review_head_sha=?4
+                 )",
+                params![agent_run_id, run_id, launch.pr, launch.head_sha],
+                |row| row.get(0),
+            )?;
+            if !matching_launch {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(existing));
+    }
+
+    // The partial UNIQUE index on `agent_run_id` prevents a second fresh
+    // capability from being attached to the same process evidence. Check it
+    // before insertion so replay/concurrent mismatch is a clean negative
+    // outcome, never a leaked half-issued capability.
+    let already_bound: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run_capabilities WHERE agent_run_id=?1)",
+        [agent_run_id],
+        |row| row.get(0),
+    )?;
+    if already_bound {
+        return Ok(None);
+    }
+
+    if let Some(launch) = reviewer_launch {
+        // Bind the reviewer launch target before exposing its capability. This
+        // caller-owned transaction also contains the alternate run insertion,
+        // so a reader can observe either all three authority records or none.
+        // The NULL-only guard makes a conflicting/partial historical bind a
+        // clean rejection rather than an overwrite of immutable evidence.
+        let bound = tx.execute(
+            "UPDATE agent_runs
+             SET review_cap_run_id=?2,review_pr=?3,review_head_sha=?4
+             WHERE id=?1 AND role='reviewer' AND ended_at IS NULL
+               AND review_cap_run_id IS NULL AND review_pr IS NULL
+               AND review_head_sha IS NULL",
+            params![agent_run_id, run_id, launch.pr, launch.head_sha],
+        )?;
+        if bound != 1 {
+            return Ok(None);
+        }
+    }
+
+    tx.execute(
+        "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at,agent_run_id)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![run_id, task_id, agent, token.role(), now, agent_run_id],
+    )?;
+    Ok(Some(RunCapability {
+        run_id: run_id.to_string(),
+        task_id,
+        agent: agent.to_string(),
+        role: token.role().to_string(),
+        created_at: now,
+        revoked_at: None,
+        agent_run_id: Some(agent_run_id),
+    }))
 }
 
 /// Validate a run capability: it must exist, not be revoked, and its derived
@@ -57,7 +875,7 @@ pub fn validate(
 ) -> Result<RunCapability> {
     let cap = conn
         .query_row(
-            "SELECT run_id, task_id, agent, role, created_at, revoked_at
+            "SELECT run_id, task_id, agent, role, created_at, revoked_at, agent_run_id
              FROM run_capabilities WHERE run_id = ?1",
             params![run_id],
             |r| {
@@ -68,6 +886,7 @@ pub fn validate(
                     role: r.get(3)?,
                     created_at: r.get(4)?,
                     revoked_at: r.get(5)?,
+                    agent_run_id: r.get(6)?,
                 })
             },
         )
@@ -157,6 +976,132 @@ pub(crate) fn revoke_for_agent_task_tx(
     revoke_tx(tx, run_id, now)
 }
 
+/// Check whether one exact managed-run capability is still active. Unknown or
+/// mismatched identities are rejected so a recycled agent name cannot make a
+/// retiring process appear to own a successor's authority.
+pub(crate) fn managed_run_is_active_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    agent: &str,
+    task_id: i64,
+    role: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT revoked_at IS NULL FROM run_capabilities
+         WHERE run_id=?1 AND agent=?2 AND task_id=?3 AND role=?4",
+        params![run_id, agent, task_id, role],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| {
+        QuorumError::Usage(format!(
+            "run_id '{run_id}' does not belong to {role} agent '{agent}' on task {task_id}"
+        ))
+    })
+}
+
+/// Revoke one exact managed-run capability within a caller-owned transaction.
+pub fn revoke_managed_run_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    agent: &str,
+    task_id: i64,
+    role: &str,
+    now: i64,
+) -> Result<bool> {
+    // Validate the immutable identity even when the capability was already
+    // revoked. Idempotent cleanup must not gain authority through a name match.
+    let _ = managed_run_is_active_tx(tx, run_id, agent, task_id, role)?;
+    revoke_tx(tx, run_id, now)
+}
+
+/// Re-prove that an attributed capability names exactly one managed run that
+/// may be retired for the supplied immutable assignment and actual route.
+///
+/// A previously retired row remains a valid replay target only when its exact
+/// terminal evidence matches. This lets authority cleanup be idempotent
+/// without allowing a caller to substitute a different historical run.
+pub fn attributed_retirement_target_tx(
+    tx: &Transaction<'_>,
+    target: &AttributedRetirementTarget<'_>,
+) -> Result<bool> {
+    let assignment = target.assignment;
+    let Some(task_id) = assignment.task_id else {
+        return Ok(false);
+    };
+    let sub_role = match (assignment.role.as_str(), assignment.review_stage.as_deref()) {
+        ("worker", None) | ("reviewer", Some("r1")) => None,
+        ("reviewer", Some("r2")) => Some("r2"),
+        _ => return Ok(false),
+    };
+    if target.capability_run_id.is_empty()
+        || target.capability_run_id.contains('\0')
+        || target.agent_run_id <= 0
+        || target.agent.is_empty()
+        || target.agent.contains('\0')
+        || target.ended_at < 0
+        || target.end_reason.is_empty()
+        || target.end_reason.contains('\0')
+        || crate::role_assignments::get(tx, assignment.id)?.as_ref() != Some(assignment)
+    {
+        return Ok(false);
+    }
+
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM run_capabilities AS capability
+             JOIN agent_runs AS run ON run.id=capability.agent_run_id
+             JOIN role_assignments AS stored_assignment ON stored_assignment.id=run.role_assignment_id
+             WHERE capability.run_id=?1
+               AND capability.agent_run_id=?2
+               AND capability.task_id=?3
+               AND capability.agent=?4
+               AND capability.role=?5
+               AND run.id=?2
+               AND run.task_id=?3
+               AND run.agent_name=?4
+               AND run.role=?5
+               AND run.sub_role IS ?6
+               AND (run.ended_at IS NULL OR (run.ended_at=?7 AND run.end_reason=?8))
+               AND run.role_assignment_id=?9
+               AND run.configured_profile_id=?10
+               AND run.configured_provider=?11
+               AND run.configured_model=?12
+               AND run.configured_effort=?13
+               AND run.provider=?11
+               AND run.model=?12
+               AND run.effort=?13
+               AND stored_assignment.id=?9
+               AND stored_assignment.task_id IS ?3
+               AND stored_assignment.responsibility_key=?14
+               AND stored_assignment.role=?5
+               AND stored_assignment.pr_number IS ?15
+               AND stored_assignment.review_stage IS ?16
+         )",
+        params![
+            target.capability_run_id,
+            target.agent_run_id,
+            task_id,
+            target.agent,
+            assignment.role,
+            sub_role,
+            target.ended_at,
+            target.end_reason,
+            assignment.id,
+            target.failed_route.id,
+            target.failed_route.provider,
+            target.failed_route.model,
+            target.failed_route.effort,
+            assignment.responsibility_key,
+            assignment.pr_number,
+            assignment.review_stage,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 /// Revoke all active capabilities for an agent. Used on agent death/recovery.
 pub fn revoke_all_for_agent(conn: &mut Connection, agent: &str, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;
@@ -180,7 +1125,7 @@ pub fn active_for_agent_task(
     role: &str,
 ) -> Result<Option<RunCapability>> {
     conn.query_row(
-        "SELECT run_id, task_id, agent, role, created_at, revoked_at
+        "SELECT run_id, task_id, agent, role, created_at, revoked_at, agent_run_id
          FROM run_capabilities
          WHERE agent = ?1 AND task_id = ?2 AND role = ?3 AND revoked_at IS NULL
          ORDER BY created_at DESC LIMIT 1",
@@ -193,6 +1138,7 @@ pub fn active_for_agent_task(
                 role: r.get(3)?,
                 created_at: r.get(4)?,
                 revoked_at: r.get(5)?,
+                agent_run_id: r.get(6)?,
             })
         },
     )
@@ -204,7 +1150,7 @@ pub fn active_for_agent_task(
 /// Returns None if no active capability exists.
 pub fn active_for_agent(conn: &Connection, agent: &str) -> Result<Option<RunCapability>> {
     conn.query_row(
-        "SELECT run_id, task_id, agent, role, created_at, revoked_at
+        "SELECT run_id, task_id, agent, role, created_at, revoked_at, agent_run_id
          FROM run_capabilities
          WHERE agent = ?1 AND revoked_at IS NULL
          ORDER BY created_at DESC LIMIT 1",
@@ -217,6 +1163,7 @@ pub fn active_for_agent(conn: &Connection, agent: &str) -> Result<Option<RunCapa
                 role: r.get(3)?,
                 created_at: r.get(4)?,
                 revoked_at: r.get(5)?,
+                agent_run_id: r.get(6)?,
             })
         },
     )
@@ -228,10 +1175,244 @@ pub fn active_for_agent(conn: &Connection, agent: &str) -> Result<Option<RunCapa
 mod tests {
     use super::*;
 
+    const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
     fn open_tmp() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let c = crate::db::open(&dir.path().join("q.db")).unwrap();
         (dir, c)
+    }
+
+    fn insert_authority_task(
+        conn: &Connection,
+        id: i64,
+        status: &str,
+        assignee: Option<&str>,
+        reviewer: Option<&str>,
+        pr: Option<i64>,
+        continue_pr: Option<i64>,
+    ) {
+        let refs = pr.map(|pr| serde_json::json!({"pr": pr}).to_string());
+        conn.execute(
+            "INSERT INTO tasks(
+                 id,title,status,priority,assignee,created_by,created_at,updated_at,
+                 refs,author,reviewer,continue_pr
+             ) VALUES (?1,'authority test',?2,0,?3,'test',1,1,?4,?3,?5,?6)",
+            params![id, status, assignee, refs, reviewer, continue_pr],
+        )
+        .unwrap();
+    }
+
+    fn insert_live_worker(conn: &mut Connection, task_id: i64, agent: &str, run_id: &str) -> i64 {
+        issue(conn, run_id, task_id, agent, "worker", 10).unwrap();
+        crate::agent_runs::insert(conn, task_id, agent, "worker", "model", "high", "codex", 10)
+            .unwrap()
+    }
+
+    fn insert_live_reviewer(
+        conn: &mut Connection,
+        task_id: i64,
+        agent: &str,
+        run_id: &str,
+        pr: i64,
+    ) -> i64 {
+        issue(conn, run_id, task_id, agent, "reviewer", 10).unwrap();
+        crate::agent_runs::insert_reviewer_with_launch(
+            conn, task_id, agent, "model", "high", "codex", None, 10, None, run_id, pr, REVIEW_SHA,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn mailbox_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM mailbox", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn assert_resolver_rejects_without_mailbox_write(
+        conn: &Connection,
+        run_id: &str,
+        operation_role: &str,
+    ) {
+        let before = mailbox_count(conn);
+        assert!(resolve_live_run_context(conn, run_id, operation_role).is_err());
+        assert_eq!(mailbox_count(conn), before);
+    }
+
+    #[test]
+    fn resolve_live_worker_derives_initial_and_rework_context() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        let agent_run_id = insert_live_worker(&mut c, 1, "Worker", "worker-run");
+
+        let initial = resolve_live_run_context(&c, "worker-run", "worker").unwrap();
+        assert_eq!(
+            initial,
+            LiveRunContext {
+                run_id: "worker-run".into(),
+                agent_run_id,
+                task_id: 1,
+                agent: "Worker".into(),
+                role: "worker".into(),
+                pr: None,
+                review_revision: None,
+                phase: LiveRunPhase::InitialWorker,
+            }
+        );
+
+        c.execute(
+            "UPDATE tasks SET status='rework',refs=json_object('pr',71) WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let rework = resolve_live_run_context(&c, "worker-run", "worker").unwrap();
+        assert_eq!(rework.pr, Some(71));
+        assert_eq!(rework.review_revision, None);
+        assert_eq!(rework.phase, LiveRunPhase::ReworkWorker);
+        assert_eq!(mailbox_count(&c), 0);
+    }
+
+    #[test]
+    fn resolve_live_reviewer_derives_immutable_launch_context() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "in-review", None, Some("Reviewer"), Some(71), None);
+        let agent_run_id = insert_live_reviewer(&mut c, 1, "Reviewer", "review-run", 71);
+
+        let context = resolve_live_run_context(&c, "review-run", "reviewer").unwrap();
+        assert_eq!(
+            context,
+            LiveRunContext {
+                run_id: "review-run".into(),
+                agent_run_id,
+                task_id: 1,
+                agent: "Reviewer".into(),
+                role: "reviewer".into(),
+                pr: Some(71),
+                review_revision: Some(REVIEW_SHA.into()),
+                phase: LiveRunPhase::Reviewer,
+            }
+        );
+        assert_eq!(mailbox_count(&c), 0);
+    }
+
+    #[test]
+    fn resolve_live_run_rejects_unknown_capability_without_mailbox_write() {
+        let (_d, c) = open_tmp();
+        assert_resolver_rejects_without_mailbox_write(&c, "unknown", "worker");
+    }
+
+    #[test]
+    fn resolve_live_run_rejects_revoked_capability_without_mailbox_write() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        insert_live_worker(&mut c, 1, "Worker", "revoked-run");
+        revoke(&mut c, "revoked-run", 20).unwrap();
+        assert_resolver_rejects_without_mailbox_write(&c, "revoked-run", "worker");
+    }
+
+    #[test]
+    fn resolve_live_run_rejects_ended_agent_run_without_mailbox_write() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        let agent_run_id = insert_live_worker(&mut c, 1, "Worker", "ended-run");
+        c.execute(
+            "UPDATE agent_runs SET ended_at=20,end_reason='completed' WHERE id=?1",
+            [agent_run_id],
+        )
+        .unwrap();
+        assert_resolver_rejects_without_mailbox_write(&c, "ended-run", "worker");
+    }
+
+    #[test]
+    fn resolve_live_run_rejects_ended_worker_capability_reused_by_later_run() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        let first_run_id = insert_live_worker(&mut c, 1, "Worker", "stale-capability");
+        c.execute(
+            "UPDATE agent_runs SET ended_at=20,end_reason='completed' WHERE id=?1",
+            [first_run_id],
+        )
+        .unwrap();
+
+        // A later process can have a durable run row without its capability
+        // when capability issuance fails. The still-active earlier capability
+        // must not be paired with this newer live row by reusable identity.
+        crate::agent_runs::insert(&c, 1, "Worker", "worker", "model", "high", "codex", 30).unwrap();
+
+        assert_resolver_rejects_without_mailbox_write(&c, "stale-capability", "worker");
+    }
+
+    #[test]
+    fn resolve_live_run_rejects_cross_run_reviewer_binding_without_mailbox_write() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "in-review", None, Some("Reviewer"), Some(71), None);
+        issue(&mut c, "requested-run", 1, "Reviewer", "reviewer", 10).unwrap();
+        crate::agent_runs::insert_reviewer_with_launch(
+            &c,
+            1,
+            "Reviewer",
+            "model",
+            "high",
+            "codex",
+            None,
+            10,
+            None,
+            "different-run",
+            71,
+            REVIEW_SHA,
+        )
+        .unwrap()
+        .unwrap();
+        assert_resolver_rejects_without_mailbox_write(&c, "requested-run", "reviewer");
+    }
+
+    #[test]
+    fn resolve_live_run_rejects_task_mismatched_run_without_mailbox_write() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "in-review", None, Some("Reviewer"), Some(71), None);
+        insert_authority_task(&c, 2, "in-review", None, Some("Reviewer"), Some(71), None);
+        issue(&mut c, "task-run", 1, "Reviewer", "reviewer", 10).unwrap();
+        crate::agent_runs::insert_reviewer_with_launch(
+            &c, 2, "Reviewer", "model", "high", "codex", None, 10, None, "task-run", 71, REVIEW_SHA,
+        )
+        .unwrap()
+        .unwrap();
+        assert_resolver_rejects_without_mailbox_write(&c, "task-run", "reviewer");
+    }
+
+    #[test]
+    fn resolve_live_run_rejects_wrong_operation_role_without_mailbox_write() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        insert_live_worker(&mut c, 1, "Worker", "role-run");
+        assert_resolver_rejects_without_mailbox_write(&c, "role-run", "reviewer");
+        assert_resolver_rejects_without_mailbox_write(&c, "role-run", "admin");
+    }
+
+    #[test]
+    fn resolve_live_run_rejects_wrong_task_phase_without_mailbox_write() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "in-review", Some("Worker"), None, Some(71), None);
+        insert_live_worker(&mut c, 1, "Worker", "phase-run");
+        assert_resolver_rejects_without_mailbox_write(&c, "phase-run", "worker");
+    }
+
+    #[test]
+    fn resolve_live_run_rejects_mismatched_reviewer_pr_without_mailbox_write() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "in-review", None, Some("Reviewer"), Some(72), None);
+        insert_live_reviewer(&mut c, 1, "Reviewer", "pr-run", 71);
+        assert_resolver_rejects_without_mailbox_write(&c, "pr-run", "reviewer");
+    }
+
+    #[test]
+    fn resolve_live_worker_rejects_ambiguous_cross_run_capability() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        insert_live_worker(&mut c, 1, "Worker", "first-run");
+        issue(&mut c, "second-run", 1, "Worker", "worker", 11).unwrap();
+        assert_resolver_rejects_without_mailbox_write(&c, "first-run", "worker");
+        assert_resolver_rejects_without_mailbox_write(&c, "second-run", "worker");
     }
 
     #[test]
@@ -380,5 +1561,170 @@ mod tests {
         assert!(active_for_agent_task(&c, "W", 10, "worker")
             .unwrap()
             .is_none());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_graph(
+        conn: &Connection,
+        graph_id: i64,
+        source_task_id: i64,
+        active: i64,
+        freeze_active: i64,
+        planner_session_id: Option<&str>,
+        planned_source_revision: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 id,source_task_id,state,active,freeze_active,
+                 planner_session_id,planned_source_revision,created_at,updated_at
+             ) VALUES (?1,?2,'planning',?3,?4,?5,?6,1,1)",
+            params![
+                graph_id,
+                source_task_id,
+                active,
+                freeze_active,
+                planner_session_id,
+                planned_source_revision
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_frozen_graph(
+        conn: &Connection,
+        graph_id: i64,
+        source_task_id: i64,
+        planner_session_id: Option<&str>,
+        planned_source_revision: i64,
+    ) {
+        insert_graph(
+            conn,
+            graph_id,
+            source_task_id,
+            0,
+            1,
+            planner_session_id,
+            planned_source_revision,
+        );
+    }
+
+    #[test]
+    fn planner_context_resolves_live_planner() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        insert_frozen_graph(&c, 5, 1, Some("planner-run"), 2);
+
+        let context = resolve_planner_context(&c, "planner-run").unwrap();
+        assert_eq!(
+            context,
+            PlannerRunContext {
+                run_id: "planner-run".into(),
+                task_id: 1,
+                agent: "Planner".into(),
+                graph_id: 5,
+                source_revision: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_worker_role() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        insert_live_worker(&mut c, 1, "Worker", "worker-run");
+        insert_frozen_graph(&c, 5, 1, Some("worker-run"), 2);
+
+        let err = resolve_planner_context(&c, "worker-run").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("operation role does not match capability"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_stale_session() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        insert_frozen_graph(&c, 5, 1, Some("other"), 2);
+
+        let err = resolve_planner_context(&c, "planner-run").unwrap_err();
+        assert!(
+            err.to_string().contains("not the live planner"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_active_graph() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        // active=1 alongside freeze_active=1 is not a state task_decompositions'
+        // invariants allow to persist (freeze_active clears once a graph activates),
+        // but it isolates the resolver's `AND active=0` clause: this row keeps
+        // freeze_active=1 and the matching planner_session_id, so only the `active=0`
+        // guard stands between it and a match. Deleting `AND active=0` from the
+        // resolver's query would make this row resolve successfully.
+        insert_graph(&c, 5, 1, 1, 1, Some("planner-run"), 2);
+
+        let err = resolve_planner_context(&c, "planner-run").unwrap_err();
+        assert!(
+            err.to_string().contains("not the live planner"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_unfrozen_graph() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        // active=0 and freeze_active=0 is the graph's rest state before a freeze is
+        // requested. This row keeps active=0 and the matching planner_session_id, so
+        // only the `AND freeze_active=1` guard stands between it and a match. Deleting
+        // `AND freeze_active=1` from the resolver's query would make this row resolve
+        // successfully.
+        insert_graph(&c, 5, 1, 0, 0, Some("planner-run"), 2);
+
+        let err = resolve_planner_context(&c, "planner-run").unwrap_err();
+        assert!(
+            err.to_string().contains("not the live planner"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn planner_context_rejects_revoked() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        insert_frozen_graph(&c, 5, 1, Some("planner-run"), 2);
+        revoke(&mut c, "planner-run", 20).unwrap();
+
+        let err = resolve_planner_context(&c, "planner-run").unwrap_err();
+        assert!(
+            err.to_string().contains("revoked"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn live_run_context_rejects_planner_role() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", None, None, None, None);
+        issue(&mut c, "planner-run", 1, "Planner", "planner", 10).unwrap();
+        insert_frozen_graph(&c, 5, 1, Some("planner-run"), 2);
+
+        for operation_role in ["worker", "reviewer"] {
+            let err = resolve_live_run_context(&c, "planner-run", operation_role).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("operation role does not match capability"),
+                "unexpected error for operation_role={operation_role}: {err}"
+            );
+        }
     }
 }

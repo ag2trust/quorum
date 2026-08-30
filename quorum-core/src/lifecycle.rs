@@ -146,6 +146,9 @@ pub struct TaskView {
     pub author: Option<String>,
     pub reviewer: Option<String>,
     pub rework_round: u32,
+    /// Per-task rework ceiling, stamped from the daemon's `max_rework` config at
+    /// first ownership and immutable thereafter. Defaults to `REWORK_CAP`.
+    pub rework_cap: u32,
     pub pr: Option<String>,
     pub review_only: bool,
 }
@@ -173,7 +176,9 @@ impl fmt::Display for InvalidTransition {
 
 impl std::error::Error for InvalidTransition {}
 
-pub const REWORK_CAP: u32 = 5;
+/// Compiled default rework ceiling, used when no per-task `rework_cap` has been
+/// stamped (historic rows, or the daemon's `max_rework` config left unset).
+pub const REWORK_CAP: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // transition — the exhaustive match
@@ -323,12 +328,12 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             }],
         )),
         (Status::InReview, Event::VerdictChanges | Event::ChecksFailed { .. }) => {
-            if t.rework_round >= REWORK_CAP {
+            if t.rework_round >= t.rework_cap {
                 return Ok((
                     Status::Failed,
                     vec![
                         Effect::NotifyOwner {
-                            reason: format!("rework cap ({REWORK_CAP}) exceeded"),
+                            reason: format!("rework cap ({}) exceeded", t.rework_cap),
                         },
                         Effect::ReleaseLease,
                     ],
@@ -472,12 +477,12 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             ],
         )),
         (Status::Merging, Event::MergeConflict) => {
-            if t.rework_round >= REWORK_CAP {
+            if t.rework_round >= t.rework_cap {
                 return Ok((
                     Status::Failed,
                     vec![
                         Effect::NotifyOwner {
-                            reason: format!("rework cap ({REWORK_CAP}) exceeded"),
+                            reason: format!("rework cap ({}) exceeded", t.rework_cap),
                         },
                         Effect::ReleaseLease,
                     ],
@@ -560,6 +565,7 @@ mod tests {
             author: None,
             reviewer: None,
             rework_round: 0,
+            rework_cap: REWORK_CAP,
             pr: None,
             review_only: false,
         }
@@ -571,6 +577,7 @@ mod tests {
             author: Some(author.to_string()),
             reviewer: None,
             rework_round: 0,
+            rework_cap: REWORK_CAP,
             pr: Some("123".to_string()),
             review_only: false,
         }
@@ -998,20 +1005,27 @@ mod tests {
     }
 
     #[test]
-    fn in_review_verdict_changes_rework_cap_exceeded() {
+    fn in_review_actionable_events_at_rework_cap_fail_without_incrementing() {
         let mut t = view_with_author(Status::InReview, "W1");
         t.rework_round = REWORK_CAP;
-        assert_ok(
-            &t,
-            &Event::VerdictChanges,
-            Status::Failed,
-            &[
-                Effect::NotifyOwner {
-                    reason: format!("rework cap ({REWORK_CAP}) exceeded"),
-                },
-                Effect::ReleaseLease,
-            ],
-        );
+        for event in [
+            Event::VerdictChanges,
+            Event::ChecksFailed {
+                checks: vec!["fmt".into()],
+            },
+        ] {
+            assert_ok(
+                &t,
+                &event,
+                Status::Failed,
+                &[
+                    Effect::NotifyOwner {
+                        reason: "rework cap (7) exceeded".into(),
+                    },
+                    Effect::ReleaseLease,
+                ],
+            );
+        }
     }
 
     #[test]
@@ -1366,7 +1380,7 @@ mod tests {
             Status::Failed,
             &[
                 Effect::NotifyOwner {
-                    reason: format!("rework cap ({REWORK_CAP}) exceeded"),
+                    reason: "rework cap (7) exceeded".into(),
                 },
                 Effect::ReleaseLease,
             ],
@@ -1490,11 +1504,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn rework_round_at_cap_minus_one_allowed() {
+    fn sixth_and_seventh_rework_rounds_are_accepted_before_cap_exhaustion() {
         let mut t = view_with_author(Status::InReview, "W1");
-        t.rework_round = REWORK_CAP - 1;
-        let (next, _) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(
+            REWORK_CAP, 7,
+            "managed rework policy must remain seven rounds"
+        );
+
+        // Round six begins with five completed rounds and increments to six.
+        t.rework_round = 5;
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
         assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+        t.rework_round += 1;
+        assert_eq!(t.rework_round, 6);
+
+        // Round seven begins at six and reaches the durable cap exactly once.
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+        t.rework_round += 1;
+        assert_eq!(t.rework_round, REWORK_CAP);
     }
 
     #[test]
@@ -1504,17 +1534,42 @@ mod tests {
         let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
         assert_eq!(next, Status::Failed);
         assert!(effects.contains(&Effect::ReleaseLease));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::NotifyOwner { reason } if reason == "rework cap (7) exceeded")
+        ));
     }
 
     #[test]
     fn rework_round_above_cap_also_fails() {
         let mut t = view_with_author(Status::InReview, "W1");
-        t.rework_round = REWORK_CAP + 5;
+        t.rework_round = REWORK_CAP + 1;
         let (next, _) = transition(&t, &Event::VerdictChanges).unwrap();
         assert_eq!(next, Status::Failed);
+    }
+
+    #[test]
+    fn per_task_rework_cap_overrides_default() {
+        // A task stamped with a higher cap keeps reworking past the compiled
+        // default and fails only at its own cap — proving the gate reads the
+        // per-task value, not the REWORK_CAP constant.
+        let mut t = view_with_author(Status::InReview, "W1");
+        t.rework_cap = 10;
+
+        t.rework_round = REWORK_CAP; // 7: below the per-task cap of 10
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(
+            next,
+            Status::Rework,
+            "round 7 must rework under a cap of 10"
+        );
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+
+        t.rework_round = 10; // at the per-task cap
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(next, Status::Failed, "round 10 must fail under a cap of 10");
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::NotifyOwner { reason } if reason == "rework cap (10) exceeded")
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -2185,6 +2240,7 @@ mod proptests {
             author: None,
             reviewer: None,
             rework_round: 0,
+            rework_cap: REWORK_CAP,
             pr: None,
             review_only: false,
         };
@@ -2249,6 +2305,7 @@ mod proptests {
                 author: None,
                 reviewer: None,
                 rework_round: 0,
+                rework_cap: REWORK_CAP,
                 pr: None,
                 review_only: false,
             };
@@ -2320,6 +2377,7 @@ mod proptests {
                 author: Some("W1".into()),
                 reviewer: Some("R1".into()),
                 rework_round: 0,
+                rework_cap: REWORK_CAP,
                 pr: Some("1".into()),
                 review_only: false,
             };
@@ -2337,6 +2395,7 @@ mod proptests {
                 author: None,
                 reviewer: None,
                 rework_round: 0,
+                rework_cap: REWORK_CAP,
                 pr: None,
                 review_only: false,
             };
@@ -2382,6 +2441,7 @@ mod proptests {
                 author: None,
                 reviewer: None,
                 rework_round: 0,
+                rework_cap: REWORK_CAP,
                 pr: None,
                 review_only: false,
             };
@@ -2420,6 +2480,7 @@ mod proptests {
                 author: None,
                 reviewer: None,
                 rework_round: 0,
+                rework_cap: REWORK_CAP,
                 pr: None,
                 review_only: false,
             };

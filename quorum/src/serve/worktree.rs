@@ -11,12 +11,30 @@ use tokio::sync::Mutex;
 const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_PIPE_LIMIT: usize = 1024 * 1024;
+// Push rejection text is persisted as a task park reason and event body. Keep
+// the complete error within the serving layer's provisioning-cause bound.
+const PUSH_REJECTION_MAX_BYTES: usize = 2048;
 
 pub struct WorktreeManager {
     lock: Mutex<()>,
     git_bin: PathBuf,
     fetch_timeout: Duration,
     local_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationBaseMerge {
+    Clean,
+    Conflicted,
+}
+
+/// Result of fetching the target branch immediately before allocating a
+/// dependent task. A missing commit is an expected short-lived GitHub ref
+/// propagation outcome; transport and Git failures remain errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyBaseVerification {
+    Verified { base_sha: String },
+    Missing { merge_commit_sha: String },
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -29,6 +47,68 @@ pub struct PublicationRefReconcileResult {
 struct GitPipeOutput {
     bytes: Vec<u8>,
     exceeded_limit: bool,
+}
+
+/// Render captured git output only when it is safe to carry into a durable
+/// diagnostic. Git output is untrusted process output: replacement-decoding
+/// malformed bytes would make an operator believe the captured text was exact,
+/// and SQLite text must never receive an embedded NUL.
+fn git_diagnostic(output: &[u8]) -> String {
+    match std::str::from_utf8(output) {
+        Ok(value) if !value.contains('\0') => value.trim().to_string(),
+        Ok(_) => "git output rejected: contains embedded NUL".into(),
+        Err(_) => "git output rejected: invalid UTF-8".into(),
+    }
+}
+
+fn truncate_utf8_prefix(value: &str, limit: usize) -> &str {
+    let mut end = limit.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn truncate_utf8_suffix(value: &str, limit: usize) -> &str {
+    let mut start = value.len().saturating_sub(limit);
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
+/// Bound a durable diagnostic without discarding either the hook's headline
+/// or Git's final rejection summary.
+fn middle_truncate_git_output(value: &str, limit: usize) -> String {
+    const MARKER: &str = "\n…<middle truncated>…\n";
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    if limit <= MARKER.len() {
+        return truncate_utf8_prefix(value, limit).to_string();
+    }
+    let head_limit = (limit - MARKER.len()) / 2;
+    let tail_limit = limit - MARKER.len() - head_limit;
+    format!(
+        "{}{}{}",
+        truncate_utf8_prefix(value, head_limit),
+        MARKER,
+        truncate_utf8_suffix(value, tail_limit)
+    )
+}
+
+fn push_rejection(remote_ref: &str, new_branch: bool, stdout: &[u8], stderr: &[u8]) -> String {
+    let target = if new_branch {
+        format!("daemon push to new branch {remote_ref} rejected:")
+    } else {
+        format!("daemon push to {remote_ref} rejected:")
+    };
+    let diagnostic = format!(
+        "{target}\nhook-stdout:\n{}\nstderr:\n{}",
+        git_diagnostic(stdout),
+        git_diagnostic(stderr)
+    );
+    middle_truncate_git_output(&diagnostic, PUSH_REJECTION_MAX_BYTES)
 }
 
 async fn drain_git_pipe<R>(
@@ -230,7 +310,11 @@ impl WorktreeManager {
     }
 
     #[cfg(test)]
-    fn with_config(git_bin: PathBuf, fetch_timeout: Duration, local_timeout: Duration) -> Self {
+    pub(crate) fn with_config(
+        git_bin: PathBuf,
+        fetch_timeout: Duration,
+        local_timeout: Duration,
+    ) -> Self {
         Self {
             lock: Mutex::new(()),
             git_bin,
@@ -532,7 +616,7 @@ impl WorktreeManager {
             if !add.status.success() {
                 return Err(format!(
                     "git worktree add (reuse branch) failed: {}",
-                    String::from_utf8_lossy(&add.stderr)
+                    git_diagnostic(&add.stderr)
                 ));
             }
         } else {
@@ -543,7 +627,7 @@ impl WorktreeManager {
             if !add.status.success() {
                 return Err(format!(
                     "git worktree add failed: {}",
-                    String::from_utf8_lossy(&add.stderr)
+                    git_diagnostic(&add.stderr)
                 ));
             }
         }
@@ -567,7 +651,7 @@ impl WorktreeManager {
         if !fetch.status.success() {
             return Err(format!(
                 "git fetch origin {remote_branch} failed: {}",
-                String::from_utf8_lossy(&fetch.stderr)
+                git_diagnostic(&fetch.stderr)
             ));
         }
 
@@ -597,11 +681,149 @@ impl WorktreeManager {
         if !add.status.success() {
             return Err(format!(
                 "git worktree add failed: {}",
-                String::from_utf8_lossy(&add.stderr)
+                git_diagnostic(&add.stderr)
             ));
         }
 
         Ok(wt_path)
+    }
+
+    /// Refresh `origin/<base_branch>` and prove every dependency merge commit
+    /// is reachable from the fetched tip. This deliberately runs before a
+    /// caller allocates a branch or worktree; a stale remote ref is a normal
+    /// deferral, never a permissible base for dependent work.
+    pub async fn fetch_base_and_verify_dependency_commits(
+        &self,
+        repo_dir: &Path,
+        base_branch: &str,
+        merge_commits: &[String],
+    ) -> Result<DependencyBaseVerification, String> {
+        let _guard = self.lock.lock().await;
+        let remote_ref = format!("refs/heads/{base_branch}");
+        let tracking_ref = format!("refs/remotes/origin/{base_branch}");
+        let refspec = format!("+{remote_ref}:{tracking_ref}");
+
+        let mut fetch = self.git_cmd(repo_dir);
+        fetch.args(["fetch", "origin", &refspec]);
+        let fetched = run_git(fetch, self.fetch_timeout, "git fetch dependency base").await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {remote_ref} failed: {}",
+                git_diagnostic(&fetched.stderr)
+            ));
+        }
+
+        let base_ref = format!("origin/{base_branch}");
+        let mut resolve = self.git_cmd(repo_dir);
+        resolve.args(["rev-parse", "--verify", &base_ref]);
+        let resolved = run_git(
+            resolve,
+            self.local_timeout,
+            "git resolve dependency base provenance",
+        )
+        .await?;
+        if !resolved.status.success() {
+            return Err(format!("cannot resolve dependency base {base_ref}"));
+        }
+        let base_sha = git_diagnostic(&resolved.stdout).to_ascii_lowercase();
+        if base_sha.is_empty() {
+            return Err(format!(
+                "dependency base {base_ref} resolved to an empty SHA"
+            ));
+        }
+
+        for merge_commit_sha in merge_commits {
+            let mut ancestry = self.git_cmd(repo_dir);
+            ancestry.args(["merge-base", "--is-ancestor", merge_commit_sha, &base_sha]);
+            let ancestry = run_git(
+                ancestry,
+                self.local_timeout,
+                "git verify dependency merge ancestry",
+            )
+            .await?;
+            if ancestry.status.success() {
+                continue;
+            }
+            // A fetch of only the stale base ref normally does not transfer
+            // the just-merged dependency object at all. `merge-base` reports
+            // that ordinary propagation state as exit 128 (rather than 1),
+            // so both outcomes must use the bounded defer path. A durable
+            // SHA which never arrives is parked loudly by that path.
+            if matches!(ancestry.status.code(), Some(1) | Some(128)) {
+                return Ok(DependencyBaseVerification::Missing {
+                    merge_commit_sha: merge_commit_sha.clone(),
+                });
+            }
+            return Err(format!(
+                "cannot verify dependency merge commit {merge_commit_sha} against {base_sha}: {}",
+                git_diagnostic(&ancestry.stderr)
+            ));
+        }
+
+        Ok(DependencyBaseVerification::Verified { base_sha })
+    }
+
+    /// Refresh and merge the configured base into an exact continuation PR
+    /// checkout. A content conflict is a prepared worker state, not a setup
+    /// failure: Git leaves `MERGE_HEAD` plus the index/worktree conflicts for
+    /// the worker to resolve. Every other non-zero merge result fails loud.
+    pub async fn integrate_continuation_base(
+        &self,
+        worktree_dir: &Path,
+        base_branch: &str,
+    ) -> Result<ContinuationBaseMerge, String> {
+        let _guard = self.lock.lock().await;
+        let remote_ref = format!("refs/heads/{base_branch}");
+        let tracking_ref = format!("refs/remotes/origin/{base_branch}");
+        let refspec = format!("+{remote_ref}:{tracking_ref}");
+
+        let mut fetch = self.git_cmd(worktree_dir);
+        fetch.args(["fetch", "origin", &refspec]);
+        let fetched = run_git(fetch, self.fetch_timeout, "git fetch continuation base").await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {remote_ref} failed: {}",
+                git_diagnostic(&fetched.stderr)
+            ));
+        }
+
+        let base_ref = format!("origin/{base_branch}");
+        let mut merge = self.git_cmd(worktree_dir);
+        // Repository policy may set merge.ff=only. Explicit --ff restores
+        // normal merge behavior for this daemon-owned integration: Git may
+        // fast-forward when possible, but divergent clean histories still
+        // produce the ancestry-preserving merge commit required here.
+        merge.args(["merge", "--ff", "--no-edit", &base_ref]);
+        let merged = run_git(merge, self.local_timeout, "git merge continuation base").await?;
+        if merged.status.success() {
+            return Ok(ContinuationBaseMerge::Clean);
+        }
+
+        let mut merge_head = self.git_cmd(worktree_dir);
+        merge_head.args(["rev-parse", "--verify", "MERGE_HEAD"]);
+        let merge_head = run_git(
+            merge_head,
+            self.local_timeout,
+            "git verify continuation merge conflict",
+        )
+        .await?;
+        let mut conflicts = self.git_cmd(worktree_dir);
+        conflicts.args(["diff", "--name-only", "--diff-filter=U"]);
+        let conflicts = run_git(
+            conflicts,
+            self.local_timeout,
+            "git list continuation merge conflicts",
+        )
+        .await?;
+        if merge_head.status.success() && conflicts.status.success() && !conflicts.stdout.is_empty()
+        {
+            Ok(ContinuationBaseMerge::Conflicted)
+        } else {
+            Err(format!(
+                "git merge {base_ref} failed without leaving a resolvable merge: {}",
+                git_diagnostic(&merged.stderr)
+            ))
+        }
     }
 
     /// Fetch a PR head via `refs/pull/<pr>/head` and provision a worktree.
@@ -623,7 +845,7 @@ impl WorktreeManager {
         if !fetch.status.success() {
             return Err(format!(
                 "git fetch origin {refspec} failed: {}",
-                String::from_utf8_lossy(&fetch.stderr)
+                git_diagnostic(&fetch.stderr)
             ));
         }
 
@@ -651,7 +873,7 @@ impl WorktreeManager {
         if !add.status.success() {
             return Err(format!(
                 "git worktree add failed: {}",
-                String::from_utf8_lossy(&add.stderr)
+                git_diagnostic(&add.stderr)
             ));
         }
 
@@ -667,7 +889,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git config {} failed: {}",
                 args.join(" "),
-                String::from_utf8_lossy(&out.stderr)
+                git_diagnostic(&out.stderr)
             ));
         }
         Ok(())
@@ -707,7 +929,7 @@ impl WorktreeManager {
             _ => {
                 return Err(format!(
                     "git config --get core.worktree failed: {}",
-                    String::from_utf8_lossy(&worktree.stderr)
+                    git_diagnostic(&worktree.stderr)
                 ));
             }
         }
@@ -736,7 +958,7 @@ impl WorktreeManager {
             _ => {
                 return Err(format!(
                     "git config --bool --get core.bare failed: {}",
-                    String::from_utf8_lossy(&bare.stderr)
+                    git_diagnostic(&bare.stderr)
                 ));
             }
         }
@@ -780,7 +1002,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git rev-parse HEAD failed in {}: {}",
                 worktree_dir.display(),
-                String::from_utf8_lossy(&out.stderr)
+                git_diagnostic(&out.stderr)
             ));
         }
         let actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -800,7 +1022,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git rev-parse HEAD failed in {}: {}",
                 worktree_dir.display(),
-                String::from_utf8_lossy(&out.stderr)
+                git_diagnostic(&out.stderr)
             ));
         }
         let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -823,6 +1045,7 @@ impl WorktreeManager {
         remote_branch: &str,
         expected_remote_sha: &str,
         source_sha: &str,
+        base_branch: &str,
     ) -> Result<String, String> {
         let _guard = self.lock.lock().await;
         let remote_ref = format!("refs/heads/{remote_branch}");
@@ -874,17 +1097,44 @@ impl WorktreeManager {
             ));
         }
 
+        // Existing PR publication is intentionally fast-forward-only.  The
+        // lease above protects against a concurrently moved remote, but it
+        // does not prove that a worker preserved the published lineage.  A
+        // rebase can leave the remote unchanged while replacing its tip with
+        // an unrelated commit, so reject that shape before invoking push.
+        let mut ancestry = self.git_cmd(worktree_dir);
+        ancestry.args([
+            "merge-base",
+            "--is-ancestor",
+            expected_remote_sha,
+            source_sha,
+        ]);
+        let ancestry = run_git(
+            ancestry,
+            self.local_timeout,
+            "git validate PR publication ancestry",
+        )
+        .await?;
+        if !ancestry.status.success() {
+            return Err(format!(
+                "publication source {source_sha} rewrites published PR head {expected_remote_sha}; preserve the PR head and merge the base branch instead of rebasing"
+            ));
+        }
+
         let refspec = format!("{source_sha}:{remote_ref}");
         let lease = format!("--force-with-lease={remote_ref}:{expected_remote_sha}");
-        let push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
+        let mut push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
+        push.env("QUORUM_CONTINUATION_BASE_BRANCH", base_branch);
         let pushed = run_git(push, self.fetch_timeout, "git push PR head").await?;
         if !pushed.status.success() {
             let mut refresh = self.git_cmd(worktree_dir);
             refresh.args(["fetch", "origin", &remote_ref]);
             let _ = run_git(refresh, self.fetch_timeout, "git refetch rejected PR push").await;
-            return Err(format!(
-                "daemon push to {remote_ref} rejected: {}",
-                String::from_utf8_lossy(&pushed.stderr)
+            return Err(push_rejection(
+                &remote_ref,
+                false,
+                &pushed.stdout,
+                &pushed.stderr,
             ));
         }
 
@@ -971,9 +1221,11 @@ impl WorktreeManager {
         let push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
         let pushed = run_git(push, self.fetch_timeout, "git push new branch").await?;
         if !pushed.status.success() {
-            return Err(format!(
-                "daemon push to new branch {remote_ref} rejected: {}",
-                String::from_utf8_lossy(&pushed.stderr)
+            return Err(push_rejection(
+                &remote_ref,
+                true,
+                &pushed.stdout,
+                &pushed.stderr,
             ));
         }
         let mut verify = self.git_cmd(worktree_dir);
@@ -1056,6 +1308,62 @@ impl WorktreeManager {
         }
 
         Ok(())
+    }
+
+    /// Verify that `repo_dir` still registers the exact canonical worktree
+    /// path and local branch. The Git boundary is bounded by the manager's
+    /// normal local timeout/output limit and explicitly kills/reaps failures.
+    pub(crate) async fn verify_exact_registration(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let expected_path = std::fs::canonicalize(worktree_dir)
+            .map_err(|error| format!("cannot canonicalize worktree path: {error}"))?;
+        let expected_ref = format!("refs/heads/{branch}");
+        let mut list = self.git_cmd(repo_dir);
+        list.args(["worktree", "list", "--porcelain"]);
+        let out = run_git(list, self.local_timeout, "git worktree list for recovery").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "git worktree list failed: {}",
+                git_diagnostic(&out.stderr)
+            ));
+        }
+
+        let mut matching_branches = Vec::new();
+        let mut listed_path = None;
+        let mut listed_branch = None;
+        for line in std::str::from_utf8(&out.stdout)
+            .map_err(|error| format!("git worktree list returned invalid UTF-8: {error}"))?
+            .lines()
+            .chain(std::iter::once(""))
+        {
+            if let Some(value) = line.strip_prefix("worktree ") {
+                listed_path = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("branch ") {
+                listed_branch = Some(value.to_string());
+            } else if line.is_empty() {
+                if listed_path.as_deref().is_some_and(|path| {
+                    std::fs::canonicalize(path).ok().as_ref() == Some(&expected_path)
+                }) {
+                    matching_branches.push(listed_branch.clone());
+                }
+                listed_path = None;
+                listed_branch = None;
+            }
+        }
+
+        match matching_branches.as_slice() {
+            [] => Err("worktree path exists without exact git registration".into()),
+            [actual] if actual.as_deref() == Some(expected_ref.as_str()) => Ok(()),
+            [actual] => Err(format!(
+                "worktree identity mismatch: expected {expected_ref}, found {actual:?}"
+            )),
+            _ => Err("worktree path has multiple git registrations".into()),
+        }
     }
 
     /// Remove only when git still reports the exact path/branch binding captured
@@ -1232,11 +1540,86 @@ impl WorktreeManager {
     pub async fn delete_branch_with_tombstone(
         &self,
         repo_dir: &Path,
+        remote_url: &str,
         branch: &str,
         expected_sha: &str,
         tombstone_ref: &str,
     ) -> Result<(), String> {
         let _guard = self.lock.lock().await;
+        let remote_ref = format!("refs/heads/{branch}");
+        let remote_tombstone_ref = format!(
+            "refs/heads/quorum-cleanup/{}",
+            tombstone_ref
+                .strip_prefix("refs/quorum/cleanup/")
+                .ok_or_else(|| "invalid cleanup tombstone namespace".to_string())?
+        );
+        let mut remote_refs = self.git_cmd(repo_dir);
+        remote_refs.args(["ls-remote", remote_url, &remote_ref, &remote_tombstone_ref]);
+        let remote_out = run_git(
+            remote_refs,
+            self.fetch_timeout,
+            "git resolve remote cleanup refs",
+        )
+        .await?;
+        if !remote_out.status.success() {
+            return Err(format!(
+                "cannot resolve remote cleanup refs: {}",
+                String::from_utf8_lossy(&remote_out.stderr)
+            ));
+        }
+        let mut remote_branch_sha = None;
+        let mut remote_tombstone_sha = None;
+        for line in String::from_utf8_lossy(&remote_out.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            let sha = fields.next().unwrap_or_default();
+            match fields.next().unwrap_or_default() {
+                name if name == remote_ref => remote_branch_sha = Some(sha.to_string()),
+                name if name == remote_tombstone_ref => {
+                    remote_tombstone_sha = Some(sha.to_string())
+                }
+                _ => return Err("unexpected remote cleanup ref response".into()),
+            }
+        }
+        if let Some(actual) = remote_tombstone_sha {
+            if actual != expected_sha {
+                return Err("remote cleanup tombstone identity mismatch".into());
+            }
+        } else {
+            if let Some(actual) = remote_branch_sha.as_deref() {
+                if actual != expected_sha {
+                    return Err(format!(
+                        "remote branch SHA mismatch: expected {expected_sha}, found {actual}"
+                    ));
+                }
+            }
+            let tombstone_refspec = format!("{expected_sha}:{remote_tombstone_ref}");
+            let tombstone_lease = format!("--force-with-lease={remote_tombstone_ref}:");
+            let branch_lease = remote_branch_sha
+                .as_ref()
+                .map(|_| format!("--force-with-lease={remote_ref}:{expected_sha}"));
+            let mut remote_delete = self.git_cmd(repo_dir);
+            remote_delete.arg("push").arg("--atomic").arg(remote_url);
+            remote_delete.arg(&tombstone_lease);
+            if let Some(lease) = &branch_lease {
+                remote_delete.arg(lease);
+            }
+            remote_delete.arg(&tombstone_refspec);
+            if remote_branch_sha.is_some() {
+                remote_delete.arg(format!(":{remote_ref}"));
+            }
+            let deleted = run_git(
+                remote_delete,
+                self.fetch_timeout,
+                "git tombstone and delete remote cleanup branch",
+            )
+            .await?;
+            if !deleted.status.success() {
+                return Err(format!(
+                    "remote cleanup branch CAS deletion failed: {}",
+                    String::from_utf8_lossy(&deleted.stderr)
+                ));
+            }
+        }
         let mut tombstone = self.git_cmd(repo_dir);
         tombstone.args(["rev-parse", "--verify", tombstone_ref]);
         let tombstone_out = run_git(
@@ -1308,10 +1691,76 @@ impl WorktreeManager {
     pub async fn retire_cleanup_tombstone(
         &self,
         repo_dir: &Path,
+        remote_url: &str,
         tombstone_ref: &str,
         expected_sha: &str,
     ) -> Result<(), String> {
         let _guard = self.lock.lock().await;
+        let remote_tombstone_ref = format!(
+            "refs/heads/quorum-cleanup/{}",
+            tombstone_ref
+                .strip_prefix("refs/quorum/cleanup/")
+                .ok_or_else(|| "invalid cleanup tombstone namespace".to_string())?
+        );
+        let mut remote_resolve = self.git_cmd(repo_dir);
+        remote_resolve.args(["ls-remote", remote_url, &remote_tombstone_ref]);
+        let resolved = run_git(
+            remote_resolve,
+            self.fetch_timeout,
+            "git resolve settled remote cleanup tombstone",
+        )
+        .await?;
+        if !resolved.status.success() {
+            return Err(format!(
+                "cannot resolve settled remote cleanup tombstone: {}",
+                String::from_utf8_lossy(&resolved.stderr)
+            ));
+        }
+        let actual = String::from_utf8_lossy(&resolved.stdout)
+            .split_whitespace()
+            .next()
+            .map(str::to_string);
+        if let Some(actual) = actual.as_deref() {
+            if actual != expected_sha {
+                return Err(format!(
+                    "settled remote cleanup tombstone mismatch: expected {expected_sha}, found {actual}"
+                ));
+            }
+        } else {
+            return self
+                .retire_local_cleanup_tombstone(repo_dir, tombstone_ref, expected_sha)
+                .await;
+        }
+        let mut remote_delete = self.git_cmd(repo_dir);
+        remote_delete
+            .arg("push")
+            .arg(remote_url)
+            .arg(format!(
+                "--force-with-lease={remote_tombstone_ref}:{expected_sha}"
+            ))
+            .arg(format!(":{remote_tombstone_ref}"));
+        let remote_out = run_git(
+            remote_delete,
+            self.fetch_timeout,
+            "git retire remote cleanup tombstone",
+        )
+        .await?;
+        if !remote_out.status.success() {
+            return Err(format!(
+                "remote cleanup tombstone CAS deletion failed: {}",
+                String::from_utf8_lossy(&remote_out.stderr)
+            ));
+        }
+        self.retire_local_cleanup_tombstone(repo_dir, tombstone_ref, expected_sha)
+            .await
+    }
+
+    async fn retire_local_cleanup_tombstone(
+        &self,
+        repo_dir: &Path,
+        tombstone_ref: &str,
+        expected_sha: &str,
+    ) -> Result<(), String> {
         let mut resolve = self.git_cmd(repo_dir);
         resolve.args(["rev-parse", "--verify", tombstone_ref]);
         let out = run_git(
@@ -1499,6 +1948,172 @@ mod tests {
         );
 
         mgr.remove(repo_dir.path(), &wt_path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn dependency_base_verification_defers_until_remote_contains_merge_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("worker");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let d = source.to_string_lossy().to_string();
+
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "dependency"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "dependency"])
+            .status()
+            .unwrap()
+            .success());
+        let dependency_commit = git_rev_parse(&source, "HEAD");
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap()
+            .success());
+
+        let missing_object = git_output(
+            &worker,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &dependency_commit,
+                "origin/main",
+            ],
+        );
+        assert_eq!(
+            missing_object.status.code(),
+            Some(128),
+            "the stale clone must not have the dependency merge object"
+        );
+
+        let mgr = WorktreeManager::new();
+        let first = mgr
+            .fetch_base_and_verify_dependency_commits(
+                &worker,
+                "main",
+                std::slice::from_ref(&dependency_commit),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            DependencyBaseVerification::Missing {
+                merge_commit_sha: dependency_commit.clone(),
+            }
+        );
+        assert!(
+            !git_output(
+                &worker,
+                &["show-ref", "--verify", "refs/heads/daemon/dependent"]
+            )
+            .status
+            .success(),
+            "verification must not allocate a branch"
+        );
+
+        assert!(StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "merge",
+                "--no-ff",
+                "dependency",
+                "-m",
+                "merge dependency"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "push", "origin", "main"])
+            .status()
+            .unwrap()
+            .success());
+
+        let second = mgr
+            .fetch_base_and_verify_dependency_commits(
+                &worker,
+                "main",
+                std::slice::from_ref(&dependency_commit),
+            )
+            .await
+            .unwrap();
+        let DependencyBaseVerification::Verified { base_sha } = second else {
+            panic!("advanced base must contain dependency commit");
+        };
+        assert!(git_output(
+            &worker,
+            &["merge-base", "--is-ancestor", &dependency_commit, &base_sha]
+        )
+        .status
+        .success());
+    }
+
+    #[tokio::test]
+    async fn initial_provision_uses_each_requested_remote_target() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let d = repo_dir.path().to_string_lossy().to_string();
+        StdCommand::new("git")
+            .args(["-C", &d, "remote", "add", "origin", &d])
+            .status()
+            .unwrap();
+
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "develop"])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "develop target"])
+            .status()
+            .unwrap();
+        let develop_head = git_rev_parse(repo_dir.path(), "develop");
+        let main_head = git_rev_parse(repo_dir.path(), "main");
+        assert_ne!(develop_head, main_head);
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap();
+        let fetched = StdCommand::new("git")
+            .args(["-C", &d, "fetch", "origin", "main", "develop"])
+            .output()
+            .unwrap();
+        assert!(fetched.status.success());
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mgr = WorktreeManager::new();
+        for (target, expected) in [("main", main_head), ("develop", develop_head)] {
+            let path = workspace.path().join(format!("{target}-worktree"));
+            mgr.provision(
+                repo_dir.path(),
+                &format!("daemon/{target}-t1"),
+                &path,
+                &format!("origin/{target}"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(git_rev_parse(&path, "HEAD"), expected);
+            mgr.remove(repo_dir.path(), &path).await.unwrap();
+        }
+
+        let missing = mgr
+            .provision(
+                repo_dir.path(),
+                "daemon/missing-t1",
+                &workspace.path().join("missing-worktree"),
+                "origin/missing-target",
+            )
+            .await
+            .expect_err("a missing remote target must reject initial provisioning");
+        assert!(missing.contains("git worktree add failed"));
     }
 
     #[tokio::test]
@@ -2073,6 +2688,35 @@ mod tests {
         mgr.remove(repo_dir.path(), &wt_path).await.ok();
     }
 
+    #[test]
+    fn captured_git_output_rejects_invalid_utf8_and_nul() {
+        assert_eq!(
+            git_diagnostic(b"fatal: cannot lock ref\0detail"),
+            "git output rejected: contains embedded NUL"
+        );
+        assert_eq!(
+            git_diagnostic(&[b'f', b'a', 0x80]),
+            "git output rejected: invalid UTF-8"
+        );
+        assert_eq!(
+            git_diagnostic(b" fatal: missing ref\n"),
+            "fatal: missing ref"
+        );
+    }
+
+    #[test]
+    fn push_rejection_rejects_unsafe_captured_output() {
+        let error = push_rejection(
+            "refs/heads/daemon/test",
+            true,
+            b"hook\0output",
+            &[b'f', b'a', 0x80],
+        );
+        assert!(error.contains("hook-stdout:\ngit output rejected: contains embedded NUL"));
+        assert!(error.contains("stderr:\ngit output rejected: invalid UTF-8"));
+        assert!(!error.contains("hook\0output"));
+    }
+
     /// Repo with a real bare `origin` remote and `main` pushed. Returns
     /// (repo dir, bare remote dir) inside `base`.
     fn init_repo_with_bare_remote(base: &Path) -> (PathBuf, PathBuf) {
@@ -2139,6 +2783,413 @@ mod tests {
         let mut cmd = StdCommand::new("git");
         cmd.arg("-C").arg(dir).args(args);
         cmd.output().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn install_repository_pre_push_hook(repo: &Path, base: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hooks = base.join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.githooks/pre-push");
+        let installed = hooks.join("pre-push");
+        std::fs::copy(&source, &installed)
+            .unwrap_or_else(|error| panic!("copy {}: {error}", source.display()));
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(git_output(
+            repo,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()]
+        )
+        .status
+        .success());
+    }
+
+    #[cfg(unix)]
+    fn install_rejecting_pre_push_hook(repo: &Path, base: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hooks = base.join("rejecting-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let hook = hooks.join("pre-push");
+        std::fs::write(&hook, script).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(git_output(
+            repo,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()]
+        )
+        .status
+        .success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_daemon_push_captures_hook_stdout_and_git_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = init_repo_with_bare_remote(tmp.path());
+        let mgr = WorktreeManager::new();
+
+        let pr_head = "fix/rejected-pr";
+        let remote_tip = push_branch(&repo, pr_head);
+        let existing_wt = tmp.path().join("existing-wt");
+        mgr.fetch_and_provision(&repo, "remediation/Rejected-t92", &existing_wt, pr_head)
+            .await
+            .unwrap();
+        assert!(
+            git_output(&existing_wt, &["commit", "--allow-empty", "-m", "work"])
+                .status
+                .success()
+        );
+        let existing_sha = git_rev_parse(&existing_wt, "HEAD");
+
+        let new_branch = "daemon/rejected-t92";
+        let new_wt = tmp.path().join("new-wt");
+        mgr.provision(&repo, new_branch, &new_wt, "origin/main")
+            .await
+            .unwrap();
+        assert!(
+            git_output(&new_wt, &["commit", "--allow-empty", "-m", "work"])
+                .status
+                .success()
+        );
+        let new_sha = git_rev_parse(&new_wt, "HEAD");
+
+        install_rejecting_pre_push_hook(
+            &repo,
+            tmp.path(),
+            "#!/bin/sh\nprintf 'PREFLIGHT: FAIL known hook marker\\n'\nexit 1\n",
+        );
+
+        let new_error = mgr
+            .push_new_branch(&new_wt, new_branch, &new_sha)
+            .await
+            .expect_err("new branch push must be rejected by the hook");
+        let existing_error = mgr
+            .push_to_pr_head(&existing_wt, pr_head, &remote_tip, &existing_sha, "main")
+            .await
+            .expect_err("existing branch push must be rejected by the hook");
+
+        for error in [&new_error, &existing_error] {
+            assert!(error.contains("hook-stdout:\nPREFLIGHT: FAIL known hook marker"));
+            assert!(error.contains("stderr:\n"));
+            assert!(error.contains("failed to push some refs"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_daemon_push_middle_truncates_oversized_hook_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = init_repo_with_bare_remote(tmp.path());
+        let mgr = WorktreeManager::new();
+        let branch = "daemon/oversized-hook-t92";
+        let worktree = tmp.path().join("worktree");
+        mgr.provision(&repo, branch, &worktree, "origin/main")
+            .await
+            .unwrap();
+        assert!(
+            git_output(&worktree, &["commit", "--allow-empty", "-m", "work"])
+                .status
+                .success()
+        );
+        let source_sha = git_rev_parse(&worktree, "HEAD");
+        install_rejecting_pre_push_hook(
+            &repo,
+            tmp.path(),
+            "#!/bin/sh\nprintf 'PREFLIGHT: FAIL hook headline\\n'\ni=0\nwhile [ \"$i\" -lt 4096 ]; do printf x; i=$((i + 1)); done\nprintf '\\nPREFLIGHT: FAIL hook tail\\n'\nexit 1\n",
+        );
+
+        let error = mgr
+            .push_new_branch(&worktree, branch, &source_sha)
+            .await
+            .expect_err("push must be rejected by the hook");
+        assert!(error.len() <= PUSH_REJECTION_MAX_BYTES, "{}", error.len());
+        assert!(error.contains("PREFLIGHT: FAIL hook headline"), "{error}");
+        assert!(error.contains("failed to push some refs"), "{error}");
+        assert!(error.contains("<middle truncated>"), "{error}");
+    }
+
+    #[cfg(unix)]
+    fn add_continuation_fixture_files(repo: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let preflight = repo.join("preflight.sh");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../preflight.sh");
+        std::fs::copy(&source, &preflight)
+            .unwrap_or_else(|error| panic!("copy {}: {error}", source.display()));
+        std::fs::set_permissions(&preflight, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"continuation-hook-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn formatted() {}\n").unwrap();
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        assert!(git_output(repo, &["add", "."]).status.success());
+        assert!(git_output(repo, &["commit", "-m", "continuation fixture"])
+            .status
+            .success());
+        assert!(git_output(repo, &["push", "origin", "main"])
+            .status
+            .success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continuation_clean_non_main_base_publishes_fast_forward_through_real_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        add_continuation_fixture_files(&repo);
+        assert!(git_output(&repo, &["config", "merge.ff", "only"])
+            .status
+            .success());
+        let pr_head = "fix/clean-continuation";
+
+        assert!(git_output(&repo, &["checkout", "-b", "develop"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", "develop"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["checkout", "-b", pr_head])
+            .status
+            .success());
+        std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+        assert!(git_output(&repo, &["add", "feature.txt"]).status.success());
+        assert!(git_output(&repo, &["commit", "-m", "PR work"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", pr_head])
+            .status
+            .success());
+        let remote_pr_head = git_rev_parse(&repo, "HEAD");
+
+        assert!(git_output(&repo, &["checkout", "develop"]).status.success());
+        std::fs::write(repo.join("base-only-a.txt"), "advanced base A\n").unwrap();
+        assert!(git_output(&repo, &["add", "base-only-a.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base cleanly A",
+                "-m",
+                "Co-Authored-By: Base-A <base-a@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        std::fs::write(repo.join("base-only-b.txt"), "advanced base B\n").unwrap();
+        assert!(git_output(&repo, &["add", "base-only-b.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base cleanly B",
+                "-m",
+                "Co-Authored-By: Base-B <base-b@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        assert!(git_output(&repo, &["push", "origin", "develop"])
+            .status
+            .success());
+        let base_head = git_rev_parse(&repo, "HEAD");
+
+        let mgr = WorktreeManager::new();
+        let worktree = tmp.path().join("clean-continuation-wt");
+        mgr.fetch_and_provision(&repo, "remediation/Clean-t353", &worktree, pr_head)
+            .await
+            .expect("provision exact PR head");
+        mgr.verify_head_sha(&worktree, &remote_pr_head)
+            .await
+            .expect("verify exact PR head before integration");
+        assert_eq!(
+            mgr.integrate_continuation_base(&worktree, "develop")
+                .await
+                .expect("clean base integration"),
+            ContinuationBaseMerge::Clean
+        );
+        let merge_head = git_rev_parse(&worktree, "HEAD");
+        let merge_parents = git_output(&worktree, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert!(merge_parents.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&merge_parents.stdout)
+                .split_whitespace()
+                .count(),
+            3,
+            "a divergent clean continuation must retain both parents even with merge.ff=only"
+        );
+        assert_ne!(merge_head, remote_pr_head);
+        assert_ne!(merge_head, base_head);
+        std::fs::write(worktree.join("worker.txt"), "worker continuation\n").unwrap();
+        assert!(git_output(&worktree, &["add", "worker.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &worktree,
+            &[
+                "commit",
+                "-m",
+                "finish clean continuation",
+                "-m",
+                "Co-Authored-By: Continue-Worker <continue-worker@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        let integrated_head = git_rev_parse(&worktree, "HEAD");
+        for ancestor in [&remote_pr_head, &base_head] {
+            assert!(
+                git_output(
+                    &worktree,
+                    &["merge-base", "--is-ancestor", ancestor, &integrated_head]
+                )
+                .status
+                .success(),
+                "integrated continuation must contain {ancestor}"
+            );
+        }
+
+        install_repository_pre_push_hook(&repo, tmp.path());
+        mgr.disable_push(&worktree)
+            .await
+            .expect("worker push lockout");
+        mgr.push_to_pr_head(
+            &worktree,
+            pr_head,
+            &remote_pr_head,
+            &integrated_head,
+            "develop",
+        )
+        .await
+        .expect("daemon publication must pass the real ff-only pre-push hook");
+        assert_eq!(git_rev_parse(&bare, pr_head), integrated_head);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continuation_conflict_remains_mergeable_and_publishes_through_real_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        add_continuation_fixture_files(&repo);
+        let pr_head = "fix/conflicting-continuation";
+
+        assert!(git_output(&repo, &["checkout", "-b", pr_head])
+            .status
+            .success());
+        std::fs::write(repo.join("shared.txt"), "PR version\n").unwrap();
+        assert!(git_output(&repo, &["add", "shared.txt"]).status.success());
+        assert!(git_output(&repo, &["commit", "-m", "PR conflicting work"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", pr_head])
+            .status
+            .success());
+        let remote_pr_head = git_rev_parse(&repo, "HEAD");
+
+        assert!(git_output(&repo, &["checkout", "main"]).status.success());
+        std::fs::write(repo.join("base-only.txt"), "base session A\n").unwrap();
+        assert!(git_output(&repo, &["add", "base-only.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base session A",
+                "-m",
+                "Co-Authored-By: Base-A <base-a@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        std::fs::write(repo.join("shared.txt"), "base version\n").unwrap();
+        assert!(git_output(&repo, &["add", "shared.txt"]).status.success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base conflict",
+                "-m",
+                "Co-Authored-By: Base-B <base-b@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        assert!(git_output(&repo, &["push", "origin", "main"])
+            .status
+            .success());
+        let base_head = git_rev_parse(&repo, "HEAD");
+
+        let mgr = WorktreeManager::new();
+        let worktree = tmp.path().join("conflicting-continuation-wt");
+        mgr.fetch_and_provision(&repo, "remediation/Conflict-t353", &worktree, pr_head)
+            .await
+            .expect("provision exact PR head");
+        mgr.verify_head_sha(&worktree, &remote_pr_head)
+            .await
+            .expect("verify exact PR head before integration");
+        assert_eq!(
+            mgr.integrate_continuation_base(&worktree, "main")
+                .await
+                .expect("conflict is a prepared continuation state"),
+            ContinuationBaseMerge::Conflicted
+        );
+        assert_eq!(git_rev_parse(&worktree, "HEAD"), remote_pr_head);
+        assert_eq!(git_rev_parse(&worktree, "MERGE_HEAD"), base_head);
+        assert!(
+            !git_output(&worktree, &["diff", "--quiet", "--diff-filter=U"])
+                .status
+                .success(),
+            "prepared worktree must retain unresolved conflict state"
+        );
+
+        std::fs::write(worktree.join("shared.txt"), "resolved continuation\n").unwrap();
+        assert!(git_output(&worktree, &["add", "shared.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &worktree,
+            &[
+                "commit",
+                "-m",
+                "Merge origin/main into continuation",
+                "-m",
+                "Co-Authored-By: Continue-Worker <continue-worker@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        let resolved_head = git_rev_parse(&worktree, "HEAD");
+        for ancestor in [&remote_pr_head, &base_head] {
+            assert!(
+                git_output(
+                    &worktree,
+                    &["merge-base", "--is-ancestor", ancestor, &resolved_head]
+                )
+                .status
+                .success(),
+                "resolved merge must contain {ancestor}"
+            );
+        }
+
+        install_repository_pre_push_hook(&repo, tmp.path());
+        mgr.disable_push(&worktree)
+            .await
+            .expect("worker push lockout");
+        mgr.push_to_pr_head(&worktree, pr_head, &remote_pr_head, &resolved_head, "main")
+            .await
+            .expect("resolved conflict must publish without parking");
+        assert_eq!(git_rev_parse(&bare, pr_head), resolved_head);
     }
 
     /// Regression (2026-07-29 mass rework burn): a PR head branch held in
@@ -2213,7 +3264,13 @@ mod tests {
         let source_sha = git_rev_parse(&wt_path, "HEAD");
 
         let result = mgr
-            .push_to_pr_head(&wt_path, pr_head, "not-the-authoritative-sha", &source_sha)
+            .push_to_pr_head(
+                &wt_path,
+                pr_head,
+                "not-the-authoritative-sha",
+                &source_sha,
+                "main",
+            )
             .await;
         assert!(
             result.is_err(),
@@ -2227,6 +3284,57 @@ mod tests {
 
         mgr.remove(&repo, &wt_path).await.ok();
         mgr.delete_branch(&repo, "remediation/Brass-t10").await;
+    }
+
+    #[tokio::test]
+    async fn daemon_push_to_pr_head_rejects_rewritten_published_lineage_before_push() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/rewritten-pr";
+        let published_tip = push_branch(&repo, pr_head);
+
+        assert!(git_output(&repo, &["checkout", "main"]).status.success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "replacement based on newer main"
+            ]
+        )
+        .status
+        .success());
+        let rewritten_source = git_rev_parse(&repo, "HEAD");
+        assert!(
+            !git_output(
+                &repo,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &published_tip,
+                    &rewritten_source,
+                ]
+            )
+            .status
+            .success(),
+            "fixture must model a rebased/squash-rebuilt PR lineage"
+        );
+
+        let error = WorktreeManager::new()
+            .push_to_pr_head(&repo, pr_head, &published_tip, &rewritten_source, "main")
+            .await
+            .expect_err("rewritten published ancestry must fail before push");
+        assert!(error.contains("rewrites published PR head"), "{error}");
+        assert!(
+            error.contains("merge the base branch instead of rebasing"),
+            "{error}"
+        );
+        assert_eq!(
+            git_rev_parse(&bare, pr_head),
+            published_tip,
+            "ancestry rejection must leave the remote PR branch unchanged"
+        );
     }
 
     #[tokio::test]
@@ -2254,19 +3362,19 @@ mod tests {
         let mutable_head = git_rev_parse(&wt_path, "HEAD");
         assert_ne!(intent_sha, mutable_head);
 
-        mgr.push_to_pr_head(&wt_path, pr_head, &remote_tip, &intent_sha)
+        mgr.push_to_pr_head(&wt_path, pr_head, &remote_tip, &intent_sha, "main")
             .await
             .expect("exact durable source must publish");
         assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
         assert_ne!(git_rev_parse(&bare, pr_head), mutable_head);
     }
 
-    /// Regression for PR #483 remediation review: a publication failure may
-    /// remove the source worktree/branch before an operator retries the parked
-    /// task. The retry can use a different run-local remediation branch, but
-    /// it must still publish intent A rather than its replacement HEAD B.
+    /// A crash-window replay with no accepted replacement delivery must keep
+    /// publishing the exact pinned intent even if another worktree HEAD moves.
+    /// The serve layer explicitly supersedes this pin only when a parked
+    /// rework retry completes a new delivery round.
     #[tokio::test]
-    async fn publication_pin_replays_exact_source_after_branch_cleanup_and_retry() {
+    async fn publication_pin_replays_exact_source_after_branch_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, bare) = init_repo_with_bare_remote(tmp.path());
         let pr_head = "fix/publication-retry";
@@ -2316,14 +3424,14 @@ mod tests {
         )
         .status
         .success());
-        let replacement_head = git_rev_parse(&retry_wt, "HEAD");
-        assert_ne!(replacement_head, intent_sha);
+        let unrelated_head = git_rev_parse(&retry_wt, "HEAD");
+        assert_ne!(unrelated_head, intent_sha);
 
-        mgr.push_to_pr_head(&retry_wt, pr_head, &remote_tip, &intent_sha)
+        mgr.push_to_pr_head(&retry_wt, pr_head, &remote_tip, &intent_sha, "main")
             .await
-            .expect("task retry must replay the durable intent source");
+            .expect("crash replay must retain the durable intent source");
         assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
-        assert_ne!(git_rev_parse(&bare, pr_head), replacement_head);
+        assert_ne!(git_rev_parse(&bare, pr_head), unrelated_head);
 
         mgr.retire_publication_source(&repo, 263, &intent_sha)
             .await
@@ -2467,7 +3575,7 @@ mod tests {
             WorktreeManager::with_config(shim, Duration::from_secs(10), Duration::from_secs(10));
         let source_sha = git_rev_parse(&wt_path, "HEAD");
         let result = mgr
-            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &source_sha)
+            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &source_sha, "main")
             .await;
         assert!(result.is_err(), "racing writer must defeat the lease");
         assert_eq!(
@@ -2611,7 +3719,7 @@ mod tests {
         );
 
         let pushed = mgr
-            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &new_tip)
+            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &new_tip, "main")
             .await
             .expect("daemon push must succeed");
         assert_eq!(pushed, new_tip);
@@ -2940,30 +4048,43 @@ mod tests {
             Some(worker_sha.clone())
         );
         let tombstone = "refs/quorum/cleanup/1/2/3";
-        mgr.delete_branch_with_tombstone(repo.path(), "daemon/discovery", &worker_sha, tombstone)
-            .await
-            .unwrap();
+        mgr.delete_branch_with_tombstone(
+            repo.path(),
+            &d,
+            "daemon/discovery",
+            &worker_sha,
+            tombstone,
+        )
+        .await
+        .unwrap();
         // Simulate crash before DB settlement followed by same-name recreation.
         StdCommand::new("git")
             .args(["-C", &d, "branch", "daemon/discovery", "main"])
             .status()
             .unwrap();
-        mgr.delete_branch_with_tombstone(repo.path(), "daemon/discovery", &worker_sha, tombstone)
-            .await
-            .unwrap();
+        mgr.delete_branch_with_tombstone(
+            repo.path(),
+            &d,
+            "daemon/discovery",
+            &worker_sha,
+            tombstone,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             git_rev_parse(repo.path(), "daemon/discovery"),
             provenance,
             "tombstone replay must not touch recreated branch"
         );
         // Simulate restart after DB completion but before best-effort retire.
-        mgr.retire_cleanup_tombstone(repo.path(), tombstone, &worker_sha)
+        mgr.retire_cleanup_tombstone(repo.path(), &d, tombstone, &worker_sha)
             .await
             .unwrap();
         assert_eq!(git_rev_parse(repo.path(), "daemon/discovery"), provenance);
         let moved = mgr
             .delete_branch_with_tombstone(
                 repo.path(),
+                &d,
                 "daemon/discovery",
                 &worker_sha,
                 "refs/quorum/cleanup/1/2/4",
@@ -2974,6 +4095,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_tombstone_delete_is_cas_safe_and_replay_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_repo(&repo);
+        let d = repo.to_string_lossy().to_string();
+        let remote_url = remote.to_string_lossy().to_string();
+        StdCommand::new("git")
+            .args(["init", "--bare", &remote_url])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "daemon/remote"])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "remote worker"])
+            .status()
+            .unwrap();
+        let expected = git_rev_parse(&repo, "daemon/remote");
+        StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "push",
+                &remote_url,
+                "daemon/remote:refs/heads/daemon/remote",
+            ])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap();
+
+        let manager = WorktreeManager::new();
+        let tombstone = "refs/quorum/cleanup/4/5/6";
+        manager
+            .delete_branch_with_tombstone(&repo, &remote_url, "daemon/remote", &expected, tombstone)
+            .await
+            .unwrap();
+        assert!(!git_output(
+            &remote,
+            &["show-ref", "--verify", "refs/heads/daemon/remote"]
+        )
+        .status
+        .success());
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_output(&remote, &["rev-parse", "refs/heads/quorum-cleanup/4/5/6"]).stdout
+            )
+            .trim(),
+            expected
+        );
+
+        // A crash before DB settlement may be followed by same-name recreation,
+        // even at the same object. The durable remote tombstone makes replay inert.
+        StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "push",
+                &remote_url,
+                &format!("{expected}:refs/heads/daemon/remote"),
+            ])
+            .status()
+            .unwrap();
+        manager
+            .delete_branch_with_tombstone(&repo, &remote_url, "daemon/remote", &expected, tombstone)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_output(&remote, &["rev-parse", "refs/heads/daemon/remote"]).stdout
+            )
+            .trim(),
+            expected
+        );
+        manager
+            .retire_cleanup_tombstone(&repo, &remote_url, tombstone, &expected)
+            .await
+            .unwrap();
+        assert!(!git_output(
+            &remote,
+            &["show-ref", "--verify", "refs/heads/quorum-cleanup/4/5/6"]
+        )
+        .status
+        .success());
+
+        let replacement = git_rev_parse(&repo, "main");
+        StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "push",
+                "--force",
+                &remote_url,
+                &format!("{replacement}:refs/heads/daemon/remote"),
+            ])
+            .status()
+            .unwrap();
+        let error = manager
+            .delete_branch_with_tombstone(
+                &repo,
+                &remote_url,
+                "daemon/remote",
+                &expected,
+                "refs/quorum/cleanup/4/5/7",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("remote branch SHA mismatch"));
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_output(&remote, &["rev-parse", "refs/heads/daemon/remote"]).stdout
+            )
+            .trim(),
+            replacement
+        );
+    }
+
+    #[tokio::test]
     async fn absent_finalized_branch_gets_tombstone_before_recreation() {
         let repo = tempfile::tempdir().unwrap();
         init_git_repo(repo.path());
@@ -2981,14 +4225,14 @@ mod tests {
         let expected = git_rev_parse(repo.path(), "main");
         let mgr = WorktreeManager::new();
         let tombstone = "refs/quorum/cleanup/9/8/7";
-        mgr.delete_branch_with_tombstone(repo.path(), "daemon/absent", &expected, tombstone)
+        mgr.delete_branch_with_tombstone(repo.path(), &d, "daemon/absent", &expected, tombstone)
             .await
             .unwrap();
         StdCommand::new("git")
             .args(["-C", &d, "branch", "daemon/absent", "main"])
             .status()
             .unwrap();
-        mgr.delete_branch_with_tombstone(repo.path(), "daemon/absent", &expected, tombstone)
+        mgr.delete_branch_with_tombstone(repo.path(), &d, "daemon/absent", &expected, tombstone)
             .await
             .unwrap();
         assert_eq!(git_rev_parse(repo.path(), "daemon/absent"), expected);

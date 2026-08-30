@@ -2,14 +2,18 @@
 //! `events` stream (not the message feed), `quorum log` reads them, `--refs` filters by
 //! subject, `--since <seq>` is a strict delta, and `post`/`read` are NOT affected.
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 
 fn quorum(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("quorum").unwrap();
-    c.env("QUORUM_HOME", home).env("QUORUM_REPO", "test/repo");
+    c.env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        .env_remove("QUORUM_AGENT")
+        .env_remove("QUORUM_RUN_ID")
+        .env_remove("QUORUM_AGENT_ENDPOINT");
     c
 }
 

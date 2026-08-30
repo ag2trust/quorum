@@ -1,8 +1,8 @@
 # Bounded Task Decomposition — Technical Specification
 
-**Date:** 2026-07-31  
-**Status:** Proposed  
-**Product source:** `quorum-pml` commit `b6d4e4b`  
+**Date:** 2026-07-31
+**Status:** Proposed
+**Product source:** `quorum-pml` commit `b6d4e4b`
 **Implementation prerequisite:** PR #485 (explicit classifier size and admission readiness)
 
 ## Problem
@@ -51,11 +51,96 @@ open -> planning -> decomposed -> done
 used for a valid Planning Blocker, exhausted proposal attempts, exhausted provider failures, or
 unsafe recovered state. A materialized graph blocker does not move the source out of
 `decomposed`; it marks the graph blocked and fails the affected child. Only source cancellation
-and a replacement source can recover a graph after generated delivery has started.
+and a replacement source can normally recover a graph after generated delivery has started. The
+only exception is exact, evidence-bound adoption of an already merged continuation; it does not
+unblock, replan, or otherwise repair the blocked graph.
 
-The final child merge transaction marks the child done and, if every graph member is done,
-marks the source and graph done atomically. Source dependents remain blocked until that source
-transition commits.
+There is one narrow incident-recovery exception for a failed generated child whose exact work
+was subsequently delivered by a separate managed continuation task. The automatic core call may
+adopt that delivery only when the failed task is the final unfinished member of a live graph
+(`state` active or blocked, with `active=1`); both tasks identify the same repository and PR; the
+continuation has creator-selected `continue_pr` authority and explicit `source_task` provenance;
+and its daemon publication, managed approval, merge transition, PR target, and approved head SHA
+all agree. On a blocked graph, this is limited to marking that exact failed child done and
+recording its recovery provenance: the graph remains blocked and active, its source remains
+decomposed, no new child gains execution authority, and no graph completion/dependent release is
+emitted. Cancellation and replacement remain necessary to resolve the graph. Publication and
+merge events are short-lived evidence: every required event must be live at the transaction's
+`now` (`expires_at > now`), so an event at its expiry boundary is rejected regardless of whether
+housekeeping has swept it.
+
+One operator-only command may authorize a known exact child/continuation pair without granting
+automatic discovery any new authority: `quorum decomposition-adopt-recovery
+--original-child-id <child> --recovery-task-id <continuation> --by <operator>`. Its single
+`BEGIN IMMEDIATE` transaction requires the same active graph and final failed-child predicates,
+the same repository, PR, continuation, target, and approved-head agreement, and no conflicting
+`source_task` metadata. In place of live feed events, it requires durable daemon evidence: a
+completed assigned worker preceding final PR-target persistence, an assigned approved reviewer
+bound to that target head and its sampling decision, and `merged` completion provenance. The
+explicit pair supplies the missing relationship only when `source_task` is absent; it never
+overrides a conflicting source and never infers from task text or shared PR equality. Success
+records the exact operator/source/child/recovery/PR/head tuple in the decomposition recovery
+ledger and child projection.
+
+The explicit command also recognizes one fail-closed legacy prepublication state created by the
+older retry path: the final generated child is unassigned `open`, has no completion or PR target,
+retains a valid task-scoped `daemon_publication` intent before PR creation, and its active graph is
+blocked by the matching non-JSON `generated-child-failed` publication summary. The recorded intent
+branch must match the exact daemon-authored grammar `daemon/<author-slug>-t<child-id>`, where
+`<author-slug>` is a non-empty lowercase ASCII `[a-z0-9-]+` run and `<child-id>` is the exact
+original child ID. Non-daemon prefixes, empty slugs, nested paths, whitespace, uppercase letters,
+dots, embedded NULs, and every other character outside that grammar are rejected before any lifecycle
+mutation. The preserved local SHA likewise rejects embedded NULs before its length and hexadecimal
+checks. The continuation
+must postdate the child, satisfy the same durable managed worker/reviewer/sampling/merge chain,
+and have an immutable target equal to the decomposition
+source's immutable target. No resolved publication field may be present. Success additionally
+audits the preserved local SHA and branch, removes the stale intent, and clears only that exact
+legacy hold while atomically completing the child, graph, and source. This predicate does not
+accept any other open task or generated-child failure. Classifier duplicate hints are explicitly
+non-authoritative and do not participate in this lifecycle predicate.
+
+Both paths use the same transaction-scoped finalizer: mark only the eligible child done and
+preserve its PR association when one exists. The automatic path then runs ordinary final-child
+graph completion only for an active graph; on a blocked graph completion is intentionally skipped,
+leaving the graph blocked and active and the source decomposed. The explicit path may additionally
+complete a blocked graph for either the exact structured `boundary-violation` hold naming the
+failed child or the exact legacy prepublication hold described above. The continuation row remains
+unchanged. No match, replay, or losing concurrent caller changes state or emits an event; the
+winner emits the bounded child-completion event once and emits graph completion only when its
+corresponding guarded graph predicate succeeds.
+
+The daemon invokes this primitive automatically after graph consistency reconciliation and before
+generic stateless lifecycle recovery or provisioning, once at startup and once per ordinary tick.
+Discovery reads at most eight physical lifecycle-event rows in ascending sequence order from a
+dedicated persisted cursor. It filters for a live terminal `task_done` record, then resolves the candidate's
+explicit `source_task`, live graph membership, PR targets, and live publication/merge evidence
+through primary-key/subject-indexed short reads. It neither scans all done tasks nor performs
+network I/O. The read connection closes before any guarded core write begins.
+
+The daemon acknowledges the event page monotonically only after every candidate application
+and retry-marker write returns successfully. The short read also records whether another active
+sibling is unfinished. If that snapshot is partial and the guarded call remains a clean negative,
+the daemon records one idempotent, TTL-bounded event marker for the exact child/recovery pair. A
+later sibling `task_done` event drains live markers in ascending event sequence through bounded
+live-graph and subject-indexed reads. A second monotonic cursor advances after each settled pair;
+at most eight pairs are applied per pass, and a full batch retains the sibling trigger so the next
+pass continues with the next-oldest marker. If another sibling remains unfinished, the trigger is
+consumed without advancing pending markers and the next sibling completion retries them. Every
+settled page advances rather than letting a stalled graph starve later deliveries. A crash before
+application leaves the cursor unchanged; a crash after the core, marker, or pending-cursor commit
+but before acknowledgement replays an idempotent no-op. A startup-pass error is logged and does not
+block other recovery, while a normal-tick error follows the ordinary tick error policy; neither
+advances the page. Candidate discovery grants no authority beyond the guarded core predicate. It
+may settle one exact evidence-complete delivery on a `blocked` graph, but cannot unblock it,
+start new work, complete the graph, or release dependents; graph-blocker scope defects still
+require source cancellation and a replacement source for resolution.
+
+Every event transition that marks a generated child done, including the final child merge, and
+every permitted manual child close checks graph completion in the same transaction. If every
+graph member is done, that transaction marks the source and graph done atomically. Manual close
+rejects an active graph source, which must use graph cancellation. Source dependents remain
+blocked until the source transition commits.
 
 ## Durable model
 
@@ -101,7 +186,10 @@ CREATE UNIQUE INDEX one_planning_freeze
 ```
 
 States are `freeze-requested`, `draining`, `planning`, `validating`, `preclassifying`,
-`provider-backoff`, `held`, `active`, `blocked`, `completed`, and `cancelled`. `active=1` is set
+`provider-backoff`, `held`, `active`, `blocked`, `completed`, and `cancelled`. The frozen planning
+order is `planning` -> `preclassifying` (closed-book classifier) -> `validating` (Arbiter) ->
+`active`; `accepted_classifications_json` (v64) carries the accepted classifier batch from
+`preclassifying` into `validating` and materialization. `active=1` is set
 only for a materialized `active` or `blocked` graph. `freeze_active=1` covers the stable-repo
 planning window. `planned_source_revision` is only the captured task revision for compare-and-swap
 validation; `tasks.revision` and `tasks.edit_count` remain authoritative. Partial unique indexes
@@ -160,7 +248,10 @@ The migration is additive and forward-only under the normal `BEGIN IMMEDIATE` mi
 
 The daemon selects planning candidates by priority, then task ID. A candidate must be an open,
 unclaimed, admission-ready L/XL implementation task whose dependencies are done. It must not be
-review-only or generated work. S/M work follows normal dispatch regardless of complexity.
+review-only or generated work. Review-only work always routes directly to reviewer provisioning
+at any classified size; S/M implementation work follows normal dispatch regardless of complexity.
+The atomic planning transaction rechecks `review_only=0` and `continue_pr IS NULL`, so neither
+PR-bound entry shape can become a decomposition source even if a stale caller selects it.
 
 Starting a cycle atomically moves the source to `planning`, records `freeze-requested`, and sets
 `freeze_active=1`. Every worker, reviewer, remediation, and merge-start authority check must
@@ -171,9 +262,14 @@ transaction; freeze acquisition is refused while any reservation is live, and ev
 failure path releases it.
 
 After the freeze commits, already active managed work may finish, including protected merge.
-Nothing new is provisioned. Planning starts only when live slots and durable in-flight journal
-rows are empty. This coordinator is separate from self-update `DrainState`, which drains and
-exits the process.
+Nothing new is provisioned. Planning starts only when live slots, durable in-flight journal
+rows, and started-but-not-terminal tasks (`working`, `in-review`, `rework`, excluding the
+planning source itself) are all empty. Zero live processes alone is not enough: a task can be
+`in-review` between worker teardown and reviewer attach with no futures retained, and starting
+planning while that task is still non-terminal would let its merge race the frozen-base
+capture. Convergence holds because the freeze blocks new claims, so the set of started tasks
+can only shrink under drain. This coordinator is separate from self-update `DrainState`, which
+drains and exits the process.
 
 A semantic plan rejection retains the freeze. A provider failure clears it during bounded
 backoff; retry reacquires it and drains again. A valid blocker or exhausted budget clears the
@@ -194,7 +290,10 @@ The planner runs against the frozen base revision with:
 - a read-only repository view;
 - no network namespace access;
 - no Quorum binary, database path, run capability, or coordination environment;
-- bounded stdout, stderr, response bytes, and wall-clock time;
+- source-directed inspection guidance capped at five Grep/Glob calls and ten focused Read calls;
+- a 128 KiB streamed-stdout ceiling, 64 KiB response ceiling, and 600-second wall-clock
+  ceiling; no provider USD ceiling is set;
+- bounded stderr diagnostics;
 - process-group kill and reap on timeout/cancellation.
 
 This requires a planner-specific provider spawn boundary. Worker commands and any Codex path
@@ -213,11 +312,36 @@ or:
 {"outcome":"blocker","category":"...","evidence":["..."],"required_decision":"...","why_no_safe_split":"..."}
 ```
 
-A plan contains 2–8 uniquely keyed tasks. Each task has title, observable outcome, acceptance
-criteria, applicable source constraints, verification expectations, and prerequisite local keys
-or source dependency IDs. A blocker must be concrete. Markdown wrappers, unknown fields,
+A plan contains 2–8 uniquely keyed tasks. Each task has a title, concrete implementation delta,
+affected repository paths, observable outcome, acceptance criteria, applicable source constraints,
+verification expectations, explicit non-goals, byte-exact preserved literals, and prerequisite
+local keys or source dependency IDs. The planner receives the same S/M execution-size rubric as
+the classifier. It inspects from source-named paths and symbols under bounded search/read guidance,
+and separates independently deliverable code or ownership seams rather than turning preserved
+outcomes into standalone work. A blocker must be concrete. Markdown wrappers, unknown fields,
 multiple outcomes, oversized output, malformed JSON, and sandbox violations are provider
 failures.
+
+Literal preservation is byte-exact and bounded by the 8 KiB `preserved_literals` field and an
+8 KiB aggregate across all extracted values. Inline/fenced Markdown code uses matching backtick
+delimiter runs of any positive length; mismatched or unclosed runs are not extracted. Those code
+values and quoted values attached to the words `literal`, `label`, `tag`, or `message` are sorted
+and deduplicated; their lexicographic prefix is deterministically extracted only while it fits
+both bounds. Every
+extracted value must appear
+unchanged in at least one child's
+`preserved_literals`; every planner-declared preserved literal must occur in the source bytes.
+Missing or normalized values reject the proposal before classification. Larger source-marked
+values, and otherwise-fitting values beyond the aggregate prefix, remain planner context but are
+not preservation-field requirements, because no valid proposal can carry them within the bounded
+planner response and durable proposal. Source authors should use those explicit forms whenever
+spelling is load-bearing and fits both bounds.
+
+Durable accepted proposals are revalidated against the complete closed-plan semantic contract
+before a restart resumes preclassifying or validating. Compatibility defaults for newly added
+fields never admit an older stored proposal with empty required fields; an atomic compatibility
+reset clears the accepted JSON and returns it to planning without consuming the current semantic
+proposal-rejection budget.
 
 A syntactically valid blocker that lacks a supported category, concrete evidence, required
 decision, or the explanation of why no safe split exists is a semantic rejection, not a valid
@@ -233,21 +357,40 @@ Deterministic validation rejects the complete proposal for:
 
 - fewer than two or more than eight tasks;
 - duplicate keys, self-edges, cycles, or unknown dependencies;
+- a requested-write deliverable that uses parent traversal or resolves outside the canonical
+  managed repository, including through an in-repository symlink;
 - empty/no-op work or synthetic integration work;
+- empty required grounding fields or missing/modified byte-exact source-marked literals;
 - missing source outcome/constraint coverage;
 - unrelated scope or weakened source constraints;
 - dependencies that are not real delivery prerequisites;
-- duplication of existing work.
+- classifier-reported duplication of existing work.
 
 Duplicate authority is fail-closed: any child classifier duplicate reference rejects the whole
 plan; deterministic exact/normalized identity checks may reject earlier but never modify the
 existing task.
 
+Each child declares a bounded structured deliverables manifest that distinguishes requested
+writes from read-only contextual references. Repository containment validation inspects only the
+requested writes; an external read-only reference does not grant write authority and is permitted.
+Lexically external absolute writes are rejected without filesystem access. Inspection needed for
+in-repository symlinks runs off the serial daemon tick on at most one dedicated OS resolver thread
+with no queued retry. A hard timeout fails closed as an escape, and while the resolver remains
+stuck its occupied slot rejects later proposals without consuming Tokio's shared blocking pool or
+delaying database work. This is deterministic proposal admission, not a general filesystem sandbox
+or a planner self-attestation check.
+
 All proposed children are classified together before any child row exists. Classification uses
 temporary proposal keys, not task IDs. Every result must be present, admission-ready,
-implementation work, nonduplicate, and size S or M. Runtime readiness is deliberately not
-required: a child may wait for another generated prerequisite. Any missing, malformed, L/XL,
-not-ready, duplicate, or extra classification rejects the entire plan as a semantic proposal.
+implementation work, nonduplicate, size S or M, and carry a nonempty, NUL-free `size_reason`
+bounded to 1 KiB. The reason names the concrete execution surfaces supporting the selected size;
+for L/XL it identifies independently deliverable seams rather than merely repeating the rubric.
+Runtime readiness is deliberately not required: a child may wait for another generated
+prerequisite. Any missing, malformed, L/XL, not-ready, duplicate, or extra classification rejects
+the entire plan as a semantic proposal. A completed batch records every rejected child's bounded
+key, verdict, size rationale, implementation delta, and affected paths in one deterministic,
+globally bounded proposal-attempt summary, and the next planner attempt receives that complete
+applicable rejection context.
 
 Semantic rejection increments only `proposal_attempts`; provider/protocol/sandbox failure
 increments only `provider_failures`. Each cap is three per unchanged source revision. A valid
@@ -350,7 +493,12 @@ Decomposition reconciliation runs before generic lifecycle recovery or provision
 - An inconsistent graph may replan only if no child has ever been claimed, created a proposed
   change, or merged and proposal budget remains.
 - Any evidence of generated delivery forbids automatic replanning and requires cancellation plus
-  replacement.
+  replacement except for the exact-continuation adoption predicate described under Lifecycle.
+  After consistency checks, startup and tick reconciliation discover that case through the
+  bounded monotonic event cursor and invoke the guarded transaction; no shared-PR or inferred
+  provenance match is sufficient. A coordinator/operator may instead invoke the exact-pair
+  command above when durable evidence is complete; that command does not scan or create automatic
+  recovery authority.
 - Generic recovery must not reset planning/decomposed sources or treat children as unrelated.
 - Pre-feature unrelated tasks enter the current admission policy when next eligible. A complete
   existing graph resumes; incomplete/inconsistent graphs are held with a visible reason.

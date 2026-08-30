@@ -17,6 +17,8 @@
 //! - No errors rows from normal operation
 //! - ReworkPushed is never rejected
 
+mod common;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -139,7 +141,7 @@ elif [ "$cmd" = "pr view" ]; then
   branch="daemon/origworker-t1"
   sha="$(git -C "$QUORUM_TEST_REPO" ls-remote origin "refs/heads/$branch" | awk '{print $1}')"
   if [ -z "$sha" ]; then sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"; fi
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -258,6 +260,18 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock")
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let agent = args
         .iter()
@@ -288,6 +302,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -373,6 +388,7 @@ fn seed_review_only_task(home: &std::path::Path, pr: i64) -> i64 {
             task_id: id,
             cx_est: 3,
             size: "M".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
@@ -412,6 +428,7 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
             task_id: id,
             cx_est: 3,
             size: "M".into(),
+            size_reason: "bounded test classification rationale".into(),
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
@@ -460,7 +477,7 @@ fn record_closed_run(home: &std::path::Path, task_id: i64, agent: &str, role: &s
 }
 
 #[test]
-fn orphan_reviewer_waits_for_complete_v2_classification() {
+fn orphan_reviewer_waits_for_complete_v3_classification() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -514,7 +531,7 @@ fn orphan_reviewer_waits_for_complete_v2_classification() {
         .lines
         .iter()
         .position(|line| line.contains("classifier: stored 1 classification"))
-        .expect("v2 classification was not persisted");
+        .expect("v3 classification was not persisted");
     let spawned = handle
         .lines
         .iter()
@@ -522,15 +539,19 @@ fn orphan_reviewer_waits_for_complete_v2_classification() {
         .expect("reviewer spawn log missing");
     assert!(
         gated < classified && classified < spawned,
-        "reviewer must not spawn before v2 classification: {:?}",
+        "reviewer must not spawn before v3 classification: {:?}",
         handle.lines
     );
 
     let task = get_task(home.path(), task_id);
     let refs: serde_json::Value =
         serde_json::from_str(task.refs.as_deref().expect("classified refs")).unwrap();
-    assert_eq!(refs["cx_by"], "claude-opus-4-6:v2");
+    assert_eq!(refs["cx_by"], "claude-opus-4-6:v3");
     assert_eq!(refs["cx_size"], "S");
+    assert_eq!(
+        refs["cx_size_reason"],
+        "test fixture is one focused execution seam"
+    );
     assert_eq!(refs["cx_ready"], true);
     drop(handle);
 }
@@ -767,9 +788,17 @@ fn reviewer_run_insert_error_never_attaches_and_restart_recovers() {
         "injected persistence failure was not surfaced: {:?}",
         failed.lines
     );
+    // The failure is contained to this task: it is logged and the tick keeps
+    // going, instead of aborting the whole tick with `tick error`.
     assert!(
-        failed.wait_for("tick error", 10),
+        failed.wait_for("orphan provision error for task #1 PR #42", 10),
         "daemon did not finish fail-safe cleanup: {:?}",
+        failed.lines
+    );
+    failed.drain_pending_lines();
+    assert!(
+        !failed.lines.iter().any(|line| line.contains("tick error")),
+        "a single task's provision failure must not abort the tick: {:?}",
         failed.lines
     );
     drop(failed);
@@ -790,6 +819,9 @@ fn reviewer_run_insert_error_never_attaches_and_restart_recovers() {
             .unwrap();
     }
 
+    // SIGKILL + immediate restart is Held until stale or cleared (instance-id
+    // authority); tests clear the leftover row instead of waiting stale_secs.
+    common::clear_daemon_lock(&db_path(home.path()));
     let retry_wt_base = tempfile::tempdir().unwrap();
     let mut recovered = ServeHandle::start(
         home.path(),
@@ -852,7 +884,7 @@ fn persistent_reviewer_run_insert_error_stops_after_provision_budget() {
         &[],
     );
     assert!(
-        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 30),
+        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 90),
         "persistent failure did not exhaust and park: {:?}",
         handle.lines
     );
@@ -931,10 +963,12 @@ fn orphan_r2_does_not_reuse_torn_down_worker_or_r1_name() {
                 reviewer: r1.into(),
                 verdict: "approved".into(),
                 blocking_count: 0,
-                approved_head_sha: head_sha,
+                approved_head_sha: head_sha.clone(),
             },
         )
         .unwrap();
+        quorum_core::review_audits::record_r2_requirement(&mut conn, task_id, pr, &head_sha, true)
+            .unwrap();
     }
     let names = write_named_pool(home.path(), &["Worker".into(), "R1".into(), "R2".into()]);
 

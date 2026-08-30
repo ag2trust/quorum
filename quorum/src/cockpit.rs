@@ -1,7 +1,8 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
     AlertMessage, BlockedTask, DaemonAgentView, DaemonLiveness, DecompositionStatusView,
-    DedupedError, HealthVerdict, MergeBlockerView, PipelineTask, QueueTask, ReviewingTask, Stats,
+    DedupedError, HealthVerdict, HostResourcesView, MergeBlockerView, PipelineTask, QueueTask,
+    ResourceSeverity, ReviewingTask, Stats,
 };
 use std::io::Write;
 
@@ -132,6 +133,7 @@ pub fn render_with_style(s: &Stats, sty: &Style, w: &mut dyn Write) {
 
 fn render_with_style_at_width(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
     render_header(s, sty, w, width);
+    render_resources(s.resources.as_ref(), sty, w, width);
     render_working(s, sty, w, width);
     render_queue(&s.queue_tasks, sty, w, width);
     render_blocked(&s.blocked, sty, w, width);
@@ -142,6 +144,76 @@ fn render_with_style_at_width(s: &Stats, sty: &Style, w: &mut dyn Write, width: 
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
     render_alerts(&s.alerts, sty, w, width);
     render_errors(&s.recent_errors, s.older_errors_silenced, sty, w, width);
+}
+
+fn render_resources(
+    resources: Option<&HostResourcesView>,
+    sty: &Style,
+    w: &mut dyn Write,
+    width: usize,
+) {
+    let Some(resources) = resources else {
+        return;
+    };
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("RESOURCES", width));
+    if let Some(memory) = &resources.memory {
+        let status = resource_status(memory.severity, sty);
+        let _ = writeln!(
+            w,
+            "  memory  {:>6.1} / {:>6.1} GiB available ({:>3.0}%)   swap {:>5.1} / {:>5.1} GiB used   {}",
+            crate::resource_health::bytes_to_gib(memory.available_bytes),
+            crate::resource_health::bytes_to_gib(memory.total_bytes),
+            memory.available_percent,
+            crate::resource_health::bytes_to_gib(memory.swap_used_bytes),
+            crate::resource_health::bytes_to_gib(memory.swap_total_bytes),
+            status,
+        );
+    }
+    for disk in &resources.disks {
+        let status = resource_status(disk.severity, sty);
+        let _ = writeln!(
+            w,
+            "  disk    {:>6.1} / {:>6.1} GiB available ({:>3.0}%)   {:<20} {}",
+            crate::resource_health::bytes_to_gib(disk.available_bytes),
+            crate::resource_health::bytes_to_gib(disk.total_bytes),
+            disk.available_percent,
+            disk.targets.join("+"),
+            status,
+        );
+        let _ = writeln!(w, "          {}", sty.dim(&truncate(&disk.path, 68)));
+    }
+    for error in &resources.errors {
+        let line = format!("sample unavailable: {}", truncate(error, 58));
+        let rendered = if sty.color { sty.yellow(&line) } else { line };
+        let _ = writeln!(w, "  {rendered}");
+    }
+}
+
+fn resource_status(severity: ResourceSeverity, sty: &Style) -> String {
+    match severity {
+        ResourceSeverity::Normal => {
+            if sty.color {
+                sty.green("ok")
+            } else {
+                "ok".to_string()
+            }
+        }
+        ResourceSeverity::Warning => {
+            if sty.color {
+                sty.yellow("WARNING")
+            } else {
+                "WARNING".to_string()
+            }
+        }
+        ResourceSeverity::Critical => {
+            if sty.color {
+                sty.red("CRITICAL")
+            } else {
+                "CRITICAL".to_string()
+            }
+        }
+    }
 }
 
 fn render_header(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
@@ -536,6 +608,28 @@ fn render_decomposition(
         planner,
         revision,
     );
+    let planner_effort = graph.planner_effort.as_deref().unwrap_or("pending");
+    let planner_log_dir = graph
+        .planner_log_dir
+        .as_deref()
+        .map(|dir| truncate(dir, width.saturating_sub(48)))
+        .unwrap_or_else(|| "—".to_string());
+    let planner_age = graph
+        .planner_last_activity_age_secs
+        .map(fmt_age)
+        .unwrap_or_else(|| "—".to_string());
+    let planner_activity = graph
+        .planner_activity_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let planner_tools = graph
+        .planner_tool_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let _ = writeln!(
+        w,
+        "      planner effort={planner_effort} log={planner_log_dir} age={planner_age} activity={planner_activity} tools={planner_tools}",
+    );
     let _ = writeln!(
         w,
         "      {}",
@@ -543,9 +637,27 @@ fn render_decomposition(
     );
     let _ = writeln!(
         w,
-        "      attempts proposal={}/3 provider={}/3",
-        graph.proposal_attempts, graph.provider_failures
+        "      attempts proposal={}/3 provider={}/3 operator-retries={}/{}",
+        graph.proposal_attempts,
+        graph.provider_failures,
+        graph.operator_retry_count,
+        graph.operator_retry_cap,
     );
+    if let Some(code) = &graph.hold_code {
+        let disposition = if graph.retryable_planning_hold {
+            "retryable with task-retry"
+        } else {
+            "not retryable"
+        };
+        let _ = writeln!(w, "      planning-hold: {code} ({disposition})");
+    }
+    if let Some(hold) = &graph.dispatch_hold {
+        let _ = writeln!(
+            w,
+            "      hold: {}",
+            truncate(hold, width.saturating_sub(12))
+        );
+    }
     for member in &graph.members {
         let prerequisites = if member.prerequisites.is_empty() {
             "—".to_string()
@@ -788,6 +900,64 @@ mod tests {
         assert!(output.contains("ERRORS"));
     }
 
+    fn resource_fixture(severity: ResourceSeverity) -> HostResourcesView {
+        let available_memory = match severity {
+            ResourceSeverity::Normal => 32,
+            ResourceSeverity::Warning => 8,
+            ResourceSeverity::Critical => 3,
+        };
+        let available_disk = match severity {
+            ResourceSeverity::Normal => 120,
+            ResourceSeverity::Warning => 60,
+            ResourceSeverity::Critical => 20,
+        };
+        HostResourcesView {
+            sampled_at: 123,
+            complete: true,
+            severity,
+            memory: Some(quorum_core::stats::MemoryResourceView {
+                total_bytes: 64 * 1024 * 1024 * 1024,
+                available_bytes: available_memory * 1024 * 1024 * 1024,
+                available_percent: available_memory as f64 / 64.0 * 100.0,
+                swap_total_bytes: 8 * 1024 * 1024 * 1024,
+                swap_used_bytes: 2 * 1024 * 1024 * 1024,
+                severity,
+            }),
+            disks: vec![quorum_core::stats::DiskResourceView {
+                targets: vec!["database".into(), "worktrees".into()],
+                path: "/Users/example/.quorum".into(),
+                total_bytes: 500 * 1024 * 1024 * 1024,
+                available_bytes: available_disk * 1024 * 1024 * 1024,
+                available_percent: available_disk as f64 / 500.0 * 100.0,
+                severity,
+            }],
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resources_render_normal_warning_and_critical_values() {
+        for (severity, label) in [
+            (ResourceSeverity::Normal, "ok"),
+            (ResourceSeverity::Warning, "WARNING"),
+            (ResourceSeverity::Critical, "CRITICAL"),
+        ] {
+            let mut stats = default_stats();
+            stats.resources = Some(resource_fixture(severity));
+            if severity != ResourceSeverity::Normal {
+                stats.health = HealthVerdict::Attention;
+            }
+            let mut buffer = Vec::new();
+            render_with_style(&stats, &Style::plain(), &mut buffer);
+            let output = String::from_utf8(buffer).unwrap();
+            assert!(output.contains("RESOURCES"), "{output}");
+            assert!(output.contains("memory"), "{output}");
+            assert!(output.contains("swap"), "{output}");
+            assert!(output.contains("database+worktrees"), "{output}");
+            assert!(output.contains(label), "{output}");
+        }
+    }
+
     #[test]
     fn decomposition_renders_bounded_graph_details() {
         let mut s = default_stats();
@@ -797,10 +967,22 @@ mod tests {
             source_title: "deliver the requested outcome".into(),
             source_status: "decomposed".into(),
             graph_state: "blocked".into(),
+            dispatch_hold: Some(
+                "implementation dispatch held: graph state=blocked, active=1".into(),
+            ),
             proposal_attempts: 2,
             provider_failures: 1,
+            hold_code: Some("graph-blocked".into()),
+            retryable_planning_hold: false,
+            operator_retry_count: 0,
+            operator_retry_cap: 2,
             planner_provider: Some("codex".into()),
             planner_model: Some("gpt-5.6-sol".into()),
+            planner_effort: Some("high".into()),
+            planner_log_dir: Some("/tmp/planner-live".into()),
+            planner_last_activity_age_secs: Some(15),
+            planner_activity_count: Some(3),
+            planner_tool_count: Some(2),
             accepted_plan_revision: Some(3),
             completed_children: 1,
             total_children: 2,
@@ -821,7 +1003,12 @@ mod tests {
         assert!(output.contains("DECOMPOSITION"));
         assert!(output.contains("source #40"));
         assert!(output.contains("children=1/2"));
-        assert!(output.contains("proposal=2/3 provider=1/3"));
+        assert!(
+            output.contains("planner effort=high log=/tmp/planner-live age=15s activity=3 tools=2")
+        );
+        assert!(output.contains("proposal=2/3 provider=1/3 operator-retries=0/2"));
+        assert!(output.contains("planning-hold: graph-blocked (not retryable)"));
+        assert!(output.contains("hold: implementation dispatch held: graph state=blocked"));
         assert!(output.contains("#42") && output.contains("deps #41"));
         assert!(output.contains("blocker: child failed review"));
     }
@@ -1013,6 +1200,7 @@ mod tests {
             status: "done".into(),
             pr: Some(42),
             blocked: false,
+            arbiter: None,
         };
         let (icon, label) = pipeline_state(&done, &sty);
         assert_eq!(icon, "[merged]");
@@ -1027,6 +1215,7 @@ mod tests {
             status: "working".into(),
             pr: Some(99),
             blocked: false,
+            arbiter: None,
         };
         let (icon, _) = pipeline_state(&pending, &sty);
         assert_eq!(icon, "[working]");

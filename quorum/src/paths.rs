@@ -142,6 +142,41 @@ pub fn try_resolve_repo() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard};
+
+    // Environment variables are process-global, so tests which mutate Quorum's
+    // path inputs must not overlap under libtest's default parallel execution.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn parse_ssh_url() {
@@ -191,32 +226,47 @@ mod tests {
 
     #[test]
     fn db_path_for_repo_uses_double_underscore() {
-        std::env::set_var("QUORUM_HOME", "/tmp/qtest");
+        let _lock = lock_env();
+        let _home = EnvVarGuard::set("QUORUM_HOME", "/tmp/qtest");
         let p = db_path_for_repo("ag2trust/quorum").unwrap();
         assert_eq!(
             p,
             PathBuf::from("/tmp/qtest/repos/ag2trust__quorum/quorum.db")
         );
-        std::env::remove_var("QUORUM_HOME");
     }
 
     #[test]
     fn resolve_repo_from_env_var() {
-        std::env::set_var("QUORUM_REPO", "ag2trust/quorum");
+        let _lock = lock_env();
+        let _repo = EnvVarGuard::set("QUORUM_REPO", "ag2trust/quorum");
         let repo = resolve_repo().unwrap();
         assert_eq!(repo, "ag2trust/quorum");
-        std::env::remove_var("QUORUM_REPO");
     }
 
     #[test]
     fn resolve_repo_empty_env_var_falls_through() {
-        std::env::set_var("QUORUM_REPO", "");
+        let _lock = lock_env();
+        let _repo = EnvVarGuard::set("QUORUM_REPO", "");
         // Should fall through to git detection (which may or may not work
         // depending on the test environment — we just verify it doesn't
         // return empty string).
         if let Ok(repo) = resolve_repo() {
             assert!(!repo.is_empty());
         }
-        std::env::remove_var("QUORUM_REPO");
+    }
+
+    #[test]
+    fn env_var_guard_restores_previous_value_after_panic() {
+        let _lock = lock_env();
+        let key = "QUORUM_HOME";
+        let previous = std::env::var_os(key);
+
+        let result = std::panic::catch_unwind(|| {
+            let _home = EnvVarGuard::set(key, "/tmp/qtest-panic");
+            panic!("exercise unwind restoration");
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::env::var_os(key), previous);
     }
 }

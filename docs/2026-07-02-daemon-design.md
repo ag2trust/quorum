@@ -87,7 +87,11 @@ Agents communicate with the daemon exclusively through the SQLite database:
   recovery), `worktree`, `branch`, `phase`, and `cost_tokens`. Entries are deleted
   on terminal transitions (teardown).
 
-No sockets, no pipes beyond the stream-json stdin/stdout of each agent process.
+This implemented baseline originally used no sockets and no pipes beyond each agent's stream-JSON
+stdin/stdout. The proposed credentialless GitHub collaboration MCP supersedes that constraint with
+one narrow, local, run-capability-authorized agent endpoint; see
+`2026-08-17-github-collaboration-mcp-technical-spec.md`. It does not add a remote or general daemon
+API.
 
 ## Lifecycle
 
@@ -242,10 +246,11 @@ in stream-json also carries `total_cost_usd`, `num_turns`, and `duration_ms`.
 
 The daemon enforces fail-closed per-turn and per-task ceilings via `quorum serve`
 flags: `--max-turn-tokens`, `--max-task-tokens`, `--max-turn-cost-usd`,
-`--max-task-cost-usd`, `--max-turn-wall-secs`, `--max-task-wall-secs`, and
-`--max-rework-rounds`. Note that `total_cost_usd` on stream-json result events is
-session-cumulative, so per-turn cost is computed as a delta (high-water mark), not
-summed.
+`--max-task-cost-usd`, and `--max-task-wall-secs`. It reaps slots idle between
+turns with `--max-idle-secs`. `--max-turn-wall-secs` is a deprecated compatibility
+alias for the idle timeout and no longer caps active turns. Note that `total_cost_usd`
+on stream-json result events is session-cumulative, so per-turn cost is computed as a
+delta (high-water mark), not summed.
 
 ## Name pool
 

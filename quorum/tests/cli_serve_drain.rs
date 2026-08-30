@@ -4,7 +4,9 @@
 //! (other-repo merge does NOT trigger drain), drain timeout path,
 //! queued tasks survive restart, and T3: drain timeout with merge-in-progress.
 
+use std::collections::hash_map::DefaultHasher;
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -14,6 +16,15 @@ use std::time::Duration;
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
+}
+
+fn agent_endpoint(home: &std::path::Path) -> std::path::PathBuf {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut hasher = DefaultHasher::new();
+    db.hash(&mut hasher);
+    std::env::temp_dir()
+        .join(format!("quorum-agent-{:016x}", hasher.finish()))
+        .join("endpoint.sock")
 }
 
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
@@ -41,6 +52,28 @@ fn init_git_repo(dir: &std::path::Path) {
         .unwrap();
     Command::new("git")
         .args(["-C", &d, "commit", "--allow-empty", "-m", "init"])
+        .status()
+        .unwrap();
+    // Align the fixture's initial origin/main with the executable under test.
+    // The daemon now compares origin directly to its embedded build SHA rather
+    // than taking a startup baseline, so a fresh fixture must represent a
+    // current build before a test advances it.
+    let source_repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("quorum crate has repository parent");
+    Command::new("git")
+        .args([
+            "-C",
+            &d,
+            "fetch",
+            "--update-shallow",
+            &source_repo.to_string_lossy(),
+            "HEAD",
+        ])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "reset", "--hard", "FETCH_HEAD"])
         .status()
         .unwrap();
     Command::new("git")
@@ -118,7 +151,23 @@ elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  case " $* " in
+    *" --json statusCheckRollup,mergeStateStatus "*)
+      printf '{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}\n'
+      exit 0
+      ;;
+    *" --json mergeCommit "*)
+      printf '{"mergeCommit":{"oid":"%s"}}\n' "$sha"
+      exit 0
+      ;;
+    *" --json headRefOid --jq .headRefOid "*)
+      printf '%s\n' "$sha"
+      exit 0
+      ;;
+  esac
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"%s","state":"OPEN"}\n' "$branch" "$sha" "$QUORUM_TEST_GH_BASE"
+elif [ "$cmd" = "pr review" ] || [ "$cmd" = "pr merge" ]; then
+  exit 0
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -133,6 +182,10 @@ fi
             env::var("PATH").unwrap_or_default()
         );
         let fake_agent = cargo_bin("fake-agent");
+        let gh_base = extra_args
+            .windows(2)
+            .find_map(|args| (args[0] == "--base-branch").then_some(args[1]))
+            .unwrap_or("main");
         let mut args: Vec<String> = vec![
             "serve",
             "--repo",
@@ -147,14 +200,15 @@ fi
             &names.to_string_lossy(),
             "--agent-bin",
             &fake_agent.to_string_lossy(),
-            "--merge-cmd",
-            merge_cmd,
             "--exit-when-gone",
             &sentinel_path,
         ]
         .into_iter()
         .map(|s| s.to_string())
         .collect();
+        if !merge_cmd.is_empty() {
+            args.extend(["--merge-cmd".to_string(), merge_cmd.to_string()]);
+        }
         for a in extra_args {
             args.push(a.to_string());
         }
@@ -165,6 +219,7 @@ fi
             .env("PATH", path)
             .env("QUORUM_TEST_GH_STATE", &gh_state)
             .env("QUORUM_TEST_REPO", repo)
+            .env("QUORUM_TEST_GH_BASE", gh_base)
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -244,18 +299,26 @@ fi
 }
 
 fn seed_task_with_refs(home: &std::path::Path, title: &str, refs: &str) {
+    seed_task_with_base(home, title, refs, None);
+}
+
+fn seed_task_with_base(home: &std::path::Path, title: &str, refs: &str, base_branch: Option<&str>) {
+    let mut args = vec![
+        "task-create",
+        "--title",
+        title,
+        "--created-by",
+        "TestCreator",
+        "--refs",
+        refs,
+    ];
+    if let Some(base_branch) = base_branch {
+        args.extend(["--base-branch", base_branch]);
+    }
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
-        .args([
-            "task-create",
-            "--title",
-            title,
-            "--created-by",
-            "TestCreator",
-            "--refs",
-            refs,
-        ])
+        .args(args)
         .output()
         .unwrap();
     assert!(
@@ -263,6 +326,21 @@ fn seed_task_with_refs(home: &std::path::Path, title: &str, refs: &str) {
         "task-create failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn task_json(home: &std::path::Path, task_id: i64) -> serde_json::Value {
+    let out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", &task_id.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "task-get #{task_id} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
 }
 
 fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
@@ -296,6 +374,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", agent_endpoint(home))
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
@@ -307,7 +386,85 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     );
 }
 
-/// Self-repo merge triggers drain → roster empties → exit 75.
+fn complete_successful_merge(handle: &mut ServeHandle, home: &std::path::Path) {
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "did not spawn agent: {:?}",
+        handle.lines
+    );
+    let agent_name = handle
+        .extract_agent_name("spawning agent ")
+        .expect("could not extract agent name");
+    assert!(
+        handle.wait_for("result", 15),
+        "agent did not produce result: {:?}",
+        handle.lines
+    );
+    quorum_done(home, &["--agent", &agent_name]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle
+        .extract_agent_name("spawning reviewer ")
+        .expect("could not extract reviewer name");
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer did not produce result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home,
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "R2 reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let r2_name = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("could not extract R2 reviewer name");
+    let r2_name = r2_name.split_whitespace().next().unwrap().to_string();
+    assert!(
+        handle.wait_for("result", 15),
+        "R2 reviewer did not produce result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home,
+        &[
+            "--agent",
+            &r2_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(
+        handle.wait_for("PR #1 merged — firing MergeSucceeded", 15),
+        "PR was not merged: {:?}",
+        handle.lines
+    );
+}
+
+/// A self-repo merge into the self-update branch triggers drain → roster
+/// empties → exit 75.
 #[test]
 fn self_repo_merge_drains_and_exits_75() {
     let home = tempfile::tempdir().unwrap();
@@ -330,17 +487,20 @@ fn self_repo_merge_drains_and_exits_75() {
         r#"{"repo":"test-owner/test-repo"}"#,
     );
 
-    // merge-cmd: "true" — always succeeds
+    // Use the fake GitHub executor so the successful merge has a real
+    // mergeCommit response, as production does.
     let mut handle = ServeHandle::start(
         home.path(),
         repo_dir.path(),
         wt_base.path(),
         &names_file,
-        "true",
+        "",
         &[
             "--self-update-drain",
             "--self-repo",
             "test-owner/test-repo",
+            "--self-update-branch",
+            "main",
             "--drain-timeout-secs",
             "10",
         ],
@@ -451,6 +611,75 @@ fn self_repo_merge_drains_and_exits_75() {
     );
 }
 
+/// A self-repo merge to a task base other than the self-update branch must
+/// leave the daemon running.
+#[test]
+fn self_repo_merge_to_non_self_update_branch_does_not_drain() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let repo = repo_dir.path().to_string_lossy().to_string();
+    Command::new("git")
+        .args(["-C", &repo, "branch", "develop"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &repo, "fetch", "origin"])
+        .status()
+        .unwrap();
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task_with_base(
+        home.path(),
+        "Develop task",
+        r#"{"repo":"test-owner/test-repo"}"#,
+        Some("develop"),
+    );
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--base-branch",
+            "develop",
+            "--self-update-drain",
+            "--self-repo",
+            "test-owner/test-repo",
+            "--self-update-branch",
+            "main",
+            "--drain-timeout-secs",
+            "5",
+        ],
+    );
+
+    complete_successful_merge(&mut handle, home.path());
+    std::thread::sleep(Duration::from_millis(600));
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+    assert!(
+        handle.child.try_wait().unwrap().is_none(),
+        "merge to develop must not request self-update exit: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle.lines.iter().any(|line| line.contains("DRAIN:")),
+        "merge to develop must not start a self-update drain: {:?}",
+        handle.lines
+    );
+    handle.stop();
+}
+
 /// Non-self-repo merge does NOT trigger drain.
 #[test]
 fn other_repo_merge_does_not_drain() {
@@ -528,6 +757,221 @@ fn other_repo_merge_does_not_drain() {
     handle.stop();
 }
 
+/// Trigger B treats an origin matching the running build as current.
+#[test]
+fn build_sha_matching_origin_does_not_drain() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &["--self-update-drain"],
+    );
+
+    assert!(
+        handle.wait_for("decision=Current", 15),
+        "did not observe current build-staleness decision: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.child.try_wait().unwrap().is_none(),
+        "current build SHA must not stop the daemon: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle.lines.iter().any(|line| line.contains("DRAIN:")),
+        "current build SHA must not start a drain: {:?}",
+        handle.lines
+    );
+    handle.stop();
+}
+
+/// With task base develop and self-update branch main, staleness polling must
+/// use refs/heads/main. An advanced develop must not trigger a self-update.
+#[test]
+fn build_staleness_polls_self_update_branch_not_task_base() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let repo = repo_dir.path().to_string_lossy().to_string();
+    Command::new("git")
+        .args(["-C", &repo, "checkout", "-b", "develop"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args([
+            "-C",
+            &repo,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "advance develop",
+        ])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &repo, "checkout", "main"])
+        .status()
+        .unwrap();
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--base-branch",
+            "develop",
+            "--self-update-branch",
+            "main",
+            "--self-update-drain",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("build staleness branch=main", 15),
+        "staleness lookup did not identify self-update branch main: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle
+            .lines
+            .iter()
+            .any(|line| line.contains("decision=Current")),
+        "advanced develop must not make the main self-update build stale: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.child.try_wait().unwrap().is_none(),
+        "polling develop instead of main would request self-update exit: {:?}",
+        handle.lines
+    );
+    handle.stop();
+}
+
+/// Trigger B's idle path: the daemon starts at build SHA A, origin/main
+/// advances to B, then the empty roster completes the self-update drain.
+/// The exit status, rather than a log line, is the supervisor handoff contract.
+#[test]
+fn build_sha_advance_drains_and_exits_75() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &["--self-update-drain", "--sha-poll-interval-secs", "30"],
+    );
+
+    assert!(
+        handle.wait_for("decision=Current", 15),
+        "did not observe initial current build SHA: {:?}",
+        handle.lines
+    );
+
+    let repo = repo_dir.path().to_string_lossy().to_string();
+    Command::new("git")
+        .args(["-C", &repo, "commit", "--allow-empty", "-m", "advance main"])
+        .status()
+        .unwrap();
+
+    assert!(
+        handle.wait_for("decision=Behind", 45),
+        "did not observe build SHA advancement: {:?}",
+        handle.lines
+    );
+    let status = handle
+        .wait_exit(10)
+        .expect("serve did not exit after self-update drain");
+    assert_eq!(
+        status.code(),
+        Some(75),
+        "self-update drain must hand off to the supervisor with exit 75; lines: {:?}",
+        handle.lines
+    );
+}
+
+/// A failed staleness check is explicitly non-fatal so offline supervisors do
+/// not enter a restart loop.
+#[test]
+fn unreachable_origin_logs_warning_and_daemon_keeps_running() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let d = repo_dir.path().to_string_lossy().to_string();
+    Command::new("git")
+        .args(["-C", &d, "remote", "set-url", "origin", "/does/not/exist"])
+        .status()
+        .unwrap();
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &["--self-update-drain"],
+    );
+
+    assert!(
+        handle.wait_for("WARN: self-update-drain build staleness check failed", 15),
+        "did not observe staleness warning: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.child.try_wait().unwrap().is_none(),
+        "unreachable origin must not stop the daemon: {:?}",
+        handle.lines
+    );
+    handle.stop();
+}
+
 /// Drain timeout force-kills remaining agents and still exits 75.
 /// Uses Trigger B (sha change) to start drain while agent is mid-turn.
 #[test]
@@ -564,7 +1008,8 @@ fn drain_timeout_force_kills_and_exits_75() {
     //
     // The fake-agent auto-completes its turn, so we rely on timing: if drain triggers
     // BEFORE the result event drains, the slot is still draining=true. With
-    // sha-poll-interval-secs=1, we advance main immediately after spawn.
+    // sha-poll-interval-secs=30, so the next build-SHA check can take up to
+    // one configured interval after we advance main.
     let mut handle = ServeHandle::start(
         home.path(),
         repo_dir.path(),
@@ -578,7 +1023,7 @@ fn drain_timeout_force_kills_and_exits_75() {
             "--drain-timeout-secs",
             "3",
             "--sha-poll-interval-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -604,7 +1049,7 @@ fn drain_timeout_force_kills_and_exits_75() {
     // (b) timeout after 3s if the agent is still mid-turn
     // Either way, it exits 75.
     assert!(
-        handle.wait_for("DRAIN: all agents finished", 20)
+        handle.wait_for("DRAIN: all agents finished", 45)
             || handle.wait_for("DRAIN: exiting 75", 5),
         "did not see drain exit log: {:?}",
         handle.lines
@@ -621,20 +1066,27 @@ fn drain_timeout_force_kills_and_exits_75() {
         status.code(),
         handle.lines
     );
-
-    // Verify queued task (#2) is still open (claimable after restart)
-    let get_out = Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home.path())
-        .env("QUORUM_REPO", "test/repo")
-        .args(["task-get", "--task-id", "2"])
-        .output()
-        .unwrap();
-    assert!(get_out.status.success());
-    let stdout = String::from_utf8_lossy(&get_out.stdout);
     assert!(
-        stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
-        "queued task was not left open for next generation: {stdout}"
+        handle
+            .lines
+            .iter()
+            .any(|line| line.contains("decision=Behind")),
+        "advanced origin/main did not record a behind decision: {:?}",
+        handle.lines
     );
+
+    // State evidence: once the behind decision is made, task #2 was neither
+    // claimed nor spawned. It remains wholly available to the next daemon.
+    let queued = task_json(home.path(), 2);
+    assert_eq!(queued["status"], "open");
+    assert!(queued["assignee"].is_null());
+    assert_eq!(queued["agent_runs"].as_array().unwrap().len(), 0);
+
+    // The in-flight task remains durable and recoverable after the bounded
+    // drain; the daemon must not silently lose it while stopping.
+    let in_flight = task_json(home.path(), 1);
+    assert_eq!(in_flight["status"], "open");
+    assert!(!in_flight["agent_runs"].as_array().unwrap().is_empty());
 }
 
 /// T3 regression: drain timeout must be honored even when tick() is blocked
@@ -685,7 +1137,7 @@ fn drain_timeout_honored_during_merge_checks() {
             "--merge-checks-timeout-secs",
             "30",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 
@@ -854,7 +1306,7 @@ fn pending_checks_timeout_without_drain_enters_merge_wait() {
             "--merge-checks-timeout-secs",
             "3",
             "--merge-checks-poll-secs",
-            "1",
+            "30",
         ],
     );
 

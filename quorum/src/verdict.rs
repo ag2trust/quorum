@@ -70,6 +70,29 @@ pub fn validate(
     }
 }
 
+/// Maximum UTF-8 byte length for a non-authoritative review-draft summary.
+/// This is deliberately small continuation context, not a second findings ledger.
+pub const MAX_REVIEW_DRAFT_FEEDBACK_BYTES: usize = 8 * 1024;
+
+/// Validate the structurally separate `quorum review-draft` payload. A draft
+/// records only a positive blocking count and a bounded continuation summary;
+/// it does not carry a verdict and must not enter the authoritative gate.
+pub fn validate_review_draft(blocking: u32, feedback: &str) -> Result<(), String> {
+    if blocking == 0 {
+        return Err("review-draft requires a positive --blocking count".to_string());
+    }
+    if feedback.trim().is_empty() {
+        return Err("review-draft requires a non-empty --feedback-file summary".to_string());
+    }
+    if feedback.len() > MAX_REVIEW_DRAFT_FEEDBACK_BYTES {
+        return Err(format!(
+            "review-draft feedback exceeds the {} byte limit",
+            MAX_REVIEW_DRAFT_FEEDBACK_BYTES
+        ));
+    }
+    Ok(())
+}
+
 /// Serialized attestation for the mailbox `payload` column: `{"blocking":N}`.
 /// `None` when no attestation was supplied.
 pub fn attestation_payload(blocking: Option<u32>) -> Option<String> {
@@ -291,6 +314,16 @@ mod tests {
     #[test]
     fn blocking_without_verdict_is_refused() {
         assert!(validate(None, Some(0), None, true).is_err());
+    }
+
+    #[test]
+    fn review_draft_requires_positive_bounded_nonempty_summary() {
+        assert!(validate_review_draft(1, "Need a second pass on the error path.").is_ok());
+        assert!(validate_review_draft(0, "Need a second pass.").is_err());
+        assert!(validate_review_draft(1, " \n ").is_err());
+        assert!(
+            validate_review_draft(1, &"x".repeat(MAX_REVIEW_DRAFT_FEEDBACK_BYTES + 1)).is_err()
+        );
     }
 
     // --- attestation payload ---

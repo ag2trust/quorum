@@ -8,13 +8,198 @@
 use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 
 pub const MAX_PROPOSAL_ATTEMPTS: i64 = 3;
 pub const MAX_PROVIDER_FAILURES: i64 = 3;
+pub const MAX_OPERATOR_RETRIES: i64 = 2;
 pub const MIN_CHILDREN: usize = 2;
 pub const MAX_CHILDREN: usize = 8;
+/// Upper bound on one durable decomposition attempt or recovery summary. The
+/// planner's retry feedback (`MAX_REJECTION_SUMMARY_BYTES`) is derived from
+/// this bound so a complete child rejection is never dropped at persistence.
+pub const ATTEMPT_SUMMARY_MAX_BYTES: usize = 8 * 1024;
 const MAX_CLEANUP_ARTIFACT_BYTES: usize = 4096;
+
+/// The explicit file-level contract attached to one generated child.  This is
+/// deliberately a small manifest rather than an inference from task prose: a
+/// later boundary check can inspect only [`Self::writable_paths`] and leave
+/// contextual references out of its write authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct ChildDeliverables(pub Vec<ChildDeliverable>);
+
+impl ChildDeliverables {
+    /// Paths the child was explicitly asked to modify.
+    pub fn writable_paths(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().filter_map(ChildDeliverable::writable_path)
+    }
+
+    /// Paths named solely as contextual, read-only references.
+    pub fn reference_paths(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().filter_map(ChildDeliverable::reference_path)
+    }
+}
+
+/// One declared child-deliverable path and its authority class.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChildDeliverable {
+    /// A path the generated child is expected to write.
+    Write { path: String },
+    /// A path supplied only for context; it grants no write authority.
+    ReadOnlyReference { path: String },
+}
+
+impl ChildDeliverable {
+    pub fn writable_path(&self) -> Option<&str> {
+        match self {
+            Self::Write { path } => Some(path),
+            Self::ReadOnlyReference { .. } => None,
+        }
+    }
+
+    pub fn reference_path(&self) -> Option<&str> {
+        match self {
+            Self::Write { .. } => None,
+            Self::ReadOnlyReference { path } => Some(path),
+        }
+    }
+}
+
+/// Deterministic repository-containment result for a requested write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WritableDeliverablePath {
+    /// The requested write resolves within the managed repository.
+    Permitted,
+    /// The requested write traverses or resolves outside the managed repository.
+    Escaping,
+}
+
+/// Reject paths that are already outside the configured repository without
+/// touching the filesystem. This gate must run before canonicalization so an
+/// absolute planner-controlled NFS/autofs/FUSE path cannot trigger I/O.
+pub fn writable_deliverable_is_lexically_external(repo_root: &Path, declared_path: &str) -> bool {
+    let path = Path::new(declared_path);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return true;
+    }
+    let Ok(absolute_repo) = std::path::absolute(repo_root) else {
+        return true;
+    };
+    let absolute_repo = lexical_normalize(&absolute_repo);
+    let candidate = if path.is_absolute() {
+        lexical_normalize(path)
+    } else {
+        lexical_normalize(&absolute_repo.join(path))
+    };
+    !candidate.starts_with(&absolute_repo)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Classify one requested write against the managed repository boundary.
+///
+/// Parent traversal is rejected before filesystem resolution. For paths whose
+/// final components do not exist yet, the nearest existing ancestor is
+/// canonicalized and the remaining components are reapplied. This detects an
+/// in-repository symlink that redirects a future file into a sibling or other
+/// external directory without requiring the deliverable itself to exist.
+/// Filesystem inspection failures are fail-closed. This function performs
+/// blocking filesystem I/O for lexically in-repository paths; async callers
+/// must isolate it on a blocking thread behind a timeout.
+pub fn classify_writable_deliverable_path_blocking(
+    repo_root: &Path,
+    declared_path: &str,
+) -> WritableDeliverablePath {
+    let path = Path::new(declared_path);
+    if writable_deliverable_is_lexically_external(repo_root, declared_path) {
+        return WritableDeliverablePath::Escaping;
+    }
+
+    let Ok(canonical_repo) = std::fs::canonicalize(repo_root) else {
+        return WritableDeliverablePath::Escaping;
+    };
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        canonical_repo.join(path)
+    };
+    let Some(resolved) = resolve_with_nearest_existing_ancestor(&candidate) else {
+        return WritableDeliverablePath::Escaping;
+    };
+    if resolved.starts_with(&canonical_repo) {
+        WritableDeliverablePath::Permitted
+    } else {
+        WritableDeliverablePath::Escaping
+    }
+}
+
+fn resolve_with_nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    resolve_with_nearest_existing_ancestor_inner(path, 0)
+}
+
+fn resolve_with_nearest_existing_ancestor_inner(
+    path: &Path,
+    symlink_depth: usize,
+) -> Option<PathBuf> {
+    const MAX_SYMLINK_DEPTH: usize = 40;
+    let mut ancestor = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&ancestor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(_) => match std::fs::symlink_metadata(&ancestor) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    if symlink_depth >= MAX_SYMLINK_DEPTH {
+                        return None;
+                    }
+                    let target = std::fs::read_link(&ancestor).ok()?;
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        ancestor.parent()?.join(target)
+                    };
+                    let mut resolved =
+                        resolve_with_nearest_existing_ancestor_inner(&target, symlink_depth + 1)?;
+                    for component in missing.iter().rev() {
+                        resolved.push(component);
+                    }
+                    return Some(resolved);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(ancestor.file_name()?.to_os_string());
+                    if !ancestor.pop() {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeginPlanning<'a> {
@@ -80,6 +265,29 @@ pub struct GraphBlocker<'a> {
 
 pub const GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION: &str = "boundary-violation";
 
+/// Operator-selected authority for adopting one already-merged continuation
+/// as the delivery of a failed generated child. The IDs are deliberately
+/// exact inputs: no title, label, note, or shared-PR discovery is permitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitRecoveryAdoption<'a> {
+    pub original_child_id: i64,
+    pub recovery_task_id: i64,
+    pub authorized_by: &'a str,
+    pub now: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryDelivery {
+    graph_id: i64,
+    decomposition_source_id: i64,
+    source_revision: i64,
+    pr_number: i64,
+    merged_head_sha: String,
+    legacy_prepublication: bool,
+    original_publication_branch: Option<String>,
+    original_publication_sha: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StartupReconcileResult {
     pub healthy: usize,
@@ -87,10 +295,29 @@ pub struct StartupReconcileResult {
     pub held: usize,
 }
 
-/// Reconcile every materialized active/blocked graph before generic daemon
-/// recovery. Incomplete graphs with no delivery evidence reset safely; once
-/// evidence exists, inconsistency is held for owner intervention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanningRetryOutcome {
+    Retried { graph_id: i64, generation: i64 },
+    RetryCapExhausted { retry_count: i64 },
+    NotEligible,
+}
+
+/// Reconcile durable decomposition state before generic daemon recovery.
+/// Provider retries created before the frozen-base reset fix may retain a SHA
+/// in `draining`; clear only that impossible retry state so the guarded bind
+/// can capture a fresh base. Incomplete materialized graphs with no delivery
+/// evidence reset safely; once evidence exists, inconsistency is held for
+/// owner intervention.
 pub fn reconcile_startup_graphs(conn: &mut Connection, now: i64) -> Result<StartupReconcileResult> {
+    let tx = begin_immediate(conn)?;
+    tx.execute(
+        "UPDATE task_decompositions SET frozen_base_sha=NULL,updated_at=?1
+         WHERE state='draining' AND active=0 AND freeze_active=1
+           AND provider_failures>0 AND frozen_base_sha IS NOT NULL",
+        [now],
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+
     let graph_ids = {
         let mut stmt = conn.prepare(
             "SELECT id FROM task_decompositions WHERE state IN ('active','blocked') ORDER BY id",
@@ -112,8 +339,8 @@ pub fn reconcile_startup_graphs(conn: &mut Connection, now: i64) -> Result<Start
                          AND m.plan_revision=d.accepted_plan_revision) BETWEEN 2 AND 8
                   AND NOT EXISTS(
                       SELECT 1 FROM task_graph_members m LEFT JOIN tasks child ON child.id=m.task_id
-                      WHERE m.graph_id=d.id AND
-                        (m.active!=1 OR m.plan_revision!=d.accepted_plan_revision OR child.id IS NULL)
+                      WHERE m.graph_id=d.id AND m.active=1 AND
+                        (m.plan_revision!=d.accepted_plan_revision OR child.id IS NULL)
                   )
             )",
             [graph_id],
@@ -166,6 +393,251 @@ fn is_unique_constraint(error: &rusqlite::Error) -> bool {
     matches!(error, rusqlite::Error::SqliteFailure(f, _) if f.code == ErrorCode::ConstraintViolation)
 }
 
+#[derive(Debug)]
+struct PlanningRetryCandidate {
+    graph_id: i64,
+    hold_code: String,
+    retry_count: i64,
+}
+
+fn planning_attempt_history_is_consistent(
+    conn: &Connection,
+    graph_id: i64,
+    source_revision: i64,
+    retry_count: i64,
+    proposal_attempts: i64,
+    provider_failures: i64,
+    hold_code: &str,
+) -> Result<bool> {
+    let generation_count = (retry_count + 1) as usize;
+    let mut attempts_by_generation = vec![[0_i64; 2]; generation_count];
+    let mut expected_ordinal = [1_i64; 2];
+    let mut last_generation = [-1_i64; 2];
+    // Retry eligibility replays only budget-bearing attempts. Observational
+    // rows (including Arbiter verdicts) never consume either retry budget.
+    let mut stmt = conn.prepare(
+        "SELECT source_revision,kind,ordinal,retry_generation
+         FROM decomposition_attempts
+         WHERE graph_id=?1 AND kind IN ('proposal','provider')
+         ORDER BY kind,ordinal",
+    )?;
+    let mut rows = stmt.query([graph_id])?;
+    while let Some(row) = rows.next()? {
+        let attempt_source_revision: i64 = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let ordinal: i64 = row.get(2)?;
+        let generation: i64 = row.get(3)?;
+        let kind_index = match kind.as_str() {
+            "proposal" => 0,
+            "provider" => 1,
+            _ => return Ok(false),
+        };
+        if attempt_source_revision != source_revision
+            || ordinal != expected_ordinal[kind_index]
+            || generation < last_generation[kind_index]
+            || generation < 0
+            || generation > retry_count
+        {
+            return Ok(false);
+        }
+        let count = &mut attempts_by_generation[generation as usize][kind_index];
+        *count += 1;
+        if *count > 3 {
+            return Ok(false);
+        }
+        expected_ordinal[kind_index] += 1;
+        last_generation[kind_index] = generation;
+    }
+
+    let mut replayed = [0_i64; 2];
+    for (generation, attempts) in attempts_by_generation.into_iter().enumerate() {
+        replayed[0] += attempts[0];
+        replayed[1] += attempts[1];
+        if replayed[0] > MAX_PROPOSAL_ATTEMPTS || replayed[1] > MAX_PROVIDER_FAILURES {
+            return Ok(false);
+        }
+        if generation + 1 < generation_count {
+            match (
+                replayed[0] == MAX_PROPOSAL_ATTEMPTS,
+                replayed[1] == MAX_PROVIDER_FAILURES,
+            ) {
+                (true, false) => replayed[0] = 0,
+                (false, true) => replayed[1] = 0,
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    Ok(replayed == [proposal_attempts, provider_failures]
+        && match hold_code {
+            "proposal-attempts-exhausted" => {
+                replayed[0] == MAX_PROPOSAL_ATTEMPTS && replayed[1] < MAX_PROVIDER_FAILURES
+            }
+            "provider-attempts-exhausted" => {
+                replayed[1] == MAX_PROVIDER_FAILURES && replayed[0] < MAX_PROPOSAL_ATTEMPTS
+            }
+            _ => false,
+        })
+}
+
+fn planning_retry_candidate(
+    conn: &Connection,
+    source_task_id: i64,
+    now: i64,
+) -> Result<Option<PlanningRetryCandidate>> {
+    let candidate: Option<(i64, String, i64, i64, i64, i64)> = conn
+        .query_row(
+            "SELECT d.id,d.hold_code,d.operator_retry_count,d.planned_source_revision,
+                    d.proposal_attempts,d.provider_failures
+             FROM task_decompositions d
+             JOIN tasks t ON t.id=d.source_task_id
+             WHERE d.source_task_id=?1
+               AND d.state='held' AND d.active=0 AND d.freeze_active=0
+               AND d.hold_code IN ('provider-attempts-exhausted',
+                                   'proposal-attempts-exhausted')
+               AND d.operator_retry_count BETWEEN 0 AND ?2
+               AND d.accepted_proposal_json IS NULL
+               AND d.accepted_plan_revision IS NULL
+               AND t.status='failed' AND t.assignee IS NULL AND t.reviewer IS NULL
+               AND t.revision=d.planned_source_revision
+               AND t.review_only=0 AND t.continue_pr IS NULL
+               AND t.completion_provenance IS NULL
+               AND (t.refs IS NULL OR (
+                    json_valid(t.refs)
+                    AND json_type(t.refs,'$.pr') IS NULL
+                    AND json_type(t.refs,'$.daemon_publication') IS NULL
+                    AND json_type(t.refs,'$.recovery_delivery') IS NULL))
+               AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.graph_id=d.id)
+               AND NOT EXISTS (SELECT 1 FROM decomposition_cleanup c WHERE c.graph_id=d.id)
+               AND NOT EXISTS (SELECT 1 FROM agent_runs r WHERE r.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM journal j WHERE j.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM task_branches b WHERE b.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM pr_targets p WHERE p.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM approvals a WHERE a.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations r
+                               WHERE r.task_id=t.id)
+               AND NOT EXISTS (SELECT 1 FROM claims c
+                               WHERE c.target=('task#' || t.id)
+                                 AND c.active=1 AND c.expires_at>?3)",
+            params![source_task_id, MAX_OPERATOR_RETRIES, now],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        graph_id,
+        hold_code,
+        retry_count,
+        source_revision,
+        proposal_attempts,
+        provider_failures,
+    )) = candidate
+    else {
+        return Ok(None);
+    };
+    if !planning_attempt_history_is_consistent(
+        conn,
+        graph_id,
+        source_revision,
+        retry_count,
+        proposal_attempts,
+        provider_failures,
+        &hold_code,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(PlanningRetryCandidate {
+        graph_id,
+        hold_code,
+        retry_count,
+    }))
+}
+
+pub(crate) fn exhausted_planning_retry_is_eligible(
+    conn: &Connection,
+    source_task_id: i64,
+    now: i64,
+) -> Result<bool> {
+    Ok(planning_retry_candidate(conn, source_task_id, now)?
+        .is_some_and(|candidate| candidate.retry_count < MAX_OPERATOR_RETRIES))
+}
+
+/// Explicitly resume an exhausted, pre-materialization planning aggregate.
+///
+/// Every eligibility and negative-evidence check is made under one immediate
+/// transaction. A stale or racing caller is a clean negative; attempt history
+/// is retained and the current budget alone is reset.
+pub fn retry_exhausted_planning(
+    conn: &mut Connection,
+    source_task_id: i64,
+    by: &str,
+    now: i64,
+) -> Result<PlanningRetryOutcome> {
+    let tx = begin_immediate(conn)?;
+    let Some(candidate) = planning_retry_candidate(&tx, source_task_id, now)? else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(PlanningRetryOutcome::NotEligible);
+    };
+    let PlanningRetryCandidate {
+        graph_id,
+        hold_code,
+        retry_count,
+    } = candidate;
+    if retry_count >= MAX_OPERATOR_RETRIES {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(PlanningRetryOutcome::RetryCapExhausted { retry_count });
+    }
+
+    let generation = retry_count + 1;
+    crate::agents::touch(&tx, by, now)?;
+    let changed = tx.execute(
+        "UPDATE task_decompositions
+         SET state='provider-backoff',freeze_active=0,
+             proposal_attempts=CASE WHEN hold_code='proposal-attempts-exhausted'
+                                    THEN 0 ELSE proposal_attempts END,
+             provider_failures=CASE WHEN hold_code='provider-attempts-exhausted'
+                                    THEN 0 ELSE provider_failures END,
+             operator_retry_count=?2,planner_session_id=NULL,frozen_base_sha=NULL,
+             hold_code=NULL,hold_summary=NULL,updated_at=?3
+         WHERE id=?1 AND state='held' AND active=0 AND freeze_active=0
+           AND hold_code=?4 AND operator_retry_count=?5",
+        params![graph_id, generation, now, hold_code, retry_count],
+    )?;
+    if changed != 1 {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(PlanningRetryOutcome::NotEligible);
+    }
+    let source_changed = tx.execute(
+        "UPDATE tasks SET status='planning',assignee=NULL,reviewer=NULL,updated_at=?2
+         WHERE id=?1 AND status='failed' AND assignee IS NULL AND reviewer IS NULL
+           AND revision=(SELECT planned_source_revision FROM task_decompositions WHERE id=?3)",
+        params![source_task_id, now, graph_id],
+    )?;
+    if source_changed != 1 {
+        return Ok(PlanningRetryOutcome::NotEligible);
+    }
+    crate::events::emit(
+        &tx,
+        "decomposition_planning_retry",
+        &format!("task#{source_task_id}"),
+        &format!("planning retry generation {generation} requested by {by}"),
+        now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(PlanningRetryOutcome::Retried {
+        graph_id,
+        generation,
+    })
+}
+
 /// Acquire the repository planning freeze and move one stable source revision
 /// to `planning`. `Ok(None)` is the expected result of a stale/racing request.
 pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Result<Option<i64>> {
@@ -173,6 +645,7 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     let eligible: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM tasks
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
+           AND review_only=0 AND continue_pr IS NULL
            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
            AND NOT EXISTS (SELECT 1 FROM task_decompositions
                            WHERE state IN ('active','blocked') OR active=1))",
@@ -202,7 +675,8 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     let graph_id = tx.last_insert_rowid();
     let changed = tx.execute(
         "UPDATE tasks SET status='planning', updated_at=?3
-         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL",
+         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
+           AND review_only=0 AND continue_pr IS NULL",
         params![input.source_task_id, input.expected_revision, input.now],
     )?;
     if changed != 1 {
@@ -237,6 +711,7 @@ pub fn begin_routed_planning(
     let eligible: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM tasks
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
+           AND review_only=0 AND continue_pr IS NULL
            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
            AND NOT EXISTS (SELECT 1 FROM task_decompositions
                            WHERE state IN ('active','blocked') OR active=1))",
@@ -253,29 +728,16 @@ pub fn begin_routed_planning(
         input.seed,
         input.now,
     )?;
-    let inserted = tx.execute(
-        "INSERT INTO task_decompositions(
-             source_task_id,state,active,freeze_active,planned_source_revision,
-             planner_provider,planner_model,planner_assignment_id,frozen_base_sha,
-             created_at,updated_at)
-         VALUES (?1,'freeze-requested',0,1,?2,?3,?4,?5,NULL,?6,?6)",
-        params![
-            input.source_task_id,
-            input.expected_revision,
-            assignment.provider,
-            assignment.model,
-            assignment.id,
-            input.now
-        ],
-    );
-    if matches!(&inserted, Err(error) if is_unique_constraint(error)) {
+    let inserted = insert_routed_planning_evidence(&tx, input, &assignment);
+    if matches!(&inserted, Err(QuorumError::Db(error)) if is_unique_constraint(error)) {
         return Ok(None);
     }
-    inserted.map_err(map_sql_err)?;
+    inserted?;
     let graph_id = tx.last_insert_rowid();
     let changed = tx.execute(
         "UPDATE tasks SET status='planning',updated_at=?3
-         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL",
+         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
+           AND review_only=0 AND continue_pr IS NULL",
         params![input.source_task_id, input.expected_revision, input.now],
     )?;
     if changed != 1 {
@@ -283,6 +745,48 @@ pub fn begin_routed_planning(
     }
     tx.commit().map_err(map_sql_err)?;
     Ok(Some((graph_id, assignment)))
+}
+
+const ROUTED_PLANNING_INSERT: &str = "INSERT INTO task_decompositions(
+        source_task_id,state,active,freeze_active,planned_source_revision,
+        planner_provider,planner_model,planner_assignment_id,frozen_base_sha,
+        created_at,updated_at)
+    SELECT :source_task_id,'freeze-requested',0,1,:source_revision,
+        :planner_provider,:planner_model,:quorum_assignment_id,NULL,:now,:now
+    /* quorum-role-assignment-guard */";
+
+fn insert_routed_planning_evidence(
+    tx: &Transaction<'_>,
+    input: &BeginRoutedPlanning<'_>,
+    assignment: &crate::role_assignments::RoleAssignment,
+) -> Result<()> {
+    let responsibility = format!(
+        "planner:task:{}:revision:{}",
+        input.source_task_id, input.expected_revision
+    );
+    let context = crate::role_assignments::EvidenceAssignmentContext {
+        role_assignment_id: Some(assignment.id),
+        task_id: Some(input.source_task_id),
+        responsibility_key: &responsibility,
+        role: "planner",
+        provider: &assignment.provider,
+        runner: &assignment.runner,
+        model: &assignment.model,
+        effort: &assignment.effort,
+    };
+    crate::role_assignments::guarded_evidence_insert(
+        tx,
+        "planner aggregate",
+        &context,
+        ROUTED_PLANNING_INSERT,
+        &[
+            (":source_task_id", &input.source_task_id),
+            (":source_revision", &input.expected_revision),
+            (":planner_provider", &assignment.provider),
+            (":planner_model", &assignment.model),
+            (":now", &input.now),
+        ],
+    )
 }
 
 /// Link a planning aggregate to the durable routing assignment that selected its
@@ -331,10 +835,23 @@ pub fn bind_frozen_base_and_enter_planning(
         return Err(QuorumError::Usage("invalid frozen base SHA".into()));
     }
     let tx = begin_immediate(conn)?;
+    // Bind must recheck drain quiescence atomically: the daemon tick's
+    // pre-check reads task status outside this transaction, and a supported
+    // operator retry (see `tasks::retry_parked`) can restore a parked task to
+    // `rework`/`in-review` between that read and this update. Refuse the bind
+    // if any started-but-not-terminal task exists other than the planning
+    // source itself, so the drain-to-planning handoff never captures a base
+    // while a merge, remediation, or review is still in flight.
     let changed = tx.execute(
         "UPDATE task_decompositions SET state='planning',frozen_base_sha=?2,updated_at=?3
          WHERE id=?1 AND state='draining' AND freeze_active=1 AND active=0
-           AND frozen_base_sha IS NULL",
+           AND frozen_base_sha IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM tasks t
+               WHERE t.status IN ('working','in-review','rework')
+                 AND t.id != (SELECT g.source_task_id
+                              FROM task_decompositions g WHERE g.id=?1)
+           )",
         params![graph_id, sha, now],
     )?;
     tx.commit().map_err(map_sql_err)?;
@@ -351,7 +868,10 @@ pub fn record_attempt(
     summary: &str,
     now: i64,
 ) -> Result<Option<i64>> {
-    if summary.len() > 2048 || reason_code.is_empty() || reason_code.len() > 128 {
+    if summary.len() > ATTEMPT_SUMMARY_MAX_BYTES
+        || reason_code.is_empty()
+        || reason_code.len() > 128
+    {
         return Err(QuorumError::Usage(
             "invalid bounded decomposition attempt".into(),
         ));
@@ -362,16 +882,17 @@ pub fn record_attempt(
         ));
     }
     let tx = begin_immediate(conn)?;
-    let row: Option<(i64, i64, i64, i64)> = tx
+    let row: Option<(i64, i64, i64, i64, i64)> = tx
         .query_row(
-            "SELECT source_task_id,planned_source_revision,proposal_attempts,provider_failures
+            "SELECT source_task_id,planned_source_revision,proposal_attempts,provider_failures,
+                    operator_retry_count
              FROM task_decompositions WHERE id=?1 AND active=0
                AND state NOT IN ('held','completed','cancelled')",
             [graph_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let Some((source_id, source_revision, proposals, providers)) = row else {
+    let Some((source_id, source_revision, proposals, providers, retry_generation)) = row else {
         return Ok(None);
     };
     if kind == "blocker" {
@@ -385,13 +906,28 @@ pub fn record_attempt(
              WHERE id=?1 AND status='planning'",
             params![source_id, now],
         )?;
+        let ordinal: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(ordinal),0)+1 FROM decomposition_attempts
+             WHERE graph_id=?1 AND source_revision=?2 AND kind='blocker'",
+            params![graph_id, source_revision],
+            |row| row.get(0),
+        )?;
         tx.execute(
             "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
-                 reason_code,summary,created_at) VALUES (?1,?2,'blocker',1,?3,?4,?5)",
-            params![graph_id, source_revision, reason_code, summary, now],
+                 retry_generation,reason_code,summary,created_at)
+             VALUES (?1,?2,'blocker',?3,?4,?5,?6,?7)",
+            params![
+                graph_id,
+                source_revision,
+                ordinal,
+                retry_generation,
+                reason_code,
+                summary,
+                now
+            ],
         )?;
         tx.commit().map_err(map_sql_err)?;
-        return Ok(Some(1));
+        return Ok(Some(ordinal));
     }
     let (current, cap, column) = if kind == "proposal" {
         (proposals, MAX_PROPOSAL_ATTEMPTS, "proposal_attempts")
@@ -401,23 +937,31 @@ pub fn record_attempt(
     if current >= cap {
         return Ok(None);
     }
-    let ordinal = current + 1;
+    let ordinal: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(ordinal),0)+1 FROM decomposition_attempts
+         WHERE graph_id=?1 AND source_revision=?2 AND kind=?3",
+        params![graph_id, source_revision, kind],
+        |row| row.get(0),
+    )?;
     tx.execute(
         "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
-             reason_code,summary,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+             retry_generation,reason_code,summary,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
         params![
             graph_id,
             source_revision,
             kind,
             ordinal,
+            retry_generation,
             reason_code,
             summary,
             now
         ],
     )?;
     let sql = format!("UPDATE task_decompositions SET {column}=?2,updated_at=?3 WHERE id=?1");
-    tx.execute(&sql, params![graph_id, ordinal, now])?;
-    if ordinal == cap {
+    let next_count = current + 1;
+    tx.execute(&sql, params![graph_id, next_count, now])?;
+    if next_count == cap {
         tx.execute(
             "UPDATE task_decompositions SET state='held',freeze_active=0,
                  hold_code=?2,hold_summary=?3,updated_at=?4 WHERE id=?1",
@@ -431,12 +975,107 @@ pub fn record_attempt(
     } else if kind == "provider" {
         tx.execute(
             "UPDATE task_decompositions SET state='provider-backoff',freeze_active=0,
-                 updated_at=?2 WHERE id=?1",
+                 frozen_base_sha=NULL,updated_at=?2 WHERE id=?1",
             params![graph_id, now],
         )?;
     }
     tx.commit().map_err(map_sql_err)?;
     Ok(Some(ordinal))
+}
+
+/// Reject a durable proposal from one of its post-planner validation phases.
+///
+/// The attempt evidence and retry/hold transition are committed together so a
+/// rejected proposal can never become runnable or lose its actionable reason
+/// across a crash. `Ok(false)` is a clean loss of graph or source authority.
+pub fn reject_frozen_proposal(
+    conn: &mut Connection,
+    graph_id: i64,
+    expected_phase: &str,
+    reason_code: &str,
+    summary: &str,
+    now: i64,
+) -> Result<bool> {
+    if !matches!(expected_phase, "validating" | "preclassifying") {
+        return Err(QuorumError::Usage(
+            "invalid proposal rejection phase".into(),
+        ));
+    }
+    if summary.len() > ATTEMPT_SUMMARY_MAX_BYTES
+        || reason_code.is_empty()
+        || reason_code.len() > 128
+    {
+        return Err(QuorumError::Usage(
+            "invalid bounded decomposition attempt".into(),
+        ));
+    }
+
+    let tx = begin_immediate(conn)?;
+    let row: Option<(i64, i64, i64, i64)> = tx
+        .query_row(
+            "SELECT d.source_task_id,d.planned_source_revision,d.proposal_attempts,
+                    d.operator_retry_count
+             FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+             WHERE d.id=?1 AND d.state=?2 AND d.freeze_active=1 AND d.active=0
+               AND t.status='planning' AND t.revision=d.planned_source_revision",
+            params![graph_id, expected_phase],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((source_id, source_revision, attempts, retry_generation)) = row else {
+        return Ok(false);
+    };
+    if attempts >= MAX_PROPOSAL_ATTEMPTS {
+        return Ok(false);
+    }
+
+    let ordinal: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(ordinal),0)+1 FROM decomposition_attempts
+         WHERE graph_id=?1 AND source_revision=?2 AND kind='proposal'",
+        params![graph_id, source_revision],
+        |row| row.get(0),
+    )?;
+    let next_count = attempts + 1;
+    tx.execute(
+        "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
+             retry_generation,reason_code,summary,created_at)
+         VALUES (?1,?2,'proposal',?3,?4,?5,?6,?7)",
+        params![
+            graph_id,
+            source_revision,
+            ordinal,
+            retry_generation,
+            reason_code,
+            summary,
+            now
+        ],
+    )?;
+    if next_count == MAX_PROPOSAL_ATTEMPTS {
+        tx.execute(
+            "UPDATE task_decompositions SET state='held',freeze_active=0,
+                 proposal_attempts=?2,accepted_proposal_json=NULL,
+                 accepted_classifications_json=NULL,
+                 planner_session_id=NULL,hold_code='proposal-attempts-exhausted',
+                 hold_summary=?3,updated_at=?4
+             WHERE id=?1",
+            params![graph_id, next_count, summary, now],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET status='failed',updated_at=?2
+             WHERE id=?1 AND status='planning'",
+            params![source_id, now],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE task_decompositions SET state='planning',proposal_attempts=?2,
+                 accepted_proposal_json=NULL,accepted_classifications_json=NULL,
+                 planner_session_id=NULL,updated_at=?3
+             WHERE id=?1",
+            params![graph_id, next_count, now],
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
 }
 
 /// Reacquire the freeze before retrying a provider failure or resuming a
@@ -447,7 +1086,12 @@ pub fn reacquire_freeze(conn: &mut Connection, graph_id: i64, now: i64) -> Resul
     let changed = tx.execute(
         "UPDATE task_decompositions SET state='freeze-requested',freeze_active=1,updated_at=?2
          WHERE id=?1 AND state IN ('provider-backoff','freeze-requested')
-           AND active=0 AND freeze_active=0",
+           AND active=0 AND freeze_active=0
+           AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
+           AND NOT EXISTS (
+               SELECT 1 FROM task_decompositions other
+               WHERE other.id!=?1 AND (other.state IN ('active','blocked') OR other.active=1)
+           )",
         params![graph_id, now],
     );
     if matches!(&changed, Err(error) if is_unique_constraint(error)) {
@@ -468,6 +1112,22 @@ pub fn set_frozen_phase(
     planner_session_id: Option<&str>,
     now: i64,
 ) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = set_frozen_phase_tx(&tx, graph_id, expected, next, planner_session_id, now)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed)
+}
+
+/// The guarded phase write itself, inside a caller-owned transaction, so one
+/// caller may serialize it with the authority record that depends on it.
+fn set_frozen_phase_tx(
+    tx: &Transaction<'_>,
+    graph_id: i64,
+    expected: &str,
+    next: &str,
+    planner_session_id: Option<&str>,
+    now: i64,
+) -> Result<bool> {
     const PHASES: &[&str] = &[
         "freeze-requested",
         "draining",
@@ -478,19 +1138,98 @@ pub fn set_frozen_phase(
     if !PHASES.contains(&expected) || !PHASES.contains(&next) {
         return Err(QuorumError::Usage("invalid frozen planning phase".into()));
     }
-    let tx = begin_immediate(conn)?;
     let changed = tx.execute(
         "UPDATE task_decompositions SET state=?3,planner_session_id=?4,updated_at=?5
          WHERE id=?1 AND state=?2 AND freeze_active=1 AND active=0",
         params![graph_id, expected, next, planner_session_id, now],
     )?;
+    Ok(changed == 1)
+}
+
+/// Record one planner attempt's run identity on its graph and issue that run's
+/// `planner` capability in a single `BEGIN IMMEDIATE` transaction, before the
+/// provider spawns.
+///
+/// `capabilities::resolve_planner_context` admits a `SubmitPlan` only when the
+/// capability's run id is also the graph's `planner_session_id`. Writing both
+/// records in one transaction is what makes that pairing atomic: a lost race
+/// leaves neither, so a capability can never exist without the live planner
+/// session that authorizes it.
+///
+/// Returns `false` for that expected lost race (invariant #3) — the graph left
+/// `planning`, lost its freeze, or is not the named source's graph. The caller
+/// must not spawn.
+pub fn issue_planner_run(
+    conn: &mut Connection,
+    graph_id: i64,
+    source_task_id: i64,
+    run_id: &str,
+    agent: &str,
+    now: i64,
+) -> Result<bool> {
+    if run_id.is_empty()
+        || run_id.contains('\0')
+        || agent.is_empty()
+        || agent.contains('\0')
+        || source_task_id <= 0
+    {
+        return Err(QuorumError::BadInput(
+            "invalid planner capability identity".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    // The phase write alone does not prove the caller named this graph's own
+    // source task, and the capability carries that task id: a mismatch would
+    // issue authority the planner resolver could never honor.
+    let owns_source: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_decompositions
+         WHERE id=?1 AND source_task_id=?2 AND state='planning'
+           AND freeze_active=1 AND active=0)",
+        params![graph_id, source_task_id],
+        |row| row.get(0),
+    )?;
+    if !owns_source {
+        return Ok(false);
+    }
+    if !set_frozen_phase_tx(&tx, graph_id, "planning", "planning", Some(run_id), now)? {
+        return Ok(false);
+    }
+    crate::capabilities::issue_tx(&tx, run_id, source_task_id, agent, "planner", now)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
+/// Reject a durable accepted proposal and atomically return its freeze-owning
+/// aggregate to planning. A later planner turn must never inherit the rejected
+/// JSON after a restart.
+pub fn reset_accepted_proposal_to_planning(
+    conn: &mut Connection,
+    graph_id: i64,
+    expected: &str,
+    now: i64,
+) -> Result<bool> {
+    if !matches!(expected, "validating" | "preclassifying") {
+        return Err(QuorumError::Usage(
+            "accepted proposal may only be reset from validation phases".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE task_decompositions
+         SET state='planning',planner_session_id=NULL,accepted_proposal_json=NULL,
+             accepted_classifications_json=NULL,updated_at=?3
+         WHERE id=?1 AND state=?2 AND freeze_active=1 AND active=0",
+        params![graph_id, expected, now],
+    )?;
     tx.commit().map_err(map_sql_err)?;
     Ok(changed == 1)
 }
 
-/// Durably accept one bounded provider proposal before leaving planning. This
-/// makes validating and preclassifying restart-resumable without charging a
-/// semantic rejection budget.
+/// Durably accept one bounded provider proposal before leaving planning. The
+/// graph enters `preclassifying` (the closed-book classifier runs before the
+/// Arbiter), which makes preclassifying and validating restart-resumable
+/// without charging a semantic rejection budget. Any classification from an
+/// earlier proposal is discarded with it.
 pub fn accept_proposal(
     conn: &mut Connection,
     graph_id: i64,
@@ -508,7 +1247,8 @@ pub fn accept_proposal(
     let tx = begin_immediate(conn)?;
     let changed = tx.execute(
         "UPDATE task_decompositions
-         SET state='validating',accepted_proposal_json=?2,updated_at=?3
+         SET state='preclassifying',accepted_proposal_json=?2,
+             accepted_classifications_json=NULL,updated_at=?3
          WHERE id=?1 AND state='planning' AND freeze_active=1 AND active=0",
         params![graph_id, proposal_json, now],
     )?;
@@ -516,7 +1256,43 @@ pub fn accept_proposal(
     Ok(changed == 1)
 }
 
-fn classification_is_small_dispatchable(raw: &str) -> bool {
+/// Durably accept the classifier's complete verdict batch for the accepted
+/// proposal and advance `preclassifying` -> `validating`, where the Arbiter
+/// gates the classified proposal. The batch is persisted next to the proposal
+/// so the later materialization (and a restart inside `validating`) consumes
+/// exactly the classification that was reviewed rather than re-running a
+/// non-deterministic classifier. Guarded on `preclassifying` with a present
+/// proposal: a zero-row bind is a clean lost race (invariant #3).
+pub fn accept_classifications(
+    conn: &mut Connection,
+    graph_id: i64,
+    classifications_json: &str,
+    now: i64,
+) -> Result<bool> {
+    if classifications_json.is_empty()
+        || classifications_json.len() > 65_536
+        || serde_json::from_str::<serde_json::Value>(classifications_json).is_err()
+    {
+        return Err(QuorumError::Usage(
+            "invalid bounded accepted decomposition classification".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE task_decompositions
+         SET state='validating',accepted_classifications_json=?2,updated_at=?3
+         WHERE id=?1 AND state='preclassifying' AND freeze_active=1 AND active=0
+           AND accepted_proposal_json IS NOT NULL",
+        params![graph_id, classifications_json, now],
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed == 1)
+}
+
+/// A generated child may materialize only when it is ready, not a duplicate,
+/// and its size verdict satisfies the same implementation-size policy that
+/// dispatches root tasks ([`crate::tasks::size_is_dispatchable`]).
+fn classification_is_child_dispatchable(raw: &str) -> bool {
     let owned = Some(raw.to_owned());
     if !crate::tasks::classification_is_complete(&owned) {
         return false;
@@ -525,12 +1301,17 @@ fn classification_is_small_dispatchable(raw: &str) -> bool {
         return false;
     };
     let size = value.get("cx_size").and_then(|v| v.as_str());
+    let cx_est = value.get("cx_est").and_then(|v| v.as_i64());
     let ready = value.get("cx_ready").and_then(|v| v.as_bool());
     let duplicate = value
         .get("cx_dup_of")
         .and_then(|v| v.as_array())
         .is_some_and(|values| !values.is_empty());
-    matches!(size, Some("S" | "M")) && ready == Some(true) && !duplicate
+    let size_ok = match (size, cx_est) {
+        (Some(size), Some(cx_est)) => crate::tasks::size_is_dispatchable(size, cx_est),
+        _ => false,
+    };
+    size_ok && ready == Some(true) && !duplicate
 }
 
 /// Atomically create every generated task and member. The returned IDs follow
@@ -555,7 +1336,7 @@ pub fn materialize_graph(
         || children.iter().any(|child| {
             child.local_key.is_empty()
                 || child.title.trim().is_empty()
-                || !classification_is_small_dispatchable(&child.classification_refs)
+                || !classification_is_child_dispatchable(&child.classification_refs)
                 || child
                     .prerequisite_keys
                     .iter()
@@ -717,7 +1498,8 @@ pub fn materialize_graph(
     }
     let changed = tx.execute(
         "UPDATE task_decompositions SET state='active',active=1,freeze_active=0,
-             accepted_plan_revision=plan_revision,accepted_proposal_json=NULL,updated_at=?2
+             accepted_plan_revision=plan_revision,accepted_proposal_json=NULL,
+             accepted_classifications_json=NULL,updated_at=?2
          WHERE id=?1 AND active=0 AND freeze_active=1",
         params![graph_id, now],
     );
@@ -777,9 +1559,9 @@ pub fn cancel_source_graph(
         ));
     }
     let tx = begin_immediate(conn)?;
-    let source: Option<(i64, String, i64, String, Option<String>, i64)> = tx
+    let source: Option<(i64, String, String, Option<String>, i64)> = tx
         .query_row(
-            "SELECT d.id,d.state,d.active,t.created_by,t.assignee,t.revision
+            "SELECT d.id,d.state,t.created_by,t.assignee,t.revision
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
              WHERE d.source_task_id=?1",
             [source_task_id],
@@ -790,12 +1572,11 @@ pub fn cancel_source_graph(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
-                    row.get(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((graph_id, state, active, creator, assignee, revision)) = source else {
+    let Some((graph_id, state, creator, assignee, revision)) = source else {
         tx.commit()?;
         return Ok(SourceCancellation::NotGraphSource);
     };
@@ -804,10 +1585,12 @@ pub fn cancel_source_graph(
             "decomposed source cancellation requires --expected-revision".into(),
         ));
     };
-    if creator != caller && assignee.as_deref() != Some(caller)
+    // Cancellation is the universal terminal escape hatch for any non-terminal
+    // graph state (planning/backoff/held/active/blocked/…). Only refuse on
+    // authority mismatch, stale revision, or an already-terminal graph.
+    if (creator != caller && assignee.as_deref() != Some(caller))
         || revision != expected_revision
-        || active != 1
-        || !matches!(state.as_str(), "active" | "blocked")
+        || matches!(state.as_str(), "completed" | "cancelled")
     {
         tx.commit()?;
         return Ok(SourceCancellation::Rejected);
@@ -984,7 +1767,7 @@ fn cancel_graph_in_tx(
     intents: &[CleanupIntent],
     now: i64,
 ) -> Result<()> {
-    cancel_unfinished_members(tx, graph_id, now)?;
+    let cancelled_members = cancel_unfinished_members(tx, graph_id, now)?;
     for intent in intents {
         validate_cleanup_intent(intent)?;
         let member: bool = tx.query_row(
@@ -1016,15 +1799,30 @@ fn cancel_graph_in_tx(
         [graph_id],
     )?;
     tx.execute(
-        "UPDATE task_decompositions SET state='cancelled',active=0,freeze_active=0,updated_at=?2
+        "UPDATE task_decompositions
+             SET state='cancelled',active=0,freeze_active=0,
+                 frozen_base_sha=NULL,hold_code=NULL,hold_summary=NULL,
+                 planner_assignment_id=NULL,updated_at=?2
          WHERE id=?1",
         params![graph_id, now],
     )?;
-    tx.execute(
+    let source_cancelled = tx.execute(
         "UPDATE tasks SET status='cancelled',assignee=NULL,updated_at=?2
          WHERE id=?1 AND status!='done'",
         params![source_task_id, now],
     )?;
+    // Task #473: every real cancellation writer must refresh the durable
+    // park refs of dependents so status inference and the durable reason
+    // stay coherent. `tasks::update` covers the ordinary path; graph and
+    // member cancellations reach `cancelled` via this path with no
+    // intervening call to that helper, so run convergence here per newly
+    // cancelled id. Bounded by CONVERGE_LIMIT per id.
+    for id in &cancelled_members {
+        crate::tasks::converge_parked_dependents_of_cancelled(tx, *id, now)?;
+    }
+    if source_cancelled > 0 {
+        crate::tasks::converge_parked_dependents_of_cancelled(tx, source_task_id, now)?;
+    }
     Ok(())
 }
 
@@ -1116,7 +1914,7 @@ fn validate_cleanup_intent(intent: &CleanupIntent) -> Result<()> {
     Ok(())
 }
 
-fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> Result<()> {
+fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> Result<Vec<i64>> {
     tx.execute(
         "UPDATE claims SET active=0 WHERE active=1 AND target IN (
              SELECT 'task#' || task_id FROM task_graph_members WHERE graph_id=?1)",
@@ -1127,13 +1925,19 @@ fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> R
              SELECT task_id FROM task_graph_members WHERE graph_id=?1)",
         params![graph_id, now],
     )?;
-    tx.execute(
-        "UPDATE tasks SET status='cancelled',assignee=NULL,updated_at=?2
-         WHERE status!='done' AND id IN (
-             SELECT task_id FROM task_graph_members WHERE graph_id=?1)",
-        params![graph_id, now],
-    )?;
-    Ok(())
+    let cancelled_ids: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "UPDATE tasks SET status='cancelled',assignee=NULL,updated_at=?2
+             WHERE status!='done' AND id IN (
+                 SELECT task_id FROM task_graph_members WHERE graph_id=?1)
+             RETURNING id",
+        )?;
+        let rows = stmt
+            .query_map(params![graph_id, now], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    Ok(cancelled_ids)
 }
 
 /// Record a reviewer-confirmed decomposition defect and revoke only the
@@ -1181,9 +1985,9 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
     }
 
     let tx = begin_immediate(conn)?;
-    let graph: Option<(i64, i64, i64)> = tx
+    let graph: Option<(i64, i64, i64, i64)> = tx
         .query_row(
-            "SELECT d.id,d.planned_source_revision,review_run.id
+            "SELECT d.id,d.planned_source_revision,review_run.id,d.operator_retry_count
              FROM task_graph_members m
              JOIN task_decompositions d ON d.id=m.graph_id
              JOIN tasks child ON child.id=m.task_id
@@ -1210,10 +2014,10 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
                    WHERE current_run.task_id=m.task_id AND current_run.role='reviewer'
                )",
             params![blocker.task_id, blocker.reviewer, blocker.run_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((graph_id, source_revision, agent_run_id)) = graph else {
+    let Some((graph_id, source_revision, agent_run_id, retry_generation)) = graph else {
         tx.commit().map_err(map_sql_err)?;
         return Ok(false);
     };
@@ -1225,12 +2029,13 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
     )?;
     tx.execute(
         "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
-             reason_code,summary,created_at)
-         VALUES (?1,?2,'blocker',?3,?4,?5,?6)",
+             retry_generation,reason_code,summary,created_at)
+         VALUES (?1,?2,'blocker',?3,?4,?5,?6,?7)",
         params![
             graph_id,
             source_revision,
             ordinal,
+            retry_generation,
             blocker.category,
             summary,
             blocker.now
@@ -1287,6 +2092,536 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
     Ok(true)
 }
 
+/// Adopt the exact managed delivery of a continuation task for one failed
+/// generated child.
+///
+/// This is intentionally an evidence-heavy, incident-recovery primitive.  It
+/// does not infer relationships from titles, notes, labels, or a shared PR
+/// alone.  The original graph membership, explicit source-task provenance,
+/// daemon publication handoff, managed review, merge transition, and exact PR
+/// head all have to agree inside one `BEGIN IMMEDIATE` transaction. A blocked
+/// graph still accepts a managed recovery delivery; blocking stops new
+/// execution authority without discarding recovery evidence. A stale,
+/// incomplete, or replayed request is a clean negative.
+pub fn adopt_recovery_delivery(
+    conn: &mut Connection,
+    original_child_id: i64,
+    recovery_task_id: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let delivery: Option<RecoveryDelivery> = tx
+        .query_row(
+            "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
+                    recovery_target.pr_number,recovery_target.head_sha
+             FROM task_graph_members member
+             JOIN task_decompositions graph ON graph.id=member.graph_id
+             JOIN tasks source ON source.id=graph.source_task_id
+             JOIN tasks original ON original.id=member.task_id
+             JOIN tasks recovery ON recovery.id=?2
+             JOIN pr_targets original_target ON original_target.task_id=original.id
+             JOIN pr_targets recovery_target ON recovery_target.task_id=recovery.id
+             JOIN r2_sampling_decisions sampling
+               ON sampling.pr_number=recovery_target.pr_number
+              AND sampling.head_sha=recovery_target.head_sha
+              AND sampling.task_id=recovery.id
+             WHERE original.id=?1 AND original.id!=recovery.id
+               AND original.status='failed'
+               AND member.active=1 AND member.plan_revision=graph.accepted_plan_revision
+               AND graph.state IN ('active','blocked') AND graph.active=1
+               AND source.status='decomposed'
+               AND NOT EXISTS (
+                    SELECT 1 FROM task_graph_members sibling
+                    JOIN tasks sibling_task ON sibling_task.id=sibling.task_id
+                    WHERE sibling.graph_id=graph.id AND sibling.active=1
+                      AND sibling.task_id!=original.id
+                      AND sibling_task.status!='done'
+               )
+               AND json_valid(original.refs)
+               AND json_type(original.refs,'$.pr')='integer'
+               AND json_extract(original.refs,'$.pr')=original_target.pr_number
+               AND original_target.pr_number=recovery_target.pr_number
+               AND original_target.head_ref!=''
+               AND length(original_target.head_sha) IN (40,64)
+               AND original_target.head_sha NOT GLOB '*[^0-9A-Fa-f]*'
+               AND recovery.status='done' AND recovery.review_only=0
+               AND recovery.continue_pr=recovery_target.pr_number
+               AND json_valid(recovery.refs)
+               AND json_type(recovery.refs,'$.pr')='integer'
+               AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number
+               AND json_type(recovery.refs,'$.source_task')='integer'
+               AND json_extract(recovery.refs,'$.source_task')=original.id
+               AND json_type(recovery.refs,'$.daemon_publication') IS NULL
+               AND (
+                    (json_type(original.refs,'$.repo') IS NULL
+                     AND json_type(recovery.refs,'$.repo') IS NULL)
+                    OR
+                    (json_type(original.refs,'$.repo')='text'
+                     AND json_type(recovery.refs,'$.repo')='text'
+                     AND json_extract(original.refs,'$.repo')=
+                         json_extract(recovery.refs,'$.repo'))
+               )
+               AND recovery_target.head_ref!=''
+               AND length(recovery_target.head_sha) IN (40,64)
+               AND recovery_target.head_sha NOT GLOB '*[^0-9A-Fa-f]*'
+               AND EXISTS (
+                    SELECT 1 FROM agent_runs worker
+                    JOIN role_assignments assignment
+                      ON assignment.id=worker.role_assignment_id
+                    JOIN events published
+                      ON published.subject='task#' || recovery.id
+                     AND published.kind='task_in_review'
+                     AND published.expires_at>?3
+                     AND published.body='by ' || worker.agent_name
+                     AND published.ts BETWEEN worker.spawned_at AND worker.ended_at
+                    WHERE worker.task_id=recovery.id AND worker.role='worker'
+                      AND worker.sub_role IS NULL AND worker.ended_at IS NOT NULL
+                      AND worker.end_reason='completed'
+                      AND assignment.task_id=recovery.id
+                      AND assignment.role='worker'
+                      AND assignment.pr_number IS NULL
+                      AND EXISTS (
+                           SELECT 1 FROM events merging
+                           WHERE merging.subject=published.subject
+                             AND merging.kind='task_merging'
+                             AND merging.expires_at>?3
+                             AND merging.seq>published.seq
+                      )
+               )
+               AND EXISTS (
+                    SELECT 1 FROM agent_runs reviewer
+                    JOIN role_assignments assignment
+                      ON assignment.id=reviewer.role_assignment_id
+                    WHERE reviewer.task_id=recovery.id AND reviewer.role='reviewer'
+                      AND reviewer.ended_at IS NOT NULL
+                      AND reviewer.end_reason='verdict:approved'
+                      AND reviewer.review_pr=recovery_target.pr_number
+                      AND reviewer.review_head_sha=recovery_target.head_sha
+                      AND assignment.task_id=recovery.id
+                      AND assignment.pr_number=recovery_target.pr_number
+                      AND assignment.role='reviewer'
+                      AND ((sampling.required=0 AND reviewer.sub_role IS NULL
+                            AND assignment.review_stage='r1')
+                           OR (sampling.required=1 AND reviewer.sub_role='r2'
+                            AND assignment.review_stage='r2'))
+               )
+               AND EXISTS (
+                    SELECT 1 FROM events merging
+                    JOIN events done ON done.subject=merging.subject
+                                    AND done.kind='task_done'
+                                    AND done.expires_at>?3
+                                    AND done.seq>merging.seq
+                    WHERE merging.subject='task#' || recovery.id
+                      AND merging.kind='task_merging'
+                      AND merging.expires_at>?3
+            )",
+            params![original_child_id, recovery_task_id, now],
+            |row| {
+                Ok(RecoveryDelivery {
+                    graph_id: row.get(0)?,
+                    decomposition_source_id: row.get(1)?,
+                    source_revision: row.get(2)?,
+                    pr_number: row.get(3)?,
+                    merged_head_sha: row.get(4)?,
+                    legacy_prepublication: false,
+                    original_publication_branch: None,
+                    original_publication_sha: None,
+                })
+            },
+        )
+        .optional()?;
+    let Some(delivery) = delivery else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    };
+
+    finalize_recovery_delivery(
+        &tx,
+        original_child_id,
+        recovery_task_id,
+        &delivery,
+        None,
+        now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
+/// Explicitly authorize the exact durable delivery of a completed managed
+/// continuation for the final failed member of an active decomposition, or of
+/// a boundary-violation-blocked decomposition when that block names this child.
+///
+/// This is the operator recovery path for a known pair, not a discovery
+/// mechanism and not general task equivalence. It substitutes durable daemon
+/// evidence for the automatic path's short-lived events: the final managed
+/// worker run must complete before the persisted final PR target or be merged,
+/// an approved managed
+/// reviewer must be bound to that exact target head, and daemon-owned merged
+/// completion provenance must close the chain. Conflicting `source_task`
+/// metadata is rejected; absent metadata grants no authority beyond this
+/// explicit call. Every predicate and the final lifecycle transition are
+/// serialized by one `BEGIN IMMEDIATE` transaction.
+pub fn adopt_explicit_recovery_delivery(
+    conn: &mut Connection,
+    input: &ExplicitRecoveryAdoption<'_>,
+) -> Result<bool> {
+    let authorized_by = input.authorized_by.trim();
+    if input.original_child_id <= 0 || input.recovery_task_id <= 0 {
+        return Err(QuorumError::Usage(
+            "recovery task IDs must be positive".into(),
+        ));
+    }
+    if authorized_by.is_empty() || authorized_by.len() > 128 {
+        return Err(QuorumError::Usage(
+            "recovery operator identity must be 1-128 bytes".into(),
+        ));
+    }
+    if authorized_by.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "recovery operator identity contains NUL".into(),
+        ));
+    }
+
+    let tx = begin_immediate(conn)?;
+    let delivery: Option<RecoveryDelivery> = tx
+        .query_row(
+            "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
+                    recovery_target.pr_number,recovery_target.head_sha,
+                    original.status='open',
+                    json_extract(original.refs,'$.daemon_publication.branch'),
+                    json_extract(original.refs,'$.daemon_publication.local_sha')
+             FROM task_graph_members member
+             JOIN task_decompositions graph ON graph.id=member.graph_id
+             JOIN tasks source ON source.id=graph.source_task_id
+             JOIN tasks original ON original.id=member.task_id
+             JOIN tasks recovery ON recovery.id=?2
+             LEFT JOIN pr_targets original_target ON original_target.task_id=original.id
+             JOIN pr_targets recovery_target ON recovery_target.task_id=recovery.id
+             JOIN r2_sampling_decisions sampling
+               ON sampling.pr_number=recovery_target.pr_number
+              AND sampling.head_sha=recovery_target.head_sha
+              AND sampling.task_id=recovery.id
+             WHERE original.id=?1 AND original.id!=recovery.id
+               AND member.active=1 AND member.plan_revision=graph.accepted_plan_revision
+               AND graph.active=1
+               AND (
+                    (
+                        original.status='failed'
+                        AND (
+                            graph.state='active'
+                            OR (
+                                graph.state='blocked'
+                                AND graph.hold_code=?4
+                                AND json_valid(graph.hold_summary)
+                                AND json_type(graph.hold_summary,'$.affected_task')='integer'
+                                AND json_extract(graph.hold_summary,'$.affected_task')=original.id
+                            )
+                        )
+                        AND json_valid(original.refs)
+                        AND json_type(original.refs,'$.pr')='integer'
+                        AND json_extract(original.refs,'$.pr')=original_target.pr_number
+                        AND original_target.pr_number=recovery_target.pr_number
+                        AND original_target.head_ref!=''
+                        AND original_target.head_ref=recovery_target.head_ref
+                        AND length(original_target.head_sha) IN (40,64)
+                        AND original_target.head_sha NOT GLOB '*[^0-9A-Fa-f]*'
+                    )
+                    OR (
+                        original.status='open'
+                        AND original.assignee IS NULL AND original.reviewer IS NULL
+                        AND original.completion_provenance IS NULL
+                        AND graph.state='blocked'
+                        AND graph.hold_code='generated-child-failed'
+                        AND NOT json_valid(graph.hold_summary)
+                        AND substr(graph.hold_summary,1,length(
+                            'generated child task #' || original.id ||
+                            ' failed: daemon-owned publication failed: daemon push to new branch refs/heads/' ||
+                            json_extract(original.refs,'$.daemon_publication.branch') ||
+                            ' rejected:'
+                        ))=(
+                            'generated child task #' || original.id ||
+                            ' failed: daemon-owned publication failed: daemon push to new branch refs/heads/' ||
+                            json_extract(original.refs,'$.daemon_publication.branch') ||
+                            ' rejected:'
+                        )
+                        AND json_valid(original.refs)
+                        AND json_type(original.refs,'$.pr') IS NULL
+                        AND json_type(original.refs,'$.daemon_publication')='object'
+                        AND json_type(original.refs,'$.daemon_publication.stage')='text'
+                        AND json_extract(original.refs,'$.daemon_publication.stage')='intent'
+                        AND json_type(original.refs,'$.daemon_publication.branch')='text'
+                        AND instr(
+                            json_extract(original.refs,'$.daemon_publication.branch'), char(0)
+                        )=0
+                        AND length(json_extract(original.refs,'$.daemon_publication.branch'))
+                            BETWEEN length('daemon/-t' || original.id) + 1 AND 512
+                        AND substr(
+                            json_extract(original.refs,'$.daemon_publication.branch'),
+                            1, length('daemon/')
+                        )='daemon/'
+                        AND substr(
+                            json_extract(original.refs,'$.daemon_publication.branch'),
+                            -length('-t' || original.id)
+                        )='-t' || original.id
+                        AND substr(
+                            json_extract(original.refs,'$.daemon_publication.branch'),
+                            length('daemon/') + 1,
+                            length(json_extract(original.refs,'$.daemon_publication.branch'))
+                              - length('daemon/') - length('-t' || original.id)
+                        ) NOT GLOB '*[^a-z0-9-]*'
+                        AND json_type(original.refs,'$.daemon_publication.local_sha')='text'
+                        AND instr(
+                            json_extract(original.refs,'$.daemon_publication.local_sha'), char(0)
+                        )=0
+                        AND length(json_extract(original.refs,'$.daemon_publication.local_sha'))
+                            IN (40,64)
+                        AND json_extract(original.refs,'$.daemon_publication.local_sha')
+                            NOT GLOB '*[^0-9A-Fa-f]*'
+                        AND (json_type(original.refs,'$.daemon_publication.pr') IS NULL
+                             OR json_type(original.refs,'$.daemon_publication.pr')='null')
+                        AND (json_type(original.refs,'$.daemon_publication.expected_remote_sha') IS NULL
+                             OR json_type(original.refs,'$.daemon_publication.expected_remote_sha')='null')
+                        AND (json_type(original.refs,'$.daemon_publication.target_branch') IS NULL
+                             OR json_type(original.refs,'$.daemon_publication.target_branch')='null')
+                        AND NOT EXISTS (
+                            SELECT 1 FROM pr_targets stale_original_target
+                            WHERE stale_original_target.task_id=original.id
+                        )
+                        AND source.target_branch IS NOT NULL
+                        AND source.target_branch!=''
+                        AND recovery.target_branch=source.target_branch
+                        AND recovery.created_at>original.updated_at
+                    )
+               )
+               AND source.status='decomposed'
+               AND NOT EXISTS (
+                    SELECT 1 FROM task_graph_members sibling
+                    JOIN tasks sibling_task ON sibling_task.id=sibling.task_id
+                    WHERE sibling.graph_id=graph.id AND sibling.active=1
+                      AND sibling.task_id!=original.id
+                      AND sibling_task.status!='done'
+               )
+               AND recovery.status='done' AND recovery.review_only=0
+               AND recovery.completion_provenance=?3
+               AND recovery.continue_pr=recovery_target.pr_number
+               AND json_valid(recovery.refs)
+               AND json_type(recovery.refs,'$.pr')='integer'
+               AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number
+               AND (
+                    json_type(recovery.refs,'$.source_task') IS NULL
+                    OR (
+                        json_type(recovery.refs,'$.source_task')='integer'
+                        AND json_extract(recovery.refs,'$.source_task')=original.id
+                    )
+               )
+               AND json_type(recovery.refs,'$.daemon_publication') IS NULL
+               AND (
+                    (json_type(original.refs,'$.repo') IS NULL
+                     AND json_type(recovery.refs,'$.repo') IS NULL)
+                    OR
+                    (json_type(original.refs,'$.repo')='text'
+                     AND json_type(recovery.refs,'$.repo')='text'
+                     AND json_extract(original.refs,'$.repo')=
+                         json_extract(recovery.refs,'$.repo'))
+               )
+               AND recovery_target.head_ref!=''
+               AND length(recovery_target.head_sha) IN (40,64)
+               AND recovery_target.head_sha NOT GLOB '*[^0-9A-Fa-f]*'
+               AND EXISTS (
+                    SELECT 1 FROM agent_runs worker
+                    JOIN role_assignments assignment
+                      ON assignment.id=worker.role_assignment_id
+                    WHERE worker.task_id=recovery.id AND worker.role='worker'
+                      AND worker.sub_role IS NULL AND worker.ended_at IS NOT NULL
+                      AND worker.end_reason IN ('completed','merged')
+                      AND (worker.end_reason='merged'
+                           OR worker.ended_at<=recovery_target.resolved_at)
+                      AND worker.id=(
+                           SELECT MAX(latest_worker.id) FROM agent_runs latest_worker
+                           WHERE latest_worker.task_id=recovery.id
+                             AND latest_worker.role='worker'
+                             AND latest_worker.sub_role IS NULL
+                      )
+                      AND assignment.task_id=recovery.id
+                      AND assignment.role='worker'
+                      AND assignment.pr_number IS NULL
+               )
+               AND EXISTS (
+                    SELECT 1 FROM agent_runs reviewer
+                    JOIN role_assignments assignment
+                      ON assignment.id=reviewer.role_assignment_id
+                    WHERE reviewer.task_id=recovery.id AND reviewer.role='reviewer'
+                      AND reviewer.ended_at IS NOT NULL
+                      AND reviewer.end_reason='verdict:approved'
+                      AND reviewer.spawned_at>=recovery_target.resolved_at
+                      AND reviewer.ended_at<=recovery.updated_at
+                      AND reviewer.id=(
+                           SELECT MAX(latest_reviewer.id) FROM agent_runs latest_reviewer
+                           WHERE latest_reviewer.task_id=recovery.id
+                             AND latest_reviewer.role='reviewer'
+                      )
+                      AND reviewer.review_pr=recovery_target.pr_number
+                      AND reviewer.review_head_sha=recovery_target.head_sha
+                      AND assignment.task_id=recovery.id
+                      AND assignment.pr_number=recovery_target.pr_number
+                      AND assignment.role='reviewer'
+                      AND ((sampling.required=0 AND reviewer.sub_role IS NULL
+                            AND assignment.review_stage='r1')
+                           OR (sampling.required=1 AND reviewer.sub_role='r2'
+                            AND assignment.review_stage='r2'))
+               )",
+            params![
+                input.original_child_id,
+                input.recovery_task_id,
+                crate::tasks::COMPLETION_PROVENANCE_MERGED,
+                GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION
+            ],
+            |row| {
+                Ok(RecoveryDelivery {
+                    graph_id: row.get(0)?,
+                    decomposition_source_id: row.get(1)?,
+                    source_revision: row.get(2)?,
+                    pr_number: row.get(3)?,
+                    merged_head_sha: row.get(4)?,
+                    legacy_prepublication: row.get(5)?,
+                    original_publication_branch: row.get(6)?,
+                    original_publication_sha: row.get(7)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(delivery) = delivery else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    };
+
+    let ordinal: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(ordinal),0)+1 FROM decomposition_attempts
+         WHERE graph_id=?1 AND source_revision=?2 AND kind='recovery'",
+        params![delivery.graph_id, delivery.source_revision],
+        |row| row.get(0),
+    )?;
+    let summary = serde_json::json!({
+        "authority": "explicit-operator",
+        "authorized_by": authorized_by,
+        "decomposition_source": delivery.decomposition_source_id,
+        "original_child": input.original_child_id,
+        "recovery_task": input.recovery_task_id,
+        "pr": delivery.pr_number,
+        "merged_head_sha": delivery.merged_head_sha,
+        "legacy_prepublication": delivery.legacy_prepublication,
+        "original_publication_branch": delivery.original_publication_branch,
+        "original_publication_sha": delivery.original_publication_sha,
+    })
+    .to_string();
+    tx.execute(
+        "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
+             retry_generation,reason_code,summary,created_at)
+         VALUES (?1,?2,'recovery',?3,
+                 (SELECT operator_retry_count FROM task_decompositions WHERE id=?1),
+                 'explicit-delivery-adoption',?4,?5)",
+        params![
+            delivery.graph_id,
+            delivery.source_revision,
+            ordinal,
+            summary,
+            input.now
+        ],
+    )?;
+
+    finalize_recovery_delivery(
+        &tx,
+        input.original_child_id,
+        input.recovery_task_id,
+        &delivery,
+        Some(authorized_by),
+        input.now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
+fn finalize_recovery_delivery(
+    tx: &Transaction<'_>,
+    original_child_id: i64,
+    recovery_task_id: i64,
+    delivery: &RecoveryDelivery,
+    explicit_authority: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let mut recovery_provenance = serde_json::json!({
+        "source_task": original_child_id,
+        "recovery_task": recovery_task_id,
+        "pr": delivery.pr_number,
+        "merged_head_sha": delivery.merged_head_sha,
+        "adopted_at": now,
+    });
+    if let Some(authorized_by) = explicit_authority {
+        recovery_provenance["authority"] = serde_json::json!("explicit-operator");
+        recovery_provenance["authorized_by"] = serde_json::json!(authorized_by);
+        recovery_provenance["decomposition_source"] =
+            serde_json::json!(delivery.decomposition_source_id);
+        recovery_provenance["legacy_prepublication"] =
+            serde_json::json!(delivery.legacy_prepublication);
+        if let Some(branch) = &delivery.original_publication_branch {
+            recovery_provenance["original_publication_branch"] = serde_json::json!(branch);
+        }
+        if let Some(sha) = &delivery.original_publication_sha {
+            recovery_provenance["original_publication_sha"] = serde_json::json!(sha);
+        }
+    }
+    let recovery_provenance = recovery_provenance.to_string();
+
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET status='done',assignee=NULL,updated_at=?2,
+             completion_provenance=?3,
+             refs=json_set(
+                 json_remove(refs,
+                     '$.daemon_parked',
+                     '$.daemon_parked_reason',
+                     '$.daemon_resume_status',
+                     '$.daemon_publication'),
+                 '$.recovery_delivery',
+                 json(?4))
+         WHERE id=?1
+           AND ((?5=0 AND status='failed') OR (?5=1 AND status='open'))",
+        params![
+            original_child_id,
+            now,
+            crate::tasks::COMPLETION_PROVENANCE_MERGED,
+            recovery_provenance,
+            delivery.legacy_prepublication
+        ],
+    )?;
+    if changed != 1 {
+        return Err(QuorumError::Io(
+            "recovery child changed during adoption transaction".into(),
+        ));
+    }
+    crate::events::emit(
+        tx,
+        "task_done",
+        &format!("task#{original_child_id}"),
+        &format!(
+            "adopted recovery task #{recovery_task_id} for PR #{} at {}",
+            delivery.pr_number, delivery.merged_head_sha
+        ),
+        now,
+    )?;
+    if explicit_authority.is_some() {
+        complete_graph_after_explicit_recovery(
+            tx,
+            original_child_id,
+            now,
+            delivery.legacy_prepublication,
+        )?;
+    } else {
+        complete_graph_if_final_child(tx, original_child_id, now)?;
+    }
+    Ok(())
+}
+
 /// Fold graph completion into the transaction that marks a generated child
 /// done. This is deliberately transaction-scoped for the final-child race.
 pub(crate) fn complete_graph_if_final_child(
@@ -1294,13 +2629,83 @@ pub(crate) fn complete_graph_if_final_child(
     task_id: i64,
     now: i64,
 ) -> Result<bool> {
+    complete_graph_if_final_child_with_boundary_recovery(tx, task_id, now, false)
+}
+
+/// The explicit operator recovery path may complete a blocked graph only when
+/// the persisted boundary blocker names the child whose exact delivery it just
+/// adopted. Ordinary child completion intentionally cannot clear a block.
+fn complete_graph_after_explicit_recovery(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    now: i64,
+    allow_legacy_publication_recovery: bool,
+) -> Result<bool> {
+    complete_graph_if_final_child_with_explicit_recovery(
+        tx,
+        task_id,
+        now,
+        true,
+        allow_legacy_publication_recovery,
+    )
+}
+
+fn complete_graph_if_final_child_with_boundary_recovery(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    now: i64,
+    allow_boundary_recovery: bool,
+) -> Result<bool> {
+    complete_graph_if_final_child_with_explicit_recovery(
+        tx,
+        task_id,
+        now,
+        allow_boundary_recovery,
+        false,
+    )
+}
+
+fn complete_graph_if_final_child_with_explicit_recovery(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    now: i64,
+    allow_boundary_recovery: bool,
+    allow_legacy_publication_recovery: bool,
+) -> Result<bool> {
     let graph: Option<(i64, i64)> = tx
         .query_row(
             "SELECT d.id,d.source_task_id
              FROM task_graph_members m
              JOIN task_decompositions d ON d.id=m.graph_id
-             WHERE m.task_id=?1 AND m.active=1 AND d.state='active' AND d.active=1",
-            [task_id],
+             WHERE m.task_id=?1 AND m.active=1 AND d.active=1
+               AND (
+                    d.state='active'
+                    OR (
+                        ?2=1 AND d.state='blocked'
+                        AND d.hold_code=?3
+                        AND json_valid(d.hold_summary)
+                        AND json_type(d.hold_summary,'$.affected_task')='integer'
+                        AND json_extract(d.hold_summary,'$.affected_task')=m.task_id
+                    )
+                    OR (
+                        ?4=1 AND d.state='blocked'
+                        AND d.hold_code='generated-child-failed'
+                        AND NOT json_valid(d.hold_summary)
+                        AND substr(d.hold_summary,1,length(
+                            'generated child task #' || m.task_id ||
+                            ' failed: daemon-owned publication failed:'
+                        ))=(
+                            'generated child task #' || m.task_id ||
+                            ' failed: daemon-owned publication failed:'
+                        )
+                    )
+               )",
+            params![
+                task_id,
+                allow_boundary_recovery,
+                GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION,
+                allow_legacy_publication_recovery
+            ],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -1318,9 +2723,40 @@ pub(crate) fn complete_graph_if_final_child(
         return Ok(false);
     }
     let graph_changed = tx.execute(
-        "UPDATE task_decompositions SET state='completed',active=0,freeze_active=0,updated_at=?2
-         WHERE id=?1 AND state='active' AND active=1",
-        params![graph_id, now],
+        "UPDATE task_decompositions
+         SET state='completed',active=0,freeze_active=0,hold_code=NULL,hold_summary=NULL,
+             updated_at=?2
+         WHERE id=?1 AND active=1
+           AND (
+                state='active'
+                OR (
+                    ?3=1 AND state='blocked'
+                    AND hold_code=?4
+                    AND json_valid(hold_summary)
+                    AND json_type(hold_summary,'$.affected_task')='integer'
+                    AND json_extract(hold_summary,'$.affected_task')=?5
+                )
+                OR (
+                    ?6=1 AND state='blocked'
+                    AND hold_code='generated-child-failed'
+                    AND NOT json_valid(hold_summary)
+                    AND substr(hold_summary,1,length(
+                        'generated child task #' || ?5 ||
+                        ' failed: daemon-owned publication failed:'
+                    ))=(
+                        'generated child task #' || ?5 ||
+                        ' failed: daemon-owned publication failed:'
+                    )
+                )
+           )",
+        params![
+            graph_id,
+            now,
+            allow_boundary_recovery,
+            GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION,
+            task_id,
+            allow_legacy_publication_recovery
+        ],
     )?;
     if graph_changed != 1 {
         return Ok(false);
@@ -1339,7 +2775,94 @@ pub(crate) fn complete_graph_if_final_child(
         tx,
         "task_graph_completed",
         &format!("task#{source_id}"),
-        "all generated children merged",
+        "all generated children are done",
+        now,
+    )?;
+    Ok(true)
+}
+
+/// Fold a terminal generated-child park into its active graph aggregate.
+///
+/// Callers own the surrounding `BEGIN IMMEDIATE` transaction so the child
+/// park, graph blocker, event, and owner alert become visible together. A
+/// staged retry/remediation keeps the graph active because the failed child
+/// still has daemon-owned continuation authority.
+pub(crate) fn block_graph_if_child_failed(
+    conn: &Connection,
+    task_id: i64,
+    reason: &str,
+    now: i64,
+) -> Result<bool> {
+    if reason.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "embedded NUL in graph child failure reason".into(),
+        ));
+    }
+    let graph: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT d.id,child.refs
+             FROM task_graph_members m
+             JOIN task_decompositions d ON d.id=m.graph_id
+             JOIN tasks child ON child.id=m.task_id
+             WHERE m.task_id=?1 AND m.active=1
+               AND d.state='active' AND d.active=1
+               AND child.status='failed'",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((graph_id, refs)) = graph else {
+        return Ok(false);
+    };
+
+    if let Some(refs) = refs {
+        let refs: serde_json::Value = serde_json::from_str(&refs)
+            .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?;
+        let runner_retry_requested = crate::runner_state::retry_requested(&refs);
+        let daemon_rework_retry_requested = refs
+            .get(crate::tasks::PARKED_REWORK_RETRY_REF)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let ci_remediation_requested = refs
+            .get(crate::tasks::CI_REMEDIATION_REQUESTED_REF)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if runner_retry_requested || daemon_rework_retry_requested || ci_remediation_requested {
+            return Ok(false);
+        }
+    }
+
+    let summary = serde_json::json!({
+        "affected_task": task_id,
+        "reason": reason,
+    })
+    .to_string();
+    if summary.len() > 8192 {
+        return Err(QuorumError::Usage(
+            "generated child failure reason exceeds bounded storage".into(),
+        ));
+    }
+    let event_summary = format!("generated child task #{task_id} failed: {reason}");
+    let graph_changed = conn.execute(
+        "UPDATE task_decompositions
+         SET state='blocked',hold_code='generated-child-failed',hold_summary=?2,updated_at=?3
+         WHERE id=?1 AND state='active' AND active=1",
+        params![graph_id, summary, now],
+    )?;
+    if graph_changed != 1 {
+        return Ok(false);
+    }
+    crate::events::emit(
+        conn,
+        "task_graph_blocked",
+        &format!("task#{task_id}"),
+        &event_summary,
+        now,
+    )?;
+    crate::tasks::alert_owner_of_park(
+        conn,
+        task_id,
+        &format!("task graph blocked after generated child failed: {reason}"),
         now,
     )?;
     Ok(true)
@@ -1353,21 +2876,21 @@ pub fn recovery_reset(
     summary: &str,
     now: i64,
 ) -> Result<bool> {
-    if summary.is_empty() || summary.len() > 2048 {
+    if summary.is_empty() || summary.len() > ATTEMPT_SUMMARY_MAX_BYTES {
         return Err(QuorumError::Usage(
             "invalid bounded recovery summary".into(),
         ));
     }
     let tx = begin_immediate(conn)?;
-    let row: Option<(i64, i64, i64)> = tx
+    let row: Option<(i64, i64, i64, i64)> = tx
         .query_row(
-            "SELECT source_task_id,planned_source_revision,plan_revision
+            "SELECT source_task_id,planned_source_revision,plan_revision,operator_retry_count
          FROM task_decompositions WHERE id=?1 AND state NOT IN ('completed','cancelled')",
             [graph_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let Some((source_id, source_revision, plan_revision)) = row else {
+    let Some((source_id, source_revision, plan_revision, retry_generation)) = row else {
         return Ok(false);
     };
     let evidence: bool = tx.query_row(
@@ -1384,15 +2907,26 @@ pub fn recovery_reset(
     if evidence {
         return Ok(false);
     }
-    cancel_unfinished_members(&tx, graph_id, now)?;
+    let cancelled_members = cancel_unfinished_members(&tx, graph_id, now)?;
+    for id in &cancelled_members {
+        crate::tasks::converge_parked_dependents_of_cancelled(&tx, *id, now)?;
+    }
     tx.execute(
         "UPDATE task_graph_members SET active=0 WHERE graph_id=?1",
         [graph_id],
     )?;
     tx.execute(
         "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
-             reason_code,summary,created_at) VALUES (?1,?2,'recovery',?3,'inconsistent-graph',?4,?5)",
-        params![graph_id, source_revision, plan_revision, summary, now],
+             retry_generation,reason_code,summary,created_at)
+         VALUES (?1,?2,'recovery',?3,?4,'inconsistent-graph',?5,?6)",
+        params![
+            graph_id,
+            source_revision,
+            plan_revision,
+            retry_generation,
+            summary,
+            now
+        ],
     )?;
     tx.execute(
         "UPDATE task_decompositions SET state='freeze-requested',active=0,freeze_active=0,
@@ -1411,6 +2945,98 @@ pub fn recovery_reset(
 mod tests {
     use super::*;
 
+    #[test]
+    fn child_deliverables_keep_writes_distinct_from_context_references() {
+        let deliverables: ChildDeliverables = serde_json::from_str(
+            r#"[
+                {"kind":"write","path":"quorum-core/src/decomposition.rs"},
+                {"kind":"read_only_reference","path":"docs/decomposition.md"}
+            ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            deliverables.writable_paths().collect::<Vec<_>>(),
+            ["quorum-core/src/decomposition.rs"]
+        );
+        assert_eq!(
+            deliverables.reference_paths().collect::<Vec<_>>(),
+            ["docs/decomposition.md"]
+        );
+    }
+
+    #[test]
+    fn writable_deliverable_classifier_rejects_external_and_traversing_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+
+        for path in [
+            "../sibling/output.rs".to_string(),
+            "src/../../sibling/output.rs".to_string(),
+            sibling.join("output.rs").to_string_lossy().into_owned(),
+        ] {
+            assert!(
+                writable_deliverable_is_lexically_external(&repo, &path),
+                "{path}"
+            );
+            assert_eq!(
+                classify_writable_deliverable_path_blocking(&repo, &path),
+                WritableDeliverablePath::Escaping,
+                "{path}"
+            );
+        }
+
+        for path in [
+            "src/output.rs".to_string(),
+            "new/nested/output.rs".to_string(),
+            repo.join("src/output.rs").to_string_lossy().into_owned(),
+        ] {
+            assert!(
+                !writable_deliverable_is_lexically_external(&repo, &path),
+                "{path}"
+            );
+            assert_eq!(
+                classify_writable_deliverable_path_blocking(&repo, &path),
+                WritableDeliverablePath::Permitted,
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_deliverable_classifier_resolves_symlink_escapes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let sibling = root.path().join("sibling");
+        let absent_external = root.path().join("absent-external");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        std::os::unix::fs::symlink(&sibling, repo.join("external-link")).unwrap();
+        std::os::unix::fs::symlink(&absent_external, repo.join("dangling-external-link")).unwrap();
+        std::os::unix::fs::symlink(repo.join("absent-internal"), repo.join("internal-link"))
+            .unwrap();
+
+        assert_eq!(
+            classify_writable_deliverable_path_blocking(&repo, "external-link/new/output.rs"),
+            WritableDeliverablePath::Escaping
+        );
+        assert_eq!(
+            classify_writable_deliverable_path_blocking(
+                &repo,
+                "dangling-external-link/new/output.rs",
+            ),
+            WritableDeliverablePath::Escaping
+        );
+        assert_eq!(
+            classify_writable_deliverable_path_blocking(&repo, "internal-link/new/output.rs"),
+            WritableDeliverablePath::Permitted
+        );
+    }
+
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::migrate(&conn).unwrap();
@@ -1421,6 +3047,18 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    fn file_setup() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("decomposition.db")).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('large','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        (dir, conn)
     }
 
     fn begin(conn: &mut Connection) -> i64 {
@@ -1441,6 +3079,166 @@ mod tests {
             set_frozen_phase(conn, graph, "freeze-requested", "preclassifying", None, 2).unwrap()
         );
         graph
+    }
+
+    /// Issuance is what makes a planner run addressable by the endpoint: the
+    /// capability and the graph's live planner session are written together, so
+    /// `resolve_planner_context` can accept a `SubmitPlan` only from the run the
+    /// daemon actually spawned.
+    #[test]
+    fn planner_run_issuance_binds_the_capability_to_the_live_planner_session() {
+        let mut conn = setup();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 3).unwrap()
+        );
+
+        assert!(
+            issue_planner_run(&mut conn, graph, 1, "run-a", "decomposition-planner-1", 4).unwrap()
+        );
+        let context = crate::capabilities::resolve_planner_context(&conn, "run-a").unwrap();
+        assert_eq!((context.graph_id, context.task_id), (graph, 1));
+        assert_eq!(
+            conn.query_row(
+                "SELECT planner_session_id FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "run-a"
+        );
+
+        // A second attempt replaces the live session, so the previous run's
+        // capability can no longer resolve even before it is revoked.
+        assert!(
+            issue_planner_run(&mut conn, graph, 1, "run-b", "decomposition-planner-1", 5).unwrap()
+        );
+        assert!(crate::capabilities::resolve_planner_context(&conn, "run-a").is_err());
+        assert!(crate::capabilities::resolve_planner_context(&conn, "run-b").is_ok());
+
+        // Naming another task's id would issue authority the resolver could
+        // never honor, and a graph that left planning is an expected lost race:
+        // neither writes anything.
+        assert!(
+            !issue_planner_run(&mut conn, graph, 2, "run-c", "decomposition-planner-1", 6).unwrap()
+        );
+        assert!(
+            set_frozen_phase(&mut conn, graph, "planning", "validating", Some("run-b"), 7).unwrap()
+        );
+        assert!(
+            !issue_planner_run(&mut conn, graph, 1, "run-d", "decomposition-planner-1", 8).unwrap()
+        );
+        for refused in ["run-c", "run-d"] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM run_capabilities WHERE run_id=?1",
+                    [refused],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+                "{refused} was issued without a live planner session"
+            );
+        }
+    }
+
+    fn exhaust_planning(conn: &mut Connection, graph: i64, kind: &str, start: i64) {
+        for index in 0..3 {
+            if index > 0 {
+                assert!(reacquire_freeze(conn, graph, start + index * 3).unwrap());
+                assert!(set_frozen_phase(
+                    conn,
+                    graph,
+                    "freeze-requested",
+                    "planning",
+                    None,
+                    start + index * 3 + 1,
+                )
+                .unwrap());
+            }
+            assert!(record_attempt(
+                conn,
+                graph,
+                kind,
+                "test-failure",
+                &format!("{kind} failure {}", index + 1),
+                start + index * 3 + 2,
+            )
+            .unwrap()
+            .is_some());
+        }
+    }
+
+    fn exhausted_provider() -> (Connection, i64) {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        exhaust_planning(&mut conn, graph, "provider", 10);
+        (conn, graph)
+    }
+
+    fn assert_exhausted_retry_rejected(mut conn: Connection, graph: i64) {
+        let before: (String, i64, i64, Option<String>, String, i64) = conn
+            .query_row(
+                "SELECT d.state,d.provider_failures,d.operator_retry_count,d.hold_code,
+                        t.status,
+                        (SELECT count(*) FROM events
+                         WHERE kind='decomposition_planning_retry')
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 90).unwrap(),
+            PlanningRetryOutcome::NotEligible
+        );
+        let after: (String, i64, i64, Option<String>, String, i64) = conn
+            .query_row(
+                "SELECT d.state,d.provider_failures,d.operator_retry_count,d.hold_code,
+                        t.status,
+                        (SELECT count(*) FROM events
+                         WHERE kind='decomposition_planning_retry')
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "rejection must not partially mutate authority"
+        );
     }
 
     fn planner_pool() -> crate::role_assignments::ValidatedPool {
@@ -1473,7 +3271,7 @@ mod tests {
 
     #[test]
     fn routed_planning_binds_assignment_in_authority_transaction() {
-        let mut conn = setup();
+        let (_dir, mut conn) = file_setup();
         let request = planner_request();
         let pool = planner_pool();
         let (graph, assignment) = begin_routed_planning(
@@ -1498,6 +3296,107 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (assignment.id, "codex".into(), "sol".into()));
+    }
+
+    #[test]
+    fn planning_authority_rejects_review_only_and_continuation_sources() {
+        for (review_only, continue_pr) in [(1, None), (0, Some(529))] {
+            for routed in [false, true] {
+                let (_dir, mut conn) = file_setup();
+                conn.execute(
+                    "UPDATE tasks SET review_only=?1,continue_pr=?2 WHERE id=1",
+                    params![review_only, continue_pr],
+                )
+                .unwrap();
+
+                let graph = if routed {
+                    let request = planner_request();
+                    let pool = planner_pool();
+                    begin_routed_planning(
+                        &mut conn,
+                        &BeginRoutedPlanning {
+                            source_task_id: 1,
+                            expected_revision: 1,
+                            assignment: &request,
+                            pool: &pool,
+                            seed: 7,
+                            now: 2,
+                        },
+                    )
+                    .unwrap()
+                    .map(|(graph, _)| graph)
+                } else {
+                    begin_planning(
+                        &mut conn,
+                        &BeginPlanning {
+                            source_task_id: 1,
+                            expected_revision: 1,
+                            provider: "codex",
+                            model: "sol",
+                            frozen_base_sha: "abc",
+                            now: 2,
+                        },
+                    )
+                    .unwrap()
+                };
+
+                assert_eq!(graph, None);
+                let state: (String, i64, i64) = conn
+                    .query_row(
+                        "SELECT status,
+                                (SELECT count(*) FROM task_decompositions),
+                                (SELECT count(*) FROM role_assignments)
+                         FROM tasks WHERE id=1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(state, ("open".into(), 0, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn routed_planning_rejects_wrong_context_assignment_without_partial_mutation() {
+        let (_dir, mut conn) = file_setup();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,profile_id,
+                 provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (71,'collector:pr:71',71,71,'collector','profile',
+                     'codex','codex','sol','high','collector','g1',1)",
+            [],
+        )
+        .unwrap();
+        let assignment = crate::role_assignments::get(&conn, 71).unwrap().unwrap();
+        let request = planner_request();
+        let pool = planner_pool();
+        let input = BeginRoutedPlanning {
+            source_task_id: 1,
+            expected_revision: 1,
+            assignment: &request,
+            pool: &pool,
+            seed: 7,
+            now: 2,
+        };
+        let result = (|| -> Result<()> {
+            let tx = begin_immediate(&mut conn)?;
+            tx.execute("UPDATE tasks SET status='planning' WHERE id=1", [])?;
+            insert_routed_planning_evidence(&tx, &input, &assignment)?;
+            tx.commit().map_err(map_sql_err)?;
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        let state: (String, i64) = conn
+            .query_row(
+                "SELECT status,(SELECT count(*) FROM task_decompositions)
+                 FROM tasks WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("open".into(), 0));
     }
 
     #[test]
@@ -1543,6 +3442,94 @@ mod tests {
         }
     }
 
+    fn sized_child(key: &str, size: &str, cx_est: i64) -> PlannedChild {
+        let mut child = child(key, &[]);
+        child.classification_refs = format!(
+            r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}}"#
+        );
+        child
+    }
+
+    #[test]
+    fn materialize_graph_applies_the_shared_size_policy_to_children() {
+        let (_dir, mut conn) = file_setup();
+        let graph = begin(&mut conn);
+        for (size, cx_est) in [("L", 4), ("L", 5), ("XL", 2)] {
+            let error = materialize_graph(
+                &mut conn,
+                graph,
+                1,
+                &[child("a", &[]), sized_child("b", size, cx_est)],
+                4,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid or unclassified decomposition children"),
+                "{size}/{cx_est}: {error}"
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM task_graph_members WHERE graph_id=?1",
+                [graph],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), sized_child("b", "L", 3)],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ids.len(), 2);
+        let refs = crate::tasks::get(&conn, ids[1]).unwrap().unwrap().refs;
+        assert!(crate::tasks::classification_is_dispatchable(
+            &refs, false, None
+        ));
+    }
+
+    #[test]
+    fn attempt_summaries_are_bounded_by_the_shared_cap() {
+        let (_dir, mut conn) = file_setup();
+        let graph = begin(&mut conn);
+        let at_cap = "s".repeat(ATTEMPT_SUMMARY_MAX_BYTES);
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "classifier-provider",
+            &at_cap,
+            5
+        )
+        .unwrap()
+        .is_some());
+        let over = "s".repeat(ATTEMPT_SUMMARY_MAX_BYTES + 1);
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "classifier-provider",
+            &over,
+            6
+        )
+        .is_err());
+        let stored: String = conn
+            .query_row(
+                "SELECT summary FROM decomposition_attempts WHERE graph_id=?1 AND reason_code='classifier-provider'",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.len(), ATTEMPT_SUMMARY_MAX_BYTES);
+    }
+
     fn make_reviewable_graph(conn: &mut Connection) -> (i64, Vec<i64>) {
         let graph = begin(conn);
         let ids = materialize_graph(conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
@@ -1581,6 +3568,330 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap()
+    }
+
+    const RECOVERY_PR: i64 = 526;
+    const ORIGINAL_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RECOVERY_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    struct RecoveryFixture {
+        _dir: tempfile::TempDir,
+        db_path: std::path::PathBuf,
+        conn: Connection,
+        graph: i64,
+        original: i64,
+        recovery: i64,
+        dependent: i64,
+        siblings: Vec<i64>,
+    }
+
+    type RecoveryEvidenceMutation = Box<dyn FnOnce(&mut RecoveryFixture)>;
+
+    impl RecoveryFixture {
+        fn new() -> Self {
+            let (dir, mut conn) = file_setup();
+            let db_path = dir.path().join("decomposition.db");
+            let graph = begin(&mut conn);
+            let children = [
+                child("one", &[]),
+                child("two", &[]),
+                child("three", &[]),
+                child("failed", &[]),
+            ];
+            let ids = materialize_graph(&mut conn, graph, 1, &children, 4)
+                .unwrap()
+                .unwrap();
+            let original = ids[3];
+            let siblings = ids[..3].to_vec();
+            for (ordinal, sibling) in siblings.iter().enumerate() {
+                conn.execute(
+                    "UPDATE tasks
+                     SET status='done',refs=json_object('pr',?2),
+                         completion_provenance=?3
+                     WHERE id=?1",
+                    params![
+                        sibling,
+                        RECOVERY_PR - 3 + ordinal as i64,
+                        crate::tasks::COMPLETION_PROVENANCE_MERGED
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE tasks SET status='failed',refs=?2 WHERE id=?1",
+                params![
+                    original,
+                    serde_json::json!({
+                        "daemon_parked": true,
+                        "daemon_parked_reason": "publication failed",
+                        "daemon_publication": {
+                            "branch": "daemon/original",
+                            "local_sha": ORIGINAL_HEAD,
+                            "pr": RECOVERY_PR,
+                            "stage": "intent"
+                        },
+                        "daemon_resume_status": "rework",
+                        "pr": RECOVERY_PR
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (?1,?2,'daemon/original',?3,0,8)",
+                params![original, RECOVERY_PR, ORIGINAL_HEAD],
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO tasks(title,status,labels,created_by,created_at,updated_at,refs,
+                     review_only,continue_pr)
+                 VALUES ('exact continuation','done','[\"type:recovery\"]','owner',9,40,?1,0,?2)",
+                params![
+                    serde_json::json!({
+                        "pr": RECOVERY_PR,
+                        "source_task": original
+                    })
+                    .to_string(),
+                    RECOVERY_PR
+                ],
+            )
+            .unwrap();
+            let recovery = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (?1,?2,'daemon/original',?3,0,25)",
+                params![recovery, RECOVERY_PR, RECOVERY_HEAD],
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO role_assignments(
+                     responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                     profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (?1,?2,NULL,'worker',NULL,'M','worker','codex','codex','sol','high',
+                         'worker','test',9)",
+                params![format!("worker:task:{recovery}:revision:1"), recovery],
+            )
+            .unwrap();
+            let worker_assignment = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+                     role_assignment_id,spawned_at,ended_at,end_reason)
+                 VALUES (?1,'worker','worker','sol','high','codex',?2,10,20,'completed')",
+                params![recovery, worker_assignment],
+            )
+            .unwrap();
+            crate::events::emit(
+                &conn,
+                "task_in_review",
+                &format!("task#{recovery}"),
+                "by worker",
+                15,
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO role_assignments(
+                     responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                     profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (?1,?2,?3,'reviewer','r1','M','reviewer','codex','codex','sol','high',
+                         'reviewer','test',21)",
+                params![
+                    format!("reviewer:task:{recovery}:r1"),
+                    recovery,
+                    RECOVERY_PR
+                ],
+            )
+            .unwrap();
+            let reviewer_assignment = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+                     role_assignment_id,spawned_at,ended_at,end_reason,review_cap_run_id,
+                     review_pr,review_head_sha)
+                 VALUES (?1,'reviewer','reviewer','sol','high','codex',?2,21,40,
+                         'verdict:approved','review-cap',?3,?4)",
+                params![recovery, reviewer_assignment, RECOVERY_PR, RECOVERY_HEAD],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO r2_sampling_decisions(pr_number,head_sha,task_id,required,created_at)
+                 VALUES (?1,?2,?3,0,29)",
+                params![RECOVERY_PR, RECOVERY_HEAD, recovery],
+            )
+            .unwrap();
+            crate::events::emit(
+                &conn,
+                "task_merging",
+                &format!("task#{recovery}"),
+                "by reviewer",
+                30,
+            )
+            .unwrap();
+            crate::events::emit(
+                &conn,
+                "task_done",
+                &format!("task#{recovery}"),
+                "by system",
+                40,
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,refs,depends_on)
+                 VALUES ('dependent','open','owner',41,41,'{}','[1]')",
+                [],
+            )
+            .unwrap();
+            let dependent = conn.last_insert_rowid();
+
+            Self {
+                _dir: dir,
+                db_path,
+                conn,
+                graph,
+                original,
+                recovery,
+                dependent,
+                siblings,
+            }
+        }
+
+        fn adoption(&mut self) -> bool {
+            adopt_recovery_delivery(&mut self.conn, self.original, self.recovery, 50).unwrap()
+        }
+
+        fn make_explicit_eligible(&mut self) {
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET completion_provenance=?2,
+                         refs=json_remove(refs,'$.source_task')
+                     WHERE id=?1",
+                    params![self.recovery, crate::tasks::COMPLETION_PROVENANCE_MERGED],
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "UPDATE pr_targets SET resolved_at=20 WHERE task_id=?1",
+                    [self.recovery],
+                )
+                .unwrap();
+        }
+
+        fn make_legacy_prepublication_eligible(&mut self) {
+            self.make_explicit_eligible();
+            let branch = format!("daemon/pivot-sma1-t{}", self.original);
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET status='open',assignee=NULL,reviewer=NULL,
+                         completion_provenance=NULL,refs=?2
+                     WHERE id=?1",
+                    params![
+                        self.original,
+                        serde_json::json!({
+                            "daemon_publication": {
+                                "branch": branch,
+                                "expected_remote_sha": null,
+                                "local_sha": ORIGINAL_HEAD,
+                                "pr": null,
+                                "stage": "intent",
+                                "target_branch": null
+                            }
+                        })
+                        .to_string()
+                    ],
+                )
+                .unwrap();
+            self.conn
+                .execute("DELETE FROM pr_targets WHERE task_id=?1", [self.original])
+                .unwrap();
+            self.conn
+                .execute(
+                    "UPDATE tasks SET target_branch='main' WHERE id IN (?1,?2)",
+                    params![1, self.recovery],
+                )
+                .unwrap();
+            let summary = format!(
+                "generated child task #{} failed: daemon-owned publication failed: daemon push to new branch refs/heads/{} rejected: error: failed to push some refs",
+                self.original, branch
+            );
+            self.conn
+                .execute(
+                    "UPDATE task_decompositions
+                     SET state='blocked',hold_code='generated-child-failed',hold_summary=?2
+                     WHERE id=?1",
+                    params![self.graph, summary],
+                )
+                .unwrap();
+        }
+
+        fn rewrite_legacy_prepublication_branch(&mut self, branch: &str) {
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET refs=json_set(refs,'$.daemon_publication.branch',?2)
+                     WHERE id=?1",
+                    params![self.original, branch],
+                )
+                .unwrap();
+            let summary = format!(
+                "generated child task #{} failed: daemon-owned publication failed: daemon push to new branch refs/heads/{} rejected: error: failed to push some refs",
+                self.original, branch
+            );
+            self.conn
+                .execute(
+                    "UPDATE task_decompositions SET hold_summary=?2 WHERE id=?1",
+                    params![self.graph, summary],
+                )
+                .unwrap();
+        }
+
+        fn rewrite_legacy_prepublication_local_sha(&mut self, local_sha: &str) {
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET refs=json_set(refs,'$.daemon_publication.local_sha',?2)
+                     WHERE id=?1",
+                    params![self.original, local_sha],
+                )
+                .unwrap();
+        }
+
+        fn add_final_worker_run(&mut self, end_reason: &str, ended_at: i64) {
+            let assignment: i64 = self
+                .conn
+                .query_row(
+                    "SELECT id FROM role_assignments
+                     WHERE task_id=?1 AND role='worker' AND pr_number IS NULL",
+                    [self.recovery],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+                         role_assignment_id,spawned_at,ended_at,end_reason)
+                     VALUES (?1,'worker','worker','sol','high','codex',?2,21,?3,?4)",
+                    params![self.recovery, assignment, ended_at, end_reason],
+                )
+                .unwrap();
+        }
+
+        fn explicit_adoption(&mut self, now: i64) -> bool {
+            adopt_explicit_recovery_delivery(
+                &mut self.conn,
+                &ExplicitRecoveryAdoption {
+                    original_child_id: self.original,
+                    recovery_task_id: self.recovery,
+                    authorized_by: "operator",
+                    now,
+                },
+            )
+            .unwrap()
+        }
     }
 
     #[test]
@@ -1666,6 +3977,149 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, ("planning".into(), drained_head.into()));
+    }
+
+    #[test]
+    fn bind_refuses_when_a_task_is_started_non_terminal() {
+        let mut conn = setup();
+        // Second task the drain must wait on. Starts terminal, then a supported
+        // operator retry restores it under the freeze between the tick's read
+        // and this bind's transaction — the atomic recheck must refuse.
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('other','failed','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "unused",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3).unwrap();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+
+        // Simulate the retry race: task #2 restored to in-review just before bind.
+        conn.execute("UPDATE tasks SET status='in-review' WHERE id=2", [])
+            .unwrap();
+        assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 4).unwrap());
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM task_decompositions WHERE id=?1",
+                [graph],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "draining");
+
+        // The planning source itself sits in `planning` — it must not block.
+        conn.execute("UPDATE tasks SET status='working' WHERE id=1", [])
+            .unwrap();
+        assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 5).unwrap());
+        conn.execute("UPDATE tasks SET status='planning' WHERE id=1", [])
+            .unwrap();
+
+        // Rework also holds; other terminals do not.
+        conn.execute("UPDATE tasks SET status='rework' WHERE id=2", [])
+            .unwrap();
+        assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 6).unwrap());
+        conn.execute("UPDATE tasks SET status='done' WHERE id=2", [])
+            .unwrap();
+        assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 7).unwrap());
+    }
+
+    #[test]
+    fn concurrent_retry_and_bind_never_capture_base_over_started_work() {
+        use std::sync::{Arc, Barrier};
+        for iteration in 0..32 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("retry-bind-{iteration}.db"));
+            let mut conn = crate::db::open(&path).unwrap();
+            // Source: sits in planning under the freeze.
+            let source = crate::tasks::create(
+                &mut conn, "owner", "src", None, 1, None, None, None, None, 1,
+            )
+            .unwrap();
+            // Parked continuation: `failed` with daemon_parked=1, resume=in-review.
+            let parked = crate::tasks::create(
+                &mut conn, "owner", "parked", None, 1, None, None, None, None, 1,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='failed',refs=json_set(
+                    json_object(
+                        'cx_est',2,'cx_size','S','cx_ready',true,
+                        'cx_not_ready_reason',NULL,'cx_by','test:v2'
+                    ),
+                    '$.daemon_parked', json('true'),
+                    '$.daemon_parked_reason','test',
+                    '$.daemon_resume_status','in-review'
+                 ) WHERE id=?1",
+                [parked],
+            )
+            .unwrap();
+            let graph = begin_planning(
+                &mut conn,
+                &BeginPlanning {
+                    source_task_id: source,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "sol",
+                    frozen_base_sha: "unused",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3).unwrap();
+            drop(conn);
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            let retry_path = path.clone();
+            let retry_barrier = Arc::clone(&barrier);
+            let retry = std::thread::spawn(move || {
+                let mut conn = crate::db::open(&retry_path).unwrap();
+                retry_barrier.wait();
+                crate::tasks::retry_parked(&mut conn, parked, "operator", true, 4)
+            });
+
+            let bind_path = path.clone();
+            let bind_barrier = Arc::clone(&barrier);
+            let bind = std::thread::spawn(move || {
+                let mut conn = crate::db::open(&bind_path).unwrap();
+                bind_barrier.wait();
+                let sha = "0123456789abcdef0123456789abcdef01234567";
+                bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 4).unwrap()
+            });
+
+            let retry_result = retry.join().unwrap();
+            let _bind_result = bind.join().unwrap();
+
+            // The freeze guard in `retry_parked` fires under an active freeze,
+            // so retry must fail regardless of scheduling. The parked task must
+            // still be `failed`; bind may or may not have committed the base,
+            // but it cannot have done so over restored non-terminal work.
+            assert!(
+                retry_result.is_err(),
+                "iteration {iteration}: retry_parked succeeded under an active freeze"
+            );
+            let conn = crate::db::open(&path).unwrap();
+            let restored_status: String = conn
+                .query_row("SELECT status FROM tasks WHERE id=?1", [parked], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(restored_status, "failed", "iteration {iteration}");
+        }
     }
 
     #[test]
@@ -1914,6 +4368,258 @@ mod tests {
         assert_eq!(state, ("held".into(), 0, 0, 0));
     }
 
+    fn accepted_columns(conn: &Connection, graph: i64) -> (String, Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT state,accepted_proposal_json,accepted_classifications_json
+             FROM task_decompositions WHERE id=?1",
+            [graph],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    fn planning_graph(conn: &mut Connection) -> i64 {
+        let graph = begin_planning(
+            conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(set_frozen_phase(conn, graph, "freeze-requested", "planning", None, 2).unwrap());
+        graph
+    }
+
+    /// The lifecycle order is planning -> preclassifying (classifier) ->
+    /// validating (Arbiter): an accepted proposal never reaches the Arbiter
+    /// phase until its classification is durably accepted, and the
+    /// classification is discarded with the proposal it belongs to.
+    #[test]
+    fn accepted_proposal_is_classified_before_it_reaches_the_arbiter_phase() {
+        let mut conn = setup();
+        let graph = planning_graph(&mut conn);
+
+        assert!(accept_proposal(&mut conn, graph, "[]", 3).unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("preclassifying".into(), Some("[]".into()), None)
+        );
+        assert!(
+            !accept_proposal(&mut conn, graph, "[]", 4).unwrap(),
+            "a proposal is accepted from planning only"
+        );
+
+        assert!(accept_classifications(&mut conn, graph, r#"{"tasks":[]}"#, 5).unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            (
+                "validating".into(),
+                Some("[]".into()),
+                Some(r#"{"tasks":[]}"#.into())
+            )
+        );
+        assert!(
+            !accept_classifications(&mut conn, graph, "[]", 6).unwrap(),
+            "the guarded classification write is keyed on preclassifying"
+        );
+        assert_eq!(
+            accepted_columns(&conn, graph).2.as_deref(),
+            Some(r#"{"tasks":[]}"#),
+            "a second classification cannot replace the reviewed one"
+        );
+
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "validating",
+            "arbiter-changes",
+            "blocking finding",
+            7,
+        )
+        .unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("planning".into(), None, None),
+            "an Arbiter rejection discards the proposal and its classification"
+        );
+
+        // The next proposal must be classified again before any Arbiter run.
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_classifications_json='stale' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert!(accept_proposal(&mut conn, graph, "[1]", 8).unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("preclassifying".into(), Some("[1]".into()), None),
+            "a stale classification never carries into a new proposal"
+        );
+    }
+
+    #[test]
+    fn classification_acceptance_requires_a_durable_proposal() {
+        let mut conn = setup();
+        let graph = planning_graph(&mut conn);
+        assert!(set_frozen_phase(&mut conn, graph, "planning", "preclassifying", None, 3).unwrap());
+        assert!(
+            !accept_classifications(&mut conn, graph, "[]", 4).unwrap(),
+            "preclassifying without an accepted proposal has nothing to classify"
+        );
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("preclassifying".into(), None, None)
+        );
+        assert!(accept_classifications(&mut conn, graph, "", 5).is_err());
+        assert!(accept_classifications(&mut conn, graph, "not json", 5).is_err());
+    }
+
+    #[test]
+    fn classifier_rejection_from_preclassifying_never_reaches_validating() {
+        let mut conn = setup();
+        let graph = planning_graph(&mut conn);
+        assert!(accept_proposal(&mut conn, graph, "[]", 3).unwrap());
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "preclassifying",
+            "child-preclassification",
+            "child a rejected by preclassification: size L",
+            4,
+        )
+        .unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("planning".into(), None, None)
+        );
+        assert!(
+            !accept_classifications(&mut conn, graph, "[]", 5).unwrap(),
+            "a rejected proposal cannot be advanced into the Arbiter phase"
+        );
+        assert_eq!(accepted_columns(&conn, graph).0, "planning");
+    }
+
+    #[test]
+    fn compatibility_reset_and_materialization_clear_accepted_classifications() {
+        let mut conn = setup();
+        let graph = planning_graph(&mut conn);
+        assert!(accept_proposal(&mut conn, graph, "[]", 3).unwrap());
+        assert!(accept_classifications(&mut conn, graph, "[]", 4).unwrap());
+        assert!(reset_accepted_proposal_to_planning(&mut conn, graph, "validating", 5).unwrap());
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("planning".into(), None, None)
+        );
+
+        assert!(accept_proposal(&mut conn, graph, "[]", 6).unwrap());
+        assert!(accept_classifications(&mut conn, graph, "[]", 7).unwrap());
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            accepted_columns(&conn, graph),
+            ("active".into(), None, None)
+        );
+    }
+
+    #[test]
+    fn frozen_proposal_rejection_atomically_retries_then_holds() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+
+        for ordinal in 1..=MAX_PROPOSAL_ATTEMPTS {
+            let phase = if ordinal == 1 {
+                "preclassifying"
+            } else {
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "planning",
+                    "validating",
+                    None,
+                    ordinal * 10,
+                )
+                .unwrap());
+                conn.execute(
+                    "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                    [graph],
+                )
+                .unwrap();
+                "validating"
+            };
+            let summary = format!("bounded rejection {ordinal}");
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "deterministic-validation",
+                &summary,
+                ordinal * 10 + 1,
+            )
+            .unwrap());
+
+            let state: (String, i64, i64, Option<String>, String, i64) = conn
+                .query_row(
+                    "SELECT d.state,d.freeze_active,d.proposal_attempts,
+                            d.accepted_proposal_json,t.status,
+                            (SELECT count(*) FROM decomposition_attempts WHERE graph_id=d.id)
+                     FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                     WHERE d.id=?1",
+                    [graph],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            if ordinal < MAX_PROPOSAL_ATTEMPTS {
+                assert_eq!(
+                    state,
+                    (
+                        "planning".into(),
+                        1,
+                        ordinal,
+                        None,
+                        "planning".into(),
+                        ordinal
+                    )
+                );
+            } else {
+                assert_eq!(
+                    state,
+                    ("held".into(), 0, ordinal, None, "failed".into(), ordinal)
+                );
+            }
+        }
+
+        let authority: (i64, i64) = conn
+            .query_row(
+                "SELECT count(*),(SELECT count(*) FROM task_graph_members) FROM tasks",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(authority, (1, 0));
+    }
+
     #[test]
     fn provider_failure_releases_freeze_and_third_failure_holds() {
         let mut conn = setup();
@@ -1955,6 +4661,745 @@ mod tests {
             )
             .unwrap();
         assert_eq!(held, ("held".into(), 3, "failed".into()));
+    }
+
+    #[test]
+    fn exhausted_provider_retry_preserves_attempts_and_appends_next_generation() {
+        let (mut conn, graph) = exhausted_provider();
+        assert_eq!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 30).unwrap(),
+            PlanningRetryOutcome::Retried {
+                graph_id: graph,
+                generation: 1,
+            }
+        );
+        let restored: (String, i64, i64, i64, Option<String>, String) = conn
+            .query_row(
+                "SELECT d.state,d.provider_failures,d.proposal_attempts,
+                        d.operator_retry_count,d.hold_code,t.status
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            restored,
+            ("provider-backoff".into(), 0, 0, 1, None, "planning".into())
+        );
+        assert!(reacquire_freeze(&mut conn, graph, 31).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 32,).unwrap()
+        );
+        assert_eq!(
+            record_attempt(
+                &mut conn,
+                graph,
+                "provider",
+                "test-failure",
+                "new generation",
+                33,
+            )
+            .unwrap(),
+            Some(4)
+        );
+        let attempts: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT ordinal,retry_generation FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='provider' ORDER BY ordinal",
+            )
+            .unwrap()
+            .query_map([graph], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(attempts, vec![(1, 0), (2, 0), (3, 0), (4, 1)]);
+        let events: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='decomposition_planning_retry' AND subject='task#1'
+                   AND body LIKE '%generation 1%operator%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[test]
+    fn retried_planning_reacquires_single_freeze_and_materializes_valid_graph() {
+        let (mut conn, graph) = exhausted_provider();
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 30).unwrap(),
+            PlanningRetryOutcome::Retried { .. }
+        ));
+        let competing_source = crate::tasks::create(
+            &mut conn,
+            "owner",
+            "competing source",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            31,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,freeze_active,planned_source_revision,created_at,updated_at)
+             VALUES (?1,'freeze-requested',1,1,31,31)",
+            [competing_source],
+        )
+        .unwrap();
+        assert!(!reacquire_freeze(&mut conn, graph, 32).unwrap());
+        conn.execute(
+            "UPDATE task_decompositions SET state='cancelled',freeze_active=0
+             WHERE source_task_id=?1",
+            [competing_source],
+        )
+        .unwrap();
+        assert!(reacquire_freeze(&mut conn, graph, 33).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 34,).unwrap()
+        );
+        let proposal = serde_json::json!({"outcome":"plan","tasks":[
+            {"key":"a"},{"key":"b","prerequisites":["a"]}
+        ]})
+        .to_string();
+        assert!(accept_proposal(&mut conn, graph, &proposal, 35).unwrap());
+        let children = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &["a"])],
+            36,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(children.len(), 2);
+        let state: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("active".into(), 1, "decomposed".into()));
+    }
+
+    #[test]
+    fn exhausted_proposal_retry_resets_only_proposal_budget_and_resumes_freeze() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "timeout",
+            "preserved provider failure",
+            3,
+        )
+        .unwrap()
+        .is_some());
+        assert!(reacquire_freeze(&mut conn, graph, 4).unwrap());
+        assert!(set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            5,
+        )
+        .unwrap());
+        for ordinal in 1..=MAX_PROPOSAL_ATTEMPTS {
+            if ordinal > 1 {
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "planning",
+                    "validating",
+                    None,
+                    ordinal * 10,
+                )
+                .unwrap());
+            }
+            conn.execute(
+                "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                [graph],
+            )
+            .unwrap();
+            let phase = if ordinal == 1 {
+                "preclassifying"
+            } else {
+                "validating"
+            };
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "semantic",
+                "proposal rejected",
+                ordinal * 10 + 1,
+            )
+            .unwrap());
+        }
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 40).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 1, .. }
+        ));
+        let budgets: (i64, i64, String) = conn
+            .query_row(
+                "SELECT proposal_attempts,provider_failures,state
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(budgets, (0, 1, "provider-backoff".into()));
+        assert!(reacquire_freeze(&mut conn, graph, 41).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "validating", None, 42,)
+                .unwrap()
+        );
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "validating",
+            "semantic",
+            "new rejection",
+            43,
+        )
+        .unwrap());
+        let latest: (i64, i64) = conn
+            .query_row(
+                "SELECT ordinal,retry_generation FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='proposal' ORDER BY ordinal DESC LIMIT 1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(latest, (4, 1));
+    }
+
+    #[test]
+    fn exhausted_carried_proposal_budget_remains_operator_retryable() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        for attempt in 0..2 {
+            let phase = if attempt == 0 {
+                "preclassifying"
+            } else {
+                assert!(
+                    set_frozen_phase(&mut conn, graph, "planning", "validating", None, 10,)
+                        .unwrap()
+                );
+                "validating"
+            };
+            conn.execute(
+                "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                [graph],
+            )
+            .unwrap();
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "semantic",
+                "carried proposal rejection",
+                11 + attempt,
+            )
+            .unwrap());
+        }
+        exhaust_planning(&mut conn, graph, "provider", 20);
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 40).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 1, .. }
+        ));
+
+        assert!(reacquire_freeze(&mut conn, graph, 41).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "validating", None, 42,)
+                .unwrap()
+        );
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "validating",
+            "semantic",
+            "exhaust carried proposal budget",
+            43,
+        )
+        .unwrap());
+        let held: (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT hold_code,proposal_attempts,provider_failures,
+                        (SELECT count(*) FROM decomposition_attempts
+                         WHERE graph_id=?1 AND kind='proposal' AND retry_generation=1)
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(held, ("proposal-attempts-exhausted".into(), 3, 0, 1));
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 44).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn exhausted_carried_provider_budget_remains_operator_retryable() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "timeout",
+            "first carried provider failure",
+            10,
+        )
+        .unwrap()
+        .is_some());
+        assert!(reacquire_freeze(&mut conn, graph, 11).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 12,).unwrap()
+        );
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "timeout",
+            "second carried provider failure",
+            13,
+        )
+        .unwrap()
+        .is_some());
+        assert!(reacquire_freeze(&mut conn, graph, 14).unwrap());
+        assert!(set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            15,
+        )
+        .unwrap());
+        for attempt in 0..MAX_PROPOSAL_ATTEMPTS {
+            let phase = if attempt == 0 {
+                "preclassifying"
+            } else {
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "planning",
+                    "validating",
+                    None,
+                    20 + attempt,
+                )
+                .unwrap());
+                "validating"
+            };
+            conn.execute(
+                "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                [graph],
+            )
+            .unwrap();
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "semantic",
+                "proposal rejection before carried provider exhaustion",
+                30 + attempt,
+            )
+            .unwrap());
+        }
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 40).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 1, .. }
+        ));
+
+        assert!(reacquire_freeze(&mut conn, graph, 41).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 42,).unwrap()
+        );
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "timeout",
+            "exhaust carried provider budget",
+            43,
+        )
+        .unwrap()
+        .is_some());
+        let held: (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT hold_code,proposal_attempts,provider_failures,
+                        (SELECT count(*) FROM decomposition_attempts
+                         WHERE graph_id=?1 AND kind='provider' AND retry_generation=1)
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(held, ("provider-attempts-exhausted".into(), 0, 3, 1));
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 44).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn exhausted_planning_retry_cap_is_bounded_and_clean() {
+        let (mut conn, graph) = exhausted_provider();
+        for generation in 1..=MAX_OPERATOR_RETRIES {
+            assert!(matches!(
+                retry_exhausted_planning(&mut conn, 1, "operator", generation * 100).unwrap(),
+                PlanningRetryOutcome::Retried { generation: actual, .. } if actual == generation
+            ));
+            assert!(reacquire_freeze(&mut conn, graph, generation * 100 + 1).unwrap());
+            assert!(set_frozen_phase(
+                &mut conn,
+                graph,
+                "freeze-requested",
+                "planning",
+                None,
+                generation * 100 + 2,
+            )
+            .unwrap());
+            exhaust_planning(&mut conn, graph, "provider", generation * 100 + 10);
+        }
+        let before: (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT state,provider_failures,operator_retry_count,
+                        (SELECT count(*) FROM events WHERE kind='decomposition_planning_retry')
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 999).unwrap(),
+            PlanningRetryOutcome::RetryCapExhausted {
+                retry_count: MAX_OPERATOR_RETRIES,
+            }
+        );
+        let after: (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT state,provider_failures,operator_retry_count,
+                        (SELECT count(*) FROM events WHERE kind='decomposition_planning_retry')
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(after.3, MAX_OPERATOR_RETRIES);
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='provider'",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 3 * (MAX_OPERATOR_RETRIES + 1));
+    }
+
+    #[test]
+    fn exhausted_planning_retry_rejects_corrupt_or_materialized_authority() {
+        for mutation in [
+            "UPDATE task_decompositions SET hold_code='scope-blocker' WHERE id=?1",
+            "UPDATE task_decompositions SET provider_failures=2 WHERE id=?1",
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            "UPDATE task_decompositions SET accepted_plan_revision=1 WHERE id=?1",
+            "UPDATE task_decompositions SET active=1 WHERE id=?1",
+            "UPDATE task_decompositions SET freeze_active=1 WHERE id=?1",
+        ] {
+            let (conn, graph) = exhausted_provider();
+            conn.execute(mutation, [graph]).unwrap();
+            assert_exhausted_retry_rejected(conn, graph);
+        }
+
+        let (conn, graph) = exhausted_provider();
+        conn.execute(
+            "DELETE FROM decomposition_attempts WHERE graph_id=?1 AND ordinal=3",
+            [graph],
+        )
+        .unwrap();
+        assert_exhausted_retry_rejected(conn, graph);
+
+        for mutation in [
+            "UPDATE tasks SET revision=2 WHERE id=1",
+            "UPDATE tasks SET review_only=1 WHERE id=1",
+            "UPDATE tasks SET continue_pr=42 WHERE id=1",
+            "UPDATE tasks SET reviewer='reviewer' WHERE id=1",
+            "UPDATE tasks SET completion_provenance='merged' WHERE id=1",
+            "UPDATE tasks SET refs=json_object('pr',42) WHERE id=1",
+            "UPDATE tasks SET refs=json_object('daemon_publication',json_object(\
+                 'pr',42,'branch','daemon/source','local_sha','abc',\
+                 'expected_remote_sha','def','stage','push')) WHERE id=1",
+        ] {
+            let (conn, graph) = exhausted_provider();
+            conn.execute(mutation, []).unwrap();
+            assert_exhausted_retry_rejected(conn, graph);
+        }
+
+        let (mut conn, graph) = exhausted_provider();
+        let child = crate::tasks::create(
+            &mut conn,
+            "owner",
+            "generated child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            80,
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?1", [child])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'child',1,0)",
+            params![graph, child],
+        )
+        .unwrap();
+        assert_exhausted_retry_rejected(conn, graph);
+
+        let (conn, graph) = exhausted_provider();
+        conn.execute(
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,spawned_at)
+             VALUES (1,'worker','worker','model','high',80)",
+            [],
+        )
+        .unwrap();
+        assert_exhausted_retry_rejected(conn, graph);
+
+        let (conn, graph) = exhausted_provider();
+        conn.execute(
+            "INSERT INTO journal(agent,role,task_id,session_id,phase,updated_at)
+             VALUES ('worker','worker',1,'session','working',80)",
+            [],
+        )
+        .unwrap();
+        assert_exhausted_retry_rejected(conn, graph);
+
+        let (conn, graph) = exhausted_provider();
+        conn.execute(
+            "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,resolved_at)
+             VALUES (1,42,'branch',?1,80)",
+            ["a".repeat(40)],
+        )
+        .unwrap();
+        assert_exhausted_retry_rejected(conn, graph);
+
+        let (conn, graph) = exhausted_provider();
+        conn.execute(
+            "INSERT INTO decomposition_cleanup(
+                 graph_id,task_id,artifact_kind,artifact_ref,updated_at)
+             VALUES (?1,1,'process','evidence',80)",
+            [graph],
+        )
+        .unwrap();
+        assert_exhausted_retry_rejected(conn, graph);
+    }
+
+    #[test]
+    fn provider_retry_rebinds_a_fresh_frozen_base_after_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider-retry-frozen-base.db");
+        {
+            let conn = crate::db::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let graph = {
+            let mut conn = crate::db::open(&path).unwrap();
+            begin_planning(
+                &mut conn,
+                &BeginPlanning {
+                    source_task_id: 1,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "sol",
+                    frozen_base_sha: "ignored-until-drained",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first_sha = "0123456789abcdef0123456789abcdef01234567";
+        {
+            let mut conn = crate::db::open(&path).unwrap();
+            assert!(
+                set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3,)
+                    .unwrap()
+            );
+            assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, first_sha, 4).unwrap());
+        }
+        {
+            let mut conn = crate::db::open(&path).unwrap();
+            assert_eq!(
+                record_attempt(
+                    &mut conn,
+                    graph,
+                    "provider",
+                    "timeout",
+                    "planner timed out",
+                    5,
+                )
+                .unwrap(),
+                Some(1)
+            );
+        }
+        {
+            let conn = crate::db::open(&path).unwrap();
+            let state: (String, i64, Option<String>, i64) = conn
+                .query_row(
+                    "SELECT state,freeze_active,frozen_base_sha,provider_failures
+                     FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("provider-backoff".into(), 0, None, 1));
+        }
+        {
+            let mut conn = crate::db::open(&path).unwrap();
+            assert!(reacquire_freeze(&mut conn, graph, 6).unwrap());
+            assert!(
+                set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 7,)
+                    .unwrap()
+            );
+            let retry_sha = "fedcba9876543210fedcba9876543210fedcba98";
+            assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, retry_sha, 8).unwrap());
+        }
+        let conn = crate::db::open(&path).unwrap();
+        let rebound: (String, String, i64) = conn
+            .query_row(
+                "SELECT state,frozen_base_sha,provider_failures
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            rebound,
+            (
+                "planning".into(),
+                "fedcba9876543210fedcba9876543210fedcba98".into(),
+                1,
+            )
+        );
+    }
+
+    #[test]
+    fn concurrent_provider_retry_reacquire_has_one_clean_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider-retry-reacquire-race.db");
+        let mut conn = crate::db::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('large','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "ignored-until-drained",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3).unwrap();
+        bind_frozen_base_and_enter_planning(
+            &mut conn,
+            graph,
+            "0123456789abcdef0123456789abcdef01234567",
+            4,
+        )
+        .unwrap();
+        record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "timeout",
+            "planner timed out",
+            5,
+        )
+        .unwrap();
+        drop(conn);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    reacquire_freeze(&mut conn, graph, 6).unwrap()
+                })
+            })
+            .collect();
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap() as usize)
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+
+        let conn = crate::db::open(&path).unwrap();
+        let state: (String, i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT state,freeze_active,frozen_base_sha,provider_failures
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("freeze-requested".into(), 1, None, 1));
     }
 
     #[test]
@@ -2230,6 +5675,252 @@ mod tests {
         ));
     }
 
+    struct CancelledSnapshot {
+        state: String,
+        active: i64,
+        freeze_active: i64,
+        frozen_base_sha: Option<String>,
+        hold_code: Option<String>,
+        hold_summary: Option<String>,
+        planner_assignment_id: Option<i64>,
+        source_status: String,
+    }
+
+    fn assert_source_and_graph_cancelled(conn: &Connection, graph: i64) {
+        let snapshot = conn
+            .query_row(
+                "SELECT d.state,d.active,d.freeze_active,d.frozen_base_sha,
+                        d.hold_code,d.hold_summary,d.planner_assignment_id,t.status
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| {
+                    Ok(CancelledSnapshot {
+                        state: row.get(0)?,
+                        active: row.get(1)?,
+                        freeze_active: row.get(2)?,
+                        frozen_base_sha: row.get(3)?,
+                        hold_code: row.get(4)?,
+                        hold_summary: row.get(5)?,
+                        planner_assignment_id: row.get(6)?,
+                        source_status: row.get(7)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(snapshot.state, "cancelled", "graph state");
+        assert_eq!(snapshot.active, 0, "graph active flag");
+        assert_eq!(snapshot.freeze_active, 0, "graph freeze_active flag");
+        assert!(
+            snapshot.frozen_base_sha.is_none(),
+            "frozen_base_sha cleared"
+        );
+        assert!(snapshot.hold_code.is_none(), "hold_code cleared");
+        assert!(snapshot.hold_summary.is_none(), "hold_summary cleared");
+        assert!(
+            snapshot.planner_assignment_id.is_none(),
+            "planner_assignment_id cleared"
+        );
+        assert_eq!(snapshot.source_status, "cancelled", "source task status");
+    }
+
+    #[test]
+    fn source_cancellation_from_provider_backoff_releases_zero_child_graph() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        record_attempt(&mut conn, graph, "provider", "timeout", "first", 3)
+            .unwrap()
+            .unwrap();
+        let pre: (String, i64, i64) = conn
+            .query_row(
+                "SELECT state,active,freeze_active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            pre,
+            ("provider-backoff".into(), 0, 0),
+            "precondition: stranded in provider-backoff"
+        );
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 5).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        assert_source_and_graph_cancelled(&conn, graph);
+
+        let members: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_graph_members WHERE graph_id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 0, "no members to clean up");
+        let cleanups: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM decomposition_cleanup WHERE graph_id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleanups, 0, "no cleanup intents to persist");
+        let events: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='task_cancelled' AND subject='task#1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "task_cancelled emitted once");
+    }
+
+    #[test]
+    fn source_cancellation_from_routed_provider_backoff_releases_planner_assignment_link() {
+        let (_dir, mut conn) = file_setup();
+        let request = planner_request();
+        let pool = planner_pool();
+        let (graph, assignment) = begin_routed_planning(
+            &mut conn,
+            &BeginRoutedPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                assignment: &request,
+                pool: &pool,
+                seed: 7,
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        // Drive the routed aggregate into provider-backoff. `record_attempt`
+        // accepts any non-terminal, inactive state, so the freeze-requested
+        // aggregate transitions on the first provider failure. The
+        // planner_assignment_id link persists across that transition.
+        record_attempt(&mut conn, graph, "provider", "timeout", "first", 4)
+            .unwrap()
+            .unwrap();
+        let pre: (String, i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT state,active,freeze_active,planner_assignment_id
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (pre.0, pre.1, pre.2, pre.3),
+            ("provider-backoff".into(), 0, 0, Some(assignment.id)),
+            "precondition: routed provider-backoff still binds the planner assignment"
+        );
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 6).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        assert_source_and_graph_cancelled(&conn, graph);
+
+        // The role assignment itself is immutable evidence and must survive.
+        let assignment_survives: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM role_assignments WHERE id=?1",
+                [assignment.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            assignment_survives, 1,
+            "immutable planner assignment row is retained as evidence"
+        );
+    }
+
+    #[test]
+    fn source_cancellation_from_held_state_releases_exhausted_graph() {
+        let (mut conn, graph) = exhausted_provider();
+        let pre: (String, i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT state,active,freeze_active,hold_code
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (pre.0, pre.1, pre.2),
+            ("held".into(), 0, 0),
+            "precondition: exhausted planning stranded in held"
+        );
+        assert!(pre.3.is_some(), "precondition: hold_code populated");
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 20).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        assert_source_and_graph_cancelled(&conn, graph);
+    }
+
+    #[test]
+    fn source_cancellation_from_freeze_requested_releases_pre_children_graph() {
+        let mut conn = setup();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let pre: (String, i64, i64) = conn
+            .query_row(
+                "SELECT state,active,freeze_active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pre, ("freeze-requested".into(), 0, 1));
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 5).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        assert_source_and_graph_cancelled(&conn, graph);
+    }
+
+    #[test]
+    fn source_cancellation_rejects_terminal_graph_states() {
+        for terminal in ["completed", "cancelled"] {
+            let mut conn = setup();
+            let graph = begin(&mut conn);
+            conn.execute(
+                "UPDATE task_decompositions SET state=?2,active=0,freeze_active=0 WHERE id=?1",
+                params![graph, terminal],
+            )
+            .unwrap();
+            let source_status_before: String = conn
+                .query_row("SELECT status FROM tasks WHERE id=1", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                cancel_source_graph(&mut conn, "owner", 1, Some(1), 5).unwrap(),
+                SourceCancellation::Rejected,
+                "terminal graph state {terminal} must refuse cancellation"
+            );
+            let source_status_after: String = conn
+                .query_row("SELECT status FROM tasks WHERE id=1", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                source_status_before, source_status_after,
+                "terminal refusal must not mutate source"
+            );
+        }
+    }
+
     #[test]
     fn cleanup_intents_reject_unknown_malformed_nul_and_oversize_without_mutation() {
         for (kind, artifact_ref) in [
@@ -2332,6 +6023,85 @@ mod tests {
     }
 
     #[test]
+    fn startup_reconciliation_repairs_pre_fix_provider_retry_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-provider-retry.db");
+        let graph = {
+            let mut conn = crate::db::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            let graph = begin_planning(
+                &mut conn,
+                &BeginPlanning {
+                    source_task_id: 1,
+                    expected_revision: 1,
+                    provider: "claude",
+                    model: "opus",
+                    frozen_base_sha: "ignored-until-drained",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3).unwrap();
+            bind_frozen_base_and_enter_planning(
+                &mut conn,
+                graph,
+                "0123456789abcdef0123456789abcdef01234567",
+                4,
+            )
+            .unwrap();
+            record_attempt(
+                &mut conn,
+                graph,
+                "provider",
+                "protocol",
+                "missing outcome",
+                5,
+            )
+            .unwrap();
+            reacquire_freeze(&mut conn, graph, 6).unwrap();
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 7).unwrap();
+            conn.execute(
+                "UPDATE task_decompositions SET frozen_base_sha=?2 WHERE id=?1",
+                params![graph, "0123456789abcdef0123456789abcdef01234567"],
+            )
+            .unwrap();
+            graph
+        };
+
+        let mut conn = crate::db::open(&path).unwrap();
+        reconcile_startup_graphs(&mut conn, 8).unwrap();
+        assert!(bind_frozen_base_and_enter_planning(
+            &mut conn,
+            graph,
+            "fedcba9876543210fedcba9876543210fedcba98",
+            9,
+        )
+        .unwrap());
+        let state: (String, String, i64) = conn
+            .query_row(
+                "SELECT state,frozen_base_sha,provider_failures
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "planning".into(),
+                "fedcba9876543210fedcba9876543210fedcba98".into(),
+                1,
+            )
+        );
+    }
+
+    #[test]
     fn startup_reconciliation_holds_incomplete_graph_with_delivery_evidence() {
         let mut conn = setup();
         let graph = begin(&mut conn);
@@ -2382,6 +6152,15 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(replacement.len(), 2);
+        let retained_history: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_graph_members
+                 WHERE graph_id=?1 AND active=0 AND plan_revision=1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_history, 2);
         let state: (String, i64, i64) = conn
             .query_row(
                 "SELECT state,active,freeze_active FROM task_decompositions WHERE id=?1",
@@ -2390,6 +6169,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("active".into(), 1, 0));
+
+        let before_delivery = reconcile_startup_graphs(&mut conn, 10).unwrap();
+        assert_eq!(
+            before_delivery,
+            StartupReconcileResult {
+                healthy: 1,
+                reset: 0,
+                held: 0,
+            }
+        );
+
+        conn.execute(
+            "UPDATE tasks SET status='working' WHERE id=?1",
+            [replacement[0]],
+        )
+        .unwrap();
+        let after_delivery = reconcile_startup_graphs(&mut conn, 11).unwrap();
+        assert_eq!(
+            after_delivery,
+            StartupReconcileResult {
+                healthy: 1,
+                reset: 0,
+                held: 0,
+            }
+        );
+        let final_state: (String, i64) = conn
+            .query_row(
+                "SELECT state,active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(final_state, ("active".into(), 1));
     }
 
     #[test]
@@ -2442,6 +6254,56 @@ mod tests {
     }
 
     #[test]
+    fn blocked_graph_member_is_not_selected_until_graph_reactivates() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[
+                child("prerequisite", &[]),
+                child("ready", &["prerequisite"]),
+            ],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        conn.execute(
+            "UPDATE task_decompositions SET state='blocked' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+
+        let selected = crate::tasks::list_implementation_ready_open(&conn).unwrap();
+        assert!(
+            selected.is_empty(),
+            "blocked graph member must not be selected"
+        );
+        let claims: i64 = conn
+            .query_row("SELECT count(*) FROM claims", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(claims, 0, "selection must not attempt a claim");
+
+        conn.execute(
+            "UPDATE task_decompositions SET state='active',active=1 WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        let selected = crate::tasks::list_implementation_ready_open(&conn).unwrap();
+        assert_eq!(
+            selected.iter().map(|task| task.id).collect::<Vec<_>>(),
+            [ids[1]]
+        );
+        let claimed = crate::tasks::claim(&mut conn, "worker", Some(ids[1]), &[], 60, 5)
+            .unwrap()
+            .expect("reactivated graph member must claim on the next tick");
+        assert_eq!(claimed.id, ids[1]);
+    }
+
+    #[test]
     fn failed_sibling_stops_new_implementation_claims() {
         let mut conn = setup();
         let graph = begin(&mut conn);
@@ -2471,6 +6333,153 @@ mod tests {
             })
             .unwrap();
         assert_eq!(first_status, "working", "active sibling keeps authority");
+    }
+
+    #[test]
+    fn failed_child_blocks_active_graph_and_alerts_owner_atomically() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        let reason = "push rejected after protected-branch update";
+        let tx = begin_immediate(&mut conn).unwrap();
+        tx.execute(
+            "UPDATE tasks SET status='failed',refs=?2,updated_at=5 WHERE id=?1",
+            params![
+                ids[0],
+                serde_json::json!({
+                    "daemon_parked": true,
+                    "daemon_parked_reason": reason,
+                    "daemon_resume_status": "rework"
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+        assert!(block_graph_if_child_failed(&tx, ids[0], reason, 5).unwrap());
+        tx.commit().unwrap();
+
+        let aggregate: (String, i64, String, String) = conn
+            .query_row(
+                "SELECT state,active,hold_code,hold_summary
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(aggregate.0, "blocked");
+        assert_eq!(aggregate.1, 1);
+        assert_eq!(aggregate.2, "generated-child-failed");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&aggregate.3).unwrap(),
+            serde_json::json!({"affected_task": ids[0], "reason": reason})
+        );
+        let event: (String, String, String) = conn
+            .query_row(
+                "SELECT kind,subject,body FROM events
+                 WHERE kind='task_graph_blocked'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(event.0, "task_graph_blocked");
+        assert_eq!(event.1, format!("task#{}", ids[0]));
+        assert!(event.2.contains(&format!("task #{}", ids[0])));
+        assert!(event.2.contains(reason));
+        let alert: (String, String, String, String) = conn
+            .query_row(
+                "SELECT kind,recipient,refs,body FROM messages
+                 WHERE kind='alert' AND recipient='owner'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(alert.0, "alert");
+        assert_eq!(alert.1, "owner");
+        assert_eq!(alert.2, format!("task:{}", ids[0]));
+        assert!(alert.3.contains("task graph blocked"));
+        assert!(alert.3.contains(reason));
+    }
+
+    #[test]
+    fn failed_child_with_retry_or_remediation_marker_keeps_graph_active() {
+        for refs in [
+            serde_json::json!({"runner_retry": {"requested": true}}),
+            serde_json::json!({"codex_retry_requested": true}),
+            serde_json::json!({"daemon_rework_retry_requested": true}),
+            serde_json::json!({"ci_remediation_requested": true}),
+        ] {
+            let mut conn = setup();
+            let graph = begin(&mut conn);
+            let ids =
+                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+                    .unwrap()
+                    .unwrap();
+            let tx = begin_immediate(&mut conn).unwrap();
+            tx.execute(
+                "UPDATE tasks SET status='failed',refs=?2,updated_at=5 WHERE id=?1",
+                params![ids[0], refs.to_string()],
+            )
+            .unwrap();
+            assert!(!block_graph_if_child_failed(&tx, ids[0], "retry staged", 5).unwrap());
+            tx.commit().unwrap();
+
+            let state: (String, i64, Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT state,active,hold_code,hold_summary
+                     FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("active".into(), 1, None, None));
+            let side_effects: (i64, i64) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT count(*) FROM events WHERE kind='task_graph_blocked'),
+                         (SELECT count(*) FROM messages
+                          WHERE kind='alert' AND recipient='owner')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(side_effects, (0, 0));
+        }
+    }
+
+    #[test]
+    fn failed_child_graph_block_is_idempotent() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='failed',refs='{}',updated_at=5 WHERE id=?1",
+            [ids[0]],
+        )
+        .unwrap();
+
+        let tx = begin_immediate(&mut conn).unwrap();
+        assert!(block_graph_if_child_failed(&tx, ids[0], "terminal park", 5).unwrap());
+        tx.commit().unwrap();
+        let replay = begin_immediate(&mut conn).unwrap();
+        assert!(!block_graph_if_child_failed(&replay, ids[0], "terminal park", 6).unwrap());
+        replay.commit().unwrap();
+
+        let state: (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT state,updated_at,
+                        (SELECT count(*) FROM events WHERE kind='task_graph_blocked'),
+                        (SELECT count(*) FROM messages
+                         WHERE kind='alert' AND recipient='owner')
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("blocked".into(), 5, 1, 1));
     }
 
     #[test]
@@ -2779,6 +6788,1339 @@ mod tests {
     }
 
     #[test]
+    fn exact_continuation_adoption_completes_incident_graph_and_releases_dependent() {
+        let mut fixture = RecoveryFixture::new();
+        let recovery_before: (String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT status,refs FROM tasks WHERE id=?1",
+                [fixture.recovery],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert!(fixture.adoption());
+        assert_graph_completed(
+            &fixture.conn,
+            fixture.graph,
+            1,
+            &[
+                fixture.siblings[0],
+                fixture.siblings[1],
+                fixture.siblings[2],
+                fixture.original,
+            ],
+        );
+        let (original_refs, original_provenance): (String, Option<String>) = fixture
+            .conn
+            .query_row(
+                "SELECT refs,completion_provenance FROM tasks WHERE id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let original_refs: serde_json::Value = serde_json::from_str(&original_refs).unwrap();
+        assert_eq!(original_refs["pr"], RECOVERY_PR);
+        assert_eq!(
+            original_provenance.as_deref(),
+            Some(crate::tasks::COMPLETION_PROVENANCE_MERGED)
+        );
+        assert_eq!(
+            original_refs["recovery_delivery"],
+            serde_json::json!({
+                "source_task": fixture.original,
+                "recovery_task": fixture.recovery,
+                "pr": RECOVERY_PR,
+                "merged_head_sha": RECOVERY_HEAD,
+                "adopted_at": 50
+            })
+        );
+        for key in [
+            "daemon_parked",
+            "daemon_parked_reason",
+            "daemon_resume_status",
+            "daemon_publication",
+        ] {
+            assert!(original_refs.get(key).is_none(), "stale {key} survived");
+        }
+        let recovery_after: (String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT status,refs FROM tasks WHERE id=?1",
+                [fixture.recovery],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recovery_before, recovery_after);
+        assert!(
+            crate::tasks::get(&fixture.conn, fixture.dependent)
+                .unwrap()
+                .unwrap()
+                .ready
+        );
+        let events: (i64, i64) = fixture
+            .conn
+            .query_row(
+                "SELECT
+                   count(*) FILTER (WHERE kind='task_done' AND subject=?1),
+                   count(*) FILTER (WHERE kind='task_graph_completed' AND subject='task#1')
+                 FROM events",
+                [format!("task#{}", fixture.original)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(events, (1, 1));
+        assert_eq!(
+            crate::review_followup_graph_eligibility::classify_graph_assessment(
+                &fixture.conn,
+                fixture.graph,
+                "followups-v1",
+            )
+            .unwrap(),
+            crate::review_followup_graph_eligibility::GraphAssessmentEligibility::WaitingInterpretation
+        );
+    }
+
+    #[test]
+    fn exact_continuation_adoption_succeeds_on_blocked_graph_without_completing_it() {
+        let mut fixture = RecoveryFixture::new();
+        fixture
+            .conn
+            .execute(
+                "UPDATE task_decompositions SET state='blocked' WHERE id=?1",
+                [fixture.graph],
+            )
+            .unwrap();
+
+        assert!(fixture.adoption());
+
+        let state: (String, String, i64, String) = fixture
+            .conn
+            .query_row(
+                "SELECT original.status,graph.state,graph.active,source.status
+                 FROM tasks original
+                 JOIN task_graph_members member ON member.task_id=original.id
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks source ON source.id=graph.source_task_id
+                 WHERE original.id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("done".into(), "blocked".into(), 1, "decomposed".into())
+        );
+
+        let completed_events: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='task_graph_completed' AND subject='task#1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed_events, 0);
+    }
+
+    #[test]
+    fn explicit_recovery_adopts_final_merged_worker_after_target_resolution() {
+        let mut fixture = RecoveryFixture::new();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET status='in-review',reviewer='blocker',assignee='blocker'
+                 WHERE id=?1",
+                [fixture.original],
+            )
+            .unwrap();
+        add_reviewer_authority(
+            &mut fixture.conn,
+            fixture.original,
+            "blocker",
+            "boundary-blocker-run",
+            "reviewer",
+            50,
+        );
+        let evidence = vec!["review evidence".into()];
+        assert!(block_graph(
+            &mut fixture.conn,
+            &GraphBlocker {
+                task_id: fixture.original,
+                reviewer: "blocker",
+                run_id: "boundary-blocker-run",
+                category: GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION,
+                violated_boundary: "child crossed a safety boundary",
+                evidence: &evidence,
+                now: 51,
+            }
+        )
+        .unwrap());
+        fixture.make_explicit_eligible();
+        fixture.add_final_worker_run("merged", 26);
+
+        assert!(fixture.explicit_adoption(90_000));
+        assert_graph_completed(
+            &fixture.conn,
+            fixture.graph,
+            1,
+            &[
+                fixture.siblings[0],
+                fixture.siblings[1],
+                fixture.siblings[2],
+                fixture.original,
+            ],
+        );
+        let (provenance, refs): (Option<String>, String) = fixture
+            .conn
+            .query_row(
+                "SELECT completion_provenance,refs FROM tasks WHERE id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance.as_deref(),
+            Some(crate::tasks::COMPLETION_PROVENANCE_MERGED)
+        );
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["recovery_delivery"]["recovery_task"], fixture.recovery);
+        let holds: (Option<String>, Option<String>) = fixture
+            .conn
+            .query_row(
+                "SELECT hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [fixture.graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(holds, (None, None));
+    }
+
+    #[test]
+    fn explicit_recovery_refuses_boundary_block_for_another_child_without_mutation() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+        fixture
+            .conn
+            .execute(
+                "UPDATE task_decompositions
+                 SET state='blocked',hold_code=?2,hold_summary=?3
+                 WHERE id=?1",
+                params![
+                    fixture.graph,
+                    GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION,
+                    serde_json::json!({
+                        "affected_task": fixture.siblings[0],
+                        "violated_boundary": "another child crossed a safety boundary",
+                        "evidence": ["review evidence"]
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        assert!(!fixture.explicit_adoption(90_000));
+        let state: (String, String, String, i64) = fixture
+            .conn
+            .query_row(
+                "SELECT child.status,graph.state,source.status,
+                        (SELECT count(*) FROM decomposition_attempts
+                         WHERE graph_id=graph.id AND kind='recovery'
+                           AND reason_code='explicit-delivery-adoption')
+                 FROM tasks child
+                 JOIN task_graph_members member ON member.task_id=child.id
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks source ON source.id=graph.source_task_id
+                 WHERE child.id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("failed".into(), "blocked".into(), "decomposed".into(), 0)
+        );
+    }
+
+    #[test]
+    fn explicit_recovery_adopts_final_completed_worker_before_target_resolution_after_event_expiry()
+    {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+
+        // The automatic path remains bound to live event evidence. The
+        // explicit operator path must not revive that discovery mechanism; it
+        // authorizes only this exact pair from the durable managed chain.
+        assert!(!adopt_recovery_delivery(
+            &mut fixture.conn,
+            fixture.original,
+            fixture.recovery,
+            90_000,
+        )
+        .unwrap());
+        assert!(fixture.explicit_adoption(90_000));
+
+        assert_graph_completed(
+            &fixture.conn,
+            fixture.graph,
+            1,
+            &[
+                fixture.siblings[0],
+                fixture.siblings[1],
+                fixture.siblings[2],
+                fixture.original,
+            ],
+        );
+        assert!(
+            crate::tasks::get(&fixture.conn, fixture.dependent)
+                .unwrap()
+                .unwrap()
+                .ready
+        );
+
+        let refs: String = fixture
+            .conn
+            .query_row(
+                "SELECT refs FROM tasks WHERE id=?1",
+                [fixture.original],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["recovery_delivery"]["authority"], "explicit-operator");
+        assert_eq!(refs["recovery_delivery"]["authorized_by"], "operator");
+        assert_eq!(refs["recovery_delivery"]["decomposition_source"], 1);
+        assert_eq!(refs["recovery_delivery"]["merged_head_sha"], RECOVERY_HEAD);
+
+        let (reason, summary): (String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT reason_code,summary FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='recovery'",
+                [fixture.graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, "explicit-delivery-adoption");
+        let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(summary["decomposition_source"], 1);
+        assert_eq!(summary["original_child"], fixture.original);
+        assert_eq!(summary["recovery_task"], fixture.recovery);
+        assert_eq!(summary["authorized_by"], "operator");
+
+        assert!(!fixture.explicit_adoption(90_001));
+        let audit_count: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT count(*) FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='recovery'
+                   AND reason_code='explicit-delivery-adoption'",
+                [fixture.graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 1, "replay must not duplicate provenance");
+    }
+
+    #[test]
+    fn explicit_recovery_adopts_exact_legacy_prepublication_failure_on_source_target() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_legacy_prepublication_eligible();
+
+        assert!(fixture.explicit_adoption(90_000));
+        assert_graph_completed(
+            &fixture.conn,
+            fixture.graph,
+            1,
+            &[
+                fixture.siblings[0],
+                fixture.siblings[1],
+                fixture.siblings[2],
+                fixture.original,
+            ],
+        );
+        let (refs, attempt): (String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT child.refs,attempt.summary
+                 FROM tasks child
+                 JOIN task_graph_members member ON member.task_id=child.id
+                 JOIN decomposition_attempts attempt ON attempt.graph_id=member.graph_id
+                 WHERE child.id=?1 AND attempt.kind='recovery'",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        let attempt: serde_json::Value = serde_json::from_str(&attempt).unwrap();
+        assert!(refs.get("daemon_publication").is_none());
+        assert_eq!(refs["recovery_delivery"]["legacy_prepublication"], true);
+        assert_eq!(
+            refs["recovery_delivery"]["original_publication_sha"],
+            ORIGINAL_HEAD
+        );
+        assert_eq!(attempt["legacy_prepublication"], true);
+        assert_eq!(attempt["original_publication_sha"], ORIGINAL_HEAD);
+    }
+
+    #[test]
+    fn explicit_legacy_prepublication_recovery_fails_closed_on_mismatched_evidence() {
+        let cases: Vec<(&str, RecoveryEvidenceMutation)> = vec![
+            (
+                "recovery landed off the source target",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET target_branch='develop' WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "recovery predates the stale child state",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET created_at=1 WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "publication branch is not task scoped",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks
+                             SET refs=json_set(refs,'$.daemon_publication.branch','daemon/wrong')
+                             WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "publication branch has a non-daemon prefix",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "feature/unrelated-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has an empty author slug",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch nests an extra path segment",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/worker/nested-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has whitespace in the author slug",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/bad slug-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has uppercase in the author slug",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/BadSlug-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has a dot in the author slug",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/bad.slug-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has another invalid author character",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/bad~slug-t{}",
+                        fixture.original
+                    ));
+                }),
+            ),
+            (
+                "publication branch has an embedded NUL",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_branch(&format!(
+                        "daemon/pivot-sma1-t{}\0trailing",
+                        fixture.original
+                    ));
+                    let nul_position: i64 = fixture
+                        .conn
+                        .query_row(
+                            "SELECT instr(json_extract(refs,'$.daemon_publication.branch'),char(0))
+                             FROM tasks WHERE id=?1",
+                            [fixture.original],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_ne!(nul_position, 0, "fixture must persist the branch NUL");
+                }),
+            ),
+            (
+                "publication SHA has an embedded NUL",
+                Box::new(|fixture| {
+                    fixture.rewrite_legacy_prepublication_local_sha(&format!(
+                        "{}\0trailing",
+                        ORIGINAL_HEAD
+                    ));
+                    let nul_position: i64 = fixture
+                        .conn
+                        .query_row(
+                            "SELECT instr(json_extract(refs,'$.daemon_publication.local_sha'),char(0))
+                             FROM tasks WHERE id=?1",
+                            [fixture.original],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_ne!(nul_position, 0, "fixture must persist the SHA NUL");
+                }),
+            ),
+            (
+                "publication advanced beyond intent",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks
+                             SET refs=json_set(refs,'$.daemon_publication.pr',?2)
+                             WHERE id=?1",
+                            params![fixture.original, RECOVERY_PR],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "legacy hold names a different publication failure",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE task_decompositions
+                             SET hold_summary='generated child task #999 failed: daemon-owned publication failed:'
+                             WHERE id=?1",
+                            [fixture.graph],
+                        )
+                        .unwrap();
+                }),
+            ),
+        ];
+
+        for (name, mutate) in cases {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_legacy_prepublication_eligible();
+            mutate(&mut fixture);
+            assert!(!fixture.explicit_adoption(90_000), "{name}");
+            let state: (String, String, String, i64) = fixture
+                .conn
+                .query_row(
+                    "SELECT child.status,graph.state,source.status,
+                            (SELECT count(*) FROM decomposition_attempts
+                             WHERE graph_id=graph.id AND kind='recovery')
+                     FROM tasks child
+                     JOIN task_graph_members member ON member.task_id=child.id
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     JOIN tasks source ON source.id=graph.source_task_id
+                     WHERE child.id=?1",
+                    [fixture.original],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                ("open".into(), "blocked".into(), "decomposed".into(), 0),
+                "{name} mutated recovery state"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_recovery_fails_closed_for_inconsistent_durable_evidence() {
+        let cases: Vec<(&str, RecoveryEvidenceMutation)> = vec![
+            (
+                "non-failed child",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET status='open' WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "recovery task not completed",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET status='failed' WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "conflicting source provenance",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.source_task',999)
+                             WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "wrong PR",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET continue_pr=?2 WHERE id=?1",
+                            params![fixture.recovery, RECOVERY_PR + 1],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "wrong repository",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.repo','owner/repo')
+                             WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.repo','other/repo')
+                             WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "missing publication",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET end_reason='failed'
+                             WHERE task_id=?1 AND role='worker'",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "latest worker drained",
+                Box::new(|fixture| {
+                    fixture.add_final_worker_run("drain", 26);
+                }),
+            ),
+            (
+                "latest worker failed",
+                Box::new(|fixture| {
+                    fixture.add_final_worker_run("failed", 26);
+                }),
+            ),
+            (
+                "wrong approved head",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET review_head_sha=?2
+                             WHERE task_id=?1 AND role='reviewer'",
+                            params![fixture.recovery, "cccccccccccccccccccccccccccccccccccccccc"],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "missing managed approval",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET end_reason='completed'
+                             WHERE task_id=?1 AND role='reviewer'",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "missing merge evidence",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET completion_provenance=NULL WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "unfinished sibling",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET status='open' WHERE id=?1",
+                            [fixture.siblings[0]],
+                        )
+                        .unwrap();
+                }),
+            ),
+        ];
+
+        for (name, mutate) in cases {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_explicit_eligible();
+            mutate(&mut fixture);
+            assert!(
+                !fixture.explicit_adoption(90_000),
+                "{name} unexpectedly adopted"
+            );
+            let state: (String, String, String, i64) = fixture
+                .conn
+                .query_row(
+                    "SELECT child.status,graph.state,source.status,
+                            (SELECT count(*) FROM decomposition_attempts
+                             WHERE graph_id=graph.id AND kind='recovery'
+                               AND reason_code='explicit-delivery-adoption')
+                     FROM tasks child
+                     JOIN task_graph_members member ON member.task_id=child.id
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     JOIN tasks source ON source.id=graph.source_task_id
+                     WHERE child.id=?1",
+                    [fixture.original],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(state.1, "active", "{name} mutated graph state");
+            assert_eq!(state.2, "decomposed", "{name} mutated source state");
+            assert_eq!(state.3, 0, "{name} persisted recovery authority");
+        }
+    }
+
+    #[test]
+    fn explicit_recovery_rejects_nonmember() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,refs)
+                 VALUES ('not a member','failed','owner',1,1,?1)",
+                [serde_json::json!({"pr": RECOVERY_PR}).to_string()],
+            )
+            .unwrap();
+        let nonmember = fixture.conn.last_insert_rowid();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (?1,?2,'daemon/original',?3,0,8)",
+                params![nonmember, RECOVERY_PR, ORIGINAL_HEAD],
+            )
+            .unwrap();
+
+        assert!(!adopt_explicit_recovery_delivery(
+            &mut fixture.conn,
+            &ExplicitRecoveryAdoption {
+                original_child_id: nonmember,
+                recovery_task_id: fixture.recovery,
+                authorized_by: "operator",
+                now: 90_000,
+            },
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn explicit_recovery_rejects_invalid_operator_identity_without_mutation() {
+        for identity in ["", "operator\0forged"] {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_explicit_eligible();
+            assert!(adopt_explicit_recovery_delivery(
+                &mut fixture.conn,
+                &ExplicitRecoveryAdoption {
+                    original_child_id: fixture.original,
+                    recovery_task_id: fixture.recovery,
+                    authorized_by: identity,
+                    now: 90_000,
+                },
+            )
+            .is_err());
+            let state: (String, String, i64) = fixture
+                .conn
+                .query_row(
+                    "SELECT child.status,graph.state,
+                            (SELECT count(*) FROM decomposition_attempts
+                             WHERE graph_id=graph.id AND kind='recovery')
+                     FROM tasks child
+                     JOIN task_graph_members member ON member.task_id=child.id
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     WHERE child.id=?1",
+                    [fixture.original],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("failed".into(), "active".into(), 0));
+        }
+    }
+
+    #[test]
+    fn continuation_adoption_rejects_inconsistent_or_incomplete_evidence_without_mutation() {
+        let cases: Vec<(&str, RecoveryEvidenceMutation)> = vec![
+            (
+                "wrong PR",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET continue_pr=?2 WHERE id=?1",
+                            params![fixture.recovery, RECOVERY_PR + 1],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "wrong repository",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.repo','owner/repo') WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.repo','other/repo') WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "wrong source provenance",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.source_task',999) WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "inconsistent authoritative SHA",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET review_head_sha=?2
+                             WHERE task_id=?1 AND role='reviewer'",
+                            params![fixture.recovery, "cccccccccccccccccccccccccccccccccccccccc"],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "unpublished recovery",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "DELETE FROM events WHERE subject=?1 AND kind='task_in_review'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "unmerged recovery",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "DELETE FROM events WHERE subject=?1 AND kind='task_merging'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "publication event expired at the exact adoption boundary",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE events SET expires_at=50
+                             WHERE subject=?1 AND kind='task_in_review'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "merging event expired at the exact adoption boundary",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE events SET expires_at=50
+                             WHERE subject=?1 AND kind='task_merging'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "done event expired at the exact adoption boundary",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE events SET expires_at=50
+                             WHERE subject=?1 AND kind='task_done'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "unreviewed recovery",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET end_reason='completed'
+                             WHERE task_id=?1 AND role='reviewer'",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "failed recovery",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET status='failed' WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "partial graph",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET status='open' WHERE id=?1",
+                            [fixture.siblings[0]],
+                        )
+                        .unwrap();
+                }),
+            ),
+        ];
+
+        for (name, mutate) in cases {
+            let mut fixture = RecoveryFixture::new();
+            mutate(&mut fixture);
+            assert!(!fixture.adoption(), "{name} unexpectedly adopted");
+            let state: (String, String, String) = fixture
+                .conn
+                .query_row(
+                    "SELECT child.status,graph.state,source.status
+                     FROM tasks child
+                     JOIN task_graph_members member ON member.task_id=child.id
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     JOIN tasks source ON source.id=graph.source_task_id
+                     WHERE child.id=?1",
+                    [fixture.original],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                ("failed".into(), "active".into(), "decomposed".into()),
+                "{name} mutated lifecycle state"
+            );
+            let emitted: i64 = fixture
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM events
+                     WHERE kind='task_done' AND subject=?1",
+                    [format!("task#{}", fixture.original)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(emitted, 0, "{name} emitted an adoption event");
+        }
+    }
+
+    #[test]
+    fn continuation_adoption_rejects_nonmember_and_replay() {
+        let mut fixture = RecoveryFixture::new();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,refs)
+                 VALUES ('not a member','failed','owner',1,1,?1)",
+                [serde_json::json!({"pr": RECOVERY_PR}).to_string()],
+            )
+            .unwrap();
+        let nonmember = fixture.conn.last_insert_rowid();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (?1,?2,'daemon/original',?3,0,1)",
+                params![nonmember, RECOVERY_PR, ORIGINAL_HEAD],
+            )
+            .unwrap();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET refs=json_set(refs,'$.source_task',?2) WHERE id=?1",
+                params![fixture.recovery, nonmember],
+            )
+            .unwrap();
+        assert!(
+            !adopt_recovery_delivery(&mut fixture.conn, nonmember, fixture.recovery, 49).unwrap()
+        );
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET refs=json_set(refs,'$.source_task',?2) WHERE id=?1",
+                params![fixture.recovery, fixture.original],
+            )
+            .unwrap();
+        assert!(fixture.adoption());
+        assert!(!adopt_recovery_delivery(
+            &mut fixture.conn,
+            fixture.original,
+            fixture.recovery,
+            51
+        )
+        .unwrap());
+        let count: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_done' AND subject=?1",
+                [format!("task#{}", fixture.original)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn concurrent_exact_continuation_adopters_have_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..8 {
+            let fixture = RecoveryFixture::new();
+            let barrier = Arc::new(Barrier::new(3));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let path = fixture.db_path.clone();
+                let barrier = Arc::clone(&barrier);
+                let original = fixture.original;
+                let recovery = fixture.recovery;
+                handles.push(std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    adopt_recovery_delivery(&mut conn, original, recovery, 50).unwrap()
+                }));
+            }
+            barrier.wait();
+            let outcomes: Vec<bool> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            assert_eq!(
+                outcomes.iter().filter(|outcome| **outcome).count(),
+                1,
+                "round {round}: {outcomes:?}"
+            );
+            let count: i64 = fixture
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM events WHERE kind='task_done' AND subject=?1",
+                    [format!("task#{}", fixture.original)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "round {round}");
+        }
+    }
+
+    #[test]
+    fn concurrent_explicit_recovery_adopters_have_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..8 {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_explicit_eligible();
+            let barrier = Arc::new(Barrier::new(3));
+            let mut handles = Vec::new();
+            for operator in ["operator-a", "operator-b"] {
+                let path = fixture.db_path.clone();
+                let barrier = Arc::clone(&barrier);
+                let original = fixture.original;
+                let recovery = fixture.recovery;
+                handles.push(std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    adopt_explicit_recovery_delivery(
+                        &mut conn,
+                        &ExplicitRecoveryAdoption {
+                            original_child_id: original,
+                            recovery_task_id: recovery,
+                            authorized_by: operator,
+                            now: 90_000,
+                        },
+                    )
+                    .unwrap()
+                }));
+            }
+            barrier.wait();
+            let outcomes: Vec<bool> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            assert_eq!(
+                outcomes.iter().filter(|outcome| **outcome).count(),
+                1,
+                "round {round}: {outcomes:?}"
+            );
+            let provenance_count: i64 = fixture
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM decomposition_attempts
+                     WHERE graph_id=?1 AND kind='recovery'
+                       AND reason_code='explicit-delivery-adoption'",
+                    [fixture.graph],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(provenance_count, 1, "round {round}");
+        }
+    }
+
+    fn assert_graph_completed(conn: &Connection, graph: i64, source: i64, children: &[i64]) {
+        let graph_state: (String, i64) = conn
+            .query_row(
+                "SELECT state,active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(graph_state, ("completed".into(), 0));
+        let source_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=?1", [source], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(source_status, "done");
+        for child in children {
+            let status: String = conn
+                .query_row("SELECT status FROM tasks WHERE id=?1", [child], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(status, "done");
+        }
+    }
+
+    #[test]
+    fn merge_succeeded_event_completes_graph_and_source_atomically() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [ids[1]])
+            .unwrap();
+
+        crate::tasks::apply_event(
+            &mut conn,
+            "system",
+            ids[1],
+            &crate::lifecycle::Event::MergeSucceeded,
+            5,
+        )
+        .unwrap();
+
+        assert_graph_completed(&conn, graph, 1, &ids);
+    }
+
+    #[test]
+    fn pr_found_merged_event_completes_graph_and_source_atomically() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [ids[1]])
+            .unwrap();
+
+        crate::tasks::apply_event(
+            &mut conn,
+            "system",
+            ids[1],
+            &crate::lifecycle::Event::PrFoundMerged,
+            5,
+        )
+        .unwrap();
+
+        assert_graph_completed(&conn, graph, 1, &ids);
+    }
+
+    #[test]
+    fn merge_succeeded_rolls_back_when_graph_source_authority_is_lost() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [ids[1]])
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=1", [])
+            .unwrap();
+
+        let error = match crate::tasks::apply_event(
+            &mut conn,
+            "system",
+            ids[1],
+            &crate::lifecycle::Event::MergeSucceeded,
+            5,
+        ) {
+            Ok(_) => panic!("lost source authority must reject final child completion"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, QuorumError::Io(_)));
+        let state: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=?2 WHERE d.id=?1",
+                params![graph, ids[1]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("active".into(), 1, "merging".into()));
+    }
+
+    #[test]
+    fn manual_close_rejects_active_source_without_mutation() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+
+        let error = crate::tasks::close_manual(&mut conn, "owner", 1, "obsolete", 5).unwrap_err();
+        assert!(matches!(error, QuorumError::Usage(_)));
+        let state: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("active".into(), 1, "decomposed".into()));
+        assert!(ids.iter().all(|id| {
+            conn.query_row("SELECT status='open' FROM tasks WHERE id=?1", [id], |row| {
+                row.get::<_, bool>(0)
+            })
+            .unwrap()
+        }));
+    }
+
+    #[test]
+    fn manual_final_child_close_completes_graph_and_source_atomically() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+
+        crate::tasks::close_manual(&mut conn, "owner", ids[0], "fixed elsewhere", 5)
+            .unwrap()
+            .unwrap();
+        let midway: (String, String) = conn
+            .query_row(
+                "SELECT d.state,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(midway, ("active".into(), "decomposed".into()));
+
+        crate::tasks::close_manual(&mut conn, "owner", ids[1], "merged externally", 6)
+            .unwrap()
+            .unwrap();
+        assert_graph_completed(&conn, graph, 1, &ids);
+    }
+
+    #[test]
     fn real_file_concurrent_child_claims_never_exceed_two() {
         use std::sync::{Arc, Barrier};
 
@@ -2835,524 +8177,89 @@ mod tests {
         }
     }
 
-    /// Internal subprocess entrypoint for the process-level graph claim canary.
-    /// It is reachable only by re-executing this test binary with the private
-    /// environment tuple; no user-facing claim command is introduced.
-    #[test]
-    fn process_child_claim_helper() {
-        let Ok(db_path) = std::env::var("QUORUM_TEST_GRAPH_CLAIM_DB") else {
-            return;
-        };
-        let task_id: i64 = std::env::var("QUORUM_TEST_GRAPH_CLAIM_TASK")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let agent = std::env::var("QUORUM_TEST_GRAPH_CLAIM_AGENT").unwrap();
-        let ready_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_READY").unwrap();
-        let go_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_GO").unwrap();
-        let result_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_RESULT").unwrap();
-        std::fs::write(&ready_path, b"ready").unwrap();
-        for _ in 0..500 {
-            if std::path::Path::new(&go_path).exists() {
-                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
-                let won = crate::tasks::claim(&mut conn, &agent, Some(task_id), &[], 60, 10)
-                    .unwrap()
-                    .is_some();
-                std::fs::write(&result_path, if won { b"1" } else { b"0" }).unwrap();
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("timed out waiting for process claim barrier");
-    }
-
-    /// Internal subprocess entrypoint paired with `process_child_claim_helper`
-    /// to race source cancellation against generated execution authority.
-    #[test]
-    fn process_source_cancel_helper() {
-        let Ok(db_path) = std::env::var("QUORUM_TEST_GRAPH_CANCEL_DB") else {
-            return;
-        };
-        let ready_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_READY").unwrap();
-        let go_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_GO").unwrap();
-        let result_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_RESULT").ok();
-        std::fs::write(&ready_path, b"ready").unwrap();
-        for _ in 0..500 {
-            if std::path::Path::new(&go_path).exists() {
-                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
-                let outcome = cancel_source_graph(&mut conn, "owner", 1, Some(1), 11).unwrap();
-                if let Some(result_path) = result_path {
-                    std::fs::write(
-                        result_path,
-                        match outcome {
-                            SourceCancellation::Cancelled => b"won".as_slice(),
-                            SourceCancellation::Rejected => b"lost".as_slice(),
-                            SourceCancellation::NotGraphSource => b"not-graph".as_slice(),
-                        },
-                    )
-                    .unwrap();
-                } else {
-                    assert_eq!(outcome, SourceCancellation::Cancelled);
-                }
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("timed out waiting for process cancellation barrier");
-    }
-
-    #[test]
-    fn process_graph_lifecycle_event_helper() {
-        let Ok(db_path) = std::env::var("QUORUM_TEST_GRAPH_EVENT_DB") else {
-            return;
-        };
-        let task_id: i64 = std::env::var("QUORUM_TEST_GRAPH_EVENT_TASK")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let event = std::env::var("QUORUM_TEST_GRAPH_EVENT_KIND").unwrap();
-        let ready_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_READY").unwrap();
-        let go_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_GO").unwrap();
-        let result_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_RESULT").unwrap();
-        std::fs::write(&ready_path, b"ready").unwrap();
-        for _ in 0..500 {
-            if std::path::Path::new(&go_path).exists() {
-                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
-                let outcome = match event.as_str() {
-                    "submit" => (
-                        "worker",
-                        crate::lifecycle::Event::SignaledDone { pr: "42".into() },
-                    ),
-                    "review" => ("reviewer", crate::lifecycle::Event::VerdictApprove),
-                    "merge" => {
-                        let won = crate::tasks::close_after_merge(
-                            &mut conn,
-                            task_id,
-                            "merged by race test",
-                            10,
-                        )
-                        .unwrap();
-                        std::fs::write(
-                            result_path,
-                            if won {
-                                b"won".as_slice()
-                            } else {
-                                b"lost".as_slice()
-                            },
-                        )
-                        .unwrap();
-                        return;
-                    }
-                    _ => panic!("unknown graph event helper kind"),
-                };
-                let won = crate::tasks::apply_event(&mut conn, outcome.0, task_id, &outcome.1, 10)
-                    .is_ok();
-                std::fs::write(
-                    result_path,
-                    if won {
-                        b"won".as_slice()
-                    } else {
-                        b"lost".as_slice()
-                    },
-                )
-                .unwrap();
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("timed out waiting for process lifecycle event barrier");
-    }
-
-    fn race_cancel_with_event(
-        db_path: &std::path::Path,
-        task_id: i64,
-        event_kind: &str,
-        dir: &std::path::Path,
-    ) -> (String, String) {
-        use std::process::Command;
-        let go_path = dir.join("event-go");
-        let event_ready = dir.join("event-ready");
-        let event_result = dir.join("event-result");
-        let cancel_ready = dir.join("cancel-ready");
-        let cancel_result = dir.join("cancel-result");
-        let test_binary = std::env::current_exe().unwrap();
-        let mut event = Command::new(&test_binary)
-            .arg("--exact")
-            .arg("decomposition::tests::process_graph_lifecycle_event_helper")
-            .env("QUORUM_TEST_GRAPH_EVENT_DB", db_path)
-            .env("QUORUM_TEST_GRAPH_EVENT_TASK", task_id.to_string())
-            .env("QUORUM_TEST_GRAPH_EVENT_KIND", event_kind)
-            .env("QUORUM_TEST_GRAPH_EVENT_READY", &event_ready)
-            .env("QUORUM_TEST_GRAPH_EVENT_GO", &go_path)
-            .env("QUORUM_TEST_GRAPH_EVENT_RESULT", &event_result)
-            .spawn()
-            .unwrap();
-        let mut cancel = Command::new(&test_binary)
-            .arg("--exact")
-            .arg("decomposition::tests::process_source_cancel_helper")
-            .env("QUORUM_TEST_GRAPH_CANCEL_DB", db_path)
-            .env("QUORUM_TEST_GRAPH_CANCEL_READY", &cancel_ready)
-            .env("QUORUM_TEST_GRAPH_CANCEL_GO", &go_path)
-            .env("QUORUM_TEST_GRAPH_CANCEL_RESULT", &cancel_result)
-            .spawn()
-            .unwrap();
-        for _ in 0..500 {
-            if event_ready.exists() && cancel_ready.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(event_ready.exists() && cancel_ready.exists());
-        std::fs::write(&go_path, b"go").unwrap();
-        assert!(event.wait().unwrap().success());
-        assert!(cancel.wait().unwrap().success());
-        (
-            std::fs::read_to_string(event_result).unwrap(),
-            std::fs::read_to_string(cancel_result).unwrap(),
-        )
-    }
-
-    #[test]
-    fn real_process_cancel_racing_child_claim_leaves_no_authority() {
-        use std::process::Command;
-
-        for iteration in 0..8 {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("quorum.db");
-            let mut conn = crate::db::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
-                 VALUES ('large','open','owner',1,1)",
-                [],
-            )
-            .unwrap();
-            let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
-            drop(conn);
-
-            let go_path = dir.path().join("go");
-            let claim_ready = dir.path().join("claim-ready");
-            let claim_result = dir.path().join("claim-result");
-            let cancel_ready = dir.path().join("cancel-ready");
-            let test_binary = std::env::current_exe().unwrap();
-            let mut claim = Command::new(&test_binary)
-                .arg("--exact")
-                .arg("decomposition::tests::process_child_claim_helper")
-                .env("QUORUM_TEST_GRAPH_CLAIM_DB", &db_path)
-                .env("QUORUM_TEST_GRAPH_CLAIM_TASK", ids[0].to_string())
-                .env("QUORUM_TEST_GRAPH_CLAIM_AGENT", "process-worker")
-                .env("QUORUM_TEST_GRAPH_CLAIM_READY", &claim_ready)
-                .env("QUORUM_TEST_GRAPH_CLAIM_GO", &go_path)
-                .env("QUORUM_TEST_GRAPH_CLAIM_RESULT", &claim_result)
-                .spawn()
-                .unwrap();
-            let mut cancel = Command::new(&test_binary)
-                .arg("--exact")
-                .arg("decomposition::tests::process_source_cancel_helper")
-                .env("QUORUM_TEST_GRAPH_CANCEL_DB", &db_path)
-                .env("QUORUM_TEST_GRAPH_CANCEL_READY", &cancel_ready)
-                .env("QUORUM_TEST_GRAPH_CANCEL_GO", &go_path)
-                .spawn()
-                .unwrap();
-            for _ in 0..500 {
-                if claim_ready.exists() && cancel_ready.exists() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            assert!(claim_ready.exists() && cancel_ready.exists());
-            std::fs::write(&go_path, b"go").unwrap();
-            assert!(
-                claim.wait().unwrap().success(),
-                "claim iteration {iteration}"
-            );
-            assert!(
-                cancel.wait().unwrap().success(),
-                "cancel iteration {iteration}"
-            );
-
-            let conn = crate::db::open(&db_path).unwrap();
-            let authority: (i64, i64, i64) = conn
-                .query_row(
-                    "SELECT
-                       (SELECT count(*) FROM claims WHERE active=1),
-                       (SELECT count(*) FROM run_capabilities WHERE revoked_at IS NULL
-                          AND task_id IN (SELECT task_id FROM task_graph_members WHERE graph_id=?1)),
-                       (SELECT active FROM task_decompositions WHERE id=?1)",
-                    [graph],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .unwrap();
-            assert_eq!(authority, (0, 0, 0), "iteration {iteration}");
-        }
-    }
-
-    #[test]
-    fn real_process_cancel_racing_submit_revokes_winner_and_stale_submit_is_inert() {
-        for iteration in 0..8 {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("quorum.db");
-            let mut conn = crate::db::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
-                 VALUES ('large','open','owner',1,1)",
-                [],
-            )
-            .unwrap();
-            let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
-            conn.execute(
-                "UPDATE tasks SET status='working',assignee='worker' WHERE id=?1",
-                [ids[0]],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO claims(target,holder,ts,expires_at,active)
-                 VALUES (?1,'worker',4,100,1)",
-                [format!("task#{}", ids[0])],
-            )
-            .unwrap();
-            crate::capabilities::issue(&mut conn, "worker-run", ids[0], "worker", "worker", 4)
-                .unwrap();
-            drop(conn);
-
-            let (submit, cancel) = race_cancel_with_event(&db_path, ids[0], "submit", dir.path());
-            assert!(
-                matches!(submit.as_str(), "won" | "lost") && cancel == "won",
-                "iteration {iteration}: submit={submit}, cancel={cancel}"
-            );
-            let mut conn = crate::db::open(&db_path).unwrap();
-            let state: (String, String, i64, i64) = conn
-                .query_row(
-                    "SELECT d.state,t.status,
-                       (SELECT count(*) FROM claims WHERE active=1),
-                       (SELECT count(*) FROM run_capabilities WHERE revoked_at IS NULL
-                          AND task_id=?2)
-                     FROM task_decompositions d JOIN tasks t ON t.id=?2 WHERE d.id=?1",
-                    params![graph, ids[0]],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .unwrap();
-            assert_eq!(state, ("cancelled".into(), "cancelled".into(), 0, 0));
-            let events_before: i64 = conn
-                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
-                .unwrap();
-            assert!(crate::tasks::apply_event(
-                &mut conn,
-                "worker",
-                ids[0],
-                &crate::lifecycle::Event::SignaledDone { pr: "42".into() },
-                12,
-            )
-            .is_err());
-            let events_after: i64 = conn
-                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(events_before, events_after);
-        }
-    }
-
-    #[test]
-    fn real_process_cancel_racing_review_revokes_authority_and_stale_review_is_inert() {
-        for iteration in 0..8 {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("quorum.db");
-            let mut conn = crate::db::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
-                 VALUES ('large','open','owner',1,1)",
-                [],
-            )
-            .unwrap();
-            let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
-            conn.execute(
-                "UPDATE tasks SET status='in-review',reviewer='reviewer' WHERE id=?1",
-                [ids[0]],
-            )
-            .unwrap();
-            crate::capabilities::issue(&mut conn, "review-run", ids[0], "reviewer", "reviewer", 4)
-                .unwrap();
-            drop(conn);
-
-            let (review, cancel) = race_cancel_with_event(&db_path, ids[0], "review", dir.path());
-            assert!(
-                matches!(review.as_str(), "won" | "lost") && cancel == "won",
-                "iteration {iteration}: review={review}, cancel={cancel}"
-            );
-            let mut conn = crate::db::open(&db_path).unwrap();
-            let authority: (String, i64) = conn
-                .query_row(
-                    "SELECT t.status,
-                       (SELECT count(*) FROM run_capabilities WHERE revoked_at IS NULL
-                          AND task_id=?1)
-                     FROM tasks t WHERE t.id=?1",
-                    [ids[0]],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(authority, ("cancelled".into(), 0));
-            let events_before: i64 = conn
-                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
-                .unwrap();
-            assert!(crate::tasks::apply_event(
-                &mut conn,
-                "reviewer",
-                ids[0],
-                &crate::lifecycle::Event::VerdictApprove,
-                12,
-            )
-            .is_err());
-            let events_after: i64 = conn
-                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(events_before, events_after);
-        }
-    }
-
-    #[test]
-    fn real_process_cancel_racing_final_merge_has_mutually_exclusive_terminal_outcomes() {
-        for iteration in 0..16 {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("quorum.db");
-            let mut conn = crate::db::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
-                 VALUES ('large','open','owner',1,1)",
-                [],
-            )
-            .unwrap();
-            let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
-            conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
-                .unwrap();
-            conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [ids[1]])
-                .unwrap();
-            drop(conn);
-
-            let (merge, cancel) = race_cancel_with_event(&db_path, ids[1], "merge", dir.path());
-            assert_ne!(merge, cancel, "iteration {iteration}");
-            let conn = crate::db::open(&db_path).unwrap();
-            let state: (String, String, String, String) = conn
-                .query_row(
-                    "SELECT d.state,source.status,first.status,last.status
-                     FROM task_decompositions d
-                     JOIN tasks source ON source.id=d.source_task_id
-                     JOIN tasks first ON first.id=?2 JOIN tasks last ON last.id=?3
-                     WHERE d.id=?1",
-                    params![graph, ids[0], ids[1]],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .unwrap();
-            if merge == "won" {
-                assert_eq!(cancel, "lost");
-                assert_eq!(
-                    state,
-                    (
-                        "completed".into(),
-                        "done".into(),
-                        "done".into(),
-                        "done".into()
-                    )
-                );
-                let cleanup: i64 = conn
-                    .query_row("SELECT count(*) FROM decomposition_cleanup", [], |row| {
-                        row.get(0)
-                    })
-                    .unwrap();
-                assert_eq!(cleanup, 0);
-            } else {
-                assert_eq!(cancel, "won");
-                assert_eq!(
-                    state,
-                    (
-                        "cancelled".into(),
-                        "cancelled".into(),
-                        "done".into(),
-                        "cancelled".into()
-                    )
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn real_process_child_claims_never_exceed_two() {
-        use std::process::Command;
-
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("quorum.db");
-        let mut conn = crate::db::open(&db_path).unwrap();
+    /// Task #473 blocker 1: graph member cancellation must refresh the
+    /// durable park refs of parked dependents. Ordinary `tasks::update`
+    /// wires convergence; `cancel_graph_in_tx` is a separate cancellation
+    /// writer and must do the same.
+    fn park_dependent(conn: &Connection, dep: i64, dependent: i64) {
         conn.execute(
-            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
-             VALUES ('large','open','owner',1,1)",
-            [],
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'dependency #' || ?2 || ' is terminal-not-done',
+                 'daemon_parked_unsatisfiable', json('false'),
+                 'daemon_resume_status', 'open'
+             ) WHERE id=?1",
+            params![dependent, dep],
         )
         .unwrap();
-        let graph = begin(&mut conn);
-        let ids = materialize_graph(
-            &mut conn,
-            graph,
-            1,
-            &[child("a", &[]), child("b", &[]), child("c", &[])],
-            4,
-        )
-        .unwrap()
-        .unwrap();
-        drop(conn);
+    }
 
-        let go_path = dir.path().join("go");
-        let test_binary = std::env::current_exe().unwrap();
-        let mut children = Vec::new();
-        let mut ready_paths = Vec::new();
-        let mut result_paths = Vec::new();
-        for (index, task_id) in ids.into_iter().enumerate() {
-            let ready_path = dir.path().join(format!("ready-{index}"));
-            let result_path = dir.path().join(format!("result-{index}"));
-            let child = Command::new(&test_binary)
-                .arg("--exact")
-                .arg("decomposition::tests::process_child_claim_helper")
-                .arg("--nocapture")
-                .env("QUORUM_TEST_GRAPH_CLAIM_DB", &db_path)
-                .env("QUORUM_TEST_GRAPH_CLAIM_TASK", task_id.to_string())
-                .env("QUORUM_TEST_GRAPH_CLAIM_AGENT", format!("process-{index}"))
-                .env("QUORUM_TEST_GRAPH_CLAIM_READY", &ready_path)
-                .env("QUORUM_TEST_GRAPH_CLAIM_GO", &go_path)
-                .env("QUORUM_TEST_GRAPH_CLAIM_RESULT", &result_path)
-                .spawn()
-                .unwrap();
-            children.push(child);
-            ready_paths.push(ready_path);
-            result_paths.push(result_path);
-        }
-        for _ in 0..500 {
-            if ready_paths.iter().all(|path| path.exists()) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(ready_paths.iter().all(|path| path.exists()));
-        std::fs::write(&go_path, b"go").unwrap();
-        for mut child in children {
-            assert!(child.wait().unwrap().success());
-        }
-        let winners = result_paths
-            .iter()
-            .map(|path| std::fs::read_to_string(path).unwrap())
-            .filter(|result| result == "1")
-            .count();
-        assert_eq!(winners, 2);
+    #[test]
+    fn graph_member_cancellation_converges_parked_dependents() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        // Create an external dependent parked recoverably on member a.
+        let dependent: i64 = conn
+            .query_row(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,depends_on)
+                 VALUES ('external','open','owner',1,1,?1) RETURNING id",
+                [format!("[{}]", ids[0])],
+                |r| r.get(0),
+            )
+            .unwrap();
+        park_dependent(&conn, ids[0], dependent);
+        assert!(cancel_graph(&mut conn, 1, &[], 5).unwrap());
+        let refs: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [dependent], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["daemon_parked_unsatisfiable"], true);
+        assert_eq!(
+            refs["daemon_parked_reason"],
+            format!("dependency #{} is cancelled — unsatisfiable", ids[0])
+        );
+    }
+
+    #[test]
+    fn graph_source_cancellation_converges_parked_dependents() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        // Materialize so cancel_graph reaches the source-cancel path.
+        let _ = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        // A dependent parked recoverably on the graph source (task#1).
+        let dependent: i64 = conn
+            .query_row(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,depends_on)
+                 VALUES ('external','open','owner',1,1,'[1]') RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        park_dependent(&conn, 1, dependent);
+        assert!(cancel_graph(&mut conn, 1, &[], 5).unwrap());
+        // Source itself is now cancelled.
+        let source_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(source_status, "cancelled");
+        // Dependent's park was converged to unsatisfiable naming the source.
+        let refs: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [dependent], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["daemon_parked_unsatisfiable"], true);
+        assert_eq!(
+            refs["daemon_parked_reason"],
+            "dependency #1 is cancelled — unsatisfiable"
+        );
     }
 }

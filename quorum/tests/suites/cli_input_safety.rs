@@ -4,13 +4,17 @@
 //! is unit-tested, but never integration-tested through the CLI stdin path. These tests pipe
 //! bad bytes via `--body-stdin` to `post`, `task-create`, and `task-update`, asserting exit 2.
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 
 fn quorum(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("quorum").unwrap();
-    c.env("QUORUM_HOME", home).env("QUORUM_REPO", "test/repo");
+    c.env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        .env_remove("QUORUM_AGENT")
+        .env_remove("QUORUM_RUN_ID")
+        .env_remove("QUORUM_AGENT_ENDPOINT");
     c
 }
 

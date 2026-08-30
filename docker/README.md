@@ -92,5 +92,5 @@ The image includes the pinned, checksummed Codex standalone package and its Apac
 and notice. It intentionally does not include Claude Code: its redistribution terms have
 not been established for this public image. Self-hosters may create a derived image that
 installs Claude Code under terms they have independently accepted. Quorum itself does not
-need provider-specific container changes; `quorum serve --agent codex` selects the bundled
-provider CLI.
+need provider-specific container changes; configure a model profile with `runner = "codex"`
+and route the desired roles to that profile to select the bundled provider CLI.

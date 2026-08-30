@@ -16,15 +16,23 @@
 //! - Idempotent: re-running for the same PR replaces prior findings and the run
 //!   record via `pr_number`-keyed UPSERT.
 
-use super::agent::{self, AgentProc, AgentSpec};
 use super::classifier::{CLASSIFIER_EFFORT, CLASSIFIER_MODEL};
-use super::codex_agent::{CodexProc, CodexSpec};
-use super::runner::{AgentEvent, AgentKind, RunnerProc};
+use super::runner::{AdapterConfig, AgentEvent, AgentKind, LaunchMode, LaunchRequest, RunnerProc};
 use quorum_core::clock;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::review_findings::{
-    self, AgentRunSummary, CollectionRun, CollectorInputs, RunStatus, TaskContext, VerdictSummary,
+    self, AgentRunSummary, CollectionRun, CollectorInputs, ReviewFinding, RunStatus, TaskContext,
+    VerdictSummary,
 };
+use quorum_core::review_followups::{
+    EvidenceKind, FollowupEvidenceIds, ReviewFollowupArtifact, ReviewFollowupEvidenceId,
+    ScopeRelationship, TechnicalImpact, VerificationExpectations, MAX_FOLLOWUP_ARTIFACTS,
+    MAX_FOLLOWUP_EVIDENCE_IDS, MAX_FOLLOWUP_TEXT_BYTES,
+};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
+use std::collections::HashSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -32,7 +40,7 @@ use tokio::time::timeout;
 /// Version stamp on every finding / run row this collector generation writes.
 /// Bump when the prompt/schema meaningfully changes so future readers can filter
 /// analytics by generation.
-pub const COLLECTOR_VERSION: &str = "v1";
+pub const COLLECTOR_VERSION: &str = "v3";
 
 /// Hard wall-clock cap on the classifier turn. Post-merge, so failing here
 /// leaves the merged task alone — the observable surface is `review_collection_runs`.
@@ -46,6 +54,618 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 /// runs — better than letting the daemon-scoped task stall indefinitely.
 const GH_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+const MAX_REVIEW_FINDINGS: usize = 128;
+
+/// The largest distinct evidence universe a maximum-size response can cite:
+/// every finding and every artifact may use its complete bounded evidence list.
+/// Production extraction stops at this record count while streaming the raw
+/// paginated JSON, before retaining another entry or allocating a full DOM.
+const MAX_FETCHED_EVIDENCE_RECORDS: usize =
+    (MAX_REVIEW_FINDINGS + MAX_FOLLOWUP_ARTIFACTS) * MAX_FOLLOWUP_EVIDENCE_IDS;
+
+/// Bound the raw evidence material this PR's added parser will inspect. The
+/// underlying `gh` capture is older transport debt, but payloads above this
+/// aggregate limit fail before Serde performs any additional parsing work.
+const MAX_FETCHED_EVIDENCE_JSON_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FETCHED_EVIDENCE_ARRAY_DEPTH: usize = 2;
+
+/// Parse failures are durable operator-facing telemetry, not a place to retain
+/// unbounded model-derived text. The fixed shape fields always fit, while a
+/// long validation reason is safely shortened at a UTF-8 boundary.
+const MAX_PARSE_FAILURE_ERROR_BYTES: usize = 2 * 1024;
+const PARSE_FAILURE_REASON_TRUNCATION: &str = "... [reason truncated]";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCollectorResponse {
+    findings: Vec<RawFinding>,
+    followup_artifacts: Vec<RawFollowupArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFinding {
+    reviewer: String,
+    kind: String,
+    author_pushback: bool,
+    pushback_accepted: Option<bool>,
+    severity: Option<String>,
+    text: String,
+    source_endpoint: String,
+    addressed_status: String,
+    evidence: Vec<RawEvidenceId>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEvidenceId {
+    kind: EvidenceKind,
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFollowupArtifact {
+    source_finding_index: usize,
+    technical_impact: TechnicalImpact,
+    scope_relationship: ScopeRelationship,
+    concern: RawConcreteConcern,
+    non_blocking_reason: String,
+    affected_behavior: String,
+    desired_outcome: RawObservableOutcome,
+    verification_expectations: Vec<String>,
+    evidence: Vec<RawEvidenceId>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConcreteConcern {
+    failure_mode: String,
+    trigger_or_assumption: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawObservableOutcome {
+    observable_behavior: String,
+    observation_condition: String,
+}
+
+#[derive(Debug)]
+struct ValidatedArtifactText {
+    concern: String,
+    desired_outcome: String,
+}
+
+#[derive(Debug)]
+struct ValidatedCollectorResponse {
+    findings: Vec<ReviewFinding>,
+    followup_artifacts: Vec<ReviewFollowupArtifact>,
+}
+
+fn parse_and_validate_response(
+    text: &str,
+    inputs: &CollectorInputs,
+    task_id: Option<i64>,
+    collector_model: &str,
+    collector_version: &str,
+) -> Result<ValidatedCollectorResponse> {
+    let json_text = extract_collector_json(text)
+        .ok_or_else(|| QuorumError::Usage("collector response is not a JSON object".into()))?;
+    let raw: RawCollectorResponse = serde_json::from_str(json_text)
+        .map_err(|error| QuorumError::Usage(format!("invalid collector response: {error}")))?;
+
+    if raw.findings.len() > MAX_REVIEW_FINDINGS {
+        return Err(QuorumError::Usage(
+            "collector response exceeds 128 findings".into(),
+        ));
+    }
+    if raw.followup_artifacts.len() > MAX_FOLLOWUP_ARTIFACTS {
+        return Err(QuorumError::Usage(
+            "collector response exceeds 32 follow-up artifacts".into(),
+        ));
+    }
+
+    let available_evidence = fetched_evidence(inputs)?;
+    for finding in &raw.findings {
+        validate_finding(finding, &available_evidence)?;
+    }
+
+    // Keep the existing review_findings parser as the sole normalization and
+    // provenance-stamping path. The strict envelope above adds collector-only
+    // validation without changing compatibility for other callers of that API.
+    let findings = review_findings::parse_response_with_provenance(
+        json_text,
+        inputs.pr_number,
+        task_id,
+        Some(collector_model),
+        Some(collector_version),
+    )
+    .ok_or_else(|| QuorumError::Usage("collector findings could not be normalized".into()))?;
+
+    let mut followup_artifacts = Vec::with_capacity(raw.followup_artifacts.len());
+    for (ordinal, artifact) in raw.followup_artifacts.into_iter().enumerate() {
+        validate_artifact_source(&artifact, &raw.findings)?;
+        let artifact_text = validate_artifact_text(&artifact)?;
+        let verification_expectations =
+            VerificationExpectations::new(artifact.verification_expectations)?;
+        let evidence_ids = validated_evidence(artifact.evidence, &available_evidence)?;
+        followup_artifacts.push(ReviewFollowupArtifact::new(
+            None,
+            inputs.pr_number,
+            ordinal as i64,
+            artifact.technical_impact,
+            artifact.scope_relationship,
+            artifact_text.concern,
+            artifact.non_blocking_reason,
+            artifact.affected_behavior,
+            artifact_text.desired_outcome,
+            verification_expectations,
+            evidence_ids,
+            None,
+            0,
+            0,
+        )?);
+    }
+
+    Ok(ValidatedCollectorResponse {
+        findings,
+        followup_artifacts,
+    })
+}
+
+fn extract_collector_json(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        return Some(trimmed);
+    }
+    if let Some(start) = trimmed.find("```json") {
+        let after = &trimmed[start + 7..];
+        return after.find("```").map(|end| after[..end].trim());
+    }
+    if let Some(start) = trimmed.find("```") {
+        let after = &trimmed[start + 3..];
+        if let Some(end) = after.find("```") {
+            let inner = after[..end].trim();
+            if inner.starts_with('{') {
+                return Some(inner);
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollectorResponseShape {
+    trimmed_starts_with_object: bool,
+    json_fence_present: bool,
+    code_fence_present: bool,
+    json_extracted: bool,
+}
+
+fn collector_response_shape(text: &str) -> CollectorResponseShape {
+    let trimmed = text.trim();
+    CollectorResponseShape {
+        trimmed_starts_with_object: trimmed.starts_with('{'),
+        json_fence_present: trimmed.contains("```json"),
+        code_fence_present: trimmed.contains("```"),
+        json_extracted: extract_collector_json(text).is_some(),
+    }
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn bounded_parse_failure_reason(reason: &str, max_bytes: usize) -> String {
+    let safe_reason = reason.replace('\0', "�");
+    if safe_reason.len() <= max_bytes {
+        return safe_reason;
+    }
+    if max_bytes <= PARSE_FAILURE_REASON_TRUNCATION.len() {
+        return truncate_utf8_bytes(&safe_reason, max_bytes).to_string();
+    }
+
+    let prefix_len = max_bytes - PARSE_FAILURE_REASON_TRUNCATION.len();
+    format!(
+        "{}{}",
+        truncate_utf8_bytes(&safe_reason, prefix_len),
+        PARSE_FAILURE_REASON_TRUNCATION
+    )
+}
+
+fn format_parse_failure(pr_number: i64, response_text: &str, parse_error: &QuorumError) -> String {
+    let shape = collector_response_shape(response_text);
+    let prefix = format!(
+        "collector response parse failed for PR #{pr_number} — response len {}; reason: ",
+        response_text.len()
+    );
+    let suffix = format!(
+        "; shape: trimmed_starts_with_object={}, json_fence_present={}, \
+         code_fence_present={}, json_extracted={}",
+        shape.trimmed_starts_with_object,
+        shape.json_fence_present,
+        shape.code_fence_present,
+        shape.json_extracted,
+    );
+    let reason_limit = MAX_PARSE_FAILURE_ERROR_BYTES.saturating_sub(prefix.len() + suffix.len());
+    format!(
+        "{prefix}{}{suffix}",
+        bounded_parse_failure_reason(&parse_error.to_string(), reason_limit)
+    )
+}
+
+fn validate_finding(
+    finding: &RawFinding,
+    available_evidence: &HashSet<(EvidenceKind, i64)>,
+) -> Result<()> {
+    validate_bounded_text("finding reviewer", &finding.reviewer)?;
+    validate_bounded_text("finding text", &finding.text)?;
+    if !matches!(finding.kind.as_str(), "blocking" | "suggestion") {
+        return Err(QuorumError::Usage(format!(
+            "invalid collector finding kind: {}",
+            finding.kind
+        )));
+    }
+    if !matches!(finding.source_endpoint.as_str(), "pulls" | "issues") {
+        return Err(QuorumError::Usage(format!(
+            "invalid collector finding source endpoint: {}",
+            finding.source_endpoint
+        )));
+    }
+    if !matches!(
+        finding.addressed_status.as_str(),
+        "addressed" | "unaddressed" | "partial" | "unclear" | "withdrawn"
+    ) {
+        return Err(QuorumError::Usage(format!(
+            "invalid collector finding addressed status: {}",
+            finding.addressed_status
+        )));
+    }
+    if finding
+        .severity
+        .as_deref()
+        .is_some_and(|severity| !matches!(severity, "critical" | "major" | "minor" | "nit"))
+    {
+        return Err(QuorumError::Usage(
+            "invalid collector finding severity".into(),
+        ));
+    }
+    if !finding.author_pushback && finding.pushback_accepted.is_some() {
+        return Err(QuorumError::Usage(
+            "collector finding accepts pushback that was not reported".into(),
+        ));
+    }
+    validated_evidence(finding.evidence.clone(), available_evidence)?;
+    Ok(())
+}
+
+fn validate_artifact_source(artifact: &RawFollowupArtifact, findings: &[RawFinding]) -> Result<()> {
+    let source = findings.get(artifact.source_finding_index).ok_or_else(|| {
+        QuorumError::Usage(format!(
+            "follow-up artifact source finding index {} is out of bounds",
+            artifact.source_finding_index
+        ))
+    })?;
+    if source.kind != "suggestion" {
+        return Err(QuorumError::Usage(
+            "follow-up artifact source finding is not a suggestion".into(),
+        ));
+    }
+    if matches!(source.addressed_status.as_str(), "addressed" | "withdrawn")
+        || source.pushback_accepted == Some(true)
+    {
+        return Err(QuorumError::Usage(
+            "follow-up artifact source was fixed, withdrawn, or accepted as invalid".into(),
+        ));
+    }
+
+    let artifact_evidence = artifact
+        .evidence
+        .iter()
+        .map(|evidence| (evidence.kind, evidence.id))
+        .collect::<HashSet<_>>();
+    if !source
+        .evidence
+        .iter()
+        .any(|evidence| artifact_evidence.contains(&(evidence.kind, evidence.id)))
+    {
+        return Err(QuorumError::Usage(
+            "follow-up artifact does not share evidence with its source finding".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_text(artifact: &RawFollowupArtifact) -> Result<ValidatedArtifactText> {
+    for (field, value) in [
+        ("non-blocking reason", artifact.non_blocking_reason.as_str()),
+        ("affected behavior", artifact.affected_behavior.as_str()),
+    ] {
+        validate_bounded_text(field, value)?;
+    }
+    for expectation in &artifact.verification_expectations {
+        validate_bounded_text("verification expectation", expectation)?;
+    }
+    let concern = join_structured_text(
+        "concern",
+        "failure mode",
+        &artifact.concern.failure_mode,
+        "trigger or assumption",
+        &artifact.concern.trigger_or_assumption,
+    )?;
+    let desired_outcome = join_structured_text(
+        "desired outcome",
+        "observable behavior",
+        &artifact.desired_outcome.observable_behavior,
+        "observation condition",
+        &artifact.desired_outcome.observation_condition,
+    )?;
+    Ok(ValidatedArtifactText {
+        concern,
+        desired_outcome,
+    })
+}
+
+fn validate_bounded_text(field: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() || value.contains('\0') || value.len() > MAX_FOLLOWUP_TEXT_BYTES {
+        return Err(QuorumError::Usage(format!(
+            "invalid bounded collector {field}"
+        )));
+    }
+    Ok(())
+}
+
+fn join_structured_text(
+    field: &str,
+    first_label: &str,
+    first: &str,
+    second_label: &str,
+    second: &str,
+) -> Result<String> {
+    validate_bounded_text(first_label, first)?;
+    validate_bounded_text(second_label, second)?;
+    let combined = format!("{} when {}", first.trim(), second.trim());
+    validate_bounded_text(field, &combined)?;
+    Ok(combined)
+}
+
+fn validated_evidence(
+    evidence: Vec<RawEvidenceId>,
+    available_evidence: &HashSet<(EvidenceKind, i64)>,
+) -> Result<FollowupEvidenceIds> {
+    let evidence = evidence
+        .into_iter()
+        .map(|evidence| {
+            if !available_evidence.contains(&(evidence.kind, evidence.id)) {
+                return Err(QuorumError::Usage(format!(
+                    "collector evidence {}#{} is absent from fetched input",
+                    evidence.kind, evidence.id
+                )));
+            }
+            ReviewFollowupEvidenceId::new(evidence.kind, evidence.id)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    FollowupEvidenceIds::new(evidence)
+}
+
+fn fetched_evidence(inputs: &CollectorInputs) -> Result<HashSet<(EvidenceKind, i64)>> {
+    if let Some(index) = &inputs.fetched_evidence {
+        if index.len() > MAX_FETCHED_EVIDENCE_RECORDS {
+            return Err(QuorumError::Usage(
+                "fetched evidence index exceeds bounded record count".into(),
+            ));
+        }
+        return index
+            .iter()
+            .map(|evidence| {
+                let kind = evidence.kind.parse::<EvidenceKind>()?;
+                ReviewFollowupEvidenceId::new(kind, evidence.id)?;
+                Ok((kind, evidence.id))
+            })
+            .collect();
+    }
+    fetched_evidence_from_json(
+        &inputs.reviews_json,
+        &inputs.review_comments_json,
+        &inputs.issue_comments_json,
+    )
+}
+
+fn fetched_evidence_from_json(
+    reviews_json: &str,
+    review_comments_json: &str,
+    issue_comments_json: &str,
+) -> Result<HashSet<(EvidenceKind, i64)>> {
+    let input_bytes = reviews_json
+        .len()
+        .checked_add(review_comments_json.len())
+        .and_then(|bytes| bytes.checked_add(issue_comments_json.len()))
+        .ok_or_else(|| QuorumError::Usage("fetched evidence byte count overflow".into()))?;
+    if input_bytes > MAX_FETCHED_EVIDENCE_JSON_BYTES {
+        return Err(QuorumError::Usage(
+            "fetched evidence JSON exceeds bounded input size".into(),
+        ));
+    }
+    let mut index = FetchedEvidenceIndex::default();
+    add_fetched_ids(&mut index, EvidenceKind::Review, reviews_json)?;
+    add_fetched_ids(
+        &mut index,
+        EvidenceKind::ReviewComment,
+        review_comments_json,
+    )?;
+    add_fetched_ids(&mut index, EvidenceKind::IssueComment, issue_comments_json)?;
+    Ok(index.evidence)
+}
+
+#[derive(Default)]
+struct FetchedEvidenceIndex {
+    evidence: HashSet<(EvidenceKind, i64)>,
+    records: usize,
+}
+
+fn add_fetched_ids(index: &mut FetchedEvidenceIndex, kind: EvidenceKind, json: &str) -> Result<()> {
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    FetchedEvidenceSeed {
+        index,
+        kind,
+        array_depth: 0,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|()| deserializer.end())
+    .map_err(|error| QuorumError::Usage(format!("malformed fetched {kind} evidence JSON: {error}")))
+}
+
+struct FetchedEvidenceSeed<'a> {
+    index: &'a mut FetchedEvidenceIndex,
+    kind: EvidenceKind,
+    array_depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for FetchedEvidenceSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(FetchedEvidenceVisitor {
+            index: self.index,
+            kind: self.kind,
+            array_depth: self.array_depth,
+        })
+    }
+}
+
+struct FetchedEvidenceVisitor<'a> {
+    index: &'a mut FetchedEvidenceIndex,
+    kind: EvidenceKind,
+    array_depth: usize,
+}
+
+impl<'de> Visitor<'de> for FetchedEvidenceVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a GitHub evidence record or paginated array")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        if self.array_depth >= MAX_FETCHED_EVIDENCE_ARRAY_DEPTH {
+            return Err(de::Error::custom(
+                "fetched evidence exceeds bounded array depth",
+            ));
+        }
+        let index = self.index;
+        while sequence
+            .next_element_seed(FetchedEvidenceSeed {
+                index: &mut *index,
+                kind: self.kind,
+                array_depth: self.array_depth + 1,
+            })?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        self.index.records = self
+            .index
+            .records
+            .checked_add(1)
+            .ok_or_else(|| de::Error::custom("fetched evidence record count overflow"))?;
+        if self.index.records > MAX_FETCHED_EVIDENCE_RECORDS {
+            return Err(de::Error::custom(
+                "fetched evidence exceeds bounded record count",
+            ));
+        }
+
+        let mut id = None;
+        while let Some(field) = map.next_key::<FetchedEvidenceField>()? {
+            match field {
+                FetchedEvidenceField::Id => id = map.next_value::<Option<i64>>()?,
+                FetchedEvidenceField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        if let Some(id) = id.filter(|id| *id > 0) {
+            self.index.evidence.insert((self.kind, id));
+        }
+        Ok(())
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<(), E> {
+        Ok(())
+    }
+}
+
+enum FetchedEvidenceField {
+    Id,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for FetchedEvidenceField {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_identifier(FetchedEvidenceFieldVisitor)
+    }
+}
+
+struct FetchedEvidenceFieldVisitor;
+
+impl Visitor<'_> for FetchedEvidenceFieldVisitor {
+    type Value = FetchedEvidenceField;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a GitHub evidence record field")
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(if value == "id" {
+            FetchedEvidenceField::Id
+        } else {
+            FetchedEvidenceField::Other
+        })
+    }
+}
+
 /// Everything the collector needs to run for one PR. Passed into
 /// [`run_collection_with_inputs`] so tests can bypass `gh api` entirely.
 #[derive(Debug, Clone)]
@@ -57,6 +677,8 @@ pub struct CollectionRequest {
     pub repo_dir: PathBuf,
     pub agent_bin: Option<String>,
     pub bare_agent: bool,
+    pub collector_provider: String,
+    pub collector_runner: String,
     pub collector_model: String,
     pub collector_effort: String,
     pub role_assignment_id: Option<i64>,
@@ -79,6 +701,9 @@ impl CollectionRequest {
         agent_bin: Option<String>,
         bare_agent: bool,
     ) -> Self {
+        let default_provider = AgentKind::for_model(CLASSIFIER_MODEL)
+            .map(|kind| kind.to_string())
+            .unwrap_or_default();
         Self {
             pr_number,
             task_id,
@@ -87,6 +712,8 @@ impl CollectionRequest {
             repo_dir,
             agent_bin,
             bare_agent,
+            collector_provider: default_provider.clone(),
+            collector_runner: default_provider,
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
             role_assignment_id: None,
@@ -97,10 +724,14 @@ impl CollectionRequest {
 
     pub fn with_collector(
         mut self,
+        provider: impl Into<String>,
+        runner: impl Into<String>,
         model: impl Into<String>,
         effort: impl Into<String>,
         codex_sandbox: impl Into<String>,
     ) -> Self {
+        self.collector_provider = provider.into();
+        self.collector_runner = runner.into();
         self.collector_model = model.into();
         self.collector_effort = effort.into();
         self.codex_sandbox = codex_sandbox.into();
@@ -117,6 +748,11 @@ pub struct CollectionOutcome {
     pub status: RunStatus,
     pub findings_count: i64,
     pub error: Option<String>,
+}
+
+struct ClassifierTurnOutcome {
+    response: Result<String>,
+    usage: super::runner::TokenUsage,
 }
 
 /// Full pipeline: fetch inputs, spawn classifier, parse + store. On any failure
@@ -147,8 +783,17 @@ pub async fn run_collection_with_inputs(
     attempted_at: i64,
 ) -> Result<CollectionOutcome> {
     // 2) Spawn classifier + await bounded turn.
-    let response_text = match spawn_and_run_classifier(request, &inputs).await {
-        Ok(t) => t,
+    let turn = match spawn_and_run_classifier(request, &inputs).await {
+        Ok(turn) => turn,
+        Err(e) => {
+            let err_text = format!("collector classifier failed: {e}");
+            record_failure(request, &err_text, attempted_at).await;
+            return Err(QuorumError::Io(err_text));
+        }
+    };
+    record_token_usage(request, turn.usage).await;
+    let response_text = match turn.response {
+        Ok(response) => response,
         Err(e) => {
             let err_text = format!("collector classifier failed: {e}");
             record_failure(request, &err_text, attempted_at).await;
@@ -157,44 +802,50 @@ pub async fn run_collection_with_inputs(
     };
 
     // 3) Parse response.
-    let findings = match review_findings::parse_response_with_provenance(
+    let validated = match parse_and_validate_response(
         &response_text,
-        request.pr_number,
+        &inputs,
         request.task_id,
-        Some(&request.collector_model),
-        Some(COLLECTOR_VERSION),
+        &request.collector_model,
+        COLLECTOR_VERSION,
     ) {
-        Some(f) => f,
-        None => {
-            let err_text = format!(
-                "collector response parse failed for PR #{} — response len {}",
-                request.pr_number,
-                response_text.len()
-            );
-            record_failure(request, &err_text, attempted_at).await;
-            return Err(QuorumError::Io(err_text));
+        Ok(response) => response,
+        Err(error) => {
+            return Err(record_parse_failure(request, &response_text, &error, attempted_at).await);
         }
     };
+    let findings = validated.findings;
+    // Persistence of the already validated immutable artifact batch belongs to
+    // the later atomic-success slice. Keep this parser-only change from
+    // altering existing success writes.
+    let _followup_artifacts = validated.followup_artifacts;
 
     // 4) Persist findings + success run row.
     let pr = request.pr_number;
     let task_id = request.task_id;
     let db_path = request.db_path.clone();
+    let collector_provider = request.collector_provider.clone();
+    let collector_runner = request.collector_runner.clone();
     let collector_model = request.collector_model.clone();
+    let collector_effort = request.collector_effort.clone();
     let role_assignment_id = request.role_assignment_id;
     let count = findings.len() as i64;
     let write_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
-        review_findings::replace_for_pr(&mut conn, pr, &findings)?;
         let now = clock::now();
-        review_findings::record_run(
-            &conn,
+        review_findings::replace_for_pr_and_record_run(
+            &mut conn,
+            pr,
+            &findings,
             &CollectionRun {
                 pr_number: pr,
                 task_id,
                 status: RunStatus::Success,
                 error: None,
                 collector_model,
+                collector_provider: Some(collector_provider),
+                collector_runner: Some(collector_runner),
+                collector_effort: Some(collector_effort),
                 collector_version: COLLECTOR_VERSION.to_string(),
                 findings_count: count,
                 attempted_at,
@@ -227,6 +878,17 @@ pub async fn run_collection_with_inputs(
     }
 }
 
+async fn record_parse_failure(
+    request: &CollectionRequest,
+    response_text: &str,
+    parse_error: &QuorumError,
+    attempted_at: i64,
+) -> QuorumError {
+    let error_text = format_parse_failure(request.pr_number, response_text, parse_error);
+    record_failure(request, &error_text, attempted_at).await;
+    QuorumError::Io(error_text)
+}
+
 /// Record a failed run + log to `errors`. Best-effort: a follow-up failure here
 /// must not shadow the original error the caller is about to report.
 async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: i64) {
@@ -234,12 +896,15 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
     let pr = request.pr_number;
     let task_id = request.task_id;
     let error_text = error.to_string();
+    let collector_provider = request.collector_provider.clone();
+    let collector_runner = request.collector_runner.clone();
     let collector_model = request.collector_model.clone();
+    let collector_effort = request.collector_effort.clone();
     let role_assignment_id = request.role_assignment_id;
     let _ = tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = quorum_core::db::open(&db_path)?;
         let now = clock::now();
-        review_findings::record_run(
+        let record_result = review_findings::record_run(
             &conn,
             &CollectionRun {
                 pr_number: pr,
@@ -247,17 +912,60 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
                 status: RunStatus::Failed,
                 error: Some(error_text.clone()),
                 collector_model,
+                collector_provider: Some(collector_provider),
+                collector_runner: Some(collector_runner),
+                collector_effort: Some(collector_effort),
                 collector_version: COLLECTOR_VERSION.to_string(),
                 findings_count: 0,
                 attempted_at,
                 completed_at: Some(now),
                 role_assignment_id,
             },
-        )?;
+        );
+        // The guarded evidence write may reject a stale or mismatched managed
+        // assignment. Preserve that failure while still reporting it through
+        // the existing canonical error telemetry.
         quorum_core::errlog::log_error(&conn, now, "review-collector", &error_text);
-        Ok(())
+        record_result
     })
     .await;
+}
+
+/// Token telemetry is best-effort and intentionally independent from collector
+/// findings and lifecycle records.
+async fn record_token_usage(request: &CollectionRequest, usage: super::runner::TokenUsage) {
+    let db_path = request.db_path.clone();
+    let task_ids: Vec<i64> = request.task_id.into_iter().collect();
+    let pr_number = request.pr_number;
+    let provider = request.collector_provider.clone();
+    let model = request.collector_model.clone();
+    let effort = request.collector_effort.clone();
+    match tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        let usage = super::runner::try_durable_token_usage(usage)
+            .map_err(|error| QuorumError::Io(format!("invalid token telemetry: {error}")))?;
+        quorum_core::token_usage::record(
+            &mut conn,
+            None,
+            "collector",
+            &task_ids,
+            Some(pr_number),
+            &provider,
+            &model,
+            &effort,
+            usage,
+            clock::now(),
+        )?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("quorum collector: token usage write failed (ignored): {error}")
+        }
+        Err(error) => eprintln!("quorum collector: token usage join failed (ignored): {error}"),
+    }
 }
 
 /// Deterministically fetch every input the classifier will read. Failures at
@@ -313,6 +1021,19 @@ pub async fn fetch_inputs(request: &CollectionRequest) -> Result<CollectorInputs
     .await?;
     let diff_stat = gh_diff_stat(&repo, &repo_dir, pr).await?;
     let checks_summary = gh_checks_summary(&repo, &repo_dir, pr).await?;
+    let mut fetched_evidence =
+        fetched_evidence_from_json(&reviews_json, &review_comments_json, &issue_comments_json)?
+            .into_iter()
+            .map(|(kind, id)| review_findings::EvidenceId {
+                kind: kind.to_string(),
+                id,
+            })
+            .collect::<Vec<_>>();
+    fetched_evidence.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.id.cmp(&right.id))
+    });
 
     // DB context (task metadata + agent runs + verdicts). All best-effort;
     // absence produces empty context rather than a hard failure.
@@ -324,6 +1045,7 @@ pub async fn fetch_inputs(request: &CollectionRequest) -> Result<CollectorInputs
         reviews_json: truncate(&reviews_json),
         review_comments_json: truncate(&review_comments_json),
         issue_comments_json: truncate(&issue_comments_json),
+        fetched_evidence: Some(fetched_evidence),
         commits_json: truncate(&commits_json),
         checks_summary: truncate(&checks_summary),
         diff_stat: truncate(&diff_stat),
@@ -526,46 +1248,32 @@ async fn run_gh_raw(
 async fn spawn_and_run_classifier(
     request: &CollectionRequest,
     inputs: &CollectorInputs,
-) -> Result<String> {
+) -> Result<ClassifierTurnOutcome> {
     let prompt = review_findings::build_collector_prompt(inputs);
-    let kind = AgentKind::for_model(&request.collector_model)
-        .map_err(|e| QuorumError::Io(format!("collector provider: {e}")))?;
-    let mut proc = match kind {
-        AgentKind::Claude => {
-            let spec = AgentSpec {
-                kind,
-                model: request.collector_model.clone(),
-                effort: request.collector_effort.clone(),
-                session_id: agent::new_session_id(),
-                worktree: request.repo_dir.clone(),
-                bare: request.bare_agent,
-                allowed_tools: String::new(),
-                env_vars: request.env_vars.clone(),
-            };
-            let mut proc = AgentProc::spawn(&spec, request.agent_bin.as_deref())
-                .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
-            proc.feed_turn(&agent::user_turn(&prompt))
-                .await
-                .map_err(|e| QuorumError::Io(format!("feed_turn: {e}")))?;
-            RunnerProc::Claude(proc)
-        }
-        AgentKind::Codex => {
-            let spec = CodexSpec {
-                model: request.collector_model.clone(),
-                effort: request.collector_effort.clone(),
-                sandbox: request.codex_sandbox.clone(),
-                worktree: request.repo_dir.clone(),
-                prompt,
-                env_vars: request.env_vars.clone(),
-            };
-            CodexProc::spawn(&spec, request.agent_bin.as_deref())
-                .map(RunnerProc::Codex)
-                .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?
-        }
-    };
+    let mut proc = RunnerProc::launch(
+        &LaunchRequest {
+            model: &request.collector_model,
+            effort: &request.collector_effort,
+            worktree: &request.repo_dir,
+            prompt: &prompt,
+            environment: &request.env_vars,
+            mode: LaunchMode::Normal,
+            continuation_id: None,
+        },
+        &AdapterConfig {
+            executable: request.agent_bin.as_deref(),
+            claude_bare: request.bare_agent,
+            claude_allowed_tools: "",
+            codex_sandbox: &request.codex_sandbox,
+            grok: Default::default(),
+        },
+    )
+    .await
+    .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
 
     let deadline = tokio::time::Instant::now() + CLASSIFIER_TIMEOUT;
     let mut response_text = String::new();
+    let mut usage_total = super::runner::TokenUsage::default();
     let outcome: Result<String> = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -576,35 +1284,26 @@ async fn spawn_and_run_classifier(
         }
         match timeout(remaining, proc.next_raw_line()).await {
             Ok(Some(raw)) => {
-                if kind == AgentKind::Claude {
-                    if let Some(super::stream::Event::Result {
-                        result, is_error, ..
-                    }) = super::stream::parse_line(&raw)
-                    {
-                        let text = super::stream::result_text(&result);
-                        if is_error.unwrap_or(false) {
-                            break Err(QuorumError::Io(format!(
-                                "classifier returned an error: {text}"
-                            )));
-                        }
-                        if !text.is_empty() {
-                            response_text = text;
-                        }
-                        break Ok(response_text.clone());
-                    }
+                let line = proc.normalize_line(&raw);
+                if let Some(text) = line.terminal_text.as_ref().filter(|text| !text.is_empty()) {
+                    response_text = text.clone();
                 }
-                let events = match kind {
-                    AgentKind::Claude => super::runner::normalize_claude_line(&raw),
-                    AgentKind::Codex => super::runner::normalize_codex_line(&raw),
-                };
                 let mut terminal = None;
-                for event in events {
+                for event in line.events {
                     match event {
                         AgentEvent::AssistantText { text } => response_text.push_str(&text),
-                        AgentEvent::TurnCompleted { .. } => {
+                        AgentEvent::CompletedAssistantText { text, .. } => response_text = text,
+                        AgentEvent::TurnCompleted { usage, .. } => {
+                            if let Some(usage) = usage {
+                                usage_total.saturating_add_assign(usage);
+                            }
                             terminal = Some(Ok(response_text.clone()))
                         }
-                        AgentEvent::TurnFailed { message, .. } => {
+                        AgentEvent::TurnFailed { message, usage, .. } => {
+                            if let Some(usage) = usage {
+                                usage_total.saturating_add_assign(usage);
+                            }
+                            let message = line.terminal_text.as_deref().unwrap_or(&message);
                             terminal = Some(Err(QuorumError::Io(format!(
                                 "classifier returned an error: {message}"
                             ))))
@@ -634,8 +1333,41 @@ async fn spawn_and_run_classifier(
         }
     };
 
-    proc.kill_and_reap().await;
-    outcome
+    // Reaping can drain a terminal event raced by the timeout. It remains
+    // lifecycle-inert, but its usage is still durable telemetry.
+    let kind = proc.kind();
+    let terminal = proc.kill_and_reap().await;
+    Ok(finalize_classifier_turn(
+        kind,
+        terminal,
+        outcome,
+        usage_total,
+    ))
+}
+
+fn finalize_classifier_turn(
+    kind: AgentKind,
+    terminal: Vec<super::runner::CapturedOutput>,
+    response: Result<String>,
+    mut usage: super::runner::TokenUsage,
+) -> ClassifierTurnOutcome {
+    for captured in terminal {
+        let super::runner::CapturedOutput::Stdout(raw_line) = captured else {
+            continue;
+        };
+        for event in super::runner::normalize_line(kind, &raw_line) {
+            match event {
+                AgentEvent::TurnCompleted {
+                    usage: Some(value), ..
+                }
+                | AgentEvent::TurnFailed {
+                    usage: Some(value), ..
+                } => usage.saturating_add_assign(value),
+                _ => {}
+            }
+        }
+    }
+    ClassifierTurnOutcome { response, usage }
 }
 
 /// Spawn a detached collection task from the daemon merge branch. Never awaits.
@@ -679,8 +1411,16 @@ mod tests {
             None,
             false,
         )
-        .with_collector("gpt-5.6-terra", "high", "danger-full-access");
+        .with_collector(
+            "codex",
+            "codex",
+            "gpt-5.6-terra",
+            "high",
+            "danger-full-access",
+        );
 
+        assert_eq!(request.collector_provider, "codex");
+        assert_eq!(request.collector_runner, "codex");
         assert_eq!(request.collector_model, "gpt-5.6-terra");
         assert_eq!(request.collector_effort, "high");
     }
@@ -719,6 +1459,76 @@ mod tests {
         assert!(out.contains("truncated"));
     }
 
+    #[test]
+    fn timeout_boundary_reap_retains_terminal_usage() {
+        let outcome = finalize_classifier_turn(
+            AgentKind::Claude,
+            vec![super::super::runner::CapturedOutput::Stdout(
+                r#"{"type":"result","result":"late","is_error":false,"usage":{"input_tokens":100,"cache_read_input_tokens":80,"cache_creation_input_tokens":10,"output_tokens":5}}"#
+                    .into(),
+            )],
+            Err(QuorumError::Io("classifier timeout for PR #464".into())),
+            super::super::runner::TokenUsage::default(),
+        );
+
+        assert!(matches!(
+            outcome.response,
+            Err(QuorumError::Io(ref message)) if message.contains("timeout")
+        ));
+        assert_eq!(
+            outcome.usage,
+            super::super::runner::TokenUsage {
+                input_tokens: 100,
+                uncached_input_tokens: 20,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 10,
+                output_tokens: 5,
+                reasoning_tokens: 0,
+            },
+            "terminal usage raced by the timeout must survive final reap"
+        );
+    }
+
+    #[tokio::test]
+    async fn overflowing_collector_usage_is_ignored_without_a_negative_row() {
+        let (_dir, db_path) = tmp_conn();
+        let request = CollectionRequest::new(
+            464,
+            None,
+            None,
+            db_path.clone(),
+            std::env::current_dir().unwrap(),
+            None,
+            true,
+        )
+        .with_collector(
+            "codex",
+            "codex",
+            "gpt-5.6-terra",
+            "medium",
+            "danger-full-access",
+        );
+
+        record_token_usage(
+            &request,
+            super::super::runner::TokenUsage {
+                output_tokens: u64::MAX,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let conn = db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM token_usage_runs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+            "collector overflow must fail inside the best-effort boundary"
+        );
+    }
+
     #[tokio::test]
     async fn record_failure_writes_run_and_error_rows() {
         let (_dir, db_path) = tmp_conn();
@@ -731,7 +1541,13 @@ mod tests {
             None,
             true,
         )
-        .with_collector("gpt-5.6-terra", "medium", "danger-full-access");
+        .with_collector(
+            "codex",
+            "codex",
+            "gpt-5.6-terra",
+            "medium",
+            "danger-full-access",
+        );
         record_failure(&request, "boom", 1000).await;
 
         let conn = db::open(&db_path).unwrap();
@@ -746,6 +1562,54 @@ mod tests {
                 "SELECT COUNT(*) FROM errors WHERE source='review-collector'",
                 [],
                 |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn record_failure_logs_error_when_guarded_run_rejects_assignment() {
+        let (_dir, db_path) = tmp_conn();
+        let mut request = CollectionRequest::new(
+            45,
+            Some(7),
+            None,
+            db_path.clone(),
+            std::env::current_dir().unwrap(),
+            None,
+            true,
+        )
+        .with_collector(
+            "codex",
+            "codex",
+            "gpt-5.6-terra",
+            "medium",
+            "danger-full-access",
+        );
+        request.role_assignment_id = Some(77);
+
+        let conn = db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (77,'collector:pr:45',7,45,'collector','collector-profile','codex',
+                     'claude','gpt-5.6-terra','medium','collector','g1',1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        record_failure(&request, "assignment mismatch", 1000).await;
+
+        let conn = db::open(&db_path).unwrap();
+        assert!(review_findings::get_run(&conn, 45).unwrap().is_none());
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM errors
+                 WHERE source='review-collector' AND detail='assignment mismatch'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
         assert_eq!(n, 1);
@@ -795,7 +1659,13 @@ mod tests {
             Some("/bin/false".into()),
             true,
         )
-        .with_collector("unknown-provider-model", "medium", "danger-full-access");
+        .with_collector(
+            "unknown",
+            "unknown",
+            "unknown-provider-model",
+            "medium",
+            "danger-full-access",
+        );
 
         let error = run_collection_with_inputs(&request, synthetic_inputs(44), 1000)
             .await
@@ -844,13 +1714,786 @@ mod tests {
             pr_number: pr,
             pr_metadata_json: "{}".into(),
             reviews_json: "[]".into(),
-            review_comments_json: "[]".into(),
-            issue_comments_json: "[]".into(),
+            review_comments_json: r#"[[{"id":101}]]"#.into(),
+            issue_comments_json: r#"[{"id":202}]"#.into(),
+            fetched_evidence: None,
             commits_json: "[]".into(),
             checks_summary: "unknown".into(),
             diff_stat: "unknown".into(),
             task_context: TaskContext::default(),
         }
+    }
+
+    fn parser_inputs(review_comment_ids: &[i64], issue_comment_ids: &[i64]) -> CollectorInputs {
+        let records = |ids: &[i64]| {
+            serde_json::to_string(
+                &ids.iter()
+                    .map(|id| serde_json::json!({"id": id}))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        CollectorInputs {
+            pr_number: 42,
+            pr_metadata_json: "{}".into(),
+            reviews_json: "[]".into(),
+            review_comments_json: records(review_comment_ids),
+            issue_comments_json: records(issue_comment_ids),
+            fetched_evidence: None,
+            commits_json: "[]".into(),
+            checks_summary: "all passed".into(),
+            diff_stat: "1 file".into(),
+            task_context: TaskContext::default(),
+        }
+    }
+
+    fn finding(kind: &str, id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "reviewer": "reviewer",
+            "kind": kind,
+            "author_pushback": false,
+            "pushback_accepted": null,
+            "severity": "minor",
+            "text": "Timeout handling can lose the pending operation",
+            "source_endpoint": "pulls",
+            "addressed_status": "unaddressed",
+            "evidence": [{"kind": "review_comment", "id": id}]
+        })
+    }
+
+    fn artifact(id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "source_finding_index": 0,
+            "technical_impact": "major",
+            "scope_relationship": "out_of_scope",
+            "concern": {
+                "failure_mode": "The worker loses the pending operation",
+                "trigger_or_assumption": "A provider request times out during shutdown"
+            },
+            "non_blocking_reason": "The merged change does not alter timeout handling",
+            "affected_behavior": "Worker shutdown after a provider timeout",
+            "desired_outcome": {
+                "observable_behavior": "The worker preserves the pending operation for retry",
+                "observation_condition": "A provider request times out during shutdown"
+            },
+            "verification_expectations": ["A timeout recovery test preserves the operation"],
+            "evidence": [{"kind": "review_comment", "id": id}]
+        })
+    }
+
+    fn response(findings: Vec<serde_json::Value>, artifacts: Vec<serde_json::Value>) -> String {
+        serde_json::json!({
+            "findings": findings,
+            "followup_artifacts": artifacts,
+        })
+        .to_string()
+    }
+
+    fn parse_fixture(
+        response: &str,
+        inputs: &CollectorInputs,
+    ) -> Result<ValidatedCollectorResponse> {
+        parse_and_validate_response(response, inputs, Some(7), "collector-model", "v-test")
+    }
+
+    async fn assert_parse_failure_is_recorded(
+        response_text: &str,
+        reason_substring: &str,
+        expected_shape: &str,
+    ) {
+        let (_dir, db_path) = tmp_conn();
+        let request = CollectionRequest::new(
+            52,
+            Some(7),
+            None,
+            db_path.clone(),
+            std::env::current_dir().unwrap(),
+            None,
+            true,
+        );
+        let parse_error = parse_fixture(response_text, &parser_inputs(&[10], &[])).unwrap_err();
+        assert!(parse_error.to_string().contains(reason_substring));
+
+        let returned = record_parse_failure(&request, response_text, &parse_error, 1000).await;
+        assert!(returned.to_string().contains(reason_substring));
+
+        let conn = db::open(&db_path).unwrap();
+        let run = review_findings::get_run(&conn, 52).unwrap().unwrap();
+        let error = run.error.as_deref().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.findings_count, 0);
+        assert!(error.contains(reason_substring));
+        assert!(error.contains(&format!("response len {}", response_text.len())));
+        assert!(
+            error.contains(expected_shape),
+            "unexpected failure detail: {error}"
+        );
+
+        let logged: String = conn
+            .query_row(
+                "SELECT detail FROM errors WHERE source='review-collector'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(logged, error);
+        assert!(review_findings::list_for_pr(&conn, 52).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_failure_records_non_json_reason_and_shape() {
+        assert_parse_failure_is_recorded(
+            "I could not produce the requested response.",
+            "collector response is not a JSON object",
+            "trimmed_starts_with_object=false, json_fence_present=false, \
+             code_fence_present=false, json_extracted=false",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parse_failure_records_invalid_json_reason_and_shape() {
+        assert_parse_failure_is_recorded(
+            r#"{"findings":[],"followup_artifacts":[]"#,
+            "invalid collector response:",
+            "trimmed_starts_with_object=true, json_fence_present=false, \
+             code_fence_present=false, json_extracted=true",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parse_failure_records_validation_reason_and_fenced_shape() {
+        let response_text = format!(
+            "```json\n{}\n```",
+            response(vec![finding("invalid-kind", 10)], vec![])
+        );
+        assert_parse_failure_is_recorded(
+            &response_text,
+            "invalid collector finding kind: invalid-kind",
+            "trimmed_starts_with_object=false, json_fence_present=true, \
+             code_fence_present=true, json_extracted=true",
+        )
+        .await;
+    }
+
+    #[test]
+    fn collector_protocol_accepts_valid_zero_artifact_interpretation() {
+        let parsed = parse_fixture(
+            r#"{"findings":[],"followup_artifacts":[]}"#,
+            &parser_inputs(&[], &[]),
+        )
+        .unwrap();
+        assert!(parsed.findings.is_empty());
+        assert!(parsed.followup_artifacts.is_empty());
+    }
+
+    #[test]
+    fn collector_protocol_accepts_single_artifact_and_stamps_relationships() {
+        let parsed = parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![artifact(10)]),
+            &parser_inputs(&[10], &[]),
+        )
+        .unwrap();
+        assert_eq!(parsed.findings.len(), 1);
+        assert_eq!(parsed.findings[0].pr_number, 42);
+        assert_eq!(parsed.findings[0].task_id, Some(7));
+        assert_eq!(parsed.followup_artifacts.len(), 1);
+        assert_eq!(parsed.followup_artifacts[0].pr_number(), 42);
+        assert_eq!(parsed.followup_artifacts[0].ordinal(), 0);
+        assert_eq!(
+            parsed.followup_artifacts[0].technical_impact(),
+            TechnicalImpact::Major
+        );
+    }
+
+    #[test]
+    fn collector_protocol_accepts_every_artifact_enum_value() {
+        for impact in ["critical", "major", "minor", "nit"] {
+            let mut value = artifact(10);
+            value["technical_impact"] = serde_json::Value::String(impact.into());
+            assert!(parse_fixture(
+                &response(vec![finding("suggestion", 10)], vec![value]),
+                &parser_inputs(&[10], &[]),
+            )
+            .is_ok());
+        }
+        for relationship in [
+            "pre_existing",
+            "out_of_scope",
+            "threat_model_expansion",
+            "defense_in_depth",
+            "future_requirement",
+            "design_debt",
+        ] {
+            let mut value = artifact(10);
+            value["scope_relationship"] = serde_json::Value::String(relationship.into());
+            assert!(parse_fixture(
+                &response(vec![finding("suggestion", 10)], vec![value]),
+                &parser_inputs(&[10], &[]),
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn collector_protocol_rejects_unknown_enum_values() {
+        for (field, value) in [
+            ("technical_impact", "severe"),
+            ("scope_relationship", "adjacent"),
+        ] {
+            let mut candidate = artifact(10);
+            candidate[field] = serde_json::Value::String(value.into());
+            assert!(parse_fixture(
+                &response(vec![finding("suggestion", 10)], vec![candidate]),
+                &parser_inputs(&[10], &[]),
+            )
+            .is_err());
+        }
+
+        let mut candidate = artifact(10);
+        candidate["evidence"][0]["kind"] = serde_json::json!("commit");
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![candidate]),
+            &parser_inputs(&[10], &[]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_accepts_every_evidence_kind() {
+        for kind in ["review", "review_comment", "issue_comment"] {
+            let mut inputs = parser_inputs(&[10], &[10]);
+            inputs.reviews_json = r#"[{"id":10}]"#.into();
+            let mut source = finding("suggestion", 10);
+            source["evidence"][0]["kind"] = serde_json::json!(kind);
+            let mut candidate = artifact(10);
+            candidate["evidence"][0]["kind"] = serde_json::json!(kind);
+            assert!(parse_fixture(&response(vec![source], vec![candidate]), &inputs).is_ok());
+        }
+    }
+
+    #[test]
+    fn collector_protocol_rejects_unknown_finding_enum_values() {
+        let inputs = parser_inputs(&[10], &[]);
+        for (field, value) in [
+            ("kind", "advisory"),
+            ("severity", "moderate"),
+            ("source_endpoint", "commits"),
+            ("addressed_status", "fixed"),
+        ] {
+            let mut source = finding("suggestion", 10);
+            source[field] = serde_json::json!(value);
+            assert!(parse_fixture(&response(vec![source], vec![]), &inputs).is_err());
+        }
+    }
+
+    #[test]
+    fn collector_protocol_rejects_unknown_fields_at_every_level() {
+        let inputs = parser_inputs(&[10], &[]);
+
+        let mut envelope: serde_json::Value = serde_json::from_str(&response(
+            vec![finding("suggestion", 10)],
+            vec![artifact(10)],
+        ))
+        .unwrap();
+        envelope["extra"] = serde_json::json!(true);
+        assert!(parse_fixture(&envelope.to_string(), &inputs).is_err());
+
+        let mut unknown_finding = finding("suggestion", 10);
+        unknown_finding["extra"] = serde_json::json!(true);
+        assert!(parse_fixture(
+            &response(vec![unknown_finding], vec![artifact(10)]),
+            &inputs
+        )
+        .is_err());
+
+        let mut unknown_artifact = artifact(10);
+        unknown_artifact["extra"] = serde_json::json!(true);
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![unknown_artifact]),
+            &inputs,
+        )
+        .is_err());
+
+        let mut unknown_concern = artifact(10);
+        unknown_concern["concern"]["extra"] = serde_json::json!(true);
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![unknown_concern]),
+            &inputs,
+        )
+        .is_err());
+
+        let mut unknown_outcome = artifact(10);
+        unknown_outcome["desired_outcome"]["extra"] = serde_json::json!(true);
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![unknown_outcome]),
+            &inputs,
+        )
+        .is_err());
+
+        let mut unknown_evidence = artifact(10);
+        unknown_evidence["evidence"][0]["extra"] = serde_json::json!(true);
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![unknown_evidence]),
+            &inputs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_accepts_maximum_counts_and_bounds() {
+        let ids = (1..=MAX_REVIEW_FINDINGS as i64).collect::<Vec<_>>();
+        let findings = ids
+            .iter()
+            .map(|id| finding("suggestion", *id))
+            .collect::<Vec<_>>();
+        let mut artifacts = (0..MAX_FOLLOWUP_ARTIFACTS)
+            .map(|_| artifact(1))
+            .collect::<Vec<_>>();
+        let trigger = "concurrent shutdown overlaps request handling";
+        artifacts[0]["concern"]["failure_mode"] = serde_json::Value::String(
+            "x".repeat(MAX_FOLLOWUP_TEXT_BYTES - " when ".len() - trigger.len()),
+        );
+        artifacts[0]["concern"]["trigger_or_assumption"] =
+            serde_json::Value::String(trigger.into());
+        for candidate in &mut artifacts {
+            candidate["verification_expectations"] = serde_json::json!([
+                "expectation one",
+                "expectation two",
+                "expectation three",
+                "expectation four",
+                "expectation five",
+                "expectation six",
+                "expectation seven",
+                "expectation eight"
+            ]);
+        }
+        let parsed =
+            parse_fixture(&response(findings, artifacts), &parser_inputs(&ids, &[])).unwrap();
+        assert_eq!(parsed.findings.len(), MAX_REVIEW_FINDINGS);
+        assert_eq!(parsed.followup_artifacts.len(), MAX_FOLLOWUP_ARTIFACTS);
+        assert_eq!(
+            parsed.followup_artifacts[0]
+                .verification_expectations()
+                .as_slice()
+                .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn collector_protocol_accepts_maximum_evidence_count() {
+        let ids = (1..=128i64).collect::<Vec<_>>();
+        let evidence = ids
+            .iter()
+            .map(|id| serde_json::json!({"kind": "review_comment", "id": id}))
+            .collect::<Vec<_>>();
+        let mut source = finding("suggestion", 1);
+        source["evidence"] = serde_json::Value::Array(evidence.clone());
+        let mut candidate = artifact(1);
+        candidate["evidence"] = serde_json::Value::Array(evidence);
+        let parsed = parse_fixture(
+            &response(vec![source], vec![candidate]),
+            &parser_inputs(&ids, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.followup_artifacts[0].evidence_ids().as_slice().len(),
+            128
+        );
+    }
+
+    #[test]
+    fn collector_protocol_rejects_evidence_absent_from_fetched_input() {
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![artifact(10)]),
+            &parser_inputs(&[11], &[]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_uses_pre_truncation_evidence_index() {
+        let mut inputs = parser_inputs(&[], &[]);
+        inputs.review_comments_json = "[{\"id\":10}\n... [truncated 200 bytes]".into();
+        inputs.fetched_evidence = Some(vec![review_findings::EvidenceId {
+            kind: "review_comment".into(),
+            id: 10,
+        }]);
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![artifact(10)]),
+            &inputs,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn fetched_evidence_streams_paginated_records_without_nested_payload_ids() {
+        let large_body = "x".repeat(MAX_PAYLOAD_BYTES * 2);
+        let reviews = format!(
+            r#"[[{{"id":10,"body":{},"nested":{{"id":999}}}}],[{{"id":11}}]]"#,
+            serde_json::to_string(&large_body).unwrap()
+        );
+        let evidence = fetched_evidence_from_json(&reviews, "[]", "[]").unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence.contains(&(EvidenceKind::Review, 10)));
+        assert!(evidence.contains(&(EvidenceKind::Review, 11)));
+        assert!(!evidence.contains(&(EvidenceKind::Review, 999)));
+    }
+
+    #[test]
+    fn fetched_evidence_rejects_record_overrun_at_streaming_boundary() {
+        let records = std::iter::repeat_n(r#"{"id":1}"#, MAX_FETCHED_EVIDENCE_RECORDS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let reviews = format!("[{records}]");
+        let error = fetched_evidence_from_json(&reviews, "[]", "[]").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("fetched evidence exceeds bounded record count"));
+    }
+
+    #[test]
+    fn fetched_evidence_rejects_oversized_input_before_json_parsing() {
+        let oversized_malformed = "[".repeat(MAX_FETCHED_EVIDENCE_JSON_BYTES + 1);
+        let error = fetched_evidence_from_json(&oversized_malformed, "[]", "[]").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("fetched evidence JSON exceeds bounded input size"));
+    }
+
+    #[test]
+    fn fetched_evidence_rejects_unexpected_array_nesting() {
+        let error = fetched_evidence_from_json("[[[{\"id\":1}]]]", "[]", "[]").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("fetched evidence exceeds bounded array depth"));
+    }
+
+    #[test]
+    fn collector_protocol_rejects_artifact_without_suggestion_source() {
+        assert!(parse_fixture(
+            &response(vec![finding("blocking", 10)], vec![artifact(10)]),
+            &parser_inputs(&[10], &[]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_disambiguates_mixed_validity_findings_with_shared_evidence() {
+        let inputs = parser_inputs(&[10], &[]);
+        let mut invalid = finding("suggestion", 10);
+        invalid["addressed_status"] = serde_json::json!("addressed");
+        let valid = finding("suggestion", 10);
+
+        let mut valid_artifact = artifact(10);
+        valid_artifact["source_finding_index"] = serde_json::json!(1);
+        assert!(parse_fixture(
+            &response(vec![invalid.clone(), valid.clone()], vec![valid_artifact]),
+            &inputs,
+        )
+        .is_ok());
+
+        let invalid_artifact = artifact(10);
+        assert!(parse_fixture(
+            &response(vec![invalid, valid], vec![invalid_artifact]),
+            &inputs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_rejects_invalid_source_finding_references() {
+        let inputs = parser_inputs(&[10], &[]);
+        for invalid_index in [
+            serde_json::json!(-1),
+            serde_json::json!(1),
+            serde_json::json!("0"),
+        ] {
+            let mut candidate = artifact(10);
+            candidate["source_finding_index"] = invalid_index;
+            assert!(parse_fixture(
+                &response(vec![finding("suggestion", 10)], vec![candidate]),
+                &inputs,
+            )
+            .is_err());
+        }
+
+        let mut missing = artifact(10);
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("source_finding_index");
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![missing]),
+            &inputs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_requires_evidence_shared_with_selected_source() {
+        let inputs = parser_inputs(&[10, 11], &[]);
+        let evidence_match = finding("suggestion", 10);
+        let selected_without_match = finding("suggestion", 11);
+        let mut candidate = artifact(10);
+        candidate["source_finding_index"] = serde_json::json!(1);
+
+        assert!(parse_fixture(
+            &response(
+                vec![evidence_match, selected_without_match],
+                vec![candidate]
+            ),
+            &inputs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_rejects_fixed_withdrawn_or_invalid_sources() {
+        let inputs = parser_inputs(&[10], &[]);
+        let mut fixed = finding("suggestion", 10);
+        fixed["addressed_status"] = serde_json::json!("addressed");
+        assert!(parse_fixture(&response(vec![fixed], vec![artifact(10)]), &inputs).is_err());
+
+        // A reviewer can independently retract a suggestion without any
+        // author pushback. That final state must be representable and rejected.
+        let mut withdrawn = finding("suggestion", 10);
+        withdrawn["addressed_status"] = serde_json::json!("withdrawn");
+        assert!(parse_fixture(&response(vec![withdrawn], vec![artifact(10)]), &inputs).is_err());
+
+        let mut accepted_as_invalid = finding("suggestion", 10);
+        accepted_as_invalid["author_pushback"] = serde_json::json!(true);
+        accepted_as_invalid["pushback_accepted"] = serde_json::json!(true);
+        assert!(parse_fixture(
+            &response(vec![accepted_as_invalid], vec![artifact(10)]),
+            &inputs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_preserves_withdrawn_finding_without_artifact() {
+        let inputs = parser_inputs(&[10], &[]);
+        let mut withdrawn = finding("suggestion", 10);
+        withdrawn["addressed_status"] = serde_json::json!("withdrawn");
+
+        let parsed = parse_fixture(&response(vec![withdrawn], vec![]), &inputs).unwrap();
+        assert_eq!(
+            parsed.findings[0].addressed_status.as_deref(),
+            Some("withdrawn")
+        );
+        assert!(parsed.followup_artifacts.is_empty());
+    }
+
+    #[test]
+    fn collector_protocol_rejects_unstructured_vague_concern_or_desired_outcome() {
+        let inputs = parser_inputs(&[10], &[]);
+        for field in ["concern", "desired_outcome"] {
+            for vague_text in [
+                "Make code better",
+                "Improve reliability",
+                "Better reliability.",
+                "Improve queue reliability",
+                "Queue reliability should improve",
+                "The queue should be more reliable",
+            ] {
+                let mut candidate = artifact(10);
+                candidate[field] = serde_json::json!(vague_text);
+                assert!(
+                    parse_fixture(
+                        &response(vec![finding("suggestion", 10)], vec![candidate]),
+                        &inputs,
+                    )
+                    .is_err(),
+                    "{field} accepted vague text: {vague_text}"
+                );
+            }
+        }
+
+        let mut incomplete_concern = artifact(10);
+        incomplete_concern["concern"] =
+            serde_json::json!({"failure_mode": "Queue reliability should improve"});
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![incomplete_concern]),
+            &inputs,
+        )
+        .is_err());
+
+        let mut incomplete_outcome = artifact(10);
+        incomplete_outcome["desired_outcome"] =
+            serde_json::json!({"observable_behavior": "The queue should be more reliable"});
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![incomplete_outcome]),
+            &inputs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_accepts_concise_concrete_concern_and_outcome() {
+        let inputs = parser_inputs(&[10], &[]);
+        let mut candidate = artifact(10);
+        candidate["concern"]["failure_mode"] = serde_json::json!("Requests deadlock");
+        candidate["concern"]["trigger_or_assumption"] =
+            serde_json::json!("Concurrent shutdown overlaps request handling");
+        candidate["desired_outcome"]["observable_behavior"] =
+            serde_json::json!("Requests complete");
+        candidate["desired_outcome"]["observation_condition"] =
+            serde_json::json!("The retry resumes after shutdown");
+        let parsed = parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![candidate]),
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.followup_artifacts[0].concern(),
+            "Requests deadlock when Concurrent shutdown overlaps request handling"
+        );
+        assert_eq!(
+            parsed.followup_artifacts[0].desired_outcome(),
+            "Requests complete when The retry resumes after shutdown"
+        );
+    }
+
+    #[test]
+    fn collector_protocol_rejects_duplicate_artifact_evidence() {
+        let mut candidate = artifact(10);
+        candidate["evidence"] = serde_json::json!([
+            {"kind": "review_comment", "id": 10},
+            {"kind": "review_comment", "id": 10}
+        ]);
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![candidate]),
+            &parser_inputs(&[10], &[]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_rejects_evidence_count_overrun() {
+        let ids = (1..=129i64).collect::<Vec<_>>();
+        let evidence = ids
+            .iter()
+            .map(|id| serde_json::json!({"kind": "review_comment", "id": id}))
+            .collect::<Vec<_>>();
+        let mut candidate = artifact(1);
+        candidate["evidence"] = serde_json::Value::Array(evidence);
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 1)], vec![candidate]),
+            &parser_inputs(&ids, &[]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_rejects_malformed_json() {
+        assert!(parse_fixture(
+            r#"{"findings":[],"followup_artifacts":[}"#,
+            &parser_inputs(&[], &[]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_rejects_count_overruns() {
+        let too_many_findings = (0..=MAX_REVIEW_FINDINGS)
+            .map(|_| finding("suggestion", 10))
+            .collect();
+        assert!(parse_fixture(
+            &response(too_many_findings, vec![]),
+            &parser_inputs(&[10], &[]),
+        )
+        .is_err());
+
+        let too_many_artifacts = (0..=MAX_FOLLOWUP_ARTIFACTS).map(|_| artifact(10)).collect();
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], too_many_artifacts),
+            &parser_inputs(&[10], &[]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_rejects_each_overlong_artifact_string() {
+        let inputs = parser_inputs(&[10], &[]);
+        for field in ["non_blocking_reason", "affected_behavior"] {
+            let mut candidate = artifact(10);
+            candidate[field] = serde_json::Value::String("x".repeat(MAX_FOLLOWUP_TEXT_BYTES + 1));
+            assert!(parse_fixture(
+                &response(vec![finding("suggestion", 10)], vec![candidate]),
+                &inputs,
+            )
+            .is_err());
+        }
+        for (field, component) in [
+            ("concern", "failure_mode"),
+            ("concern", "trigger_or_assumption"),
+            ("desired_outcome", "observable_behavior"),
+            ("desired_outcome", "observation_condition"),
+        ] {
+            let mut candidate = artifact(10);
+            candidate[field][component] =
+                serde_json::Value::String("x".repeat(MAX_FOLLOWUP_TEXT_BYTES + 1));
+            assert!(parse_fixture(
+                &response(vec![finding("suggestion", 10)], vec![candidate]),
+                &inputs,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn collector_protocol_rejects_aggregate_artifact_overrun() {
+        let mut candidate = artifact(10);
+        for field in ["non_blocking_reason", "affected_behavior"] {
+            candidate[field] = serde_json::Value::String("x".repeat(8_000));
+        }
+        for (field, component) in [
+            ("concern", "failure_mode"),
+            ("concern", "trigger_or_assumption"),
+            ("desired_outcome", "observable_behavior"),
+            ("desired_outcome", "observation_condition"),
+        ] {
+            candidate[field][component] = serde_json::Value::String("x".repeat(3_900));
+        }
+        candidate["verification_expectations"] = serde_json::Value::Array(
+            (0..8)
+                .map(|_| serde_json::Value::String("x".repeat(5_000)))
+                .collect(),
+        );
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![candidate]),
+            &parser_inputs(&[10], &[]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_rejects_verification_list_bounds() {
+        let inputs = parser_inputs(&[10], &[]);
+        for expectations in [
+            Vec::<serde_json::Value>::new(),
+            (0..9).map(|_| serde_json::json!("test")).collect(),
+        ] {
+            let mut candidate = artifact(10);
+            candidate["verification_expectations"] = serde_json::Value::Array(expectations);
+            assert!(parse_fixture(
+                &response(vec![finding("suggestion", 10)], vec![candidate]),
+                &inputs,
+            )
+            .is_err());
+        }
+
+        let mut candidate = artifact(10);
+        candidate["verification_expectations"] =
+            serde_json::json!(["x".repeat(MAX_FOLLOWUP_TEXT_BYTES + 1)]);
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![candidate]),
+            &inputs,
+        )
+        .is_err());
     }
 
     fn live_request(
@@ -872,6 +2515,8 @@ mod tests {
             repo_dir: dir.to_path_buf(),
             agent_bin: Some(fake_agent_path().to_string_lossy().to_string()),
             bare_agent: true,
+            collector_provider: AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string(),
+            collector_runner: AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string(),
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
             role_assignment_id: None,
@@ -888,8 +2533,19 @@ mod tests {
     async fn live_positive_run_stores_findings_and_run_row() {
         let dir = setup_git_dir();
         let db = dir.path().join("q.db");
-        let _ = db::open(&db).unwrap();
-        let request = live_request(dir.path(), &db, 42, Some(7), false);
+        let conn = db::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,profile_id,
+                 provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (77,'collector:pr:42',7,42,'collector','profile',
+                     'claude','claude',?1,?2,'collector','g1',1)",
+            rusqlite::params![CLASSIFIER_MODEL, CLASSIFIER_EFFORT],
+        )
+        .unwrap();
+        drop(conn);
+        let mut request = live_request(dir.path(), &db, 42, Some(7), false);
+        request.role_assignment_id = Some(77);
 
         let outcome = run_live(&request)
             .await
@@ -903,6 +2559,7 @@ mod tests {
         assert_eq!(run.findings_count, 2);
         assert!(run.error.is_none());
         assert_eq!(run.collector_version, COLLECTOR_VERSION);
+        assert_eq!(run.role_assignment_id, Some(77));
         assert!(run.completed_at.is_some());
 
         let findings = review_findings::list_for_pr(&conn, 42).unwrap();
@@ -1142,6 +2799,8 @@ mod tests {
             repo_dir: dir.path().to_path_buf(),
             agent_bin: Some("/nonexistent/quorum-fake-agent-t126".into()),
             bare_agent: true,
+            collector_provider: AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string(),
+            collector_runner: AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string(),
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
             role_assignment_id: None,
@@ -1203,7 +2862,10 @@ case "$*" in
     # records survive. IDs 101 (page 1) and 102 (page 2 late record).
     echo '[[{{"id":101,"body":"first-page"}}],[{{"id":102,"body":"late-page"}}]]'
     ;;
-  *"pulls/1/reviews"*|*"pulls/1/commits"*|*"issues/1/comments"*)
+  *"issues/1/comments"*)
+    echo '[{{"id":202,"body":"suggestion"}}]'
+    ;;
+  *"pulls/1/reviews"*|*"pulls/1/commits"*)
     echo '[]'
     ;;
   *"pulls/1"*)
@@ -1307,7 +2969,13 @@ case "$*" in
   *"pr view"*)
     echo '{{"changedFiles":1,"additions":5,"deletions":2,"title":"test"}}'
     ;;
-  *"pulls/"*"/reviews"*|*"pulls/"*"/comments"*|*"issues/"*"/comments"*|*"pulls/"*"/commits"*)
+  *"pulls/"*"/comments"*)
+    echo '[[{{"id":101}}]]'
+    ;;
+  *"issues/"*"/comments"*)
+    echo '[{{"id":202}}]'
+    ;;
+  *"pulls/"*"/reviews"*|*"pulls/"*"/commits"*)
     echo '[]'
     ;;
   *"pulls/"*)

@@ -4,6 +4,8 @@
 //! exits with a stable code: 0 success · 1 clean "didn't get it"/not-holder · 2 usage/bad
 //! input · 3 internal/DB/migration error.
 
+mod agent_client;
+mod agent_mcp;
 mod cheatsheet;
 mod cli;
 mod cockpit;
@@ -12,6 +14,7 @@ mod graph_blocker;
 mod input;
 mod output;
 mod paths;
+mod resource_health;
 mod serve;
 mod serve_config;
 mod verdict;
@@ -21,6 +24,15 @@ use clap::Parser;
 use quorum_core::error::{QuorumError, Result};
 
 const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
+const MIN_EXTERNAL_POLL_INTERVAL_SECS: u64 = 30;
+
+#[derive(serde::Serialize)]
+struct TaskGetView<'a> {
+    #[serde(flatten)]
+    task: &'a quorum_core::tasks::TaskDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arbiter: Option<quorum_core::stats::ArbiterVerdict>,
+}
 
 const DEFAULT_SERVE_TOML: &str = "\
 # quorum serve config — edit repository paths and routing percentages as needed.
@@ -67,21 +79,29 @@ primary = 100
 # agent_bin = \"/path/to/provider-cli\"
 # no_bare_agent = true   # default: use operator's Claude login (no --bare)
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
-# base_branch = \"main\"
+# base_branch = \"main\" # task/PR base: worktrees, PRs, validation, and merges
+# self_update_branch = \"main\" # daemon update poll; defaults to resolved base_branch
+
+## Grok Build settings for managed worker roles only.
+# [grok]
+# sandbox = \"off\"                        # off|workspace (default: off)
+# permission_mode = \"bypassPermissions\"
+# max_turns = 64                         # 1..=256
 
 ## Token / cost / wall-clock limits (unlimited when absent)
 # max_turn_tokens = 200000
 # max_task_tokens = 1000000
+# token_limit_basis = \"raw\" # raw (default) | uncached
 # max_turn_cost_usd = 5.0
 # max_task_cost_usd = 50.0
-# max_turn_wall_secs = 2700
+# max_idle_secs = 900
 # max_task_wall_secs = 14400
-# idle_timeout_secs = 300
+# idle_timeout_secs = 300 # legacy alias for max_idle_secs
 
 ## Merge
 # merge_token_file = \"/path/to/token\"
 # merge_checks_timeout_secs = 900
-# merge_checks_poll_secs = 30
+# merge_checks_poll_secs = 30 # minimum: 30 seconds
 # required_jobs = [\"ci\"]
 # master_ci_gate = false
 # master_ci_timeout_secs = 300
@@ -90,16 +110,25 @@ primary = 100
 # self_update_drain = false
 # drain_timeout_secs = 900
 # self_repo = \"owner/name\"
-# sha_poll_interval_secs = 60
+# sha_poll_interval_secs = 600 # minimum: 30 seconds
 
 ## Diagnostics
 # log_dir = \"/path/to/logs\"
 # doctor_enabled = false
+# resource_poll_secs = 30                  # range: 5..=3600
+# disk_warn_free_gib = 80
+# disk_critical_free_gib = 40              # must be less than warning
+# memory_warn_available_pct = 15
+# memory_critical_available_pct = 8        # must be less than warning
 
 ## R2 pre-merge review sampling (safe defaults remain mandatory).
 ## r2_enabled = true                 # false disables sampling, not the R2 gate
 ## r2_target_per_stratum = 0         # guaranteed coverage before probability
 ## r2_steady_state_p = 1.0           # 1.0 preserves mandatory R2 by default
+
+## Rework ceiling: max changes-to-rework rounds before a task fails. Stamped
+## onto each task at adoption; unset keeps the compiled default (7).
+# max_rework = 7
 ";
 
 fn run() -> Result<i32> {
@@ -109,11 +138,19 @@ fn run() -> Result<i32> {
     // Best-effort: log genuinely abnormal failures (exit 3) — never normal lost-race (1) or
     // usage errors (2).
     if let Err(ref e) = result {
-        if e.exit_code() == 3 {
+        if e.exit_code() == 3 && source != "agent-mcp" && !managed_endpoint_command(source) {
             best_effort_errlog(source, &e.to_string());
         }
     }
     result
+}
+
+/// Managed endpoint calls deliberately lack repository authority. In
+/// particular, an endpoint failure must not be followed by an error-log write
+/// that opens the provider's private Quorum database.
+fn managed_endpoint_command(source: &str) -> bool {
+    matches!(source, "task-update" | "react" | "submit")
+        && std::env::var_os("QUORUM_RUN_ID").is_some()
 }
 
 fn command_source(cmd: &cli::Command) -> &'static str {
@@ -139,7 +176,9 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Sweep => "sweep",
         cli::Command::Message { .. } => "message",
         cli::Command::React { .. } => "react",
+        cli::Command::AgentMcp => "agent-mcp",
         cli::Command::Submit { .. } => "submit",
+        cli::Command::ReviewDraft { .. } => "review-draft",
         cli::Command::Serve { .. } => "serve",
         cli::Command::SessionRegister { .. } => "session-register",
         cli::Command::Activity { .. } => "activity",
@@ -148,6 +187,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Classify { .. } => "classify",
         cli::Command::TaskClose { .. } => "task-close",
         cli::Command::TaskRetry { .. } => "task-retry",
+        cli::Command::DecompositionAdoptRecovery { .. } => "decomposition-adopt-recovery",
         cli::Command::Kill { .. } => "kill",
         cli::Command::ReviewInterpret { .. } => "review-interpret",
         cli::Command::Upgrade { .. } => "upgrade",
@@ -159,15 +199,73 @@ fn command_source(cmd: &cli::Command) -> &'static str {
     }
 }
 
+/// Gather one DB snapshot, close its connection, and only then perform OS
+/// resource sampling. Keeping this ordering in the shared one-shot/watch path
+/// prevents a slow platform syscall from extending the WAL reader lifetime.
+fn status_snapshot(online_window: i64) -> Result<quorum_core::stats::Stats> {
+    let now = quorum_core::clock::now();
+    let db_path = paths::db_path()?;
+    assemble_status_snapshot(
+        || {
+            let conn = quorum_core::db::open(&db_path)?;
+            let mut stats = quorum_core::stats::stats(&conn, now, online_window)?;
+            stats.daemon =
+                quorum_core::daemon_lock::liveness(&conn, now, DAEMON_STALE_SECS, pid_is_alive)?;
+            drop(conn); // load-bearing: close the short DB read before returning
+            Ok(stats)
+        },
+        || status_resources(&db_path, now),
+    )
+}
+
+fn assemble_status_snapshot<Read, Sample>(
+    read: Read,
+    sample: Sample,
+) -> Result<quorum_core::stats::Stats>
+where
+    Read: FnOnce() -> Result<quorum_core::stats::Stats>,
+    Sample: FnOnce() -> quorum_core::stats::HostResourcesView,
+{
+    let mut stats = read()?;
+    let resources = sample();
+    resource_health::attach_to_stats(&mut stats, resources);
+    Ok(stats)
+}
+
+fn status_resources(db_path: &std::path::Path, now: i64) -> quorum_core::stats::HostResourcesView {
+    let mut monitor = resource_health::ResourceMonitorConfig::default();
+    let mut targets = vec![resource_health::DiskTarget {
+        label: "database",
+        path: db_path.to_path_buf(),
+    }];
+    let mut config_error = None;
+    if let Some(repo) = paths::try_resolve_repo() {
+        match serve_config::status_resource_config(&repo) {
+            Ok(status) => {
+                monitor = status.monitor;
+                if let Some(path) = status.worktree_base {
+                    targets.push(resource_health::DiskTarget {
+                        label: "worktrees",
+                        path,
+                    });
+                }
+            }
+            Err(error) => config_error = Some(format!("resource config: {error}")),
+        }
+    }
+    let mut resources = resource_health::sample_system(now, &targets, monitor);
+    if let Some(error) = config_error {
+        resources.complete = false;
+        resources.errors.push(error);
+    }
+    resources
+}
+
 /// `status --watch`: re-render every ~1.5s. Opens a FRESH short-lived connection per tick and
-/// closes it — never holds a transaction across ticks, which would pin the WAL (see CLAUDE.md).
+/// closes it before every host-resource sample and sleep — never holds a reader across ticks.
 fn watch_status(online_window: i64) -> Result<()> {
     loop {
-        let now = quorum_core::clock::now();
-        let conn = quorum_core::db::open(&paths::db_path()?)?;
-        let mut s = quorum_core::stats::stats(&conn, now, online_window)?;
-        s.daemon = quorum_core::daemon_lock::liveness(&conn, now, DAEMON_STALE_SECS, pid_is_alive)?;
-        drop(conn); // close before sleeping; do not hold across ticks
+        let s = status_snapshot(online_window)?;
         print!("\x1b[H\x1b[J");
         cockpit::render(&s);
         std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -191,6 +289,16 @@ fn check_nonneg(flag: &str, v: Option<i64>) -> Result<()> {
         Some(n) if n < 0 => Err(QuorumError::Usage(format!("{flag} must be >= 0"))),
         _ => Ok(()),
     }
+}
+
+/// External API polls must leave enough room for service-side rate limits.
+fn validate_external_poll_interval(name: &str, seconds: u64) -> Result<()> {
+    if seconds < MIN_EXTERNAL_POLL_INTERVAL_SECS {
+        return Err(QuorumError::Usage(format!(
+            "{name} must be at least {MIN_EXTERNAL_POLL_INTERVAL_SECS} seconds"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve run identity: explicit `--run-id` flag, then `QUORUM_RUN_ID` env var.
@@ -464,6 +572,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             depends_on,
             review_pr,
             continue_pr,
+            base_branch,
             body_file,
             repo,
         } => {
@@ -471,8 +580,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             quorum_core::tasks::validate_creator_labels(labels.as_deref())?;
             quorum_core::tasks::validate_creator_refs(refs.as_deref())?;
             let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let target_branch =
+                base_branch.unwrap_or(serve_config::task_create_base_branch(&resolved_repo)?);
+            quorum_core::tasks::validate_target_branch(&target_branch)?;
             let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
-            let id = quorum_core::tasks::create_with_continue_pr(
+            let id = quorum_core::tasks::create_with_continue_pr_and_target_branch(
                 &mut conn,
                 &created_by,
                 &title,
@@ -483,6 +595,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 depends_on.as_deref(),
                 review_pr,
                 continue_pr,
+                Some(&target_branch),
                 now,
             )?;
             output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
@@ -511,6 +624,30 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                      --body-stdin/--body-file/--note-stdin/--note-file/--depends-on"
                         .into(),
                 ));
+            }
+            // A run identity always takes the scoped path. In particular, a
+            // provider must not regain caller-selected task/agent writes by
+            // inheriting QUORUM_HOME or by losing its endpoint setting.
+            let managed_run = std::env::var_os("QUORUM_RUN_ID").is_some();
+            if managed_run {
+                if has_field_update || note.is_none() {
+                    return Err(QuorumError::Usage(
+                        "daemon-managed task-update supports only --note-stdin or --note-file"
+                            .into(),
+                    ));
+                }
+                let run_id = resolve_run_id(None, "task-update")?;
+                // Retain prompt-compatible flags as identity constraints; the
+                // endpoint derives the authoritative task and agent from the
+                // run capability and rejects a mismatch before writing.
+                let note_id = agent_client::append_note(agent_client::AppendNote {
+                    capability: &run_id,
+                    task_id,
+                    agent: &agent,
+                    note: note.as_deref().unwrap(),
+                })?;
+                output::emit(&serde_json::json!({ "ok": true, "note_id": note_id }));
+                return Ok(0);
             }
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let task = if has_field_update {
@@ -576,7 +713,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             match quorum_core::tasks::get_with_notes(&conn, task_id)? {
                 Some(t) => {
-                    output::emit(&t);
+                    output::emit(&TaskGetView {
+                        task: &t,
+                        arbiter: quorum_core::stats::arbiter_verdict(&conn, task_id)?,
+                    });
                     Ok(0)
                 }
                 None => {
@@ -701,14 +841,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 watch_status(cfg.online_window_secs)?;
                 Ok(0)
             } else {
-                let conn = quorum_core::db::open(&paths::db_path()?)?;
-                let mut s = quorum_core::stats::stats(&conn, now, cfg.online_window_secs)?;
-                s.daemon = quorum_core::daemon_lock::liveness(
-                    &conn,
-                    now,
-                    DAEMON_STALE_SECS,
-                    pid_is_alive,
-                )?;
+                let s = status_snapshot(cfg.online_window_secs)?;
                 if json {
                     output::emit(&s);
                 } else {
@@ -903,24 +1036,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 }
             }
             let rid = resolve_run_id(run_id, "react")?;
-            let db = paths::db_path()?;
-            let conn = quorum_core::db::open(&db)?;
-            quorum_core::capabilities::validate(&conn, &rid, &agent, "worker", Some(task_id))
-                .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
-            let mut conn = conn;
-            let row = quorum_core::mailbox::MailboxRow {
-                agent,
-                kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
-                task_id: Some(task_id),
-                pr: None,
-                verdict: None,
-                feedback: None,
-                note: Some(state),
-                to_agent: None,
-                payload: None,
-            };
-            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            // Retain the legacy intent flags, but never trust them as target
+            // authority: the endpoint derives agent and task from `rid`.
+            let _ = (agent, task_id);
+            let id = agent_client::react(&rid, &state)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
+        cli::Command::AgentMcp => {
+            agent_mcp::run()?;
             Ok(0)
         }
         cli::Command::Submit {
@@ -979,39 +1103,47 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let rid = resolve_run_id(run_id, "submit")?;
+            if let Some(raw) = feedback_json.as_deref() {
+                graph_blocker::parse_feedback(raw).map_err(QuorumError::Usage)?;
+            }
+            // The endpoint derives agent, task, PR, role, and revision from the
+            // capability. These parsed compatibility flags are not authority.
+            let _ = (agent, pr);
+            let id = agent_client::submit(agent_client::Submit {
+                capability: &rid,
+                summary: summary.as_deref(),
+                verdict: verdict.as_deref(),
+                feedback: feedback.as_deref(),
+                feedback_json: feedback_json.as_deref(),
+                blocking,
+            })?;
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
+        cli::Command::ReviewDraft {
+            agent,
+            pr,
+            blocking,
+            feedback_file,
+            run_id,
+        } => {
+            let feedback = input::read_text(input::TextSource::File(feedback_file))?;
+            verdict::validate_review_draft(blocking, &feedback).map_err(QuorumError::Usage)?;
+            let rid = resolve_run_id(run_id, "review-draft")?;
             let db = paths::db_path()?;
             let mut conn = quorum_core::db::open(&db)?;
-            let expected_role = if verdict.is_some() {
-                "reviewer"
-            } else {
-                "worker"
-            };
-            let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, expected_role, None)
+            let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, "reviewer", None)
                 .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
-            let kind = quorum_core::mailbox::MailboxKind::Done;
-            let payload = if let Some(raw) = feedback_json {
-                let graph_feedback =
-                    graph_blocker::parse_feedback(&raw).map_err(QuorumError::Usage)?;
-                if graph_feedback.affected_task != cap.task_id {
-                    return Err(QuorumError::Usage(format!(
-                        "graph-blocker affected_task {} does not match reviewer task {}",
-                        graph_feedback.affected_task, cap.task_id
-                    )));
-                }
-                Some(graph_blocker::encode(rid, graph_feedback).map_err(QuorumError::Usage)?)
-            } else {
-                verdict::attestation_payload(blocking)
-            };
             let row = quorum_core::mailbox::MailboxRow {
                 agent,
-                kind,
+                kind: quorum_core::mailbox::MailboxKind::ReviewDraft,
                 task_id: Some(cap.task_id),
-                pr,
-                verdict,
-                feedback,
-                note: summary,
+                pr: Some(pr),
+                verdict: None,
+                feedback: Some(feedback),
+                note: None,
                 to_agent: None,
-                payload,
+                payload: verdict::attestation_payload(Some(blocking)),
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
@@ -1046,6 +1178,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::TaskRetry { task_id, by } => {
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let cancelled = quorum_core::tasks::cancelled_dep_ids(&conn, task_id)?;
+            if !cancelled.is_empty() {
+                output::emit(&serde_json::json!({
+                    "ok": false,
+                    "reason": "dependency cancelled — unsatisfiable; \
+                               edit depends_on or close the dependent",
+                    "cancelled_deps": cancelled,
+                }));
+                return Ok(1);
+            }
             let retried =
                 match quorum_core::tasks::retry_parked(&mut conn, task_id, &by, true, now)? {
                     some @ Some(_) => some,
@@ -1058,13 +1200,81 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     output::emit(&quorum_core::tasks::TaskCompact::from(&task));
                     Ok(0)
                 }
-                None => {
-                    output::emit(&serde_json::json!({
-                        "ok": false,
-                        "reason": "task is not daemon-parked or provider-blocked",
-                    }));
-                    Ok(1)
-                }
+                None => match quorum_core::decomposition::retry_exhausted_planning(
+                    &mut conn, task_id, &by, now,
+                )? {
+                    quorum_core::decomposition::PlanningRetryOutcome::Retried {
+                        graph_id,
+                        generation,
+                    } => {
+                        let task = quorum_core::tasks::get(&conn, task_id)?.ok_or_else(|| {
+                            QuorumError::Io(format!(
+                                "retried decomposition source #{task_id} disappeared"
+                            ))
+                        })?;
+                        output::emit(&serde_json::json!({
+                            "ok": true,
+                            "outcome": "decomposition-planning-retried",
+                            "graph_id": graph_id,
+                            "retry_generation": generation,
+                            "task": quorum_core::tasks::TaskCompact::from(&task),
+                        }));
+                        Ok(0)
+                    }
+                    quorum_core::decomposition::PlanningRetryOutcome::RetryCapExhausted {
+                        retry_count,
+                    } => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "outcome": "decomposition-planning-retry-rejected",
+                            "reason": "operator retry cap exhausted; inspect the planning failures and rescope or close the source",
+                            "retry_count": retry_count,
+                            "retry_cap": quorum_core::decomposition::MAX_OPERATOR_RETRIES,
+                        }));
+                        Ok(1)
+                    }
+                    quorum_core::decomposition::PlanningRetryOutcome::NotEligible => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "outcome": "task-retry-rejected",
+                            "reason": "task is not daemon-parked, provider-blocked, or an eligible exhausted decomposition source",
+                        }));
+                        Ok(1)
+                    }
+                },
+            }
+        }
+        cli::Command::DecompositionAdoptRecovery {
+            original_child_id,
+            recovery_task_id,
+            by,
+        } => {
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let adopted = quorum_core::decomposition::adopt_explicit_recovery_delivery(
+                &mut conn,
+                &quorum_core::decomposition::ExplicitRecoveryAdoption {
+                    original_child_id,
+                    recovery_task_id,
+                    authorized_by: &by,
+                    now,
+                },
+            )?;
+            if adopted {
+                output::emit(&serde_json::json!({
+                    "ok": true,
+                    "original_child_id": original_child_id,
+                    "recovery_task_id": recovery_task_id,
+                    "authorized_by": by,
+                }));
+                Ok(0)
+            } else {
+                output::emit(&serde_json::json!({
+                    "ok": false,
+                    "reason": "exact recovery pair is ineligible, stale, or already adopted",
+                    "original_child_id": original_child_id,
+                    "recovery_task_id": recovery_task_id,
+                }));
+                Ok(1)
             }
         }
         cli::Command::Kill {
@@ -1110,6 +1320,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             max_turn_cost_usd,
             max_task_cost_usd,
             max_turn_wall_secs,
+            max_idle_secs,
             max_task_wall_secs,
             idle_timeout_secs,
             allowed_tools,
@@ -1120,6 +1331,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             sha_poll_interval_secs,
             repo,
             base_branch,
+            self_update_branch,
             exit_when_gone,
             doctor_enabled,
         } => {
@@ -1200,6 +1412,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_no_bare = resolve_bool(no_bare_agent, file_cfg.no_bare_agent, true);
             let r_max_turn_tokens = resolve_opt(max_turn_tokens, file_cfg.max_turn_tokens);
             let r_max_task_tokens = resolve_opt(max_task_tokens, file_cfg.max_task_tokens);
+            let r_token_limit_basis =
+                resolve_token_limit_basis(file_cfg.token_limit_basis.as_deref())?;
+            validate_token_ceilings(r_max_turn_tokens.value, r_max_task_tokens.value)?;
             let r_max_turn_cost = resolve_opt(max_turn_cost_usd, file_cfg.max_turn_cost_usd);
             let r_max_task_cost = resolve_opt(max_task_cost_usd, file_cfg.max_task_cost_usd);
             serve_config::validate_routed_cost_limits(
@@ -1208,6 +1423,17 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r_max_task_cost.value,
             )?;
             let r_max_turn_wall = resolve_opt(max_turn_wall_secs, file_cfg.max_turn_wall_secs);
+            let r_max_idle = serve_config::resolve_idle_limit(
+                max_idle_secs,
+                max_turn_wall_secs,
+                file_cfg.max_idle_secs,
+                file_cfg.max_turn_wall_secs,
+            );
+            if r_max_turn_wall.value.is_some() {
+                eprintln!(
+                    "quorum serve: WARNING: max_turn_wall_secs is deprecated; it now sets the max_idle_secs idle timeout when max_idle_secs is unset"
+                );
+            }
             let r_max_task_wall = resolve_opt(max_task_wall_secs, file_cfg.max_task_wall_secs);
             let r_idle_timeout = resolve_opt(idle_timeout_secs, file_cfg.idle_timeout_secs);
             let r_allowed_tools =
@@ -1217,12 +1443,25 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_drain_timeout = resolve_val(drain_timeout_secs, file_cfg.drain_timeout_secs, 900);
             let r_self_repo = resolve_opt_str(self_repo.as_deref(), file_cfg.self_repo.as_deref());
             let r_sha_poll =
-                resolve_val(sha_poll_interval_secs, file_cfg.sha_poll_interval_secs, 60);
+                resolve_val(sha_poll_interval_secs, file_cfg.sha_poll_interval_secs, 600);
+            validate_external_poll_interval("sha_poll_interval_secs", r_sha_poll.value)?;
             let r_base_branch = resolve_str(
                 base_branch.as_deref(),
                 file_cfg.base_branch.as_deref(),
                 "main",
             );
+            // Self-update polling has an independent branch, but preserves
+            // existing deployments by inheriting the fully resolved task/PR base.
+            let r_self_update_branch =
+                if self_update_branch.is_some() || file_cfg.self_update_branch.is_some() {
+                    resolve_str(
+                        self_update_branch.as_deref(),
+                        file_cfg.self_update_branch.as_deref(),
+                        "main",
+                    )
+                } else {
+                    r_base_branch.clone()
+                };
             let r_merge_checks_timeout = resolve_val(
                 merge_checks_timeout_secs,
                 file_cfg.merge_checks_timeout_secs,
@@ -1230,10 +1469,37 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             );
             let r_merge_checks_poll =
                 resolve_val(merge_checks_poll_secs, file_cfg.merge_checks_poll_secs, 30);
+            validate_external_poll_interval("merge_checks_poll_secs", r_merge_checks_poll.value)?;
             let r_required_jobs: Vec<String> = file_cfg.required_jobs.clone().unwrap_or_default();
             let r_master_ci_gate = resolve_bool(false, file_cfg.master_ci_gate, false);
             let r_master_ci_timeout = resolve_val(None, file_cfg.master_ci_timeout_secs, 300);
             let r_doctor_enabled = resolve_bool(doctor_enabled, file_cfg.doctor_enabled, false);
+            let resource_monitor = serve_config::resolve_resource_monitor_config(&file_cfg)?;
+            let r_resource_poll = resolve_val(
+                None,
+                file_cfg.resource_poll_secs,
+                resource_health::DEFAULT_RESOURCE_POLL_SECS,
+            );
+            let r_disk_warn = resolve_val(
+                None,
+                file_cfg.disk_warn_free_gib,
+                resource_health::DEFAULT_DISK_WARN_FREE_GIB,
+            );
+            let r_disk_critical = resolve_val(
+                None,
+                file_cfg.disk_critical_free_gib,
+                resource_health::DEFAULT_DISK_CRITICAL_FREE_GIB,
+            );
+            let r_memory_warn = resolve_val(
+                None,
+                file_cfg.memory_warn_available_pct,
+                resource_health::DEFAULT_MEMORY_WARN_AVAILABLE_PCT,
+            );
+            let r_memory_critical = resolve_val(
+                None,
+                file_cfg.memory_critical_available_pct,
+                resource_health::DEFAULT_MEMORY_CRITICAL_AVAILABLE_PCT,
+            );
             // Defaults preserve the mandatory R2 gate.  Sampling is opt-in by
             // lowering p (and optionally setting a coverage floor).
             let r_r2_enabled = file_cfg.r2_enabled.unwrap_or(true);
@@ -1241,9 +1507,20 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(1.0);
             serve_config::validate_r2_sampling(r_r2_target_per_stratum, r_r2_steady_state_p)?;
 
+            // Rework ceiling: unset preserves the compiled default. Stamped onto
+            // each task at adoption, immutable thereafter.
+            let r_max_rework = file_cfg
+                .max_rework
+                .unwrap_or(quorum_core::lifecycle::REWORK_CAP);
+            serve_config::validate_max_rework(r_max_rework)?;
+
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
             })?;
+            serve_config::validate_agent_bin_for_profiles(
+                r_agent_bin.value.as_deref(),
+                &model_profiles,
+            )?;
             let routing = file_cfg
                 .routing
                 .clone()
@@ -1253,6 +1530,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 .as_ref()
                 .and_then(|c| c.sandbox.clone())
                 .unwrap_or_else(|| "danger-full-access".to_string());
+            let grok = serve_config::resolve_grok_adapter(file_cfg.grok.as_ref())?;
 
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
@@ -1261,6 +1539,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 repo_dir: &r_repo_dir,
                 worktree_base: &r_wt,
                 base_branch: &r_base_branch,
+                self_update_branch: &r_self_update_branch,
                 cap: &r_cap,
                 model_profiles: &model_profiles,
                 routing: &routing,
@@ -1268,11 +1547,12 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 no_bare_agent: &r_no_bare,
                 self_update_drain: &r_self_update,
                 drain_timeout_secs: &r_drain_timeout,
-                max_turn_wall_secs: &r_max_turn_wall,
+                max_idle_secs: &r_max_idle,
                 max_task_wall_secs: &r_max_task_wall,
                 idle_timeout_secs: &r_idle_timeout,
                 max_turn_tokens: &r_max_turn_tokens,
                 max_task_tokens: &r_max_task_tokens,
+                token_limit_basis: &r_token_limit_basis,
                 max_turn_cost_usd: &r_max_turn_cost,
                 max_task_cost_usd: &r_max_task_cost,
                 merge_checks_timeout_secs: &r_merge_checks_timeout,
@@ -1280,6 +1560,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 master_ci_gate: &r_master_ci_gate,
                 master_ci_timeout_secs: &r_master_ci_timeout,
                 doctor_enabled: &r_doctor_enabled,
+                resource_poll_secs: &r_resource_poll,
+                disk_warn_free_gib: &r_disk_warn,
+                disk_critical_free_gib: &r_disk_critical,
+                memory_warn_available_pct: &r_memory_warn,
+                memory_critical_available_pct: &r_memory_critical,
             });
             eprintln!(
                 "quorum serve: {}",
@@ -1328,6 +1613,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 names_file: r_names.value.map(std::path::PathBuf::from),
                 agent_bin: r_agent_bin.value,
                 codex_sandbox,
+                grok,
+                pr_target_program: None,
                 model_profiles,
                 routing,
                 merge_executor,
@@ -1335,9 +1622,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 limits: serve::CostLimits {
                     max_turn_tokens: r_max_turn_tokens.value,
                     max_task_tokens: r_max_task_tokens.value,
+                    token_limit_basis: r_token_limit_basis.value,
                     max_turn_cost_usd: r_max_turn_cost.value,
                     max_task_cost_usd: r_max_task_cost.value,
-                    max_turn_wall_secs: r_max_turn_wall.value,
+                    max_idle_secs: r_max_idle.value,
                     max_task_wall_secs: r_max_task_wall.value,
                     idle_timeout_secs: r_idle_timeout.value,
                 },
@@ -1350,15 +1638,18 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 merge_checks_poll_secs: r_merge_checks_poll.value,
                 repo: r_repo.value,
                 base_branch: r_base_branch.value,
+                self_update_branch: r_self_update_branch.value,
                 exit_when_gone: exit_when_gone.map(std::path::PathBuf::from),
                 required_jobs: r_required_jobs,
                 master_ci_gate: r_master_ci_gate.value,
                 master_ci_timeout_secs: r_master_ci_timeout.value,
                 allowed_tools: r_allowed_tools.value.map(|s| s.to_string()),
                 doctor_enabled: r_doctor_enabled.value,
+                resource_monitor,
                 r2_enabled: r_r2_enabled,
                 r2_target_per_stratum: r_r2_target_per_stratum,
                 r2_steady_state_p: r_r2_steady_state_p,
+                max_rework: r_max_rework,
             };
             Ok(serve::run_serve(config)?)
         }
@@ -1389,10 +1680,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     if line.trim().is_empty() {
                         continue;
                     }
-                    if raw {
-                        println!("{line}");
-                    } else if let Some(event) = serve::stream::parse_line(&line) {
-                        if let Some(rendered) = serve::render::render_event(&event) {
+                    if let Some(rendered) = tail_output_for_line(&agent, raw, &line) {
+                        if raw {
+                            println!("{rendered}");
+                        } else {
                             print!("{rendered}");
                         }
                     }
@@ -1445,6 +1736,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::Classify {
             backfill,
+            config: config_flag,
             agent_bin,
             no_bare_agent,
         } => {
@@ -1454,6 +1746,36 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let db = paths::db_path()?;
+            // Backfill is a supported classification writer, so a task it makes
+            // dispatchable must receive the durable adoption-time cap before
+            // claim — otherwise lifecycle/R2/reviewer consumers fall back to the
+            // compiled default despite a configured `max_rework`.
+            //
+            // When the operator passes `--config <path>`, resolve from that
+            // exact file so the stamped cap matches the daemon started with
+            // the same `--config`. When absent, resolve from the same
+            // per-repo default path the daemon uses. Explicit-config missing
+            // must fail exit 2 (same policy as `serve --config`) so backfill
+            // cannot silently diverge from an intended non-default policy;
+            // an absent default file falls back to `REWORK_CAP`, matching
+            // `serve` without a config.
+            let max_rework = if let Some(ref p) = config_flag {
+                let path = std::path::Path::new(p);
+                if !path.exists() {
+                    return Err(QuorumError::Usage(format!(
+                        "classify --config: file not found: {}",
+                        path.display()
+                    )));
+                }
+                serve_config::resolve_max_rework_at(path)?
+            } else {
+                let repo_slug = paths::try_resolve_repo().ok_or_else(|| {
+                    QuorumError::Usage(
+                        "classify --backfill: cannot resolve the current repository".into(),
+                    )
+                })?;
+                serve_config::resolve_max_rework(&repo_slug)?
+            };
             let mut total_stored = 0;
             let mut total_tasks = 0;
             let rt = tokio::runtime::Runtime::new()
@@ -1494,21 +1816,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         "workspace-write",
                         &recommendations,
                     )
+                    .await
                     .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
-                    let turn = serve::classifier::classifier_turn_with_recommendations(
-                        &tasks,
-                        &dup_context,
-                        &recommendations,
-                    );
-                    if !slot.proc.is_codex() {
-                        if let Err(error) = slot.proc.feed_turn(&turn).await {
-                            slot.kill_and_reap().await;
-                            return Err(QuorumError::Io(format!("feed classifier turn: {error}")));
-                        }
-                    }
 
                     let deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                        tokio::time::Instant::now() + serve::classifier::CLASSIFIER_TIMEOUT;
                     let response = loop {
                         if let Some(result) =
                             serve::classifier::drain_classifier_events(&mut slot).await
@@ -1541,7 +1853,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
                 let stored = {
                     let mut conn = quorum_core::db::open(&db)?;
-                    quorum_core::classify::store_classifications_for_inputs(
+                    quorum_core::classify::store_classifications_and_stamp_rework_cap(
                         &mut conn,
                         &results,
                         &pending_inputs,
@@ -1549,6 +1861,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                             serve::classifier::CLASSIFIER_MODEL,
                         ),
                         quorum_core::clock::now(),
+                        max_rework,
                     )?
                 };
                 total_stored += stored;
@@ -1866,6 +2179,70 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
     }
 }
 
+/// Format a single `quorum tail` record. Decomposition planners use a closed,
+/// sanitized stream; every other agent keeps the existing provider-stream
+/// renderer unchanged.
+fn tail_output_for_line(agent: &str, raw: bool, line: &str) -> Option<String> {
+    if agent.starts_with("decomposition-planner-") {
+        let event = serde_json::from_str::<serve::session_log::SanitizedSessionEvent>(line).ok()?;
+        return Some(if raw {
+            line.to_string()
+        } else {
+            serve::render::render_sanitized_session_event(&event)
+        });
+    }
+
+    if raw {
+        Some(line.to_string())
+    } else {
+        grok_delta_tail_output(line).or_else(|| {
+            serve::stream::parse_line(line).and_then(|event| serve::render::render_event(&event))
+        })
+    }
+}
+
+/// Grok in-progress tool updates are stored as output deltas. Render the
+/// delta itself so `quorum tail` remains useful without reconstructing and
+/// retaining every previous full snapshot.
+fn grok_delta_tail_output(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str)
+        == Some("provider.stream_bytes_truncated")
+    {
+        let limit = value
+            .get("stream_limit_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        return Some(format!("> Session raw output truncated at {limit} bytes\n"));
+    }
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("tool_call_update")
+        || value
+            .get("quorum_output_delta")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return None;
+    }
+    let tool_call_id = value
+        .get("toolCallId")
+        .and_then(serde_json::Value::as_str)?;
+    let text = value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.pointer("/content/text")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect::<String>();
+    Some(if text.is_empty() {
+        format!("> Grok tool {tool_call_id} in progress\n")
+    } else {
+        format!("> Grok tool {tool_call_id}: {text}\n")
+    })
+}
+
 fn diff_lines(old: &str, new: &str) -> Vec<String> {
     let mut out = Vec::new();
     let old_lines: Vec<&str> = old.lines().collect();
@@ -1905,7 +2282,84 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ttl, resolve_repo_override, wait_child_stdout};
+    use super::{
+        assemble_status_snapshot, parse_ttl, resolve_repo_override, tail_output_for_line,
+        validate_external_poll_interval, wait_child_stdout,
+    };
+
+    #[test]
+    fn status_read_scope_drops_before_resource_sampling() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct ReadScope(Rc<RefCell<Vec<&'static str>>>);
+        impl Drop for ReadScope {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("read scope dropped");
+            }
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let read_events = Rc::clone(&events);
+        let sample_events = Rc::clone(&events);
+        let snapshot = assemble_status_snapshot(
+            move || {
+                let _scope = ReadScope(Rc::clone(&read_events));
+                read_events.borrow_mut().push("read");
+                Ok(quorum_core::stats::Stats::default())
+            },
+            move || {
+                sample_events.borrow_mut().push("sample");
+                quorum_core::stats::HostResourcesView {
+                    sampled_at: 1,
+                    complete: true,
+                    severity: quorum_core::stats::ResourceSeverity::Normal,
+                    memory: None,
+                    disks: Vec::new(),
+                    errors: Vec::new(),
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(snapshot.resources.is_some());
+        assert_eq!(*events.borrow(), ["read", "read scope dropped", "sample"]);
+    }
+
+    #[test]
+    fn planner_tail_accepts_only_sanitized_records_in_rendered_and_raw_modes() {
+        let secret = "sk-tail-secret-must-not-appear";
+        let record = r#"{"event":"command_summary","command":"shell","outcome":"succeeded","details":{"summary":"structural","shape":"string","captured_bytes":30}}"#;
+        let rendered = tail_output_for_line("decomposition-planner-17", false, record).unwrap();
+        assert!(rendered.contains("Command shell succeeded"));
+        assert!(!rendered.contains(secret));
+
+        assert_eq!(
+            tail_output_for_line("decomposition-planner-17", true, record).as_deref(),
+            Some(record),
+            "raw planner tail preserves the bounded sanitized record"
+        );
+        assert!(tail_output_for_line(
+            "decomposition-planner-17",
+            false,
+            &format!(r#"{{"event":"command_summary","credential":"{secret}"}}"#),
+        )
+        .is_none());
+        assert!(tail_output_for_line("decomposition-planner-17", true, secret).is_none());
+    }
+
+    #[test]
+    fn tail_renders_grok_tool_output_deltas() {
+        let delta = r#"{"type":"tool_call_update","toolCallId":"call-7","status":"in_progress","quorum_output_delta":true,"content":[{"type":"content","content":{"type":"text","text":"new output"}}]}"#;
+        assert_eq!(
+            tail_output_for_line("GrokAgent", false, delta).as_deref(),
+            Some("> Grok tool call-7: new output\n")
+        );
+        assert_eq!(
+            tail_output_for_line("GrokAgent", true, delta).as_deref(),
+            Some(delta)
+        );
+    }
 
     #[test]
     fn parse_ttl_units() {
@@ -1942,6 +2396,21 @@ mod tests {
             super::MAX_TTL_SECS
         );
         assert_eq!(parse_ttl("30d").unwrap(), 30 * 86_400);
+    }
+
+    #[test]
+    fn external_poll_intervals_require_30_second_floor() {
+        for name in ["merge_checks_poll_secs", "sha_poll_interval_secs"] {
+            let error = validate_external_poll_interval(name, 10).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert_eq!(
+                error.to_string(),
+                format!("usage: {name} must be at least 30 seconds")
+            );
+
+            assert!(validate_external_poll_interval(name, 30).is_ok());
+        }
+        assert!(validate_external_poll_interval("sha_poll_interval_secs", 600).is_ok());
     }
 
     #[test]

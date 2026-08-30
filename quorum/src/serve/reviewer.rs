@@ -8,9 +8,9 @@
 //! warm worker (changes).
 //!
 //! Responsibility boundary (agents own PR collaboration):
-//! - The GitHub PR is the source of truth for findings, advisory suggestions,
+//! - The GitHub PR is the source of truth for findings and follow-ups,
 //!   author pushback, reviewer resolution, and evidence. Reviewers post all
-//!   blockers and advisory findings to the PR (inline where location matters)
+//!   BLOCKING and FOLLOW-UP findings to the PR (inline where location matters)
 //!   and respond to author pushback there. Authors address findings on the PR
 //!   and reply with concrete evidence when disagreeing rather than silently
 //!   ignoring a finding.
@@ -21,10 +21,14 @@
 //!   post findings as inline and summary comments; the daemon posts formal
 //!   approval or request-changes from the reviewer verdict as the merge account.
 
-use super::agent::{AgentProc, AgentSpec, ALLOWED_TOOLS};
-use super::codex_agent;
-use super::runner::{AgentKind, RunnerProc};
+use super::rereview_builder::review_round_contract;
+use super::review_cycle_context::ReviewCycleContext;
+use super::runner::AgentKind;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+pub use super::rereview_builder::build_rereview_turn;
+pub use super::rereview_builder::build_rereview_turn_with_context;
 
 pub struct ReviewerSpec {
     pub pr: i64,
@@ -32,24 +36,104 @@ pub struct ReviewerSpec {
     pub reviewer_name: String,
 }
 
+pub fn task_review_contract(
+    task_id: i64,
+    title: &str,
+    body: Option<&str>,
+    depends_on: Option<&str>,
+    recovery_notes: &[String],
+) -> String {
+    let body = body.unwrap_or("<no task body>");
+    let depends_on = depends_on.unwrap_or("[]");
+    let notes = if recovery_notes.is_empty() {
+        "<none>".to_string()
+    } else {
+        recovery_notes
+            .iter()
+            .enumerate()
+            .map(|(index, note)| format!("{}. {}", index + 1, note))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let context = format!(
+        "task_id: {task_id}\ntitle: {title}\ndepends_on: {depends_on}\n\nbody:\n{body}\n\nrecent recovery notes:\n{notes}"
+    )
+    .replace('\n', "\n    ");
+    format!(
+        "## Authoritative managed-task contract\n\n\
+         Review the PR against this task context, not the generic PR title or body. The task body \
+         defines the assigned outcome, constraints, and verification expectations; dependencies \
+         are scheduler-enforced assumptions, and recovery notes are bounded operational context.\n\n\
+             {context}\n"
+    )
+}
+
 /// Reviewers must finish the planned audit for a SHA before their lifecycle
 /// verdict. This deliberately asks for coverage of related paths without
 /// demanding speculative findings or an audit of unrelated code.
-const COMPLETE_REVIEW_CONTRACT: &str = "\
+pub(super) const COMPLETE_REVIEW_CONTRACT: &str = "\
 ## Complete-review requirement\n\n\
 Complete the planned review before submitting a verdict. Coverage, not the number of \
 findings, determines when the review is complete: audit the full current diff, surrounding \
 code, and relevant sibling and negative paths. A complete review may have zero findings.\n\
-For cross-cutting changes, derive a small affected-path matrix/checklist from the PR scope \
-(for example, producers × success/error/shutdown) and audit every applicable cell together. \
-Do not turn this into an exhaustive proof over unrelated code or invent speculative findings.\n\
+Before reaching a verdict, derive a bounded, task-specific affected-path model from the \
+embedded managed-task contract when provided and the mechanisms changed by the PR. Choose the \
+useful representation — a short matrix, checklist, state/event map, or equivalent — and use it \
+to review applicable related lifecycle and compatibility paths together, including whether the \
+proposed remedy closes each relevant path. This is not a mandatory format or an exhaustive proof \
+over unrelated code; do not invent speculative findings.\n\
+On re-review, a new blocker in unchanged behavior must explain why it was not reasonably \
+discoverable in the prior complete audit.\n\
 Before submitting, publish one complete PR review summary for this reviewed SHA, with inline \
-comments where needed, that reports the complete blocker and advisory set discovered. \
+comments where needed, that reports the complete BLOCKING and FOLLOW-UP set discovered. \
 `--blocking` must equal the complete BLOCKING count for that SHA.\n";
+
+/// Shared two-axis finding policy. Keeping this in one bounded block prevents
+/// R1, R2, generated-child, and re-review prompts from drifting apart.
+pub(super) const REVIEW_FINDING_CONTRACT: &str = "\
+## Finding impact and merge disposition\n\n\
+Classify every substantive finding on two independent axes:\n\
+1. Technical impact: critical, major, minor, or nit — how serious the concrete failure is \
+if its stated assumptions hold.\n\
+2. Merge disposition: BLOCKING or FOLLOW-UP — whether this Proposed Change must resolve \
+the finding before merge.\n\
+Critical or major technical impact does not by itself make a finding BLOCKING. Resource \
+exhaustion, unbounded growth, network or model calls in a database transaction, data loss, \
+corruption, security-boundary failures, and stuck processing are presumptively major or \
+critical impact, but their category alone never decides merge disposition.\n\n\
+A finding is BLOCKING only when merging this exact change would leave the assigned primary \
+outcome false, violate an applicable repository invariant, or introduce or materially worsen \
+supported behavior. Its assumptions must fit the applicable established operating or threat \
+model. Do not ignore applicable repository invariants. For documentation changes, require the \
+smallest accurate statement of supported behavior, not an exhaustive inventory of implementation \
+exceptions.\n\n\
+Classify a real issue as FOLLOW-UP when it is pre-existing and not materially worsened, \
+adjacent to or outside the current task, defense-in-depth, a future requirement, or dependent \
+on a materially stronger threat model, unless an explicit current contract makes it BLOCKING. \
+Prefer FOLLOW-UP for pre-existing edge behavior that the change merely reveals when the primary \
+outcome can remain accurate without cataloguing or fixing that behavior.\n\n\
+Evidence and PR-summary requirements:\n\
+- Every finding must cite a concrete code path (file:line or function), explain the \
+demonstrated failure and assumptions, and identify the affected product behavior.\n\
+- Every BLOCKING finding must explain why this PR cannot merge under the current contract, name \
+the exact repository invariant it violates (or the precise assigned outcome left false or \
+supported behavior materially worsened), and explain the broader affected path left unsafe, \
+not only the local symptom.\n\
+- Every FOLLOW-UP finding must explain why deferral is safe; identify its scope relationship \
+(pre-existing, out-of-scope/adjacent, threat-model expansion, defense-in-depth, future \
+requirement, or design debt); and give a desired future outcome and verification. Include \
+enough concrete context for later collector extraction.\n\
+- The review summary must report `BLOCKING: <N>` and `FOLLOW-UP: <N>`, then record each \
+finding's technical impact, merge disposition, failure and assumptions, scope relationship, \
+and blocking or safe-deferral reason.\n\n\
+Post both dispositions to the PR. Only BLOCKING findings contribute to `--blocking`; FOLLOW-UP \
+findings never do and never force a changes verdict. With zero BLOCKING findings and one or \
+more FOLLOW-UP findings, submit `approved --blocking 0`. Reviewers do not create or modify \
+Managed Tasks for follow-ups.\n";
 
 /// CI and author-side verification are daemon concerns, never review findings.
 /// This wording is shared by every reviewer prompt.
-const REVIEWER_VERIFICATION_BOUNDARY: &str = "\
+pub(super) const REVIEWER_VERIFICATION_BOUNDARY: &str = "\
 Do NOT run tests, builds, formatters, or linters locally. Do not inspect, report, or block \
 on CI status or PR-body verification evidence, formatting, transcripts, links, headings, \
 tokens, or checklists. The daemon alone gates reviewer provisioning and merge on the \
@@ -65,12 +149,11 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          and surrounding code (never the diff hunks alone), and check the repo CLAUDE.md \
          invariants — then apply the contract below.\n\n\
          Calibration: review with independent judgment. Zero blocking findings is a \
-         valid outcome — do not manufacture findings to justify requesting changes. \
-         Every BLOCKING finding must cite a concrete code path and explain a \
-         reproducible or logically demonstrated failure.\n\n\
+         valid outcome — do not manufacture findings to justify requesting changes.\n\n\
          {complete_review_contract}\n\
+         {finding_contract}\n\
          The PR is the source of truth for this review:\n\
-         - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
+         - Post every BLOCKING and FOLLOW-UP finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
          findings. The `submit` verdict is a lifecycle signal — the PR is where findings, \
          evidence, and the back-and-forth actually live.\n\
@@ -83,19 +166,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
          {verification_boundary}\n\
-         Severity contract (#159 — concrete failure classes are BLOCKING unless you \
-         cite evidence disproving the failure):\n\
-         - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
-         - Unbounded prompt or context growth\n\
-         - Network or model API calls while holding a database transaction\n\
-         - Data loss, corruption, or security boundary violations\n\
-         - Stuck-processing paths (deadlocks, infinite loops, missing timeouts)\n\
-         A reviewer may not describe one of these concrete failures and then submit it \
-         as advisory without an explicit evidence-backed reason.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Classify every finding as BLOCKING (correctness, security, data loss, \
-         regression, invariant violation — anything that must be fixed before merge) \
-         or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: write a short blocker summary to a temp file, then \
@@ -119,6 +190,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
@@ -138,51 +210,6 @@ pub fn remediation_branch(agent_name: &str, task_id: i64) -> String {
     format!("remediation/{}-t{}", agent_name.to_lowercase(), task_id)
 }
 
-/// Spawn a reviewer as Claude or Codex based on the resolved model.
-/// `prompt` is the full review prompt text; for Claude it is fed via stdin,
-/// for Codex it is passed as a CLI argument.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_reviewer(
-    kind: AgentKind,
-    model: &str,
-    effort: &str,
-    session_id: &str,
-    worktree_path: &Path,
-    agent_bin: Option<&str>,
-    bare: bool,
-    env_vars: Vec<(String, String)>,
-    allowed_tools_override: Option<&str>,
-    codex_sandbox: &str,
-    prompt: &str,
-) -> std::io::Result<RunnerProc> {
-    match kind {
-        AgentKind::Claude => {
-            let agent_spec = AgentSpec {
-                kind: AgentKind::Claude,
-                model: model.to_string(),
-                effort: effort.to_string(),
-                session_id: session_id.to_string(),
-                worktree: worktree_path.to_path_buf(),
-                bare,
-                allowed_tools: allowed_tools_override.unwrap_or(ALLOWED_TOOLS).to_string(),
-                env_vars,
-            };
-            AgentProc::spawn(&agent_spec, agent_bin).map(RunnerProc::Claude)
-        }
-        AgentKind::Codex => {
-            let spec = codex_agent::CodexSpec {
-                model: model.to_string(),
-                effort: effort.to_string(),
-                sandbox: codex_sandbox.to_string(),
-                worktree: worktree_path.to_path_buf(),
-                prompt: prompt.to_string(),
-                env_vars,
-            };
-            codex_agent::CodexProc::spawn(&spec, agent_bin).map(RunnerProc::Codex)
-        }
-    }
-}
-
 /// Build a review prompt appropriate for the resolved provider.
 /// Claude: invokes the builtin `review` skill. Codex: follows AGENTS.md.
 #[cfg(test)]
@@ -190,50 +217,80 @@ pub fn build_review_prompt_for_kind(kind: AgentKind, spec: &ReviewerSpec, effort
     build_review_prompt_for_kind_with_context(kind, spec, effort, None)
 }
 
+#[cfg(test)]
 pub fn build_review_prompt_for_kind_with_context(
     kind: AgentKind,
     spec: &ReviewerSpec,
     effort: &str,
     graph_context: Option<&str>,
 ) -> String {
+    build_review_prompt_for_kind_with_context_and_cycle(kind, spec, effort, graph_context, None)
+}
+
+/// Build an R1 prompt with optional persisted re-review lifecycle context.
+/// Initial reviews have no completed changes-to-rework transition, so callers
+/// omit the context for them rather than presenting a re-review calibration.
+pub fn build_review_prompt_for_kind_with_context_and_cycle(
+    kind: AgentKind,
+    spec: &ReviewerSpec,
+    effort: &str,
+    graph_context: Option<&str>,
+    review_cycle: Option<ReviewCycleContext>,
+) -> String {
+    let review_cycle_contract = review_cycle
+        .map(|context| review_round_contract(spec.pr, context))
+        .unwrap_or_default();
     match kind {
         AgentKind::Claude => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_review_prompt(spec, effort),
             graph_review_contract(spec.reviewer_name.as_str(), spec.pr, graph_context)
         ),
         AgentKind::Codex => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_codex_review_prompt(spec, effort),
             graph_review_contract(spec.reviewer_name.as_str(), spec.pr, graph_context)
         ),
+        AgentKind::Grok => unreachable!("Grok managed reviewer roles are not enabled"),
     }
 }
 
-fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&str>) -> String {
+pub(super) fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&str>) -> String {
     let Some(context) = context else {
         return String::new();
     };
+    // Use an indented Markdown code block instead of a fenced block. Generated
+    // task text may legitimately contain backtick fences; indentation keeps
+    // every context line inside the data block without needing a sentinel that
+    // task content could close.
+    let context = context.replace('\n', "\n    ");
     let category = quorum_core::decomposition::GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION;
     let example = crate::graph_blocker::Feedback {
         category: category.into(),
         affected_task: 1,
-        violated_assigned_boundary: "<exact assigned boundary violated>".into(),
+        violated_assigned_boundary: "<exact safety or authority boundary violated>".into(),
         evidence: vec!["<concrete diff or repository evidence>".into()],
     };
     let payload = serde_json::to_string(&example).expect("static graph-blocker example serializes");
     format!(
         "\n\n## Generated-child review boundary\n\n\
          The following bounded JSON is authoritative for this generated child's assignment and \
-         direct prerequisites only:\n```json\n{context}\n```\n\
+         direct prerequisites only:\n\n    {context}\n\n\
          Review this child against its assigned requirements. Do not absorb, require, or move \
          unrelated sibling scope into this PR. A sibling is relevant only when it is listed above \
          as a direct prerequisite; inspect no transitive or unrelated sibling assignment as scope.\n\
-         Use ordinary `--verdict changes` for defects within this child's implementation. Use the \
-         distinct `--verdict graph-blocker` only when concrete diff/repository evidence proves the \
-         decomposition boundary itself is invalid (for example the assigned outcome necessarily \
-         requires forbidden sibling scope). The only supported category is `{category}`. Signal it \
-         with this exact closed payload shape:\n\
+         Use ordinary `--verdict changes` for BLOCKING defects within this child's implementation. \
+         If the change is otherwise correct and safe but requires a bounded edit outside the \
+         child's `write` deliverables, including a `read_only_reference` path, issue a BLOCKING \
+         `--verdict changes`. Its feedback must name the specific out-of-scope edit the correct fix \
+         requires and explicitly authorize the rework worker to make that minimal, justified edit \
+         in the named file(s), treating the assigned file list as advisory for this remediation. \
+         FOLLOW-UP findings follow the contract above and never trigger a graph-blocker verdict. \
+         Reserve the distinct `--verdict graph-blocker` for genuine safety or authority boundary \
+         violations: a change that would grant authority, break restricted-role or phase isolation, \
+         escape the managed repository, or expose secrets. Do not use graph-blocker merely because \
+         a correct, safe fix crosses the declared file scope. The only supported category is \
+         `{category}`. Signal it with this exact closed payload shape:\n\
          `quorum submit --agent {reviewer} --pr {pr} --verdict graph-blocker --feedback-json '{payload}'`\n\
          Replace affected_task with this context's task_id and replace both placeholders with \
          concrete bounded evidence. Do not invent categories or extra fields.\n"
@@ -247,12 +304,11 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          Read the full PR diff and surrounding code (never the diff hunks alone), \
          check the repo CLAUDE.md/AGENTS.md invariants. Review at effort level {effort}.\n\n\
          Calibration: review with independent judgment. Zero blocking findings is a \
-         valid outcome — do not manufacture findings to justify requesting changes. \
-         Every BLOCKING finding must cite a concrete code path and explain a \
-         reproducible or logically demonstrated failure.\n\n\
+         valid outcome — do not manufacture findings to justify requesting changes.\n\n\
          {complete_review_contract}\n\
+         {finding_contract}\n\
          The PR is the source of truth for this review:\n\
-         - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
+         - Post every BLOCKING and FOLLOW-UP finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
          findings. The `submit` verdict is a lifecycle signal — the PR is where findings, \
          evidence, and the back-and-forth actually live.\n\
@@ -265,19 +321,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
          {verification_boundary}\n\
-         Severity contract (#159 — concrete failure classes are BLOCKING unless you \
-         cite evidence disproving the failure):\n\
-         - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
-         - Unbounded prompt or context growth\n\
-         - Network or model API calls while holding a database transaction\n\
-         - Data loss, corruption, or security boundary violations\n\
-         - Stuck-processing paths (deadlocks, infinite loops, missing timeouts)\n\
-         A reviewer may not describe one of these concrete failures and then submit it \
-         as advisory without an explicit evidence-backed reason.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Classify every finding as BLOCKING (correctness, security, data loss, \
-         regression, invariant violation — anything that must be fixed before merge) \
-         or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: write a short blocker summary to a temp file, then \
@@ -301,6 +345,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
@@ -315,23 +360,39 @@ pub fn build_r2_review_prompt_for_kind(
     build_r2_review_prompt_for_kind_with_context(kind, spec, effort, None)
 }
 
+#[cfg(test)]
 pub fn build_r2_review_prompt_for_kind_with_context(
     kind: AgentKind,
     spec: &R2ReviewSpec,
     effort: &str,
     graph_context: Option<&str>,
 ) -> String {
+    build_r2_review_prompt_for_kind_with_context_and_cycle(kind, spec, effort, graph_context, None)
+}
+
+/// Build an R2 prompt with optional persisted re-review lifecycle context.
+pub fn build_r2_review_prompt_for_kind_with_context_and_cycle(
+    kind: AgentKind,
+    spec: &R2ReviewSpec,
+    effort: &str,
+    graph_context: Option<&str>,
+    review_cycle: Option<ReviewCycleContext>,
+) -> String {
+    let review_cycle_contract = review_cycle
+        .map(|context| review_round_contract(spec.pr, context))
+        .unwrap_or_default();
     match kind {
         AgentKind::Claude => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_r2_review_prompt(spec, effort),
             graph_review_contract(spec.r2_name.as_str(), spec.pr, graph_context)
         ),
         AgentKind::Codex => format!(
-            "{}{}",
+            "{}{review_cycle_contract}{}",
             build_codex_r2_review_prompt(spec, effort),
             graph_review_contract(spec.r2_name.as_str(), spec.pr, graph_context)
         ),
+        AgentKind::Grok => unreachable!("Grok managed reviewer roles are not enabled"),
     }
 }
 
@@ -353,17 +414,16 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          2. Resolve differences by checking surrounding code and tests. Agreement with R1 \
          and no additional findings are both valid outcomes.\n\n\
          ## Evidence-bound requirement\n\n\
-         Zero blocking findings is a valid outcome after a thorough review. Every \
-         BLOCKING finding must cite a concrete code path (file:line or function) and \
-         explain a reproducible or logically demonstrated failure. Speculative, \
-         contrarian, or \"what if\" findings without a concrete failure scenario are \
-         not blocking.\n\n\
+         Zero blocking findings is a valid outcome after a thorough review. Speculative, \
+         contrarian, or \"what if\" concerns without a concrete failure scenario are not \
+         findings.\n\n\
          Follow the repository AGENTS.md instructions for the review methodology. \
          Read the full PR diff and surrounding code (never the diff hunks alone), \
          check the repo CLAUDE.md/AGENTS.md invariants. Review at effort level {effort}.\n\n\
          {complete_review_contract}\n\
+         {finding_contract}\n\
          The PR is the source of truth for this review:\n\
-         - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
+         - Post every BLOCKING and FOLLOW-UP finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
          findings. The `submit` verdict is a lifecycle signal — the PR is where findings, \
          evidence, and the back-and-forth actually live.\n\
@@ -376,19 +436,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
          {verification_boundary}\n\
-         Severity contract (#159 — concrete failure classes are BLOCKING unless you \
-         cite evidence disproving the failure):\n\
-         - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
-         - Unbounded prompt or context growth\n\
-         - Network or model API calls while holding a database transaction\n\
-         - Data loss, corruption, or security boundary violations\n\
-         - Stuck-processing paths (deadlocks, infinite loops, missing timeouts)\n\
-         A reviewer may not describe one of these concrete failures and then submit it \
-         as advisory without an explicit evidence-backed reason.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Classify every finding as BLOCKING (correctness, security, data loss, \
-         regression, invariant violation — anything that must be fixed before merge) \
-         or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: write a short blocker summary to a temp file, then \
@@ -413,6 +461,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         r1 = spec.r1_reviewer,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
@@ -442,19 +491,18 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          2. Resolve differences by checking surrounding code and tests. Agreement with R1 \
          and no additional findings are both valid outcomes.\n\n\
          ## Evidence-bound requirement\n\n\
-         Zero blocking findings is a valid outcome after a thorough review. Every \
-         BLOCKING finding must cite a concrete code path (file:line or function) and \
-         explain a reproducible or logically demonstrated failure. Speculative, \
-         contrarian, or \"what if\" findings without a concrete failure scenario are \
-         not blocking.\n\n\
+         Zero blocking findings is a valid outcome after a thorough review. Speculative, \
+         contrarian, or \"what if\" concerns without a concrete failure scenario are not \
+         findings.\n\n\
          Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology (full diff + surrounding code, severity classification). \
          If the builtin skill is unavailable, run the review directly: read the full PR diff \
          and surrounding code (never the diff hunks alone), and check the repo CLAUDE.md \
          invariants — then apply the contract below.\n\n\
          {complete_review_contract}\n\
+         {finding_contract}\n\
          The PR is the source of truth for this review:\n\
-         - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
+         - Post every BLOCKING and FOLLOW-UP finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
          findings. The `submit` verdict is a lifecycle signal — the PR is where findings, \
          evidence, and the back-and-forth actually live.\n\
@@ -467,19 +515,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
          {verification_boundary}\n\
-         Severity contract (#159 — concrete failure classes are BLOCKING unless you \
-         cite evidence disproving the failure):\n\
-         - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
-         - Unbounded prompt or context growth\n\
-         - Network or model API calls while holding a database transaction\n\
-         - Data loss, corruption, or security boundary violations\n\
-         - Stuck-processing paths (deadlocks, infinite loops, missing timeouts)\n\
-         A reviewer may not describe one of these concrete failures and then submit it \
-         as advisory without an explicit evidence-backed reason.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Classify every finding as BLOCKING (correctness, security, data loss, \
-         regression, invariant violation — anything that must be fixed before merge) \
-         or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: write a short blocker summary to a temp file, then \
@@ -504,6 +540,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         r1 = spec.r1_reviewer,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
@@ -522,17 +559,27 @@ fn budget_line(spent_usd: f64, max_task_cost_usd: Option<f64>) -> String {
     }
 }
 
-/// Token-economy guidance for spawned workers. A daemon worker is a batch
-/// process: nobody waits on wall-clock, so parallel subagent fan-out buys
-/// nothing and multiplies cost (each subagent re-pays full boot context).
+/// Work-style guidance for spawned workers. A daemon worker is a batch process:
+/// nobody waits on wall-clock, so the levers are simplicity, token economy, and
+/// no subagent fan-out (each fan-out re-pays full boot context and buys nothing
+/// when latency does not matter).
 const WORKING_STYLE: &str =
     "Working style — you are a batch worker; wall-clock is cheap, tokens are not:\n\
+     - Bias to the simplest solution that fully solves the task. Take the lowest-friction \
+     path that keeps quality, maintainability, and the codebase's existing conventions: \
+     reach for what's already here before adding new machinery, and add complexity only \
+     when the task genuinely needs it — not for hypothetical futures. Match the surrounding \
+     code. Simpler means less code, never weaker code — do not trade away correctness, \
+     validation, tests, or safety to be smaller.\n\
      - Do ALL edits, fixes, and mechanical work directly in this session. Do NOT fan out \
      subagents (Agent/Task tool) to parallelize them — each subagent re-pays your full \
-     context as a boot tax and shares no cache with its siblings.\n\
-     - A subagent is justified ONLY to quarantine bulky read-only exploration (many-file \
-     reads that would bloat your context) behind a short returned conclusion, and rarely \
-     more than one or two per task.";
+     context as a boot tax and shares no cache with its siblings. A subagent is justified \
+     ONLY to quarantine bulky read-only exploration (many-file reads that would bloat your \
+     context) behind a short returned conclusion, and rarely more than one or two per task.\n\
+     - Spend as few tokens as the task allows: avoid needless re-reads, redundant tool \
+     calls, and re-running expensive builds or test suites you do not need. Never let \
+     austerity degrade quality or completeness — run the verification the task requires, \
+     and do not skip a real check to save tokens.";
 
 /// Build the raw worker prompt (no runner-specific wrapping).
 pub fn build_worker_prompt(
@@ -577,69 +624,6 @@ pub fn build_worker_turn(
     ))
 }
 
-#[cfg(test)]
-pub fn build_rereview_turn(
-    reviewer_name: &str,
-    pr: i64,
-    worker_agent: &str,
-    effort: &str,
-) -> String {
-    build_rereview_turn_with_context(reviewer_name, pr, worker_agent, effort, None)
-}
-
-pub fn build_rereview_turn_with_context(
-    reviewer_name: &str,
-    pr: i64,
-    worker_agent: &str,
-    effort: &str,
-    graph_context: Option<&str>,
-) -> String {
-    super::agent::user_turn(&format!(
-        "The author ({worker}) pushed rework for PR #{pr}. Re-review the updated diff.\n\n\
-         Verify the branch actually advanced (new commits since prior review) — approving \
-         an unchanged diff over prior blocking findings is forbidden.\n\n\
-         Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
-         for the review methodology. If the builtin skill is unavailable, read the full \
-         PR diff and surrounding code and check the repo CLAUDE.md invariants.\n\n\
-         Verify prior fixes by reading the prior review thread on the PR. Then re-audit the \
-         full current diff and relevant sibling paths; do not narrowly inspect only the last \
-         remediation commit.\n\n\
-         {complete_review_contract}\n\
-         The PR is the source of truth for this review:\n\
-         - Read the prior review thread on the PR. For each earlier finding, resolve it on \
-         the PR — mark it fixed, downgrade it, or reaffirm it — so a later reader can \
-         determine fixed / accepted / overridden / unaddressed outcomes. Do not silently \
-         drop a prior blocker.\n\
-         - Post new findings to the PR (inline where a specific file/line is involved, \
-         summary comment for cross-cutting findings) and reply to author pushback there.\n\
-         - Encouraged GitHub operations: normal PR comments, inline comments, and review summary \
-         comments.\n\
-         - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
-         --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
-         your verdict as the merge account and owns merge.\n\n\
-         {verification_boundary}\n\
-         Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Classify every finding as BLOCKING or advisory.\n\
-         - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
-         --verdict approved --blocking 0\n\
-         - One or more blocking findings: write a short blocker summary to a temp file, then \
-         run: quorum submit --agent {name} --pr {pr} --verdict changes --blocking <count> \
-         --feedback-file <path>\n\
-         - The feedback file is a lifecycle-signal summary; the authoritative \
-         findings must already be on the PR.\n\n\
-         Do NOT merge the PR yourself — the daemon handles merging.\n\
-         Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
-         approval as the merge account after your verdict.\n\
-         Do NOT mark the task done yourself — the daemon handles task lifecycle.{graph_contract}",
-        worker = worker_agent,
-        name = reviewer_name,
-        pr = pr,
-        complete_review_contract = COMPLETE_REVIEW_CONTRACT,
-        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
-        graph_contract = graph_review_contract(reviewer_name, pr, graph_context),
-    ))
-}
-
 pub fn build_rework_prompt(
     agent_name: &str,
     task_id: i64,
@@ -661,6 +645,9 @@ pub fn build_rework_prompt(
          - The final PR history must let a later reader determine, for each finding, whether \
          it was fixed, accepted, overridden with evidence, or unaddressed. That trail lives \
          on the PR, not in this turn.\n\n\
+         Preserve the existing published PR lineage. If the base branch must be integrated, \
+         merge it into the PR branch. Never rebase, reset away, squash-rebuild, or otherwise \
+         replace the published PR head; it must remain an ancestor of your final commit.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
          After fixing and committing (do not push):\n\
          1. Run the verification prescribed by the target repository's checked-in instructions \
@@ -703,6 +690,7 @@ pub fn build_remediation_turn(
     pr: i64,
     feedback: &str,
     task_body: &str,
+    continuation_context: Option<&str>,
     max_task_cost_usd: Option<f64>,
 ) -> String {
     format!(
@@ -710,6 +698,7 @@ pub fn build_remediation_turn(
          and no managed worker exists to address them.\n\n\
          ## Task context\n{body}\n\n\
          ## Blocking findings from the reviewer\n{feedback}\n\n\
+         {continuation_context}\
          ## Instructions\n\
          You are fixing an EXISTING PR — do NOT open a new one and do NOT run `gh pr create`.\n\n\
          ## Publishing your fix\n\
@@ -735,6 +724,7 @@ pub fn build_remediation_turn(
         local_branch = remediation_branch(agent_name, task_id),
         body = if task_body.is_empty() { "(no task body)" } else { task_body },
         feedback = feedback,
+        continuation_context = continuation_context.unwrap_or_default(),
         task_id = task_id,
         budget = budget_line(0.0, max_task_cost_usd),
     )
@@ -743,6 +733,24 @@ pub fn build_remediation_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_review_contract_carries_bounded_authoritative_fields() {
+        let contract = task_review_contract(
+            473,
+            "Surface cancelled dependencies",
+            Some("Expected\nCancelled dependency parks are visible."),
+            Some("[461,462]"),
+            &["recovery attempt preserved PR #618".into()],
+        );
+        assert!(contract.contains("Authoritative managed-task contract"));
+        assert!(contract.contains("task_id: 473"));
+        assert!(contract.contains("title: Surface cancelled dependencies"));
+        assert!(contract.contains("depends_on: [461,462]"));
+        assert!(contract.contains("Cancelled dependency parks are visible."));
+        assert!(contract.contains("recovery attempt preserved PR #618"));
+        assert!(contract.contains("not the generic PR title or body"));
+    }
 
     #[test]
     fn review_prompt_contains_agent_names_and_pr() {
@@ -927,22 +935,62 @@ mod tests {
             r1_reviewer: "Reviewer-1".into(),
             r2_name: "Reviewer-2".into(),
         };
+        let context =
+            r#"{"task_id":7,"assigned_requirements":"parser only","direct_prerequisites":[]}"#;
         let prompts = [
-            ("Claude R1", build_review_prompt(&r1_spec, "high"), false),
+            (
+                "Claude R1",
+                build_review_prompt_for_kind_with_context(
+                    AgentKind::Claude,
+                    &r1_spec,
+                    "high",
+                    Some(context),
+                ),
+                false,
+            ),
             (
                 "Codex R1",
-                build_review_prompt_for_kind(AgentKind::Codex, &r1_spec, "high"),
+                build_review_prompt_for_kind_with_context(
+                    AgentKind::Codex,
+                    &r1_spec,
+                    "high",
+                    Some(context),
+                ),
                 false,
             ),
-            ("Claude R2", build_r2_review_prompt(&r2_spec, "high"), false),
+            (
+                "Claude R2",
+                build_r2_review_prompt_for_kind_with_context(
+                    AgentKind::Claude,
+                    &r2_spec,
+                    "high",
+                    Some(context),
+                ),
+                false,
+            ),
             (
                 "Codex R2",
-                build_r2_review_prompt_for_kind(AgentKind::Codex, &r2_spec, "high"),
+                build_r2_review_prompt_for_kind_with_context(
+                    AgentKind::Codex,
+                    &r2_spec,
+                    "high",
+                    Some(context),
+                ),
                 false,
             ),
             (
-                "re-review",
-                build_rereview_turn("Reviewer-1", 42, "Worker-1", "high"),
+                "sticky re-review (Claude/Codex)",
+                build_rereview_turn_with_context(
+                    "Reviewer-1",
+                    42,
+                    "Worker-1",
+                    "high",
+                    Some(context),
+                    ReviewCycleContext::from_persisted_rework_round(
+                        1,
+                        quorum_core::lifecycle::REWORK_CAP,
+                    ),
+                ),
                 true,
             ),
         ];
@@ -958,11 +1006,30 @@ mod tests {
                 "{name} must define completion by coverage without a finding quota"
             );
             assert!(
-                prompt.contains("affected-path matrix/checklist"),
-                "{name} must require cross-cutting path coverage"
+                prompt.contains("bounded, task-specific affected-path model")
+                    && prompt.contains("embedded managed-task contract when provided")
+                    && prompt.contains("mechanisms changed by the PR"),
+                "{name} must derive task-specific coverage from the managed-task contract and changed mechanisms"
             );
             assert!(
-                prompt.contains("complete blocker and advisory set"),
+                prompt.contains("short matrix, checklist, state/event map, or equivalent")
+                    && prompt.contains("not a mandatory format")
+                    && prompt.contains("complete review may have zero findings"),
+                "{name} must preserve reviewer discretion and zero-findings validity"
+            );
+            assert!(
+                prompt.contains("lifecycle and compatibility paths together")
+                    && prompt.contains("proposed remedy closes each relevant path"),
+                "{name} must review related paths together and assess whole-path remedies"
+            );
+            assert!(
+                !prompt.contains("producers × success/error/shutdown")
+                    && !prompt.contains("durable-state checklist")
+                    && !prompt.contains("mandatory visible table"),
+                "{name} must not prescribe a hard-coded affected-path checklist or table"
+            );
+            assert!(
+                prompt.contains("complete BLOCKING and FOLLOW-UP set"),
                 "{name} must report the full finding set"
             );
             assert!(
@@ -985,6 +1052,160 @@ mod tests {
                     "{name} must not narrow re-review to the latest remediation"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_reviewer_variant_separates_impact_from_merge_disposition() {
+        let context =
+            r#"{"task_id":7,"assigned_requirements":"parser only","direct_prerequisites":[]}"#;
+        let r1_spec = ReviewerSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Reviewer-1".into(),
+        };
+        let r2_spec = R2ReviewSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            r1_reviewer: "Reviewer-1".into(),
+            r2_name: "Reviewer-2".into(),
+        };
+        let prompts = [
+            ("Claude R1", build_review_prompt(&r1_spec, "high")),
+            (
+                "Codex R1",
+                build_review_prompt_for_kind(AgentKind::Codex, &r1_spec, "high"),
+            ),
+            ("Claude R2", build_r2_review_prompt(&r2_spec, "high")),
+            (
+                "Codex R2",
+                build_r2_review_prompt_for_kind(AgentKind::Codex, &r2_spec, "high"),
+            ),
+            (
+                "generated-child Claude R1",
+                build_review_prompt_for_kind_with_context(
+                    AgentKind::Claude,
+                    &r1_spec,
+                    "high",
+                    Some(context),
+                ),
+            ),
+            (
+                "generated-child Codex R1",
+                build_review_prompt_for_kind_with_context(
+                    AgentKind::Codex,
+                    &r1_spec,
+                    "high",
+                    Some(context),
+                ),
+            ),
+            (
+                "generated-child Claude R2",
+                build_r2_review_prompt_for_kind_with_context(
+                    AgentKind::Claude,
+                    &r2_spec,
+                    "high",
+                    Some(context),
+                ),
+            ),
+            (
+                "generated-child Codex R2",
+                build_r2_review_prompt_for_kind_with_context(
+                    AgentKind::Codex,
+                    &r2_spec,
+                    "high",
+                    Some(context),
+                ),
+            ),
+            (
+                "ordinary re-review",
+                build_rereview_turn("Reviewer-1", 42, "Worker-1", "high"),
+            ),
+            (
+                "generated-child re-review",
+                build_rereview_turn_with_context(
+                    "Reviewer-1",
+                    42,
+                    "Worker-1",
+                    "high",
+                    Some(context),
+                    ReviewCycleContext::from_persisted_rework_round(
+                        1,
+                        quorum_core::lifecycle::REWORK_CAP,
+                    ),
+                ),
+            ),
+        ];
+
+        for (name, prompt) in prompts {
+            assert!(
+                prompt.contains("Classify every substantive finding on two independent axes")
+                    && prompt.contains("Technical impact: critical, major, minor, or nit")
+                    && prompt.contains("Merge disposition: BLOCKING or FOLLOW-UP"),
+                "{name} must classify technical impact independently from merge disposition"
+            );
+            assert!(
+                prompt.contains(
+                    "Critical or major technical impact does not by itself make a finding BLOCKING"
+                ) && prompt.contains("their category alone never decides merge disposition"),
+                "{name} must not turn high technical impact into an automatic blocker"
+            );
+            assert!(
+                prompt.contains("merging this exact change")
+                    && prompt.contains("assigned primary outcome")
+                    && prompt.contains("applicable repository invariant")
+                    && prompt.contains("introduce or materially worsen")
+                    && prompt.contains("applicable established operating or threat model"),
+                "{name} must carry the complete current-contract blocker boundary"
+            );
+            assert!(
+                prompt.contains("pre-existing and not materially worsened")
+                    && prompt.contains("defense-in-depth")
+                    && prompt.contains("a future requirement")
+                    && prompt.contains("materially stronger threat model"),
+                "{name} must preserve real adjacent concerns as follow-ups"
+            );
+            assert!(
+                prompt.contains("smallest accurate statement of supported behavior")
+                    && prompt.contains("not an exhaustive inventory")
+                    && prompt.contains("pre-existing edge behavior that the change merely reveals")
+                    && prompt.contains("without cataloguing or fixing that behavior"),
+                "{name} must not turn documentation into an implementation-exception inventory"
+            );
+            assert!(
+                prompt.contains("new blocker in unchanged behavior")
+                    && prompt.contains("not reasonably discoverable in the prior complete audit"),
+                "{name} must explain late blockers after a complete prior audit"
+            );
+            assert!(
+                prompt.contains("why this PR cannot merge")
+                    && prompt.contains("exact repository invariant it violates")
+                    && prompt.contains("broader affected path left unsafe")
+                    && prompt.contains("why deferral is safe")
+                    && prompt.contains("desired future outcome and verification")
+                    && prompt.contains("later collector extraction"),
+                "{name} must require blockers to identify their violated contract and affected path, while keeping both dispositions evidence-rich and collector-readable"
+            );
+            assert!(
+                prompt.contains("Only BLOCKING findings contribute to `--blocking`")
+                    && prompt.contains("FOLLOW-UP findings never do")
+                    && prompt.contains("never force a changes verdict"),
+                "{name} must exclude follow-ups from lifecycle blocking"
+            );
+            assert!(
+                prompt.contains("zero BLOCKING findings and one or more FOLLOW-UP findings")
+                    && prompt.contains("submit `approved --blocking 0`"),
+                "{name} must approve a follow-up-only review with zero blockers"
+            );
+            assert!(
+                prompt.contains("Reviewers do not create or modify Managed Tasks"),
+                "{name} must preserve daemon ownership of future work"
+            );
+            assert!(
+                !prompt.contains("concrete failure classes are BLOCKING unless")
+                    && !prompt.contains("or advisory (quality/follow-up)"),
+                "{name} must not retain the collapsed severity/disposition policy"
+            );
         }
     }
 
@@ -1058,7 +1279,7 @@ mod tests {
 
     #[test]
     fn remediation_turn_uses_repository_relative_verification() {
-        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None);
+        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None, None);
         assert!(
             turn.contains("verification prescribed by the target repository")
                 && turn.contains("checked-in instructions")
@@ -1079,7 +1300,7 @@ mod tests {
     /// so the remediation prompt must require commit-only delivery.
     #[test]
     fn remediation_turn_forbids_agent_push_on_namespaced_branch() {
-        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None);
+        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None, None);
         assert!(
             turn.contains(&remediation_branch("W-1", 42)),
             "remediation turn must name the local branch it checked out: {turn}"
@@ -1096,6 +1317,30 @@ mod tests {
             turn.contains("gh pr create"),
             "remediation turn must forbid opening a new PR explicitly"
         );
+    }
+
+    #[test]
+    fn rework_turn_requires_published_ancestry_preservation() {
+        let turn = build_rework_prompt("W-1", 42, 99, "resolve conflicts", 0.0, None);
+        assert!(turn.contains("Preserve the existing published PR lineage"));
+        assert!(turn.contains("Never rebase"));
+        assert!(turn.contains("must remain an ancestor"));
+    }
+
+    #[test]
+    fn remediation_turn_includes_daemon_prepared_merge_context() {
+        let context = "CONTINUATION SOURCE — ANCESTRY MUST BE PRESERVED: The daemon already started a merge. Never rebase.\n\n";
+        let turn = build_remediation_turn(
+            "W-1",
+            42,
+            99,
+            "resolve conflicts",
+            "task context",
+            Some(context),
+            None,
+        );
+        assert!(turn.contains(context));
+        assert!(turn.contains("do NOT push"));
     }
 
     #[test]
@@ -1190,6 +1435,106 @@ mod tests {
     }
 
     #[test]
+    fn recovered_r1_r2_prompts_preserve_cycle_context_for_both_providers() {
+        let spec = ReviewerSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Rev-1".into(),
+        };
+        let r2_spec = R2ReviewSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            r1_reviewer: "Rev-1".into(),
+            r2_name: "Rev-2".into(),
+        };
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            let initial = build_review_prompt_for_kind(kind, &spec, "high");
+            assert!(!initial.contains("Review-cycle context"));
+            assert!(
+                !initial.contains("Required cumulative cross-round review ledger"),
+                "the initial review has no cross-round ledger"
+            );
+        }
+
+        let context = ReviewCycleContext::from_persisted_rework_round(
+            i64::from(quorum_core::lifecycle::REWORK_CAP),
+            quorum_core::lifecycle::REWORK_CAP,
+        );
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            let r1 = build_review_prompt_for_kind_with_context_and_cycle(
+                kind,
+                &spec,
+                "high",
+                None,
+                Some(context),
+            );
+            let r2 = build_r2_review_prompt_for_kind_with_context_and_cycle(
+                kind,
+                &r2_spec,
+                "high",
+                None,
+                Some(context),
+            );
+            assert!(r1.contains("final review opportunity"));
+            assert!(r2.contains("final review opportunity"));
+            for (role, prompt) in [("R1", r1), ("R2", r2)] {
+                assert!(
+                    prompt.contains("Required cumulative cross-round review ledger")
+                        && prompt.contains("### Prior BLOCKING findings")
+                        && prompt.contains("### Newly discovered findings"),
+                    "{kind:?} recovered {role} must require the cumulative ledger"
+                );
+                assert!(
+                    prompt.contains(
+                        "TRUNCATED: additional ledger history omitted; read PR #42 discussion"
+                    ),
+                    "{kind:?} recovered {role} must carry explicit PR-directed truncation"
+                );
+                assert!(
+                    prompt.contains("daemon to fail the task because the rework cap is exhausted"),
+                    "{kind:?} {role} must state the lifecycle-owned final consequence"
+                );
+                assert!(
+                    prompt.contains(
+                        "Do not approve, downgrade, omit, or defer a valid BLOCKING finding"
+                    ),
+                    "{kind:?} {role} must resist final-round approval pressure"
+                );
+                assert!(
+                    prompt.contains(
+                        "Zero blockers is valid only after a complete independent review"
+                    ),
+                    "{kind:?} {role} must retain independent zero-blocker calibration"
+                );
+                assert!(
+                    !prompt.contains("approve because") && !prompt.contains("must approve"),
+                    "{kind:?} {role} must not pressure approval on the final opportunity"
+                );
+            }
+        }
+        let claude_turn =
+            build_rereview_turn_with_context("Rev-1", 42, "Worker-1", "high", None, context);
+        let codex_turn =
+            build_rereview_turn_with_context("Rev-1", 42, "Worker-1", "high", None, context);
+        assert_eq!(
+            claude_turn, codex_turn,
+            "the runner receives one neutral turn"
+        );
+        assert!(claude_turn.contains("final review opportunity"));
+        assert!(claude_turn.contains("Required cumulative cross-round review ledger"));
+        assert!(claude_turn.contains("### Prior BLOCKING findings"));
+        assert!(claude_turn.contains("### Newly discovered findings"));
+        assert!(claude_turn.contains("daemon to fail the task because the rework cap is exhausted"));
+        assert!(claude_turn
+            .contains("Do not approve, downgrade, omit, or defer a valid BLOCKING finding"));
+        assert!(
+            claude_turn.contains("Zero blockers is valid only after a complete independent review")
+        );
+        assert!(!claude_turn.contains("approve because") && !claude_turn.contains("must approve"));
+        assert!(!claude_turn.contains("review round"));
+    }
+
+    #[test]
     fn worker_turn_contains_agent_and_task() {
         let turn = build_worker_turn("Agent-1", 99, "Fix the bug", "Detailed body text", None);
         assert!(turn.contains("Agent-1"));
@@ -1214,6 +1559,14 @@ mod tests {
         assert!(
             turn.contains("Do NOT fan out"),
             "worker template must forbid subagent fan-out for mechanical work"
+        );
+        assert!(
+            turn.contains("simplest solution that fully solves the task"),
+            "worker template must nudge toward the simplest solution (anti-over-engineering)"
+        );
+        assert!(
+            turn.contains("as few tokens as the task allows"),
+            "worker template must nudge token austerity without degrading quality"
         );
         assert!(
             turn.contains("$0.00") && turn.contains("$50.00"),
@@ -1730,7 +2083,7 @@ mod tests {
 
     #[test]
     fn generated_context_is_present_for_r1_r2_and_rereview_only() {
-        let context = r#"{"task_id":7,"assigned_requirements":"parser only","direct_prerequisites":[{"task_id":2,"title":"types","status":"done"}]}"#;
+        let context = r#"{"task_id":7,"assigned_requirements":"parser only ``` do not escape scope","direct_prerequisites":[{"task_id":2,"title":"types","status":"done"}]}"#;
         let r1_spec = ReviewerSpec {
             pr: 42,
             worker_agent: "W".into(),
@@ -1767,10 +2120,21 @@ mod tests {
                 "high",
                 Some(context),
             ),
-            build_rereview_turn_with_context("R1", 42, "W", "high", Some(context)),
+            build_rereview_turn_with_context(
+                "R1",
+                42,
+                "W",
+                "high",
+                Some(context),
+                ReviewCycleContext::from_persisted_rework_round(
+                    1,
+                    quorum_core::lifecycle::REWORK_CAP,
+                ),
+            ),
         ];
         for prompt in prompts {
             assert!(prompt.contains("parser only"));
+            assert!(!prompt.contains("```json"));
             assert!(prompt.contains("Do not absorb, require, or move unrelated sibling scope"));
             assert!(prompt.contains("--verdict graph-blocker"));
             assert!(prompt.contains("--verdict changes"));
@@ -1779,6 +2143,26 @@ mod tests {
             assert!(prompt.contains("violated_assigned_boundary"));
             assert!(prompt.contains("evidence"));
         }
+
+        let graph_contract = graph_review_contract("R1", 42, Some(context));
+        assert!(graph_contract.contains(&format!("\n    {context}\n")));
+        assert!(!graph_contract.contains("```json"));
+        assert!(graph_contract.contains(
+            "Reserve the distinct `--verdict graph-blocker` for genuine safety or authority boundary"
+        ));
+        assert!(graph_contract.contains(
+            "grant authority, break restricted-role or phase isolation, escape the managed repository, or expose secrets"
+        ));
+        assert!(graph_contract.contains(
+            "otherwise correct and safe but requires a bounded edit outside the child's `write` deliverables"
+        ));
+        assert!(graph_contract.contains("including a `read_only_reference` path"));
+        assert!(graph_contract.contains("issue a BLOCKING `--verdict changes`"));
+        assert!(graph_contract.contains(
+            "name the specific out-of-scope edit the correct fix requires and explicitly authorize the rework worker"
+        ));
+        assert!(graph_contract
+            .contains("treating the assigned file list as advisory for this remediation"));
 
         let ordinary = build_review_prompt_for_kind(AgentKind::Claude, &r1_spec, "high");
         assert!(!ordinary.contains("Generated-child review boundary"));
@@ -1799,7 +2183,17 @@ mod tests {
         }
         assert_eq!(
             build_rereview_turn("R1", 42, "W", "high"),
-            build_rereview_turn_with_context("R1", 42, "W", "high", None)
+            build_rereview_turn_with_context(
+                "R1",
+                42,
+                "W",
+                "high",
+                None,
+                ReviewCycleContext::from_persisted_rework_round(
+                    1,
+                    quorum_core::lifecycle::REWORK_CAP
+                ),
+            )
         );
     }
 }

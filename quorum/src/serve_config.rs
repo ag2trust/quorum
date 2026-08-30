@@ -1,8 +1,9 @@
 //! TOML config file for `quorum serve`. Missing file → built-in defaults.
 //! Malformed or unknown keys → fail loud (exit 2).
 //!
-//! CLI flags override config-file values (explicit wins). The resolved config
-//! and each value's source (file vs flag vs default) are logged at startup.
+//! Corresponding CLI flags override config-file values (explicit wins); some
+//! diagnostics are intentionally file-only. The resolved config and each
+//! value's source (file vs flag vs default) are logged at startup.
 
 use quorum_core::error::{QuorumError, Result};
 use serde::Deserialize;
@@ -33,9 +34,33 @@ pub type PercentagePool = BTreeMap<String, u8>;
 pub struct RoutingPolicy {
     pub classifier: PercentagePool,
     pub planner: PercentagePool,
+    /// Plan-review Arbiter pool. Absent `[routing.arbiter]` blocks deserialize
+    /// to an empty map (the `#[serde(default)]` sentinel), which
+    /// [`RoutingPolicy::arbiter_pool`] resolves to the planner pool. Profile
+    /// IDs are owner-defined, so no fixed default value could validate against
+    /// an arbitrary config's `[model_profiles]`; mirroring the planner pool is
+    /// the only default that keeps every existing config parsing and
+    /// validating unchanged while carrying the planner's Claude-Opus intent.
+    #[serde(default)]
+    pub arbiter: PercentagePool,
     pub collector: PercentagePool,
     pub worker: BTreeMap<String, PercentagePool>,
     pub reviewer: BTreeMap<String, PercentagePool>,
+}
+
+impl RoutingPolicy {
+    /// Effective Arbiter routing pool. An unset `[routing.arbiter]` block
+    /// (empty map) falls back to the planner pool, so the Arbiter resolves to
+    /// the same Claude Opus 4.8 model the planner uses unless an operator
+    /// configures an explicit override. Dormant: no runtime path resolves an
+    /// Arbiter assignment yet.
+    pub fn arbiter_pool(&self) -> &PercentagePool {
+        if self.arbiter.is_empty() {
+            &self.planner
+        } else {
+            &self.arbiter
+        }
+    }
 }
 
 /// Which CLI runner the daemon uses for all spawned agents.
@@ -43,6 +68,7 @@ pub struct RoutingPolicy {
 pub enum RunnerKind {
     Claude,
     Codex,
+    Grok,
 }
 
 impl std::fmt::Display for RunnerKind {
@@ -50,6 +76,7 @@ impl std::fmt::Display for RunnerKind {
         match self {
             Self::Claude => write!(f, "claude"),
             Self::Codex => write!(f, "codex"),
+            Self::Grok => write!(f, "grok"),
         }
     }
 }
@@ -59,8 +86,40 @@ impl RunnerKind {
         match s {
             None | Some("claude") => Ok(Self::Claude),
             Some("codex") => Ok(Self::Codex),
+            Some("grok") => Ok(Self::Grok),
             Some(other) => Err(QuorumError::Usage(format!(
-                "bad agent value: \"{other}\" (expected \"claude\" or \"codex\")"
+                "bad agent value: \"{other}\" (expected \"claude\", \"codex\", or \"grok\")"
+            ))),
+        }
+    }
+}
+
+/// Token counters used by the managed-agent token watchdog ceilings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TokenLimitBasis {
+    /// Provider-reported input plus output tokens; the historical behavior.
+    #[default]
+    Raw,
+    /// Normalized uncached input plus output tokens.
+    Uncached,
+}
+
+impl std::fmt::Display for TokenLimitBasis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Raw => write!(f, "raw"),
+            Self::Uncached => write!(f, "uncached"),
+        }
+    }
+}
+
+impl TokenLimitBasis {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "raw" => Ok(Self::Raw),
+            "uncached" => Ok(Self::Uncached),
+            other => Err(QuorumError::Usage(format!(
+                "token_limit_basis must be \"raw\" or \"uncached\", got \"{other}\""
             ))),
         }
     }
@@ -134,9 +193,11 @@ declare_serve_file_config! {
     no_bare_agent: Option<bool>,
     max_turn_tokens: Option<i64>,
     max_task_tokens: Option<i64>,
+    token_limit_basis: Option<String>,
     max_turn_cost_usd: Option<f64>,
     max_task_cost_usd: Option<f64>,
     max_turn_wall_secs: Option<u64>,
+    max_idle_secs: Option<u64>,
     max_task_wall_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
     allowed_tools: Option<String>,
@@ -147,20 +208,32 @@ declare_serve_file_config! {
     sha_poll_interval_secs: Option<u64>,
     repo: Option<String>,
     base_branch: Option<String>,
+    self_update_branch: Option<String>,
     merge_checks_timeout_secs: Option<u64>,
     merge_checks_poll_secs: Option<u64>,
     required_jobs: Option<Vec<String>>,
     master_ci_gate: Option<bool>,
     master_ci_timeout_secs: Option<u64>,
     doctor_enabled: Option<bool>,
+    /// Cadence for observational host memory/disk sampling.
+    resource_poll_secs: Option<u64>,
+    disk_warn_free_gib: Option<u64>,
+    disk_critical_free_gib: Option<u64>,
+    memory_warn_available_pct: Option<u8>,
+    memory_critical_available_pct: Option<u8>,
     /// Whether deterministic R2 sampling participates. `false` keeps R2 mandatory.
     r2_enabled: Option<bool>,
     /// Guaranteed coverage floor per (model, effort, complexity) stratum.
     r2_target_per_stratum: Option<i64>,
     /// Sampling probability once a stratum reaches its coverage floor.
     r2_steady_state_p: Option<f64>,
+    /// Maximum rework rounds before a task fails. Stamped onto each task at
+    /// adoption, immutable thereafter; unset falls back to the compiled default.
+    max_rework: Option<u32>,
     /// Runner-specific Codex configuration.
     codex: Option<CodexFileConfig>,
+    /// Grok adapter configuration for managed worker roles.
+    grok: Option<GrokFileConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,9 +279,11 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("no_bare_agent", ConfigKeyDisposition::Runtime),
     ("max_turn_tokens", ConfigKeyDisposition::Runtime),
     ("max_task_tokens", ConfigKeyDisposition::Runtime),
+    ("token_limit_basis", ConfigKeyDisposition::Runtime),
     ("max_turn_cost_usd", ConfigKeyDisposition::Runtime),
     ("max_task_cost_usd", ConfigKeyDisposition::Runtime),
     ("max_turn_wall_secs", ConfigKeyDisposition::Runtime),
+    ("max_idle_secs", ConfigKeyDisposition::Runtime),
     ("max_task_wall_secs", ConfigKeyDisposition::Runtime),
     ("idle_timeout_secs", ConfigKeyDisposition::Runtime),
     ("allowed_tools", ConfigKeyDisposition::Runtime),
@@ -219,16 +294,27 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("sha_poll_interval_secs", ConfigKeyDisposition::Runtime),
     ("repo", ConfigKeyDisposition::Runtime),
     ("base_branch", ConfigKeyDisposition::Runtime),
+    ("self_update_branch", ConfigKeyDisposition::Runtime),
     ("merge_checks_timeout_secs", ConfigKeyDisposition::Runtime),
     ("merge_checks_poll_secs", ConfigKeyDisposition::Runtime),
     ("required_jobs", ConfigKeyDisposition::Runtime),
     ("master_ci_gate", ConfigKeyDisposition::Runtime),
     ("master_ci_timeout_secs", ConfigKeyDisposition::Runtime),
     ("doctor_enabled", ConfigKeyDisposition::Runtime),
+    ("resource_poll_secs", ConfigKeyDisposition::Runtime),
+    ("disk_warn_free_gib", ConfigKeyDisposition::Runtime),
+    ("disk_critical_free_gib", ConfigKeyDisposition::Runtime),
+    ("memory_warn_available_pct", ConfigKeyDisposition::Runtime),
+    (
+        "memory_critical_available_pct",
+        ConfigKeyDisposition::Runtime,
+    ),
     ("r2_enabled", ConfigKeyDisposition::Runtime),
     ("r2_target_per_stratum", ConfigKeyDisposition::Runtime),
     ("r2_steady_state_p", ConfigKeyDisposition::Runtime),
+    ("max_rework", ConfigKeyDisposition::Runtime),
     ("codex", ConfigKeyDisposition::Runtime),
+    ("grok", ConfigKeyDisposition::Runtime),
     #[cfg(test)]
     ("test_only_unconsumed", ConfigKeyDisposition::Deprecated),
 ];
@@ -314,7 +400,7 @@ pub fn resolve_roles(
         .or(cli_agent)
         .or(file.agent.as_deref());
     let provider = RunnerKind::from_str_opt(provider_name)?;
-    let provider_explicit = file.provider.is_some();
+    let provider_explicit = provider_name.is_some();
 
     let (
         worker_default_model,
@@ -323,24 +409,33 @@ pub fn resolve_roles(
         review_default_effort,
         classifier_default_model,
         classifier_default_effort,
-    ) = if provider_explicit && provider == RunnerKind::Codex {
-        (
+    ) = match (provider_explicit, provider) {
+        (true, RunnerKind::Codex) => (
             "gpt-5.6-terra",
             "medium",
             "gpt-5.6-terra",
             "high",
             "gpt-5.6-luna",
             "medium",
-        )
-    } else {
-        (
+        ),
+        // Provider selection controls workers only for Grok. Reviewer,
+        // classifier, and collector roles retain their non-Grok defaults.
+        (true, RunnerKind::Grok) => (
+            "grok-4.5",
+            "high",
+            legacy_model,
+            legacy_effort,
+            "claude-haiku-4-5-20251001",
+            "low",
+        ),
+        _ => (
             legacy_model,
             legacy_effort,
             legacy_model,
             legacy_effort,
             "claude-haiku-4-5-20251001",
             "low",
-        )
+        ),
     };
 
     let classifier_model = file
@@ -387,6 +482,19 @@ pub fn resolve_roles(
         || file.review_model.is_some()
         || file.classifier_model.is_some()
         || file.collector_model.is_some();
+    for (role, model) in [
+        ("review", roles.review_model.as_str()),
+        ("classifier", roles.classifier_model.as_str()),
+        ("collector", roles.collector_model.as_str()),
+    ] {
+        if crate::serve::runner::AgentKind::for_model(model)
+            .is_ok_and(|kind| kind == crate::serve::runner::AgentKind::Grok)
+        {
+            return Err(QuorumError::Usage(format!(
+                "{role}_model \"{model}\" selects Grok, but Grok is enabled only for managed workers"
+            )));
+        }
+    }
     if provider_explicit || role_models_explicit {
         // `review_model` may intentionally select the other supported provider:
         // reviewer spawning resolves its provider from this model. The remaining
@@ -398,9 +506,15 @@ pub fn resolve_roles(
         ] {
             let actual =
                 crate::serve::runner::AgentKind::for_model(model).map_err(QuorumError::Usage)?;
+            if (provider == RunnerKind::Grok && role != "worker")
+                || (role == "worker" && actual == crate::serve::runner::AgentKind::Grok)
+            {
+                continue;
+            }
             let expected = match provider {
                 RunnerKind::Claude => crate::serve::runner::AgentKind::Claude,
                 RunnerKind::Codex => crate::serve::runner::AgentKind::Codex,
+                RunnerKind::Grok => crate::serve::runner::AgentKind::Grok,
             };
             if actual != expected {
                 return Err(QuorumError::Usage(format!(
@@ -423,6 +537,56 @@ pub struct CodexFileConfig {
     pub sandbox: Option<String>,
 }
 
+/// `[grok]` transport settings. These are validated now so enabling managed
+/// roles later cannot inherit permissive or misspelled values silently.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrokFileConfig {
+    pub sandbox: Option<String>,
+    pub permission_mode: Option<String>,
+    pub max_turns: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokResolvedConfig {
+    pub sandbox: String,
+    pub permission_mode: String,
+    pub max_turns: u32,
+}
+
+impl Default for GrokResolvedConfig {
+    fn default() -> Self {
+        Self {
+            sandbox: crate::serve::grok_agent::DEFAULT_SANDBOX.into(),
+            permission_mode: crate::serve::grok_agent::DEFAULT_PERMISSION_MODE.into(),
+            max_turns: crate::serve::grok_agent::DEFAULT_MAX_TURNS,
+        }
+    }
+}
+
+pub fn resolve_grok_adapter(file: Option<&GrokFileConfig>) -> Result<GrokResolvedConfig> {
+    let defaults = GrokResolvedConfig::default();
+    let resolved = GrokResolvedConfig {
+        sandbox: file
+            .and_then(|config| config.sandbox.clone())
+            .unwrap_or(defaults.sandbox),
+        permission_mode: file
+            .and_then(|config| config.permission_mode.clone())
+            .unwrap_or(defaults.permission_mode),
+        max_turns: file
+            .and_then(|config| config.max_turns)
+            .unwrap_or(defaults.max_turns),
+    };
+    crate::serve::grok_agent::GrokAdapterConfig {
+        sandbox: &resolved.sandbox,
+        permission_mode: &resolved.permission_mode,
+        max_turns: resolved.max_turns,
+    }
+    .validate()
+    .map_err(QuorumError::Usage)?;
+    Ok(resolved)
+}
+
 /// Load serve config from `path`. Malformed / unknown keys → exit 2.
 /// When `explicit` is true (user passed --config), missing file → exit 2.
 /// When false (auto-discovered default path), missing file → built-in defaults.
@@ -434,7 +598,9 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             let cfg: ServeFileConfig = toml::from_str(&s).map_err(|e| {
                 QuorumError::Usage(format!("bad serve config {}: {e}", path.display()))
             })?;
+            resolve_grok_adapter(cfg.grok.as_ref())?;
             validate_model_routing(&cfg)?;
+            resolve_resource_monitor_config(&cfg)?;
             warn_for_deprecated_keys(&s)?;
             Ok(cfg)
         }
@@ -504,18 +670,17 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
             "model_profiles must contain at least one profile".into(),
         ));
     }
-    let mut configured_runners = std::collections::BTreeSet::new();
     for (name, profile) in profiles {
         validate_durable_routing_text("model profile name", name)?;
         validate_durable_routing_text("model", &profile.model)?;
         validate_durable_routing_text("effort", &profile.effort)?;
         let expected = RunnerKind::from_str_opt(Some(&profile.runner))?;
-        configured_runners.insert(expected);
         let actual = crate::serve::runner::AgentKind::for_model(&profile.model)
             .map_err(|error| QuorumError::Usage(format!("model profile \"{name}\": {error}")))?;
         let expected = match expected {
             RunnerKind::Claude => crate::serve::runner::AgentKind::Claude,
             RunnerKind::Codex => crate::serve::runner::AgentKind::Codex,
+            RunnerKind::Grok => crate::serve::runner::AgentKind::Grok,
         };
         if actual != expected {
             return Err(QuorumError::Usage(format!(
@@ -530,6 +695,9 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
             crate::serve::runner::AgentKind::Codex => {
                 matches!(profile.effort.as_str(), "low" | "medium" | "high" | "xhigh")
             }
+            crate::serve::runner::AgentKind::Grok => {
+                matches!(profile.effort.as_str(), "low" | "medium" | "high")
+            }
         };
         if !effort_supported {
             return Err(QuorumError::Usage(format!(
@@ -538,11 +706,7 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
             )));
         }
     }
-    if config.agent_bin.is_some() && configured_runners.len() > 1 {
-        return Err(QuorumError::Usage(
-            "agent_bin cannot be used when model_profiles span multiple runners".into(),
-        ));
-    }
+    validate_agent_bin_for_profiles(config.agent_bin.as_deref(), profiles)?;
 
     let routing = config
         .routing
@@ -550,17 +714,62 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
         .ok_or_else(|| QuorumError::Usage("serve config requires [routing]".into()))?;
     validate_percentage_pool("classifier", &routing.classifier, profiles)?;
     validate_percentage_pool("planner", &routing.planner, profiles)?;
-    for profile_id in routing.planner.keys() {
-        if profiles[profile_id].runner == "codex" {
-            return Err(QuorumError::Usage(format!(
-                "routing.planner profile \"{profile_id}\" uses unsupported runner \"codex\""
-            )));
-        }
-    }
+    validate_percentage_pool("arbiter", routing.arbiter_pool(), profiles)?;
     validate_percentage_pool("collector", &routing.collector, profiles)?;
     validate_complexity_pools("worker", &routing.worker, profiles)?;
     validate_complexity_pools("reviewer", &routing.reviewer, profiles)?;
+    validate_grok_role_gate("classifier", &routing.classifier, profiles)?;
+    validate_grok_role_gate("planner", &routing.planner, profiles)?;
+    validate_grok_role_gate("arbiter", routing.arbiter_pool(), profiles)?;
+    validate_grok_role_gate("collector", &routing.collector, profiles)?;
+    for (complexity, pool) in &routing.reviewer {
+        validate_grok_role_gate(&format!("reviewer.{complexity}"), pool, profiles)?;
+    }
+    resolve_token_limit_basis(config.token_limit_basis.as_deref())?;
+    validate_token_ceilings(config.max_turn_tokens, config.max_task_tokens)?;
     validate_routed_cost_limits(config, config.max_turn_cost_usd, config.max_task_cost_usd)?;
+    Ok(())
+}
+
+/// Grok Build is available only to managed worker pools. Keeping this check at
+/// the routing boundary means a valid Grok profile cannot accidentally become
+/// selectable by a planner, reviewer, classifier, or collector.
+fn validate_grok_role_gate(
+    role: &str,
+    pool: &PercentagePool,
+    profiles: &BTreeMap<String, ModelProfile>,
+) -> Result<()> {
+    if let Some((profile_id, _)) = pool.iter().find(|(profile_id, _)| {
+        profiles
+            .get(*profile_id)
+            .is_some_and(|profile| profile.runner == "grok")
+    }) {
+        return Err(QuorumError::Usage(format!(
+            "routing.{role} profile \"{profile_id}\" selects Grok, which is enabled only for worker roles"
+        )));
+    }
+    Ok(())
+}
+
+/// A custom executable belongs to one provider CLI. Validate it after every
+/// config source has been resolved, because `--agent-bin` is merged after the
+/// TOML file itself has been validated.
+pub fn validate_agent_bin_for_profiles(
+    agent_bin: Option<&str>,
+    profiles: &BTreeMap<String, ModelProfile>,
+) -> Result<()> {
+    if agent_bin.is_none() {
+        return Ok(());
+    }
+    let configured_runners: std::collections::BTreeSet<&str> = profiles
+        .values()
+        .map(|profile| profile.runner.as_str())
+        .collect();
+    if configured_runners.len() > 1 {
+        return Err(QuorumError::Usage(
+            "agent_bin cannot be used when model_profiles span multiple runners".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -576,10 +785,12 @@ pub fn validate_routed_cost_limits(
         return Ok(());
     };
     if (max_turn_cost_usd.is_some() || max_task_cost_usd.is_some())
-        && referenced_profile_ids(routing).any(|profile_id| profiles[profile_id].runner == "codex")
+        && referenced_profile_ids(routing)
+            .any(|profile_id| matches!(profiles[profile_id].runner.as_str(), "codex" | "grok"))
     {
         return Err(QuorumError::Usage(
-            "USD cost limits are unsupported when routing can select a Codex profile".into(),
+            "USD cost limits are unsupported when routing can select a Codex or Grok profile"
+                .into(),
         ));
     }
     Ok(())
@@ -590,6 +801,7 @@ fn referenced_profile_ids(routing: &RoutingPolicy) -> impl Iterator<Item = &Stri
         .classifier
         .keys()
         .chain(routing.planner.keys())
+        .chain(routing.arbiter_pool().keys())
         .chain(routing.collector.keys())
         .chain(routing.worker.values().flat_map(|pool| pool.keys()))
         .chain(routing.reviewer.values().flat_map(|pool| pool.keys()))
@@ -742,6 +954,107 @@ pub fn validate_r2_sampling(target_per_stratum: i64, steady_state_p: f64) -> Res
     Ok(())
 }
 
+/// Validate the configured rework ceiling. A cap of zero would fail every task
+/// on its first requested change, so it is rejected as a configuration error.
+pub fn validate_max_rework(max_rework: u32) -> Result<()> {
+    if max_rework == 0 {
+        return Err(QuorumError::Usage("max_rework must be >= 1 (got 0)".into()));
+    }
+    Ok(())
+}
+
+/// Resolve and validate the daemon's observational host-resource monitor.
+pub fn resolve_resource_monitor_config(
+    file: &ServeFileConfig,
+) -> Result<crate::resource_health::ResourceMonitorConfig> {
+    use crate::resource_health::{
+        ResourceMonitorConfig, DEFAULT_DISK_CRITICAL_FREE_GIB, DEFAULT_DISK_WARN_FREE_GIB,
+        DEFAULT_MEMORY_CRITICAL_AVAILABLE_PCT, DEFAULT_MEMORY_WARN_AVAILABLE_PCT,
+        DEFAULT_RESOURCE_POLL_SECS, MAX_RESOURCE_POLL_SECS, MIN_RESOURCE_POLL_SECS,
+    };
+
+    let resolved = ResourceMonitorConfig {
+        poll_secs: file
+            .resource_poll_secs
+            .unwrap_or(DEFAULT_RESOURCE_POLL_SECS),
+        disk_warn_free_gib: file
+            .disk_warn_free_gib
+            .unwrap_or(DEFAULT_DISK_WARN_FREE_GIB),
+        disk_critical_free_gib: file
+            .disk_critical_free_gib
+            .unwrap_or(DEFAULT_DISK_CRITICAL_FREE_GIB),
+        memory_warn_available_pct: file
+            .memory_warn_available_pct
+            .unwrap_or(DEFAULT_MEMORY_WARN_AVAILABLE_PCT),
+        memory_critical_available_pct: file
+            .memory_critical_available_pct
+            .unwrap_or(DEFAULT_MEMORY_CRITICAL_AVAILABLE_PCT),
+    };
+    if !(MIN_RESOURCE_POLL_SECS..=MAX_RESOURCE_POLL_SECS).contains(&resolved.poll_secs) {
+        return Err(QuorumError::Usage(format!(
+            "resource_poll_secs must be between {MIN_RESOURCE_POLL_SECS} and {MAX_RESOURCE_POLL_SECS}, got {}",
+            resolved.poll_secs
+        )));
+    }
+    if resolved.disk_critical_free_gib == 0
+        || resolved.disk_critical_free_gib >= resolved.disk_warn_free_gib
+    {
+        return Err(QuorumError::Usage(format!(
+            "disk_critical_free_gib must be greater than zero and less than disk_warn_free_gib (got critical={}, warn={})",
+            resolved.disk_critical_free_gib, resolved.disk_warn_free_gib
+        )));
+    }
+    if resolved.memory_critical_available_pct == 0
+        || resolved.memory_warn_available_pct > 100
+        || resolved.memory_critical_available_pct >= resolved.memory_warn_available_pct
+    {
+        return Err(QuorumError::Usage(format!(
+            "memory_critical_available_pct must be greater than zero and less than memory_warn_available_pct, and warning must be at most 100 (got critical={}, warn={})",
+            resolved.memory_critical_available_pct, resolved.memory_warn_available_pct
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Resource settings needed by a read-only status process. Unlike daemon
+/// startup, this does not require or validate model routing: status remains
+/// usable while the daemon is absent. Unknown/malformed TOML still fails loud
+/// to callers, which may choose the documented fail-open defaults.
+pub struct StatusResourceConfig {
+    pub monitor: crate::resource_health::ResourceMonitorConfig,
+    pub worktree_base: Option<std::path::PathBuf>,
+}
+
+pub fn status_resource_config(repo: &str) -> Result<StatusResourceConfig> {
+    status_resource_config_at(&default_config_path(repo)?)
+}
+
+fn status_resource_config_at(path: &Path) -> Result<StatusResourceConfig> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StatusResourceConfig {
+                monitor: crate::resource_health::ResourceMonitorConfig::default(),
+                worktree_base: None,
+            });
+        }
+        Err(error) => {
+            return Err(QuorumError::Io(format!(
+                "cannot read serve config {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let file: ServeFileConfig = toml::from_str(&contents).map_err(|error| {
+        QuorumError::Usage(format!("bad serve config {}: {error}", path.display()))
+    })?;
+    let monitor = resolve_resource_monitor_config(&file)?;
+    Ok(StatusResourceConfig {
+        monitor,
+        worktree_base: file.worktree_base.map(std::path::PathBuf::from),
+    })
+}
+
 /// Tracks where each resolved config value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -831,6 +1144,30 @@ pub fn resolve_opt<T: Copy>(flag: Option<T>, file: Option<T>) -> Sourced<Option<
     }
 }
 
+/// Resolve the modern idle ceiling and its legacy turn-wall alias without
+/// losing the normal CLI-over-file precedence between the two names.
+pub fn resolve_idle_limit<T: Copy>(
+    max_idle_flag: Option<T>,
+    max_turn_wall_flag: Option<T>,
+    max_idle_file: Option<T>,
+    max_turn_wall_file: Option<T>,
+) -> Sourced<Option<T>> {
+    for (value, source) in [
+        (max_idle_flag, Source::Flag),
+        (max_turn_wall_flag, Source::Flag),
+        (max_idle_file, Source::File),
+        (max_turn_wall_file, Source::File),
+    ] {
+        if value.is_some() {
+            return Sourced { value, source };
+        }
+    }
+    Sourced {
+        value: None,
+        source: Source::Default,
+    }
+}
+
 pub fn resolve_opt_str(flag: Option<&str>, file: Option<&str>) -> Sourced<Option<String>> {
     if let Some(v) = flag {
         return Sourced {
@@ -848,6 +1185,39 @@ pub fn resolve_opt_str(flag: Option<&str>, file: Option<&str>) -> Sourced<Option
         value: None,
         source: Source::Default,
     }
+}
+
+/// Resolve the file-only token watchdog accounting policy. Missing preserves
+/// the historical raw provider input + output behavior.
+pub fn resolve_token_limit_basis(file: Option<&str>) -> Result<Sourced<TokenLimitBasis>> {
+    match file {
+        Some(value) => Ok(Sourced {
+            value: TokenLimitBasis::parse(value)?,
+            source: Source::File,
+        }),
+        None => Ok(Sourced {
+            value: TokenLimitBasis::Raw,
+            source: Source::Default,
+        }),
+    }
+}
+
+/// Reject unusable ceilings before the daemon can claim work.
+pub fn validate_token_ceilings(
+    max_turn_tokens: Option<i64>,
+    max_task_tokens: Option<i64>,
+) -> Result<()> {
+    for (name, value) in [
+        ("max_turn_tokens", max_turn_tokens),
+        ("max_task_tokens", max_task_tokens),
+    ] {
+        if let Some(value) = value.filter(|value| *value <= 0) {
+            return Err(QuorumError::Usage(format!(
+                "{name} must be greater than zero, got {value}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn resolve_bool(flag: bool, file: Option<bool>, default: bool) -> Sourced<bool> {
@@ -877,6 +1247,7 @@ pub struct BannerData<'a> {
     pub repo_dir: &'a Sourced<String>,
     pub worktree_base: &'a Sourced<String>,
     pub base_branch: &'a Sourced<String>,
+    pub self_update_branch: &'a Sourced<String>,
     pub cap: &'a Sourced<usize>,
     pub model_profiles: &'a BTreeMap<String, ModelProfile>,
     pub routing: &'a RoutingPolicy,
@@ -884,11 +1255,12 @@ pub struct BannerData<'a> {
     pub no_bare_agent: &'a Sourced<bool>,
     pub self_update_drain: &'a Sourced<bool>,
     pub drain_timeout_secs: &'a Sourced<u64>,
-    pub max_turn_wall_secs: &'a Sourced<Option<u64>>,
+    pub max_idle_secs: &'a Sourced<Option<u64>>,
     pub max_task_wall_secs: &'a Sourced<Option<u64>>,
     pub idle_timeout_secs: &'a Sourced<Option<u64>>,
     pub max_turn_tokens: &'a Sourced<Option<i64>>,
     pub max_task_tokens: &'a Sourced<Option<i64>>,
+    pub token_limit_basis: &'a Sourced<TokenLimitBasis>,
     pub max_turn_cost_usd: &'a Sourced<Option<f64>>,
     pub max_task_cost_usd: &'a Sourced<Option<f64>>,
     pub merge_checks_timeout_secs: &'a Sourced<u64>,
@@ -896,6 +1268,11 @@ pub struct BannerData<'a> {
     pub master_ci_gate: &'a Sourced<bool>,
     pub master_ci_timeout_secs: &'a Sourced<u64>,
     pub doctor_enabled: &'a Sourced<bool>,
+    pub resource_poll_secs: &'a Sourced<u64>,
+    pub disk_warn_free_gib: &'a Sourced<u64>,
+    pub disk_critical_free_gib: &'a Sourced<u64>,
+    pub memory_warn_available_pct: &'a Sourced<u8>,
+    pub memory_critical_available_pct: &'a Sourced<u8>,
 }
 
 /// Format the startup banner showing resolved config + sources.
@@ -911,6 +1288,10 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!("  repo_dir:                  {}", d.repo_dir));
     lines.push(format!("  worktree_base:             {}", d.worktree_base));
     lines.push(format!("  base_branch:               {}", d.base_branch));
+    lines.push(format!(
+        "  self_update_branch:        {}",
+        d.self_update_branch
+    ));
     lines.push(format!("  cap:                       {}", d.cap));
     lines.push(format!(
         "  model_profiles:            {}",
@@ -960,8 +1341,11 @@ pub fn banner(d: &BannerData<'_>) -> String {
         }
     }
     lines.push(format!(
-        "  max_turn_wall_secs:        {}",
-        opt_u64(d.max_turn_wall_secs)
+        "  max_idle_secs:             {}",
+        match d.max_idle_secs.value {
+            Some(v) => format!("{v} ({src})", src = d.max_idle_secs.source),
+            None => format!("900 ({src})", src = d.max_idle_secs.source),
+        }
     ));
     lines.push(format!(
         "  max_task_wall_secs:        {}",
@@ -983,6 +1367,10 @@ pub fn banner(d: &BannerData<'_>) -> String {
         opt_i64(d.max_task_tokens)
     ));
     lines.push(format!(
+        "  token_limit_basis:         {}",
+        d.token_limit_basis
+    ));
+    lines.push(format!(
         "  max_turn_cost_usd:         {}",
         opt_f64(d.max_turn_cost_usd)
     ));
@@ -993,6 +1381,18 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!(
         "  merge_checks_timeout_secs: {}",
         d.merge_checks_timeout_secs
+    ));
+    lines.push(format!(
+        "  resource_poll_secs:        {}",
+        d.resource_poll_secs
+    ));
+    lines.push(format!(
+        "  disk free GiB warn/crit:   {}/{}",
+        d.disk_warn_free_gib, d.disk_critical_free_gib
+    ));
+    lines.push(format!(
+        "  memory avail % warn/crit:  {}/{}",
+        d.memory_warn_available_pct, d.memory_critical_available_pct
     ));
     if d.required_jobs.is_empty() {
         lines.push("  required_jobs:             (none)".to_string());
@@ -1071,6 +1471,64 @@ pub fn default_config_path(repo: &str) -> Result<std::path::PathBuf> {
         .join(format!("{slug}.toml")))
 }
 
+/// Resolve the base branch that a task created outside the daemon should store.
+///
+/// This does not require the daemon's routing configuration, but it deserializes
+/// the same config shape so unknown keys fail exactly as they do for `serve`.
+/// It uses the same per-repository config location and built-in `main` fallback.
+pub fn task_create_base_branch(repo: &str) -> Result<String> {
+    let path = default_config_path(repo)?;
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("main".into()),
+        Err(error) => {
+            return Err(QuorumError::Io(format!(
+                "cannot read serve config {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let config: ServeFileConfig = toml::from_str(&contents).map_err(|error| {
+        QuorumError::Usage(format!("bad serve config {}: {error}", path.display()))
+    })?;
+    Ok(config.base_branch.unwrap_or_else(|| "main".into()))
+}
+
+/// Resolve the rework ceiling that a supported non-daemon classification writer
+/// (currently `quorum classify --backfill`) must stamp when it makes a task
+/// newly dispatchable.
+///
+/// Uses the same per-repository config location and validation as `serve`.
+/// When the config file is absent or does not set `max_rework`, this falls back
+/// to the compiled [`quorum_core::lifecycle::REWORK_CAP`], matching serve.
+pub fn resolve_max_rework(repo: &str) -> Result<u32> {
+    resolve_max_rework_at(&default_config_path(repo)?)
+}
+
+/// Path-parameterised variant of [`resolve_max_rework`]. Directly testable.
+pub fn resolve_max_rework_at(path: &Path) -> Result<u32> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(quorum_core::lifecycle::REWORK_CAP);
+        }
+        Err(error) => {
+            return Err(QuorumError::Io(format!(
+                "cannot read serve config {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let config: ServeFileConfig = toml::from_str(&contents).map_err(|error| {
+        QuorumError::Usage(format!("bad serve config {}: {error}", path.display()))
+    })?;
+    let cap = config
+        .max_rework
+        .unwrap_or(quorum_core::lifecycle::REWORK_CAP);
+    validate_max_rework(cap)?;
+    Ok(cap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1113,6 +1571,66 @@ primary = 100
 "#;
 
     #[test]
+    fn resource_monitor_defaults_and_custom_values_validate() {
+        let defaults = resolve_resource_monitor_config(&ServeFileConfig::default()).unwrap();
+        assert_eq!(
+            defaults,
+            crate::resource_health::ResourceMonitorConfig::default()
+        );
+
+        let custom: ServeFileConfig = toml::from_str(
+            "resource_poll_secs = 45\ndisk_warn_free_gib = 120\ndisk_critical_free_gib = 60\nmemory_warn_available_pct = 20\nmemory_critical_available_pct = 10\n",
+        )
+        .unwrap();
+        let custom = resolve_resource_monitor_config(&custom).unwrap();
+        assert_eq!(custom.poll_secs, 45);
+        assert_eq!(custom.disk_warn_free_gib, 120);
+        assert_eq!(custom.memory_critical_available_pct, 10);
+    }
+
+    #[test]
+    fn resource_monitor_rejects_bad_interval_and_threshold_ordering() {
+        for (source, expected) in [
+            ("resource_poll_secs = 4\n", "resource_poll_secs"),
+            (
+                "disk_warn_free_gib = 40\ndisk_critical_free_gib = 40\n",
+                "disk_critical_free_gib",
+            ),
+            (
+                "memory_warn_available_pct = 8\nmemory_critical_available_pct = 15\n",
+                "memory_critical_available_pct",
+            ),
+            (
+                "memory_warn_available_pct = 101\nmemory_critical_available_pct = 8\n",
+                "warning must be at most 100",
+            ),
+        ] {
+            let file: ServeFileConfig = toml::from_str(source).unwrap();
+            let error = resolve_resource_monitor_config(&file).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn status_resource_config_reads_worktree_path_without_routing_requirement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(
+            &path,
+            "worktree_base = \"/tmp/quorum-worktrees\"\nresource_poll_secs = 60\n",
+        )
+        .unwrap();
+
+        let status = status_resource_config_at(&path).unwrap();
+        assert_eq!(status.monitor.poll_secs, 60);
+        assert_eq!(
+            status.worktree_base,
+            Some(std::path::PathBuf::from("/tmp/quorum-worktrees"))
+        );
+    }
+
+    #[test]
     fn load_missing_implicit_returns_defaults() {
         let cfg = load(Path::new("/nonexistent/path/serve.toml"), false).unwrap();
         assert!(cfg.cap.is_none());
@@ -1128,6 +1646,51 @@ primary = 100
             msg.contains("not found"),
             "error should say not found: {msg}"
         );
+    }
+
+    #[test]
+    fn resolve_idle_limit_preserves_source_precedence_across_aliases() {
+        let modern_flag = resolve_idle_limit(Some(900), Some(60), Some(300), Some(120));
+        assert_eq!(modern_flag.value, Some(900));
+        assert_eq!(modern_flag.source, Source::Flag);
+
+        let legacy_flag_over_file = resolve_idle_limit(None, Some(60), Some(900), Some(120));
+        assert_eq!(legacy_flag_over_file.value, Some(60));
+        assert_eq!(legacy_flag_over_file.source, Source::Flag);
+
+        let modern_file = resolve_idle_limit(None, None, Some(900), Some(120));
+        assert_eq!(modern_file.value, Some(900));
+        assert_eq!(modern_file.source, Source::File);
+
+        let default = resolve_idle_limit::<u64>(None, None, None, None);
+        assert_eq!(default.value, None);
+        assert_eq!(default.source, Source::Default);
+    }
+
+    #[test]
+    fn token_limit_basis_defaults_to_raw_and_parses_uncached() {
+        let default = resolve_token_limit_basis(None).unwrap();
+        assert_eq!(default.value, TokenLimitBasis::Raw);
+        assert_eq!(default.source, Source::Default);
+
+        let uncached = resolve_token_limit_basis(Some("uncached")).unwrap();
+        assert_eq!(uncached.value, TokenLimitBasis::Uncached);
+        assert_eq!(uncached.source, Source::File);
+    }
+
+    #[test]
+    fn token_limit_policy_rejects_invalid_basis_and_nonpositive_ceilings() {
+        let invalid_basis: ServeFileConfig =
+            toml::from_str(&format!("token_limit_basis = \"cached\"\n{VALID_ROUTING}")).unwrap();
+        let basis_err = validate_model_routing(&invalid_basis).unwrap_err();
+        assert_eq!(basis_err.exit_code(), 2);
+        assert!(basis_err.to_string().contains("token_limit_basis"));
+
+        for (turn, task) in [(Some(0), None), (None, Some(-1))] {
+            let err = validate_token_ceilings(turn, task).unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert!(err.to_string().contains("greater than zero"));
+        }
     }
 
     #[test]
@@ -1189,6 +1752,7 @@ primary = 100
                 r#"
 cap = 8
 max_turn_wall_secs = 2700
+max_idle_secs = 900
 max_task_wall_secs = 14400
 repo = "ag2trust/quorum"
 repo_dir = "/home/user/dev/quorum"
@@ -1205,6 +1769,7 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
             "high"
         );
         assert_eq!(cfg.max_turn_wall_secs, Some(2700));
+        assert_eq!(cfg.max_idle_secs, Some(900));
         assert!(cfg.doctor_enabled.is_none());
     }
 
@@ -1219,6 +1784,83 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
         .unwrap();
         let cfg = load(&path, true).unwrap();
         assert_eq!(cfg.doctor_enabled, Some(true));
+    }
+
+    #[test]
+    fn grok_transport_configuration_is_closed_and_validated() {
+        let cfg: ServeFileConfig = toml::from_str(
+            "[grok]\nsandbox = \"off\"\npermission_mode = \"bypassPermissions\"\nmax_turns = 12\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_grok_adapter(cfg.grok.as_ref()).unwrap(),
+            GrokResolvedConfig {
+                sandbox: "off".into(),
+                permission_mode: "bypassPermissions".into(),
+                max_turns: 12,
+            }
+        );
+        for source in [
+            "[grok]\nsandbox = \"custom\"\n",
+            "[grok]\npermission_mode = \"auto\"\n",
+            "[grok]\nmax_turns = 0\n",
+            "[grok]\nmax_turns = 257\n",
+        ] {
+            let cfg: ServeFileConfig = toml::from_str(source).unwrap();
+            let error = resolve_grok_adapter(cfg.grok.as_ref()).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn load_rejects_invalid_grok_transport_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "[grok]\npermission_mode = \"default\"\n").unwrap();
+        let error = load(&path, true).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("permission_mode"), "{error}");
+    }
+
+    #[test]
+    fn grok_is_available_only_for_legacy_worker_selection() {
+        assert_eq!(
+            RunnerKind::from_str_opt(Some("grok")).unwrap(),
+            RunnerKind::Grok
+        );
+        assert_eq!(RunnerKind::Grok.to_string(), "grok");
+
+        for (source, cli_agent) in [
+            ("provider = \"grok\"\n", None),
+            ("agent = \"grok\"\n", None),
+            ("", Some("grok")),
+        ] {
+            let config: ServeFileConfig = toml::from_str(source).unwrap();
+            let roles = resolve_roles(&config, cli_agent, "sonnet", "high").unwrap();
+            assert_eq!(roles.worker_model, "grok-4.5");
+        }
+
+        for model in ["grok-4.5", "grok-4.6"] {
+            let worker: ServeFileConfig =
+                toml::from_str(&format!("worker_model = \"{model}\"\n")).unwrap();
+            assert_eq!(
+                resolve_roles(&worker, None, "sonnet", "high")
+                    .unwrap()
+                    .worker_model,
+                model
+            );
+            for key in ["review_model", "classifier_model", "collector_model"] {
+                let cfg: ServeFileConfig =
+                    toml::from_str(&format!("{key} = \"{model}\"\n")).unwrap();
+                let error = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("enabled only for managed workers"),
+                    "{key}/{model}: {error}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1473,6 +2115,37 @@ worktree_base = "/tmp/wt"
     }
 
     #[test]
+    fn routing_rejects_usd_limits_when_worker_can_select_grok() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let profiles = cfg.model_profiles.as_mut().unwrap();
+        profiles.get_mut("primary").unwrap().runner = "claude".into();
+        profiles.get_mut("primary").unwrap().model = "claude-sonnet-4-6".into();
+        profiles.insert(
+            "grok-worker".into(),
+            ModelProfile {
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+            },
+        );
+        for pool in cfg.routing.as_mut().unwrap().worker.values_mut() {
+            pool.clear();
+            pool.insert("grok-worker".into(), 100);
+        }
+
+        cfg.max_turn_cost_usd = Some(1.0);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("Grok"), "{err}");
+
+        cfg.max_turn_cost_usd = None;
+        cfg.max_task_cost_usd = Some(10.0);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("Grok"), "{err}");
+    }
+
+    #[test]
     fn routing_rejects_missing_role_and_complexity_pools() {
         let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
         cfg.routing.as_mut().unwrap().collector.clear();
@@ -1570,18 +2243,160 @@ worktree_base = "/tmp/wt"
 
         cfg.agent_bin = None;
         validate_model_routing(&cfg).unwrap();
+
+        let err = validate_agent_bin_for_profiles(
+            Some("/custom/provider-cli"),
+            cfg.model_profiles.as_ref().unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("span multiple runners"), "{err}");
     }
 
     #[test]
-    fn planner_rejects_codex_profile_until_launch_boundary_supports_it() {
+    fn worker_allows_grok_but_other_managed_roles_reject_it() {
+        fn config_with_grok_worker(model: &str) -> ServeFileConfig {
+            let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+            cfg.model_profiles.as_mut().unwrap().insert(
+                "grok-worker".into(),
+                ModelProfile {
+                    runner: "grok".into(),
+                    model: model.into(),
+                    effort: "high".into(),
+                },
+            );
+            for pool in cfg.routing.as_mut().unwrap().worker.values_mut() {
+                pool.clear();
+                pool.insert("grok-worker".into(), 100);
+            }
+            cfg
+        }
+
+        for model in ["grok-4.5", "grok-4.6"] {
+            validate_model_routing(&config_with_grok_worker(model)).unwrap();
+
+            for role in [
+                "classifier",
+                "planner",
+                "arbiter",
+                "collector",
+                "reviewer.1",
+            ] {
+                let mut cfg = config_with_grok_worker(model);
+                let routing = cfg.routing.as_mut().unwrap();
+                let pool = match role {
+                    "classifier" => &mut routing.classifier,
+                    "planner" => &mut routing.planner,
+                    "arbiter" => &mut routing.arbiter,
+                    "collector" => &mut routing.collector,
+                    "reviewer.1" => routing.reviewer.get_mut("1").unwrap(),
+                    _ => unreachable!(),
+                };
+                pool.clear();
+                pool.insert("grok-worker".into(), 100);
+                let err = validate_model_routing(&cfg).unwrap_err();
+                assert!(err.to_string().contains(role), "{role}/{model}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn routing_rejects_unknown_grok_model() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        cfg.model_profiles.as_mut().unwrap().insert(
+            "grok-unknown".into(),
+            ModelProfile {
+                runner: "grok".into(),
+                model: "grok-4.7".into(),
+                effort: "high".into(),
+            },
+        );
+        let error = validate_model_routing(&cfg).unwrap_err();
+        assert!(error.to_string().contains("unknown model"), "{error}");
+    }
+
+    #[test]
+    fn planner_accepts_matching_codex_profile_and_rejects_mismatch() {
         let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
         let planner = &mut cfg.routing.as_mut().unwrap().planner;
         planner.clear();
         planner.insert("primary".into(), 100);
+        validate_model_routing(&cfg).unwrap();
+
+        cfg.model_profiles
+            .as_mut()
+            .unwrap()
+            .get_mut("primary")
+            .unwrap()
+            .runner = "claude".into();
         let err = validate_model_routing(&cfg).unwrap_err();
         assert!(
-            err.to_string().contains("routing.planner")
-                && err.to_string().contains("unsupported runner \"codex\""),
+            err.to_string().contains("does not match runner \"claude\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn arbiter_defaults_to_planner_pool_when_absent_and_validates() {
+        // VALID_ROUTING carries no [routing.arbiter] block, so the field
+        // deserializes to the empty sentinel and the effective pool mirrors
+        // the planner pool — existing configs keep validating unchanged.
+        let cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        validate_model_routing(&cfg).unwrap();
+        let routing = cfg.routing.as_ref().unwrap();
+        assert!(
+            routing.arbiter.is_empty(),
+            "no explicit [routing.arbiter] block was configured"
+        );
+        assert_eq!(
+            routing.arbiter_pool(),
+            &routing.planner,
+            "absent arbiter pool mirrors the planner pool"
+        );
+        let total: u16 = routing
+            .arbiter_pool()
+            .values()
+            .map(|percentage| u16::from(*percentage))
+            .sum();
+        assert_eq!(total, 100, "effective arbiter pool totals 100");
+    }
+
+    #[test]
+    fn arbiter_pool_must_total_100() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        {
+            let routing = cfg.routing.as_mut().unwrap();
+            routing.arbiter.clear();
+            // `planner` is a valid Claude profile; only the total is wrong.
+            routing.arbiter.insert("planner".into(), 90);
+        }
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains("routing.arbiter") && err.to_string().contains("total"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn grok_rejected_in_arbiter_role() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        cfg.model_profiles.as_mut().unwrap().insert(
+            "grok-worker".into(),
+            ModelProfile {
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+            },
+        );
+        {
+            let routing = cfg.routing.as_mut().unwrap();
+            routing.arbiter.clear();
+            routing.arbiter.insert("grok-worker".into(), 100);
+        }
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains("routing.arbiter") && err.to_string().contains("Grok"),
             "{err}"
         );
     }
@@ -1704,8 +2519,67 @@ worktree_base = "/tmp/wt"
     }
 
     #[test]
+    fn max_rework_validation_rejects_zero_with_usage_exit() {
+        let err = validate_max_rework(0).unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+        validate_max_rework(1).unwrap();
+        validate_max_rework(10).unwrap();
+    }
+
+    #[test]
+    fn resolve_max_rework_at_missing_file_returns_compiled_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.toml");
+        assert_eq!(
+            resolve_max_rework_at(&missing).unwrap(),
+            quorum_core::lifecycle::REWORK_CAP
+        );
+    }
+
+    #[test]
+    fn resolve_max_rework_at_unset_key_returns_compiled_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "repo = \"owner/repo\"\n").unwrap();
+        assert_eq!(
+            resolve_max_rework_at(&path).unwrap(),
+            quorum_core::lifecycle::REWORK_CAP
+        );
+    }
+
+    #[test]
+    fn resolve_max_rework_at_set_value_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "max_rework = 10\n").unwrap();
+        assert_eq!(resolve_max_rework_at(&path).unwrap(), 10);
+    }
+
+    #[test]
+    fn resolve_max_rework_at_zero_is_a_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "max_rework = 0\n").unwrap();
+        let err = resolve_max_rework_at(&path).unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+    }
+
+    #[test]
+    fn resolve_max_rework_at_bad_toml_is_a_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "not = valid = toml\n").unwrap();
+        let err = resolve_max_rework_at(&path).unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+    }
+
+    #[test]
     fn banner_shows_config_path() {
         let routing_cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let token_limit_basis = Sourced {
+            value: TokenLimitBasis::Raw,
+            source: Source::Default,
+        };
         let b = banner(&BannerData {
             config_path: Some("/path/to/config.toml"),
             repo: &Sourced {
@@ -1721,6 +2595,10 @@ worktree_base = "/tmp/wt"
                 source: Source::File,
             },
             base_branch: &Sourced {
+                value: "main".into(),
+                source: Source::Default,
+            },
+            self_update_branch: &Sourced {
                 value: "main".into(),
                 source: Source::Default,
             },
@@ -1746,9 +2624,9 @@ worktree_base = "/tmp/wt"
                 value: 900,
                 source: Source::Default,
             },
-            max_turn_wall_secs: &Sourced {
-                value: Some(2700),
-                source: Source::File,
+            max_idle_secs: &Sourced {
+                value: None,
+                source: Source::Default,
             },
             max_task_wall_secs: &Sourced {
                 value: None,
@@ -1766,6 +2644,7 @@ worktree_base = "/tmp/wt"
                 value: None,
                 source: Source::Default,
             },
+            token_limit_basis: &token_limit_basis,
             max_turn_cost_usd: &Sourced {
                 value: None,
                 source: Source::Default,
@@ -1791,6 +2670,26 @@ worktree_base = "/tmp/wt"
                 value: false,
                 source: Source::Default,
             },
+            resource_poll_secs: &Sourced {
+                value: crate::resource_health::DEFAULT_RESOURCE_POLL_SECS,
+                source: Source::Default,
+            },
+            disk_warn_free_gib: &Sourced {
+                value: crate::resource_health::DEFAULT_DISK_WARN_FREE_GIB,
+                source: Source::Default,
+            },
+            disk_critical_free_gib: &Sourced {
+                value: crate::resource_health::DEFAULT_DISK_CRITICAL_FREE_GIB,
+                source: Source::Default,
+            },
+            memory_warn_available_pct: &Sourced {
+                value: crate::resource_health::DEFAULT_MEMORY_WARN_AVAILABLE_PCT,
+                source: Source::Default,
+            },
+            memory_critical_available_pct: &Sourced {
+                value: crate::resource_health::DEFAULT_MEMORY_CRITICAL_AVAILABLE_PCT,
+                source: Source::Default,
+            },
         });
         assert!(
             b.contains("config file:               /path/to/config.toml"),
@@ -1798,8 +2697,20 @@ worktree_base = "/tmp/wt"
         );
         assert!(b.contains("8 (file)"), "cap should show file source: {b}");
         assert!(
-            b.contains("2700 (file)"),
-            "wall secs should show file source: {b}"
+            b.contains("self_update_branch:        main (default)"),
+            "self-update branch should be shown with its source: {b}"
+        );
+        assert!(
+            b.contains("token_limit_basis:         raw (default)"),
+            "raw token basis should be shown: {b}"
+        );
+        assert!(
+            !b.contains("max_turn_wall_secs"),
+            "deprecated turn-wall ceiling must not appear in the resolved banner: {b}"
+        );
+        assert!(
+            b.contains("max_idle_secs:             900 (default)"),
+            "max_idle_secs should default to 900: {b}"
         );
         assert!(b.contains("(default)"), "defaults should be labeled: {b}");
     }
