@@ -10,7 +10,7 @@ use quorum_core::role_assignments::{
     AssignmentIdentity, ModelProfile, RoleAssignment, ValidatedPool,
 };
 use quorum_core::routing_attempts::{self, RecordRoutingAttempt, RouteExclusions};
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 
 /// Exact managed-run evidence that must be retired with the failed route.
 #[derive(Debug, Clone, Copy)]
@@ -41,14 +41,25 @@ pub struct FallbackRetireInput<'a> {
 /// accounting untouched. This function performs no provider, process, or
 /// network operation.
 pub fn retire(conn: &mut Connection, input: &FallbackRetireInput<'_>) -> Result<RouteExclusions> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let exclusions = retire_tx(&tx, input)?;
+    tx.commit()?;
+    Ok(exclusions)
+}
+
+/// Transactional form of [`retire`].
+///
+/// The fallback installer owns the one write transaction that records failed
+/// route evidence, retires its authority, establishes an alternate route, and
+/// persists its restart-safe launch intent before any provider operation.
+pub fn retire_tx(tx: &Transaction<'_>, input: &FallbackRetireInput<'_>) -> Result<RouteExclusions> {
     validate_input(input)?;
     let task_id = input
         .assignment
         .task_id
         .expect("validated task-scoped assignment");
-    let tx = quorum_core::db::begin_immediate(conn)?;
     if !quorum_core::capabilities::attributed_retirement_target_tx(
-        &tx,
+        tx,
         &quorum_core::capabilities::AttributedRetirementTarget {
             capability_run_id: input.failed_run.capability_run_id,
             agent_run_id: input.failed_run.agent_run_id,
@@ -64,7 +75,7 @@ pub fn retire(conn: &mut Connection, input: &FallbackRetireInput<'_>) -> Result<
         ));
     }
     routing_attempts::record_tx(
-        &tx,
+        tx,
         &RecordRoutingAttempt {
             role_assignment_id: input.assignment.id,
             responsibility_key: input.responsibility.responsibility_key,
@@ -74,22 +85,21 @@ pub fn retire(conn: &mut Connection, input: &FallbackRetireInput<'_>) -> Result<
         },
         input.eligible_pool,
     )?;
-    let exclusions = routing_attempts::exclusions(&tx, input.responsibility.responsibility_key)?;
+    let exclusions = routing_attempts::exclusions(tx, input.responsibility.responsibility_key)?;
     quorum_core::agent_runs::close_tx(
-        &tx,
+        tx,
         input.failed_run.agent_run_id,
         input.failed_run.ended_at,
         input.failed_run.end_reason,
     )?;
     quorum_core::capabilities::revoke_managed_run_tx(
-        &tx,
+        tx,
         input.failed_run.capability_run_id,
         input.failed_run.agent,
         task_id,
         &input.assignment.role,
         input.failed_run.ended_at,
     )?;
-    tx.commit()?;
     Ok(exclusions)
 }
 
