@@ -37738,9 +37738,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     /// Live-process harness for the planning lifecycle order. One fake Codex
-    /// binary dispatches on how the daemon spawns it: a planner carries its run
-    /// envelope (`QUORUM_RUN_ID`) and stays live; the Arbiter runs inside the
-    /// frozen repository view (where `src/core.rs` exists); the classifier
+    /// binary dispatches on how the daemon spawns it: a planner carries its
+    /// `submit_plan` MCP configuration and stays live; the Arbiter runs inside
+    /// the frozen repository view (where `src/core.rs` exists); the classifier
     /// runs in an empty isolation directory. The graph starts in `planning`
     /// bound to the repository's real HEAD so frozen views can be built.
     #[cfg(unix)]
@@ -37797,7 +37797,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &runner,
             format!(
                 "#!/bin/sh\n\
-                 if [ -n \"$QUORUM_RUN_ID\" ]; then exec /bin/sleep 30; fi\n\
+                 case \"$*\" in *mcp_servers.quorum*) exec /bin/sleep 30 ;; esac\n\
                  if [ -f src/core.rs ]; then exec /bin/cat '{}'; fi\n\
                  exec /bin/cat '{}'\n",
                 arbiter_output.display(),
