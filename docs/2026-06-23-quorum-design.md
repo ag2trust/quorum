@@ -386,7 +386,13 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   normal worker/review/rework/merge lifecycle, dispatches directly regardless of classified
   size, and publishes back to that PR under lease. It is never a decomposition source because
   generated children cannot inherit the continuation publication authority. `--continue-pr`
-  and `--review-pr` are mutually exclusive.
+  and `--review-pr` are mutually exclusive. Continuation authority is retained on retry except
+  in one narrow case: a publication or provisioning failure classified as `pr-closed` (the
+  pinned PR is closed unmerged) — `retry_parked` retires the matching `continue_pr` in the
+  same atomic UPDATE, records `refs.abandoned_publication={pr,branch,local_sha,continue_pr}`
+  as a bounded audit trail so the orphaned PR stays traceable, and the next dispatch mints a
+  fresh branch/PR. A `pr-merged` classification is delivery evidence: the park is terminal
+  and retry refuses to restore it (§ Explicit cancellation and durable parking).
 - ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
   `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
   dependency gating, and reviewer attachment are all preserved as internal functions.
@@ -890,8 +896,17 @@ recovery, while a worker-fixable result invalidates those approvals, records
 following generic recovery even when no worker journal or continuation exists, so the daemon
 provisions the actionable remediation turn rather than resetting the task to `open`.
 Retry does not change PR identity, approvals, dependencies, author/reviewer provenance, or
-rework count. An
-unparked or terminal task is a clean negative (exit 1). One additional clean negative
+rework count, with one narrow exception recorded at park time as a structured
+`daemon_publication_failure_kind` (pure DB decision — no reason-string parse, no network):
+a `pr-closed` park (the pinned publication PR is closed unmerged, observed either at the
+publication call or when the daemon re-provisions a retained rework intent whose live PR
+has since closed) causes `retry_parked` to abandon the pinned `daemon_publication` intent in
+the same UPDATE, retire a matching `continue_pr`, deallocate the branch, and write
+`refs.abandoned_publication={pr,branch,local_sha,continue_pr}` so the orphaned PR remains
+traceable; the next publication attempt mints a fresh branch/PR. A `pr-merged` park is
+delivery evidence: `retry_parked` returns the clean-negative (`Ok(None)`, status stays
+`failed`, no branch deallocation, no retry event) — the operator must investigate manually.
+An unparked or terminal task is a clean negative (exit 1). One additional clean negative
 (exit 1) fires when the parked task's `depends_on` still contains any `cancelled`
 task id: silently restoring the dependent would just have the sweep re-park it on
 the next tick while leaving the operator with no disposition signal. The CLI names

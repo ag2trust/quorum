@@ -2354,8 +2354,15 @@ async fn resolve_and_persist_parked_rework_target(
             .unwrap_or(Path::new("gh")),
     )
     .await?;
-    validate_continue_pr_target(&target, pr, base_branch)?;
+    // State classification runs first so a CLOSED/MERGED live PR surfaces the
+    // `existing_pr_lease_baseline` markers (`is closed (unmerged)` /
+    // `is already merged`) to the spawn_worker park site. The generic
+    // `validate_continue_pr_target` would otherwise reject with a plain
+    // `not open` string that `publication_failure_kind_from_error` collapses
+    // into `Other`, hiding the pr-closed/pr-merged disposition from
+    // `retry_parked` and re-parking the task forever (#186).
     existing_pr_lease_baseline(intent, &target, base_branch)?;
+    validate_continue_pr_target(&target, pr, base_branch)?;
 
     let db_path = config.db_path.clone();
     let persisted = target.clone();
@@ -19377,11 +19384,20 @@ async fn spawn_worker(
                 {
                     Ok(target) => (Some(target), true),
                     Err(error) => {
+                        // Classify the daemon-side state observation so a
+                        // PR that closed or merged between operator retry
+                        // and re-provisioning parks with the structured
+                        // `daemon_publication_failure_kind`. Without this
+                        // routing the next `task-retry` cannot see the
+                        // dead intent (`Other` retains it) and a merged PR
+                        // is not terminal (#186).
                         let reason = format!(
                             "parked rework publication for PR #{pr} provisioning rejected: {error}"
                         );
+                        let kind = publication_failure_kind_from_error(&error);
                         persist_provisioning_failure(&db_path, task.id, &reason).await;
-                        park_task(&db_path, task.id, &reason, "rework").await;
+                        park_task_publication_failure(&db_path, task.id, &reason, "rework", kind)
+                            .await;
                         guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id)
                             .await;
                         return Ok(false);
@@ -32413,6 +32429,94 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .head_sha,
             head_sha,
             "legacy validation must durably retain the exact rework lease"
+        );
+    }
+
+    #[cfg(unix)]
+    fn closed_pr_target_json(head_ref: &str, head_sha: &str, base: &str) -> String {
+        format!(
+            "{{\"headRefName\":\"{head_ref}\",\"headRefOid\":\"{head_sha}\",\
+             \"isCrossRepository\":false,\"baseRefName\":\"{base}\",\"state\":\"CLOSED\"}}"
+        )
+    }
+
+    #[cfg(unix)]
+    fn merged_pr_target_json(head_ref: &str, head_sha: &str, base: &str) -> String {
+        format!(
+            "{{\"headRefName\":\"{head_ref}\",\"headRefOid\":\"{head_sha}\",\
+             \"isCrossRepository\":false,\"baseRefName\":\"{base}\",\"state\":\"MERGED\"}}"
+        )
+    }
+
+    /// Task #186 blocker 2: a parked-rework whose pinned PR closed between the
+    /// operator retry and re-provisioning must surface the `pr-closed` marker
+    /// so the spawn_worker park classifies it as
+    /// `PublicationFailureKind::PrClosed`. Without the marker the classifier
+    /// collapses to `Other`, the next `task-retry` retains the dead intent,
+    /// and the task re-parks forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parked_rework_resolver_emits_pr_closed_marker_when_live_pr_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("parked-rework-closed.db");
+        let pr = 811;
+        let head_sha = "8118118118118118118118118118118118118118";
+        let (task_id, intent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_parked_rework_publication(&mut conn, pr, Some("develop"), head_sha)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-parked-closed",
+            &closed_pr_target_json(&intent.branch, head_sha, "develop"),
+        ));
+
+        let error = resolve_and_persist_parked_rework_target(&config, task_id, &intent, "develop")
+            .await
+            .expect_err("closed live PR must reject the parked-rework resolver");
+        assert!(
+            error.contains(PUBLICATION_PR_CLOSED_MARKER),
+            "resolver error must carry the closed marker so the park classifies as pr-closed; got: {error}"
+        );
+        assert_eq!(
+            publication_failure_kind_from_error(&error),
+            tasks::PublicationFailureKind::PrClosed
+        );
+    }
+
+    /// Task #186 blocker 2: same window but the live PR merged. Delivery
+    /// evidence — the resolver must surface the `pr-merged` marker so the park
+    /// records `PublicationFailureKind::PrMerged` and `retry_parked` refuses to
+    /// restore. Preserves the "merged is terminal, not retryable" contract.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parked_rework_resolver_emits_pr_merged_marker_when_live_pr_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("parked-rework-merged.db");
+        let pr = 812;
+        let head_sha = "8128128128128128128128128128128128128128";
+        let (task_id, intent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            seed_parked_rework_publication(&mut conn, pr, Some("develop"), head_sha)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-parked-merged",
+            &merged_pr_target_json(&intent.branch, head_sha, "develop"),
+        ));
+
+        let error = resolve_and_persist_parked_rework_target(&config, task_id, &intent, "develop")
+            .await
+            .expect_err("merged live PR must reject the parked-rework resolver");
+        assert!(
+            error.contains(PUBLICATION_PR_MERGED_MARKER),
+            "resolver error must carry the merged marker so the park classifies as pr-merged; got: {error}"
+        );
+        assert_eq!(
+            publication_failure_kind_from_error(&error),
+            tasks::PublicationFailureKind::PrMerged
         );
     }
 
