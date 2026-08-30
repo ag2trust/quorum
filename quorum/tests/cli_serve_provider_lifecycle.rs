@@ -1030,6 +1030,11 @@ fi
         model: &str,
         role_config: Option<&str>,
     ) {
+        // Instance-identity authority (task #179) blocks a restart against a
+        // fresh `daemon_lock` row from a different instance, so a SIGKILL-based
+        // `crash_mut` must clear the leftover row before the next process
+        // starts (matches supervisor behavior in production).
+        common::clear_daemon_lock(&self.home.path().join("repos/test__repo/quorum.db"));
         let names = self.home.path().join("names.txt");
         let runner = self.home.path().join("dual-runner.sh");
         let config_path = self.home.path().join("restart-serve.toml");

@@ -2145,14 +2145,15 @@ mod tests {
                 Some(fixture._dir.path().join("absent-daemon-sentinel"));
 
             let daemon_pid = std::process::id() as i64;
+            let daemon_instance = quorum_core::daemon_lock::new_instance_id();
             let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
             assert_eq!(
                 quorum_core::daemon_lock::try_acquire(
                     &mut conn,
                     daemon_pid,
+                    &daemon_instance,
                     super::super::now_unix(),
                     30,
-                    |_| false,
                 )
                 .unwrap(),
                 quorum_core::daemon_lock::AcquireResult::Acquired,
@@ -2162,6 +2163,7 @@ mod tests {
             let exit = super::super::tick_loop(
                 &fixture.config,
                 daemon_pid,
+                daemon_instance.clone(),
                 crate::serve::planner::WritablePathResolver::default(),
             )
             .await
@@ -2229,13 +2231,14 @@ mod tests {
         fixture.config.pr_target_program = Some(gh);
 
         let daemon_pid = std::process::id() as i64;
+        let daemon_instance = quorum_core::daemon_lock::new_instance_id();
         let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
         quorum_core::daemon_lock::try_acquire(
             &mut conn,
             daemon_pid,
+            &daemon_instance,
             super::super::now_unix(),
             30,
-            |_| false,
         )
         .unwrap();
         drop(conn);
@@ -2245,6 +2248,7 @@ mod tests {
             super::super::tick_loop(
                 &fixture.config,
                 daemon_pid,
+                daemon_instance.clone(),
                 crate::serve::planner::WritablePathResolver::default(),
             ),
         )
@@ -2324,13 +2328,14 @@ mod tests {
         fixture.config.pr_target_program = Some(gh);
 
         let daemon_pid = std::process::id() as i64;
+        let daemon_instance = quorum_core::daemon_lock::new_instance_id();
         let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
         quorum_core::daemon_lock::try_acquire(
             &mut conn,
             daemon_pid,
+            &daemon_instance,
             super::super::now_unix(),
             30,
-            |_| false,
         )
         .unwrap();
         drop(conn);
@@ -2338,6 +2343,7 @@ mod tests {
         let error = super::super::tick_loop(
             &fixture.config,
             daemon_pid,
+            daemon_instance.clone(),
             crate::serve::planner::WritablePathResolver::default(),
         )
         .await
@@ -2404,19 +2410,21 @@ exec sleep 30
         );
 
         let daemon_pid = std::process::id() as i64;
+        let daemon_instance = quorum_core::daemon_lock::new_instance_id();
         let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
         quorum_core::daemon_lock::try_acquire(
             &mut conn,
             daemon_pid,
+            &daemon_instance,
             super::super::now_unix(),
             30,
-            |_| false,
         )
         .unwrap();
         drop(conn);
         let error = super::super::tick_loop(
             &fixture.config,
             daemon_pid,
+            daemon_instance.clone(),
             crate::serve::planner::WritablePathResolver::default(),
         )
         .await
@@ -2520,13 +2528,14 @@ exec sleep 30
         );
 
         let daemon_pid = std::process::id() as i64;
+        let daemon_instance = quorum_core::daemon_lock::new_instance_id();
         let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
         quorum_core::daemon_lock::try_acquire(
             &mut conn,
             daemon_pid,
+            &daemon_instance,
             super::super::now_unix(),
             30,
-            |_| false,
         )
         .unwrap();
         drop(conn);
@@ -2536,6 +2545,7 @@ exec sleep 30
             super::super::tick_loop(
                 &fixture.config,
                 daemon_pid,
+                daemon_instance.clone(),
                 crate::serve::planner::WritablePathResolver::default(),
             ),
         )
