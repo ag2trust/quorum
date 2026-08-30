@@ -883,6 +883,15 @@ impl LifetimeRoster {
     }
 }
 
+/// Live GitHub PR states surfaced through `gh pr view --json state`.
+const PR_STATE_CLOSED: &str = "CLOSED";
+const PR_STATE_MERGED: &str = "MERGED";
+
+/// Substring emitted by `existing_pr_lease_baseline` for the closed-unmerged
+/// case. Used at the daemon publication-park site to classify the failure as
+/// `PublicationFailureKind::PrClosed` (#186).
+const PUBLICATION_PR_CLOSED_MARKER: &str = "is closed (unmerged)";
+
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 struct PrTarget {
@@ -892,6 +901,18 @@ struct PrTarget {
     is_fork: bool,
     base_ref: Option<String>,
     state: Option<String>,
+}
+
+/// Recognize the closed-unmerged classification from a publication error so
+/// the daemon can park with a structured kind. Errors wrap upstream messages
+/// with framing prefixes ("daemon-owned publication failed: …"), so match by
+/// substring against the shape produced in `existing_pr_lease_baseline`.
+fn publication_failure_kind_from_error(error: &str) -> tasks::PublicationFailureKind {
+    if error.contains(PUBLICATION_PR_CLOSED_MARKER) {
+        tasks::PublicationFailureKind::PrClosed
+    } else {
+        tasks::PublicationFailureKind::Other
+    }
 }
 
 fn pr_target_args(pr: i64, gh_repo: Option<&str>) -> Vec<String> {
@@ -1542,7 +1563,19 @@ fn existing_pr_lease_baseline<'a>(
     base_branch: &str,
 ) -> std::result::Result<Option<&'a str>, String> {
     if target.state.as_deref() != Some("OPEN") {
-        return Err(format!("PR #{} is not open", target.pr));
+        // Distinguish CLOSED (unmerged) from MERGED (delivery evidence) at the
+        // daemon boundary. `retry_parked` (#186) discards the pinned intent
+        // only for the closed-unmerged classification; a merged PR is not
+        // recoverable this way and must surface loudly.
+        return Err(match target.state.as_deref() {
+            Some(PR_STATE_MERGED) => format!(
+                "PR #{} is already merged; delivery evidence — investigate manually",
+                target.pr
+            ),
+            Some(PR_STATE_CLOSED) => format!("PR #{} is closed (unmerged)", target.pr),
+            Some(other) => format!("PR #{} is in state {other}, not open", target.pr),
+            None => format!("PR #{} has no reported state", target.pr),
+        });
     }
     if target.is_fork {
         return Err(format!(
@@ -4043,11 +4076,13 @@ async fn recover_late_worker_done_with_publication(
                 } else {
                     "open"
                 };
-                park_task(
+                let kind = publication_failure_kind_from_error(&error);
+                park_task_publication_failure(
                     &config.db_path,
                     task_id,
                     &format!("restart publication reconciliation failed: {error}"),
                     resume_status,
+                    kind,
                 )
                 .await;
                 return Ok(false);
@@ -13194,11 +13229,13 @@ async fn tick(
                     ));
                     let w = workers.remove(wi);
                     let resume_status = if w.rework_count > 0 { "rework" } else { "open" };
-                    park_task(
+                    let kind = publication_failure_kind_from_error(error);
+                    park_task_publication_failure(
                         &db_path,
                         w.task_id,
                         &format!("daemon-owned publication failed: {error}"),
                         resume_status,
+                        kind,
                     )
                     .await;
                     cleanup_slot(config, wt_mgr, name_pool, w, None, "daemon_push_failed").await;
@@ -19990,6 +20027,54 @@ async fn park_task_result(
         log(&format!("PARKED: task #{task_id}: {reason_for_log}"));
     }
     Ok(parked)
+}
+
+/// Park variant for daemon-owned publication failures (#186). Records a
+/// structured `publication_failure_kind` so `retry_parked` can decide whether
+/// to abandon a pinned publication intent without inspecting the reason
+/// string. Non-fatal wrapper — errors are logged, matching `park_task`.
+async fn park_task_publication_failure(
+    db_path: &std::path::Path,
+    task_id: i64,
+    reason: &str,
+    resume_status: &str,
+    kind: tasks::PublicationFailureKind,
+) -> bool {
+    let p = db_path.to_path_buf();
+    let reason_for_log = reason.to_string();
+    let reason = reason.to_string();
+    let resume_status = resume_status.to_string();
+    let join = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&p)?;
+        Ok(tasks::park_publication_failure(
+            &mut conn,
+            task_id,
+            &reason,
+            &resume_status,
+            kind,
+            now_unix(),
+        )?
+        .is_some())
+    })
+    .await;
+    match join {
+        Ok(Ok(parked)) => {
+            if parked {
+                log(&format!("PARKED: task #{task_id}: {reason_for_log}"));
+            }
+            parked
+        }
+        Ok(Err(error)) => {
+            log(&format!("FATAL: failed to park task #{task_id}: {error}"));
+            false
+        }
+        Err(error) => {
+            log(&format!(
+                "FATAL: park task #{task_id} join failure: {error}"
+            ));
+            false
+        }
+    }
 }
 
 async fn require_park_task(
@@ -31974,9 +32059,23 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .contains("targets base"));
         target.base_ref = Some("main".into());
         target.state = Some("CLOSED".into());
-        assert!(existing_pr_lease_baseline(&intent, &target, "main")
-            .unwrap_err()
-            .contains("not open"));
+        let closed_error = existing_pr_lease_baseline(&intent, &target, "main").unwrap_err();
+        assert!(
+            closed_error.contains(PUBLICATION_PR_CLOSED_MARKER),
+            "CLOSED state must surface the closed-unmerged marker so \
+             `publication_failure_kind_from_error` classifies it as `PrClosed`: {closed_error}"
+        );
+        target.state = Some("MERGED".into());
+        let merged_error = existing_pr_lease_baseline(&intent, &target, "main").unwrap_err();
+        assert!(
+            merged_error.contains("already merged"),
+            "MERGED state must NOT surface the closed-unmerged marker; a merged PR \
+             is delivery evidence and must not become retry-eligible: {merged_error}"
+        );
+        assert!(
+            !merged_error.contains(PUBLICATION_PR_CLOSED_MARKER),
+            "MERGED state must NOT contain the pr-closed marker: {merged_error}"
+        );
         target.state = Some("OPEN".into());
 
         target.head_sha = "unrelated-b".into();
@@ -31986,6 +32085,76 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(existing_pr_lease_baseline(&legacy_intent, &target, "main")
             .unwrap_err()
             .contains("no durable spawn-time"));
+    }
+
+    /// Task #186: the daemon publication park site classifies the returned
+    /// error into `PublicationFailureKind` and records it on the parked refs.
+    /// The classifier MUST recognize the closed-unmerged shape emitted by
+    /// `existing_pr_lease_baseline` (even after the outer framing prefix) and
+    /// MUST NOT misclassify the merged shape or unrelated failures as
+    /// `PrClosed`.
+    #[test]
+    fn publication_failure_kind_from_error_classifies_pr_closed_only() {
+        let closed = existing_pr_lease_baseline(
+            &PublicationIntent {
+                branch: "b".into(),
+                local_sha: "a".into(),
+                pr: Some(9),
+                stage: "intent".into(),
+                target_branch: None,
+                expected_remote_sha: Some("x".into()),
+            },
+            &PrTarget {
+                pr: 9,
+                head_ref: "b".into(),
+                head_sha: "x".into(),
+                is_fork: false,
+                base_ref: Some("main".into()),
+                state: Some("CLOSED".into()),
+            },
+            "main",
+        )
+        .unwrap_err();
+        assert_eq!(
+            publication_failure_kind_from_error(&format!(
+                "daemon-owned publication failed: {closed}"
+            )),
+            tasks::PublicationFailureKind::PrClosed,
+        );
+
+        let merged = existing_pr_lease_baseline(
+            &PublicationIntent {
+                branch: "b".into(),
+                local_sha: "a".into(),
+                pr: Some(9),
+                stage: "intent".into(),
+                target_branch: None,
+                expected_remote_sha: Some("x".into()),
+            },
+            &PrTarget {
+                pr: 9,
+                head_ref: "b".into(),
+                head_sha: "x".into(),
+                is_fork: false,
+                base_ref: Some("main".into()),
+                state: Some("MERGED".into()),
+            },
+            "main",
+        )
+        .unwrap_err();
+        assert_eq!(
+            publication_failure_kind_from_error(&format!(
+                "daemon-owned publication failed: {merged}"
+            )),
+            tasks::PublicationFailureKind::Other,
+            "MERGED is delivery evidence — must never classify as PrClosed"
+        );
+        assert_eq!(
+            publication_failure_kind_from_error(
+                "daemon-owned publication failed: remote rejected push"
+            ),
+            tasks::PublicationFailureKind::Other,
+        );
     }
 
     fn seed_sticky_rework_task(

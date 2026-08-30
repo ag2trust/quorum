@@ -116,7 +116,7 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
             // lifecycle layer); the resulting terminal park is owner-gated.
             let park_reason = format!("remediation {reason}");
             let parked_refs =
-                crate::tasks::set_parked_refs(refs.as_deref(), &park_reason, "rework")?;
+                crate::tasks::set_parked_refs(refs.as_deref(), &park_reason, "rework", None)?;
             conn.execute(
                 "UPDATE tasks SET status='failed', assignee=NULL, refs=?2, updated_at=?3 WHERE id=?1",
                 params![id, parked_refs, now],

@@ -1934,7 +1934,11 @@ fn continuation_publication_rejects_same_sha_base_retarget() {
 
 #[test]
 fn continuation_publication_rejects_same_sha_closed_pr() {
-    assert_continuation_publication_rejects_live_target_change("state", "CLOSED", "is not open");
+    assert_continuation_publication_rejects_live_target_change(
+        "state",
+        "CLOSED",
+        "is closed (unmerged)",
+    );
 }
 
 #[test]
