@@ -2680,6 +2680,7 @@ fn terminal_parked_retry_markers_reconcile_once_without_provisioning() {
             first.lines
         );
     }
+    common::clear_daemon_lock(&db_path);
     let mut restarted = run_daemon();
     assert!(
         restarted.wait_for("recovery: complete", 15),

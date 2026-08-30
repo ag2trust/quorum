@@ -3404,19 +3404,20 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
     ));
 
     let daemon_pid = std::process::id() as i64;
+    let daemon_instance = quorum_core::daemon_lock::new_instance_id();
     let now = now_unix();
 
     // Acquire the single-daemon-per-DB lock. The check + acquire is atomic
     // (single BEGIN IMMEDIATE) to prevent TOCTOU races between two daemons
-    // starting simultaneously.
+    // starting simultaneously. Instance identity — not PID — is the authority.
     {
         let mut conn = quorum_core::db::open(&config.db_path)?;
         match quorum_core::daemon_lock::try_acquire(
             &mut conn,
             daemon_pid,
+            &daemon_instance,
             now,
             DAEMON_LOCK_STALE_SECS,
-            pid_is_alive,
         )? {
             quorum_core::daemon_lock::AcquireResult::Acquired => {}
             quorum_core::daemon_lock::AcquireResult::Held {
@@ -3448,14 +3449,21 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
             writable_path_resolver.clone(),
         )
         .await?;
-        let result = tick_loop(&config, daemon_pid, writable_path_resolver).await;
+        let result = tick_loop(
+            &config,
+            daemon_pid,
+            daemon_instance.clone(),
+            writable_path_resolver,
+        )
+        .await;
         endpoint.shutdown().await;
         result
     });
 
-    // Release the lock on clean shutdown (best-effort).
+    // Release the lock on clean shutdown (best-effort). Guarded by instance
+    // identity so a superseded daemon cannot delete the new holder's row.
     if let Ok(conn) = quorum_core::db::open(&config.db_path) {
-        let _ = quorum_core::daemon_lock::release(&conn, daemon_pid);
+        let _ = quorum_core::daemon_lock::release(&conn, &daemon_instance);
     }
 
     // Abandoned spawn_blocking threads (e.g. wait_for_checks interrupted by
@@ -3464,15 +3472,6 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
     rt.shutdown_timeout(std::time::Duration::from_secs(1));
 
     result
-}
-
-fn pid_is_alive(pid: i64) -> bool {
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if ret == 0 {
-        return true;
-    }
-    // EPERM means the process exists but we lack permission — still alive.
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 pub(crate) struct LiveStats {
@@ -9356,7 +9355,8 @@ async fn reconcile_merged_continuations(
 
 async fn tick_loop(
     config: &ServeConfig,
-    daemon_pid: i64,
+    _daemon_pid: i64,
+    daemon_instance: String,
     writable_path_resolver: planner::WritablePathResolver,
 ) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
@@ -9629,7 +9629,7 @@ async fn tick_loop(
     let lock_stolen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let db = config.db_path.clone();
-        let pid = daemon_pid;
+        let instance = daemon_instance.clone();
         let stolen = lock_stolen.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -9637,11 +9637,12 @@ async fn tick_loop(
             loop {
                 interval.tick().await;
                 let db2 = db.clone();
+                let instance2 = instance.clone();
                 let result =
                     tokio::task::spawn_blocking(move || -> std::result::Result<usize, String> {
                         let conn = quorum_core::db::open(&db2).map_err(|e| e.to_string())?;
                         let now = now_unix();
-                        quorum_core::daemon_lock::refresh(&conn, pid, now)
+                        quorum_core::daemon_lock::refresh(&conn, &instance2, now)
                             .map_err(|e| e.to_string())
                     })
                     .await;

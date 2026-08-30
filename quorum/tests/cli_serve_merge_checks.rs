@@ -6,6 +6,8 @@
 //! - checks timeout → rework (recoverable, not terminal cancel)
 //! - merge is NOT attempted while checks are pending (negative path)
 
+mod common;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -1003,6 +1005,7 @@ fn pre_review_pending_survives_daemon_restart() {
         first.lines
     );
     first.crash();
+    common::clear_daemon_lock(&home.path().join("repos/test__repo/quorum.db"));
 
     std::fs::write(&checks_state, "ready").unwrap();
     let mut restarted = ServeHandle::start(
