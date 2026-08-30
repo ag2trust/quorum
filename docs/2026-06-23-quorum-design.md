@@ -511,15 +511,42 @@ to the same per-repo DB without relying on cwd.
 ### Single-daemon-per-DB guard
 
 On startup, `quorum serve` acquires an exclusive lease in the `daemon_lock` table
-(one-row, stores pid + heartbeat timestamp). The heartbeat is refreshed on every tick.
-A second daemon on the same DB:
+(one-row, stores pid + heartbeat timestamp + opaque instance identity). The instance
+identity is a fresh UUID minted at daemon startup (`daemon_lock::new_instance_id`, 128
+bits of entropy) and is the sole authority: `try_acquire`, `refresh`, and `release` are
+all guarded by it. The stored PID is a human-readable diagnostic only — it is never
+consulted for admission or ownership. The heartbeat is refreshed on every tick.
 
-- **Live holder** (heartbeat fresh within 30s AND pid alive via `kill(pid, 0)`) → exit 2
-  with error naming the holder pid. Never a silent second daemon.
-- **Stale holder** (heartbeat old OR pid dead) → take over the lease, log it.
+The check-and-acquire runs inside a single `BEGIN IMMEDIATE` transaction so two daemons
+starting simultaneously can never both write. A second daemon on the same DB:
 
-On clean shutdown the lease is released (row deleted). A crash leaves a stale row that
-the next daemon takes over.
+- **Live holder** (heartbeat fresh within 30s) under a **different instance identity**
+  → exit 2 with error naming the stored holder PID for diagnostics. This holds even
+  when the incoming numeric PID equals the stored one (PID namespaces, container
+  restart, PID wraparound) and even when the stored PID is not locally visible
+  (containers, remote host). Never a silent second daemon.
+- **Live holder** under the **same instance identity** → idempotent reacquire (also
+  refreshes the heartbeat). This is the normal restart of the same lifetime.
+- **Stale holder** (heartbeat older than 30s) → take over the lease via UPSERT
+  overwriting pid + instance, log it. Legacy pre-v70 rows with `instance_id IS NULL`
+  fall through the same paths: fresh legacy rows fail closed (unknown identity), and
+  stale legacy rows are treated as abandoned and taken over without manual edit.
+
+The heartbeat freshness gate is the sole liveness input. `status` reports `Alive` while
+the heartbeat is within `stale_secs` and `Stale` once it expires; a `pid_dead` flag
+(populated by `kill(pid, 0)`) is surfaced on `Stale` verdicts as a diagnostic only and
+never influences the verdict. This is namespace-safe: a live daemon whose PID is
+locally invisible still reads `Alive`, and an expired heartbeat still reads `Stale`
+even when the stored numeric PID happens to collide with an unrelated live process.
+
+On clean shutdown the lease is released, guarded by the calling instance identity so a
+superseded process cannot delete the current holder's row. A crash leaves the row
+behind with the crashed instance identity. The consequence of dropping PID liveness
+from the admission gate: a `SIGKILL` followed by an immediate restart within the
+30s stale window fails closed under the new (different) instance identity and exits 2
+until the stored heartbeat expires — the `serve-supervisor.sh` wrapper is expected to
+retry through this brief window. This trades a small self-recovery delay for the
+guarantee that no PID collision or PID-namespace edge case can ever bypass the guard.
 
 ### Daemon limits and stall detection
 

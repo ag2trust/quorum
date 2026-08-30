@@ -26,10 +26,11 @@ pub enum Operation {
     ApplyGraphEvent,
     ClaimCleanup,
     MaterializeAssessment,
+    AcquireDaemonLock,
 }
 
 impl Operation {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::AllocateRole,
         Self::ClaimTask,
         Self::ClaimProviderRetryRework,
@@ -37,6 +38,7 @@ impl Operation {
         Self::ApplyGraphEvent,
         Self::ClaimCleanup,
         Self::MaterializeAssessment,
+        Self::AcquireDaemonLock,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -48,6 +50,7 @@ impl Operation {
             Self::ApplyGraphEvent => "apply-graph-event",
             Self::ClaimCleanup => "claim-cleanup",
             Self::MaterializeAssessment => "materialize-assessment",
+            Self::AcquireDaemonLock => "acquire-daemon-lock",
         }
     }
 }
@@ -140,6 +143,16 @@ pub struct ApplyGraphEventInput {
 pub struct ClaimCleanupInput {
     pub db_path: PathBuf,
     pub now: i64,
+    pub barrier: Barrier,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcquireDaemonLockInput {
+    pub db_path: PathBuf,
+    pub pid: i64,
+    pub now: i64,
+    pub stale_secs: i64,
     pub barrier: Barrier,
 }
 
