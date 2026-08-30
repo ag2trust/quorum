@@ -1301,6 +1301,38 @@ mod tests {
         json!({"outcome": "plan", "tasks": [plan_task("only", "src/only.rs", vec![])]})
     }
 
+    /// Mirrors the rejected #179/#180 shape: one child changes a public core
+    /// signature but explicitly leaves its callers to a dependent sibling.
+    fn compile_atomic_signature_seam_plan() -> serde_json::Value {
+        let mut core = plan_task("lock-api", "quorum-core/src/daemon_lock.rs", vec![]);
+        core["implementation_delta"] = json!(
+            "change public function signatures and thread instance_id through acquire, refresh, and release"
+        );
+        core["non_goals"] = json!([
+            "Do not change quorum/src/serve/mod.rs callers; that wiring belongs to serve-wiring"
+        ]);
+
+        json!({
+            "outcome": "plan",
+            "tasks": [
+                core,
+                plan_task("serve-wiring", "quorum/src/serve/mod.rs", vec!["lock-api"]),
+            ],
+        })
+    }
+
+    fn no_safe_split_blocker() -> serde_json::Value {
+        json!({
+            "outcome": "blocker",
+            "category": "no_safe_split",
+            "evidence": [
+                "changing daemon_lock public signatures requires the serve callers to change together"
+            ],
+            "required_decision": "allow one compile-atomic child",
+            "why_no_safe_split": "the signature and caller wiring cannot pass preflight independently"
+        })
+    }
+
     fn result_value(response: &Response) -> serde_json::Value {
         serde_json::to_value(response).unwrap()
     }
@@ -1349,6 +1381,36 @@ mod tests {
         );
         let (stored, rejections) = fixture.submission_row();
         assert_eq!(stored, None);
+        assert_eq!(rejections, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_plan_rejects_compile_atomic_signature_split_and_accepts_no_safe_split() {
+        let fixture = PlannerFixture::new();
+        let error = fixture
+            .submit_plan("planner-cap", compile_atomic_signature_seam_plan())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_plan");
+        assert!(
+            error.message.contains("compile-atomic signature seam"),
+            "unexpected message: {}",
+            error.message
+        );
+        assert!(error.message.contains("serve-wiring"));
+        assert_eq!(fixture.submission_row(), (None, 1));
+
+        let blocker = no_safe_split_blocker();
+        let accepted = fixture
+            .submit_plan("planner-cap", blocker.clone())
+            .await
+            .unwrap();
+        assert_eq!(result_value(&accepted)["result"]["type"], "plan_accepted");
+        let (stored, rejections) = fixture.submission_row();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored.unwrap()).unwrap(),
+            blocker
+        );
         assert_eq!(rejections, 1);
     }
 

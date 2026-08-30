@@ -2245,9 +2245,15 @@ names its concrete implementation delta, affected paths, and non-goals, and carr
 load-bearing source requirement forward faithfully in the child that owns it. Tasks follow
 independently deliverable code or ownership seams; preserved
 behavior and regression-only expectations remain criteria or non-goals rather than synthetic
-implementation work. Before any task row is created, deterministic validation checks the closed
-shape, references, cycles, prohibited synthetic integration work, and the structured deliverables
-manifest (below); it no longer requires a byte-exact echo of source-marked literals. Plan
+implementation work. A child that changes a function/API signature or shared type, trait, or
+struct shape must own every affected caller needed for its workspace build and preflight after
+its prerequisites merge; a definition/signature child must not reserve those callers for a
+sibling. If that compile closure cannot remain M-sized, the planner returns a `no_safe_split`
+blocker rather than manufacturing definition and wiring siblings. Before any task row is created,
+deterministic validation checks the closed shape, references, cycles, prohibited synthetic
+integration work, mechanically visible compile-atomic signature-seam reservations, and the
+structured deliverables manifest (below); it no longer requires a byte-exact echo of
+source-marked literals. Plan
 faithfulness — that every load-bearing source requirement and constraint is carried forward,
 nothing is dropped or silently weakened, the children cover the source without overlap, and the
 plan is coherent — is judged by the Arbiter plan-review gate (below), not by a deterministic
@@ -2275,8 +2281,8 @@ feedback. Renaming or paraphrasing a rejected child is not scope reduction.
 classifier-accepted proposal on a single-shot, stateless **Arbiter** — a model
 reviewer spawned fresh per proposal in the same frozen read-only repository view the planner used,
 selected from the `[routing.arbiter]` pool (defaulting to the planner pool). The Arbiter judges the
-proposal against the authoritative source on four mandates — faithfulness, coverage and
-non-overlap, coherence, and decomposability — and emits exactly one closed verdict, parsed with the
+proposal against the authoritative source on five mandates — faithfulness, coverage and
+non-overlap, coherence, compile closure, and decomposability — and emits exactly one closed verdict, parsed with the
 planner's fail-closed discipline. The Arbiter only emits a verdict; the daemon alone transitions
 lifecycle and materializes children (lifecycle authority stays with the daemon). Verdict mapping:
 *approve* (or a *changes* verdict with no blocking finding) materializes the children directly
