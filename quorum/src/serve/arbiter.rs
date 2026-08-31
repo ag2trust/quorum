@@ -188,6 +188,12 @@ pub fn build_arbiter_prompt(
          gaps and without two children owning the same work. \
          Coherence: dependencies must be sane and acyclic, every deliverable must be in-repo, and \
          each child must have an observable outcome and acceptance criteria. \
+         Compile closure: after prerequisites are merged, every child must have all write paths \
+         needed for the workspace to build and pass preflight on its own. A compile-atomic \
+         signature seam is one child: a child that changes a function/API signature or a shared \
+         type, trait, or struct shape must also own every affected caller; a non-goal that \
+         reserves those callers for a sibling is a blocking compile-closure failure. Return \
+         blocking changes for that proposal, not approval. \
          Decomposability: if the source is too vague or underspecified to split safely, do not \
          approve or request changes — return reject_source naming the decision the source owner \
          must make. \
@@ -1026,6 +1032,8 @@ mod tests {
         for needle in [
             "faithful",
             "coverage",
+            "compile-atomic signature seam is one child",
+            "reserves those callers for a sibling",
             "reject_source",
             "\"outcome\":\"approve\"",
             "SOURCE=",
