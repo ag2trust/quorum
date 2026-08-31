@@ -389,9 +389,10 @@ fi
 # continuation still has authoritative local evidence: its configured remote
 # upstream is the published PR head. Recognize that history only when the
 # upstream is on TIP's first-parent chain and a later first-parent merge
-# contains the freshly fetched origin/main. This keeps an ordinary branch that
-# merely tracks another feature branch on the strict origin/main..TIP path.
+# contains a freshly fetched supported base. This keeps an ordinary branch that
+# merely tracks another feature branch on the strict base..TIP path.
 CONFIGURED_CONTINUATION_FROM=
+CONFIGURED_CONTINUATION_BASE=
 if [ "$QUICK" -eq 0 ] && [ "$PROPOSED_SET" -eq 0 ]; then
   CONFIGURED_UPSTREAM_REF=$(git rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null)
   case "$CONFIGURED_UPSTREAM_REF" in
@@ -402,10 +403,14 @@ if [ "$QUICK" -eq 0 ] && [ "$PROPOSED_SET" -eq 0 ]; then
         && git rev-list --first-parent "$TIP" | grep -Fqx "$CONFIGURED_UPSTREAM_SHA"; then
         for MERGE_SHA in $(git rev-list --first-parent --merges \
           "$CONFIGURED_UPSTREAM_SHA..$TIP"); do
-          if git merge-base --is-ancestor origin/main "$MERGE_SHA"; then
-            CONFIGURED_CONTINUATION_FROM=$CONFIGURED_UPSTREAM_SHA
-            break
-          fi
+          for CANDIDATE_BASE in origin/develop origin/main; do
+            if git rev-parse --verify --quiet "$CANDIDATE_BASE" >/dev/null \
+              && git merge-base --is-ancestor "$CANDIDATE_BASE" "$MERGE_SHA"; then
+              CONFIGURED_CONTINUATION_FROM=$CONFIGURED_UPSTREAM_SHA
+              CONFIGURED_CONTINUATION_BASE=$CANDIDATE_BASE
+              break 2
+            fi
+          done
         done
       fi
       ;;
@@ -465,10 +470,11 @@ else
       git show -s --oneline $OWN_COMMITS
     fi
   elif [ -n "$CONFIGURED_CONTINUATION_FROM" ]; then
-    BASE_REF="$CONFIGURED_UPSTREAM_REF + origin/main"
+    BASE_REF="$CONFIGURED_UPSTREAM_REF + $CONFIGURED_CONTINUATION_BASE"
     OWN_COMMITS=$(git rev-list "$TIP" --not \
-      "$CONFIGURED_CONTINUATION_FROM" origin/main)
-    printf 'configured-upstream continuation-owned commits excluding published head and origin/main:\n'
+      "$CONFIGURED_CONTINUATION_FROM" "$CONFIGURED_CONTINUATION_BASE")
+    printf 'configured-upstream continuation-owned commits excluding published head and %s:\n' \
+      "$CONFIGURED_CONTINUATION_BASE"
     if [ -n "$OWN_COMMITS" ]; then
       git show -s --oneline $OWN_COMMITS
     fi

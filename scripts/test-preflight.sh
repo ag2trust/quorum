@@ -448,6 +448,18 @@ printf 'develop continuation worker\n' >> develop-remediation
 git commit -qam 'finish develop continuation' \
   -m 'Co-Authored-By: Develop-Continue <develop-continue@example.invalid>'
 DEVELOP_CONTINUATION_SHA=$(git rev-parse HEAD)
+
+# Full author preflight has no hook tuple. Its configured upstream must still
+# recognize that this continuation merged develop rather than main.
+git fetch -q origin \
+  refs/heads/daemon/develop-continuation-t8:refs/remotes/origin/daemon/develop-continuation-t8
+git branch --set-upstream-to=origin/daemon/develop-continuation-t8
+PATH="$BIN:$PATH" ./preflight.sh >"$TMP/full-develop-merge-continuation.out"
+grep -q 'configured-upstream continuation-owned commits excluding published head and origin/develop' \
+  "$TMP/full-develop-merge-continuation.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green;' \
+  "$TMP/full-develop-merge-continuation.out"
+
 if PATH="$BIN:$PATH" git push -q origin \
   "$DEVELOP_CONTINUATION_SHA:refs/heads/daemon/develop-continuation-t8" \
   >"$TMP/develop-default-base.out" 2>&1; then
