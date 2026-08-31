@@ -993,6 +993,10 @@ impl RunnerProc {
         matches!(self, Self::Grok(proc) if proc.terminal_evidence_pending())
     }
 
+    pub fn grok_terminal_candidate_pending(&self) -> bool {
+        matches!(self, Self::Grok(proc) if proc.terminal_candidate_pending())
+    }
+
     pub fn grok_terminal_handoff_pending(&self) -> bool {
         matches!(self, Self::Grok(proc) if proc.terminal_handoff_pending())
     }

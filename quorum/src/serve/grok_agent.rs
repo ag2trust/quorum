@@ -1218,6 +1218,12 @@ impl GrokProc {
         self.pending_terminal.is_some() && !self.terminal_rejected && self.stdout_complete
     }
 
+    pub(super) fn terminal_candidate_pending(&self) -> bool {
+        self.pending_terminal.is_some()
+            && !self.terminal_rejected
+            && self.failures.observed_strict_failure().is_none()
+    }
+
     pub(super) fn set_raw_drain_budget_exhausted(&mut self, exhausted: bool) {
         self.raw_drain_budget_exhausted = exhausted;
     }
@@ -1228,6 +1234,7 @@ impl GrokProc {
         // leader exit plus an open descendant-held pipe cannot defer a
         // terminal-free delivery forever.
         !self.terminal_rejected
+            && self.failures.observed_strict_failure().is_none()
             && (self.pending_terminal.is_some() || self.raw_drain_budget_exhausted)
     }
 
