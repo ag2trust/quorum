@@ -212,6 +212,12 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          guidance rather than an enforcement claim. For \
          each task, declare every file-level deliverable in `deliverables`: use \
          `write` only for requested changes and `read_only_reference` only for context. \
+         A compile-atomic API seam is one child: if a child changes a function signature or a \
+         shared type, trait, or struct shape used outside that child's writable paths, that child \
+         must own every affected caller. Do not split a definition/signature change from its \
+         caller wiring, including by reserving those callers as a sibling's non-goal. If that \
+         compile closure pushes the child past M, return the `no_safe_split` BLOCKER rather than \
+         manufacturing definition and wiring siblings. \
          Report by calling the `submit_plan` tool exactly once with the PLAN or BLOCKER \
          object as its `response` argument. The tool answers with the daemon's own \
          validation errors: fix the reported defect and call `submit_plan` again in the same \
@@ -490,7 +496,107 @@ pub(super) fn validate_plan_tasks(tasks: &[ProposedTask]) -> Result<(), PlannerP
             }
         }
     }
+    reject_compile_atomic_signature_seam_split(tasks)?;
     reject_cycles(tasks)
+}
+
+/// Reject a mechanically visible subset of compile-closure violations before
+/// spending classifier or Arbiter work. This deliberately does not parse Rust:
+/// the planner already declares both the API change in its task body and the
+/// file ownership it is reserving. The Arbiter still checks the broader
+/// compile-closure rubric against the frozen repository.
+fn reject_compile_atomic_signature_seam_split(
+    tasks: &[ProposedTask],
+) -> Result<(), PlannerParseError> {
+    for signature_task in tasks {
+        if !changes_compile_interface(signature_task) {
+            continue;
+        }
+        for caller_task in tasks {
+            if caller_task.key == signature_task.key {
+                continue;
+            }
+            for caller_path in caller_task.deliverables.writable_paths() {
+                let named_in_deliverables = signature_task.deliverables.0.iter().any(|deliverable| {
+                    matches!(deliverable,
+                        quorum_core::decomposition::ChildDeliverable::Write { path }
+                        | quorum_core::decomposition::ChildDeliverable::ReadOnlyReference { path }
+                        if path == caller_path
+                    )
+                });
+                let reserved_in_non_goal = signature_task
+                    .non_goals
+                    .iter()
+                    .any(|non_goal| names_path(non_goal, caller_path));
+                if named_in_deliverables || reserved_in_non_goal {
+                    let caller_path = bounded_path_for_message(caller_path);
+                    return semantic(&format!(
+                        "child {} changes a compile-atomic signature seam but names caller path `{caller_path}` owned by child {}; a child changing an API must own its callers",
+                        signature_task.key, caller_task.key,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn changes_compile_interface(task: &ProposedTask) -> bool {
+    let body = format!(
+        "{} {} {}",
+        task.title, task.implementation_delta, task.observable_outcome
+    )
+    .to_ascii_lowercase();
+    [
+        "signature",
+        "public api",
+        "api change",
+        "api changes",
+        "api surface",
+        "api contract",
+        "public function",
+        "pub fn",
+        "function parameter",
+        "function argument",
+        "method parameter",
+        "method argument",
+        "return type",
+        "trait shape",
+        "struct shape",
+        "type shape",
+        "shared trait",
+        "shared struct",
+        "argument through",
+        "parameter through",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
+}
+
+fn names_path(text: &str, path: &str) -> bool {
+    if text.contains(path) {
+        return true;
+    }
+    let Some(file_name) = path.rsplit('/').next() else {
+        return false;
+    };
+    // A basename such as `recovery.rs` is an explicit reservation; generic
+    // `mod.rs` is too ambiguous for this deterministic guard.
+    file_name != "mod.rs" && text.contains(file_name)
+}
+
+fn bounded_path_for_message(path: &str) -> String {
+    const MAX_PATH_BYTES: usize = 512;
+    const ELLIPSIS: &str = "…";
+    if path.len() <= MAX_PATH_BYTES {
+        path.into()
+    } else {
+        format!(
+            "{}{}",
+            truncate_utf8(path, MAX_PATH_BYTES - ELLIPSIS.len()),
+            ELLIPSIS
+        )
+    }
 }
 
 fn validate_deliverables(
@@ -1185,8 +1291,9 @@ async fn spawn_planner_with_timeout(
                     .feed_turn_until(&agent::user_turn(prompt), deadline)
                     .await
                 {
-                    let _ = proc.kill_and_reap().await;
-                    return Err(error);
+                    return Err(proc
+                        .diagnose_first_turn_feed_failure(error, Some(deadline))
+                        .await);
                 }
                 RunnerProc::Claude(proc)
             }
@@ -1673,9 +1780,9 @@ mod tests {
         let runner = executable_script(
             dir,
             "claude",
-            // Claude receives its first turn through stdin. Keeping the fixture alive until
-            // that line is written prevents an eager `cat` exit from turning this provider
-            // protocol test into a scheduler-dependent BrokenPipe.
+            // Claude receives its first turn through stdin. Keeping the fixture
+            // alive until that line is written prevents an eager `cat` exit from
+            // turning this protocol test into a scheduler-dependent BrokenPipe.
             &format!(
                 "read -r _ || true\nexec /bin/cat '{}'",
                 stdout_path.display()
@@ -3536,6 +3643,8 @@ mod tests {
         assert!(prompt.contains("S = one focused local seam"));
         assert!(prompt.contains("translate from human project sizes"));
         assert!(prompt.contains("raw file count or requirement count as a shortcut"));
+        assert!(prompt.contains("compile-atomic API seam is one child"));
+        assert!(prompt.contains("return the `no_safe_split` BLOCKER"));
         assert!(prompt.contains("Use at most 5 Grep/Glob calls and 10 Read calls"));
         assert!(prompt.contains("Arbiter judges that faithfulness"));
         assert!(prompt.contains(&format!(

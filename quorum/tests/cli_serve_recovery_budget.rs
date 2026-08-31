@@ -949,6 +949,12 @@ fn consecutive_restarts_accumulate_recovery_count() {
     // Recovery fires AgentFailed, task goes to open, counter = 1
     // SIGKILL immediately before the die-agent can do further damage
     handle.sigkill();
+    // A hard SIGKILL never runs `daemon_lock::release`, so the previous
+    // fresh row now blocks the next restart under instance-authority
+    // semantics (a live-daemon spoof in another namespace would look
+    // identical). A real supervisor either waits stale_secs or clears the
+    // lock explicitly; the test does the latter to keep runtime tight.
+    common::clear_daemon_lock(db_path);
 
     let task = env.task(task_id);
     assert_eq!(

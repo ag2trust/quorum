@@ -1,10 +1,10 @@
 mod protocol;
 
 use protocol::{
-    AllocateRoleInput, ApplyGraphEventInput, Barrier, CancelSourceGraphInput, ClaimCleanupInput,
-    ClaimProviderRetryReworkInput, ClaimTaskInput, GraphEvent, MaterializeAssessmentInput,
-    Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_BARRIER_WAIT_MS,
-    MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
+    AcquireDaemonLockInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
+    CancelSourceGraphInput, ClaimCleanupInput, ClaimProviderRetryReworkInput, ClaimTaskInput,
+    GraphEvent, MaterializeAssessmentInput, Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS,
+    EXIT_USAGE, MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
 };
 use quorum_core::decomposition::SourceCancellation;
 use quorum_core::error::QuorumError;
@@ -73,6 +73,7 @@ fn run() -> Result<i32, HelperError> {
         Operation::ApplyGraphEvent => apply_graph_event(parse(&input)?)?,
         Operation::ClaimCleanup => claim_cleanup(parse(&input)?)?,
         Operation::MaterializeAssessment => materialize_assessment(parse(&input)?)?,
+        Operation::AcquireDaemonLock => acquire_daemon_lock(parse(&input)?)?,
     };
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -332,6 +333,44 @@ fn materialize_assessment(
             "assessment_id": assessment.id(),
         })),
         None => OperationResult::race(json!({"won": false}), false),
+    })
+}
+
+fn acquire_daemon_lock(input: AcquireDaemonLockInput) -> Result<OperationResult, HelperError> {
+    use quorum_core::daemon_lock::{new_instance_id, try_acquire, AcquireResult};
+    validate_path("database", &input.db_path)?;
+    validate_positive("pid", input.pid)?;
+    validate_positive("stale_secs", input.stale_secs)?;
+    // Mint a fresh instance id per process so every helper races under a
+    // distinct identity, matching how independent daemon lifetimes behave.
+    let instance_id = new_instance_id();
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    wait_at_barrier(&input.barrier)?;
+    let outcome = try_acquire(
+        &mut conn,
+        input.pid,
+        &instance_id,
+        input.now,
+        input.stale_secs,
+    )?;
+    Ok(match outcome {
+        AcquireResult::Acquired => OperationResult::race(
+            json!({"won": true, "instance_id": instance_id, "pid": input.pid}),
+            true,
+        ),
+        AcquireResult::Held {
+            holder_pid,
+            heartbeat_age,
+        } => OperationResult::race(
+            json!({
+                "won": false,
+                "instance_id": instance_id,
+                "pid": input.pid,
+                "holder_pid": holder_pid,
+                "heartbeat_age": heartbeat_age,
+            }),
+            false,
+        ),
     })
 }
 

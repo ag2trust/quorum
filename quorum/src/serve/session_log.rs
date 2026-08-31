@@ -17,6 +17,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::grok_agent::StreamLogCoalescer;
 use super::render;
 use super::runner::AgentEvent;
 
@@ -26,6 +27,10 @@ pub const MAX_SANITIZED_FIELD_BYTES: usize = 256;
 /// Maximum closed sanitized-event records retained for one session.
 pub const MAX_SANITIZED_RECORDS_PER_SESSION: usize = 256;
 const MAX_SANITIZED_RECORD_BYTES: usize = 1024;
+/// Maximum regular raw-provider bytes retained in one session stream. Terminal
+/// and completed tool records remain available after this limit so a log cap
+/// cannot hide lifecycle evidence or a final tool result.
+pub const MAX_RAW_STREAM_BYTES_PER_SESSION: usize = 64 * 1024 * 1024;
 static LOG_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Explicit marker written when a source field exceeds its retained bound.
@@ -405,6 +410,10 @@ pub struct SessionLog {
     transcript_file: File,
     meta: SessionMeta,
     sanitized_record_count: usize,
+    stream_bytes: usize,
+    raw_stream_limit_bytes: usize,
+    raw_stream_truncated: bool,
+    grok_stream_coalescer: StreamLogCoalescer,
 }
 
 #[derive(serde::Serialize)]
@@ -475,6 +484,10 @@ impl SessionLog {
             transcript_file,
             meta,
             sanitized_record_count: 0,
+            stream_bytes: 0,
+            raw_stream_limit_bytes: MAX_RAW_STREAM_BYTES_PER_SESSION,
+            raw_stream_truncated: false,
+            grok_stream_coalescer: StreamLogCoalescer::default(),
         };
         // The task detail API verifies a run link against this metadata. Write
         // it before the daemon persists the durable run so active sessions are
@@ -518,6 +531,7 @@ impl SessionLog {
         }
 
         self.sanitized_record_count += 1;
+        self.stream_bytes = self.stream_bytes.saturating_add(json.len() + 1);
         let _ = self.transcript_file.flush();
         let _ = self.stream_file.flush();
         true
@@ -537,11 +551,41 @@ impl SessionLog {
         let _ = self.stream_file.flush();
     }
 
-    /// Write a raw provider line verbatim to stream.jsonl, then render
-    /// normalized events to transcript.md.
+    /// Write a raw provider line to stream.jsonl, then render normalized
+    /// events to transcript.md. A full session never retains more than the
+    /// raw-stream limit except for final tool and lifecycle evidence.
     pub fn log_raw_and_normalized(&mut self, raw_line: &str, events: &[AgentEvent]) {
-        let _ = writeln!(self.stream_file, "{raw_line}");
-        let _ = self.stream_file.flush();
+        self.log_raw_and_normalized_inner(raw_line, events);
+    }
+
+    /// Write a Grok line after compacting its append-only in-progress command
+    /// output. Other provider records remain byte-for-byte unchanged.
+    pub fn log_grok_raw_and_normalized(&mut self, raw_line: &str, events: &[AgentEvent]) {
+        let raw_line = self.grok_stream_coalescer.compact(raw_line);
+        self.log_raw_and_normalized_inner(&raw_line, events);
+    }
+
+    fn log_raw_and_normalized_inner(&mut self, raw_line: &str, events: &[AgentEvent]) {
+        let keep_after_cap = raw_line_is_final_tool_or_lifecycle(raw_line, events);
+        let record_bytes = raw_line.len().saturating_add(1);
+        let marker = raw_stream_truncation_marker(self.raw_stream_limit_bytes);
+        let raw_budget = self.raw_stream_limit_bytes.saturating_sub(marker.len() + 1);
+
+        let write_raw = if self.raw_stream_truncated {
+            keep_after_cap
+        } else if self.stream_bytes.saturating_add(record_bytes) <= raw_budget {
+            true
+        } else {
+            self.raw_stream_truncated = true;
+            if self.write_stream_line(&marker) {
+                let _ = self.stream_file.flush();
+            }
+            keep_after_cap
+        };
+
+        if write_raw && self.write_stream_line(raw_line) {
+            let _ = self.stream_file.flush();
+        }
 
         for event in events {
             if let Some(rendered) = render::render_agent_event(event) {
@@ -549,6 +593,19 @@ impl SessionLog {
             }
         }
         let _ = self.transcript_file.flush();
+    }
+
+    fn write_stream_line(&mut self, line: &str) -> bool {
+        if writeln!(self.stream_file, "{line}").is_err() {
+            return false;
+        }
+        self.stream_bytes = self.stream_bytes.saturating_add(line.len() + 1);
+        true
+    }
+
+    #[cfg(test)]
+    fn set_raw_stream_limit_for_test(&mut self, bytes: usize) {
+        self.raw_stream_limit_bytes = bytes;
     }
 
     pub fn set_phase(&mut self, phase: &str) {
@@ -579,6 +636,36 @@ impl SessionLog {
         }
         Ok(())
     }
+}
+
+fn raw_stream_truncation_marker(limit_bytes: usize) -> String {
+    serde_json::json!({
+        "type": "provider.stream_bytes_truncated",
+        "stream_limit_bytes": limit_bytes,
+    })
+    .to_string()
+}
+
+fn raw_line_is_final_tool_or_lifecycle(raw_line: &str, events: &[AgentEvent]) -> bool {
+    if events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ThreadStarted { .. }
+                | AgentEvent::TurnCompleted { .. }
+                | AgentEvent::TurnFailed { .. }
+        )
+    }) {
+        return true;
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_line) else {
+        return false;
+    };
+    matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some("end" | "error" | "result" | "turn.completed" | "turn.failed")
+    ) || (value.get("type").and_then(serde_json::Value::as_str) == Some("tool_call_update")
+        && value.get("status").and_then(serde_json::Value::as_str) == Some("completed"))
 }
 
 fn create_session_dir(log_dir: &Path, agent: &str, start_time: i64) -> io::Result<PathBuf> {
@@ -1037,6 +1124,101 @@ mod tests {
             stream.contains("extra_provider_field"),
             "extra fields must survive in stream.jsonl"
         );
+    }
+
+    fn grok_update(status: &str, output: &str) -> String {
+        serde_json::json!({
+            "type": "tool_call_update",
+            "toolCallId": "call-1",
+            "status": status,
+            "content": [{
+                "type": "content",
+                "content": {"type": "text", "text": output},
+            }],
+            "rawOutput": {
+                "type": "Bash",
+                "output": output.as_bytes(),
+                "output_for_prompt": output,
+                "total_bytes": output.len(),
+            },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn grok_in_progress_updates_store_only_output_deltas() {
+        let dir = TempDir::new().unwrap();
+        let mut log =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
+        let mut uncoalesced_bytes = 0usize;
+
+        for update in 1..=32 {
+            let output = "x".repeat(update * 4096);
+            let raw = grok_update("in_progress", &output);
+            uncoalesced_bytes = uncoalesced_bytes.saturating_add(raw.len() + 1);
+            log.log_grok_raw_and_normalized(&raw, &[]);
+        }
+
+        let stream = fs::read_to_string(log.dir().join("stream.jsonl")).unwrap();
+        assert!(
+            stream.len().saturating_mul(8) < uncoalesced_bytes,
+            "delta stream must grow with total output, not every accumulated snapshot: {} vs {uncoalesced_bytes}",
+            stream.len()
+        );
+        let records = stream
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 32);
+        assert!(records
+            .iter()
+            .all(|record| record["quorum_output_delta"] == true));
+        let expected_last_delta = "x".repeat(4096);
+        assert_eq!(
+            records
+                .last()
+                .and_then(|record| record.pointer("/content/0/content/text"))
+                .and_then(serde_json::Value::as_str),
+            Some(expected_last_delta.as_str())
+        );
+    }
+
+    #[test]
+    fn raw_stream_cap_marks_once_drops_output_and_keeps_terminal_records() {
+        let dir = TempDir::new().unwrap();
+        let mut log =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
+        log.set_raw_stream_limit_for_test(512);
+
+        let retained = serde_json::json!({"type": "text", "data": "retain".repeat(30)}).to_string();
+        let dropped =
+            serde_json::json!({"type": "text", "data": "drop-this".repeat(30)}).to_string();
+        log.log_raw_and_normalized(&retained, &[]);
+        log.log_raw_and_normalized(&dropped, &[]);
+        log.log_raw_and_normalized(&dropped, &[]);
+
+        let completed = r#"{"type":"tool_call_update","toolCallId":"call-1","status":"completed"}"#;
+        let end = r#"{"type":"end","sessionId":"session-1"}"#;
+        log.log_grok_raw_and_normalized(completed, &[]);
+        log.log_raw_and_normalized(end, &[]);
+
+        let stream = fs::read_to_string(log.dir().join("stream.jsonl")).unwrap();
+        assert!(
+            stream.len() <= 512,
+            "stream exceeded cap: {} bytes",
+            stream.len()
+        );
+        assert_eq!(
+            stream
+                .lines()
+                .filter(|line| line.contains("provider.stream_bytes_truncated"))
+                .count(),
+            1
+        );
+        assert!(stream.contains("retain"));
+        assert!(!stream.contains("drop-this"));
+        assert!(stream.contains(r#""status":"completed""#));
+        assert!(stream.contains("session-1"));
     }
 
     #[test]

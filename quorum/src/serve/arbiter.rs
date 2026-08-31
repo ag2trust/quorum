@@ -180,8 +180,8 @@ pub fn build_arbiter_prompt(
     format!(
         "You are Quorum's plan-review Arbiter: a single-shot, stateless reviewer that judges the \
          planner's proposed decomposition before any child materializes. Judge the PROPOSAL against \
-         the authoritative SOURCE and the STRUCTURAL_SUMMARY on four mandates: faithfulness, \
-         coverage and non-overlap, coherence, and decomposability. \
+         the authoritative SOURCE and the STRUCTURAL_SUMMARY on five mandates: faithfulness, \
+         coverage and non-overlap, coherence, compile closure, and decomposability. \
          Faithfulness: every source requirement and constraint must be carried by some child; \
          nothing load-bearing may be dropped, weakened, or paraphrased away. \
          Coverage and non-overlap: the children together must cover the source's scope without \
@@ -391,8 +391,9 @@ pub async fn spawn_arbiter(
                     .feed_turn_until(&agent::user_turn(prompt), deadline)
                     .await
                 {
-                    let _ = proc.kill_and_reap().await;
-                    return Err(error);
+                    return Err(proc
+                        .diagnose_first_turn_feed_failure(error, Some(deadline))
+                        .await);
                 }
                 RunnerProc::Claude(proc)
             }
@@ -1034,6 +1035,9 @@ mod tests {
             "coverage",
             "compile-atomic signature seam is one child",
             "reserves those callers for a sibling",
+            "Compile closure",
+            "workspace to build and pass preflight on its own",
+            "Return blocking changes",
             "reject_source",
             "\"outcome\":\"approve\"",
             "SOURCE=",
