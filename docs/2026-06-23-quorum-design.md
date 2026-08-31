@@ -2237,9 +2237,17 @@ names its concrete implementation delta, affected paths, and non-goals, and carr
 load-bearing source requirement forward faithfully in the child that owns it. Tasks follow
 independently deliverable code or ownership seams; preserved
 behavior and regression-only expectations remain criteria or non-goals rather than synthetic
-implementation work. Before any task row is created, deterministic validation checks the closed
-shape, references, cycles, prohibited synthetic integration work, and the structured deliverables
-manifest (below); it no longer requires a byte-exact echo of source-marked literals. Plan
+implementation work. A compile-atomic ownership seam — a function or API signature change together
+with every caller that must move with it for the workspace to build and pass preflight after the
+child's prerequisites merge — is one child. A child that changes a function or API signature, or a
+shared type, trait, or struct shape used outside its own writable paths, must own every affected
+caller in the same child; it may not reserve those callers for a sibling, whether by omission from
+its deliverables or by an explicit sibling non-goal. When that compile closure cannot remain M-sized,
+the supported planner outcome is a `no_safe_split` blocker, not a manufactured definition/wiring
+split that individually fails to compile. Before any task row is created, deterministic validation
+checks the closed shape, references, cycles, prohibited synthetic integration work, and the
+structured deliverables manifest (below); it no longer requires a byte-exact echo of source-marked
+literals. Plan
 faithfulness — that every load-bearing source requirement and constraint is carried forward,
 nothing is dropped or silently weakened, the children cover the source without overlap, and the
 plan is coherent — is judged by the Arbiter plan-review gate (below), not by a deterministic
