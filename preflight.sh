@@ -12,9 +12,11 @@
 #   2. cargo fmt     — --all -- --check
 #   3. cargo clippy  — all targets and quorum-core/test-support
 #   4. cargo test    — compile/no-run then full execution, timed by the collector
+#   5. entrypoint    — host supervisor contract (when Docker inputs are present)
+#   6. container     — exact linux/amd64 build and real-container verification
 #
 # Usage:
-#   ./preflight.sh          # all four gates
+#   ./preflight.sh          # all six gates in the repository; four in policy fixtures
 #   ./preflight.sh --quick  # gates 1+2 only (what the pre-push hook runs)
 
 set -u
@@ -92,6 +94,11 @@ if [ "$HOOK_FORMAT_ONLY" -eq 1 ] \
 fi
 
 fail() { printf '\nPREFLIGHT: FAIL (%s)\n' "$1"; exit 1; }
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 \
+    || fail "required command not found: $1"
+}
 
 # Full preflight writes its timing evidence to this deterministic path. The
 # collector owns the Cargo gates and the per-test-binary top-N list; preflight
@@ -583,6 +590,40 @@ else
   esac
 fi
 
+TEST_EXECUTION_SUMMARY=$(test_execution_summary) \
+  || fail "read test execution counts"
+
+# Keep Docker integration additive to the current timing collector. Fixtures
+# that exercise preflight policy without the image sources retain the four
+# Cargo gates; the repository's real full gate always runs all six.
+DOCKER_GATES=0
+if [ -f Dockerfile ] && [ -x docker/entrypoint_test.sh ] \
+  && [ -x docker/verify.sh ]; then
+  DOCKER_GATES=1
+  printf '=== preflight 5/6: docker/entrypoint_test.sh ===\n'
+  ./docker/entrypoint_test.sh || fail "entrypoint contract"
+
+  require_command docker
+  require_command sqlite3
+  docker buildx version >/dev/null 2>&1 \
+    || fail "Docker buildx is unavailable"
+  docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
+
+  printf '=== preflight 6/6: linux/amd64 container verification ===\n'
+  PREFLIGHT_IMAGE_TAG="quorum-preflight:$(date +%s)-$$"
+  cleanup_preflight_image() {
+    status=$?
+    trap - 0
+    docker image rm "$PREFLIGHT_IMAGE_TAG" >/dev/null 2>&1 || true
+    exit "$status"
+  }
+  trap cleanup_preflight_image 0
+  docker buildx build --load --platform linux/amd64 \
+    --tag "$PREFLIGHT_IMAGE_TAG" . || fail "Docker image build"
+  ./docker/verify.sh "$PREFLIGHT_IMAGE_TAG" \
+    || fail "Docker image verification"
+fi
+
 if [ -n "$FULL_GATE_FINGERPRINT" ]; then
   if FINAL_FINGERPRINT=$(working_tree_fingerprint); then
     if [ "$FINAL_FINGERPRINT" = "$FULL_GATE_FINGERPRINT" ]; then
@@ -596,6 +637,8 @@ if [ -n "$FULL_GATE_FINGERPRINT" ]; then
   fi
 fi
 
-TEST_EXECUTION_SUMMARY=$(test_execution_summary) \
-  || fail "read test execution counts"
-printf '\nPREFLIGHT: PASS (all 4 gates green; %s)\n' "$TEST_EXECUTION_SUMMARY"
+if [ "$DOCKER_GATES" -eq 1 ]; then
+  printf '\nPREFLIGHT: PASS (all 6 gates green; %s)\n' "$TEST_EXECUTION_SUMMARY"
+else
+  printf '\nPREFLIGHT: PASS (all 4 gates green; %s)\n' "$TEST_EXECUTION_SUMMARY"
+fi

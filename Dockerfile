@@ -45,7 +45,9 @@ COPY --from=quorum-builder /src/target/release/quorum /usr/local/bin/quorum
 COPY --from=codex-fetcher /opt/codex /opt/codex
 COPY LICENSE /usr/share/doc/quorum/LICENSE
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod 0555 /usr/local/bin/entrypoint.sh
+COPY docker/serve-codex.toml /usr/share/quorum/serve-codex.toml
+RUN chmod 0555 /usr/local/bin/entrypoint.sh \
+    && chmod 0444 /usr/share/quorum/serve-codex.toml
 RUN install --directory --owner=10001 --group=10001 \
       /home/quorum \
       /data /data/quorum /data/repos /data/worktrees \
@@ -65,5 +67,5 @@ VOLUME ["/data"]
 WORKDIR /data/repos
 USER 10001:10001
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 CMD ["/usr/local/bin/entrypoint.sh"]

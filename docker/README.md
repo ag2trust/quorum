@@ -1,47 +1,36 @@
 # Container image
 
-The root `Dockerfile` builds the public, self-hostable `linux/amd64` Quorum runtime. Its
-default command supervises `quorum serve` and the read-only `quorum web` dashboard for one
-repository. `tini` runs as PID 1 and forwards signals to the supervisor.
+The root `Dockerfile` builds the generic public `linux/amd64` Quorum service
+image. Pinned `tini` is PID 1. The default command initializes durable state,
+then supervises one `quorum serve` authority and one loopback-only `quorum web`
+process without respawning either child.
 
 ## Build and verify
 
 Build from the repository root so `.dockerignore` bounds the context:
 
 ```sh
-docker build --platform linux/amd64 --tag quorum:local .
+docker buildx build --load --platform linux/amd64 --tag quorum:local .
 ./docker/verify.sh quorum:local
 ```
 
-Container verification requires a running Docker daemon and `sqlite3` on the host. The
-mandatory full `preflight.sh` gate additionally requires the Docker buildx plugin.
+Verification checks the image architecture, pinned tools and Codex checksum,
+host-side supervisor behavior, fresh Codex routing, and real-container service,
+shutdown, bind-collision, and daemon-lock behavior. It requires Docker buildx
+and `sqlite3` on the host.
 
-The build pins the Debian base digest, Rust builder version, direct `git` and `gh` package
-versions, and Codex release/checksum. A wrong `CODEX_SHA256` fails the build before the
-archive is extracted. `verify.sh` exercises this negative path automatically; the
-equivalent manual check is:
+The build pins the Debian base digest, Rust builder, direct `git`, `gh`, and
+`tini` packages, and the Codex release and archive checksum. A wrong
+`CODEX_SHA256` fails before extraction. The provider and base packages are
+upgraded by rebuilding the image.
 
-```sh
-docker build \
-  --build-arg CODEX_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
-  --target codex-fetcher .
-```
+## Prepare and run
 
-Rebuilding after a Debian package leaves its configured repositories may require updating
-the base digest and package pins together. The root-owned provider binary is upgraded by
-building and replacing the image. Quorum managed runs ignore Codex user configuration, so
-this image does not claim to control provider update behavior through a user config file.
-
-## Run the supervisor
-
-Set `QUORUM_REPO` to the repository's `owner/name` identity and mount durable state at
-`/data`. The volume must already contain a git checkout at `/data/repos/project`; the
-supervisor does not clone the repository.
-
-Run exactly one active container for each globally unique `owner/name` identity. Quorum
-namespaces coordination state by that identity, so different repositories resolve different
-state paths. Overlapping containers for the same identity are unsupported; during an upgrade,
-stop the old container before starting its replacement on the preserved state.
+Use one writable volume at `/data`. Before the first run, place the managed Git
+checkout at `/data/repos/project`; the service deliberately does not clone a
+repository. Its `.git` entry may be a directory or linked-worktree file, but it
+must identify a valid checkout. The mounted directory must be writable by
+numeric UID/GID `10001:10001`.
 
 ```sh
 docker run --rm \
@@ -50,47 +39,47 @@ docker run --rm \
   quorum:local
 ```
 
-On every start, the supervisor runs idempotent `quorum init` before either managed process.
-This creates or migrates the repository database and ensures the persistent routing config
-under `/data/quorum` exists; subsequent starts preserve that config.
+`QUORUM_REPO` must be a nonempty `owner/name`. On every start, the entrypoint
+prepares `/data/worktrees` and `/data/quorum/logs`, then runs idempotent
+`quorum init` from `/data/quorum/init`, outside the managed checkout. Persistent
+state is namespaced below `/data/quorum` through `QUORUM_HOME`.
 
-The dashboard listens on loopback only (`127.0.0.1:8080`) and is therefore not published
-outside the container, even if Docker maps the port. Set `QUORUM_WEB_PORT` to change its
-port. A proxy in an ordinary container on the same bridge network cannot reach that
-loopback address. Remote access requires a trusted sidecar sharing the Quorum container's
-network namespace (for example, `--network container:<quorum-container>`) and proxying the
-loopback listener. General ingress configuration is outside this image's current scope.
+For a fresh repository identity, the image atomically installs a Codex-only
+routing file at `/data/quorum/serve/<owner>__<name>.toml`; every managed role
+selects the bundled Codex CLI. An existing file at that path is never
+overwritten. Set `QUORUM_SERVE_CONFIG` to use another persistent file.
 
-The container never restarts a failed child. If Web exits unexpectedly, the container
-exits 1. Otherwise it propagates `quorum serve`'s exact code. Examples include 0 for a
-clean drain, 1 for an expected clean negative, 2 for usage or bad input, 3 for an internal,
-database, or migration failure, and 75 when supervised self-update is requested. An
-external orchestrator owns image rebuild and container relaunch. Base-branch self-update
-drain is disabled by default; set `QUORUM_SELF_UPDATE_DRAIN=1` to opt in.
+Readiness requires all three facts at once: both supervised children are live,
+`quorum status --json` reports live daemon authority, and Web returns a real
+HTTP response on `127.0.0.1`. Web always binds loopback; publishing the port
+does not make it remotely reachable. Remote access requires a separately
+secured proxy sharing the container's network namespace.
 
-## Runtime paths and settings
+The daemon identity lock rejects another container serving the same repository
+database, including containers whose isolated PID namespaces give both daemon
+processes the same numeric PID. Stop the active container before replacement.
 
-Run with one durable volume mounted at `/data`. Quorum's existing `QUORUM_HOME` override
-places its database, configuration, and logs below `/data/quorum`. The supervisor defaults
-to:
+## Lifecycle and overrides
 
-- repository checkout: `/data/repos/project`
-- transient task worktrees: `/data/worktrees`
-- Quorum state: `/data/quorum`
+An external SIGTERM reaches the full process group through `tini -g`. The
+supervisor also records direct and descendant PIDs, sends TERM, waits a bounded
+interval, escalates remaining processes to KILL, and reaps its direct children.
+It never internally respawns them.
 
-Override the checkout, worktree, log, Web port, or readiness budget with
-`QUORUM_REPO_DIR`, `QUORUM_WORKTREE_BASE`, `QUORUM_LOG_DIR`, `QUORUM_WEB_PORT`, or
-`QUORUM_READY_TRIES`, respectively. `QUORUM_REPO` is always required.
+The container propagates `quorum serve`'s exact exit status, including 0, 3,
+and 75. A Web-first failure stops serve and exits 1. Initialization failures
+also propagate exactly. Set `QUORUM_SELF_UPDATE_DRAIN=1` to let serve request
+external rebuild/relaunch with exit 75; it is disabled by default.
 
-The process runs as numeric UID/GID `10001:10001`; the mounted volume must be writable by
-that identity. The image contains no credentials. Inject provider and GitHub credentials
-at runtime through the hosting control plane; do not bake them into an image or volume.
+Docker command replacement is explicit and bypasses the default supervisor
+command while retaining `tini`, for example:
 
-## Provider boundary
+```sh
+docker run --rm quorum:local quorum --help
+```
 
-The image includes the pinned, checksummed Codex standalone package and its Apache license
-and notice. It intentionally does not include Claude Code: its redistribution terms have
-not been established for this public image. Self-hosters may create a derived image that
-installs Claude Code under terms they have independently accepted. Quorum itself does not
-need provider-specific container changes; configure a model profile with `runner = "codex"`
-and route the desired roles to that profile to select the bundled provider CLI.
+Runtime path and timing overrides are `QUORUM_REPO_DIR`,
+`QUORUM_WORKTREE_BASE`, `QUORUM_LOG_DIR`, `QUORUM_WEB_PORT`,
+`QUORUM_READY_TRIES`, and `QUORUM_SHUTDOWN_TRIES`. The image contains no
+credentials, tenancy, billing, gateway, or provisioning behavior; inject
+provider and GitHub credentials at runtime.
