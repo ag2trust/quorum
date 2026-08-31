@@ -387,10 +387,12 @@ if [ "$PROPOSED_SET" -eq 1 ]; then
 fi
 # A full author gate has no pre-push tuple, but a daemon-prepared PR
 # continuation still has authoritative local evidence: its configured remote
-# upstream is the published PR head. Recognize that history only when the
-# upstream is on TIP's first-parent chain and a later first-parent merge
-# contains a freshly fetched supported base. This keeps an ordinary branch that
-# merely tracks another feature branch on the strict base..TIP path.
+# upstream is the published PR head. Recognize the initial continuation when a
+# later first-parent merge contains a freshly fetched supported base. After the
+# daemon publishes that continuation, a remediation round has the merge at or
+# before its upstream instead; recognize that narrower managed-worktree shape
+# only for a differently named `remediation/*` branch. Ordinary branches that
+# merely track another feature branch stay on the strict base..TIP path.
 CONFIGURED_CONTINUATION_FROM=
 CONFIGURED_CONTINUATION_BASE=
 if [ "$QUICK" -eq 0 ] && [ "$PROPOSED_SET" -eq 0 ]; then
@@ -412,6 +414,24 @@ if [ "$QUICK" -eq 0 ] && [ "$PROPOSED_SET" -eq 0 ]; then
             fi
           done
         done
+        if [ -z "$CONFIGURED_CONTINUATION_FROM" ] \
+          && [ "${CONFIGURED_UPSTREAM_REF#refs/remotes/origin/}" != "$BRANCH" ]; then
+          case "$BRANCH" in
+            remediation/*)
+              for MERGE_SHA in $(git rev-list --first-parent --merges \
+                "$CONFIGURED_UPSTREAM_SHA"); do
+                for CANDIDATE_BASE in origin/develop origin/main; do
+                  if git rev-parse --verify --quiet "$CANDIDATE_BASE" >/dev/null \
+                    && git merge-base --is-ancestor "$CANDIDATE_BASE" "$MERGE_SHA"; then
+                    CONFIGURED_CONTINUATION_FROM=$CONFIGURED_UPSTREAM_SHA
+                    CONFIGURED_CONTINUATION_BASE=$CANDIDATE_BASE
+                    break 2
+                  fi
+                done
+              done
+              ;;
+          esac
+        fi
       fi
       ;;
   esac
