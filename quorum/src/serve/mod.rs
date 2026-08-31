@@ -139,6 +139,20 @@ const FAILED_WORKER_HANDOFF_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 /// Limit per-slot stream work so one noisy provider cannot starve other slots.
 const MAX_STREAM_LINES_PER_TICK: usize = 64;
+/// Claude and Codex readers retain partial records across cancelled polls, so a short readiness
+/// window preserves bytes while preventing a quiet turn from monopolizing the serialized tick.
+const STREAM_READ_POLL: Duration = Duration::from_millis(25);
+/// Grok's terminal handoff couples stdout EOF, process exit, and stderr completion. Keep its
+/// established evidence window until that adapter exposes a cancellation-safe readiness probe.
+const GROK_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn stream_read_timeout(kind: runner::AgentKind) -> Duration {
+    if kind == runner::AgentKind::Grok {
+        GROK_STREAM_READ_TIMEOUT
+    } else {
+        STREAM_READ_POLL
+    }
+}
 /// Cheap-polling pace between ticks. Applied on the success path at the end of
 /// `tick` and again on the `Continue` error path in `tick_loop`, which the
 /// success-path sleep never reaches.
@@ -17272,7 +17286,7 @@ fn require_remediation_continuation(
     Ok(continuation_id)
 }
 
-/// Drain stream events from an agent slot (bounded per tick, 5s timeout).
+/// Drain stream events from an agent slot with bounded records and a short readiness poll.
 /// Returns `Some(LimitBreached)` if a cost/time ceiling was hit.
 ///
 /// Raw provider lines are retained in stream.jsonl; Grok's repeated
@@ -17293,8 +17307,9 @@ async fn drain_events(
         QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
     })?;
     for _ in 0..MAX_STREAM_LINES_PER_TICK {
+        let read_timeout = stream_read_timeout(slot.process_kind());
         let read = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            read_timeout,
             slot.live_process_mut()
                 .map_err(|error| {
                     QuorumError::Io(format!("slot event drain requires a live process: {error}"))
@@ -24559,6 +24574,58 @@ mod tests {
                 .is_none()
         );
         assert_eq!(slot.live_stats.tool_count, MAX_STREAM_LINES_PER_TICK as u32);
+    }
+
+    #[tokio::test]
+    async fn drain_events_returns_promptly_for_a_quiet_slot() {
+        use tokio::io::BufReader;
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 2"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+            child,
+            stdin,
+            BufReader::new(stdout),
+        ));
+        let mut slot = slot_with_process(proc);
+        let tempdir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+
+        assert!(
+            drain_events(&mut slot, tempdir.path(), "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "a quiet provider held the serialized lifecycle tick for {:?}",
+            started.elapsed()
+        );
+
+        slot.kill_and_reap().await;
+    }
+
+    #[test]
+    fn stream_read_poll_is_short_for_claude_and_codex_but_preserves_grok_evidence_window() {
+        assert_eq!(
+            stream_read_timeout(runner::AgentKind::Claude),
+            STREAM_READ_POLL
+        );
+        assert_eq!(
+            stream_read_timeout(runner::AgentKind::Codex),
+            STREAM_READ_POLL
+        );
+        assert_eq!(
+            stream_read_timeout(runner::AgentKind::Grok),
+            GROK_STREAM_READ_TIMEOUT
+        );
     }
 
     #[cfg(unix)]

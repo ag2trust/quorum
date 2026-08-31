@@ -925,6 +925,7 @@ fn list_runs(root: &FsPath, before: Option<&str>, limit: usize) -> std::io::Resu
 struct StreamQuery {
     from: Option<u64>,
     max: Option<u64>,
+    follow: Option<bool>,
 }
 
 async fn api_stream(
@@ -936,7 +937,13 @@ async fn api_stream(
         .max
         .unwrap_or(DEFAULT_STREAM_BYTES)
         .min(MAX_STREAM_BYTES);
-    match stream_payload(&state.logs_root, &dir, query.from, max) {
+    match stream_payload(
+        &state.logs_root,
+        &dir,
+        query.from,
+        max,
+        query.follow.unwrap_or(false),
+    ) {
         Ok(value) => Json(value).into_response(),
         Err(StreamError::BadPath) => {
             (StatusCode::BAD_REQUEST, "invalid run directory").into_response()
@@ -986,12 +993,19 @@ fn stream_payload(
     dir: &str,
     from: Option<u64>,
     max: u64,
+    follow: bool,
 ) -> Result<Value, StreamError> {
     let path = run_dir(root, dir)?.join("stream.jsonl");
     let mut file = File::open(&path).map_err(StreamError::Io)?;
     let len = file.metadata().map_err(StreamError::Io)?.len();
     let start = from
-        .unwrap_or_else(|| len.saturating_sub(DEFAULT_STREAM_BYTES))
+        .unwrap_or_else(|| {
+            if follow {
+                len
+            } else {
+                len.saturating_sub(DEFAULT_STREAM_BYTES)
+            }
+        })
         .min(len);
     // A nonzero initial offset is not necessarily in the middle of a record: it can
     // land immediately after a newline. Only discard the first chunk when the byte
@@ -1011,7 +1025,7 @@ fn stream_payload(
     bytes.truncate(read);
     let next = start + read as u64;
     let complete_records = bytes.iter().filter(|byte| **byte == b'\n').count();
-    let partial = (!bytes.ends_with(b"\n")).then(|| {
+    let partial = (!bytes.is_empty() && !bytes.ends_with(b"\n")).then(|| {
         let start = bytes
             .iter()
             .rposition(|byte| *byte == b'\n')
@@ -1172,9 +1186,9 @@ mod tests {
         let dir = root.path().join("A-100");
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("stream.jsonl"), "one\ntwo\n").unwrap();
-        let first = stream_payload(root.path(), "A-100", Some(0), 4).unwrap();
+        let first = stream_payload(root.path(), "A-100", Some(0), 4, false).unwrap();
         let next = first["next_offset"].as_u64().unwrap();
-        let second = stream_payload(root.path(), "A-100", Some(next), 20).unwrap();
+        let second = stream_payload(root.path(), "A-100", Some(next), 20, false).unwrap();
         assert_eq!(second["lines"], json!(["74776f"]));
     }
 
@@ -1189,7 +1203,8 @@ mod tests {
         );
         fs::write(dir.join("stream.jsonl"), &record).unwrap();
 
-        let first = stream_payload(root.path(), "A-100", Some(0), DEFAULT_STREAM_BYTES).unwrap();
+        let first =
+            stream_payload(root.path(), "A-100", Some(0), DEFAULT_STREAM_BYTES, false).unwrap();
         assert_eq!(first["lines"], json!([]));
         assert_eq!(
             first["partial"].as_str().unwrap().len(),
@@ -1201,6 +1216,7 @@ mod tests {
             "A-100",
             first["next_offset"].as_u64(),
             DEFAULT_STREAM_BYTES,
+            false,
         )
         .unwrap();
         let reassembled = format!(
@@ -1219,7 +1235,8 @@ mod tests {
         let record_count = MAX_STREAM_RECORDS * 3;
         fs::write(dir.join("stream.jsonl"), "{}\n".repeat(record_count)).unwrap();
 
-        let payload = stream_payload(root.path(), "A-100", Some(0), DEFAULT_STREAM_BYTES).unwrap();
+        let payload =
+            stream_payload(root.path(), "A-100", Some(0), DEFAULT_STREAM_BYTES, false).unwrap();
         let lines = payload["lines"].as_array().unwrap();
         assert_eq!(lines.len(), MAX_STREAM_RECORDS);
         assert_eq!(payload["omitted"], json!(record_count - MAX_STREAM_RECORDS));
@@ -1240,12 +1257,44 @@ mod tests {
         assert_eq!(record.len(), DEFAULT_STREAM_BYTES as usize);
         fs::write(dir.join("stream.jsonl"), format!("discarded\n{record}")).unwrap();
 
-        let tail = stream_payload(root.path(), "A-100", None, DEFAULT_STREAM_BYTES).unwrap();
+        let tail = stream_payload(root.path(), "A-100", None, DEFAULT_STREAM_BYTES, false).unwrap();
         assert_eq!(tail["starts_mid_line"], json!(false));
         assert_eq!(
             tail["lines"],
             json!([hex_bytes(record.trim_end().as_bytes())])
         );
+    }
+
+    #[test]
+    fn stream_follow_starts_at_eof_and_returns_only_later_records() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("A-100");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("stream.jsonl"), "history\n").unwrap();
+
+        let initial =
+            stream_payload(root.path(), "A-100", None, DEFAULT_STREAM_BYTES, true).unwrap();
+        assert_eq!(initial["lines"], json!([]));
+        assert_eq!(initial["next_offset"], json!(8));
+        assert_eq!(initial["eof"], json!(true));
+
+        let mut stream = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("stream.jsonl"))
+            .unwrap();
+        writeln!(stream, "live").unwrap();
+
+        let update = stream_payload(
+            root.path(),
+            "A-100",
+            initial["next_offset"].as_u64(),
+            DEFAULT_STREAM_BYTES,
+            false,
+        )
+        .unwrap();
+        assert_eq!(update["lines"], json!([hex_bytes(b"live")]));
     }
 
     #[test]

@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}, TextDecoder};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_TASK_LIST_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskRoute, journeyModel, taskDetailModel, navigableRuns, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_TASK_LIST_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, shouldReconcileItem, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskRoute, journeyModel, taskDetailModel, navigableRuns, textValue, pollState, dashboardModel} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -47,8 +47,19 @@ assert.equal(denseAssistant.length, MAX_NORMALIZED_EVENTS_PER_RECORD);
 assert.equal(denseAssistant.at(-1).kind, 'meta');
 assert.match(denseAssistant.at(-1).title, /901 assistant blocks omitted/);
 
-// `item.started` is superseded by its `item.completed`; rendering both duplicates every row.
-assert.equal(normalizeEvents({type: 'item.started', item: {id: 'item_0', type: 'command_execution'}}).length, 0);
+// Live follow exposes the provider's start event immediately. The matching completion keeps
+// the same item identity so the browser can replace the in-progress row rather than duplicate it.
+const commandStarted = normalizeEvent({type: 'item.started', item: {id: 'item_0', type: 'command_execution', command: 'cargo test'}});
+const commandCompleted = normalizeEvent({type: 'item.completed', item: {id: 'item_0', type: 'command_execution', command: 'cargo test', aggregated_output: 'ok', exit_code: 0}});
+assert.equal(commandStarted.kind, 'command');
+assert.equal(commandStarted.state, 'in-progress');
+assert.equal(commandStarted.item_id, 'item_0');
+assert.equal(commandCompleted.state, 'completed');
+assert.equal(commandCompleted.item_id, 'item_0');
+assert.equal(commandCompleted.body.output, 'ok');
+assert.equal(shouldReconcileItem(commandStarted.state, commandCompleted.state), true);
+assert.equal(shouldReconcileItem(commandCompleted.state, commandStarted.state), false);
+assert.equal(shouldReconcileItem(commandCompleted.state, commandCompleted.state), false);
 
 const fileChange = normalizeEvent({type: 'item.completed', item: {type: 'file_change', changes: [{kind: 'modify', path: 'src/web.rs'}]}});
 assert.equal(fileChange.kind, 'meta');
@@ -112,15 +123,19 @@ tail = reassembleTail({}, denseLines.slice(-MAX_NORMALIZED_RECORDS_PER_POLL), nu
 assert.equal(tail.lines.length, MAX_NORMALIZED_RECORDS_PER_POLL);
 assert.equal(tail.omitted, 48_000);
 
-// Explicit navigation always starts a new, live view; offset zero is a replacement,
-// not an append to a paused stream or its partial continuation.
+// Explicit navigation always resets view state. Offset zero replays history; an absent
+// offset follows only new events from the live edge.
 const detail = detailNavigationState('B-200', 0);
 assert.equal(detail.openRun, 'B-200');
 assert.equal(detail.offset, 0);
+assert.equal(detail.following, false);
 assert.equal(detail.paused, false);
 assert.equal(detail.rawMode, false);
 assert.equal(detail.renderedChars, 0);
 assert.equal(Object.keys(detail.tailState).length, 0);
+const liveDetail = detailNavigationState('B-200', null);
+assert.equal(liveDetail.offset, null);
+assert.equal(liveDetail.following, true);
 
 // Task links use a browser route and load their durable detail from `/api/tasks/:id`.
 // A reload therefore keeps the task selection instead of exposing the raw JSON endpoint.
@@ -180,6 +195,8 @@ assert.equal(liveAgentTitle({name: 'A-100', task_id: null}), 'A-100 · Live tail
 assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="liveAgentTable"/);
 assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="taskList"/);
 assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="taskJourney"/);
+assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="runPicker"/);
+assert.match(fs.readFileSync('quorum/src/web.html', 'utf8'), /id="streamStatus"[^>]*aria-live="polite"/);
 
 class FakeClassList {
   constructor() { this.values = new Set(); }
@@ -198,7 +215,7 @@ class FakeDocument {
   constructor() {
     this.hidden = true;
     this.elements = new Map();
-    ['board', 'tasks', 'agents', 'run', 'task', 'pause', 'backToCockpit', 'start', 'rawToggle', 'moreRuns', 'newestRuns', 'moreTasks', 'taskList'].forEach(id => this.elements.set(id, new FakeNode(id)));
+    ['board', 'tasks', 'agents', 'run', 'task', 'pause', 'backToCockpit', 'live', 'start', 'rawToggle', 'moreRuns', 'newestRuns', 'moreTasks', 'taskList', 'runPicker', 'runControls', 'streamStatus', 'stream', 'rawStream'].forEach(id => this.elements.set(id, new FakeNode(id)));
     this.views = [new FakeNode()]; this.views[0].dataset.view = 'tasks';
   }
   getElementById(id) { return this.elements.get(id); }

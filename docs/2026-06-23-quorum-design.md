@@ -3138,7 +3138,14 @@ changes.
   permit remote binding; remote delivery requires a separately designed secure transport.
   Each request opens, reads, and closes SQLite before responding. Dashboard task and run
   pages are bounded, stream reads are byte-capped, and `--log-dir` selects the daemon's
-  configured log root.
+  configured log root. Without that override, the web process loads the repository's serve
+  configuration and uses its `log_dir`, falling back to `~/.quorum/logs` only when unset.
+  Opening an active run starts at the current end of `stream.jsonl` and follows newly appended
+  provider records; recorded history is an explicit replay action. Provider start records are
+  visible immediately and a later completion record with the same item identity replaces the
+  in-progress row. The daemon uses a short cancellation-safe readiness poll for quiet Claude and
+  Codex streams so one inactive turn cannot delay event draining for the remaining active slots
+  by seconds; Grok retains its longer terminal-evidence window.
 - **Out of scope (YAGNI, v1):** general auth · multi-machine coordination · remote HTTP/MCP server ·
   message editing · threads beyond `topic` · PR/review mirroring · cross-repo bus ·
   presence-based claim eviction · arbitrary-byte (BLOB) payloads · **agent-name uniqueness

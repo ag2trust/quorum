@@ -855,9 +855,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             bind,
             log_dir,
         } => {
+            let configured_log_dir = if log_dir.is_none() {
+                let repo = paths::resolve_repo()?;
+                let serve_config_path = serve_config::default_config_path(&repo)?;
+                serve_config::load(&serve_config_path, false)?.log_dir
+            } else {
+                None
+            };
             web::serve(
                 paths::db_path()?,
-                log_dir.unwrap_or(paths::home_dir()?.join("logs")),
+                resolve_web_log_dir(log_dir, configured_log_dir, paths::home_dir()?),
                 &bind,
                 port,
                 load_cfg()?.online_window_secs,
@@ -2179,6 +2186,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
     }
 }
 
+fn resolve_web_log_dir(
+    explicit: Option<std::path::PathBuf>,
+    configured: Option<String>,
+    quorum_home: std::path::PathBuf,
+) -> std::path::PathBuf {
+    explicit
+        .or_else(|| configured.map(std::path::PathBuf::from))
+        .unwrap_or_else(|| quorum_home.join("logs"))
+}
+
 /// Format a single `quorum tail` record. Decomposition planners use a closed,
 /// sanitized stream; every other agent keeps the existing provider-stream
 /// renderer unchanged.
@@ -2283,9 +2300,32 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_status_snapshot, parse_ttl, resolve_repo_override, tail_output_for_line,
-        validate_external_poll_interval, wait_child_stdout,
+        assemble_status_snapshot, parse_ttl, resolve_repo_override, resolve_web_log_dir,
+        tail_output_for_line, validate_external_poll_interval, wait_child_stdout,
     };
+
+    #[test]
+    fn web_log_dir_prefers_explicit_then_configured_then_home_default() {
+        use std::path::PathBuf;
+
+        let home = PathBuf::from("/quorum-home");
+        assert_eq!(
+            resolve_web_log_dir(
+                Some(PathBuf::from("/explicit")),
+                Some("/configured".into()),
+                home.clone(),
+            ),
+            PathBuf::from("/explicit")
+        );
+        assert_eq!(
+            resolve_web_log_dir(None, Some("/configured".into()), home.clone()),
+            PathBuf::from("/configured")
+        );
+        assert_eq!(
+            resolve_web_log_dir(None, None, home),
+            PathBuf::from("/quorum-home/logs")
+        );
+    }
 
     #[test]
     fn status_read_scope_drops_before_resource_sampling() {
