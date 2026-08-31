@@ -4,6 +4,8 @@ set -eu
 
 IMAGE=${1:-quorum:local}
 PLATFORM=linux/amd64
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+FAKE_CODEX=$SCRIPT_DIR/fake-codex.sh
 WORK=$(mktemp -d)
 SUFFIX=$$
 PRIMARY=quorum-primary-$SUFFIX
@@ -198,7 +200,7 @@ printf 'supervise: cross-container matching-PID daemon lock passed\n'
 # image's generated config. Claude is deliberately absent from the image.
 prepare_volume "$PROVIDER_VOLUME"
 docker run --rm --platform "$PLATFORM" --user 0 -v "$PROVIDER_VOLUME:/data" \
-  -v "$(dirname "$0")/fake-codex.sh:/tmp/fake-codex.sh:ro" \
+  -v "$FAKE_CODEX:/tmp/fake-codex.sh:ro" \
   "$IMAGE" sh -ec '
   mkdir -p /data/fake-bin
   cp /tmp/fake-codex.sh /data/fake-bin/codex
