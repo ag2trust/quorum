@@ -3721,7 +3721,7 @@ impl SlotState {
             && self.continuation_id.is_none()
             && matches!(
                 &self.proc,
-                SlotProcess::Running(proc) if proc.grok_terminal_candidate_pending()
+                SlotProcess::Running(proc) if proc.grok_terminal_handoff_pending()
             )
     }
 
@@ -24741,6 +24741,97 @@ mod tests {
 
         // This mirrors the only lifecycle transition the mailbox handler may
         // perform after the gate has verified the exact durable identity.
+        tasks::apply_event(
+            &mut conn,
+            "Internal-grok",
+            task_id,
+            &Event::SignaledDone { pr: "189".into() },
+            now_unix(),
+        )
+        .unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_submit_retains_terminal_beyond_raw_drain_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "i=0; while [ \"$i\" -lt {MAX_STREAM_LINES_PER_TICK} ]; do printf '%s\\n' '{{\"type\":\"text\",\"data\":\"ordinary\"}}'; i=$((i+1)); done; printf '%s\\n' '{{\"type\":\"end\",\"sessionId\":\"budget-submit-session\"}}'"
+        );
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(dir.path(), &body).await;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Internal-grok".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(189),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // The first bounded Phase 2 drain consumes only ordinary records.
+        // Clean process exit is not evidence that the unread suffix lacks a
+        // terminal identity, so retain the durable submit for the next tick.
+        assert_eq!(
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
+                .await
+                .unwrap(),
+            GrokWorkerDeliveryGate::Pending
+        );
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.has_pending_grok_terminal_handoff());
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            assert!(mailbox::has_unconsumed(
+                &conn,
+                "Internal-grok",
+                mailbox::MailboxKind::Done,
+                task_id,
+            )
+            .unwrap());
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert!(runner_state::continuation(&refs, ContinuationSlot::Worker, "grok").is_none());
+            assert!(runner_state::initial_worker_session(&refs).is_none());
+        }
+
+        assert_eq!(
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
+                .await
+                .unwrap(),
+            GrokWorkerDeliveryGate::Ready
+        );
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "budget-submit-session"
+        );
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "budget-submit-session"
+        );
         tasks::apply_event(
             &mut conn,
             "Internal-grok",

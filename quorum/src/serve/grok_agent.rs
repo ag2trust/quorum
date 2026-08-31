@@ -1213,8 +1213,11 @@ impl GrokProc {
         self.pending_terminal.is_some() && !self.terminal_rejected && self.stdout_complete
     }
 
-    pub(super) fn terminal_candidate_pending(&self) -> bool {
-        self.pending_terminal.is_some() && !self.terminal_rejected
+    pub(super) fn terminal_handoff_pending(&self) -> bool {
+        // A bounded drain may stop before it reads the terminal record. Until
+        // clean EOF proves otherwise, an exited child has not demonstrated
+        // that its required terminal identity is absent.
+        !self.terminal_rejected && (self.pending_terminal.is_some() || !self.stdout_complete)
     }
 
     pub(super) fn normalize_stream_line(raw: &str) -> Vec<AgentEvent> {
