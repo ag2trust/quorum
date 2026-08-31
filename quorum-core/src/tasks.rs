@@ -11,7 +11,9 @@
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
 use crate::lifecycle::{Effect, Event, Status, TaskView};
-use crate::runner_state::{self, PendingTurn, ProviderBlock};
+use crate::runner_state::{
+    self, ContinuationSlot, InitialWorkerSession, PendingTurn, ProviderBlock,
+};
 use crate::sweep::SWEEP_LIMIT;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::Serialize;
@@ -2089,6 +2091,84 @@ pub enum LateReviewerVerdict {
 /// lifecycle before generic recovery can discard the journal identity that
 /// proves its authority. The exact mailbox row is re-read and consumed in the
 /// same transaction as the lifecycle transition.
+fn late_grok_initial_handoff(
+    refs: Option<&str>,
+    task_id: i64,
+    agent: &str,
+) -> Option<InitialWorkerSession> {
+    let refs: serde_json::Value = serde_json::from_str(refs?).ok()?;
+    let initial = runner_state::initial_worker_session(&refs)?;
+    // Rework advances the current continuation; the initial handoff remains
+    // the immutable proof of the original worker assignment.
+    let _current_continuation =
+        runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")?;
+    (initial.task_id == task_id
+        && initial.agent == agent
+        && initial.role == "worker"
+        && initial.provider == "grok"
+        && initial.runner == "grok"
+        && initial.pending_turn.provider == "grok")
+        .then_some(initial)
+}
+
+/// A late Grok delivery has no live process to re-authorize its terminal
+/// record. Its original handoff must therefore already be durable and still
+/// trace to the exact initial worker run and immutable assignment before the
+/// startup transaction can expose review state.
+fn late_grok_handoff_is_durable(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    agent: &str,
+    refs: Option<&str>,
+) -> Result<bool> {
+    let Some(initial) = late_grok_initial_handoff(refs, task_id, agent) else {
+        return Ok(false);
+    };
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM agent_runs initial_run
+             JOIN role_assignments initial_assignment
+               ON initial_assignment.id=initial_run.role_assignment_id
+             WHERE initial_run.task_id=?1
+               AND initial_run.agent_name=?2
+               AND initial_run.role='worker'
+               AND initial_run.provider='grok'
+               AND initial_run.role_assignment_id=?3
+               AND initial_run.model=?4
+               AND initial_run.effort=?5
+               AND initial_assignment.task_id=?1
+               AND initial_assignment.responsibility_key=?6
+               AND initial_assignment.role='worker'
+               AND initial_assignment.provider='grok'
+               AND initial_assignment.runner='grok'
+               AND initial_assignment.model=?4
+               AND initial_assignment.effort=?5
+         )
+         AND EXISTS(
+             SELECT 1
+             FROM agent_runs active_run
+             WHERE active_run.task_id=?1
+               AND active_run.agent_name=?2
+               AND active_run.role='worker'
+               AND active_run.provider='grok'
+               AND active_run.model=?4
+               AND active_run.effort=?5
+               AND active_run.ended_at IS NULL
+         )",
+        params![
+            task_id,
+            agent,
+            initial.role_assignment_id,
+            initial.model,
+            initial.effort,
+            initial.responsibility_key,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 pub fn recover_late_worker_completion(
     conn: &mut Connection,
     mailbox_id: i64,
@@ -2099,9 +2179,9 @@ pub fn recover_late_worker_completion(
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
-    let status: Option<String> = tx
+    let recovered: Option<(String, Option<String>, Option<String>)> = tx
         .query_row(
-            "SELECT t.status
+            "SELECT t.status,t.refs,j.provider
              FROM mailbox m
              JOIN tasks t ON t.id=m.task_id
              JOIN journal j ON j.agent=m.agent AND j.role='worker'
@@ -2118,19 +2198,41 @@ pub fn recover_late_worker_completion(
                      AND ar.role='worker'
                )",
             params![mailbox_id, agent, task_id, pr],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some(status) = status else {
+    let Some((status, refs, journal_provider)) = recovered else {
         tx.commit()?;
         return Ok(false);
     };
+    // Current journal entries carry their provider. Older rows did not, so
+    // preserve their non-Grok recovery behavior while still failing closed if
+    // their matching worker evidence identifies Grok.
+    let grok_run_exists: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM agent_runs
+             WHERE task_id=?1 AND agent_name=?2 AND role='worker' AND provider='grok'
+         )",
+        params![task_id, agent],
+        |row| row.get(0),
+    )?;
+    let grok_recovery = journal_provider.as_deref() == Some("grok")
+        || (journal_provider.is_none() && grok_run_exists);
+    if grok_recovery && !late_grok_handoff_is_durable(&tx, task_id, agent, refs.as_deref())? {
+        tx.commit()?;
+        return Ok(false);
+    }
     let event = if status == "rework" {
         Event::ReworkPushed
     } else {
         Event::SignaledDone { pr: pr.to_string() }
     };
-    apply_event_tx(tx, agent, task_id, &event, now, |tx| {
+    // A controlled shutdown intentionally revokes the worker lease but keeps
+    // the task assigned for restart recovery. For an exact Grok handoff, defer
+    // housekeeping until after the already-authorized terminal transition so
+    // that sweep cannot erase that assignment between its validation and the
+    // lifecycle event. The entire sequence remains one immediate transaction.
+    apply_event_tx_with_deferred_sweep(tx, agent, task_id, &event, now, grok_recovery, |tx| {
         if let Some(publication) = publication {
             settle_published_worker_tx(tx, task_id, publication, now)?;
         } else {
@@ -2367,8 +2469,25 @@ fn apply_event_tx<F>(
 where
     F: FnOnce(&Transaction<'_>) -> Result<()>,
 {
+    apply_event_tx_with_deferred_sweep(tx, agent, id, event, now, false, before_commit)
+}
+
+fn apply_event_tx_with_deferred_sweep<F>(
+    tx: Transaction<'_>,
+    agent: &str,
+    id: i64,
+    event: &Event,
+    now: i64,
+    defer_sweep: bool,
+    before_commit: F,
+) -> Result<TransitionResult>
+where
+    F: FnOnce(&Transaction<'_>) -> Result<()>,
+{
     crate::agents::touch(&tx, agent, now)?;
-    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    if !defer_sweep {
+        crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    }
 
     let task = tx
         .query_row(
@@ -2632,6 +2751,10 @@ where
     }
 
     before_commit(&tx)?;
+
+    if defer_sweep {
+        crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    }
 
     let mut result_task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
