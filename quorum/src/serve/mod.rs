@@ -25259,24 +25259,23 @@ mod tests {
             "sleep 6; printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"shutdown-session\"}'",
         )
         .await;
-        {
+        let done = mailbox::MailboxRow {
+            agent: "Internal-grok".into(),
+            kind: mailbox::MailboxKind::Done,
+            task_id: Some(task_id),
+            pr: Some(189),
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        };
+        let mailbox_id = {
             let mut conn = quorum_core::db::open(&db_path).unwrap();
-            mailbox::append(
-                &mut conn,
-                &mailbox::MailboxRow {
-                    agent: "Internal-grok".into(),
-                    kind: mailbox::MailboxKind::Done,
-                    task_id: Some(task_id),
-                    pr: Some(189),
-                    verdict: None,
-                    feedback: None,
-                    note: None,
-                    to_agent: None,
-                    payload: None,
-                },
-            )
-            .unwrap();
-        }
+            let mailbox_id = mailbox::append(&mut conn, &done).unwrap();
+            journal::upsert(&mut conn, &slot_journal_entry(&slot, "worker", "working")).unwrap();
+            mailbox_id
+        };
 
         assert_eq!(
             gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
@@ -25286,14 +25285,14 @@ mod tests {
             "a running Grok terminal handoff remains pending rather than entering review"
         );
 
-        let cap_run_id = slot.cap_run_id.as_deref().unwrap();
+        let cap_run_id = slot.cap_run_id.clone().unwrap();
         let mut conn = quorum_core::db::open(&db_path).unwrap();
         assert!(
             tasks::suspend_run_for_controlled_shutdown(
                 &mut conn,
                 "Internal-grok",
                 task_id,
-                cap_run_id,
+                &cap_run_id,
                 now_unix(),
             )
             .unwrap(),
@@ -25308,6 +25307,98 @@ mod tests {
             mailbox::has_unconsumed(&conn, "Internal-grok", mailbox::MailboxKind::Done, task_id,)
                 .unwrap(),
             "shutdown must not consume a delivery that never received its terminal identity"
+        );
+        drop(conn);
+
+        assert!(
+            !recover_late_worker_done_atomic(&db_path, mailbox_id, &done, done.pr, None)
+                .await
+                .unwrap(),
+            "startup late-delivery recovery must retain a submitted Grok row without its durable terminal handoff"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "working"
+        );
+        assert!(
+            mailbox::has_unconsumed(&conn, "Internal-grok", mailbox::MailboxKind::Done, task_id,)
+                .unwrap(),
+            "late recovery must not consume a Grok delivery lacking both durable refs"
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_late_delivery_recovers_after_exact_handoff_before_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"restart-session\"}'",
+        )
+        .await;
+        assert!(
+            drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none(),
+            "the exact terminal handoff must persist before shutdown"
+        );
+        let done = mailbox::MailboxRow {
+            agent: "Internal-grok".into(),
+            kind: mailbox::MailboxKind::Done,
+            task_id: Some(task_id),
+            pr: Some(189),
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        };
+        let mailbox_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let mailbox_id = mailbox::append(&mut conn, &done).unwrap();
+            journal::upsert(&mut conn, &slot_journal_entry(&slot, "worker", "working")).unwrap();
+            let cap_run_id = slot.cap_run_id.as_deref().unwrap();
+            assert!(tasks::suspend_run_for_controlled_shutdown(
+                &mut conn,
+                "Internal-grok",
+                task_id,
+                cap_run_id,
+                now_unix(),
+            )
+            .unwrap());
+            mailbox_id
+        };
+
+        assert!(
+            recover_late_worker_done_atomic(&db_path, mailbox_id, &done, done.pr, None)
+                .await
+                .unwrap(),
+            "startup late recovery must fold an already-complete exact Grok handoff"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "restart-session"
+        );
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "restart-session"
+        );
+        assert!(
+            !mailbox::has_unconsumed(&conn, "Internal-grok", mailbox::MailboxKind::Done, task_id,)
+                .unwrap(),
+            "a valid late delivery must be consumed with its lifecycle transition"
         );
         drop(conn);
         slot.kill_and_reap().await;
