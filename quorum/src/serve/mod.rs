@@ -17167,20 +17167,26 @@ async fn gate_grok_worker_delivery(
     // `end` can be authorized. If that evidence remains pending, retain the
     // mailbox row even after the child exited; the next tick finishes the
     // bounded drain instead of treating the submission as successful.
-    if slot.has_pending_grok_terminal_handoff()
-        || slot
-            .try_wait()
-            .map_err(|error| QuorumError::Io(format!("Grok delivery exit check failed: {error}")))?
-            .is_none()
-    {
+    let exit_status = slot
+        .try_wait()
+        .map_err(|error| QuorumError::Io(format!("Grok delivery exit check failed: {error}")))?;
+    if slot.has_pending_grok_terminal_handoff() || exit_status.is_none() {
         return Ok(GrokWorkerDeliveryGate::Pending);
     }
 
+    // The leader exited and this drain neither found an authorized terminal
+    // nor exhausted its raw-record budget. Finalize the retained-pipe evidence
+    // under the existing bounded exit policy before failing the delivery.
+    slot.finalize_pre_authoritative_exit_evidence("worker", limits)
+        .await;
     let detail = slot
-        .last_error_text
-        .as_deref()
-        .unwrap_or("Grok process exited without an authorized terminal session identity");
-    Ok(GrokWorkerDeliveryGate::Failed(detail.to_string()))
+        .classify_pre_authoritative_exit(exit_status.expect("exited Grok process checked above"))
+        .map(|failure| failure.to_string())
+        .or_else(|| slot.last_error_text.clone())
+        .unwrap_or_else(|| {
+            "Grok process exited without an authorized terminal session identity".into()
+        });
+    Ok(GrokWorkerDeliveryGate::Failed(detail))
 }
 
 /// The in-memory continuation becomes usable only after its persistence call,
@@ -17273,7 +17279,13 @@ async fn drain_events(
     persist_diagnostics(slot).map_err(|error| {
         QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
     })?;
-    for _ in 0..MAX_STREAM_LINES_PER_TICK {
+    slot.live_process_mut()
+        .map_err(|error| {
+            QuorumError::Io(format!("slot event drain requires a live process: {error}"))
+        })?
+        .set_grok_raw_drain_budget_exhausted(false);
+    let mut raw_drain_budget_exhausted = false;
+    for line_index in 0..MAX_STREAM_LINES_PER_TICK {
         let read = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             slot.live_process_mut()
@@ -17316,6 +17328,7 @@ async fn drain_events(
         };
         let events = match drained {
             DrainedLine::Raw(raw_line) => {
+                raw_drain_budget_exhausted = line_index + 1 == MAX_STREAM_LINES_PER_TICK;
                 let events = slot
                     .live_process_mut()
                     .map_err(|error| {
@@ -17535,6 +17548,11 @@ async fn drain_events(
             QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
         })?;
     }
+    slot.live_process_mut()
+        .map_err(|error| {
+            QuorumError::Io(format!("slot event drain requires a live process: {error}"))
+        })?
+        .set_grok_raw_drain_budget_exhausted(raw_drain_budget_exhausted);
     Ok(None)
 }
 
@@ -24844,6 +24862,109 @@ mod tests {
             tasks::get(&conn, task_id).unwrap().unwrap().status,
             "in-review"
         );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_submit_exited_without_terminal_and_descendant_pipe_fails_boundedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "i=0; while [ \"$i\" -lt {MAX_STREAM_LINES_PER_TICK} ]; do printf '%s\\n' '{{\"type\":\"text\",\"data\":\"ordinary\"}}'; i=$((i+1)); done; sleep 30 & exit 0"
+        );
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(dir.path(), &body).await;
+        let mailbox_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Internal-grok".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(189),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap()
+        };
+
+        // The first drain has an unread suffix, so retain the submitted row
+        // for one more bounded read. The background sleep inherited stdout
+        // but the Grok leader exits without its required terminal identity.
+        assert_eq!(
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
+                .await
+                .unwrap(),
+            GrokWorkerDeliveryGate::Pending
+        );
+        assert!(slot.has_pending_grok_terminal_handoff());
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            assert!(mailbox::has_unconsumed(
+                &conn,
+                "Internal-grok",
+                mailbox::MailboxKind::Done,
+                task_id,
+            )
+            .unwrap());
+        }
+
+        // The next drain times out on the descendant-held pipe. It did not
+        // exhaust its raw-record budget, so the gate must finalize exit
+        // evidence within the existing bound and reject the terminal-free
+        // delivery rather than retaining the task forever.
+        let gate = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default()).await
+        })
+        .await
+        .expect("descendant-held stdout must not leave the Grok submit pending forever")
+        .unwrap();
+        assert!(matches!(gate, GrokWorkerDeliveryGate::Failed(_)));
+        assert!(!slot.has_pending_grok_terminal_handoff());
+        assert!(slot
+            .observed_pre_authoritative_failure()
+            .unwrap()
+            .to_string()
+            .contains("stdout finalization timed out"));
+
+        // Mirror Phase 2's daemon-only rejection path: it releases working
+        // authority and consumes the submitted delivery after the bounded
+        // failure, leaving normal recovery able to provision a fresh worker.
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Internal-grok",
+            task_id,
+            &Event::AgentFailed {
+                reason: "Grok submission rejected before review: missing terminal identity".into(),
+            },
+            now_unix(),
+        )
+        .unwrap();
+        mailbox::mark_consumed(&mut conn, mailbox_id).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert!(task.assignee.is_none());
+        let active_lease_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                [tasks::lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_lease_count, 0);
+        assert!(!mailbox::has_unconsumed(
+            &conn,
+            "Internal-grok",
+            mailbox::MailboxKind::Done,
+            task_id,
+        )
+        .unwrap());
         drop(conn);
         slot.kill_and_reap().await;
     }

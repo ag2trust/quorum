@@ -908,6 +908,10 @@ pub struct GrokProc {
     pending_terminal: Option<String>,
     terminal_rejected: bool,
     stdout_complete: bool,
+    // Set only when the daemon's bounded raw drain consumed its entire
+    // allocation without reaching EOF. It grants the next drain a chance to
+    // inspect the unread suffix; an open pipe alone is not terminal evidence.
+    raw_drain_budget_exhausted: bool,
     terminal_exit_status: Option<std::process::ExitStatus>,
     worker_request: Option<Box<WorkerTurnRequest>>,
     // Keeps the invocation-local full config layer alive until the child and
@@ -1021,6 +1025,7 @@ impl GrokProc {
             pending_terminal: None,
             terminal_rejected: false,
             stdout_complete: false,
+            raw_drain_budget_exhausted: false,
             terminal_exit_status: None,
             worker_request: None,
             _mcp_config_home: mcp_config_home,
@@ -1213,11 +1218,17 @@ impl GrokProc {
         self.pending_terminal.is_some() && !self.terminal_rejected && self.stdout_complete
     }
 
+    pub(super) fn set_raw_drain_budget_exhausted(&mut self, exhausted: bool) {
+        self.raw_drain_budget_exhausted = exhausted;
+    }
+
     pub(super) fn terminal_handoff_pending(&self) -> bool {
-        // A bounded drain may stop before it reads the terminal record. Until
-        // clean EOF proves otherwise, an exited child has not demonstrated
-        // that its required terminal identity is absent.
-        !self.terminal_rejected && (self.pending_terminal.is_some() || !self.stdout_complete)
+        // A bounded drain may stop immediately before the terminal record.
+        // Each subsequent drain clears this marker before reading again, so a
+        // leader exit plus an open descendant-held pipe cannot defer a
+        // terminal-free delivery forever.
+        !self.terminal_rejected
+            && (self.pending_terminal.is_some() || self.raw_drain_budget_exhausted)
     }
 
     pub(super) fn normalize_stream_line(raw: &str) -> Vec<AgentEvent> {
@@ -2060,6 +2071,7 @@ mod tests {
             pending_terminal: None,
             terminal_rejected: false,
             stdout_complete: false,
+            raw_drain_budget_exhausted: false,
             terminal_exit_status: None,
             worker_request: None,
             _mcp_config_home: None,

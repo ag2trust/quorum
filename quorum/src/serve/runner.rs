@@ -997,6 +997,12 @@ impl RunnerProc {
         matches!(self, Self::Grok(proc) if proc.terminal_handoff_pending())
     }
 
+    pub fn set_grok_raw_drain_budget_exhausted(&mut self, exhausted: bool) {
+        if let Self::Grok(proc) = self {
+            proc.set_raw_drain_budget_exhausted(exhausted);
+        }
+    }
+
     #[cfg(test)]
     pub fn inject_grok_stdout_read_error_after_lines(&mut self, lines: usize) {
         if let Self::Grok(proc) = self {
