@@ -31,17 +31,23 @@ RUN curl --fail --location --show-error \
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 ARG GIT_VERSION=1:2.39.5-0+deb12u3
 ARG GH_VERSION=2.23.0+dfsg1-1
+ARG TINI_VERSION=0.19.0-1+b3
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
       ca-certificates=20230311+deb12u1 \
       git="${GIT_VERSION}" \
       gh="${GH_VERSION}" \
       openssh-client \
+      tini="${TINI_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=quorum-builder /src/target/release/quorum /usr/local/bin/quorum
 COPY --from=codex-fetcher /opt/codex /opt/codex
 COPY LICENSE /usr/share/doc/quorum/LICENSE
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/serve-codex.toml /usr/share/quorum/serve-codex.toml
+RUN chmod 0555 /usr/local/bin/entrypoint.sh \
+    && chmod 0444 /usr/share/quorum/serve-codex.toml
 RUN install --directory --owner=10001 --group=10001 \
       /home/quorum \
       /data /data/quorum /data/repos /data/worktrees \
@@ -61,5 +67,5 @@ VOLUME ["/data"]
 WORKDIR /data/repos
 USER 10001:10001
 
-# QIMG-002 will replace this diagnostic default with daemon/web supervision.
-CMD ["quorum", "--help"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
+CMD ["/usr/local/bin/entrypoint.sh"]

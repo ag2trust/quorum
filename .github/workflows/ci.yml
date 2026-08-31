@@ -72,3 +72,13 @@ jobs:
       - run: scripts/test-dev-install.sh
       - run: scripts/test-dogfood-install.sh
       - run: scripts/test-preflight.sh
+      - run: docker/entrypoint_test.sh
+
+  container:
+    name: container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install --yes sqlite3
+      - run: docker buildx build --load --platform linux/amd64 --tag quorum:ci .
+      - run: docker/verify.sh quorum:ci
