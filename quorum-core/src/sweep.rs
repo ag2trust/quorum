@@ -116,7 +116,7 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
             // lifecycle layer); the resulting terminal park is owner-gated.
             let park_reason = format!("remediation {reason}");
             let parked_refs =
-                crate::tasks::set_parked_refs(refs.as_deref(), &park_reason, "rework")?;
+                crate::tasks::set_parked_refs(refs.as_deref(), &park_reason, "rework", None)?;
             conn.execute(
                 "UPDATE tasks SET status='failed', assignee=NULL, refs=?2, updated_at=?3 WHERE id=?1",
                 params![id, parked_refs, now],
@@ -328,6 +328,13 @@ const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
     ("task_graph_members", "task_id"),
     ("decomposition_cleanup", "task_id"),
     ("reviewer_provision_reservations", "task_id"),
+    ("github_collaboration_attempts", "task_id"),
+    ("github_agent_operations", "task_id"),
+    ("github_review_publication_slots", "task_id"),
+    // A fallback launch remains replayable across restart, so its exact
+    // descriptor must retain the owning task until an explicit lifecycle path
+    // clears the durable intent in a future change.
+    ("fallback_launch_intents", "task_id"),
     ("review_followup_batches", "task_id"),
     ("review_followup_batches", "source_task_id"),
     ("review_followup_artifacts", "linked_task_id"),
@@ -610,6 +617,9 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     delete_bounded(conn, "agent_sessions", now, limit)?;
     delete_bounded(conn, "activity_events", now, limit)?;
     delete_token_usage_bounded(conn, now, limit)?;
+    // Collaboration operation groups are reclaimed only by the executor's
+    // atomic terminal-and-settled group proof. Generic sweep has no authority
+    // to discard their recovery identities independently.
     crate::task_messages::expire_stale_deliveries(conn, now, limit)?;
     delete_bounded(conn, "task_messages", now, limit)?;
     delete_reclaimable_task_rows_bounded(conn, now, limit)?;
@@ -653,6 +663,8 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
         params![now],
     )?;
     delete_all_expired_token_usage(&tx, now)?;
+    // See sweep_on_write: executor-owned group reclamation is deliberately
+    // deferred until it can prove terminal and settled parent state atomically.
     crate::task_messages::expire_stale_deliveries(&tx, now, usize::MAX)?;
     tx.execute(
         "DELETE FROM task_messages WHERE expires_at <= ?1",

@@ -141,6 +141,14 @@ pub enum DefaultBranchStatus {
 pub trait MergeExecutor: Send + Sync {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult;
 
+    /// GitHub's immutable merge commit for a completed PR. The production
+    /// implementation asks the PR API after merge; unavailable metadata is
+    /// intentionally represented as `None` so callers can keep the lifecycle
+    /// conservative rather than inventing a commit identity.
+    fn merge_commit_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+        None
+    }
+
     fn wait_for_checks(
         &self,
         _pr: i64,
@@ -754,6 +762,16 @@ fn parse_mergeability(json_str: &str) -> MergeabilityState {
     }
 }
 
+fn parse_merge_commit_sha(json_str: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json_str)
+        .ok()?
+        .get("mergeCommit")?
+        .get("oid")?
+        .as_str()
+        .filter(|sha| !sha.is_empty() && !sha.contains('\0'))
+        .map(str::to_owned)
+}
+
 /// Parse the `--jq .isDraft` output of `gh pr view` (bare `true`/`false`).
 /// Anything that isn't exactly `true` is treated as not-draft (fail-safe:
 /// a query hiccup skips the undraft and behaves as it did before this guard).
@@ -879,6 +897,16 @@ impl MergeExecutor for GhMergeExecutor {
         }
 
         result
+    }
+
+    fn merge_commit_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
+        let pr = pr.to_string();
+        let mut cmd = self.build_gh_cmd(&["pr", "view", &pr, "--json", "mergeCommit"], repo_dir);
+        let output = cmd.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_merge_commit_sha(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn wait_for_checks(
@@ -1125,6 +1153,24 @@ impl MergeExecutor for CommandMergeExecutor {
                 failure_kind: Some(MergeFailureKind::PolicyBlocked),
             },
         }
+    }
+
+    fn merge_commit_sha(&self, _pr: i64, repo_dir: &Path) -> Option<String> {
+        // `--merge-cmd` is a hidden local-test seam rather than a GitHub
+        // executor. Its successful command has no GraphQL mergeCommit to
+        // query, so use the immutable repository object the fixture exposes
+        // as its simulated merge witness. Production uses GhMergeExecutor and
+        // must still obtain GitHub's real mergeCommit above.
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_dir)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!sha.is_empty()).then_some(sha)
     }
 
     fn wait_for_checks(

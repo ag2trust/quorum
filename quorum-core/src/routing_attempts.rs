@@ -200,20 +200,33 @@ pub fn record(
     input: &RecordRoutingAttempt<'_>,
     eligible_pool: &ValidatedPool,
 ) -> Result<RecordOutcome> {
+    let tx = begin_immediate(conn)?;
+    let outcome = record_tx(&tx, input, eligible_pool)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(outcome)
+}
+
+/// Transactional form of [`record`].
+///
+/// A fallback coordinator can compose immutable route evidence with the
+/// retiring run's authority cleanup under the same serialization point.
+pub fn record_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &RecordRoutingAttempt<'_>,
+    eligible_pool: &ValidatedPool,
+) -> Result<RecordOutcome> {
     eligible_pool.validate()?;
     validate_text("responsibility key", input.responsibility_key)?;
     if input.role_assignment_id <= 0 || input.recorded_at < 0 {
         return usage("routing attempt assignment must be positive and timestamp non-negative");
     }
 
-    let tx = begin_immediate(conn)?;
-    let assignment = crate::role_assignments::get(&tx, input.role_assignment_id)?
+    let assignment = crate::role_assignments::get(tx, input.role_assignment_id)?
         .ok_or_else(|| QuorumError::Io("routing attempt role assignment is missing".into()))?;
     validate_assignment(&assignment, input, eligible_pool)?;
 
-    if let Some(existing) = get_by_route(&tx, input.role_assignment_id, &input.profile.id)? {
+    if let Some(existing) = get_by_route(tx, input.role_assignment_id, &input.profile.id)? {
         ensure_replay_matches(&existing, input, eligible_pool)?;
-        tx.commit().map_err(map_sql_err)?;
         return Ok(RecordOutcome::Replayed(existing));
     }
 
@@ -247,9 +260,8 @@ pub fn record(
             input.recorded_at,
         ],
     )?;
-    let inserted = get_by_route(&tx, input.role_assignment_id, &input.profile.id)?
+    let inserted = get_by_route(tx, input.role_assignment_id, &input.profile.id)?
         .ok_or_else(|| QuorumError::Io("recorded routing attempt is missing".into()))?;
-    tx.commit().map_err(map_sql_err)?;
     Ok(RecordOutcome::Inserted(inserted))
 }
 

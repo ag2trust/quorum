@@ -121,6 +121,19 @@ pub fn wait_for_daemon_state<F>(
     }
 }
 
+/// Erase any surviving `daemon_lock` row from a SIGKILLed previous run.
+/// Under instance-identity authority (task #179), a fresh row from a
+/// different instance blocks the next `serve` acquire even when the numeric
+/// PID is dead — a live daemon in another namespace would look identical. A
+/// real supervisor either waits `stale_secs` or clears the lock explicitly;
+/// tests that model a hard crash followed by an immediate restart do the
+/// latter to keep runtime tight.
+pub fn clear_daemon_lock(db_path: &Path) {
+    let conn = quorum_core::db::open(db_path).expect("open db to clear daemon_lock");
+    conn.execute("DELETE FROM daemon_lock WHERE id = 1", [])
+        .expect("delete daemon_lock row");
+}
+
 pub fn terminate_and_drain(
     child: &mut Child,
     rx: &mpsc::Receiver<String>,

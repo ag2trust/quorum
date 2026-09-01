@@ -416,6 +416,22 @@ PATH="$BIN:$PATH" git push -q origin \
 REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/continuation-t3)
 [ "$REMOTE_SHA" = "$CONTINUATION_HEAD_SHA" ]
 
+# A later remediation round starts at the now-published continuation head, so
+# its ancestry-preserving base merge is already at or before the configured
+# upstream. The managed remediation worktree must still exclude that published
+# history and attribute only the new round.
+git switch -q --detach "$CONTINUATION_HEAD_SHA"
+git switch -qc remediation/repeated-continuation-t10
+printf 'continuation worker round two\n' >> remediation
+git commit -qam 'finish second remediation round' \
+  -m 'Co-Authored-By: Continue-Round-Two <continue-round-two@example.invalid>'
+git branch --set-upstream-to=origin/daemon/continuation-t3
+PATH="$BIN:$PATH" ./preflight.sh >"$TMP/full-repeated-continuation.out"
+grep -q 'configured-upstream continuation-owned commits excluding published head and origin/main' \
+  "$TMP/full-repeated-continuation.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green;' \
+  "$TMP/full-repeated-continuation.out"
+
 # The daemon supports repositories configured with a non-main base. Seed an
 # existing PR head on develop, advance that base with two inherited sessions,
 # and prove the daemon-supplied base identity reaches the real hook.
@@ -448,6 +464,18 @@ printf 'develop continuation worker\n' >> develop-remediation
 git commit -qam 'finish develop continuation' \
   -m 'Co-Authored-By: Develop-Continue <develop-continue@example.invalid>'
 DEVELOP_CONTINUATION_SHA=$(git rev-parse HEAD)
+
+# Full author preflight has no hook tuple. Its configured upstream must still
+# recognize that this continuation merged develop rather than main.
+git fetch -q origin \
+  refs/heads/daemon/develop-continuation-t8:refs/remotes/origin/daemon/develop-continuation-t8
+git branch --set-upstream-to=origin/daemon/develop-continuation-t8
+PATH="$BIN:$PATH" ./preflight.sh >"$TMP/full-develop-merge-continuation.out"
+grep -q 'configured-upstream continuation-owned commits excluding published head and origin/develop' \
+  "$TMP/full-develop-merge-continuation.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green;' \
+  "$TMP/full-develop-merge-continuation.out"
+
 if PATH="$BIN:$PATH" git push -q origin \
   "$DEVELOP_CONTINUATION_SHA:refs/heads/daemon/develop-continuation-t8" \
   >"$TMP/develop-default-base.out" 2>&1; then
@@ -468,7 +496,7 @@ REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse \
 # Continuations only exempt already-published history. Multiple new worker
 # sessions after the authoritative remote tip remain genuine stacking.
 git switch -q --detach "$CONTINUATION_HEAD_SHA"
-git switch -qc daemon/stacked-continuation-t7
+git switch -qc remediation/stacked-continuation-t7
 printf 'continue A\n' >> remediation
 git commit -qam 'first continuation session' \
   -m 'Co-Authored-By: Continue-A <continue-a@example.invalid>'
@@ -1218,6 +1246,7 @@ grep -Fqx '    needs: [fmt, clippy, shell-tests]' \
   "$ROOT/.github/workflows/ci.yml"
 grep -Fqx '          --test-jobs 2' "$ROOT/.github/workflows/ci.yml"
 grep -Fqx '          --test-threads 2' "$ROOT/.github/workflows/ci.yml"
+grep -Fqx '          --test-timeout-secs 210' "$ROOT/.github/workflows/ci.yml"
 grep -Fqx '          --out target/ci-test-timing' \
   "$ROOT/.github/workflows/ci.yml"
 

@@ -13,10 +13,10 @@ assert_eq() {
   fi
 }
 
-identity="$(docker run --rm "$image" sh -c 'printf "%s:%s" "$(id -u)" "$(id -g)"')"
+identity="$(docker run --rm --platform linux/amd64 "$image" sh -c 'printf "%s:%s" "$(id -u)" "$(id -g)"')"
 assert_eq "10001:10001" "$identity" "runtime identity"
 
-docker run --rm "$image" sh -ec '
+docker run --rm --platform linux/amd64 "$image" sh -ec '
   test "$HOME" = /home/quorum
   test "$QUORUM_HOME" = /data/quorum
   test "$(getent passwd 10001 | cut -d: -f1,6,7)" = "quorum:/home/quorum:/bin/sh"
@@ -28,8 +28,10 @@ docker run --rm "$image" sh -ec '
   git --version | grep -F "2.39.5" >/dev/null
   gh --version | grep -F "gh version 2.23.0" >/dev/null
   codex --version | grep -F "codex-cli 0.146.0" >/dev/null
+  tini --version 2>&1 | grep -F "tini version 0.19.0" >/dev/null
   test -f /usr/share/doc/codex/LICENSE
   test -f /usr/share/doc/codex/NOTICE
+  test -f /usr/share/quorum/serve-codex.toml
   for path in /usr/local/bin/quorum /opt/codex/bin/codex /usr/bin/git /usr/bin/gh /etc/passwd; do
     test ! -w "$path"
     if sh -c "printf x >> \"\$1\"" sh "$path" 2>/dev/null; then

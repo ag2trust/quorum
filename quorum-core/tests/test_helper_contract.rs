@@ -3,9 +3,10 @@ mod support;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use support::protocol::{
-    AllocateRoleInput, ApplyGraphEventInput, Barrier, CancelSourceGraphInput, ClaimCleanupInput,
-    ClaimProviderRetryReworkInput, ClaimTaskInput, GraphEvent, MaterializeAssessmentInput,
-    Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_INPUT_BYTES,
+    AcquireDaemonLockInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
+    CancelSourceGraphInput, ClaimCleanupInput, ClaimProviderRetryReworkInput, ClaimTaskInput,
+    GraphEvent, MaterializeAssessmentInput, Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS,
+    EXIT_USAGE, MAX_INPUT_BYTES,
 };
 
 fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -148,13 +149,27 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
             support::run(
                 Operation::MaterializeAssessment,
                 &MaterializeAssessmentInput {
-                    db_path,
+                    db_path: db_path.clone(),
                     scope_kind: "task".into(),
                     scope_id: 2,
                     source_task_id: 2,
                     artifact_ids: vec![11],
                     now: 10,
                     barrier: open_barrier(dir.path(), "assessment"),
+                },
+            )
+            .unwrap(),
+            EXIT_SUCCESS,
+        ),
+        (
+            support::run(
+                Operation::AcquireDaemonLock,
+                &AcquireDaemonLockInput {
+                    db_path,
+                    pid: 12345,
+                    now: 10,
+                    stale_secs: 30,
+                    barrier: open_barrier(dir.path(), "daemon-lock"),
                 },
             )
             .unwrap(),
