@@ -766,15 +766,25 @@ fn classifier_rubric(recommendations: &str) -> String {
 The active daemon's operational routing policy for these levels is:
 {recommendations}
 This is not a cross-vendor benchmark and does not change the required output.
-2. **size**: execution surface only: S focused/local; M bounded coherent work; L broad cross-component coherent delivery; XL compound work needing decomposition. Do not estimate human time. Size the artifact's own write deliverables; responsibilities delivered by its declared dependencies are not part of this artifact's surface, so a composition over already-delivered dependency primitives is sized by what it writes, not by the breadth of what it composes.
-3. **size_reason**: a required, concrete rationale of at most {MAX_SIZE_REASON_BYTES} UTF-8 bytes tied to this exact task artifact. Name the implementation surfaces or responsibilities that make the selected size fit better than the adjacent sizes; do not merely restate the rubric or task title. For L/XL, identify independently deliverable seams that make the artifact broad or compound. For S/M, identify the focused or bounded coherent seam. This rationale is durable review feedback for a later planning iteration.
+2. **size**: execution surface for one managed AI coding agent, independent of reasoning difficulty. Do not estimate human time or translate from human project sizes. Judge the serial implementation and verification work this artifact owns: its declared write deliverables, implementation/testing responsibilities, context that must be held together, and independently verifiable seams. Do not use raw file count or the number of requirements as a shortcut. Read-only references and responsibilities delivered by declared dependencies are not part of this artifact's surface, so a composition over already-delivered dependency primitives is sized by what it writes and verifies, not by the breadth of what it composes. A task may be small and complex or broad and simple.
+   - S: one focused local seam with focused verification.
+   - M: one bounded coherent outcome, possibly across several files, with one integrated implementation/verification loop.
+   - L: broad coherent delivery spanning multiple owned seams or layers, but still one outcome.
+   - XL: compound work with independently deliverable outcomes or seams that should be decomposed.
+   Calibration examples (classify the artifact as written, not the surrounding initiative):
+   - complexity 4 / size S: change one guarded transaction predicate and add its focused race regression; the invariant is subtle but the execution surface is local.
+   - complexity 2 / size M: propagate an established field through known structs, serializers, and tests; the reasoning path is clear but several coordinated writes are owned.
+   - complexity 4 / size M: add one atomic orchestration module over dependency-delivered primitives with focused replay/race tests; the semantics are hard but form one bounded seam.
+   - complexity 3 / size L: extend an established behavior through storage, CLI, status output, and documentation; each layer is straightforward but the artifact owns several seams.
+   - complexity 4 / size XL: build storage, lifecycle coordination, provider launching, and restart recovery when those are independently deliverable outcomes.
+3. **size_reason**: a required, concrete rationale of at most {MAX_SIZE_REASON_BYTES} UTF-8 bytes tied to this exact task artifact. Name the implementation surfaces or responsibilities that make the selected size fit better than the adjacent sizes; do not merely restate the rubric or task title. For L, name the multiple owned seams or layers that remain one coherent outcome and explain why the artifact is broader than M. For XL, identify independently deliverable outcomes or seams that require decomposition. For S/M, identify the focused or bounded coherent seam. This rationale is durable review feedback for a later planning iteration.
 4. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. Declared dependencies are scheduler-enforced assumptions whose required outcomes will be satisfied before execution. Use their bounded context to understand assumed outcomes, scope, complexity, and duplication, but never return ready=false merely because a dependency is currently incomplete; dependency ordering is not classifier authority. If false, provide a concrete **not_ready_reason**; if true, it must be null.
 5. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
 
 You are closed-book: use only this prompt, do not inspect the repository, Git history, diffs, CI, or external systems.
 
 Output format (JSON array wrapped in an object):
-{{"tasks": [{{"task_id": 1, "complexity": 3, "size": "M", "size_reason": "The change is one bounded storage seam with focused callers and tests.", "ready": true, "not_ready_reason": null, "duplicate_of": []}}]}}"#
+{{"tasks": [{{"task_id": 1, "complexity": 4, "size": "M", "size_reason": "The artifact owns one atomic orchestration seam plus its focused replay and race tests; dependency-delivered primitives keep it bounded rather than broad.", "ready": true, "not_ready_reason": null, "duplicate_of": []}}]}}"#
     )
 }
 
@@ -2019,6 +2029,37 @@ mod tests {
     }
 
     #[test]
+    fn classifier_prompt_calibrates_complexity_and_size_as_orthogonal_agent_dimensions() {
+        let rubric = classifier_rubric(&complexity::recommendation_lines(
+            complexity::RecommendationProvider::Claude,
+        ));
+        assert!(rubric.contains("execution surface for one managed AI coding agent"));
+        assert!(rubric.contains("Do not estimate human time or translate from human project sizes"));
+        assert!(rubric
+            .contains("Do not use raw file count or the number of requirements as a shortcut"));
+        assert!(rubric.contains("A task may be small and complex or broad and simple"));
+        for pairing in [
+            "complexity 4 / size S",
+            "complexity 2 / size M",
+            "complexity 4 / size M",
+            "complexity 3 / size L",
+            "complexity 4 / size XL",
+        ] {
+            assert!(
+                rubric.contains(pairing),
+                "classifier rubric missing calibration pair {pairing}"
+            );
+        }
+        assert!(rubric.contains("dependency-delivered primitives"));
+        assert!(rubric.contains(
+            "For L, name the multiple owned seams or layers that remain one coherent outcome"
+        ));
+        assert!(rubric.contains(
+            "For XL, identify independently deliverable outcomes or seams that require decomposition"
+        ));
+    }
+
+    #[test]
     fn skill_file_contains_shared_rubric_descriptions() {
         let skill = include_str!("../../.claude/skills/quorum/SKILL.md");
         for (level, label, desc, _reserved) in &crate::complexity::RUBRIC {
@@ -2091,11 +2132,16 @@ mod redesigned_tests {
         ));
         assert!(p.contains("intended outcome cannot be determined"));
         assert!(p.contains("size_reason"));
-        assert!(p.contains("independently deliverable seams"));
-        assert!(p.contains("durable review feedback"));
-        assert!(p.contains("Size the artifact's own write deliverables"));
         assert!(p.contains(
-            "responsibilities delivered by its declared dependencies are not part of this artifact's surface"
+            "For L, name the multiple owned seams or layers that remain one coherent outcome"
+        ));
+        assert!(p.contains(
+            "For XL, identify independently deliverable outcomes or seams that require decomposition"
+        ));
+        assert!(p.contains("durable review feedback"));
+        assert!(p.contains("Judge the serial implementation and verification work"));
+        assert!(p.contains(
+            "responsibilities delivered by declared dependencies are not part of this artifact's surface"
         ));
     }
 

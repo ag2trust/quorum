@@ -56,6 +56,71 @@ fn task_create_rejects_nul_via_stdin() {
 }
 
 #[test]
+fn task_create_rejects_empty_and_whitespace_only_body_stdin() {
+    // Explicit --body-stdin that resolves empty/whitespace must fail loudly (exit 2)
+    // and must not create a task row. Omitting the body flag remains valid.
+    let home = tempfile::tempdir().unwrap();
+    for body in ["", "   ", "\n\t  \n"] {
+        quorum(home.path())
+            .args([
+                "task-create",
+                "--created-by",
+                "boss",
+                "--title",
+                "empty-body",
+                "--body-stdin",
+            ])
+            .write_stdin(body)
+            .assert()
+            .code(2);
+    }
+    quorum(home.path())
+        .args(["task-list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("[]"));
+}
+
+#[test]
+fn task_create_rejects_empty_body_file() {
+    let home = tempfile::tempdir().unwrap();
+    let empty = home.path().join("empty-body.txt");
+    std::fs::write(&empty, "  \n").unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "empty-body-file",
+            "--body-file",
+            empty.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2);
+    quorum(home.path())
+        .args(["task-list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("[]"));
+}
+
+#[test]
+fn task_create_allows_omitted_body() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "no body"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"id\":1"));
+    quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"body\":null"));
+}
+
+#[test]
 fn task_create_rejects_invalid_utf8_via_stdin() {
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())

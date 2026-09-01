@@ -577,6 +577,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             repo,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
+            // Explicit body source that resolves empty/whitespace-only is bad input.
+            // Omitting the body flag entirely (None) remains valid.
+            if let Some(ref text) = body {
+                if text.trim().is_empty() {
+                    return Err(QuorumError::Usage(
+                        "explicit task body (--body-stdin/--body-file) must not be empty or whitespace-only"
+                            .into(),
+                    ));
+                }
+            }
             quorum_core::tasks::validate_creator_labels(labels.as_deref())?;
             quorum_core::tasks::validate_creator_refs(refs.as_deref())?;
             let resolved_repo = resolve_repo_override(repo.as_deref())?;

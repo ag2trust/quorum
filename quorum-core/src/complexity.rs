@@ -4,21 +4,36 @@
 
 /// (level, short label, description, reserved legacy field)
 pub const RUBRIC: [(u8, &str, &str, &str); 5] = [
-    (1, "Trivial", "config tweak, typo fix, simple rename", ""),
-    (2, "Simple", "single-file change, clear spec", ""),
+    (
+        1,
+        "Trivial",
+        "mechanical change with no meaningful reasoning choice",
+        "",
+    ),
+    (
+        2,
+        "Simple",
+        "established pattern with one clear implementation path",
+        "",
+    ),
     (
         3,
         "Moderate",
-        "multi-file change, some design decisions",
+        "bounded design choices across known behavior and invariants",
         "",
     ),
     (
         4,
         "Complex",
-        "cross-cutting change, multiple components",
+        "subtle interaction among multiple invariants or failure modes",
         "",
     ),
-    (5, "Very complex", "architectural change, new subsystem", ""),
+    (
+        5,
+        "Very complex",
+        "new architectural boundary or subsystem with novel interface tradeoffs",
+        "",
+    ),
 ];
 
 /// Provider whose operational routing policy supplies recommendations.
@@ -145,11 +160,11 @@ mod tests {
     }
 
     #[test]
-    fn rubric_level_4_is_cross_cutting() {
+    fn rubric_level_4_is_about_interacting_correctness_constraints() {
         let (_, _, desc, _) = RUBRIC.iter().find(|(l, _, _, _)| *l == 4).unwrap();
         assert!(
-            desc.contains("cross-cutting") && desc.contains("multiple components"),
-            "level 4 must say cross-cutting/multiple components, got: {desc}"
+            desc.contains("multiple invariants") && desc.contains("failure modes"),
+            "level 4 must describe interacting correctness constraints, got: {desc}"
         );
     }
 
@@ -157,9 +172,20 @@ mod tests {
     fn rubric_level_5_is_architectural() {
         let (_, _, desc, _) = RUBRIC.iter().find(|(l, _, _, _)| *l == 5).unwrap();
         assert!(
-            desc.contains("architectural") && desc.contains("new subsystem"),
-            "level 5 must say architectural/new subsystem, got: {desc}"
+            desc.contains("architectural boundary") && desc.contains("novel interface tradeoffs"),
+            "level 5 must describe novel architectural reasoning, got: {desc}"
         );
+    }
+
+    #[test]
+    fn complexity_rubric_does_not_use_execution_surface_proxies() {
+        let text = rubric_lines();
+        for proxy in ["single-file", "multi-file", "multiple components"] {
+            assert!(
+                !text.contains(proxy),
+                "complexity rubric must not use size proxy {proxy}: {text}"
+            );
+        }
     }
 
     #[test]
