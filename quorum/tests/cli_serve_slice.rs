@@ -1,6 +1,8 @@
 //! Slice test: seed a task, run `quorum serve` with fake-agent, verify the agent
 //! was spawned, processed turn 1, then after a Done mailbox row, teardown occurs.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -125,7 +127,7 @@ fn serve_spawns_agent_and_tears_down_on_done() {
     // Start serve with fake-agent
     let sentinel = tempfile::tempdir().unwrap();
     let fake_agent = cargo_bin("fake-agent");
-    let mut child = Command::new(cargo_bin("quorum"))
+    let mut child = common::test_daemon_command(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
         .args([
@@ -284,7 +286,7 @@ fn sigint_during_work_releases_task_back_to_open() {
 
     let sentinel = tempfile::tempdir().unwrap();
     let fake_agent = cargo_bin("fake-agent");
-    let mut child = Command::new(cargo_bin("quorum"))
+    let mut child = common::test_daemon_command(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
         .args([

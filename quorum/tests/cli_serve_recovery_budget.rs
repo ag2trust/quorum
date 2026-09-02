@@ -151,7 +151,7 @@ fi
             gh_shim.path().display(),
             env::var("PATH").unwrap_or_default()
         );
-        let mut child = Command::new(cargo_bin("quorum"))
+        let mut child = common::test_daemon_command(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .env("PATH", path)

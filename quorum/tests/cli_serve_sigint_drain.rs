@@ -5,6 +5,8 @@
 //! 2. Second SIGINT during drain forces immediate teardown, exits 0.
 //! 3. SIGINT-drain exit code (0) does NOT trigger supervisor relaunch (only 75 does).
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -107,7 +109,7 @@ impl ServeHandle {
             args.push(a.to_string());
         }
 
-        let mut child = Command::new(cargo_bin("quorum"))
+        let mut child = common::test_daemon_command(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .args(&args)
@@ -424,9 +426,6 @@ fn double_sigint_forces_immediate_teardown() {
         "did not see drain message after first SIGINT: {:?}",
         handle.lines
     );
-
-    // Brief pause so the daemon processes the drain state before second signal.
-    std::thread::sleep(Duration::from_millis(200));
 
     // Second SIGINT → force shutdown
     handle.send_sigint();

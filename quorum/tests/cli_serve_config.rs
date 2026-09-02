@@ -1,5 +1,7 @@
 //! Integration tests for `quorum serve --config`.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -152,7 +154,7 @@ self_update_branch = "main"
     let sentinel_path = sentinel.path().to_string_lossy().to_string();
 
     // Launch serve with --config, overriding cap=2 via flag
-    let mut child = Command::new(cargo_bin())
+    let mut child = common::test_daemon_command(cargo_bin())
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
         .args([
@@ -577,7 +579,7 @@ base_branch = "develop"
     let sentinel_path = sentinel.path().to_string_lossy().to_string();
 
     // Launch with --repo only — config should be auto-discovered
-    let mut child = Command::new(cargo_bin())
+    let mut child = common::test_daemon_command(cargo_bin())
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
         .args([

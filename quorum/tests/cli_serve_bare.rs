@@ -2,6 +2,8 @@
 //! (inherits operator's Claude login), and a config with `no_bare_agent = false`
 //! re-enables bare mode.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -97,7 +99,7 @@ impl BareServeHandle {
     ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let fake_agent = cargo_bin("fake-agent");
-        let mut cmd = Command::new(cargo_bin("quorum"));
+        let mut cmd = common::test_daemon_command(cargo_bin("quorum"));
         cmd.env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .arg("serve")

@@ -176,7 +176,7 @@ fi
             args.push(a.to_string());
         }
 
-        let mut child = Command::new(cargo_bin("quorum"))
+        let mut child = common::test_daemon_command(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .env("PATH", path)
@@ -1664,7 +1664,7 @@ fn replacement_instant_death_stops_at_budget() {
     // Start daemon with the die-agent.
     let sentinel = tempfile::tempdir().unwrap();
     let sentinel_path = sentinel.path().to_string_lossy().to_string();
-    let mut child = Command::new(cargo_bin("quorum"))
+    let mut child = common::test_daemon_command(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
         .args([

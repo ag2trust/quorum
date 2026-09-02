@@ -4,6 +4,8 @@
 //! (other-repo merge does NOT trigger drain), drain timeout path,
 //! queued tasks survive restart, and T3: drain timeout with merge-in-progress.
 
+mod common;
+
 use std::collections::hash_map::DefaultHasher;
 use std::env;
 use std::hash::{Hash, Hasher};
@@ -213,7 +215,7 @@ fi
             args.push(a.to_string());
         }
 
-        let mut child = Command::new(cargo_bin("quorum"))
+        let mut child = common::test_daemon_command(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .env("PATH", path)

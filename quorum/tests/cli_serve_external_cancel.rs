@@ -1,5 +1,7 @@
 //! Integration test: daemon tears down a worker when its task is externally cancelled.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -98,7 +100,7 @@ impl ServeHandle {
         .map(|s| s.to_string())
         .collect();
 
-        let mut child = Command::new(cargo_bin("quorum"))
+        let mut child = common::test_daemon_command(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .args(&args)
