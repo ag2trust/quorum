@@ -106,8 +106,30 @@
     return ellipsize(stripShellWrapper(command).replace(/\s+/g, ' ').trim());
   }
 
+  const shouldReconcileItem = (existingState, nextState) => existingState === 'in-progress' && nextState === 'completed';
+
   function commandEvent(name, input) {
     return {kind: 'command', title: `${name || 'tool'} ${ellipsize(JSON.stringify(input || {}), 90)}`, body: {command: name || 'tool', output: ''}, exit_code: null};
+  }
+
+  function codexItemEvent(event, item) {
+    const state = event.type === 'item.started' ? 'in-progress' : 'completed';
+    const itemId = textValue(item.id) || null;
+    if (item.type === 'command_execution') {
+      return {kind: 'command', title: commandSummary(item.command) || 'Command', body: {command: String(item.command || ''), output: String(item.aggregated_output || '')}, exit_code: item.exit_code ?? null, item_id: itemId, state};
+    }
+    if (item.type === 'file_change') {
+      const changes = Array.isArray(item.changes) ? item.changes : [];
+      const summary = changes.slice(0, 5).map(change => `${change.kind || 'change'} ${change.path || '?'}`).join(', ');
+      return {kind: 'meta', title: `file change · ${ellipsize(summary || 'no paths', 90)}${changes.length > 5 ? ` (+${changes.length - 5} more)` : ''}`, body: '', exit_code: null, item_id: itemId, state};
+    }
+    if (item.type === 'agent_message') {
+      if (state === 'in-progress' && !item.text) return {kind: 'meta', title: 'Agent message in progress', body: '', exit_code: null, item_id: itemId, state};
+      return {kind: 'message', title: 'Agent message', body: String(item.text || ''), exit_code: null, item_id: itemId, state};
+    }
+    if (item.type === 'mcp_call') return {kind: 'meta', title: 'MCP call', body: '', exit_code: null, item_id: itemId, state};
+    if (item.type === 'error') return {kind: 'meta', title: 'Provider item error', body: String(item.message || ''), exit_code: null, item_id: itemId, state: 'completed'};
+    return {kind: 'unknown', title: `Unrecognized item: ${item.type || 'unknown'}`, body: '', exit_code: null, item_id: itemId, state};
   }
 
   function usageEvent(usage, title = 'Turn completed') {
@@ -117,19 +139,7 @@
 
   function normalizeEvents(event) {
     const item = event && event.item;
-    // The matching `item.completed` supersedes it; rendering both duplicates every row.
-    if (event && event.type === 'item.started') return [];
-    if (event && event.type === 'item.completed' && item && item.type === 'file_change') {
-      const changes = Array.isArray(item.changes) ? item.changes : [];
-      const summary = changes.slice(0, 5).map(change => `${change.kind || 'change'} ${change.path || '?'}`).join(', ');
-      return [{kind: 'meta', title: `file change · ${ellipsize(summary || 'no paths', 90)}${changes.length > 5 ? ` (+${changes.length - 5} more)` : ''}`, body: '', exit_code: null}];
-    }
-    if (event && event.type === 'item.completed' && item && item.type === 'agent_message') {
-      return [{kind: 'message', title: 'Agent message', body: String(item.text || ''), exit_code: null}];
-    }
-    if (event && event.type === 'item.completed' && item && item.type === 'command_execution') {
-      return [{kind: 'command', title: commandSummary(item.command), body: {command: String(item.command || ''), output: String(item.aggregated_output || '')}, exit_code: item.exit_code ?? null}];
-    }
+    if (event && (event.type === 'item.started' || event.type === 'item.completed') && item) return [codexItemEvent(event, item)];
     if (event && event.type === 'turn.completed') {
       return [usageEvent(event.usage)];
     }
@@ -209,7 +219,7 @@
   }
 
   function detailNavigationState(dir, from) {
-    return {openRun: dir, offset: from ?? null, paused: false, rawMode: false, rawText: '', renderedChars: 0, tailState: {}};
+    return {openRun: dir, offset: from ?? null, following: from == null, paused: false, rawMode: false, rawText: '', renderedChars: 0, tailState: {}};
   }
   function liveAgentTitle(agent) { return `${agent.name}${agent.task_id ? ` · Task #${agent.task_id}` : ''} · Live tail`; }
 
@@ -236,10 +246,11 @@
       ],
     };
   }
-  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_TASK_LIST_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskId, taskRoute, milestoneState, journeyModel, taskDetailModel, navigableRuns, textValue, pollState, dashboardModel};
+  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, MAX_COCKPIT_ITEMS, MAX_TASK_LIST_ITEMS, MAX_DETAIL_ITEMS, MAX_DETAIL_HISTORY_ITEMS, MAX_DETAIL_TEXT_CHARS, stripShellWrapper, commandSummary, shouldReconcileItem, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, liveAgentTitle, shouldTrim, bounded, boundedText, taskId, taskRoute, milestoneState, journeyModel, taskDetailModel, navigableRuns, textValue, pollState, dashboardModel};
   if (typeof document === 'undefined') return;
 
-  let openRun = null, openRunTitle = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null, tailState = {}, tailInFlight = false, tailEpoch = 0, runsEpoch = 0, currentRunsBefore = null, taskListBefore = null, taskListInFlight = false, taskDetailEpoch = 0, activeTaskId = null, stateInFlight = false, lastSuccess = null, stateFailed = false;
+  let openRun = null, openRunTitle = null, offset = null, following = true, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null, tailState = {}, tailInFlight = false, tailEpoch = 0, runsEpoch = 0, currentRunsBefore = null, taskListBefore = null, taskListInFlight = false, taskDetailEpoch = 0, activeTaskId = null, stateInFlight = false, lastSuccess = null, stateFailed = false, latestLiveRuns = [];
+  const renderedItems = new Map();
   const $ = id => document.getElementById(id);
   const put = (element, value) => { element.textContent = textValue(value); return element; };
   const node = value => put(document.createTextNode(''), value);
@@ -247,6 +258,7 @@
   document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => {
     show(button.dataset.view);
     if (button.dataset.view === 'tasks') loadTasks();
+    if (button.dataset.view === 'run') renderRunPicker(latestLiveRuns);
   }));
   function appendRow(table, values, head = false) { const row = document.createElement('tr'); values.forEach(value => { const cell = document.createElement(head ? 'th' : 'td'); cell.append(value instanceof Node ? value : node(value)); row.append(cell); }); table.append(row); return row; }
   function age(seconds) { const value = Math.max(0, Number(seconds || 0)); return value < 60 ? value + 's' : value < 3600 ? Math.floor(value / 60) + 'm' : value < 86400 ? Math.floor(value / 3600) + 'h' : Math.floor(value / 86400) + 'd'; }
@@ -267,20 +279,24 @@
     if (metadata && metadata.length) { const details = document.createElement('div'); details.className = 'meta'; metadata.forEach(value => details.append(value instanceof Node ? value : node(value))); entry.append(details); }
     parent.append(entry);
   }
-  function trimStream() { const stream = $('stream'); while (shouldTrim(renderedChars, stream.childElementCount) && stream.firstChild) { renderedChars -= stream.firstChild.textContent.length; stream.firstChild.remove(); } }
+  function trimStream() { const stream = $('stream'); while (shouldTrim(renderedChars, stream.childElementCount) && stream.firstChild) { const first = stream.firstChild; renderedChars -= first.textContent.length; if (first.dataset.itemId && renderedItems.get(first.dataset.itemId) === first) renderedItems.delete(first.dataset.itemId); first.remove(); } }
   function exitBadge(code) { const badge = document.createElement('span'); badge.className = 'badge ' + (code === 0 ? 'ok' : code == null ? '' : 'bad'); put(badge, code == null ? 'in progress' : 'exit ' + code); return badge; }
   function capOutput(output) { return output.length > MAX_EXPANDED_OUTPUT_CHARS ? output.slice(0, MAX_EXPANDED_OUTPUT_CHARS) + '\n… output truncated …' : output; }
   function renderEvent(event) {
-    if (event && event.type === 'item.started') return;
     const entry = event && event.kind ? event : normalizeEvent(event), row = document.createElement('div'); row.className = 'run-row run-' + entry.kind;
+    if (entry.state) row.dataset.state = entry.state;
+    if (entry.item_id) row.dataset.itemId = entry.item_id;
     if (entry.kind === 'message') put(row, entry.body);
     else if (entry.kind === 'command') { const details = document.createElement('details'), summary = document.createElement('summary'), pre = document.createElement('pre'); details.className = 'run-command'; put(summary, '$ ' + entry.title); summary.append(exitBadge(entry.exit_code)); put(pre, entry.body.command + '\n\n' + capOutput(entry.body.output)); details.append(summary, pre); row.append(details); }
     else { const title = document.createElement('span'); title.className = 'muted'; put(title, entry.title + (entry.body ? ' · ' + entry.body : '')); row.append(title); }
-    renderedChars += row.textContent.length; $('stream').append(row); trimStream();
+    const existing = entry.item_id ? renderedItems.get(entry.item_id) : null;
+    if (existing && existing.parentNode === $('stream') && shouldReconcileItem(existing.dataset.state, entry.state)) { renderedChars -= existing.textContent.length; existing.replaceWith(row); }
+    else $('stream').append(row);
+    renderedChars += row.textContent.length; if (entry.item_id) renderedItems.set(entry.item_id, row); trimStream();
   }
   function renderRaw() { $('rawStream').textContent = rawText.length > MAX_RENDERED_TAIL_CHARS ? rawText.slice(-MAX_RENDERED_TAIL_CHARS) : rawText; }
   function appendTail(lines, partial, startsMidLine, omitted, replace) {
-    if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; tailState = {}; }
+    if (replace) { $('stream').replaceChildren(); renderedItems.clear(); renderedChars = 0; rawText = ''; tailState = {}; }
     const reassembled = reassembleTail(tailState, lines, partial, startsMidLine, omitted); tailState = reassembled.state;
     const text = reassembled.lines.join('\n') + (reassembled.lines.length ? '\n' : ''); rawText = (rawText + text + (reassembled.truncated ? '[oversized stream record omitted]\n' : '')).slice(-MAX_RENDERED_TAIL_CHARS);
     const rendered = normalizeTail(reassembled.lines, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, parseEventLine, reassembled.omitted);
@@ -313,6 +329,12 @@
       item(root, title, [(agent.role || 'agent') + ' · ' + (agent.phase || 'working'), agent.now || 'Activity detail not reported', agentLink(agent), activity, 'Time in current state not reported', attention, agent.pr ? prLink(agent.pr) : 'No PR']);
     });
   }
+  function renderRunPicker(agents) {
+    const root = $('runPicker'); root.replaceChildren();
+    const runs = bounded(agents, 100).filter(agent => typeof (agent && agent.run_dir) === 'string' && agent.run_dir.length > 0);
+    if (!runs.length) return empty(root, 'No active agent run is available to follow. Historical runs remain available under Secondary data.');
+    runs.forEach(agent => item(root, runLink(agent.run_dir, liveAgentTitle(agent)), [(agent.role || 'agent') + ' · ' + (agent.phase || 'working'), agent.now || 'Waiting for provider activity']));
+  }
   function renderPipeline(pipeline) {
     const root = $('pipeline'); root.replaceChildren();
     pipeline.forEach(pair => { const cell = document.createElement('div'); cell.className = 'count'; const number = document.createElement('strong'); put(number, pair[1]); cell.append(number, node(pair[0])); root.append(cell); });
@@ -324,6 +346,7 @@
   }
   function renderDashboard(payload) {
     const model = dashboardModel(payload); renderHeader(model.health); renderAttention(model); renderWorking(model.working); renderPipeline(model.pipeline); renderQueue(model.queue);
+    latestLiveRuns = bounded(payload.live_agents, 100); renderRunPicker(latestLiveRuns);
     renderLiveAgents(payload.live_agents || []); renderAgents(payload.agents || [], payload.now || Math.floor(Date.now() / 1000));
   }
   function detailHeading(value) { const heading = document.createElement('h3'); put(heading, value); return heading; }
@@ -479,20 +502,33 @@
     if (document.hidden || (!explicit && currentRunsBefore !== null)) return;
     if (explicit) currentRunsBefore = before;
     const epoch = ++runsEpoch, suffix = before ? '?before=' + encodeURIComponent(before) : '';
-    try { const response = await fetch('/api/runs' + suffix).then(result => result.json()); if (epoch !== runsEpoch) return; renderRuns(response.runs || [], true); currentRunsBefore = before; runsBefore = response.next_before; $('moreRuns').classList.toggle('hidden', !runsBefore); $('newestRuns').classList.toggle('hidden', !currentRunsBefore); } catch (_) {}
+    try { const result = await fetch('/api/runs' + suffix); if (!result.ok) throw new Error('Run list request failed (' + result.status + ')'); const response = await result.json(); if (epoch !== runsEpoch) return; renderRuns(response.runs || [], true); currentRunsBefore = before; runsBefore = response.next_before; $('moreRuns').classList.toggle('hidden', !runsBefore); $('newestRuns').classList.toggle('hidden', !currentRunsBefore); } catch (_) {}
   }
+  function setStreamStatus(message, state = '') { const status = $('streamStatus'); put(status, message); status.dataset.state = state; }
   async function openDetail(dir, from, title = dir) {
-    tailEpoch++; const next = detailNavigationState(dir, from); ({openRun, offset, paused, rawMode, rawText, renderedChars, tailState} = next); openRunTitle = title;
-    $('stream').replaceChildren(); put($('pause'), 'Pause tail'); put($('rawToggle'), 'Show raw'); $('rawStream').classList.add('hidden'); $('stream').classList.remove('hidden'); show('run'); put($('runTitle'), title); await tail();
+    tailEpoch++; const next = detailNavigationState(dir, from); ({openRun, offset, following, paused, rawMode, rawText, renderedChars, tailState} = next); openRunTitle = title;
+    renderedItems.clear(); $('stream').replaceChildren(); $('runControls').classList.remove('hidden'); put($('pause'), 'Pause live events'); put($('rawToggle'), 'Show raw'); $('rawStream').classList.add('hidden'); $('stream').classList.remove('hidden'); show('run'); put($('runTitle'), title); setStreamStatus(following ? 'Connecting at the live edge…' : 'Loading recorded history…'); await tail();
   }
   async function tail() {
     if (!openRun || paused || document.hidden || tailInFlight) return;
     tailInFlight = true; const epoch = tailEpoch, run = openRun, from = offset;
-    try { const url = '/api/runs/' + encodeURIComponent(run) + '/stream?max=2097152' + (from !== null ? '&from=' + from : ''); const response = await fetch(url).then(result => result.json()); if (epoch !== tailEpoch || run !== openRun) return; appendTail(response.lines, response.partial, response.starts_mid_line, response.omitted || 0, from === null); offset = response.next_offset; $('stream').scrollTop = $('stream').scrollHeight; } finally { tailInFlight = false; if (epoch !== tailEpoch) tail(); }
+    try {
+      const url = '/api/runs/' + encodeURIComponent(run) + '/stream?max=2097152' + (from !== null ? '&from=' + from : following ? '&follow=true' : '');
+      const result = await fetch(url); if (!result.ok) { const detail = await result.text(); throw new Error(`HTTP ${result.status}${detail ? ' · ' + detail : ''}`); }
+      const response = await result.json(); if (epoch !== tailEpoch || run !== openRun) return;
+      appendTail(response.lines || [], response.partial, response.starts_mid_line, response.omitted || 0, from === null); offset = response.next_offset;
+      if (!following && response.eof) following = true;
+      if (!following) setStreamStatus('Loading recorded history…');
+      else if (response.lines && response.lines.length) setStreamStatus('Live · latest event received ' + new Date().toLocaleTimeString(), 'live');
+      else if (following) setStreamStatus('Live · waiting for the next event…', 'live');
+      $('stream').scrollTop = $('stream').scrollHeight;
+    } catch (error) { if (epoch === tailEpoch && run === openRun) setStreamStatus('Stream unavailable · ' + boundedText(error && error.message || error), 'error'); }
+    finally { tailInFlight = false; if (epoch !== tailEpoch) tail(); }
   }
-  $('pause').onclick = () => { paused = !paused; put($('pause'), paused ? 'Resume tail' : 'Pause tail'); };
+  $('pause').onclick = () => { paused = !paused; put($('pause'), paused ? 'Resume live events' : 'Pause live events'); setStreamStatus(paused ? 'Paused' : 'Resuming live events…', paused ? '' : 'live'); if (!paused) tail(); };
   $('backToCockpit').onclick = event => { event.preventDefault(); if (taskRoute(window.location.hash)) window.location.hash = ''; else show('board'); };
-  $('start').onclick = event => { event.preventDefault(); openDetail(openRun, 0, openRunTitle); };
+  $('live').onclick = () => { if (openRun) openDetail(openRun, null, openRunTitle); };
+  $('start').onclick = () => { if (openRun) openDetail(openRun, 0, openRunTitle); };
   $('rawToggle').onclick = () => { rawMode = !rawMode; $('stream').classList.toggle('hidden', rawMode); $('rawStream').classList.toggle('hidden', !rawMode); put($('rawToggle'), rawMode ? 'Show rendered' : 'Show raw'); if (rawMode) renderRaw(); };
   $('moreRuns').onclick = () => runs(runsBefore, true);
   $('newestRuns').onclick = () => runs(null, true);
