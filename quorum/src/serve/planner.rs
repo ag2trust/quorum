@@ -215,9 +215,11 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          A compile-atomic API seam is one child: if a child changes a function signature or a \
          shared type, trait, or struct shape used outside that child's writable paths, that child \
          must own every affected caller. Do not split a definition/signature change from its \
-         caller wiring, including by reserving those callers as a sibling's non-goal. If that \
-         compile closure pushes the child past M, return the `no_safe_split` BLOCKER rather than \
-         manufacturing definition and wiring siblings. \
+         caller wiring, including by reserving those callers as a sibling's non-goal. A \
+         compile-closed seam that fits one dispatchable child (S or M, or L at complexity 3 or \
+         lower) remains one child. Return the `no_safe_split` BLOCKER only when the closure \
+         cannot fit in one dispatchable child, rather than manufacturing definition and wiring \
+         siblings. \
          Report by calling the `submit_plan` tool exactly once with the PLAN or BLOCKER \
          object as its `response` argument. The tool answers with the daemon's own \
          validation errors: fix the reported defect and call `submit_plan` again in the same \
@@ -3644,9 +3646,25 @@ mod tests {
         assert!(prompt.contains("translate from human project sizes"));
         assert!(prompt.contains("raw file count or requirement count as a shortcut"));
         assert!(prompt.contains("compile-atomic API seam is one child"));
-        assert!(prompt.contains("return the `no_safe_split` BLOCKER"));
+        assert!(prompt.contains(
+            "compile-closed seam that fits one dispatchable child (S or M, or L at complexity 3 or lower) remains one child"
+        ));
         assert!(prompt.contains("Use at most 5 Grep/Glob calls and 10 Read calls"));
         assert!(prompt.contains("Arbiter judges that faithfulness"));
+        assert!(prompt.contains("compile-atomic API seam is one child"));
+        assert!(prompt.contains("must own every affected caller"));
+        assert!(
+            prompt.contains("reserving those callers as a sibling's non-goal"),
+            "prompt must forbid reserving required callers as a sibling non-goal"
+        );
+        assert!(
+            prompt.contains("Return the `no_safe_split` BLOCKER only when the closure cannot fit in one dispatchable child"),
+            "prompt must return no_safe_split only for a compile closure too large for one dispatchable child"
+        );
+        assert!(
+            !prompt.contains("compile closure pushes the child past M"),
+            "a dispatchable L compile-closed seam remains a valid child"
+        );
         assert!(prompt.contains(&format!(
             "Every PLAN task's `source_constraints` must include this worker-facing guidance: \"{WORKER_WRITABILITY_GUIDANCE}\""
         )));
