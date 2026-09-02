@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 70;
+pub const SCHEMA_VERSION: i64 = 71;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1300,6 +1300,39 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
         if current < 70 && !column_exists(conn, "daemon_lock", "instance_id")? {
             conn.execute("ALTER TABLE daemon_lock ADD COLUMN instance_id TEXT", [])?;
         }
+        // v71 backfills the immutable target branch only for children that are
+        // still active members of a decomposition graph. Before v71,
+        // materialization omitted the source target, so main-hotfix children
+        // could incorrectly fall back to the configured base. NULL and empty
+        // source targets retain the legacy fallback, and an already-populated
+        // child target is never overwritten.
+        if current < 71 && column_exists(conn, "task_decompositions", "source_task_id")? {
+            conn.execute(
+                "UPDATE tasks AS child
+                 SET target_branch=(
+                     SELECT source.target_branch
+                     FROM task_graph_members member
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     JOIN tasks source ON source.id=graph.source_task_id
+                     WHERE member.task_id=child.id
+                       AND member.active=1
+                       AND source.target_branch IS NOT NULL
+                       AND source.target_branch!=''
+                 )
+                 WHERE child.target_branch IS NULL
+                   AND EXISTS (
+                       SELECT 1
+                       FROM task_graph_members member
+                       JOIN task_decompositions graph ON graph.id=member.graph_id
+                       JOIN tasks source ON source.id=graph.source_task_id
+                       WHERE member.task_id=child.id
+                         AND member.active=1
+                         AND source.target_branch IS NOT NULL
+                         AND source.target_branch!=''
+                   )",
+                [],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1886,6 +1919,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(still_null, None);
+    }
+
+    #[test]
+    fn v70_to_v71_backfills_only_active_graph_children_from_nonempty_source_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v70-generated-child-target-branch.db");
+        {
+            let _ = open(&path).unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "INSERT INTO tasks(
+                     id,title,status,created_by,created_at,updated_at,target_branch)
+                 VALUES
+                     (1,'main source','decomposed','owner',1,1,'main'),
+                     (2,'active main child','open','owner',1,1,NULL),
+                     (3,'inactive main child','open','owner',1,1,NULL),
+                     (4,'unrelated task','open','owner',1,1,NULL),
+                     (5,'legacy source','decomposed','owner',1,1,NULL),
+                     (6,'legacy child','open','owner',1,1,NULL);
+                 INSERT INTO task_decompositions(
+                     id,source_task_id,state,active,planned_source_revision,created_at,updated_at)
+                 VALUES
+                     (10,1,'blocked',1,1,1,1),
+                     (11,5,'completed',0,1,1,1);
+                 INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                 VALUES
+                     (10,2,'active-main',1,1),
+                     (10,3,'inactive-main',1,0),
+                     (11,6,'legacy',1,1);
+                 PRAGMA user_version=70;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = open(&path).unwrap();
+        let branches: Vec<(i64, Option<String>)> = [1, 2, 3, 4, 5, 6]
+            .into_iter()
+            .map(|id| {
+                upgraded
+                    .query_row(
+                        "SELECT id,target_branch FROM tasks WHERE id=?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            branches,
+            vec![
+                (1, Some("main".into())),
+                (2, Some("main".into())),
+                (3, None),
+                (4, None),
+                (5, None),
+                (6, None),
+            ]
+        );
+        assert_eq!(
+            upgraded
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            71
+        );
+
+        let rerun = migrate(&upgraded).unwrap();
+        assert_eq!(rerun.migrated_from, 71);
+        assert_eq!(rerun.schema_version, 71);
+        let branches_after_rerun: Vec<(i64, Option<String>)> = [1, 2, 3, 4, 5, 6]
+            .into_iter()
+            .map(|id| {
+                upgraded
+                    .query_row(
+                        "SELECT id,target_branch FROM tasks WHERE id=?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(branches_after_rerun, branches);
     }
 
     #[test]
