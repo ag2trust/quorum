@@ -461,16 +461,28 @@ pub fn alert_due_at_retry(count: i64) -> bool {
     count == 0 || (count > 0 && (count & (count - 1)) == 0)
 }
 
-/// Daemon liveness snapshot read from `daemon_lock`.
-/// Populated by the binary crate (which owns the pid-alive syscall).
+/// Daemon liveness snapshot read from `daemon_lock`. Populated by the binary
+/// crate, which owns the platform PID-alive syscall used for the diagnostic
+/// `pid_dead` field.
+///
+/// Liveness is derived from **heartbeat freshness alone** — the daemon's
+/// namespace-safe authority — so a fresh heartbeat means Alive even when the
+/// stored PID is not visible on this host (containers, PID namespace, remote
+/// daemon), and an expired heartbeat means Stale even when the numeric PID
+/// happens to match an unrelated live local process. `pid` and `pid_dead`
+/// remain in the serialized JSON as human-readable diagnostics and MUST NOT
+/// be treated as authoritative by consumers.
 #[derive(Debug, Serialize, PartialEq, Eq, Clone, Default)]
 pub enum DaemonLiveness {
     #[default]
-    /// No row in daemon_lock — daemon has never started.
+    /// No row in `daemon_lock` — daemon has never started.
     None,
-    /// Daemon alive: heartbeat fresh AND pid exists.
+    /// Daemon alive: heartbeat is within the staleness window. `pid` is a
+    /// diagnostic snapshot of the holding process, not proof of liveness.
     Alive { pid: i64, heartbeat_age_secs: i64 },
-    /// Daemon stale: heartbeat old or pid dead.
+    /// Daemon stale: heartbeat has exceeded the staleness window. `pid_dead`
+    /// is a diagnostic derived from a best-effort local PID probe and does
+    /// not participate in the Alive/Stale decision.
     Stale {
         pid: i64,
         heartbeat_age_secs: i64,

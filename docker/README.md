@@ -1,53 +1,85 @@
 # Container image
 
-The root `Dockerfile` builds the public, self-hostable `linux/amd64` Quorum runtime. It is
-an image runtime contract, not yet a complete service: its diagnostic default command is
-`quorum --help`. Daemon and Web process supervision will be added separately.
+The root `Dockerfile` builds the generic public `linux/amd64` Quorum service
+image. Pinned `tini` is PID 1. The default command initializes durable state,
+then supervises one `quorum serve` authority and one loopback-only `quorum web`
+process without respawning either child.
 
 ## Build and verify
 
 Build from the repository root so `.dockerignore` bounds the context:
 
 ```sh
-docker build --platform linux/amd64 --tag quorum:local .
+docker buildx build --load --platform linux/amd64 --tag quorum:local .
 ./docker/verify.sh quorum:local
 ```
 
-The build pins the Debian base digest, Rust builder version, direct `git` and `gh` package
-versions, and Codex release/checksum. A wrong `CODEX_SHA256` fails the build before the
-archive is extracted. `verify.sh` exercises this negative path automatically; the
-equivalent manual check is:
+Verification checks the image architecture, pinned tools and Codex checksum,
+host-side supervisor behavior, fresh Codex routing, and real-container service,
+shutdown, bind-collision, and daemon-lock behavior. It requires Docker buildx
+and `sqlite3` on the host.
+
+The build pins the Debian base digest, Rust builder, direct `git`, `gh`, and
+`tini` packages, and the Codex release and archive checksum. A wrong
+`CODEX_SHA256` fails before extraction. The provider and base packages are
+upgraded by rebuilding the image.
+
+## Prepare and run
+
+Use one writable volume at `/data`. Before the first run, place the managed Git
+checkout at `/data/repos/project`; the service deliberately does not clone a
+repository. Its `.git` entry may be a directory or linked-worktree file, but it
+must identify a valid checkout. The mounted directory must be writable by
+numeric UID/GID `10001:10001`.
 
 ```sh
-docker build \
-  --build-arg CODEX_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
-  --target codex-fetcher .
+docker run --rm \
+  -e QUORUM_REPO=owner/name \
+  -v /host/quorum-data:/data \
+  quorum:local
 ```
 
-Rebuilding after a Debian package leaves its configured repositories may require updating
-the base digest and package pins together. The root-owned provider binary is upgraded by
-building and replacing the image. Quorum managed runs ignore Codex user configuration, so
-this image does not claim to control provider update behavior through a user config file.
+`QUORUM_REPO` must be a nonempty `owner/name`. On every start, the entrypoint
+prepares `/data/worktrees` and `/data/quorum/logs`, then runs idempotent
+`quorum init` from `/data/quorum/init`, outside the managed checkout. Persistent
+state is namespaced below `/data/quorum` through `QUORUM_HOME`.
 
-## Runtime paths
+For a fresh repository identity, the image atomically installs a Codex-only
+routing file at `/data/quorum/serve/<owner>__<name>.toml`; every managed role
+selects the bundled Codex CLI. An existing file at that path is never
+overwritten. Set `QUORUM_SERVE_CONFIG` to use another persistent file.
 
-Run with one durable volume mounted at `/data`. Quorum's existing `QUORUM_HOME` override
-places its database, configuration, and logs below `/data/quorum`. Use these explicit
-paths when starting `quorum serve` in the later supervisor layer:
+Readiness requires all three facts at once: both supervised children are live,
+`quorum status --json` reports live daemon authority, and Web returns a real
+HTTP response on `127.0.0.1`. Web always binds loopback; publishing the port
+does not make it remotely reachable. Remote access requires a separately
+secured proxy sharing the container's network namespace.
 
-- repository checkout: `/data/repos/project`
-- transient task worktrees: `/data/worktrees`
-- Quorum state: `/data/quorum`
+The daemon identity lock rejects another container serving the same repository
+database, including containers whose isolated PID namespaces give both daemon
+processes the same numeric PID. Stop the active container before replacement.
 
-The process runs as numeric UID/GID `10001:10001`; the mounted volume must be writable by
-that identity. The image contains no credentials. Inject provider and GitHub credentials
-at runtime through the hosting control plane; do not bake them into an image or volume.
+## Lifecycle and overrides
 
-## Provider boundary
+An external SIGTERM reaches the full process group through `tini -g`. The
+supervisor also records direct and descendant PIDs, sends TERM, waits a bounded
+interval, escalates remaining processes to KILL, and reaps its direct children.
+It never internally respawns them.
 
-The image includes the pinned, checksummed Codex standalone package and its Apache license
-and notice. It intentionally does not include Claude Code: its redistribution terms have
-not been established for this public image. Self-hosters may create a derived image that
-installs Claude Code under terms they have independently accepted. Quorum itself does not
-need provider-specific container changes; configure a model profile with `runner = "codex"`
-and route the desired roles to that profile to select the bundled provider CLI.
+The container propagates `quorum serve`'s exact exit status, including 0, 3,
+and 75. A Web-first failure stops serve and exits 1. Initialization failures
+also propagate exactly. Set `QUORUM_SELF_UPDATE_DRAIN=1` to let serve request
+external rebuild/relaunch with exit 75; it is disabled by default.
+
+Docker command replacement is explicit and bypasses the default supervisor
+command while retaining `tini`, for example:
+
+```sh
+docker run --rm quorum:local quorum --help
+```
+
+Runtime path and timing overrides are `QUORUM_REPO_DIR`,
+`QUORUM_WORKTREE_BASE`, `QUORUM_LOG_DIR`, `QUORUM_WEB_PORT`,
+`QUORUM_READY_TRIES`, and `QUORUM_SHUTDOWN_TRIES`. The image contains no
+credentials, tenancy, billing, gateway, or provisioning behavior; inject
+provider and GitHub credentials at runtime.

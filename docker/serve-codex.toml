@@ -1,0 +1,33 @@
+# Fresh public-image routing. The image bundles Codex, so every managed role
+# must select that runner unless the operator supplies an existing config.
+[model_profiles.codex]
+runner = "codex"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[routing.classifier]
+codex = 100
+[routing.planner]
+codex = 100
+[routing.collector]
+codex = 100
+[routing.worker."1"]
+codex = 100
+[routing.worker."2"]
+codex = 100
+[routing.worker."3"]
+codex = 100
+[routing.worker."4"]
+codex = 100
+[routing.worker."5"]
+codex = 100
+[routing.reviewer."1"]
+codex = 100
+[routing.reviewer."2"]
+codex = 100
+[routing.reviewer."3"]
+codex = 100
+[routing.reviewer."4"]
+codex = 100
+[routing.reviewer."5"]
+codex = 100

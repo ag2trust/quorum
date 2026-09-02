@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 59). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 70). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -457,7 +457,10 @@ CREATE TABLE IF NOT EXISTS reviewer_provision_attempts (
 CREATE TABLE IF NOT EXISTS daemon_lock (
     id            INTEGER PRIMARY KEY CHECK (id = 1),
     pid           INTEGER NOT NULL,
-    heartbeat_at  INTEGER NOT NULL
+    heartbeat_at  INTEGER NOT NULL,
+    -- v70: opaque instance identity for the holding daemon. Nullable so
+    -- legacy pre-upgrade rows remain NULL rather than being backfilled.
+    instance_id   TEXT
 );
 
 -- v42: one immutable executable routing decision per managed responsibility.
@@ -966,6 +969,37 @@ CREATE TABLE IF NOT EXISTS run_capabilities (
 );
 CREATE INDEX IF NOT EXISTS run_capabilities_agent ON run_capabilities(agent) WHERE revoked_at IS NULL;
 
+-- v69: a fallback launch is made durable before the daemon contacts the
+-- alternate provider. It records the exact bounded replay descriptor and
+-- references the already-attributed fallback run/capability rather than
+-- duplicating route-attribution evidence. The pending turn JSON deliberately
+-- rejects a continuation_id: a failed provider's continuation is never valid
+-- authority for a fresh alternate-provider launch.
+CREATE TABLE IF NOT EXISTS fallback_launch_intents (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    responsibility_key  TEXT NOT NULL
+                        CHECK(length(CAST(responsibility_key AS BLOB)) BETWEEN 1 AND 1024),
+    routing_attempt_id  INTEGER NOT NULL REFERENCES routing_attempts(id),
+    task_id             INTEGER NOT NULL REFERENCES tasks(id),
+    role                TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    worktree            TEXT NOT NULL
+                        CHECK(length(CAST(worktree AS BLOB)) BETWEEN 1 AND 4096),
+    pr_number           INTEGER,
+    head_sha            TEXT,
+    pending_turn_json   TEXT NOT NULL
+                        CHECK(json_valid(pending_turn_json)
+                              AND length(CAST(pending_turn_json AS BLOB)) <= 65536
+                              AND json_type(pending_turn_json, '$.continuation_id') IS NULL),
+    agent_run_id        INTEGER NOT NULL REFERENCES agent_runs(id),
+    capability_run_id   TEXT NOT NULL REFERENCES run_capabilities(run_id),
+    created_at          INTEGER NOT NULL,
+    CHECK((pr_number IS NULL AND head_sha IS NULL)
+          OR (pr_number > 0 AND head_sha IS NOT NULL)),
+    UNIQUE(responsibility_key, routing_attempt_id)
+);
+CREATE INDEX IF NOT EXISTS fallback_launch_intents_task
+    ON fallback_launch_intents(task_id);
+
 -- v27: prospective-only boundary for PR-interaction performance analytics
 -- (#158). Single row (id=1) recording the unix timestamp at which
 -- `quorum perf` results become eligible. Tasks with `updated_at` before
@@ -989,3 +1023,134 @@ CREATE TABLE IF NOT EXISTS planner_submissions (
     rejections    INTEGER NOT NULL DEFAULT 0,
     accepted_at   INTEGER
 );
+
+-- v61: durable storage for GitHub collaboration attempts, their agent operation outbox, and
+-- pending-review publication ownership. Runtime claiming/execution is deliberately separate.
+CREATE TABLE IF NOT EXISTS github_collaboration_attempts (
+    attempt_id          TEXT PRIMARY KEY,
+    task_id             INTEGER NOT NULL REFERENCES tasks(id),
+    agent               TEXT NOT NULL,
+    role                TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    pr_number           INTEGER NOT NULL,
+    head_sha            TEXT,
+    lifecycle_generation INTEGER NOT NULL,
+    -- v63: immutable daemon-resolved provider-turn identity. New attempts
+    -- always bind a provider; continuation/pending-turn fields remain NULL
+    -- only until the daemon has persisted an exact resumable handoff.
+    turn_provider       TEXT,
+    turn_continuation_id TEXT,
+    pending_turn_json   TEXT,
+    active_run_id       TEXT REFERENCES run_capabilities(run_id),
+    review_owner_marker TEXT UNIQUE,
+    state               TEXT NOT NULL
+                        CHECK(state IN ('active','awaiting_resume','completed','revoked')),
+    review_sealed       INTEGER NOT NULL DEFAULT 0 CHECK(review_sealed IN (0,1)),
+    next_review_sequence INTEGER NOT NULL DEFAULT 0,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    expires_at          INTEGER NOT NULL,
+    UNIQUE(active_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS github_agent_operations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id       TEXT NOT NULL UNIQUE,
+    client_request_id  TEXT NOT NULL,
+    attempt_id         TEXT NOT NULL REFERENCES github_collaboration_attempts(attempt_id),
+    created_by_run_id  TEXT NOT NULL REFERENCES run_capabilities(run_id),
+    task_id            INTEGER NOT NULL REFERENCES tasks(id),
+    agent              TEXT NOT NULL,
+    role               TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    pr_number          INTEGER NOT NULL,
+    head_sha           TEXT,
+    kind               TEXT NOT NULL,
+    request_json       TEXT NOT NULL,
+    state              TEXT NOT NULL
+                       CHECK(state IN ('queued','running','succeeded','failed','cancelled')),
+    send_state         TEXT NOT NULL DEFAULT 'not_started'
+                       CHECK(send_state IN ('not_started','definitely_unsent',
+                                            'ambiguous','confirmed')),
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at    INTEGER,
+    deadline_at        INTEGER NOT NULL,
+    review_sequence    INTEGER,
+    github_marker      TEXT,
+    remote_object_id   TEXT,
+    response_json      TEXT,
+    error_kind         TEXT,
+    error_summary      TEXT,
+    completed_after_revocation INTEGER NOT NULL DEFAULT 0
+                              CHECK(completed_after_revocation IN (0,1)),
+    -- v64: managed-run revalidation snapshot columns the claim child will
+    -- re-check against the live collaboration attempt on every claim attempt.
+    -- Nullable so v61-vintage inserts (which never populated them) continue
+    -- to round-trip; new callers using `github_operations::enqueue` stamp them.
+    lifecycle_generation INTEGER,
+    reviewer_launch_sha  TEXT,
+    -- v64: coarse ordering key for the claim child's fair pick order across
+    -- operations that share a natural batch (e.g. all pending replies on one
+    -- pull-request review). Storage-only; no semantics are assigned yet.
+    group_key          TEXT,
+    -- v64: claim/execution wall-clock stamps. Set by the claim child when it
+    -- transitions active 0→1 and again when execution begins; NULL until then.
+    claimed_at         INTEGER,
+    execution_started_at INTEGER,
+    -- v64: guarded active-claim sentinel. The claim child transitions this
+    -- 0→1 atomically alongside stamping `claimed_at`, and the partial UNIQUE
+    -- index below enforces at most one live claim per operation_id.
+    active             INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    expires_at         INTEGER NOT NULL,
+    UNIQUE(attempt_id, client_request_id),
+    UNIQUE(attempt_id, review_sequence)
+);
+-- v64: the load-bearing invariant for the claim child — at most one active
+-- claim per operation. Created by the v64 migration block in `db.rs` *after*
+-- the `active` column is ALTERed in, because SCHEMA_SQL runs before the
+-- migration ALTERs and cannot reference a not-yet-added column. `operation_id`
+-- is already globally UNIQUE, so this partial index adds no row-shape
+-- constraint beyond declaring the invariant (parallels `claims_one_active`).
+
+CREATE TABLE IF NOT EXISTS github_review_publication_slots (
+    publisher_scope     TEXT NOT NULL,
+    pr_number           INTEGER NOT NULL,
+    task_id             INTEGER NOT NULL REFERENCES tasks(id),
+    attempt_id          TEXT REFERENCES github_collaboration_attempts(attempt_id),
+    state               TEXT NOT NULL
+                        CHECK(state IN ('probing','owned','cleanup_required',
+                                        'cleanup_running','blocked')),
+    pending_review_id   TEXT,
+    review_owner_marker TEXT,
+    create_send_state   TEXT NOT NULL DEFAULT 'not_started'
+                        CHECK(create_send_state IN ('not_started','definitely_unsent',
+                                                    'ambiguous','confirmed')),
+    cleanup_attempts    INTEGER NOT NULL DEFAULT 0,
+    next_cleanup_at     INTEGER,
+    cleanup_deadline_at INTEGER,
+    error_kind          TEXT,
+    error_summary       TEXT,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    PRIMARY KEY(publisher_scope, pr_number),
+    UNIQUE(attempt_id)
+);
+CREATE INDEX IF NOT EXISTS github_collaboration_attempts_task
+    ON github_collaboration_attempts(task_id);
+CREATE INDEX IF NOT EXISTS github_agent_operations_task
+    ON github_agent_operations(task_id);
+CREATE INDEX IF NOT EXISTS github_review_publication_slots_task
+    ON github_review_publication_slots(task_id);
+
+-- v62: enqueue is the immutable request boundary for canonical GitHub
+-- operations. Executors may update only their send/result fields; they cannot
+-- reinterpret a persisted request or rebind it to a different attempt, run,
+-- target, kind, or deterministic marker.
+CREATE TRIGGER IF NOT EXISTS github_agent_operations_request_immutable
+BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
+                 task_id, agent, role, pr_number, head_sha, kind, request_json,
+                 github_marker, lifecycle_generation, reviewer_launch_sha, group_key,
+                 created_at ON github_agent_operations
+BEGIN
+    SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
+END;

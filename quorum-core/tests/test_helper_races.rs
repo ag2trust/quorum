@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use support::protocol::{
-    AllocateRoleInput, Barrier, ClaimCleanupInput, ClaimProviderRetryReworkInput, Operation,
-    EXIT_NEGATIVE, EXIT_SUCCESS,
+    AcquireDaemonLockInput, AllocateRoleInput, Barrier, ClaimCleanupInput,
+    ClaimProviderRetryReworkInput, Operation, EXIT_NEGATIVE, EXIT_SUCCESS,
 };
 
 const BARRIER_TIMEOUT_MS: u64 = 30_000;
@@ -366,6 +366,133 @@ fn render_provider_retry_outcomes(outcomes: &[(&String, support::HelperOutput)])
 fn stress_repeats_real_process_helper_races() {
     real_process_allocations_are_atomic(3, 8);
     real_process_cleanup_claim_has_exactly_one_winner(8);
+}
+
+/// Cross-process daemon-lock canary. Each round has `racers` distinct OS
+/// processes race `daemon_lock::try_acquire` on the same fresh DB behind a
+/// simultaneous-start barrier. The atomicity guarantee is that exactly one
+/// process observes `Acquired` (exit 0) and the rest observe
+/// `Held { .. }` (exit 1), every round — a real-process complement to the
+/// in-process concurrency test in `daemon_lock`.
+fn real_process_daemon_lock_has_exactly_one_winner(iterations: usize, racers: usize) {
+    const STALE_SECS: i64 = 30;
+    const NOW: i64 = 5_000;
+
+    for iteration in 0..iterations {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(format!("quorum-{iteration}.db"));
+        // Pre-create the DB (schema install) so the racers don't contend on
+        // migration on top of the lock race.
+        quorum_core::db::open(&db_path).unwrap();
+
+        let go_path = dir.path().join("go");
+        let ready_paths = (0..racers)
+            .map(|index| dir.path().join(format!("ready-{index}")))
+            .collect::<Vec<_>>();
+        let helpers = ready_paths
+            .iter()
+            .enumerate()
+            .map(|(index, ready_path)| {
+                support::spawn(
+                    Operation::AcquireDaemonLock,
+                    &AcquireDaemonLockInput {
+                        db_path: db_path.clone(),
+                        // Distinct diagnostic PIDs; identity is the fresh
+                        // per-process instance id the helper mints.
+                        pid: 1_000 + index as i64,
+                        now: NOW,
+                        stale_secs: STALE_SECS,
+                        barrier: barrier(ready_path.clone(), &go_path),
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        release_when_ready(&ready_paths, &go_path);
+        let outputs = helpers
+            .into_iter()
+            .map(|helper| helper.wait(PARENT_TIMEOUT).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            outputs.iter().all(|output| output.stderr.is_empty()),
+            "iteration {iteration}: helper wrote to stderr; outputs={outputs:?}"
+        );
+        let winners = outputs
+            .iter()
+            .filter(|output| {
+                output.status.code() == Some(EXIT_SUCCESS) && output.json()["won"] == true
+            })
+            .count();
+        let losers = outputs
+            .iter()
+            .filter(|output| {
+                output.status.code() == Some(EXIT_NEGATIVE) && output.json()["won"] == false
+            })
+            .count();
+        assert_eq!(
+            winners, 1,
+            "iteration {iteration}: expected exactly one Acquired; outputs={outputs:?}"
+        );
+        assert_eq!(
+            losers,
+            racers - 1,
+            "iteration {iteration}: every other process must observe Held; outputs={outputs:?}"
+        );
+        for output in &outputs {
+            if output.status.code() == Some(EXIT_NEGATIVE) {
+                let json = output.json();
+                assert!(
+                    json.get("holder_pid").and_then(|v| v.as_i64()).is_some(),
+                    "iteration {iteration}: Held helper omitted holder_pid; outputs={outputs:?}"
+                );
+                assert!(
+                    json.get("heartbeat_age").and_then(|v| v.as_i64()).is_some(),
+                    "iteration {iteration}: Held helper omitted heartbeat_age; outputs={outputs:?}"
+                );
+            }
+        }
+
+        // The winning identity must be the one stored in daemon_lock.
+        let winner_id = outputs
+            .iter()
+            .find(|output| output.status.code() == Some(EXIT_SUCCESS))
+            .and_then(|output| output.json()["instance_id"].as_str().map(str::to_owned))
+            .expect("winner must emit its instance id");
+        let winner_pid = outputs
+            .iter()
+            .find(|output| output.status.code() == Some(EXIT_SUCCESS))
+            .and_then(|output| output.json()["pid"].as_i64())
+            .expect("winner must emit its pid");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let row: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT pid, instance_id FROM daemon_lock WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (winner_pid, Some(winner_id)),
+            "iteration {iteration}: stored lock row must match the winning process"
+        );
+        assert_eq!(count(&conn, "errors"), 0, "iteration {iteration}");
+    }
+}
+
+/// Default gate: several iterations with a modest fan-out. Kept repeated
+/// enough to expose flakes on the atomic acquire path per the repo
+/// concurrency-evidence policy, while still cheap to run on every push.
+#[test]
+fn real_process_daemon_lock_smoke_has_exactly_one_winner() {
+    real_process_daemon_lock_has_exactly_one_winner(4, 4);
+}
+
+#[test]
+#[ignore = "stress lane: run scripts/stress-process-canaries.sh"]
+fn stress_repeats_real_process_daemon_lock_race() {
+    real_process_daemon_lock_has_exactly_one_winner(12, 8);
 }
 
 #[test]

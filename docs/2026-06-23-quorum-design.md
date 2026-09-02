@@ -386,7 +386,13 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   normal worker/review/rework/merge lifecycle, dispatches directly regardless of classified
   size, and publishes back to that PR under lease. It is never a decomposition source because
   generated children cannot inherit the continuation publication authority. `--continue-pr`
-  and `--review-pr` are mutually exclusive.
+  and `--review-pr` are mutually exclusive. Continuation authority is retained on retry except
+  in one narrow case: a publication or provisioning failure classified as `pr-closed` (the
+  pinned PR is closed unmerged) — `retry_parked` retires the matching `continue_pr` in the
+  same atomic UPDATE, records `refs.abandoned_publication={pr,branch,local_sha,continue_pr}`
+  as a bounded audit trail so the orphaned PR stays traceable, and the next dispatch mints a
+  fresh branch/PR. A `pr-merged` classification is delivery evidence: the park is terminal
+  and retry refuses to restore it (§ Explicit cancellation and durable parking).
 - ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
   `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
   dependency gating, and reviewer attachment are all preserved as internal functions.
@@ -511,15 +517,46 @@ to the same per-repo DB without relying on cwd.
 ### Single-daemon-per-DB guard
 
 On startup, `quorum serve` acquires an exclusive lease in the `daemon_lock` table
-(one-row, stores pid + heartbeat timestamp). The heartbeat is refreshed on every tick.
-A second daemon on the same DB:
+(one-row, stores pid + heartbeat timestamp + opaque instance identity). The instance
+identity is a fresh UUID minted at daemon startup (`daemon_lock::new_instance_id`, 128
+bits of entropy) and is the sole authority: `try_acquire`, `refresh`, and `release` are
+all guarded by it. The stored PID is a human-readable diagnostic only — it is never
+consulted for admission or ownership. The heartbeat is refreshed on every tick.
 
-- **Live holder** (heartbeat fresh within 30s AND pid alive via `kill(pid, 0)`) → exit 2
-  with error naming the holder pid. Never a silent second daemon.
-- **Stale holder** (heartbeat old OR pid dead) → take over the lease, log it.
+The check-and-acquire runs inside a single `BEGIN IMMEDIATE` transaction so two daemons
+starting simultaneously can never both write. A second daemon on the same DB:
 
-On clean shutdown the lease is released (row deleted). A crash leaves a stale row that
-the next daemon takes over.
+- **Live holder** (heartbeat fresh within 30s) under a **different instance identity**
+  → exit 2 with error naming the stored holder PID for diagnostics. This holds even
+  when the incoming numeric PID equals the stored one (PID namespaces, container
+  restart, PID wraparound) and even when the stored PID is not locally visible
+  (containers, remote host). Never a silent second daemon.
+- **Live holder** under the **same instance identity** → idempotent reacquire (also
+  refreshes the heartbeat). This is the normal restart of the same lifetime.
+- **Stale holder** (heartbeat older than 30s) → take over the lease via UPSERT
+  overwriting pid + instance, log it. Legacy pre-v70 rows with `instance_id IS NULL`
+  fall through the same paths: fresh legacy rows fail closed (unknown identity), and
+  stale legacy rows are treated as abandoned and taken over without manual edit.
+
+The heartbeat freshness gate is the sole liveness input. `status` reports `Alive` while
+the heartbeat is within `stale_secs` and `Stale` once it expires; a `pid_dead` flag
+(populated by `kill(pid, 0)`) is surfaced on `Stale` verdicts as a diagnostic only and
+never influences the verdict. This is namespace-safe: a live daemon whose PID is
+locally invisible still reads `Alive`, and an expired heartbeat still reads `Stale`
+even when the stored numeric PID happens to collide with an unrelated live process.
+
+On clean shutdown the lease is released, guarded by the calling instance identity so a
+superseded process cannot delete the current holder's row. A crash leaves the row
+behind with the crashed instance identity. The consequence of dropping PID liveness
+from the admission gate: a `SIGKILL` followed by an immediate restart within the 30s
+stale window fails closed under the new (different) instance identity and exits 2
+until the stored heartbeat expires. `scripts/serve-supervisor.sh` does not retry this
+condition — the wrapper only loops on the drain/self-update exit code (75) and
+propagates every other status, so `Held` (exit 2) causes the wrapper itself to exit.
+The supported recovery is an external restart after the 30s heartbeat goes stale, at
+which point the fresh process takes over the abandoned lease via UPSERT. This trades a
+small self-recovery delay for the guarantee that no PID collision or PID-namespace
+edge case can ever bypass the guard.
 
 ### Daemon limits and stall detection
 
@@ -768,6 +805,14 @@ only through an explicit outside request)
   finding requires `--verdict changes --feedback`. Unattested approvals are demoted to
   changes by the daemon.
 - **Dependency gating:** tasks with `depends_on` are only claimable when all deps are `done`.
+  A daemon-observed merge also records GitHub's immutable merge commit in
+  `refs.merge_commit_sha`. Before allocating a dependent task's branch or worktree, the
+  daemon fetches its authoritative target branch and requires every dependency's recorded
+  merge commit to be an ancestor of that fetched base SHA; that exact verified SHA is the
+  allocation provenance. A just-merged commit absent from the fetched ref is a bounded,
+  claim-free deferral (logged once); after three attempts, or when a completed dependency
+  lacks its merge SHA, the task parks loudly with the named commit/dependency. The daemon
+  never cuts the dependent branch from an unverifiable base.
 - **Concurrency cap:** `--cap N` limits the daemon to N concurrent tasks (≤ 2N agents:
   one worker + one reviewer per task).
 - **No passive execution (v2).** External/interactive agents cannot claim, execute,
@@ -882,8 +927,17 @@ recovery, while a worker-fixable result invalidates those approvals, records
 following generic recovery even when no worker journal or continuation exists, so the daemon
 provisions the actionable remediation turn rather than resetting the task to `open`.
 Retry does not change PR identity, approvals, dependencies, author/reviewer provenance, or
-rework count. An
-unparked or terminal task is a clean negative (exit 1). One additional clean negative
+rework count, with one narrow exception recorded at park time as a structured
+`daemon_publication_failure_kind` (pure DB decision — no reason-string parse, no network):
+a `pr-closed` park (the pinned publication PR is closed unmerged, observed either at the
+publication call or when the daemon re-provisions a retained rework intent whose live PR
+has since closed) causes `retry_parked` to abandon the pinned `daemon_publication` intent in
+the same UPDATE, retire a matching `continue_pr`, deallocate the branch, and write
+`refs.abandoned_publication={pr,branch,local_sha,continue_pr}` so the orphaned PR remains
+traceable; the next publication attempt mints a fresh branch/PR. A `pr-merged` park is
+delivery evidence: `retry_parked` returns the clean-negative (`Ok(None)`, status stays
+`failed`, no branch deallocation, no retry event) — the operator must investigate manually.
+An unparked or terminal task is a clean negative (exit 1). One additional clean negative
 (exit 1) fires when the parked task's `depends_on` still contains any `cancelled`
 task id: silently restoring the dependent would just have the sweep re-park it on
 the next tick while leaving the operator with no disposition signal. The CLI names
@@ -2237,17 +2291,16 @@ names its concrete implementation delta, affected paths, and non-goals, and carr
 load-bearing source requirement forward faithfully in the child that owns it. Tasks follow
 independently deliverable code or ownership seams; preserved
 behavior and regression-only expectations remain criteria or non-goals rather than synthetic
-implementation work. A compile-atomic ownership seam — a function or API signature change together
-with every caller that must move with it for the workspace to build and pass preflight after the
-child's prerequisites merge — is one child. A child that changes a function or API signature, or a
-shared type, trait, or struct shape used outside its own writable paths, must own every affected
-caller in the same child; it may not reserve those callers for a sibling, whether by omission from
-its deliverables or by an explicit sibling non-goal. When that compile closure cannot remain M-sized,
-the supported planner outcome is a `no_safe_split` blocker, not a manufactured definition/wiring
-split that individually fails to compile. Before any task row is created, deterministic validation
-checks the closed shape, references, cycles, prohibited synthetic integration work, and the
-structured deliverables manifest (below); it no longer requires a byte-exact echo of source-marked
-literals. Plan
+implementation work. A child that changes a function/API signature or shared type, trait, or
+struct shape must own every affected caller needed for its workspace build and preflight after
+its prerequisites merge; a definition/signature child must not reserve those callers for a
+sibling. If that compile closure cannot fit in one dispatchable S, M, or L child at complexity
+1--3, the planner returns a `no_safe_split` blocker rather than manufacturing definition and
+wiring siblings. Before any task row is created,
+deterministic validation checks the closed shape, references, cycles, prohibited synthetic
+integration work, mechanically visible compile-atomic signature-seam reservations, and the
+structured deliverables manifest (below); it no longer requires a byte-exact echo of
+source-marked literals. Plan
 faithfulness — that every load-bearing source requirement and constraint is carried forward,
 nothing is dropped or silently weakened, the children cover the source without overlap, and the
 plan is coherent — is judged by the Arbiter plan-review gate (below), not by a deterministic
@@ -2275,8 +2328,8 @@ feedback. Renaming or paraphrasing a rejected child is not scope reduction.
 classifier-accepted proposal on a single-shot, stateless **Arbiter** — a model
 reviewer spawned fresh per proposal in the same frozen read-only repository view the planner used,
 selected from the `[routing.arbiter]` pool (defaulting to the planner pool). The Arbiter judges the
-proposal against the authoritative source on four mandates — faithfulness, coverage and
-non-overlap, coherence, and decomposability — and emits exactly one closed verdict, parsed with the
+proposal against the authoritative source on five mandates — faithfulness, coverage and
+non-overlap, coherence, compile closure, and decomposability — and emits exactly one closed verdict, parsed with the
 planner's fail-closed discipline. The Arbiter only emits a verdict; the daemon alone transitions
 lifecycle and materializes children (lifecycle authority stays with the daemon). Verdict mapping:
 *approve* (or a *changes* verdict with no blocking finding) materializes the children directly

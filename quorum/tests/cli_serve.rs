@@ -93,11 +93,15 @@ fn serve_boots_and_stops_on_sigint() {
     let mut reader = BufReader::new(stderr);
 
     let mut banner_found = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // 15s matches the banner-wait ceiling used by other serve smoke tests
+    // (cli_serve_config, cli_serve_mailbox). 5s was fragile on CI runners
+    // whose cold-cache disk + parallel test-binary contention pushes the
+    // debug-build boot past the debug-build startup budget on GitHub Actions.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         if std::time::Instant::now() > deadline {
             child.kill().ok();
-            panic!("serve did not print 'serving' banner within 5s");
+            panic!("serve did not print 'serving' banner within 15s");
         }
         let mut line = String::new();
         match reader.read_line(&mut line) {
