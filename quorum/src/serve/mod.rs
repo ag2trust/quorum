@@ -17593,6 +17593,7 @@ async fn drain_events(
         };
         let events = match drained {
             DrainedLine::Raw(raw_line) => {
+                raw_drain_budget_exhausted = line_index + 1 == MAX_STREAM_LINES_PER_TICK;
                 let kind = slot.process_kind();
                 raw_drain_budget_exhausted = line_index + 1 == MAX_STREAM_LINES_PER_TICK;
                 let events = slot
