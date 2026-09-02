@@ -2415,6 +2415,8 @@ index permits one materialized active or blocked graph per repository, and sourc
 permits only one graph aggregate per source. Generated work is one level only and is immutable
 after materialization.
 
+Generated tasks inherit the source task's immutable `target_branch` at materialization; a NULL
+source target yields NULL child targets and preserves the legacy configured-base fallback.
 Generated tasks retain ordinary independent implementation, review, rework, and protected merge.
 Their atomic claim additionally requires an active decomposed source, done prerequisites, no
 failed sibling or graph blocker, and fewer than two active implementation siblings. Eligible graph

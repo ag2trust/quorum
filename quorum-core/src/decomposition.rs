@@ -23,6 +23,8 @@ pub const MAX_CHILDREN: usize = 8;
 pub const ATTEMPT_SUMMARY_MAX_BYTES: usize = 8 * 1024;
 const MAX_CLEANUP_ARTIFACT_BYTES: usize = 4096;
 
+type MaterializationSource = (i64, i64, i64, i64, String, Option<String>, Option<String>);
+
 /// The explicit file-level contract attached to one generated child.  This is
 /// deliberately a small manifest rather than an inference from task prose: a
 /// later boundary check can inspect only [`Self::writable_paths`] and leave
@@ -1378,10 +1380,10 @@ pub fn materialize_graph(
     }
 
     let tx = begin_immediate(conn)?;
-    let aggregate: Option<(i64, i64, i64, i64, String, Option<String>)> = tx
+    let aggregate: Option<MaterializationSource> = tx
         .query_row(
             "SELECT d.source_task_id,d.planned_source_revision,d.plan_revision,
-                    t.priority,t.created_by,t.depends_on
+                    t.priority,t.created_by,t.depends_on,t.target_branch
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
              WHERE d.id=?1 AND d.state IN ('planning','validating','preclassifying')
                AND d.freeze_active=1 AND d.active=0 AND t.status='planning'
@@ -1395,12 +1397,20 @@ pub fn materialize_graph(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((source_id, planned_revision, plan_revision, priority, creator, source_depends_on)) =
-        aggregate
+    let Some((
+        source_id,
+        planned_revision,
+        plan_revision,
+        priority,
+        creator,
+        source_depends_on,
+        source_target_branch,
+    )) = aggregate
     else {
         return Ok(None);
     };
@@ -1449,7 +1459,8 @@ pub fn materialize_graph(
     for child in children {
         tx.execute(
             "INSERT INTO tasks(title,body,status,priority,labels,created_by,created_at,
-                 updated_at,refs,depends_on) VALUES (?1,?2,'open',?3,?4,?5,?6,?6,?7,'[]')",
+                 updated_at,refs,depends_on,target_branch)
+             VALUES (?1,?2,'open',?3,?4,?5,?6,?6,?7,'[]',?8)",
             params![
                 child.title,
                 child.body,
@@ -1457,7 +1468,8 @@ pub fn materialize_graph(
                 child.labels,
                 creator,
                 now,
-                child.classification_refs
+                child.classification_refs,
+                source_target_branch.as_deref(),
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -3493,6 +3505,61 @@ mod tests {
         assert!(crate::tasks::classification_is_dispatchable(
             &refs, false, None
         ));
+    }
+
+    #[test]
+    fn materialize_graph_inherits_the_source_target_branch() {
+        let (_dir, mut main_conn) = file_setup();
+        main_conn
+            .execute("UPDATE tasks SET target_branch='main' WHERE id=1", [])
+            .unwrap();
+        let main_graph = begin(&mut main_conn);
+        let main_children = materialize_graph(
+            &mut main_conn,
+            main_graph,
+            1,
+            &[child("one", &[]), child("two", &[])],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        for child_id in main_children {
+            assert_eq!(
+                main_conn
+                    .query_row(
+                        "SELECT target_branch FROM tasks WHERE id=?1",
+                        [child_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .unwrap()
+                    .as_deref(),
+                Some("main")
+            );
+        }
+
+        let (_dir, mut legacy_conn) = file_setup();
+        let legacy_graph = begin(&mut legacy_conn);
+        let legacy_children = materialize_graph(
+            &mut legacy_conn,
+            legacy_graph,
+            1,
+            &[child("one", &[]), child("two", &[])],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        for child_id in legacy_children {
+            assert_eq!(
+                legacy_conn
+                    .query_row(
+                        "SELECT target_branch FROM tasks WHERE id=?1",
+                        [child_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     #[test]
