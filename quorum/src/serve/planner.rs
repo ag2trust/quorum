@@ -189,8 +189,12 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          criteria or non_goals, not standalone implementation tasks. Multiple files may belong \
          to one child when they implement one coherent seam; split a child when it combines \
          independently deliverable changes across layers or components. The execution-size \
-         rubric is: S = focused/local; M = bounded coherent work; L = broad cross-component \
-         coherent delivery; XL = compound work needing decomposition. Do not estimate human time. \
+         rubric measures the serial implementation and verification surface owned by one managed \
+         AI coding agent, independent of reasoning difficulty: S = one focused local seam; M = one \
+         bounded coherent outcome and integrated implementation/verification loop; L = broad \
+         coherent delivery spanning multiple owned seams or layers; XL = compound work with \
+         independently deliverable outcomes. Do not estimate human time, translate from human \
+         project sizes, or use raw file count or requirement count as a shortcut. \
          Inspect the repository only to ground the plan: start with source-named paths and symbols, \
          use targeted Grep or Glob, read focused excerpts, follow observed calls at most one hop, \
          and stop once each child has a concrete delta and path set. Use at most 5 Grep/Glob calls \
@@ -3632,7 +3636,13 @@ mod tests {
             r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#
         ));
         assert!(prompt.contains("`outcome` must be exactly `plan` or `blocker`"));
-        assert!(prompt.contains("S = focused/local; M = bounded coherent work"));
+        assert!(prompt.contains(
+            "serial implementation and verification surface owned by one managed AI coding agent"
+        ));
+        assert!(prompt.contains("independent of reasoning difficulty"));
+        assert!(prompt.contains("S = one focused local seam"));
+        assert!(prompt.contains("translate from human project sizes"));
+        assert!(prompt.contains("raw file count or requirement count as a shortcut"));
         assert!(prompt.contains("compile-atomic API seam is one child"));
         assert!(prompt.contains("return the `no_safe_split` BLOCKER"));
         assert!(prompt.contains("Use at most 5 Grep/Glob calls and 10 Read calls"));

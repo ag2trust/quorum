@@ -3792,6 +3792,15 @@ impl SlotState {
             && self.continuation_id.is_none()
             && matches!(
                 &self.proc,
+                SlotProcess::Running(proc) if proc.grok_terminal_handoff_pending()
+            )
+    }
+
+    fn has_pending_grok_terminal_candidate(&self) -> bool {
+        self.draining
+            && self.continuation_id.is_none()
+            && matches!(
+                &self.proc,
                 SlotProcess::Running(proc) if proc.grok_terminal_candidate_pending()
             )
     }
@@ -13176,6 +13185,61 @@ async fn tick(
                 ));
             }
 
+            // Grok supplies its continuation only in its terminal `end`
+            // record. Phase 2 normally sees the submit mailbox row before
+            // Phase 4 drains worker output, so accepting the row here used
+            // to release the exact working authority before that record could
+            // be bound to the run. Hold this delivery at the daemon boundary:
+            // either the terminal handoff is durably present before review, or
+            // an exited/malformed turn fails closed while the task is still
+            // recoverable from working/rework.
+            match gate_grok_worker_delivery(&mut workers[wi], &db_path, &config.limits).await? {
+                GrokWorkerDeliveryGate::Ready => {}
+                GrokWorkerDeliveryGate::Pending => {
+                    log(&format!(
+                        "Grok worker {} submitted task #{} before its terminal session handoff; retaining delivery",
+                        workers[wi].agent_name, workers[wi].task_id
+                    ));
+                    break;
+                }
+                GrokWorkerDeliveryGate::Failed(reason) => {
+                    let worker_name = workers[wi].agent_name.clone();
+                    let worker_task_id = workers[wi].task_id;
+                    log(&format!(
+                        "Grok worker {worker_name} delivery for task #{worker_task_id} failed before review: {reason}"
+                    ));
+                    let failed = fire_event(
+                        &db_path,
+                        &worker_name,
+                        worker_task_id,
+                        &Event::AgentFailed {
+                            reason: format!("Grok submission rejected before review: {reason}"),
+                        },
+                    )
+                    .await;
+                    if failed.is_some() {
+                        let worker = workers.remove(wi);
+                        cleanup_slot(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            worker,
+                            None,
+                            "terminal_handoff_failed",
+                        )
+                        .await;
+                        if !consume_mailbox_row(&db_path, *id).await {
+                            break;
+                        }
+                    } else {
+                        log(&format!(
+                            "FATAL: Grok delivery failure for task #{worker_task_id} could not be persisted; retaining worker and mailbox authority"
+                        ));
+                    }
+                    break;
+                }
+            }
+
             // A worker cannot select a PR head to publish to. An explicit PR
             // signal is valid only when it matches the daemon-recorded PR for
             // this slot; otherwise use task refs or create the initial PR.
@@ -17286,6 +17350,194 @@ fn require_remediation_continuation(
     Ok(continuation_id)
 }
 
+/// The outcome of holding a Grok delivery at the submit boundary. A pending
+/// terminal is normal: Phase 2 observed `quorum submit` before Phase 4's usual
+/// worker drain. A failed handoff is terminal for that delivery, but leaves the
+/// task in working/rework so normal daemon recovery can provision a fresh turn.
+#[derive(Debug, PartialEq, Eq)]
+enum GrokWorkerDeliveryGate {
+    Ready,
+    Pending,
+    Failed(String),
+}
+
+/// Grok emits its provider continuation only in the terminal `end` record.
+/// Before accepting a worker's submitted delivery, verify an already-completed
+/// handoff or drain and verify it while the worker still owns its assignment.
+/// This keeps a crash or slow terminal drain from exposing `in-review` without
+/// the continuation a later changes verdict must resume.
+async fn gate_grok_worker_delivery(
+    slot: &mut SlotState,
+    db_path: &Path,
+    limits: &CostLimits,
+) -> Result<GrokWorkerDeliveryGate> {
+    if slot.process_kind() != runner::AgentKind::Grok {
+        return Ok(GrokWorkerDeliveryGate::Ready);
+    }
+    // A dormant Grok slot already crossed this gate and retains only its
+    // exact persisted continuation while awaiting review. A duplicate stale
+    // Done row must continue to reach the ordinary lifecycle rejection path,
+    // not be treated as a request to drain a process that no longer exists.
+    if matches!(&slot.proc, SlotProcess::Dormant { .. }) {
+        return Ok(GrokWorkerDeliveryGate::Ready);
+    }
+
+    // Phase 4 may have already persisted and completed the terminal handoff
+    // before this submit reaches Phase 2. Grok deliberately retains its
+    // authorized terminal candidate so a failed persistence can be retried;
+    // draining it again after a successful handoff would replay ThreadStarted
+    // and reject that duplicate.
+    if !slot.draining && slot.error_turn_count == 0 {
+        if let Some(session_id) = slot.continuation_id.as_deref() {
+            ensure_durable_grok_worker_delivery(db_path, slot, session_id).await?;
+            return Ok(GrokWorkerDeliveryGate::Ready);
+        }
+    }
+
+    match drain_events(slot, db_path, "worker", limits).await {
+        Ok(_) => {}
+        // Terminal identity validation failures are delivery failures, not
+        // daemon failures. Keep SQLite/join/IO failures loud and retryable.
+        Err(error) if error.to_string().starts_with("Grok ") => {
+            return Ok(GrokWorkerDeliveryGate::Failed(error.to_string()));
+        }
+        Err(error) => return Err(error),
+    }
+
+    if !slot.draining && slot.error_turn_count == 0 {
+        let Some(session_id) = slot.continuation_id.as_deref() else {
+            return Ok(GrokWorkerDeliveryGate::Failed(
+                "Grok turn completed without an authorized terminal session identity".into(),
+            ));
+        };
+        ensure_durable_grok_worker_delivery(db_path, slot, session_id).await?;
+        return Ok(GrokWorkerDeliveryGate::Ready);
+    }
+
+    // A live Grok process may yet finish its terminal evidence. A completed
+    // raw-record budget, however, needs one more normal drain to find a
+    // terminal record that was just beyond the bounded prefix. Once the
+    // leader has exited with a terminal candidate, do not retain the delivery
+    // indefinitely for a descendant-held pipe: apply the bounded exit policy
+    // below, which either authorizes the exact candidate or fails safe.
+    let exit_status = slot
+        .try_wait()
+        .map_err(|error| QuorumError::Io(format!("Grok delivery exit check failed: {error}")))?;
+    if exit_status.is_none()
+        || (slot.has_pending_grok_terminal_handoff() && !slot.has_pending_grok_terminal_candidate())
+    {
+        return Ok(GrokWorkerDeliveryGate::Pending);
+    }
+
+    // The leader exited. Finalize the retained-pipe evidence under the
+    // existing bounded exit policy before failing the delivery. The generic
+    // finalizer intentionally consumes raw records only; if it completes
+    // cleanly, drain once more to authorize and durably persist a buffered
+    // Grok terminal candidate.
+    slot.finalize_pre_authoritative_exit_evidence("worker", limits)
+        .await;
+    if let Some(failure) = slot.observed_pre_authoritative_failure() {
+        return Ok(GrokWorkerDeliveryGate::Failed(failure.to_string()));
+    }
+
+    match drain_events(slot, db_path, "worker", limits).await {
+        Ok(_) => {}
+        Err(error) if error.to_string().starts_with("Grok ") => {
+            return Ok(GrokWorkerDeliveryGate::Failed(error.to_string()));
+        }
+        Err(error) => return Err(error),
+    }
+
+    if !slot.draining && slot.error_turn_count == 0 {
+        let Some(session_id) = slot.continuation_id.as_deref() else {
+            return Ok(GrokWorkerDeliveryGate::Failed(
+                "Grok turn completed without an authorized terminal session identity".into(),
+            ));
+        };
+        ensure_durable_grok_worker_delivery(db_path, slot, session_id).await?;
+        return Ok(GrokWorkerDeliveryGate::Ready);
+    }
+    let detail = slot
+        .classify_pre_authoritative_exit(exit_status.expect("exited Grok process checked above"))
+        .map(|failure| failure.to_string())
+        .or_else(|| slot.last_error_text.clone())
+        .unwrap_or_else(|| {
+            "Grok process exited without an authorized terminal session identity".into()
+        });
+    Ok(GrokWorkerDeliveryGate::Failed(detail))
+}
+
+/// The in-memory continuation becomes usable only after its persistence call,
+/// but re-read the real DB at the submit boundary so the lifecycle transition
+/// has direct evidence that the exact identity is durable. Fresh workers also
+/// require the immutable initial-handoff record used by later remediation.
+async fn ensure_durable_grok_worker_delivery(
+    db_path: &Path,
+    slot: &SlotState,
+    session_id: &str,
+) -> Result<()> {
+    let path = db_path.to_path_buf();
+    let task_id = slot.task_id;
+    let agent = slot.agent_name.clone();
+    let model = slot.model.clone();
+    let effort = slot.effort.clone();
+    let request = slot.worker_request().cloned();
+    let session_id = session_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = quorum_core::db::open(&path)?;
+        let task = tasks::get(&conn, task_id)?.ok_or_else(|| {
+            QuorumError::Io(format!(
+                "Grok delivery task #{task_id} disappeared before review"
+            ))
+        })?;
+        let refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let continuation = runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+            .ok_or_else(|| {
+                QuorumError::Io("Grok delivery continuation is not durable before review".into())
+            })?;
+        if continuation.id != session_id {
+            return Err(QuorumError::Io(
+                "Grok delivery continuation does not match its terminal session".into(),
+            ));
+        }
+        let initial = runner_state::initial_worker_session(&refs).ok_or_else(|| {
+            QuorumError::Io("Grok delivery is missing its initial durable session handoff".into())
+        })?;
+        if initial.task_id != task_id
+            || initial.agent != agent
+            || initial.role != "worker"
+            || initial.provider != "grok"
+            || initial.runner != "grok"
+            || initial.model != model
+            || initial.effort != effort
+        {
+            return Err(QuorumError::Io(
+                "Grok delivery initial session does not match the active worker identity".into(),
+            ));
+        }
+        if let Some(request) = request {
+            if initial.session_id != session_id
+                || initial.role_assignment_id != request.role_assignment_id
+                || initial.responsibility_key != request.responsibility_key
+                || initial.pending_turn != request.pending_turn
+            {
+                return Err(QuorumError::Io(
+                    "Grok delivery initial session does not match its exact worker run".into(),
+                ));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("Grok delivery durability join failed: {error}")))?
+}
+
 /// Drain stream events from an agent slot with bounded records and a short readiness poll.
 /// Returns `Some(LimitBreached)` if a cost/time ceiling was hit.
 ///
@@ -17306,7 +17558,13 @@ async fn drain_events(
     persist_diagnostics(slot).map_err(|error| {
         QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
     })?;
-    for _ in 0..MAX_STREAM_LINES_PER_TICK {
+    slot.live_process_mut()
+        .map_err(|error| {
+            QuorumError::Io(format!("slot event drain requires a live process: {error}"))
+        })?
+        .set_grok_raw_drain_budget_exhausted(false);
+    let mut raw_drain_budget_exhausted = false;
+    for line_index in 0..MAX_STREAM_LINES_PER_TICK {
         let read_timeout = stream_read_timeout(slot.process_kind());
         let read = tokio::time::timeout(
             read_timeout,
@@ -17351,6 +17609,7 @@ async fn drain_events(
         let events = match drained {
             DrainedLine::Raw(raw_line) => {
                 let kind = slot.process_kind();
+                raw_drain_budget_exhausted = line_index + 1 == MAX_STREAM_LINES_PER_TICK;
                 let events = slot
                     .live_process_mut()
                     .map_err(|error| {
@@ -17574,6 +17833,11 @@ async fn drain_events(
             QuorumError::Io(format!("slot diagnostics require a live process: {error}"))
         })?;
     }
+    slot.live_process_mut()
+        .map_err(|error| {
+            QuorumError::Io(format!("slot event drain requires a live process: {error}"))
+        })?
+        .set_grok_raw_drain_budget_exhausted(raw_drain_budget_exhausted);
     Ok(None)
 }
 
@@ -24957,6 +25221,696 @@ mod tests {
         assert_eq!(handoff.pending_turn.turn_kind, "initial");
         assert!(handoff.pending_turn.continuation_id.is_none());
         assert_eq!(handoff.session_id, "grok-session-exact");
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_terminal_before_submit_uses_durable_handoff_without_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"terminal-first-session\"}'",
+        )
+        .await;
+
+        // Phase 4 sees and persists the terminal identity before the worker
+        // submits. Grok retains this terminal candidate for persistence retry,
+        // so the submit gate must use the completed durable handoff rather
+        // than draining and replaying it.
+        assert!(
+            drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            slot.continuation_id.as_deref(),
+            Some("terminal-first-session")
+        );
+        assert!(!slot.draining);
+
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Internal-grok".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(189),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            assert!(
+                mailbox::has_unconsumed(
+                    &conn,
+                    "Internal-grok",
+                    mailbox::MailboxKind::Done,
+                    task_id,
+                )
+                .unwrap(),
+                "the terminal-first submit is durable before Phase 2 handles it"
+            );
+        }
+
+        assert_eq!(
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
+                .await
+                .unwrap(),
+            GrokWorkerDeliveryGate::Ready,
+            "an exact terminal handoff completed before submit must not be replayed"
+        );
+
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "terminal-first-session"
+        );
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "terminal-first-session"
+        );
+
+        // This mirrors the only lifecycle transition the mailbox handler may
+        // perform after the gate has verified the exact durable identity.
+        tasks::apply_event(
+            &mut conn,
+            "Internal-grok",
+            task_id,
+            &Event::SignaledDone { pr: "189".into() },
+            now_unix(),
+        )
+        .unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_submit_retains_terminal_beyond_raw_drain_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "i=0; while [ \"$i\" -lt {MAX_STREAM_LINES_PER_TICK} ]; do printf '%s\\n' '{{\"type\":\"text\",\"data\":\"ordinary\"}}'; i=$((i+1)); done; printf '%s\\n' '{{\"type\":\"end\",\"sessionId\":\"budget-submit-session\"}}'"
+        );
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(dir.path(), &body).await;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Internal-grok".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(189),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // The first bounded Phase 2 drain consumes only ordinary records.
+        // Clean process exit is not evidence that the unread suffix lacks a
+        // terminal identity, so retain the durable submit for the next tick.
+        assert_eq!(
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
+                .await
+                .unwrap(),
+            GrokWorkerDeliveryGate::Pending
+        );
+        assert!(slot.continuation_id.is_none());
+        assert!(slot.has_pending_grok_terminal_handoff());
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            assert!(mailbox::has_unconsumed(
+                &conn,
+                "Internal-grok",
+                mailbox::MailboxKind::Done,
+                task_id,
+            )
+            .unwrap());
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert!(runner_state::continuation(&refs, ContinuationSlot::Worker, "grok").is_none());
+            assert!(runner_state::initial_worker_session(&refs).is_none());
+        }
+
+        assert_eq!(
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
+                .await
+                .unwrap(),
+            GrokWorkerDeliveryGate::Ready
+        );
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "budget-submit-session"
+        );
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "budget-submit-session"
+        );
+        tasks::apply_event(
+            &mut conn,
+            "Internal-grok",
+            task_id,
+            &Event::SignaledDone { pr: "189".into() },
+            now_unix(),
+        )
+        .unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_submit_exited_without_terminal_and_descendant_pipe_fails_boundedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "i=0; while [ \"$i\" -lt {MAX_STREAM_LINES_PER_TICK} ]; do printf '%s\\n' '{{\"type\":\"text\",\"data\":\"ordinary\"}}'; i=$((i+1)); done; sleep 30 & exit 0"
+        );
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(dir.path(), &body).await;
+        let mailbox_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Internal-grok".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(189),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap()
+        };
+
+        // The first drain has an unread suffix, so retain the submitted row
+        // for one more bounded read. The background sleep inherited stdout
+        // but the Grok leader exits without its required terminal identity.
+        assert_eq!(
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
+                .await
+                .unwrap(),
+            GrokWorkerDeliveryGate::Pending
+        );
+        assert!(slot.has_pending_grok_terminal_handoff());
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            assert!(mailbox::has_unconsumed(
+                &conn,
+                "Internal-grok",
+                mailbox::MailboxKind::Done,
+                task_id,
+            )
+            .unwrap());
+        }
+
+        // The next drain times out on the descendant-held pipe. It did not
+        // exhaust its raw-record budget, so the gate must finalize exit
+        // evidence within the existing bound and reject the terminal-free
+        // delivery rather than retaining the task forever.
+        let gate = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default()).await
+        })
+        .await
+        .expect("descendant-held stdout must not leave the Grok submit pending forever")
+        .unwrap();
+        assert!(matches!(gate, GrokWorkerDeliveryGate::Failed(_)));
+        assert!(!slot.has_pending_grok_terminal_handoff());
+        assert!(slot
+            .observed_pre_authoritative_failure()
+            .unwrap()
+            .to_string()
+            .contains("stdout finalization timed out"));
+
+        // Mirror Phase 2's daemon-only rejection path: it releases working
+        // authority and consumes the submitted delivery after the bounded
+        // failure, leaving normal recovery able to provision a fresh worker.
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Internal-grok",
+            task_id,
+            &Event::AgentFailed {
+                reason: "Grok submission rejected before review: missing terminal identity".into(),
+            },
+            now_unix(),
+        )
+        .unwrap();
+        mailbox::mark_consumed(&mut conn, mailbox_id).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert!(task.assignee.is_none());
+        let active_lease_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                [tasks::lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_lease_count, 0);
+        assert!(!mailbox::has_unconsumed(
+            &conn,
+            "Internal-grok",
+            mailbox::MailboxKind::Done,
+            task_id,
+        )
+        .unwrap());
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_submit_unfinalizable_terminal_candidate_fails_boundedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"held-pipe-session\"}'; sleep 30 & exit 0",
+        )
+        .await;
+        let mailbox_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Internal-grok".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(189),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap()
+        };
+
+        // The leader emits a syntactically valid terminal identity, but its
+        // descendant retains stdout. The candidate cannot be authorized
+        // without clean terminal evidence, so an exited leader must use the
+        // bounded failure path instead of pinning the submitted Done row.
+        let gate = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default()).await
+        })
+        .await
+        .expect("descendant-held stdout must not leave the Grok submit pending forever")
+        .unwrap();
+        assert!(matches!(gate, GrokWorkerDeliveryGate::Failed(_)));
+        assert!(!slot.has_pending_grok_terminal_handoff());
+        assert!(slot
+            .observed_pre_authoritative_failure()
+            .unwrap()
+            .to_string()
+            .contains("stdout finalization timed out"));
+
+        // Mirror Phase 2's daemon-only failure path. A rejected delivery
+        // consumes its submitted row and releases the working lease, so a
+        // fresh worker can recover instead of leaving an unremediable review.
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Internal-grok",
+            task_id,
+            &Event::AgentFailed {
+                reason: "Grok submission rejected before review: incomplete terminal evidence"
+                    .into(),
+            },
+            now_unix(),
+        )
+        .unwrap();
+        mailbox::mark_consumed(&mut conn, mailbox_id).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert!(task.assignee.is_none());
+        let active_lease_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                [tasks::lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_lease_count, 0);
+        assert!(!mailbox::has_unconsumed(
+            &conn,
+            "Internal-grok",
+            mailbox::MailboxKind::Done,
+            task_id,
+        )
+        .unwrap());
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_submit_before_terminal_handoff_waits_for_durable_remediation_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "sleep 1; printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"submit-race-session\"}'",
+        )
+        .await;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Internal-grok".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(189),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(task.status, "working");
+            assert!(runner_state::continuation(&refs, ContinuationSlot::Worker, "grok").is_none());
+            assert!(
+                mailbox::has_unconsumed(
+                    &conn,
+                    "Internal-grok",
+                    mailbox::MailboxKind::Done,
+                    task_id,
+                )
+                .unwrap(),
+                "the submit must be durable before the delayed terminal record"
+            );
+        }
+
+        assert_eq!(
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
+                .await
+                .unwrap(),
+            GrokWorkerDeliveryGate::Ready,
+            "the delivery boundary must wait for the terminal handoff instead of entering review first"
+        );
+
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "working",
+            "the gate itself has no lifecycle authority"
+        );
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "submit-race-session"
+        );
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "submit-race-session"
+        );
+
+        // This is the lifecycle sequence the Phase 2 mailbox handler is now
+        // allowed to perform after the gate. A later changes verdict receives
+        // the exact continuation instead of failing closed in remediation.
+        tasks::apply_event(
+            &mut conn,
+            "Internal-grok",
+            task_id,
+            &Event::SignaledDone { pr: "189".into() },
+            now_unix(),
+        )
+        .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "daemon",
+            task_id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            now_unix(),
+        )
+        .unwrap();
+        tasks::apply_event(&mut conn, "R1", task_id, &Event::VerdictChanges, now_unix()).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        let continuation = runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+            .map(|identity| identity.id);
+        assert_eq!(
+            require_remediation_continuation(runner::AgentKind::Grok, false, true, continuation,)
+                .unwrap()
+                .as_deref(),
+            Some("submit-race-session")
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_delivery_gate_rejects_missing_malformed_and_duplicate_terminal_identity() {
+        let fixtures = [
+            ("missing", "printf '%s\\n' '{\"type\":\"text\",\"data\":\"done\"}'"),
+            ("malformed", "printf '%s\\n' '{\"type\":\"end\"}'"),
+            (
+                "duplicate",
+                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-b\"}'",
+            ),
+        ];
+        for (name, body) in fixtures {
+            let dir = tempfile::tempdir().unwrap();
+            let (db_path, mut slot, task_id) = initial_grok_worker_fixture(dir.path(), body).await;
+            let gate = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let gate =
+                        gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
+                            .await
+                            .unwrap_or_else(|error| {
+                                GrokWorkerDeliveryGate::Failed(error.to_string())
+                            });
+                    if gate != GrokWorkerDeliveryGate::Pending {
+                        return gate;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{name}: Grok process did not settle for delivery gate"));
+            assert!(
+                matches!(gate, GrokWorkerDeliveryGate::Failed(_)),
+                "{name}: a submission cannot cross into review without one authorized terminal identity ({gate:?})"
+            );
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            assert_eq!(
+                task.status, "working",
+                "{name}: the gate has not released working authority"
+            );
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert!(
+                runner_state::continuation(&refs, ContinuationSlot::Worker, "grok").is_none(),
+                "{name}: no continuation may leak from a rejected terminal handoff"
+            );
+            assert!(
+                runner_state::initial_worker_session(&refs).is_none(),
+                "{name}: no initial handoff may leak from a rejected terminal handoff"
+            );
+            drop(conn);
+            slot.kill_and_reap().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_pending_delivery_stays_out_of_review_on_controlled_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "sleep 6; printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"shutdown-session\"}'",
+        )
+        .await;
+        let done = mailbox::MailboxRow {
+            agent: "Internal-grok".into(),
+            kind: mailbox::MailboxKind::Done,
+            task_id: Some(task_id),
+            pr: Some(189),
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        };
+        let mailbox_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let mailbox_id = mailbox::append(&mut conn, &done).unwrap();
+            journal::upsert(&mut conn, &slot_journal_entry(&slot, "worker", "working")).unwrap();
+            mailbox_id
+        };
+
+        assert_eq!(
+            gate_grok_worker_delivery(&mut slot, &db_path, &CostLimits::default())
+                .await
+                .unwrap(),
+            GrokWorkerDeliveryGate::Pending,
+            "a running Grok terminal handoff remains pending rather than entering review"
+        );
+
+        let cap_run_id = slot.cap_run_id.clone().unwrap();
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(
+            tasks::suspend_run_for_controlled_shutdown(
+                &mut conn,
+                "Internal-grok",
+                task_id,
+                &cap_run_id,
+                now_unix(),
+            )
+            .unwrap(),
+            "controlled shutdown must retire the pending worker capability"
+        );
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(runner_state::continuation(&refs, ContinuationSlot::Worker, "grok").is_none());
+        assert!(runner_state::initial_worker_session(&refs).is_none());
+        assert!(
+            mailbox::has_unconsumed(&conn, "Internal-grok", mailbox::MailboxKind::Done, task_id,)
+                .unwrap(),
+            "shutdown must not consume a delivery that never received its terminal identity"
+        );
+        drop(conn);
+
+        assert!(
+            !recover_late_worker_done_atomic(&db_path, mailbox_id, &done, done.pr, None)
+                .await
+                .unwrap(),
+            "startup late-delivery recovery must retain a submitted Grok row without its durable terminal handoff"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "working"
+        );
+        assert!(
+            mailbox::has_unconsumed(&conn, "Internal-grok", mailbox::MailboxKind::Done, task_id,)
+                .unwrap(),
+            "late recovery must not consume a Grok delivery lacking both durable refs"
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_late_delivery_recovers_after_exact_handoff_before_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"restart-session\"}'",
+        )
+        .await;
+        assert!(
+            drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none(),
+            "the exact terminal handoff must persist before shutdown"
+        );
+        let done = mailbox::MailboxRow {
+            agent: "Internal-grok".into(),
+            kind: mailbox::MailboxKind::Done,
+            task_id: Some(task_id),
+            pr: Some(189),
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        };
+        let mailbox_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let mailbox_id = mailbox::append(&mut conn, &done).unwrap();
+            journal::upsert(&mut conn, &slot_journal_entry(&slot, "worker", "working")).unwrap();
+            let cap_run_id = slot.cap_run_id.as_deref().unwrap();
+            assert!(tasks::suspend_run_for_controlled_shutdown(
+                &mut conn,
+                "Internal-grok",
+                task_id,
+                cap_run_id,
+                now_unix(),
+            )
+            .unwrap());
+            mailbox_id
+        };
+
+        assert!(
+            recover_late_worker_done_atomic(&db_path, mailbox_id, &done, done.pr, None)
+                .await
+                .unwrap(),
+            "startup late recovery must fold an already-complete exact Grok handoff"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "restart-session"
+        );
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "restart-session"
+        );
+        assert!(
+            !mailbox::has_unconsumed(&conn, "Internal-grok", mailbox::MailboxKind::Done, task_id,)
+                .unwrap(),
+            "a valid late delivery must be consumed with its lifecycle transition"
+        );
+        drop(conn);
         slot.kill_and_reap().await;
     }
 
