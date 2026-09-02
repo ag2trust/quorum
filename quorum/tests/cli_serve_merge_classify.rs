@@ -3,6 +3,8 @@
 //! Verifies that policy-blocked merge failures park the task (no rework,
 //! no re-claim) and retryable merge failures send exactly one rework turn.
 
+mod common;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -231,7 +233,7 @@ fi
             args.push(a.to_string());
         }
 
-        let mut command = Command::new(cargo_bin("quorum"));
+        let mut command = common::test_daemon_command(cargo_bin("quorum"));
         command
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")

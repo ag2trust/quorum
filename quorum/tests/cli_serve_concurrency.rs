@@ -1,6 +1,8 @@
 //! M3 concurrency tests: multi-worker spawn, priority ordering,
 //! independent lifecycle, SIGINT teardown with multiple workers.
 
+mod common;
+
 use rusqlite::params;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -140,7 +142,7 @@ fi
             env::var("PATH").unwrap_or_default()
         );
         let fake_agent = cargo_bin("fake-agent");
-        let mut child = Command::new(cargo_bin("quorum"))
+        let mut child = common::test_daemon_command(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .env("PATH", path)
@@ -852,7 +854,7 @@ fn sentinel_gone_terminates_serve_and_children() {
     let sentinel_path = sentinel.path().to_string_lossy().to_string();
 
     let fake_agent = cargo_bin("fake-agent");
-    let mut child = Command::new(cargo_bin("quorum"))
+    let mut child = common::test_daemon_command(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
         .args([

@@ -6,6 +6,8 @@
 //! pinned the slot forever (draining stayed true, task never released,
 //! worktree leaked, Phase 5 never fired).
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -116,7 +118,7 @@ fn worker_dying_mid_task_releases_task_and_slot() {
 
     let sentinel = tempfile::tempdir().unwrap();
     let fake_agent = cargo_bin("fake-agent");
-    let mut child = Command::new(cargo_bin("quorum"))
+    let mut child = common::test_daemon_command(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
         .args([

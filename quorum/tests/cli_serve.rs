@@ -1,5 +1,7 @@
 //! Integration tests for `quorum serve`.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -66,7 +68,7 @@ fn serve_boots_and_stops_on_sigint() {
     let sentinel = tempfile::tempdir().unwrap();
     let sentinel_path = sentinel.path().to_string_lossy().to_string();
 
-    let mut child = Command::new(cargo_bin())
+    let mut child = common::test_daemon_command(cargo_bin())
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
         .args([

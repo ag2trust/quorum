@@ -5,6 +5,8 @@
 //! 1. max-task-tokens: worker killed when cumulative tokens exceed ceiling
 //! 2. max-turn-tokens: worker killed when single-turn tokens exceed ceiling
 
+mod common;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -214,7 +216,7 @@ fi
             args.push(a.to_string());
         }
 
-        let mut child = Command::new(cargo_bin("quorum"))
+        let mut child = common::test_daemon_command(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .env("PATH", path)
@@ -284,7 +286,7 @@ fi
             args.push(a.to_string());
         }
 
-        let mut cmd = Command::new(cargo_bin("quorum"));
+        let mut cmd = common::test_daemon_command(cargo_bin("quorum"));
         cmd.env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .env("PATH", path)
@@ -1775,7 +1777,7 @@ fn reviewer_ceiling_kills_reviewer_and_respawns() {
     let sentinel_path = sentinel.path().to_string_lossy().to_string();
     let (gh_shim, gh_state, path) = create_gh_shim();
     std::fs::write(gh_state.join("1"), "review-pr-1").unwrap();
-    let mut child = Command::new(cargo_bin("quorum"))
+    let mut child = common::test_daemon_command(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
         .env("PATH", path)

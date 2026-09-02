@@ -904,7 +904,7 @@ fi
         let path = test_command_path(gh_shim.path());
         let sentinel = tempfile::tempdir().unwrap();
         let (runner_hold_reader, runner_hold_writer) = runner_hold_pipe();
-        let mut serve = Command::new(cargo_bin("quorum"));
+        let mut serve = common::test_daemon_command(cargo_bin("quorum"));
         serve
             .env("QUORUM_HOME", home.path())
             .env("QUORUM_REPO", "test/repo")
@@ -1050,7 +1050,7 @@ fi
         std::fs::write(&config_path, &config_contents).unwrap();
         let sentinel = tempfile::tempdir().unwrap();
         let (runner_hold_reader, runner_hold_writer) = runner_hold_pipe();
-        let mut serve = Command::new(cargo_bin("quorum"));
+        let mut serve = common::test_daemon_command(cargo_bin("quorum"));
         serve
             .env("QUORUM_HOME", self.home.path())
             .env("QUORUM_REPO", "test/repo")

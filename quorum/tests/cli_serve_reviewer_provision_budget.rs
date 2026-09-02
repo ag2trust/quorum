@@ -8,6 +8,8 @@
 //!
 //! Asserts DB state (attempts rows, task status/refs), not just console lines.
 
+mod common;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -163,7 +165,7 @@ fi
             args.push(a.to_string());
         }
 
-        let mut child = Command::new(cargo_bin("quorum"))
+        let mut child = common::test_daemon_command(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .env("PATH", path)
