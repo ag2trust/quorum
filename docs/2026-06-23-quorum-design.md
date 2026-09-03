@@ -1957,6 +1957,12 @@ turns; restricted continuation is rejected. Normal configuration accepts only th
 verified model, effort vocabulary, permission mode, sandbox profiles, and bounded turn
 range. Unknown values and unverified safety combinations fail before spawn.
 
+Managed MCP launches remap `HOME` to a private configuration directory so operator MCP
+configuration cannot enter the run. Their Rustup, Cargo, and Docker config locations are
+pinned to the requested or operator-home locations before that remap; Docker needs this
+exception to discover its installed CLI plugins without exposing the rest of the operator
+home.
+
 Consumed events:
 
 | Grok `streaming-json` event | Normalized meaning |
