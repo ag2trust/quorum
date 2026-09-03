@@ -16,7 +16,9 @@
 //! - Idempotent: re-running for the same PR replaces prior findings and the run
 //!   record via `pr_number`-keyed UPSERT.
 
-use super::classifier::{CLASSIFIER_EFFORT, CLASSIFIER_MODEL};
+use super::classifier::{
+    CLASSIFIER_EFFORT, CLASSIFIER_MODEL, MAX_CLASSIFIER_RESPONSE_BYTES, MAX_CLASSIFIER_STDOUT_BYTES,
+};
 use super::runner::{AdapterConfig, AgentEvent, AgentKind, LaunchMode, LaunchRequest, RunnerProc};
 use quorum_core::clock;
 use quorum_core::error::{QuorumError, Result};
@@ -46,6 +48,12 @@ pub const COLLECTOR_VERSION: &str = "v3";
 /// Hard wall-clock cap on the classifier turn. Post-merge, so failing here
 /// leaves the merged task alone — the observable surface is `review_collection_runs`.
 const CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Bound each collector turn's provider output before it can be normalized,
+/// retained for response repair, or parsed for salvage. Keep this aligned with
+/// the shared classifier role's proven stream and response budgets.
+const MAX_COLLECTOR_STDOUT_BYTES: usize = MAX_CLASSIFIER_STDOUT_BYTES;
+const MAX_COLLECTOR_RESPONSE_BYTES: usize = MAX_CLASSIFIER_RESPONSE_BYTES;
 
 /// Cap each raw GitHub payload we splice into the prompt. Bounded input protects
 /// budget on huge PRs (a 3k-comment thread should not become a 200k-token prompt).
@@ -1626,8 +1634,9 @@ async fn spawn_and_run_classifier(
 
     let deadline = tokio::time::Instant::now() + CLASSIFIER_TIMEOUT;
     let mut response_text = String::new();
+    let mut stdout_bytes = 0usize;
     let mut usage_total = super::runner::TokenUsage::default();
-    let outcome: Result<String> = loop {
+    let outcome: Result<String> = 'turn: loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break Err(QuorumError::Io(format!(
@@ -1635,27 +1644,62 @@ async fn spawn_and_run_classifier(
                 request.pr_number
             )));
         }
-        match timeout(remaining, proc.next_raw_line()).await {
-            Ok(Some(raw)) => {
+        let line_limit = MAX_COLLECTOR_STDOUT_BYTES
+            .saturating_sub(stdout_bytes)
+            .saturating_sub(1);
+        match timeout(remaining, proc.next_raw_line_bounded(line_limit)).await {
+            Ok(Ok(Some(raw))) => {
+                stdout_bytes = stdout_bytes.saturating_add(raw.len() + 1);
+                if stdout_bytes > MAX_COLLECTOR_STDOUT_BYTES {
+                    break Err(QuorumError::Io("collector stdout exceeded 256 KiB".into()));
+                }
                 let line = proc.normalize_line(&raw);
+                // A terminal provider record can carry usage and an oversized
+                // response. Account for its usage before rejecting the
+                // response: the record is already consumed and reaping cannot
+                // reconstruct that telemetry.
+                for event in &line.events {
+                    match event {
+                        AgentEvent::TurnCompleted {
+                            usage: Some(usage), ..
+                        }
+                        | AgentEvent::TurnFailed {
+                            usage: Some(usage), ..
+                        } => usage_total.saturating_add_assign(*usage),
+                        _ => {}
+                    }
+                }
                 if let Some(text) = line.terminal_text.as_ref().filter(|text| !text.is_empty()) {
+                    if text.len() > MAX_COLLECTOR_RESPONSE_BYTES {
+                        break Err(QuorumError::Io("collector response exceeded 64 KiB".into()));
+                    }
                     response_text = text.clone();
                 }
                 let mut terminal = None;
                 for event in line.events {
                     match event {
-                        AgentEvent::AssistantText { text } => response_text.push_str(&text),
-                        AgentEvent::CompletedAssistantText { text, .. } => response_text = text,
-                        AgentEvent::TurnCompleted { usage, .. } => {
-                            if let Some(usage) = usage {
-                                usage_total.saturating_add_assign(usage);
+                        AgentEvent::AssistantText { text } => {
+                            if response_text.len().saturating_add(text.len())
+                                > MAX_COLLECTOR_RESPONSE_BYTES
+                            {
+                                break 'turn Err(QuorumError::Io(
+                                    "collector response exceeded 64 KiB".into(),
+                                ));
                             }
+                            response_text.push_str(&text);
+                        }
+                        AgentEvent::CompletedAssistantText { text, .. } => {
+                            if text.len() > MAX_COLLECTOR_RESPONSE_BYTES {
+                                break 'turn Err(QuorumError::Io(
+                                    "collector response exceeded 64 KiB".into(),
+                                ));
+                            }
+                            response_text = text;
+                        }
+                        AgentEvent::TurnCompleted { .. } => {
                             terminal = Some(Ok(response_text.clone()))
                         }
-                        AgentEvent::TurnFailed { message, usage, .. } => {
-                            if let Some(usage) = usage {
-                                usage_total.saturating_add_assign(usage);
-                            }
+                        AgentEvent::TurnFailed { message, .. } => {
                             let message = line.terminal_text.as_deref().unwrap_or(&message);
                             terminal = Some(Err(QuorumError::Io(format!(
                                 "classifier returned an error: {message}"
@@ -1668,7 +1712,7 @@ async fn spawn_and_run_classifier(
                     break result;
                 }
             }
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 break if response_text.is_empty() {
                     Err(QuorumError::Io(
                         "classifier stream closed with no response".into(),
@@ -1676,6 +1720,14 @@ async fn spawn_and_run_classifier(
                 } else {
                     Ok(response_text.clone())
                 };
+            }
+            Ok(Err(error)) => {
+                let detail = if error.to_string().contains("exceeded") {
+                    "collector stdout exceeded 256 KiB".into()
+                } else {
+                    format!("collector stdout read failed: {error}")
+                };
+                break Err(QuorumError::Io(detail));
             }
             Err(_) => {
                 break Err(QuorumError::Io(format!(
@@ -3038,6 +3090,48 @@ mod tests {
         assert_eq!(run.status, RunStatus::Success);
         assert_eq!(run.findings_count, 1);
         assert!(run.error.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_response_fails_before_repair_or_salvage() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let prompt_log = dir.path().join("collector-prompts.jsonl");
+        let mut request = live_request(dir.path(), &db, 413, Some(7), false);
+        request.env_vars.extend([
+            (
+                "FAKE_AGENT_COLLECTOR_RESPONSE".to_string(),
+                "x".repeat(MAX_COLLECTOR_RESPONSE_BYTES + 1),
+            ),
+            (
+                "FAKE_AGENT_PROMPT_LOG".to_string(),
+                prompt_log.to_string_lossy().to_string(),
+            ),
+        ]);
+
+        let error = run_live(&request).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("collector response exceeded 64 KiB"));
+
+        let prompts = std::fs::read_to_string(&prompt_log).unwrap();
+        assert_eq!(
+            prompts.matches("## Response repair").count(),
+            0,
+            "an oversized primary response must not be retained in a repair prompt"
+        );
+
+        let conn = db::open(&db).unwrap();
+        let run = review_findings::get_run(&conn, 413).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.findings_count, 0);
+        assert!(run
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("collector response exceeded 64 KiB"));
+        assert!(review_findings::list_for_pr(&conn, 413).unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

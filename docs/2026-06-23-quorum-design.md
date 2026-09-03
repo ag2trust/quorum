@@ -1601,10 +1601,13 @@ Planning Agent and daemon-owned materialization described in
      until a subsequent successful run replaces them.
 2. **Bounded classifier turn** — a Haiku-class agent (`CLASSIFIER_MODEL` /
    `CLASSIFIER_EFFORT`) is spawned with an EMPTY tool allowlist (no Bash,
-   Read, Write, Edit, gh — response-only). 3-minute wall-clock cap. A strict
-   response parse failure gets exactly one separately bounded repair turn using
-   the same model and original prompt, plus the previous response and exact
-   parser error. No model call runs while a DB transaction is open.
+   Read, Write, Edit, gh — response-only). 3-minute wall-clock cap and hard
+   256 KiB provider-stdout / 64 KiB response-text caps apply before output is
+   normalized, retained, repaired, or salvaged; a cap violation is a loud
+   failure. A strict response parse failure gets exactly one separately bounded
+   repair turn using the same model and original prompt, plus the previous
+   response and exact parser error. No model call runs while a DB transaction
+   is open.
 3. **Structured output** — response must be
    `{"findings":[...],"followup_artifacts":[...]}` with each
    finding carrying `kind` (blocking/suggestion), `author_pushback`,
