@@ -1614,13 +1614,15 @@ Planning Agent and daemon-owned materialization described in
    technical impact, scope relationship, concrete concern, non-blocking reason,
    affected behavior, desired outcome, verification expectations, and evidence.
    Prose-only or evidence-free findings/artifacts are rejected by contract. If
-   the repair response is still malformed but its top-level envelope is strict,
-   the collector validates findings and artifacts independently, retaining only
+   the repair response is still malformed but its envelope and each retained
+   element still pass strict parsing (including duplicate-field rejection), the
+   collector validates findings and artifacts independently, retaining only
    valid entries. An artifact whose source finding was dropped is also dropped.
    A salvaged run with at least one valid finding is stored as `success` with a
-   bounded error text listing dropped indices and reasons; no valid finding
-   remains a loud failed run. Evidence fields remain required and must point to
-   fetched records in both the normal and salvage paths.
+   bounded error text listing dropped indices and reasons; excess array entries
+   are summarized after the per-type cap. No valid finding remains a loud failed
+   run. Evidence fields remain required and must point to fetched records in
+   both the normal and salvage paths.
 4. **Atomic idempotent write** — one transaction replaces analytics, inserts the
    PR's immutable artifact batch only when absent, and UPSERTs the successful
    `review_collection_runs` row. Re-interpretation may refresh analytics but

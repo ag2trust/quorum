@@ -31,6 +31,7 @@ use quorum_core::review_followups::{
 };
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -76,12 +77,25 @@ const MAX_PARSE_FAILURE_ERROR_BYTES: usize = 2 * 1024;
 const PARSE_FAILURE_REASON_TRUNCATION: &str = "... [reason truncated]";
 const MAX_SALVAGE_ERROR_BYTES: usize = 32 * 1024;
 const MAX_SALVAGE_DROP_REASON_BYTES: usize = 128;
+const MAX_SALVAGE_REPAIR_REASON_BYTES: usize = 2 * 1024;
+const MAX_SALVAGE_DROPS: usize = MAX_REVIEW_FINDINGS + MAX_FOLLOWUP_ARTIFACTS + 2;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCollectorResponse {
     findings: Vec<RawFinding>,
     followup_artifacts: Vec<RawFollowupArtifact>,
+}
+
+/// Borrow each element's original JSON so salvage re-runs its strict deserializer
+/// without accepting duplicate fields that a `Value` would collapse.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSalvageResponse<'a> {
+    #[serde(borrow)]
+    findings: Vec<&'a RawValue>,
+    #[serde(borrow)]
+    followup_artifacts: Vec<&'a RawValue>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -283,53 +297,42 @@ fn salvage_response(
         Some(value) => value,
         None => return Ok(None),
     };
-    let mut envelope: serde_json::Map<String, serde_json::Value> =
-        match serde_json::from_str(json_text) {
-            Ok(value) => value,
-            Err(_) => return Ok(None),
-        };
-    if envelope.len() != 2
-        || !envelope.contains_key("findings")
-        || !envelope.contains_key("followup_artifacts")
-    {
-        return Ok(None);
-    }
-    let findings = match envelope
-        .remove("findings")
-        .and_then(|value| value.as_array().cloned())
-    {
-        Some(value) => value,
-        None => return Ok(None),
-    };
-    let artifacts = match envelope
-        .remove("followup_artifacts")
-        .and_then(|value| value.as_array().cloned())
-    {
-        Some(value) => value,
-        None => return Ok(None),
+    let envelope: RawSalvageResponse<'_> = match serde_json::from_str(json_text) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
     };
 
     let available_evidence = fetched_evidence(inputs)?;
     let mut dropped = Vec::new();
     let mut valid_findings = Vec::new();
-    for (index, value) in findings.into_iter().enumerate() {
-        if index >= MAX_REVIEW_FINDINGS {
-            dropped.push(salvage_drop(
+    if envelope.findings.len() > MAX_REVIEW_FINDINGS {
+        push_salvage_drop(
+            &mut dropped,
+            salvage_drop(
                 "findings",
-                index,
-                "exceeds the maximum of 128 findings",
-            ));
-            continue;
-        }
-        let finding = match serde_json::from_value::<RawFinding>(value) {
+                MAX_REVIEW_FINDINGS,
+                format!(
+                    "exceeds the maximum of {MAX_REVIEW_FINDINGS} findings; {} additional entries omitted",
+                    envelope.findings.len() - MAX_REVIEW_FINDINGS,
+                ),
+            ),
+        );
+    }
+    for (index, value) in envelope
+        .findings
+        .into_iter()
+        .take(MAX_REVIEW_FINDINGS)
+        .enumerate()
+    {
+        let finding = match serde_json::from_str::<RawFinding>(value.get()) {
             Ok(value) => value,
             Err(error) => {
-                dropped.push(salvage_drop("findings", index, error));
+                push_salvage_drop(&mut dropped, salvage_drop("findings", index, error));
                 continue;
             }
         };
         if let Err(error) = validate_finding(&finding, &available_evidence) {
-            dropped.push(salvage_drop("findings", index, error));
+            push_salvage_drop(&mut dropped, salvage_drop("findings", index, error));
             continue;
         }
         valid_findings.push((index, finding));
@@ -352,19 +355,32 @@ fn salvage_response(
     )?;
 
     let mut followup_artifacts = Vec::new();
-    for (index, value) in artifacts.into_iter().enumerate() {
-        if index >= MAX_FOLLOWUP_ARTIFACTS {
-            dropped.push(salvage_drop(
+    if envelope.followup_artifacts.len() > MAX_FOLLOWUP_ARTIFACTS {
+        push_salvage_drop(
+            &mut dropped,
+            salvage_drop(
                 "followup_artifacts",
-                index,
-                "exceeds the maximum of 32 follow-up artifacts",
-            ));
-            continue;
-        }
-        let artifact = match serde_json::from_value::<RawFollowupArtifact>(value) {
+                MAX_FOLLOWUP_ARTIFACTS,
+                format!(
+                    "exceeds the maximum of {MAX_FOLLOWUP_ARTIFACTS} follow-up artifacts; {} additional entries omitted",
+                    envelope.followup_artifacts.len() - MAX_FOLLOWUP_ARTIFACTS,
+                ),
+            ),
+        );
+    }
+    for (index, value) in envelope
+        .followup_artifacts
+        .into_iter()
+        .take(MAX_FOLLOWUP_ARTIFACTS)
+        .enumerate()
+    {
+        let artifact = match serde_json::from_str::<RawFollowupArtifact>(value.get()) {
             Ok(value) => value,
             Err(error) => {
-                dropped.push(salvage_drop("followup_artifacts", index, error));
+                push_salvage_drop(
+                    &mut dropped,
+                    salvage_drop("followup_artifacts", index, error),
+                );
                 continue;
             }
         };
@@ -372,14 +388,17 @@ fn salvage_response(
             .iter()
             .find(|(source_index, _)| *source_index == artifact.source_finding_index)
         else {
-            dropped.push(salvage_drop(
-                "followup_artifacts",
-                index,
-                format!(
-                    "source finding index {} was dropped or is out of bounds",
-                    artifact.source_finding_index
+            push_salvage_drop(
+                &mut dropped,
+                salvage_drop(
+                    "followup_artifacts",
+                    index,
+                    format!(
+                        "source finding index {} was dropped or is out of bounds",
+                        artifact.source_finding_index
+                    ),
                 ),
-            ));
+            );
             continue;
         };
         match validate_and_normalize_artifact(
@@ -390,7 +409,10 @@ fn salvage_response(
             index as i64,
         ) {
             Ok(value) => followup_artifacts.push(value),
-            Err(error) => dropped.push(salvage_drop("followup_artifacts", index, error)),
+            Err(error) => push_salvage_drop(
+                &mut dropped,
+                salvage_drop("followup_artifacts", index, error),
+            ),
         }
     }
 
@@ -406,8 +428,14 @@ fn salvage_response(
 fn salvage_drop(section: &str, index: usize, reason: impl fmt::Display) -> String {
     format!(
         "{section}[{index}]: {}",
-        bounded_parse_failure_reason(&reason.to_string(), MAX_SALVAGE_DROP_REASON_BYTES)
+        bounded_display_reason(reason, MAX_SALVAGE_DROP_REASON_BYTES)
     )
+}
+
+fn push_salvage_drop(dropped: &mut Vec<String>, value: String) {
+    if dropped.len() < MAX_SALVAGE_DROPS {
+        dropped.push(value);
+    }
 }
 
 fn extract_collector_json(text: &str) -> Option<&str> {
@@ -449,29 +477,64 @@ fn collector_response_shape(text: &str) -> CollectorResponseShape {
     }
 }
 
-fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
-    let mut end = value.len().min(max_bytes);
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
+fn bounded_parse_failure_reason(reason: &str, max_bytes: usize) -> String {
+    bounded_display_reason(reason, max_bytes)
 }
 
-fn bounded_parse_failure_reason(reason: &str, max_bytes: usize) -> String {
-    let safe_reason = reason.replace('\0', "�");
-    if safe_reason.len() <= max_bytes {
-        return safe_reason;
-    }
-    if max_bytes <= PARSE_FAILURE_REASON_TRUNCATION.len() {
-        return truncate_utf8_bytes(&safe_reason, max_bytes).to_string();
+/// Render model-derived errors without first allocating their full display
+/// representation. This keeps recovery diagnostics bounded even when a parser
+/// error includes hostile field text.
+fn bounded_display_reason(reason: impl fmt::Display, max_bytes: usize) -> String {
+    let mut bounded = BoundedReason::new(max_bytes);
+    let _ = fmt::write(&mut bounded, format_args!("{reason}"));
+    bounded.finish()
+}
+
+struct BoundedReason {
+    value: String,
+    content_limit: usize,
+    max_bytes: usize,
+    truncated: bool,
+}
+
+impl BoundedReason {
+    fn new(max_bytes: usize) -> Self {
+        let content_limit = if max_bytes > PARSE_FAILURE_REASON_TRUNCATION.len() {
+            max_bytes - PARSE_FAILURE_REASON_TRUNCATION.len()
+        } else {
+            max_bytes
+        };
+        Self {
+            value: String::with_capacity(max_bytes),
+            content_limit,
+            max_bytes,
+            truncated: false,
+        }
     }
 
-    let prefix_len = max_bytes - PARSE_FAILURE_REASON_TRUNCATION.len();
-    format!(
-        "{}{}",
-        truncate_utf8_bytes(&safe_reason, prefix_len),
-        PARSE_FAILURE_REASON_TRUNCATION
-    )
+    fn finish(mut self) -> String {
+        if self.truncated && self.max_bytes > PARSE_FAILURE_REASON_TRUNCATION.len() {
+            self.value.push_str(PARSE_FAILURE_REASON_TRUNCATION);
+        }
+        self.value
+    }
+}
+
+impl fmt::Write for BoundedReason {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.truncated {
+            return Ok(());
+        }
+        for character in value.chars() {
+            let character = if character == '\0' { '�' } else { character };
+            if self.value.len().saturating_add(character.len_utf8()) > self.content_limit {
+                self.truncated = true;
+                break;
+            }
+            self.value.push(character);
+        }
+        Ok(())
+    }
 }
 
 fn format_parse_failure(pr_number: i64, response_text: &str, parse_error: &QuorumError) -> String {
@@ -491,7 +554,7 @@ fn format_parse_failure(pr_number: i64, response_text: &str, parse_error: &Quoru
     let reason_limit = MAX_PARSE_FAILURE_ERROR_BYTES.saturating_sub(prefix.len() + suffix.len());
     format!(
         "{prefix}{}{suffix}",
-        bounded_parse_failure_reason(&parse_error.to_string(), reason_limit)
+        bounded_display_reason(parse_error, reason_limit)
     )
 }
 
@@ -1150,14 +1213,23 @@ fn format_salvage_success(
     repair_error: &QuorumError,
     dropped: &[String],
 ) -> String {
-    bounded_parse_failure_reason(
-        &format!(
-            "collector response salvaged after one repair turn for PR #{pr_number}; \
-             repair parse error: {repair_error}; dropped: {}",
-            dropped.join("; ")
-        ),
-        MAX_SALVAGE_ERROR_BYTES,
-    )
+    let mut error = format!(
+        "collector response salvaged after one repair turn for PR #{pr_number}; \
+         repair parse error: {}; dropped:",
+        bounded_display_reason(repair_error, MAX_SALVAGE_REPAIR_REASON_BYTES),
+    );
+    let mut wrote_drop = false;
+    for drop in dropped.iter().take(MAX_SALVAGE_DROPS) {
+        let separator = if wrote_drop { "; " } else { " " };
+        let available = MAX_SALVAGE_ERROR_BYTES.saturating_sub(error.len() + separator.len());
+        if available == 0 {
+            break;
+        }
+        error.push_str(separator);
+        error.push_str(&bounded_parse_failure_reason(drop, available));
+        wrote_drop = true;
+    }
+    error
 }
 
 async fn record_parse_failure(
@@ -2213,6 +2285,63 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn salvage_rejects_duplicate_fields_without_collapsing_them() {
+        let raw_finding = finding("suggestion", 10).to_string();
+        let duplicate_evidence =
+            raw_finding.replacen("\"evidence\":[", "\"evidence\":[],\"evidence\":[", 1);
+        assert_ne!(duplicate_evidence, raw_finding);
+        let nested_duplicate =
+            format!("{{\"findings\":[{duplicate_evidence}],\"followup_artifacts\":[]}}");
+        let envelope_duplicate =
+            format!("{{\"findings\":[],\"findings\":[{raw_finding}],\"followup_artifacts\":[]}}");
+        let inputs = parser_inputs(&[10], &[]);
+
+        for response in [nested_duplicate, envelope_duplicate] {
+            assert!(parse_fixture(&response, &inputs).is_err());
+            assert!(
+                salvage_response(&response, &inputs, Some(7), "collector-model", "v-test")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn salvage_bounds_drop_diagnostics_before_formatting() {
+        let mut findings = vec![finding("suggestion", 10)];
+        for id in 11..=(MAX_REVIEW_FINDINGS as i64 + 16) {
+            let mut missing_evidence = finding("suggestion", id);
+            missing_evidence.as_object_mut().unwrap().remove("evidence");
+            findings.push(missing_evidence);
+        }
+        let inputs = parser_inputs(
+            &(10..=(MAX_REVIEW_FINDINGS as i64 + 16)).collect::<Vec<_>>(),
+            &[],
+        );
+        let salvaged = salvage_response(
+            &response(findings, vec![]),
+            &inputs,
+            Some(7),
+            "collector-model",
+            "v-test",
+        )
+        .unwrap()
+        .expect("the first valid finding makes the response salvageable");
+
+        assert!(salvaged.dropped.len() <= MAX_SALVAGE_DROPS);
+        assert!(salvaged.dropped.iter().any(|drop| {
+            drop.contains(&format!("findings[{MAX_REVIEW_FINDINGS}]"))
+                && drop.contains("additional entries omitted")
+        }));
+        let error = format_salvage_success(
+            99,
+            &QuorumError::Usage("x".repeat(MAX_SALVAGE_ERROR_BYTES)),
+            &salvaged.dropped,
+        );
+        assert!(error.len() <= MAX_SALVAGE_ERROR_BYTES);
     }
 
     #[test]
