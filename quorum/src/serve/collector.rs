@@ -30,7 +30,7 @@ use quorum_core::review_followups::{
     MAX_FOLLOWUP_EVIDENCE_IDS, MAX_FOLLOWUP_TEXT_BYTES,
 };
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -74,6 +74,8 @@ const MAX_FETCHED_EVIDENCE_ARRAY_DEPTH: usize = 2;
 /// long validation reason is safely shortened at a UTF-8 boundary.
 const MAX_PARSE_FAILURE_ERROR_BYTES: usize = 2 * 1024;
 const PARSE_FAILURE_REASON_TRUNCATION: &str = "... [reason truncated]";
+const MAX_SALVAGE_ERROR_BYTES: usize = 32 * 1024;
+const MAX_SALVAGE_DROP_REASON_BYTES: usize = 128;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,7 +84,7 @@ struct RawCollectorResponse {
     followup_artifacts: Vec<RawFollowupArtifact>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawFinding {
     reviewer: String,
@@ -96,7 +98,7 @@ struct RawFinding {
     evidence: Vec<RawEvidenceId>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawEvidenceId {
     kind: EvidenceKind,
@@ -143,6 +145,12 @@ struct ValidatedCollectorResponse {
     followup_artifacts: Vec<ReviewFollowupArtifact>,
 }
 
+#[derive(Debug)]
+struct SalvagedCollectorResponse {
+    response: ValidatedCollectorResponse,
+    dropped: Vec<String>,
+}
+
 fn parse_and_validate_response(
     text: &str,
     inputs: &CollectorInputs,
@@ -171,40 +179,31 @@ fn parse_and_validate_response(
         validate_finding(finding, &available_evidence)?;
     }
 
-    // Keep the existing review_findings parser as the sole normalization and
-    // provenance-stamping path. The strict envelope above adds collector-only
-    // validation without changing compatibility for other callers of that API.
-    let findings = review_findings::parse_response_with_provenance(
-        json_text,
+    let findings = normalize_findings(
+        &raw.findings,
         inputs.pr_number,
         task_id,
-        Some(collector_model),
-        Some(collector_version),
-    )
-    .ok_or_else(|| QuorumError::Usage("collector findings could not be normalized".into()))?;
+        collector_model,
+        collector_version,
+    )?;
 
     let mut followup_artifacts = Vec::with_capacity(raw.followup_artifacts.len());
     for (ordinal, artifact) in raw.followup_artifacts.into_iter().enumerate() {
-        validate_artifact_source(&artifact, &raw.findings)?;
-        let artifact_text = validate_artifact_text(&artifact)?;
-        let verification_expectations =
-            VerificationExpectations::new(artifact.verification_expectations)?;
-        let evidence_ids = validated_evidence(artifact.evidence, &available_evidence)?;
-        followup_artifacts.push(ReviewFollowupArtifact::new(
-            None,
+        let source = raw
+            .findings
+            .get(artifact.source_finding_index)
+            .ok_or_else(|| {
+                QuorumError::Usage(format!(
+                    "follow-up artifact source finding index {} is out of bounds",
+                    artifact.source_finding_index
+                ))
+            })?;
+        followup_artifacts.push(validate_and_normalize_artifact(
+            artifact,
+            source,
+            &available_evidence,
             inputs.pr_number,
             ordinal as i64,
-            artifact.technical_impact,
-            artifact.scope_relationship,
-            artifact_text.concern,
-            artifact.non_blocking_reason,
-            artifact.affected_behavior,
-            artifact_text.desired_outcome,
-            verification_expectations,
-            evidence_ids,
-            None,
-            0,
-            0,
         )?);
     }
 
@@ -212,6 +211,203 @@ fn parse_and_validate_response(
         findings,
         followup_artifacts,
     })
+}
+
+fn normalize_findings(
+    findings: impl Serialize,
+    pr_number: i64,
+    task_id: Option<i64>,
+    collector_model: &str,
+    collector_version: &str,
+) -> Result<Vec<ReviewFinding>> {
+    // Keep the core parser as the single normalization and provenance-stamping
+    // path. The raw records have already passed the collector's stricter schema
+    // and evidence checks before this serialization round trip.
+    let text =
+        serde_json::to_string(&serde_json::json!({ "findings": findings })).map_err(|error| {
+            QuorumError::Io(format!(
+                "serialize collector findings for normalization: {error}"
+            ))
+        })?;
+    review_findings::parse_response_with_provenance(
+        &text,
+        pr_number,
+        task_id,
+        Some(collector_model),
+        Some(collector_version),
+    )
+    .ok_or_else(|| QuorumError::Usage("collector findings could not be normalized".into()))
+}
+
+fn validate_and_normalize_artifact(
+    artifact: RawFollowupArtifact,
+    source: &RawFinding,
+    available_evidence: &HashSet<(EvidenceKind, i64)>,
+    pr_number: i64,
+    ordinal: i64,
+) -> Result<ReviewFollowupArtifact> {
+    validate_artifact_source(&artifact, source)?;
+    let artifact_text = validate_artifact_text(&artifact)?;
+    let verification_expectations =
+        VerificationExpectations::new(artifact.verification_expectations)?;
+    let evidence_ids = validated_evidence(artifact.evidence, available_evidence)?;
+    ReviewFollowupArtifact::new(
+        None,
+        pr_number,
+        ordinal,
+        artifact.technical_impact,
+        artifact.scope_relationship,
+        artifact_text.concern,
+        artifact.non_blocking_reason,
+        artifact.affected_behavior,
+        artifact_text.desired_outcome,
+        verification_expectations,
+        evidence_ids,
+        None,
+        0,
+        0,
+    )
+}
+
+/// Best-effort recovery after the one permitted repair turn. The envelope
+/// remains strict; only entries inside its two arrays may be discarded. A
+/// salvage with no valid finding is not useful analytics and remains a failure.
+fn salvage_response(
+    text: &str,
+    inputs: &CollectorInputs,
+    task_id: Option<i64>,
+    collector_model: &str,
+    collector_version: &str,
+) -> Result<Option<SalvagedCollectorResponse>> {
+    let json_text = match extract_collector_json(text) {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let mut envelope: serde_json::Map<String, serde_json::Value> =
+        match serde_json::from_str(json_text) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+    if envelope.len() != 2
+        || !envelope.contains_key("findings")
+        || !envelope.contains_key("followup_artifacts")
+    {
+        return Ok(None);
+    }
+    let findings = match envelope
+        .remove("findings")
+        .and_then(|value| value.as_array().cloned())
+    {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let artifacts = match envelope
+        .remove("followup_artifacts")
+        .and_then(|value| value.as_array().cloned())
+    {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+
+    let available_evidence = fetched_evidence(inputs)?;
+    let mut dropped = Vec::new();
+    let mut valid_findings = Vec::new();
+    for (index, value) in findings.into_iter().enumerate() {
+        if index >= MAX_REVIEW_FINDINGS {
+            dropped.push(salvage_drop(
+                "findings",
+                index,
+                "exceeds the maximum of 128 findings",
+            ));
+            continue;
+        }
+        let finding = match serde_json::from_value::<RawFinding>(value) {
+            Ok(value) => value,
+            Err(error) => {
+                dropped.push(salvage_drop("findings", index, error));
+                continue;
+            }
+        };
+        if let Err(error) = validate_finding(&finding, &available_evidence) {
+            dropped.push(salvage_drop("findings", index, error));
+            continue;
+        }
+        valid_findings.push((index, finding));
+    }
+
+    if valid_findings.is_empty() {
+        return Ok(None);
+    }
+
+    let normalized_findings = valid_findings
+        .iter()
+        .map(|(_, finding)| finding)
+        .collect::<Vec<_>>();
+    let findings = normalize_findings(
+        &normalized_findings,
+        inputs.pr_number,
+        task_id,
+        collector_model,
+        collector_version,
+    )?;
+
+    let mut followup_artifacts = Vec::new();
+    for (index, value) in artifacts.into_iter().enumerate() {
+        if index >= MAX_FOLLOWUP_ARTIFACTS {
+            dropped.push(salvage_drop(
+                "followup_artifacts",
+                index,
+                "exceeds the maximum of 32 follow-up artifacts",
+            ));
+            continue;
+        }
+        let artifact = match serde_json::from_value::<RawFollowupArtifact>(value) {
+            Ok(value) => value,
+            Err(error) => {
+                dropped.push(salvage_drop("followup_artifacts", index, error));
+                continue;
+            }
+        };
+        let Some((_, source)) = valid_findings
+            .iter()
+            .find(|(source_index, _)| *source_index == artifact.source_finding_index)
+        else {
+            dropped.push(salvage_drop(
+                "followup_artifacts",
+                index,
+                format!(
+                    "source finding index {} was dropped or is out of bounds",
+                    artifact.source_finding_index
+                ),
+            ));
+            continue;
+        };
+        match validate_and_normalize_artifact(
+            artifact,
+            source,
+            &available_evidence,
+            inputs.pr_number,
+            index as i64,
+        ) {
+            Ok(value) => followup_artifacts.push(value),
+            Err(error) => dropped.push(salvage_drop("followup_artifacts", index, error)),
+        }
+    }
+
+    Ok(Some(SalvagedCollectorResponse {
+        response: ValidatedCollectorResponse {
+            findings,
+            followup_artifacts,
+        },
+        dropped,
+    }))
+}
+
+fn salvage_drop(section: &str, index: usize, reason: impl fmt::Display) -> String {
+    format!(
+        "{section}[{index}]: {}",
+        bounded_parse_failure_reason(&reason.to_string(), MAX_SALVAGE_DROP_REASON_BYTES)
+    )
 }
 
 fn extract_collector_json(text: &str) -> Option<&str> {
@@ -344,13 +540,7 @@ fn validate_finding(
     Ok(())
 }
 
-fn validate_artifact_source(artifact: &RawFollowupArtifact, findings: &[RawFinding]) -> Result<()> {
-    let source = findings.get(artifact.source_finding_index).ok_or_else(|| {
-        QuorumError::Usage(format!(
-            "follow-up artifact source finding index {} is out of bounds",
-            artifact.source_finding_index
-        ))
-    })?;
+fn validate_artifact_source(artifact: &RawFollowupArtifact, source: &RawFinding) -> Result<()> {
     if source.kind != "suggestion" {
         return Err(QuorumError::Usage(
             "follow-up artifact source finding is not a suggestion".into(),
@@ -783,7 +973,8 @@ pub async fn run_collection_with_inputs(
     attempted_at: i64,
 ) -> Result<CollectionOutcome> {
     // 2) Spawn classifier + await bounded turn.
-    let turn = match spawn_and_run_classifier(request, &inputs).await {
+    let collector_prompt = review_findings::build_collector_prompt(&inputs);
+    let turn = match spawn_and_run_classifier(request, &collector_prompt).await {
         Ok(turn) => turn,
         Err(e) => {
             let err_text = format!("collector classifier failed: {e}");
@@ -801,17 +992,70 @@ pub async fn run_collection_with_inputs(
         }
     };
 
-    // 3) Parse response.
-    let validated = match parse_and_validate_response(
+    // 3) Parse response. One malformed envelope gets exactly one bounded repair
+    // turn before element-by-element salvage is considered.
+    let (validated, success_error) = match parse_and_validate_response(
         &response_text,
         &inputs,
         request.task_id,
         &request.collector_model,
         COLLECTOR_VERSION,
     ) {
-        Ok(response) => response,
-        Err(error) => {
-            return Err(record_parse_failure(request, &response_text, &error, attempted_at).await);
+        Ok(response) => (response, None),
+        Err(primary_error) => {
+            let repair_prompt =
+                build_repair_prompt(&collector_prompt, &response_text, &primary_error);
+            let repair_turn = match spawn_and_run_classifier(request, &repair_prompt).await {
+                Ok(turn) => turn,
+                Err(error) => {
+                    let err_text = format!("collector repair classifier failed: {error}");
+                    record_failure(request, &err_text, attempted_at).await;
+                    return Err(QuorumError::Io(err_text));
+                }
+            };
+            record_token_usage(request, repair_turn.usage).await;
+            let repair_response = match repair_turn.response {
+                Ok(response) => response,
+                Err(error) => {
+                    let err_text = format!("collector repair classifier failed: {error}");
+                    record_failure(request, &err_text, attempted_at).await;
+                    return Err(QuorumError::Io(err_text));
+                }
+            };
+            match parse_and_validate_response(
+                &repair_response,
+                &inputs,
+                request.task_id,
+                &request.collector_model,
+                COLLECTOR_VERSION,
+            ) {
+                Ok(response) => (response, None),
+                Err(repair_error) => match salvage_response(
+                    &repair_response,
+                    &inputs,
+                    request.task_id,
+                    &request.collector_model,
+                    COLLECTOR_VERSION,
+                ) {
+                    Ok(Some(salvaged)) => (
+                        salvaged.response,
+                        Some(format_salvage_success(
+                            request.pr_number,
+                            &repair_error,
+                            &salvaged.dropped,
+                        )),
+                    ),
+                    Ok(None) | Err(_) => {
+                        return Err(record_parse_failure(
+                            request,
+                            &repair_response,
+                            &repair_error,
+                            attempted_at,
+                        )
+                        .await);
+                    }
+                },
+            }
         }
     };
     let findings = validated.findings;
@@ -829,6 +1073,7 @@ pub async fn run_collection_with_inputs(
     let collector_model = request.collector_model.clone();
     let collector_effort = request.collector_effort.clone();
     let role_assignment_id = request.role_assignment_id;
+    let run_error = success_error.clone();
     let count = findings.len() as i64;
     let write_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
@@ -841,7 +1086,7 @@ pub async fn run_collection_with_inputs(
                 pr_number: pr,
                 task_id,
                 status: RunStatus::Success,
-                error: None,
+                error: run_error,
                 collector_model,
                 collector_provider: Some(collector_provider),
                 collector_runner: Some(collector_runner),
@@ -863,7 +1108,7 @@ pub async fn run_collection_with_inputs(
             task_id,
             status: RunStatus::Success,
             findings_count: count,
-            error: None,
+            error: success_error,
         }),
         Ok(Err(e)) => {
             let err_text = format!("collector db write failed: {e}");
@@ -876,6 +1121,43 @@ pub async fn run_collection_with_inputs(
             Err(QuorumError::Io(err_text))
         }
     }
+}
+
+fn build_repair_prompt(
+    collector_prompt: &str,
+    previous_response: &str,
+    parse_error: &QuorumError,
+) -> String {
+    format!(
+        r#"{collector_prompt}
+
+## Response repair
+
+Your previous response did not satisfy the required strict JSON schema. Return a
+corrected envelope, preserving valid analysis where possible. Respond with ONLY
+the corrected JSON object.
+
+### Previous response
+{previous_response}
+
+### Exact parser error
+{parse_error}"#
+    )
+}
+
+fn format_salvage_success(
+    pr_number: i64,
+    repair_error: &QuorumError,
+    dropped: &[String],
+) -> String {
+    bounded_parse_failure_reason(
+        &format!(
+            "collector response salvaged after one repair turn for PR #{pr_number}; \
+             repair parse error: {repair_error}; dropped: {}",
+            dropped.join("; ")
+        ),
+        MAX_SALVAGE_ERROR_BYTES,
+    )
 }
 
 async fn record_parse_failure(
@@ -1247,15 +1529,14 @@ async fn run_gh_raw(
 /// respond in text, cannot Bash / Read / Write / Edit, and cannot reach GitHub.
 async fn spawn_and_run_classifier(
     request: &CollectionRequest,
-    inputs: &CollectorInputs,
+    prompt: &str,
 ) -> Result<ClassifierTurnOutcome> {
-    let prompt = review_findings::build_collector_prompt(inputs);
     let mut proc = RunnerProc::launch(
         &LaunchRequest {
             model: &request.collector_model,
             effort: &request.collector_effort,
             worktree: &request.repo_dir,
-            prompt: &prompt,
+            prompt,
             environment: &request.env_vars,
             mode: LaunchMode::Normal,
             continuation_id: None,
@@ -1875,6 +2156,63 @@ mod tests {
              code_fence_present=true, json_extracted=true",
         )
         .await;
+    }
+
+    #[test]
+    fn repair_prompt_contains_original_prompt_response_and_exact_error() {
+        let error = QuorumError::Usage("missing field `evidence`".into());
+        let prompt = build_repair_prompt("original prompt", "previous response", &error);
+        assert!(prompt.contains("original prompt"));
+        assert!(prompt.contains("previous response"));
+        assert!(prompt.contains("missing field `evidence`"));
+        assert!(prompt.contains("ONLY\nthe corrected JSON object"));
+    }
+
+    #[test]
+    fn salvage_keeps_valid_findings_and_drops_invalid_findings_and_artifacts() {
+        let mut missing_evidence = finding("suggestion", 11);
+        missing_evidence.as_object_mut().unwrap().remove("evidence");
+        let mut dependent_artifact = artifact(11);
+        dependent_artifact["source_finding_index"] = serde_json::json!(1);
+
+        let salvaged = salvage_response(
+            &response(
+                vec![finding("suggestion", 10), missing_evidence],
+                vec![artifact(10), dependent_artifact],
+            ),
+            &parser_inputs(&[10, 11], &[]),
+            Some(7),
+            "collector-model",
+            "v-test",
+        )
+        .unwrap()
+        .expect("one valid finding makes the response salvageable");
+
+        assert_eq!(salvaged.response.findings.len(), 1);
+        assert_eq!(salvaged.response.followup_artifacts.len(), 1);
+        assert!(salvaged
+            .dropped
+            .iter()
+            .any(|drop| drop.contains("findings[1]") && drop.contains("missing field `evidence`")));
+        assert!(salvaged.dropped.iter().any(|drop| {
+            drop.contains("followup_artifacts[1]")
+                && drop.contains("source finding index 1 was dropped")
+        }));
+    }
+
+    #[test]
+    fn salvage_rejects_a_response_without_any_valid_findings() {
+        let mut missing_evidence = finding("suggestion", 10);
+        missing_evidence.as_object_mut().unwrap().remove("evidence");
+        assert!(salvage_response(
+            &response(vec![missing_evidence], vec![]),
+            &parser_inputs(&[10], &[]),
+            Some(7),
+            "collector-model",
+            "v-test",
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -2527,6 +2865,125 @@ mod tests {
 
     async fn run_live(request: &CollectionRequest) -> Result<CollectionOutcome> {
         run_collection_with_inputs(request, synthetic_inputs(request.pr_number), 1000).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_parse_failure_requests_one_repair_and_stores_repaired_response() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let prompt_log = dir.path().join("collector-prompts.jsonl");
+        let mut missing_evidence = finding("blocking", 101);
+        missing_evidence.as_object_mut().unwrap().remove("evidence");
+        let mut request = live_request(dir.path(), &db, 410, Some(7), false);
+        request.env_vars.extend([
+            (
+                "FAKE_AGENT_COLLECTOR_RESPONSE".to_string(),
+                response(vec![missing_evidence], vec![]),
+            ),
+            (
+                "FAKE_AGENT_COLLECTOR_REPAIR_RESPONSE".to_string(),
+                response(vec![finding("blocking", 101)], vec![]),
+            ),
+            (
+                "FAKE_AGENT_PROMPT_LOG".to_string(),
+                prompt_log.to_string_lossy().to_string(),
+            ),
+        ]);
+
+        let outcome = run_live(&request).await.unwrap();
+        assert_eq!(outcome.status, RunStatus::Success);
+        assert_eq!(outcome.findings_count, 1);
+        assert!(outcome.error.is_none());
+
+        let prompts = std::fs::read_to_string(&prompt_log).unwrap();
+        assert_eq!(
+            prompts.matches("## Response repair").count(),
+            1,
+            "one malformed response gets exactly one repair turn"
+        );
+        assert!(prompts.contains("missing field `evidence`"));
+
+        let conn = db::open(&db).unwrap();
+        let run = review_findings::get_run(&conn, 410).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+        assert_eq!(run.findings_count, 1);
+        assert!(run.error.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_unrepaired_response_salvages_valid_findings_and_records_drops() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let mut missing_evidence = finding("suggestion", 101);
+        missing_evidence.as_object_mut().unwrap().remove("evidence");
+        let mut artifact_for_dropped_finding = artifact(101);
+        artifact_for_dropped_finding["source_finding_index"] = serde_json::json!(1);
+        let malformed = response(
+            vec![finding("suggestion", 101), missing_evidence],
+            vec![artifact(101), artifact_for_dropped_finding],
+        );
+        let mut request = live_request(dir.path(), &db, 411, Some(7), false);
+        request.env_vars.extend([
+            (
+                "FAKE_AGENT_COLLECTOR_RESPONSE".to_string(),
+                malformed.clone(),
+            ),
+            (
+                "FAKE_AGENT_COLLECTOR_REPAIR_RESPONSE".to_string(),
+                malformed,
+            ),
+        ]);
+
+        let outcome = run_live(&request).await.unwrap();
+        assert_eq!(outcome.status, RunStatus::Success);
+        assert_eq!(outcome.findings_count, 1);
+        let error = outcome.error.as_deref().unwrap();
+        assert!(error.contains("findings[1]"));
+        assert!(error.contains("followup_artifacts[1]"));
+        assert!(error.contains("source finding index 1 was dropped"));
+
+        let conn = db::open(&db).unwrap();
+        let run = review_findings::get_run(&conn, 411).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+        assert_eq!(run.findings_count, 1);
+        assert_eq!(run.error.as_deref(), outcome.error.as_deref());
+        assert_eq!(review_findings::list_for_pr(&conn, 411).unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_fully_invalid_response_records_failure_after_repair() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let mut missing_evidence = finding("blocking", 101);
+        missing_evidence.as_object_mut().unwrap().remove("evidence");
+        let malformed = response(vec![missing_evidence], vec![]);
+        let mut request = live_request(dir.path(), &db, 412, Some(7), false);
+        request.env_vars.extend([
+            (
+                "FAKE_AGENT_COLLECTOR_RESPONSE".to_string(),
+                malformed.clone(),
+            ),
+            (
+                "FAKE_AGENT_COLLECTOR_REPAIR_RESPONSE".to_string(),
+                malformed,
+            ),
+        ]);
+
+        assert!(run_live(&request).await.is_err());
+
+        let conn = db::open(&db).unwrap();
+        let run = review_findings::get_run(&conn, 412).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.findings_count, 0);
+        assert!(run
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("missing field `evidence`"));
+        assert!(review_findings::list_for_pr(&conn, 412).unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

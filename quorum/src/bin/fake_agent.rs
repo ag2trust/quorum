@@ -112,12 +112,16 @@ fn emit_classifier_result(line: &str, bare: bool) {
 
 /// Answer a post-merge collector prompt with a canned findings envelope. Fixed
 /// evidence ids let integration tests assert provenance passes through end-to-end.
-fn emit_collector_result(fail: bool) {
+/// Tests may override the primary and repair payloads independently to exercise
+/// the collector's bounded response-repair path.
+fn emit_collector_result(fail: bool, response_override: Option<String>) {
     let (result, is_error) = if fail {
         (
             serde_json::Value::String("Collector fake failure".to_string()),
             true,
         )
+    } else if let Some(response) = response_override {
+        (serde_json::Value::String(response), false)
     } else {
         let findings = serde_json::json!({
             "findings": [
@@ -271,7 +275,13 @@ fn main() {
             let fail = std::env::var("FAKE_AGENT_COLLECTOR_FAIL")
                 .map(|v| v == "1")
                 .unwrap_or(false);
-            emit_collector_result(fail);
+            let response_override = std::env::var(if line.contains("## Response repair") {
+                "FAKE_AGENT_COLLECTOR_REPAIR_RESPONSE"
+            } else {
+                "FAKE_AGENT_COLLECTOR_RESPONSE"
+            })
+            .ok();
+            emit_collector_result(fail, response_override);
             continue;
         }
 
