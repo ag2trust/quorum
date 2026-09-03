@@ -778,6 +778,9 @@ fn configure_managed_mcp_environment(
     let cargo_home = inherited_env(spec, "CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| real_home.join(".cargo"));
+    let docker_config = inherited_env(spec, "DOCKER_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| real_home.join(".docker"));
     let path = std::env::join_paths(
         std::iter::once(cargo_home.join("bin")).chain(
             inherited_env(spec, "PATH")
@@ -791,14 +794,16 @@ fn configure_managed_mcp_environment(
     // `HOME` is used by the official compatibility loaders. Point it at the
     // private config home so an operator's ~/.claude.json or ~/.cursor/mcp.json
     // cannot leak a second MCP server into the managed run.
-    // Rustup still reads its selected toolchain from the operator home, so pin
-    // its homes and cargo's bin directory before remapping `HOME` below.
+    // Rustup still reads its selected toolchain from the operator home, and
+    // Docker discovers CLI plugins through its config directory, so pin those
+    // paths and cargo's bin directory before remapping `HOME` below.
     command
         .env("GROK_HOME", home.path())
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("xdg-config"))
         .env("RUSTUP_HOME", rustup_home)
         .env("CARGO_HOME", cargo_home)
+        .env("DOCKER_CONFIG", docker_config)
         .env("PATH", path)
         // These are the provider's documented source gates. The environment
         // precedence makes them immune to settings in copied config layers.
@@ -1682,6 +1687,9 @@ mod tests {
         let expected_cargo_home = std::env::var_os("CARGO_HOME")
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| real_home_path.join(".cargo").into_os_string());
+        let expected_docker_config = std::env::var_os("DOCKER_CONFIG")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| real_home_path.join(".docker").into_os_string());
         let source_grok_home = root.path().join("grok-home");
         std::fs::create_dir_all(&source_grok_home).unwrap();
         let mut spec = test_spec(worktree.path());
@@ -1698,18 +1706,100 @@ mod tests {
                 "test \"$HOME\" = \"$EXPECTED_MANAGED_HOME\" && \\
                  test \"$RUSTUP_HOME\" = \"$EXPECTED_RUSTUP_HOME\" && \\
                  test \"$CARGO_HOME\" = \"$EXPECTED_CARGO_HOME\" && \\
+                 test \"$DOCKER_CONFIG\" = \"$EXPECTED_DOCKER_CONFIG\" && \\
                  case \":$PATH:\" in *\":$CARGO_HOME/bin:\"*) ;; *) exit 1;; esac && \\
                  cargo --version && rustup show active-toolchain",
             ])
             .envs(spec.env_vars.iter().map(|(key, value)| (key, value)))
             .env("EXPECTED_MANAGED_HOME", managed.path())
             .env("EXPECTED_RUSTUP_HOME", expected_rustup_home)
-            .env("EXPECTED_CARGO_HOME", expected_cargo_home);
+            .env("EXPECTED_CARGO_HOME", expected_cargo_home)
+            .env("EXPECTED_DOCKER_CONFIG", expected_docker_config);
         configure_managed_mcp_environment(&mut command, &managed, &spec).unwrap();
         let output = command.current_dir(&spec.worktree).output().await.unwrap();
         assert!(
             output.status.success(),
             "cargo/rustup failed with managed Grok environment:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn managed_mcp_environment_pins_or_honors_docker_config() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let real_home = root.path().join("real-home");
+        let source_grok_home = root.path().join("grok-home");
+        std::fs::create_dir_all(&real_home).unwrap();
+        std::fs::create_dir_all(&source_grok_home).unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = vec![
+            ("HOME".into(), real_home.display().to_string()),
+            ("GROK_HOME".into(), source_grok_home.display().to_string()),
+            ("DOCKER_CONFIG".into(), String::new()),
+        ];
+        let managed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+
+        let configured_value = |command: &Command| {
+            command.as_std().get_envs().find_map(|(key, value)| {
+                (key == std::ffi::OsStr::new("DOCKER_CONFIG"))
+                    .then(|| value.map(std::ffi::OsString::from))
+                    .flatten()
+            })
+        };
+        let mut default_command = Command::new("/bin/sh");
+        configure_managed_mcp_environment(&mut default_command, &managed, &spec).unwrap();
+        assert_eq!(
+            configured_value(&default_command),
+            Some(real_home.join(".docker").into_os_string())
+        );
+
+        let requested = root.path().join("requested-docker-config");
+        spec.env_vars
+            .push(("DOCKER_CONFIG".into(), requested.display().to_string()));
+        let mut requested_command = Command::new("/bin/sh");
+        configure_managed_mcp_environment(&mut requested_command, &managed, &spec).unwrap();
+        assert_eq!(
+            configured_value(&requested_command),
+            Some(requested.into_os_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_mcp_environment_keeps_docker_buildx_available() {
+        if std::process::Command::new("docker")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipped: docker is not installed");
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let real_home = std::env::var_os("HOME").expect("test runner must have a home");
+        let source_grok_home = root.path().join("grok-home");
+        std::fs::create_dir_all(&source_grok_home).unwrap();
+        let mut spec = test_spec(worktree.path());
+        spec.env_vars = vec![
+            ("HOME".into(), real_home.to_string_lossy().into_owned()),
+            ("GROK_HOME".into(), source_grok_home.display().to_string()),
+        ];
+        let managed =
+            GrokMcpConfigHome::create(&spec, crate::serve::runner::AGENT_MCP_SERVER).unwrap();
+        let mut command = Command::new("docker");
+        command
+            .args(["buildx", "version"])
+            .envs(spec.env_vars.iter().map(|(key, value)| (key, value)));
+        configure_managed_mcp_environment(&mut command, &managed, &spec).unwrap();
+        let output = command.current_dir(&spec.worktree).output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "docker buildx failed with managed Grok environment:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
