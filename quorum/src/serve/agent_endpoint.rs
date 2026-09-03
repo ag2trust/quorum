@@ -974,6 +974,9 @@ async fn validate_plan_submission(
     }
     let response: super::planner::PlannerResponse =
         serde_json::from_str(serialized).map_err(|error| format!("invalid plan: {error}"))?;
+    if let super::planner::PlannerResponse::Plan { tasks } = &response {
+        reject_compile_atomic_signature_seam_split(tasks)?;
+    }
     super::planner::validate_semantics(&response).map_err(|error| error.to_string())?;
     if let super::planner::PlannerResponse::Plan { tasks } = &response {
         super::planner::validate_for_source(
@@ -986,6 +989,104 @@ async fn validate_plan_submission(
         .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// Reject the mechanically visible subset of compile-closure violations at
+/// the planner submission boundary. The proposal itself declares both the API
+/// change and the caller path it reserves for a sibling, so no repository
+/// inspection or inference is needed here. Broader compile-closure review
+/// remains the Arbiter's responsibility.
+fn reject_compile_atomic_signature_seam_split(
+    tasks: &[super::planner::ProposedTask],
+) -> std::result::Result<(), String> {
+    for signature_task in tasks {
+        if !changes_compile_interface(signature_task) {
+            continue;
+        }
+        for caller_task in tasks {
+            if caller_task.key == signature_task.key {
+                continue;
+            }
+            for caller_path in caller_task.deliverables.writable_paths() {
+                let named_in_deliverables = signature_task.deliverables.0.iter().any(|deliverable| {
+                    matches!(deliverable,
+                        quorum_core::decomposition::ChildDeliverable::Write { path }
+                        | quorum_core::decomposition::ChildDeliverable::ReadOnlyReference { path }
+                        if path == caller_path
+                    )
+                });
+                let reserved_in_non_goal = signature_task
+                    .non_goals
+                    .iter()
+                    .any(|non_goal| names_path(non_goal, caller_path));
+                if named_in_deliverables || reserved_in_non_goal {
+                    let caller_path = bounded_path_for_message(caller_path);
+                    return Err(format!(
+                        "child {} changes a compile-atomic signature seam but names caller path `{caller_path}` owned by child {}; a child changing an API must own its callers",
+                        signature_task.key, caller_task.key,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn changes_compile_interface(task: &super::planner::ProposedTask) -> bool {
+    let body = format!(
+        "{} {} {}",
+        task.title, task.implementation_delta, task.observable_outcome
+    )
+    .to_ascii_lowercase();
+    [
+        "signature",
+        "public api",
+        "api change",
+        "api changes",
+        "api surface",
+        "api contract",
+        "public function",
+        "pub fn",
+        "function parameter",
+        "function argument",
+        "method parameter",
+        "method argument",
+        "return type",
+        "trait shape",
+        "struct shape",
+        "type shape",
+        "shared trait",
+        "shared struct",
+        "argument through",
+        "parameter through",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
+}
+
+fn names_path(text: &str, path: &str) -> bool {
+    if text.contains(path) {
+        return true;
+    }
+    let Some(file_name) = path.rsplit('/').next() else {
+        return false;
+    };
+    // A basename such as `recovery.rs` is an explicit reservation; generic
+    // `mod.rs` is too ambiguous for this deterministic guard.
+    file_name != "mod.rs" && text.contains(file_name)
+}
+
+fn bounded_path_for_message(path: &str) -> String {
+    const MAX_PATH_BYTES: usize = 512;
+    const ELLIPSIS: &str = "…";
+    if path.len() <= MAX_PATH_BYTES {
+        return path.into();
+    }
+    let mut end = MAX_PATH_BYTES - ELLIPSIS.len();
+    while !path.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &path[..end], ELLIPSIS)
 }
 
 fn record_plan_rejection(
@@ -1335,6 +1436,19 @@ mod tests {
 
     fn result_value(response: &Response) -> serde_json::Value {
         serde_json::to_value(response).unwrap()
+    }
+
+    #[test]
+    fn compile_atomic_signature_seam_guard_rejects_reserved_callers() {
+        let response: super::super::planner::PlannerResponse =
+            serde_json::from_value(compile_atomic_signature_seam_plan()).unwrap();
+        let super::super::planner::PlannerResponse::Plan { tasks } = response else {
+            panic!("fixture must be a plan");
+        };
+
+        let error = reject_compile_atomic_signature_seam_split(&tasks).unwrap_err();
+        assert!(error.contains("compile-atomic signature seam"));
+        assert!(error.contains("serve-wiring"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
