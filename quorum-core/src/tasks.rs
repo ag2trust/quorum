@@ -2193,6 +2193,52 @@ pub fn record_ci_remediation_attempt(
     Ok(attempts)
 }
 
+/// Consume a failed-CI remediation request after its guarded worker claim
+/// cleanly loses because no eligible worker can own it. The attempt increment
+/// and request removal share one transaction, so the reconciler cannot retry
+/// the same PR head indefinitely between those two writes.
+///
+/// A task blocked on unfinished dependencies intentionally keeps its request:
+/// [`retain_blocked_remediation_retry`] restores that bounded retry once the
+/// dependencies are ready. A live remediation lease likewise belongs to a
+/// concurrent winner and must remain untouched.
+pub fn record_ci_remediation_claim_loss(
+    conn: &mut Connection,
+    id: i64,
+    now: i64,
+) -> Result<Option<i64>> {
+    let tx = begin_immediate(conn)?;
+    let attempts = tx
+        .query_row(
+            &format!(
+                "UPDATE tasks
+                 SET refs=json_remove(
+                         json_set(
+                             refs,
+                             '$.ci_remediation_attempts',
+                             COALESCE(json_extract(refs, '$.ci_remediation_attempts'), 0) + 1
+                         ),
+                         '$.ci_remediation_requested'
+                     ),
+                     updated_at=?2
+                 WHERE id=?1 AND status='rework' AND json_valid(refs)
+                   AND json_extract(refs, '$.ci_remediation_requested')=1
+                   AND {DEP_READY_CLAUSE}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM claims c
+                       WHERE c.target='task#' || tasks.id
+                         AND c.active=1 AND c.expires_at > ?2
+                   )
+                 RETURNING json_extract(refs, '$.ci_remediation_attempts')"
+            ),
+            params![id, now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    tx.commit()?;
+    Ok(attempts)
+}
+
 /// Clear stale runtime ownership for a durable CI remediation after daemon
 /// restart while preserving its rework status and exact retry intent.
 pub fn reset_ci_remediation_for_recovery(conn: &mut Connection, id: i64, now: i64) -> Result<bool> {
@@ -12530,6 +12576,66 @@ mod tests {
             ci_remediation_intent(submitted.refs.as_deref()).unwrap(),
             None,
             "successful rework submission must consume durable CI intent"
+        );
+    }
+
+    #[test]
+    fn failed_ci_remediation_claim_loss_consumes_the_request_once() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "ineligible failed-CI remediation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        // The reconciler can read a durable intent left on an ineligible
+        // rework row (for example a workerless review-only task). Keep the
+        // classifier incomplete so the guarded remediation claim cleanly
+        // refuses it without allocating a lease.
+        c.execute(
+            "UPDATE tasks
+             SET status='rework', refs=json_object(
+                 'ci_remediation_requested', json('true'),
+                 'ci_remediation_pr', 453,
+                 'ci_remediation_head_sha', 'abc123',
+                 'ci_remediation_feedback', 'fix failed CI',
+                 'ci_remediation_checks', json('[\"test\"]'),
+                 'ci_remediation_attempts', 0
+             )
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+
+        assert!(
+            claim_remediation_rework(&mut c, "REM1", id, TTL, 1100)
+                .unwrap()
+                .is_none(),
+            "the invalid task must cleanly refuse remediation eligibility"
+        );
+        assert_eq!(
+            record_ci_remediation_claim_loss(&mut c, id, 1101).unwrap(),
+            Some(1),
+            "the terminal claim-loss path must record its bounded attempt"
+        );
+        let task = get(&c, id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(
+            refs.get(CI_REMEDIATION_REQUESTED_REF).is_none(),
+            "a consumed request must not be selected again"
+        );
+        assert_eq!(refs[CI_REMEDIATION_ATTEMPTS_REF], 1);
+        assert_eq!(
+            record_ci_remediation_claim_loss(&mut c, id, 1102).unwrap(),
+            None,
+            "the same request must be terminal and idempotent across ticks"
         );
     }
 
