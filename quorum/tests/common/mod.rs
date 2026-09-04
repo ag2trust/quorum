@@ -1,13 +1,25 @@
 #![allow(dead_code)]
 
+pub mod timing;
+
+use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Child;
+use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub enum WaitState<T> {
     Ready(T),
     Pending(String),
+}
+
+pub const TEST_TICK_PACING_MS: &str = "25";
+
+/// Construct a daemon command with the debug-build test pacing override.
+pub fn test_daemon_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command.env("QUORUM_TEST_TICK_PACING_MS", TEST_TICK_PACING_MS);
+    command
 }
 
 /// Poll an observable test state until it is ready or fail with the last value seen.

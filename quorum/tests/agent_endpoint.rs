@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
@@ -66,7 +68,7 @@ struct ServeProcess {
 impl ServeProcess {
     fn start(home: &Path, repo: &Path, worktrees: &Path, names: &Path, config: &Path) -> Self {
         let fake_agent = cargo_bin("fake-agent");
-        let mut child = Command::new(cargo_bin("quorum"))
+        let mut child = common::test_daemon_command(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .args(["serve", "--config"])

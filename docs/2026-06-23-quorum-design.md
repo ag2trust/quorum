@@ -1973,6 +1973,12 @@ turns; restricted continuation is rejected. Normal configuration accepts only th
 verified model, effort vocabulary, permission mode, sandbox profiles, and bounded turn
 range. Unknown values and unverified safety combinations fail before spawn.
 
+Managed MCP launches remap `HOME` to a private configuration directory so operator MCP
+configuration cannot enter the run. Their Rustup, Cargo, and Docker config locations are
+pinned to the requested or operator-home locations before that remap; Docker needs this
+exception to discover its installed CLI plugins without exposing the rest of the operator
+home.
+
 Consumed events:
 
 | Grok `streaming-json` event | Normalized meaning |
@@ -2310,8 +2316,10 @@ behavior and regression-only expectations remain criteria or non-goals rather th
 implementation work. A child that changes a function/API signature or shared type, trait, or
 struct shape must own every affected caller needed for its workspace build and preflight after
 its prerequisites merge; a definition/signature child must not reserve those callers for a
-sibling. If that compile closure cannot remain M-sized, the planner returns a `no_safe_split`
-blocker rather than manufacturing definition and wiring siblings. Before any task row is created,
+sibling. A compile-closed seam that fits one dispatchable child (S or M, or L at complexity 3 or
+lower) remains one child. The planner returns a `no_safe_split` blocker only when the closure
+cannot fit in one dispatchable child, rather than manufacturing definition and wiring siblings.
+Before any task row is created,
 deterministic validation checks the closed shape, references, cycles, prohibited synthetic
 integration work, mechanically visible compile-atomic signature-seam reservations, and the
 structured deliverables manifest (below); it no longer requires a byte-exact echo of
@@ -2429,6 +2437,8 @@ index permits one materialized active or blocked graph per repository, and sourc
 permits only one graph aggregate per source. Generated work is one level only and is immutable
 after materialization.
 
+Generated tasks inherit the source task's immutable `target_branch` at materialization; a NULL
+source target yields NULL child targets and preserves the legacy configured-base fallback.
 Generated tasks retain ordinary independent implementation, review, rework, and protected merge.
 Their atomic claim additionally requires an active decomposed source, done prerequisites, no
 failed sibling or graph blocker, and fewer than two active implementation siblings. Eligible graph
@@ -2446,14 +2456,16 @@ After validating a graph-blocker against the current run, head, membership, and 
 daemon atomically fails the affected child and blocks the graph without consuming ordinary rework.
 The source remains decomposed and the blocked graph remains active until source cancellation;
 recovery requires a replacement source, not automatic replanning after delivery has begun. The
-only exception is the explicit, evidence-bound adoption of an already merged continuation
-described below when the `boundary-violation` hold names the adopted child as its
-`affected_task`; that operation completes the already-delivered graph, but never unblocks,
-replans, or grants new execution authority.
+only exceptions are the explicit, evidence-bound adoptions of already merged continuations
+described below: a `boundary-violation` hold naming the adopted child as its `affected_task`
+completes an otherwise delivered graph, while a modern structured `generated-child-failed` hold
+naming that child can restore the graph's existing sibling authority. Neither path replans or
+grants new authority beyond the materialized graph.
 
 A narrow incident-recovery primitive may adopt the exact merged delivery of a done managed
 continuation task for the final failed member of an otherwise complete live graph (`state` active
-or blocked, with `active=1`). The automatic path's immediate transaction requires the same repository and PR,
+or blocked, with `active=1`), or for the failed child named by a modern structured
+`generated-child-failed` block while siblings remain. The automatic path's immediate transaction requires the same repository and PR,
 creator-selected `continue_pr`, explicit `source_task` provenance, live daemon publication and
 merge events (`expires_at > now`), immutable managed-review authority, and one consistent PR
 target/approved head SHA. It changes only the failed child and records recovery provenance while
@@ -2464,7 +2476,8 @@ bounded child-completion events once.
 For a coordinator/operator-selected incident pair, `quorum decomposition-adopt-recovery
 --original-child-id <child> --recovery-task-id <continuation> --by <operator>` is the sole explicit
 recovery-authority surface. The same `BEGIN IMMEDIATE` transaction rechecks active membership,
-failed/final-child state, repository and PR identity, creator-selected continuation authority,
+failed-child state (and final-child state except for the structured generated-child-failed case),
+repository and PR identity, creator-selected continuation authority,
 and exact target/head agreement. It permits absent `source_task` metadata because the caller has
 named the exact pair, but rejects conflicting metadata. Instead of expiring feed events it requires
 the durable daemon chain: the final assigned worker run is either `completed` before the persisted
@@ -2472,13 +2485,17 @@ final PR target or `merged` (which may end after that target resolves), an assig
 reviewer bound to that exact target head and sampling decision, and merged
 completion provenance. Success writes the operator, source, child, recovery task, PR, and head to
 the decomposition recovery ledger and child recovery projection before final-child completion. On
-an active graph this is ordinary completion. On a blocked graph it is permitted only when the hold
-is `boundary-violation` and its JSON `affected_task` exactly equals the named failed child; the
-same transaction then clears that hold, completes the graph, and completes the source after
-confirming every member is done. A block for any other child, malformed hold, or any other hold
-code remains non-adoptable. It does not discover candidates, infer equivalence, or weaken the
-automatic path's event rules. A rejected pair, replay, or concurrent loser is a clean negative
-with no provenance or lifecycle event.
+an active graph this is ordinary completion. On a blocked graph a `boundary-violation` hold is
+eligible only when its JSON `affected_task` exactly equals the named failed child; the same
+transaction clears that hold, completes the graph, and completes the source after confirming every
+member is done. A modern structured `generated-child-failed` hold is also eligible only when its
+JSON `affected_task` exactly equals that failed child. That exact adoption records the child
+completion event and clears the hold in the same transaction; it reactivates the graph and emits
+`task_graph_unblocked` if siblings remain, or completes the graph and source if the child was
+final. A block for any other child, malformed hold, or any other hold code remains non-adoptable.
+It does not discover candidates, infer equivalence, or weaken the automatic path's event rules. A
+rejected pair, replay, or concurrent loser is a clean negative with no provenance or lifecycle
+event.
 
 One legacy prepublication shape is also eligible through that exact operator surface. It exists
 only for a generated final child that an older retry reopened after daemon-owned publication had

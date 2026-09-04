@@ -157,6 +157,64 @@ fn stream_read_timeout(kind: runner::AgentKind) -> Duration {
 /// `tick` and again on the `Continue` error path in `tick_loop`, which the
 /// success-path sleep never reaches.
 const TICK_PACING: Duration = Duration::from_millis(500);
+#[cfg(debug_assertions)]
+const MIN_TEST_TICK_PACING: Duration = Duration::from_millis(10);
+
+#[cfg(debug_assertions)]
+fn tick_pacing() -> Duration {
+    let default_ms = TICK_PACING.as_millis() as u64;
+    let millis = std::env::var("QUORUM_TEST_TICK_PACING_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default_ms)
+        .clamp(MIN_TEST_TICK_PACING.as_millis() as u64, default_ms);
+    Duration::from_millis(millis)
+}
+
+#[cfg(not(debug_assertions))]
+const fn tick_pacing() -> Duration {
+    TICK_PACING
+}
+
+#[cfg(all(test, debug_assertions))]
+#[test]
+fn debug_tick_pacing_override_is_bounded() {
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore(Option<OsString>);
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(value) = self.0.take() {
+                std::env::set_var("QUORUM_TEST_TICK_PACING_MS", value);
+            } else {
+                std::env::remove_var("QUORUM_TEST_TICK_PACING_MS");
+            }
+        }
+    }
+
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _restore = EnvRestore(std::env::var_os("QUORUM_TEST_TICK_PACING_MS"));
+    for (value, expected) in [
+        (None, TICK_PACING),
+        (Some("20"), Duration::from_millis(20)),
+        (Some("1"), MIN_TEST_TICK_PACING),
+        (Some("5000"), TICK_PACING),
+        (Some("garbage"), TICK_PACING),
+    ] {
+        match value {
+            Some(value) => std::env::set_var("QUORUM_TEST_TICK_PACING_MS", value),
+            None => std::env::remove_var("QUORUM_TEST_TICK_PACING_MS"),
+        }
+        assert_eq!(tick_pacing(), expected, "override {value:?}");
+    }
+}
+
 const CLAIM_SKIP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CLAIM_SKIP_LOG_CAPACITY: usize = 64;
 const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -6802,16 +6860,6 @@ async fn tick_decomposition(
                     )
                     .await?;
                 }
-                planner::PlannerPoll::SemanticRejected(summary) => {
-                    record_decomposition_attempt(
-                        config,
-                        graph_id,
-                        "proposal",
-                        "semantic-rejection",
-                        &summary,
-                    )
-                    .await?;
-                }
                 planner::PlannerPoll::Done(planner::PlannerResponse::Blocker {
                     category,
                     evidence,
@@ -10108,7 +10156,7 @@ async fn tick_loop(
                     // error path skips it. Without pacing here a persistent
                     // failure re-enters the identical tick immediately and
                     // burns a core until the condition clears.
-                    tokio::time::sleep(TICK_PACING).await;
+                    tokio::time::sleep(tick_pacing()).await;
                 }
             }
         }
@@ -15502,7 +15550,7 @@ async fn tick(
         }
     }
 
-    tokio::time::sleep(TICK_PACING).await;
+    tokio::time::sleep(tick_pacing()).await;
     Ok(())
 }
 

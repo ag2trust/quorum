@@ -2,6 +2,8 @@
 //! produces a real `quorum submit` mailbox row, and `--emit-tool-use` (FAKE_AGENT_EMIT_TOOL_USE)
 //! emits tool_use stream events that exercise the daemon's tool_count/now_label tracking.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -99,7 +101,7 @@ impl ServeHandle {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
         let fake_agent = cargo_bin("fake-agent");
-        let mut cmd = Command::new(cargo_bin("quorum"));
+        let mut cmd = common::test_daemon_command(cargo_bin("quorum"));
         cmd.env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .args([
