@@ -1111,10 +1111,6 @@ pub enum PlannerTurnEnd {
 pub enum PlannerPoll {
     Done(PlannerResponse),
     ProviderFailed(String),
-    /// Retained for the Arbiter proposal-rejection path (design §4). Semantic
-    /// defects in a submitted plan are now returned to the planner in-turn by
-    /// the endpoint, so the planner attempt itself never produces this.
-    SemanticRejected(String),
 }
 
 /// Resolve one planner attempt from its durable `submit_plan` submission.

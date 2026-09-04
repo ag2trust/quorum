@@ -4823,6 +4823,101 @@ mod tests {
     }
 
     #[test]
+    fn provider_failures_do_not_consume_the_proposal_budget() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "planner-provider",
+            "first provider failure",
+            3,
+        )
+        .unwrap()
+        .is_some());
+        assert!(reacquire_freeze(&mut conn, graph, 4).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 5,).unwrap()
+        );
+
+        // Only a submitted proposal rejected by a semantic/size gate consumes
+        // the proposal budget.
+        assert!(accept_proposal(&mut conn, graph, "[]", 6).unwrap());
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "preclassifying",
+            "deterministic-validation",
+            "proposal exceeds its allowed size",
+            7,
+        )
+        .unwrap());
+
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "planner-provider",
+            "second provider failure",
+            8,
+        )
+        .unwrap()
+        .is_some());
+        assert!(reacquire_freeze(&mut conn, graph, 9).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 10,).unwrap()
+        );
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "planner-provider",
+            "third provider failure",
+            11,
+        )
+        .unwrap()
+        .is_some());
+
+        let state: (String, i64, i64, String, String, i64, i64) = conn
+            .query_row(
+                "SELECT d.state,d.proposal_attempts,d.provider_failures,d.hold_code,t.status,
+                        (SELECT count(*) FROM decomposition_attempts
+                         WHERE graph_id=d.id AND kind='proposal'),
+                        (SELECT count(*) FROM decomposition_attempts
+                         WHERE graph_id=d.id AND kind='provider')
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "held".into(),
+                1,
+                MAX_PROVIDER_FAILURES,
+                "provider-attempts-exhausted".into(),
+                "failed".into(),
+                1,
+                MAX_PROVIDER_FAILURES,
+            )
+        );
+    }
+
+    #[test]
     fn exhausted_provider_retry_preserves_attempts_and_appends_next_generation() {
         let (mut conn, graph) = exhausted_provider();
         assert_eq!(
