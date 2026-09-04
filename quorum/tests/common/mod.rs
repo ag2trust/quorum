@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod timing;
+
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Child, Command};

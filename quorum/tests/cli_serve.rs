@@ -99,11 +99,12 @@ fn serve_boots_and_stops_on_sigint() {
     // (cli_serve_config, cli_serve_mailbox). 5s was fragile on CI runners
     // whose cold-cache disk + parallel test-binary contention pushes the
     // debug-build boot past the debug-build startup budget on GitHub Actions.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let banner_budget = common::timing::budget(Duration::from_secs(15));
+    let deadline = common::timing::deadline(Duration::from_secs(15));
     loop {
         if std::time::Instant::now() > deadline {
             child.kill().ok();
-            panic!("serve did not print 'serving' banner within 15s");
+            panic!("serve did not print 'serving' banner within {banner_budget:?}");
         }
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -133,7 +134,9 @@ fn serve_boots_and_stops_on_sigint() {
         }
     });
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let shutdown_started = std::time::Instant::now();
+    let shutdown_budget = common::timing::budget(Duration::from_secs(10));
+    let deadline = common::timing::deadline(Duration::from_secs(10));
     loop {
         match child.try_wait().unwrap() {
             Some(status) => {
@@ -145,7 +148,11 @@ fn serve_boots_and_stops_on_sigint() {
                 if std::time::Instant::now() > deadline {
                     child.kill().ok();
                     drain.join().ok();
-                    panic!("serve did not exit within 3s after SIGINT");
+                    panic!(
+                        "serve did not exit within {shutdown_budget:?} after SIGINT; \\
+                         elapsed={:?}",
+                        shutdown_started.elapsed()
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }

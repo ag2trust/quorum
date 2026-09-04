@@ -15,6 +15,11 @@
 #   5. entrypoint    — host supervisor contract (when Docker inputs are present)
 #   6. container     — exact linux/amd64 build and real-container verification
 #
+# Process-oriented integration-test deadlines use QUORUM_TEST_TIMING_SCALE
+# (default 1; bounded at 10). The timing collector preserves it for Cargo test
+# binaries, so a loaded macOS host can use e.g.
+# QUORUM_TEST_TIMING_SCALE=3 rtk proxy ./preflight.sh.
+#
 # Usage:
 #   ./preflight.sh          # all six gates in the repository; four in policy fixtures
 #   ./preflight.sh --quick  # gates 1+2 only (what the pre-push hook runs)

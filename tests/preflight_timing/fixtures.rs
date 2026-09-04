@@ -14,8 +14,11 @@ use std::{
 use serde_json::Value;
 use tempfile::TempDir;
 
+use crate::timing;
+
 const COMPILE_DIAGNOSTIC: &str = "fixture compile failure: unresolved import fixture_missing";
 const TEST_DIAGNOSTIC: &str = "fixture test failure: assertion failed";
+const DARWIN_PARTIAL_SCENARIO_TIMEOUT: Duration = Duration::from_secs(4);
 static PROCESS_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
 fn process_fixture_guard() -> MutexGuard<'static, ()> {
@@ -166,13 +169,16 @@ impl Fixture {
         command.output().expect("run preflight")
     }
 
-    fn timing_collector(&self, scenario: Scenario, timeout_secs: f64) -> Command {
+    fn timing_collector(&self, scenario: Scenario, timeout: Duration) -> Command {
         let path = format!(
             "{}:{}",
             self.bin.display(),
             env::var("PATH").expect("PATH is set")
         );
-        let timeout_secs = timeout_secs.to_string();
+        let timeout = timing::budget(timeout);
+        let term_grace = timing::budget(Duration::from_millis(200));
+        let timeout_secs = timeout.as_secs_f64().to_string();
+        let term_grace_secs = term_grace.as_secs_f64().to_string();
         // These fixtures copy the collector immediately before launching it.
         // Invoke Python explicitly so Linux does not need to exec the
         // freshly materialized script inode, which can transiently fail with
@@ -188,7 +194,7 @@ impl Fixture {
                 "--test-timeout-secs",
                 &timeout_secs,
                 "--term-grace-secs",
-                "0.2",
+                &term_grace_secs,
             ])
             .env("PATH", path)
             .env("QUORUM_HOME", self.repo.join("production-quorum-home"))
@@ -255,20 +261,20 @@ impl Fixture {
         command
     }
 
-    fn run_timing_collector(&self, scenario: Scenario, timeout_secs: f64) -> Output {
-        self.timing_collector(scenario, timeout_secs)
+    fn run_timing_collector(&self, scenario: Scenario, timeout: Duration) -> Output {
+        self.timing_collector(scenario, timeout)
             .output()
             .expect("run timing collector")
     }
 
     fn interrupted_timing(&self) -> Child {
-        self.timing_collector(Scenario::Interrupted, 30.0)
+        self.timing_collector(Scenario::Interrupted, Duration::from_secs(30))
             .spawn()
             .expect("spawn interruptible timing collector")
     }
 
     fn abruptly_owned_timing(&self) -> Child {
-        self.timing_collector(Scenario::AbruptOwnerDeath, 30.0)
+        self.timing_collector(Scenario::AbruptOwnerDeath, Duration::from_secs(30))
             .process_group(0)
             .spawn()
             .expect("spawn abruptly killable timing collector")
@@ -279,7 +285,7 @@ impl Fixture {
     }
 
     fn wait_for_fixture_pids(&self) -> Vec<i32> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = timing::deadline(Duration::from_secs(10));
         loop {
             if let Ok(text) = fs::read_to_string(self.pid_file()) {
                 let pids = text
@@ -370,7 +376,7 @@ fn process_exists(pid: i32) -> bool {
 }
 
 fn assert_processes_gone(pids: &[i32]) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = timing::deadline(Duration::from_secs(3));
     while pids.iter().copied().any(process_exists) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -483,7 +489,7 @@ fn compilation_failure_preserves_diagnostics_and_timing() {
 fn timeout_reaps_descendants_in_separate_process_groups() {
     let _guard = process_fixture_guard();
     let fixture = Fixture::timing_only();
-    let output = fixture.run_timing_collector(Scenario::Timeout, 1.0);
+    let output = fixture.run_timing_collector(Scenario::Timeout, Duration::from_secs(1));
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -512,12 +518,13 @@ fn sustained_process_discovery_failure_is_bounded_and_reaps_descendants() {
     let _guard = process_fixture_guard();
     let fixture = Fixture::timing_only();
     let started = Instant::now();
-    let output = fixture.run_timing_collector(Scenario::DiscoverySpawnFailure, 1.0);
+    let output =
+        fixture.run_timing_collector(Scenario::DiscoverySpawnFailure, Duration::from_secs(1));
 
     assert_eq!(output.status.code(), Some(1));
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_secs(30),
+        elapsed < timing::budget(Duration::from_secs(30)),
         "process discovery failure did not terminate promptly: {elapsed:?}"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -534,7 +541,8 @@ fn sustained_process_discovery_failure_is_bounded_and_reaps_descendants() {
     assert_eq!(binary["cleanup"]["term_sent"], true);
     assert_eq!(binary["cleanup"]["kill_sent"], true);
     assert!(
-        binary["execute_secs"].as_f64().unwrap() < 5.0,
+        binary["execute_secs"].as_f64().unwrap()
+            < timing::budget(Duration::from_secs(5)).as_secs_f64(),
         "test supervisor exceeded its bounded cleanup window"
     );
     assert_eq!(binary["cleanup"]["complete"], true);
@@ -562,11 +570,14 @@ fn partial_darwin_fallback_is_loud_and_reaps_retained_descendants() {
     let _guard = process_fixture_guard();
     let fixture = Fixture::timing_only();
     let started = Instant::now();
-    let output = fixture.run_timing_collector(Scenario::DarwinPartialFallback, 1.5);
+    let output = fixture.run_timing_collector(
+        Scenario::DarwinPartialFallback,
+        DARWIN_PARTIAL_SCENARIO_TIMEOUT,
+    );
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        started.elapsed() < Duration::from_secs(30),
+        started.elapsed() < timing::budget(Duration::from_secs(30)),
         "partial Darwin fallback did not terminate promptly"
     );
     let timing = fixture.timing();
@@ -594,7 +605,14 @@ fn partial_darwin_fallback_is_loud_and_reaps_retained_descendants() {
 fn partial_darwin_child_list_is_loud_and_reaps_retained_descendants() {
     let _guard = process_fixture_guard();
     let fixture = Fixture::timing_only();
-    let output = fixture.run_timing_collector(Scenario::DarwinPartialChildList, 1.5);
+    // The fixture needs to install its TERM-ignore handler, retain its escaped
+    // child, and then inject the partial list before the timeout starts cleanup.
+    // On a loaded host, the former 1.5s window could expire during startup and
+    // let TERM end the not-yet-ready root before the required KILL escalation.
+    let output = fixture.run_timing_collector(
+        Scenario::DarwinPartialChildList,
+        DARWIN_PARTIAL_SCENARIO_TIMEOUT,
+    );
 
     assert_eq!(output.status.code(), Some(1));
     let timing = fixture.timing();
@@ -632,7 +650,7 @@ fn reused_darwin_pid_is_discarded_without_signaling_unrelated_process() {
     )
     .expect("publish synthetic reused PID");
 
-    let output = fixture.run_timing_collector(Scenario::DarwinPidReuse, 1.0);
+    let output = fixture.run_timing_collector(Scenario::DarwinPidReuse, Duration::from_secs(1));
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
@@ -666,11 +684,12 @@ fn fast_exit_darwin_root_reuse_never_signals_the_replacement() {
     .expect("publish synthetic reused root PID");
 
     let started = Instant::now();
-    let output = fixture.run_timing_collector(Scenario::DarwinFastExitRootReuse, 2.0);
+    let output =
+        fixture.run_timing_collector(Scenario::DarwinFastExitRootReuse, Duration::from_secs(2));
 
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        started.elapsed() < Duration::from_secs(30),
+        started.elapsed() < timing::budget(Duration::from_secs(30)),
         "root PID reuse handling did not remain bounded"
     );
     assert!(
@@ -697,7 +716,7 @@ fn interruption_reaps_the_complete_descendant_tree() {
     let _guard = process_fixture_guard();
     let fixture = Fixture::timing_only();
     let mut collector = fixture.interrupted_timing();
-    let pid_deadline = Instant::now() + Duration::from_secs(10);
+    let pid_deadline = timing::deadline(Duration::from_secs(10));
     while !fixture.pid_file().exists() {
         if let Some(status) = collector.try_wait().expect("poll timing collector startup") {
             let output = collector
@@ -722,7 +741,7 @@ fn interruption_reaps_the_complete_descendant_tree() {
         0,
         "signal timing collector"
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = timing::deadline(Duration::from_secs(5));
     while collector
         .try_wait()
         .expect("poll timing collector")
@@ -737,7 +756,7 @@ fn interruption_reaps_the_complete_descendant_tree() {
     let output = collector.wait_with_output().expect("collect timing output");
 
     assert_eq!(output.status.code(), Some(128 + libc::SIGTERM));
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < timing::budget(Duration::from_secs(5)));
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("interrupted while running test binary 'fixture_test'"));
     let timing = fixture.timing();
@@ -754,7 +773,10 @@ fn interruption_reaps_the_complete_descendant_tree() {
         "cleanup={}",
         binary["cleanup"]
     );
-    assert!(binary["execute_secs"].as_f64().unwrap() < 5.0);
+    assert!(
+        binary["execute_secs"].as_f64().unwrap()
+            < timing::budget(Duration::from_secs(5)).as_secs_f64()
+    );
     assert_processes_gone(&fixture_pids);
 }
 
