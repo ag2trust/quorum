@@ -18,6 +18,7 @@ use crate::timing;
 
 const COMPILE_DIAGNOSTIC: &str = "fixture compile failure: unresolved import fixture_missing";
 const TEST_DIAGNOSTIC: &str = "fixture test failure: assertion failed";
+#[cfg(target_os = "macos")]
 const DARWIN_PARTIAL_SCENARIO_TIMEOUT: Duration = Duration::from_secs(4);
 static PROCESS_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
