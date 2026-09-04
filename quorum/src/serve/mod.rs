@@ -8069,12 +8069,8 @@ async fn handle_pre_review_checks_failure(
         })??
     };
     if review_only {
-        if park_task_result(&config.db_path, task_id, &feedback, "in-review").await? {
-            log(&format!(
-                "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} failed ({names}) \
-                 — parked review-only task without remediation"
-            ));
-        }
+        // `park_task_result` emits the sole terminal park log after the transition.
+        park_task_result(&config.db_path, task_id, &feedback, "in-review").await?;
         return Ok(());
     }
 
