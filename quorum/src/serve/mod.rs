@@ -13937,6 +13937,12 @@ async fn tick(
                     )
                     .await;
                 }
+                Ok(tasks::DeadTurnRunnerDisposition::AgentFailed(_)) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "failed").await;
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::ReactionParked) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
+                }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
                     if let Some(failure) = dead.observed_pre_authoritative_failure() {
                         log(&format!(
@@ -14111,6 +14117,14 @@ async fn tick(
                         TerminalUsageAction::TransferredOwnershipCleanup,
                     )
                     .await;
+                    continue;
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::AgentFailed(_)) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "failed").await;
+                    continue;
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::ReactionParked) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
@@ -16538,6 +16552,30 @@ async fn settle_dormant_worker_feed_failure(
     let reason = format!("dormant continuation launch failed: {error}");
     match dispose_dead_turn_runner_worker(&config.db_path, task_id, &agent, &reason, &pending).await
     {
+        Ok(tasks::DeadTurnRunnerDisposition::AgentFailed(_)) => {
+            let worker = workers.remove(worker_index);
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                worker.agent_run_id,
+                worker.cap_run_id.as_deref(),
+                "failed",
+            )
+            .await;
+            cleanup_slot(config, wt_mgr, name_pool, worker, None, "failed").await;
+            Ok(DormantWorkerFeedFailureDisposition::Settled)
+        }
+        Ok(tasks::DeadTurnRunnerDisposition::ReactionParked) => {
+            let worker = workers.remove(worker_index);
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                worker.agent_run_id,
+                worker.cap_run_id.as_deref(),
+                "parked",
+            )
+            .await;
+            cleanup_slot(config, wt_mgr, name_pool, worker, None, "parked").await;
+            Ok(DormantWorkerFeedFailureDisposition::Settled)
+        }
         Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
             let worker = workers.remove(worker_index);
             settle_dormant_worker_turn_identity(

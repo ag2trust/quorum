@@ -349,6 +349,7 @@ pub struct TaskUpdate<'a> {
     pub expected_revision: Option<i64>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct TransitionResult {
     pub task: Task,
     pub effects: Vec<Effect>,
@@ -3407,6 +3408,8 @@ pub enum DeadTurnRunnerDisposition {
     DonePending,
     DeliveryRecorded,
     OwnershipTransferred,
+    AgentFailed(Box<TransitionResult>),
+    ReactionParked,
     ProviderBlocked,
 }
 
@@ -3657,11 +3660,12 @@ fn dispose_managed_exit_inner(
 }
 
 /// Atomically distinguish a submitted turn-oriented worker from a provider
-/// failure.
+/// failure or its durable explicit reaction.
 ///
-/// The immediate transaction serializes the Done-row check with both mailbox
-/// append and provider-block persistence, so committed work cannot be staged
-/// for a duplicate retry through a check/write race.
+/// The immediate transaction serializes the Done-row check, journal reaction,
+/// and disposition write. A consumed `react` mailbox row is represented only
+/// in the journal, so reading it here prevents an explicit worker outcome
+/// from being misclassified as a provider failure.
 pub fn dispose_dead_turn_runner(
     conn: &mut Connection,
     id: i64,
@@ -3724,6 +3728,55 @@ pub fn dispose_dead_turn_runner(
         tx.commit()?;
         return Ok(DeadTurnRunnerDisposition::OwnershipTransferred);
     }
+
+    let reaction: Option<String> = tx
+        .query_row(
+            "SELECT agent_state FROM journal
+             WHERE agent=?1 AND role='worker' AND task_id=?2",
+            params![agent, id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    match reaction.as_deref() {
+        Some("failed") => {
+            return apply_event_tx(
+                tx,
+                agent,
+                id,
+                &Event::AgentFailed {
+                    reason: "failed".into(),
+                },
+                now,
+                |_| Ok(()),
+            )
+            .map(|transition| DeadTurnRunnerDisposition::AgentFailed(Box::new(transition)));
+        }
+        Some("blocked" | "needs-info") => {
+            let reason = reaction.as_deref().expect("matched explicit reaction");
+            let refs = set_parked_refs(refs_raw.as_deref(), reason, "working", None)?;
+            tx.execute(
+                "UPDATE tasks
+                 SET status='failed', assignee=NULL, refs=?2, updated_at=?3
+                 WHERE id=?1",
+                params![id, refs, now],
+            )?;
+            deactivate_lease(&tx, id, now)?;
+            tx.execute(
+                "INSERT INTO task_notes(task_id, ts, agent, body)
+                 VALUES (?1, ?2, 'daemon', ?3)",
+                params![id, now, format!("parked: {reason}")],
+            )?;
+            crate::events::emit(&tx, "task_parked", &lease_target(id), reason, now)?;
+            alert_owner_of_park(&tx, id, reason, now)?;
+            crate::decomposition::block_graph_if_child_failed(&tx, id, reason, now)?;
+            tx.commit()?;
+            return Ok(DeadTurnRunnerDisposition::ReactionParked);
+        }
+        Some("note") | None => {}
+        Some(_) => {}
+    }
+
     let mut refs: serde_json::Value = refs_raw
         .as_deref()
         .and_then(|refs| serde_json::from_str(refs).ok())
@@ -4695,13 +4748,20 @@ pub fn retry_parked(
     }
     if !matches!(
         resume_status.as_str(),
-        "open" | "rework" | "in-review" | "merging"
+        "open" | "working" | "rework" | "in-review" | "merging"
     ) {
         return Err(QuorumError::Io(format!(
             "invalid persisted resume status for task #{id}: {resume_status}"
         )));
     }
-    let restored_status = resume_status.as_str();
+    // A worker reaction records the active phase it left. `working` itself
+    // cannot be restored without a live assignee, so retry reopens it for the
+    // normal claim path to allocate the replacement worker.
+    let restored_status = if resume_status == "working" {
+        "open"
+    } else {
+        resume_status.as_str()
+    };
     // A rejected initial branch push has no remote/PR authority to preserve.
     // Require both the parked publication reason and the most recent worker
     // outcome so an older rejected push cannot affect a later, unrelated
@@ -6605,6 +6665,156 @@ mod tests {
         assert!(result.effects.contains(&Effect::SpawnReviewer));
         assert!(result.task.reviewer.is_none());
         assert!(result.task.assignee.is_none());
+    }
+
+    fn dead_turn_retry() -> PendingTurn {
+        PendingTurn {
+            provider: "codex".into(),
+            model: "gpt-5.6-codex".into(),
+            effort: "high".into(),
+            prompt: "finish the active turn".into(),
+            turn_kind: "initial".into(),
+            continuation_id: Some("thread-live".into()),
+            requested: false,
+        }
+    }
+
+    fn worker_reacts(c: &mut Connection, task_id: i64, state: &str) {
+        late_worker_identity(c, task_id, "worker", None);
+        c.execute(
+            "UPDATE journal SET agent_state=?1
+             WHERE agent='worker' AND role='worker' AND task_id=?2",
+            params![state, task_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dead_turn_runner_failed_reaction_uses_agent_failed_not_provider_block() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(r#"{"branch":"daemon/worker-t1"}"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        worker_reacts(&mut c, id, "failed");
+        c.execute(
+            "UPDATE tasks SET recovery_attempts=?1 WHERE id=?2",
+            params![MAX_RECOVERY_ATTEMPTS, id],
+        )
+        .unwrap();
+
+        let disposition = dispose_dead_turn_runner(
+            &mut c,
+            id,
+            "worker",
+            &ProviderBlock {
+                provider: "codex".into(),
+                reason: "process exited".into(),
+            },
+            &dead_turn_retry(),
+            1001,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            disposition,
+            DeadTurnRunnerDisposition::AgentFailed(_)
+        ));
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+    }
+
+    #[test]
+    fn dead_turn_runner_blocked_reactions_park_without_provider_block() {
+        for state in ["blocked", "needs-info"] {
+            let (_d, mut c) = open_tmp();
+            let id = create(
+                &mut c,
+                "boss",
+                "t",
+                None,
+                0,
+                None,
+                Some(r#"{"branch":"daemon/worker-t1"}"#),
+                None,
+                None,
+                1000,
+            )
+            .unwrap();
+            claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+            worker_reacts(&mut c, id, state);
+
+            let disposition = dispose_dead_turn_runner(
+                &mut c,
+                id,
+                "worker",
+                &ProviderBlock {
+                    provider: "codex".into(),
+                    reason: "process exited".into(),
+                },
+                &dead_turn_retry(),
+                1001,
+            )
+            .unwrap();
+
+            assert_eq!(disposition, DeadTurnRunnerDisposition::ReactionParked);
+            let task = get(&c, id).unwrap().unwrap();
+            assert_eq!(task.status, "failed");
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(refs[PARKED_REASON_REF], state);
+            assert_eq!(refs[PARKED_RESUME_STATUS_REF], "working");
+            assert_eq!(refs["branch"], "daemon/worker-t1");
+            assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+
+            let retried = retry_parked(&mut c, id, "boss", true, 1002)
+                .unwrap()
+                .expect("reaction park must be retryable");
+            assert_eq!(retried.status, "open");
+            let refs: serde_json::Value =
+                serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(refs["branch"], "daemon/worker-t1");
+        }
+    }
+
+    #[test]
+    fn dead_turn_runner_without_reaction_is_provider_blocked() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+
+        let disposition = dispose_dead_turn_runner(
+            &mut c,
+            id,
+            "worker",
+            &ProviderBlock {
+                provider: "codex".into(),
+                reason: "process exited".into(),
+            },
+            &dead_turn_retry(),
+            1001,
+        )
+        .unwrap();
+
+        assert_eq!(disposition, DeadTurnRunnerDisposition::ProviderBlocked);
+        let task = get(&c, id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::provider_block(&refs).unwrap().reason,
+            "process exited"
+        );
     }
 
     #[test]
