@@ -8054,6 +8054,30 @@ async fn handle_pre_review_checks_failure(
         "CI checks failed before review for PR #{pr}: {names}\n\n\
          Fix the failing checks, commit, and submit the existing PR again without pushing."
     );
+
+    let review_only = {
+        let path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = quorum_core::db::open(&path)?;
+            Ok(tasks::get(&conn, task_id)?.is_some_and(|task| task.review_only))
+        })
+        .await
+        .map_err(|error| {
+            QuorumError::Io(format!(
+                "pre-review CI review-only lookup join for task #{task_id}: {error}"
+            ))
+        })??
+    };
+    if review_only {
+        if park_task_result(&config.db_path, task_id, &feedback, "in-review").await? {
+            log(&format!(
+                "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} failed ({names}) \
+                 — parked review-only task without remediation"
+            ));
+        }
+        return Ok(());
+    }
+
     log(&format!(
         "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} failed ({names}) — entering rework without spawning a reviewer"
     ));
@@ -21491,6 +21515,23 @@ async fn claim_remediation_for_worker(
     })?
 }
 
+/// A zero-row remediation claim can be a normal race with a live winner, a
+/// dependency hold, or a permanently ineligible request. The first two keep
+/// their durable authority. The last must consume the exact failed-CI request
+/// so a 500 ms reconciler tick cannot provision the same PR head forever.
+async fn record_ci_remediation_claim_loss(db_path: PathBuf, task_id: i64) -> Result<Option<i64>> {
+    tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        tasks::record_ci_remediation_claim_loss(&mut conn, task_id, now_unix())
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "CI remediation claim-loss persistence join for task #{task_id}: {error}"
+        ))
+    })?
+}
+
 /// Install a fresh remediation lease for a still-live worker before feeding it
 /// a rework turn. `VerdictChanges` and `MergeConflict` release the prior lease
 /// as part of their lifecycle transition, so renewal cannot protect this gap.
@@ -21504,16 +21545,24 @@ async fn install_live_worker_remediation_lease(
     task_id: i64,
     pr: i64,
     feedback: &str,
-) -> bool {
+) -> Result<bool> {
     match claim_remediation_for_worker(config.db_path.clone(), agent, task_id, feedback.to_string())
         .await
     {
-        Ok(Some(_)) => true,
+        Ok(Some(_)) => Ok(true),
         Ok(None) => {
             log(&format!(
                 "live remediation: claim lost for task #{task_id} — task no longer eligible"
             ));
-            false
+            if let Some(attempts) =
+                record_ci_remediation_claim_loss(config.db_path.clone(), task_id).await?
+            {
+                log(&format!(
+                    "live remediation: consumed failed-CI request after claim loss \
+                     ({attempts} attempt(s)) for task #{task_id}"
+                ));
+            }
+            Ok(false)
         }
         Err(error) => {
             log(&format!(
@@ -21523,7 +21572,7 @@ async fn install_live_worker_remediation_lease(
                 "remediation lease installation failed: {error}"
             ));
             park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
-            false
+            Ok(false)
         }
     }
 }
@@ -21545,7 +21594,7 @@ async fn install_sticky_remediation_lease_and_baseline(
     pr: i64,
     feedback: &str,
 ) -> Result<bool> {
-    if !install_live_worker_remediation_lease(config, agent.clone(), task_id, pr, feedback).await {
+    if !install_live_worker_remediation_lease(config, agent.clone(), task_id, pr, feedback).await? {
         return Ok(false);
     }
     bind_claimed_sticky_remediation_baseline(config, &agent, task_id, pr, feedback).await
@@ -22036,6 +22085,14 @@ async fn spawn_remediation_worker(
                         "remediation: retained blocked retry for task #{task_id}"
                     ));
                 }
+                if let Some(attempts) =
+                    record_ci_remediation_claim_loss(db_path.clone(), task_id).await?
+                {
+                    log(&format!(
+                        "remediation: consumed failed-CI request after claim loss \
+                         ({attempts} attempt(s)) for task #{task_id}"
+                    ));
+                }
                 name_pool.release(&agent_name);
                 return Ok(RemediationSpawnOutcome::ClaimLost);
             }
@@ -22097,6 +22154,14 @@ async fn spawn_remediation_worker(
             log(&format!(
                 "remediation: claim lost after PR lookup for task #{task_id} — task no longer eligible"
             ));
+            if let Some(attempts) =
+                record_ci_remediation_claim_loss(db_path.clone(), task_id).await?
+            {
+                log(&format!(
+                    "remediation: consumed failed-CI request after claim loss \
+                     ({attempts} attempt(s)) for task #{task_id}"
+                ));
+            }
             name_pool.release(&agent_name);
             return Ok(RemediationSpawnOutcome::ClaimLost);
         }
@@ -23956,6 +24021,252 @@ mod tests {
             matches!(error, QuorumError::SchemaTooNew { .. }),
             "database failure was collapsed into a claim loss: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn review_only_failed_pre_review_ci_parks_once_then_retries_the_same_green_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("review-only-pre-review-ci.db");
+        let now = now_unix();
+        let pr = 553;
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "review-only CI failure",
+                None,
+                0,
+                None,
+                None,
+                None,
+                Some(pr),
+                now,
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                &format!(
+                    r#"{{"pr":{pr},"cx_est":3,"cx_size":"M","cx_ready":true,
+                        "cx_not_ready_reason":null,"cx_by":"test:v2"}}"#
+                ),
+                now,
+            )
+            .unwrap();
+            task_id
+        };
+
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        handle_pre_review_checks_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut roster,
+            task_id,
+            pr,
+            head_sha,
+            &["test".into()],
+        )
+        .await
+        .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let parked = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(parked.review_only);
+        assert_eq!(parked.status, "failed");
+        assert_eq!(
+            parked.rework_round, 0,
+            "CI parking must not spend a rework round"
+        );
+        let refs: serde_json::Value =
+            serde_json::from_str(parked.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::PARKED_REF], true);
+        assert_eq!(refs[tasks::PARKED_RESUME_STATUS_REF], "in-review");
+        assert!(
+            refs.get(tasks::CI_REMEDIATION_REQUESTED_REF).is_none(),
+            "review-only CI failure must never request an implementation worker"
+        );
+        assert!(refs[tasks::PARKED_REASON_REF]
+            .as_str()
+            .unwrap()
+            .contains("CI checks failed before review for PR #553: test"));
+        let parked_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_parked'",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parked_events, 1);
+        let owner_alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE recipient='owner' AND kind='alert' AND refs=?1",
+                [format!("task:{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            owner_alerts, 1,
+            "the parked task must surface in owner attention"
+        );
+        drop(conn);
+
+        for _ in 0..3 {
+            reconcile_ci_remediations(
+                &config,
+                &wt_mgr,
+                &mut name_pool,
+                &mut workers,
+                &mut roster,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(
+            workers.is_empty(),
+            "parked review-only CI failure must not spawn a worker"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let remediation_claims: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remediation_claims, 0,
+            "three reconciler ticks must not re-provision"
+        );
+        let parked_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_parked'",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parked_events, 1, "the park transition must be one-shot");
+        drop(conn);
+
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let resumed = tasks::retry_parked(&mut conn, task_id, "owner", true, now + 1)
+            .unwrap()
+            .expect("owner retry must resume the parked review-only task");
+        assert_eq!(resumed.status, "in-review");
+        drop(conn);
+
+        // A green re-run on the exact same head must pass a fresh gate after
+        // retry; no changed SHA or stale remediation intent is required.
+        let mut waits = HashMap::new();
+        let mut gate = PreReviewChecksGate::Waiting;
+        for _ in 0..100 {
+            gate = poll_pre_review_checks(&config, &mut waits, task_id, pr, head_sha)
+                .await
+                .unwrap();
+            if gate == PreReviewChecksGate::Ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(gate, PreReviewChecksGate::Ready);
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let reviewer = tasks::claim(
+            &mut conn,
+            "reviewer",
+            Some(task_id),
+            &[],
+            tasks::DEFAULT_LEASE_TTL_SECS,
+            now + 2,
+        )
+        .unwrap()
+        .expect("the green same-head gate must leave reviewer provisioning eligible");
+        assert_eq!(reviewer.status, "in-review");
+        assert_eq!(reviewer.reviewer.as_deref(), Some("reviewer"));
+    }
+
+    #[tokio::test]
+    async fn ineligible_ci_remediation_claim_loss_is_consumed_once_across_reconciler_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ineligible-ci-remediation.db");
+        let now = now_unix();
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "ineligible CI remediation",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [task_id])
+                .unwrap();
+            seed_ci_remediation_intent(&conn, task_id, 611, "head-611");
+            task_id
+        };
+
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        reconcile_ci_remediations(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut roster,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(tasks::CI_REMEDIATION_REQUESTED_REF).is_none());
+        assert_eq!(refs[tasks::CI_REMEDIATION_ATTEMPTS_REF], 1);
+        drop(conn);
+
+        for _ in 0..3 {
+            reconcile_ci_remediations(
+                &config,
+                &wt_mgr,
+                &mut name_pool,
+                &mut workers,
+                &mut roster,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(workers.is_empty());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::CI_REMEDIATION_ATTEMPTS_REF], 1);
+        let claims: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims, 0, "the consumed request must never re-provision");
     }
 
     #[tokio::test]
@@ -27057,7 +27368,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 443,
                 "exact reviewer finding",
             )
-            .await,
+            .await
+            .unwrap(),
             "same logical worker must reacquire the rework lease"
         );
         feed_worker_turn(&mut slot, prompt, &config)
@@ -27190,16 +27502,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             managed_usage_record(&slot, "worker"),
         )
         .await;
-        assert!(
-            install_live_worker_remediation_lease(
-                &config,
-                slot.agent_name.clone(),
-                slot.task_id,
-                443,
-                "exact reviewer finding",
-            )
-            .await
-        );
+        assert!(install_live_worker_remediation_lease(
+            &config,
+            slot.agent_name.clone(),
+            slot.task_id,
+            443,
+            "exact reviewer finding",
+        )
+        .await
+        .unwrap());
 
         feed_worker_turn(&mut slot, "fix the reviewer finding", &config)
             .await
@@ -27302,16 +27613,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 worktree,
                 Some(program.to_string_lossy().into_owned()),
             );
-            assert!(
-                install_live_worker_remediation_lease(
-                    &config,
-                    slot.agent_name.clone(),
-                    slot.task_id,
-                    443,
-                    "review feedback",
-                )
-                .await
-            );
+            assert!(install_live_worker_remediation_lease(
+                &config,
+                slot.agent_name.clone(),
+                slot.task_id,
+                443,
+                "review feedback",
+            )
+            .await
+            .unwrap());
             let error = feed_worker_turn(&mut slot, "review feedback", &config)
                 .await
                 .expect_err("invalid durable continuation must not launch");
@@ -27363,16 +27673,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     .into_owned(),
             ),
         );
-        assert!(
-            install_live_worker_remediation_lease(
-                &config,
-                slot.agent_name.clone(),
-                slot.task_id,
-                443,
-                "exact launch-failure feedback",
-            )
-            .await
-        );
+        assert!(install_live_worker_remediation_lease(
+            &config,
+            slot.agent_name.clone(),
+            slot.task_id,
+            443,
+            "exact launch-failure feedback",
+        )
+        .await
+        .unwrap());
         let task_id = slot.task_id;
         let mut workers = vec![slot];
         let prompt = "Exact feedback that must survive a failed codex exec resume.";
@@ -27450,16 +27759,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.pending_prompt = "exact recovered feedback".into();
         slot.pending_turn_kind = "recovered-rework".into();
         let config = dormant_codex_test_config(db_path.clone(), worktree, None);
-        assert!(
-            install_live_worker_remediation_lease(
-                &config,
-                slot.agent_name.clone(),
-                slot.task_id,
-                443,
-                "exact recovered feedback",
-            )
-            .await
-        );
+        assert!(install_live_worker_remediation_lease(
+            &config,
+            slot.agent_name.clone(),
+            slot.task_id,
+            443,
+            "exact recovered feedback",
+        )
+        .await
+        .unwrap());
         {
             let mut conn = quorum_core::db::open(&db_path).unwrap();
             mailbox::append(
