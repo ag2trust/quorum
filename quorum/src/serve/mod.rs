@@ -15,13 +15,9 @@ pub mod codex_agent;
 pub mod codex_stream;
 pub mod collector;
 pub mod doctor;
-#[allow(dead_code)] // The installer is intentionally unwired until fallback activation.
 pub mod fallback;
-#[allow(dead_code)] // The establish step is intentionally unwired until fallback activation.
 pub mod fallback_establish;
-#[allow(dead_code)] // The gate is intentionally unwired until fallback activation.
 pub mod fallback_preflight;
-#[allow(dead_code)] // The retire step is intentionally unwired until fallback activation.
 pub mod fallback_retire;
 pub mod grok_agent;
 pub mod merge;
@@ -13654,6 +13650,54 @@ async fn tick(
         }
     }
 
+    // Persistent-child reviewers can report a provider failure while their
+    // process remains alive. They have no ordinary error-refeed loop, so route
+    // the exact failed turn as soon as it becomes idle. The installer still
+    // lets any racing verdict win under the write lock.
+    let mut settled_reviewer_fallbacks = Vec::new();
+    for (i, reviewer) in reviewers.iter_mut().enumerate() {
+        if reviewer.draining || reviewer.error_turn_count == 0 {
+            continue;
+        }
+        let Some(failure) = reviewer.observed_pre_authoritative_failure() else {
+            continue;
+        };
+        if !matches!(
+            failure.disposition(),
+            runner::FailureDisposition::ProviderUnavailable
+                | runner::FailureDisposition::ProfileUnavailable
+        ) {
+            continue;
+        }
+        let observed_at = now_unix();
+        let currency = match quorum_core::db::open(&config.db_path)
+            .and_then(|conn| load_reviewer_fallback_currency(&conn, reviewer, observed_at))
+        {
+            Ok(currency) => currency,
+            Err(QuorumError::Usage(_)) => continue,
+            Err(error) => {
+                log(&format!(
+                    "reviewer {} fallback currency check failed; retaining slot: {error}",
+                    reviewer.agent_name
+                ));
+                continue;
+            }
+        };
+        match activate_reviewer_fallback(config, reviewer, &failure, &currency).await {
+            Ok(ReviewerFallbackActivation::Activated) => {}
+            Ok(ReviewerFallbackActivation::Settled) => settled_reviewer_fallbacks.push(i),
+            Ok(ReviewerFallbackActivation::NotInstalled) => {}
+            Err(error) => log(&format!(
+                "reviewer {} live-turn fallback failed; retaining slot: {error}",
+                reviewer.agent_name
+            )),
+        }
+    }
+    for i in settled_reviewer_fallbacks.into_iter().rev() {
+        let dead = reviewers.remove(i);
+        teardown_reviewer(config, wt_mgr, name_pool, dead, "provider_blocked").await;
+    }
+
     // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
     let idle_timeout = config
         .limits
@@ -13886,7 +13930,56 @@ async fn tick(
         }
     }
     for &i in error_failed.iter().rev() {
-        let dead = workers.remove(i);
+        let mut dead = workers.remove(i);
+        // TurnFailed already carried bounded provider evidence. Try an
+        // eligible alternate before either the turn-oriented provider block
+        // or persistent-child AgentFailed path mutates lifecycle authority.
+        let observed_at = now_unix();
+        let expected_fallback_currency = match quorum_core::db::open(&config.db_path)
+            .and_then(|conn| load_worker_fallback_currency(&conn, &dead, observed_at))
+        {
+            Ok(currency) => Some(currency),
+            Err(QuorumError::Usage(_)) => None,
+            Err(error) => {
+                log(&format!(
+                    "worker {} fallback currency check failed; retaining slot: {error}",
+                    dead.agent_name
+                ));
+                workers.insert(i, dead);
+                continue;
+            }
+        };
+        let runner_failure = dead.observed_pre_authoritative_failure();
+        if let (Some(currency), Some(failure)) =
+            (expected_fallback_currency.as_ref(), runner_failure.as_ref())
+        {
+            if matches!(
+                failure.disposition(),
+                runner::FailureDisposition::ProviderUnavailable
+                    | runner::FailureDisposition::ProfileUnavailable
+            ) {
+                match activate_worker_fallback(config, &mut dead, failure, currency).await {
+                    Ok(WorkerFallbackActivation::Activated) => {
+                        workers.insert(i, dead);
+                        continue;
+                    }
+                    Ok(WorkerFallbackActivation::Settled) => {
+                        cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked")
+                            .await;
+                        continue;
+                    }
+                    Ok(WorkerFallbackActivation::NotInstalled) => {}
+                    Err(error) => {
+                        log(&format!(
+                            "worker {} fallback installation failed; retaining slot for retry: {error}",
+                            dead.agent_name
+                        ));
+                        workers.insert(i, dead);
+                        continue;
+                    }
+                }
+            }
+        }
         if dead.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
             let provider = dead.process_kind().to_string();
             let reason = dead
@@ -13956,19 +14049,55 @@ async fn tick(
             }
             continue;
         }
-        fire_event(
+        let reason = format!(
+            "worker exhausted error retries ({} consecutive error-terminated turns)",
+            dead.error_turn_count
+        );
+        let Some(disposition) = dispose_managed_process_exit(
             &db_path,
+            tasks::ManagedRunRole::Worker,
             &dead.agent_name,
             dead.task_id,
-            &Event::AgentFailed {
-                reason: format!(
-                    "worker exhausted error retries ({} consecutive error-terminated turns)",
-                    dead.error_turn_count
-                ),
-            },
+            dead.cap_run_id.as_deref(),
+            &reason,
         )
-        .await;
-        cleanup_slot(config, wt_mgr, name_pool, dead, None, "error_retries").await;
+        .await
+        else {
+            workers.insert(i, dead);
+            continue;
+        };
+        match disposition {
+            tasks::ManagedExitDisposition::OutcomePending => {
+                workers.insert(i, dead);
+            }
+            tasks::ManagedExitDisposition::OutcomeRecorded => {
+                cleanup_slot_with_terminal_action(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    None,
+                    "completed",
+                    TerminalUsageAction::RecordedOutcomeCleanup,
+                )
+                .await;
+            }
+            tasks::ManagedExitDisposition::OwnershipTransferred => {
+                cleanup_slot_with_terminal_action(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    None,
+                    "ownership_transferred",
+                    TerminalUsageAction::TransferredOwnershipCleanup,
+                )
+                .await;
+            }
+            tasks::ManagedExitDisposition::AgentFailed(_) => {
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "error_retries").await;
+            }
+        }
     }
 
     // ── Phase 4a-drain: Tear down idle agents during drain ──────────────
@@ -14059,6 +14188,61 @@ async fn tick(
     }
     for &(i, status) in dead_workers.iter().rev() {
         let mut dead = workers.remove(i);
+        // Finalize bounded stdout/stderr evidence while lifecycle is still
+        // live, then let the fallback install transaction re-prove there is no
+        // pending submission and no ownership/currency race.
+        let observed_at = now_unix();
+        let expected_fallback_currency = match quorum_core::db::open(&config.db_path)
+            .and_then(|conn| load_worker_fallback_currency(&conn, &dead, observed_at))
+        {
+            Ok(currency) => Some(currency),
+            Err(QuorumError::Usage(_)) => None,
+            Err(error) => {
+                log(&format!(
+                    "worker {} fallback currency check failed; retaining slot: {error}",
+                    dead.agent_name
+                ));
+                workers.insert(i, dead);
+                continue;
+            }
+        };
+        let runner_failure = if expected_fallback_currency.is_some() {
+            dead.finalize_pre_authoritative_exit_evidence("worker", &config.limits)
+                .await;
+            dead.classify_pre_authoritative_exit(status)
+        } else {
+            None
+        };
+        if let (Some(currency), Some(failure)) =
+            (expected_fallback_currency.as_ref(), runner_failure.as_ref())
+        {
+            if matches!(
+                failure.disposition(),
+                runner::FailureDisposition::ProviderUnavailable
+                    | runner::FailureDisposition::ProfileUnavailable
+            ) {
+                match activate_worker_fallback(config, &mut dead, failure, currency).await {
+                    Ok(WorkerFallbackActivation::Activated) => {
+                        workers.insert(i, dead);
+                        continue;
+                    }
+                    Ok(WorkerFallbackActivation::Settled) => {
+                        cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked")
+                            .await;
+                        continue;
+                    }
+                    Ok(WorkerFallbackActivation::NotInstalled) => {}
+                    Err(error) => {
+                        log(&format!(
+                            "worker {} fallback installation failed; retaining slot for retry: {error}",
+                            dead.agent_name
+                        ));
+                        workers.insert(i, dead);
+                        continue;
+                    }
+                }
+            }
+        }
         if dead.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
             let reason = dead
                 .last_error_text
@@ -14114,9 +14298,7 @@ async fn tick(
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
-                    dead.finalize_pre_authoritative_exit_evidence("worker", &config.limits)
-                        .await;
-                    if let Some(failure) = dead.classify_pre_authoritative_exit(status) {
+                    if let Some(failure) = runner_failure {
                         log(&format!(
                             "worker {} pre-authoritative runner failure classified as {failure}",
                             dead.agent_name
@@ -14150,14 +14332,11 @@ async fn tick(
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
         let terminal_action = terminal_usage_action(&disposition);
-        let runner_failure = classify_managed_pre_authoritative_exit(
-            &mut dead,
-            status,
-            &disposition,
-            "worker",
-            &config.limits,
-        )
-        .await;
+        let runner_failure = if managed_exit_permits_runner_failure(&disposition) {
+            runner_failure
+        } else {
+            None
+        };
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -14272,6 +14451,60 @@ async fn tick(
         }
     }
     for &(i, status) in dead_reviewers.iter().rev() {
+        // Capture the exact live lifecycle/lease/head currency before draining
+        // the exited provider's remaining bounded evidence. The later install
+        // re-reads it and fails closed if a verdict or ownership transition
+        // raced this observation.
+        let observed_at = now_unix();
+        let expected_fallback_currency = match quorum_core::db::open(&config.db_path)
+            .and_then(|conn| load_reviewer_fallback_currency(&conn, &reviewers[i], observed_at))
+        {
+            Ok(currency) => Some(currency),
+            Err(QuorumError::Usage(_)) => None,
+            Err(error) => {
+                log(&format!(
+                    "reviewer {} fallback currency check failed; retaining slot: {error}",
+                    reviewers[i].agent_name
+                ));
+                continue;
+            }
+        };
+        let runner_failure = if expected_fallback_currency.is_some() {
+            reviewers[i]
+                .finalize_pre_authoritative_exit_evidence("reviewer", &config.limits)
+                .await;
+            reviewers[i].classify_pre_authoritative_exit(status)
+        } else {
+            None
+        };
+        if let (Some(currency), Some(failure)) =
+            (expected_fallback_currency.as_ref(), runner_failure.as_ref())
+        {
+            if matches!(
+                failure.disposition(),
+                runner::FailureDisposition::ProviderUnavailable
+                    | runner::FailureDisposition::ProfileUnavailable
+            ) {
+                match activate_reviewer_fallback(config, &mut reviewers[i], failure, currency).await
+                {
+                    Ok(ReviewerFallbackActivation::Activated) => continue,
+                    Ok(ReviewerFallbackActivation::Settled) => {
+                        let dead = reviewers.remove(i);
+                        teardown_reviewer(config, wt_mgr, name_pool, dead, "provider_blocked")
+                            .await;
+                        continue;
+                    }
+                    Ok(ReviewerFallbackActivation::NotInstalled) => {}
+                    Err(error) => {
+                        log(&format!(
+                            "reviewer {} fallback installation failed; retaining slot for retry: {error}",
+                            reviewers[i].agent_name
+                        ));
+                        continue;
+                    }
+                }
+            }
+        }
         let disposition = dispose_managed_process_exit(
             &db_path,
             tasks::ManagedRunRole::Reviewer,
@@ -14290,14 +14523,11 @@ async fn tick(
         };
         let cleanup_reason = managed_exit_end_reason(&disposition);
         let terminal_action = terminal_usage_action(&disposition);
-        let runner_failure = classify_managed_pre_authoritative_exit(
-            &mut reviewers[i],
-            status,
-            &disposition,
-            "reviewer",
-            &config.limits,
-        )
-        .await;
+        let runner_failure = if managed_exit_permits_runner_failure(&disposition) {
+            runner_failure
+        } else {
+            None
+        };
         match disposition {
             tasks::ManagedExitDisposition::OutcomePending => {
                 log(&format!(
@@ -19303,7 +19533,11 @@ async fn provision_reviewer_reserved(
                 r2_origin: role.is_r2(),
                 reviewed_head_sha: spawn_head_sha,
                 continuation_id: reviewer_continuation_id,
-                pending_prompt: String::new(),
+                // Fallback is a fresh provider session, not a cross-provider
+                // continuation. Retain the exact daemon-authored review turn
+                // so an eligible provider failure can replay this prompt
+                // verbatim on the alternate route.
+                pending_prompt: prompt,
                 pending_turn_kind: if role.is_r2() {
                     "r2-review".into()
                 } else {
@@ -20628,6 +20862,453 @@ async fn fail_reviewer_if_owner(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewerFallbackActivation {
+    /// The runner failure was not eligible, or its immutable authority went
+    /// stale before installation. The ordinary managed-exit funnel still owns
+    /// classification and cleanup.
+    NotInstalled,
+    /// A fresh alternate provider process now owns the existing logical
+    /// reviewer slot.
+    Activated,
+    /// Installation retired the failed run, but no live alternate remains.
+    /// The helper has already settled reviewer lifecycle authority.
+    Settled,
+}
+
+type ConfiguredRunRoute = (
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn load_reviewer_fallback_currency(
+    conn: &quorum_core::Connection,
+    slot: &SlotState,
+    observed_at: i64,
+) -> Result<fallback_preflight::ManagedTurnCurrency> {
+    let (status, reviewer, generation): (String, Option<String>, i64) = conn
+        .query_row(
+            "SELECT status,reviewer,revision FROM tasks WHERE id=?1",
+            [slot.task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| QuorumError::Usage("reviewer fallback task disappeared".into()))?;
+    if reviewer.as_deref() != Some(slot.agent_name.as_str()) {
+        return Err(QuorumError::Usage(
+            "reviewer fallback ownership is no longer current".into(),
+        ));
+    }
+    let target = format!("task#{}", slot.task_id);
+    let lease = conn
+        .query_row(
+            "SELECT id,target,holder,expires_at FROM claims
+             WHERE target=?1 AND active=1 AND expires_at>?2",
+            rusqlite::params![target, observed_at],
+            |row| {
+                Ok(fallback_preflight::LeaseCurrency {
+                    claim_id: row.get(0)?,
+                    target: row.get(1)?,
+                    holder: row.get(2)?,
+                    expires_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| QuorumError::Usage("reviewer fallback lease is not live".into()))?;
+    let pr_number = slot
+        .pr
+        .ok_or_else(|| QuorumError::Usage("reviewer fallback is missing its PR".into()))?;
+    let head_sha = slot
+        .reviewed_head_sha
+        .clone()
+        .ok_or_else(|| QuorumError::Usage("reviewer fallback is missing its launch head".into()))?;
+    // `head_ref` is currency evidence only; the fallback descriptor binds the
+    // PR number and SHA. Prefer the daemon-persisted target, retaining the
+    // already-provisioned local review branch for the legacy fetch fallback.
+    let head_ref = pr_targets::get(conn, slot.task_id, pr_number)?
+        .map(|target| target.head_ref)
+        .unwrap_or_else(|| slot.branch.clone());
+    Ok(fallback_preflight::ManagedTurnCurrency {
+        lifecycle: fallback_preflight::LifecycleCurrency {
+            task_id: slot.task_id,
+            status,
+            generation,
+        },
+        lease,
+        head: Some(fallback_preflight::HeadCurrency {
+            pr_number,
+            head_ref,
+            head_sha,
+        }),
+    })
+}
+
+fn reviewer_fallback_pending_turn(slot: &SlotState) -> PendingTurn {
+    PendingTurn {
+        provider: slot.process_kind().to_string(),
+        model: slot.model.clone(),
+        effort: slot.effort.clone(),
+        prompt: slot.pending_prompt.clone(),
+        turn_kind: slot.pending_turn_kind.clone(),
+        continuation_id: slot.continuation_id.clone(),
+        requested: false,
+    }
+}
+
+/// Install and launch one reviewer fallback without crossing provider-session
+/// identity. The installer commits the failed-run retirement, alternate run,
+/// capability, and restart descriptor before this function invokes a provider.
+/// The logical reviewer name and already-verified worktree stay fixed; the
+/// process/session/run/capability are fresh.
+async fn activate_reviewer_fallback(
+    config: &ServeConfig,
+    slot: &mut SlotState,
+    failure: &runner::RunnerFailure,
+    expected_currency: &fallback_preflight::ManagedTurnCurrency,
+) -> Result<ReviewerFallbackActivation> {
+    let agent_run_id = slot
+        .agent_run_id
+        .ok_or_else(|| QuorumError::Io("reviewer fallback is missing its agent run".into()))?;
+    let capability_run_id = slot
+        .cap_run_id
+        .clone()
+        .ok_or_else(|| QuorumError::Io("reviewer fallback is missing its run capability".into()))?;
+    let pr = slot
+        .pr
+        .ok_or_else(|| QuorumError::Io("reviewer fallback is missing its PR".into()))?;
+    let reviewed_head = slot
+        .reviewed_head_sha
+        .clone()
+        .ok_or_else(|| QuorumError::Io("reviewer fallback is missing its reviewed head".into()))?;
+    let pending_turn = reviewer_fallback_pending_turn(slot);
+    let installed_at = now_unix();
+    let current_head = {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+            .await
+            .map_err(|error| QuorumError::Io(format!("reviewer fallback head join: {error}")))?
+    };
+    if current_head.as_deref() != Some(reviewed_head.as_str()) {
+        log(&format!(
+            "reviewer {} fallback rejected because PR #{} head moved from {} to {}",
+            slot.agent_name,
+            pr,
+            reviewed_head,
+            current_head.as_deref().unwrap_or("<unavailable>")
+        ));
+        return Ok(ReviewerFallbackActivation::NotInstalled);
+    }
+    let same_agent = slot.agent_name.clone();
+    let worktree = slot.worktree_path.to_string_lossy().into_owned();
+    let disposition = failure.disposition();
+    let alternate_capability_run_id = uuid::Uuid::new_v4().to_string();
+    let mut conn = quorum_core::db::open(&config.db_path)?;
+    let (
+        assignment_id,
+        configured_profile_id,
+        configured_provider,
+        configured_model,
+        configured_effort,
+    ): ConfiguredRunRoute = conn.query_row(
+        "SELECT role_assignment_id,configured_profile_id,configured_provider,
+                    configured_model,configured_effort FROM agent_runs
+             WHERE id=?1 AND task_id=?2 AND agent_name=?3 AND role='reviewer'
+               AND ended_at IS NULL",
+        rusqlite::params![
+            agent_run_id,
+            expected_currency.lifecycle.task_id,
+            same_agent
+        ],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let assignment_id = assignment_id
+        .ok_or_else(|| QuorumError::Io("reviewer fallback run has no assignment".into()))?;
+    let assignment = quorum_core::role_assignments::get(&conn, assignment_id)?
+        .ok_or_else(|| QuorumError::Io("reviewer fallback assignment disappeared".into()))?;
+    let complexity = assignment
+        .complexity
+        .as_deref()
+        .and_then(|value| value.parse::<u8>().ok())
+        .ok_or_else(|| QuorumError::Io("reviewer fallback assignment has no complexity".into()))?;
+    let pool = configured_routing_pool(
+        config,
+        "reviewer",
+        Some(complexity),
+        assignment.review_stage.as_deref(),
+    )?;
+    let current = load_reviewer_fallback_currency(&conn, slot, installed_at)?;
+    let failed_route = match (
+        configured_profile_id.as_deref(),
+        configured_provider.as_deref(),
+        configured_model.as_deref(),
+        configured_effort.as_deref(),
+    ) {
+        (None, None, None, None) => assignment.profile_snapshot(),
+        (Some(id), Some(provider), Some(model), Some(effort)) => pool
+            .profiles
+            .iter()
+            .map(|weighted| &weighted.profile)
+            .find(|profile| {
+                profile.id == id
+                    && profile.provider == provider
+                    && profile.model == model
+                    && profile.effort == effort
+            })
+            .cloned()
+            .ok_or_else(|| {
+                QuorumError::Io("reviewer fallback run route is not in its configured pool".into())
+            })?,
+        _ => {
+            return Err(QuorumError::Io(
+                "reviewer fallback run has partial configured-route evidence".into(),
+            ))
+        }
+    };
+    let responsibility = quorum_core::role_assignments::AssignmentIdentity {
+        task_id: assignment.task_id,
+        responsibility_key: &assignment.responsibility_key,
+        role: &assignment.role,
+        pr_number: assignment.pr_number,
+        review_stage: assignment.review_stage.as_deref(),
+    };
+    let install = fallback::install(
+        &mut conn,
+        &fallback::FallbackInstallInput {
+            disposition,
+            assignment: &assignment,
+            responsibility,
+            failed_route: &failed_route,
+            pending_turn: &pending_turn,
+            eligible_pool: &pool,
+            expected_currency,
+            current_currency: &current,
+            observed_at: installed_at,
+            failed_run: fallback_retire::FailedManagedRun {
+                agent_run_id,
+                capability_run_id: &capability_run_id,
+                agent: &same_agent,
+                ended_at: installed_at,
+                end_reason: "fallback-route-unavailable",
+            },
+            alternate_agent: &same_agent,
+            alternate_capability_run_id: &alternate_capability_run_id,
+            reviewer_launch: Some(quorum_core::capabilities::ReviewerLaunchEvidence {
+                pr,
+                head_sha: &reviewed_head,
+            }),
+            worktree: &worktree,
+            recorded_at: installed_at,
+            spawned_at: installed_at,
+            issued_at: installed_at,
+        },
+    )?;
+    drop(conn);
+
+    let intent = match install {
+        fallback::FallbackInstallOutcome::NoFailover
+        | fallback::FallbackInstallOutcome::FailClosed => {
+            return Ok(ReviewerFallbackActivation::NotInstalled);
+        }
+        fallback::FallbackInstallOutcome::ProviderBlocked(block) => {
+            log(&format!(
+                "reviewer {} has no eligible alternate after {}: {}",
+                slot.agent_name, block.provider, block.reason
+            ));
+            let _ = fail_reviewer_if_owner(
+                &config.db_path,
+                &slot.agent_name,
+                slot.task_id,
+                &block.reason,
+            )
+            .await;
+            return Ok(ReviewerFallbackActivation::Settled);
+        }
+        fallback::FallbackInstallOutcome::Installed(intent) => intent,
+    };
+
+    let alternate_kind =
+        match resolve_managed_provider(&intent.pending_turn.model, "reviewer fallback") {
+            Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
+            Ok(kind) => {
+                let error = format!(
+                    "fallback intent provider '{}' does not match model '{}' resolved as '{kind}'",
+                    intent.pending_turn.provider, intent.pending_turn.model
+                );
+                let _ = dispose_managed_process_exit(
+                    &config.db_path,
+                    tasks::ManagedRunRole::Reviewer,
+                    &slot.agent_name,
+                    slot.task_id,
+                    Some(&intent.capability_run_id),
+                    &error,
+                )
+                .await;
+                return Ok(ReviewerFallbackActivation::Settled);
+            }
+            Err(error) => {
+                let _ = dispose_managed_process_exit(
+                    &config.db_path,
+                    tasks::ManagedRunRole::Reviewer,
+                    &slot.agent_name,
+                    slot.task_id,
+                    Some(&intent.capability_run_id),
+                    &format!("reviewer fallback route is not executable: {error}"),
+                )
+                .await;
+                return Ok(ReviewerFallbackActivation::Settled);
+            }
+        };
+    let session_id = agent::new_session_id();
+    let environment = managed_run_environment(
+        config,
+        &slot.agent_name,
+        Some(intent.capability_run_id.as_str()),
+    );
+    let launched = runner::RunnerProc::launch(
+        &runner::LaunchRequest {
+            model: &intent.pending_turn.model,
+            effort: &intent.pending_turn.effort,
+            worktree: Path::new(&intent.worktree),
+            prompt: &intent.pending_turn.prompt,
+            environment: &environment,
+            mode: runner::LaunchMode::Normal,
+            // Cross-provider continuations are forbidden. The alternate gets
+            // the exact pending turn in a new provider session.
+            continuation_id: None,
+        },
+        &runner_adapter_config(config, agent_bin_for_kind(config, alternate_kind)),
+    )
+    .await;
+    let proc = match launched {
+        Ok(proc) => proc,
+        Err(error) => {
+            log(&format!(
+                "reviewer {} fallback process launch failed after durable installation: {error}",
+                slot.agent_name
+            ));
+            let _ = dispose_managed_process_exit(
+                &config.db_path,
+                tasks::ManagedRunRole::Reviewer,
+                &slot.agent_name,
+                slot.task_id,
+                Some(&intent.capability_run_id),
+                &format!("reviewer fallback launch failed: {error}"),
+            )
+            .await;
+            return Ok(ReviewerFallbackActivation::Settled);
+        }
+    };
+
+    let session_started_at = now_unix();
+    let new_session_log = config.log_dir.as_ref().and_then(|log_dir| {
+        session_log::SessionLog::create(
+            log_dir,
+            &slot.agent_name,
+            "reviewer",
+            Some(slot.task_id),
+            &session_id,
+            &slot.branch,
+            session_started_at,
+        )
+        .ok()
+    });
+    let journal_entry = JournalEntry {
+        agent: slot.agent_name.clone(),
+        role: "reviewer".into(),
+        task_id: Some(slot.task_id),
+        session_id: session_id.clone(),
+        worktree: Some(intent.worktree.clone()),
+        branch: Some(slot.remote_branch.clone()),
+        phase: "reviewing".into(),
+        cost_tokens: 0,
+        agent_state: None,
+        cost_usd: 0.0,
+        log_dir: new_session_log
+            .as_ref()
+            .map(|log| log.dir().to_string_lossy().into()),
+        pid: proc.pid(),
+        pr: Some(pr),
+        rework_count: slot.rework_count as i32,
+        provider: Some(alternate_kind.to_string()),
+        continuation_id: None,
+        local_branch: Some(slot.branch.clone()),
+    };
+    let journal_path = config.db_path.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&journal_path)?;
+        journal::upsert(&mut conn, &journal_entry)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("reviewer fallback journal join: {error}")))?
+    {
+        let _ = proc.kill_and_reap().await;
+        let _ = dispose_managed_process_exit(
+            &config.db_path,
+            tasks::ManagedRunRole::Reviewer,
+            &slot.agent_name,
+            slot.task_id,
+            Some(&intent.capability_run_id),
+            &format!("reviewer fallback journal failed: {error}"),
+        )
+        .await;
+        return Ok(ReviewerFallbackActivation::Settled);
+    }
+
+    record_managed_usage_snapshot(
+        &config.db_path,
+        slot.agent_run_id,
+        managed_usage_record(slot, "reviewer"),
+    )
+    .await;
+    if let Some(log) = &mut slot.session_log {
+        log.finalize(None);
+    }
+    let old_process = std::mem::replace(&mut slot.proc, SlotProcess::running(proc));
+    let old_output = old_process.kill_and_reap().await;
+    persist_terminal_output(&mut slot.session_log, old_output);
+    slot.session_log = new_session_log;
+    slot.session_id = session_id;
+    slot.model = intent.pending_turn.model;
+    slot.effort = intent.pending_turn.effort;
+    slot.agent_run_id = Some(intent.agent_run_id);
+    slot.cap_run_id = Some(intent.capability_run_id);
+    slot.continuation_id = None;
+    slot.pending_prompt = intent.pending_turn.prompt;
+    slot.pending_turn_kind = intent.pending_turn.turn_kind;
+    slot.draining = true;
+    slot.pending_watchdog_breach = None;
+    slot.error_turn_count = 0;
+    slot.last_error_text = None;
+    slot.token_usage = runner::TokenUsage::default();
+    slot.last_terminal_usage = runner::TokenUsage::default();
+    slot.last_terminal_cost_usd = None;
+    // Per-run detailed telemetry rotates with agent_run_id. The legacy
+    // task-level scalar ceilings remain cumulative across provider fallback.
+    slot.live_stats = LiveStats::new();
+    let instant = std::time::Instant::now();
+    slot.turn_started_at = instant;
+    slot.last_event_at = instant;
+    slot.turn_ended_at = None;
+    log(&format!(
+        "reviewer {} fell back to provider {} model {} for task #{} PR #{}",
+        slot.agent_name, alternate_kind, slot.model, slot.task_id, pr
+    ));
+    Ok(ReviewerFallbackActivation::Activated)
+}
+
 async fn dispose_managed_process_exit(
     db_path: &std::path::Path,
     role: tasks::ManagedRunRole,
@@ -20707,26 +21388,484 @@ fn managed_exit_end_reason(disposition: &tasks::ManagedExitDisposition) -> Optio
     }
 }
 
-/// The DB disposition is the authority gate for this taxonomy. Pending or
-/// recorded submissions/verdicts and transferred/terminal ownership are
-/// semantic managed outcomes, regardless of process output or exit status.
-async fn classify_managed_pre_authoritative_exit(
-    slot: &mut SlotState,
-    status: std::process::ExitStatus,
-    disposition: &tasks::ManagedExitDisposition,
-    role: &str,
-    limits: &CostLimits,
-) -> Option<runner::RunnerFailure> {
-    if !managed_exit_permits_runner_failure(disposition) {
-        return None;
-    }
-    slot.finalize_pre_authoritative_exit_evidence(role, limits)
-        .await;
-    slot.classify_pre_authoritative_exit(status)
-}
-
 fn managed_exit_permits_runner_failure(disposition: &tasks::ManagedExitDisposition) -> bool {
     matches!(disposition, tasks::ManagedExitDisposition::AgentFailed(_))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerFallbackActivation {
+    NotInstalled,
+    Activated,
+    Settled,
+}
+
+fn worker_fallback_pending_turn(slot: &SlotState) -> PendingTurn {
+    PendingTurn {
+        provider: slot.process_kind().to_string(),
+        model: slot.model.clone(),
+        effort: slot.effort.clone(),
+        prompt: slot.pending_prompt.clone(),
+        turn_kind: slot.pending_turn_kind.clone(),
+        continuation_id: slot.continuation_id.clone(),
+        requested: false,
+    }
+}
+
+fn load_worker_fallback_currency(
+    conn: &quorum_core::Connection,
+    slot: &SlotState,
+    observed_at: i64,
+) -> Result<fallback_preflight::ManagedTurnCurrency> {
+    let (status, revision): (String, i64) = conn
+        .query_row(
+            "SELECT status,revision FROM tasks
+             WHERE id=?1 AND status IN ('working','rework')",
+            [slot.task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| QuorumError::Usage("worker fallback lifecycle is no longer live".into()))?;
+    let target = format!("task#{}", slot.task_id);
+    let lease = conn
+        .query_row(
+            "SELECT id,target,holder,expires_at FROM claims
+             WHERE target=?1 AND holder=?2 AND active=1 AND expires_at>?3",
+            rusqlite::params![target, slot.agent_name, observed_at],
+            |row| {
+                Ok(fallback_preflight::LeaseCurrency {
+                    claim_id: row.get(0)?,
+                    target: row.get(1)?,
+                    holder: row.get(2)?,
+                    expires_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| QuorumError::Usage("worker fallback lease is not live".into()))?;
+    Ok(fallback_preflight::ManagedTurnCurrency {
+        lifecycle: fallback_preflight::LifecycleCurrency {
+            task_id: slot.task_id,
+            status,
+            generation: revision,
+        },
+        lease,
+        // Worker responsibilities are revision-scoped, not PR-head-scoped.
+        // A rework PR remains fixed by the slot and launch descriptor.
+        head: None,
+    })
+}
+
+/// Rotate a failed worker to an eligible configured route before the ordinary
+/// AgentFailed/provider-block mutation. The logical worker remains the task's
+/// assignee and lease holder; only run capability, executable profile, and
+/// provider session change.
+async fn activate_worker_fallback(
+    config: &ServeConfig,
+    slot: &mut SlotState,
+    failure: &runner::RunnerFailure,
+    expected_currency: &fallback_preflight::ManagedTurnCurrency,
+) -> Result<WorkerFallbackActivation> {
+    let agent_run_id = slot
+        .agent_run_id
+        .ok_or_else(|| QuorumError::Io("worker fallback is missing its agent run".into()))?;
+    let capability_run_id = slot
+        .cap_run_id
+        .clone()
+        .ok_or_else(|| QuorumError::Io("worker fallback is missing its run capability".into()))?;
+    let pending_turn = worker_fallback_pending_turn(slot);
+    let installed_at = now_unix();
+    let same_agent = slot.agent_name.clone();
+    let worktree = slot.worktree_path.to_string_lossy().into_owned();
+    let alternate_capability_run_id = uuid::Uuid::new_v4().to_string();
+    let mut conn = quorum_core::db::open(&config.db_path)?;
+    let (assignment_id, profile_id, provider, model, effort): ConfiguredRunRoute = conn.query_row(
+        "SELECT role_assignment_id,configured_profile_id,configured_provider,
+                configured_model,configured_effort
+         FROM agent_runs
+         WHERE id=?1 AND task_id=?2 AND agent_name=?3 AND role='worker'
+           AND ended_at IS NULL",
+        rusqlite::params![agent_run_id, slot.task_id, same_agent],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let assignment_id = assignment_id
+        .ok_or_else(|| QuorumError::Io("worker fallback run has no assignment".into()))?;
+    let assignment = quorum_core::role_assignments::get(&conn, assignment_id)?
+        .ok_or_else(|| QuorumError::Io("worker fallback assignment disappeared".into()))?;
+    let complexity = assignment
+        .complexity
+        .as_deref()
+        .and_then(|value| value.parse::<u8>().ok())
+        .ok_or_else(|| QuorumError::Io("worker fallback assignment has no complexity".into()))?;
+    let pool = configured_routing_pool(config, "worker", Some(complexity), None)?;
+    let current = load_worker_fallback_currency(&conn, slot, installed_at)?;
+    let failed_route = match (profile_id, provider, model, effort) {
+        // Ordinary initially assigned runs predate configured_* attribution;
+        // their exact route is the immutable assignment snapshot.
+        (None, None, None, None) => assignment.profile_snapshot(),
+        // Attributed fallback runs carry their selected route explicitly, so
+        // a later failure can exclude that route and chain to the next one.
+        (Some(id), Some(provider), Some(model), Some(effort)) => {
+            quorum_core::role_assignments::ModelProfile {
+                id,
+                runner: provider.clone(),
+                provider,
+                model,
+                effort,
+            }
+        }
+        _ => {
+            return Err(QuorumError::Io(
+                "worker fallback run has partial configured route evidence".into(),
+            ));
+        }
+    };
+    if failed_route.provider != slot.process_kind().to_string()
+        || failed_route.model != slot.model
+        || failed_route.effort != slot.effort
+    {
+        return Err(QuorumError::Io(
+            "worker fallback slot does not match its durable route evidence".into(),
+        ));
+    }
+    let responsibility = quorum_core::role_assignments::AssignmentIdentity {
+        task_id: assignment.task_id,
+        responsibility_key: &assignment.responsibility_key,
+        role: &assignment.role,
+        pr_number: assignment.pr_number,
+        review_stage: assignment.review_stage.as_deref(),
+    };
+    let install = fallback::install(
+        &mut conn,
+        &fallback::FallbackInstallInput {
+            disposition: failure.disposition(),
+            assignment: &assignment,
+            responsibility,
+            failed_route: &failed_route,
+            pending_turn: &pending_turn,
+            eligible_pool: &pool,
+            expected_currency,
+            current_currency: &current,
+            observed_at: installed_at,
+            failed_run: fallback_retire::FailedManagedRun {
+                agent_run_id,
+                capability_run_id: &capability_run_id,
+                agent: &same_agent,
+                ended_at: installed_at,
+                end_reason: "fallback-route-unavailable",
+            },
+            alternate_agent: &same_agent,
+            alternate_capability_run_id: &alternate_capability_run_id,
+            reviewer_launch: None,
+            worktree: &worktree,
+            recorded_at: installed_at,
+            spawned_at: installed_at,
+            issued_at: installed_at,
+        },
+    )?;
+    drop(conn);
+    let intent = match install {
+        fallback::FallbackInstallOutcome::NoFailover
+        | fallback::FallbackInstallOutcome::FailClosed => {
+            return Ok(WorkerFallbackActivation::NotInstalled);
+        }
+        fallback::FallbackInstallOutcome::ProviderBlocked(block) => {
+            let mut conn = quorum_core::db::open(&config.db_path)?;
+            let _ = tasks::dispose_dead_turn_runner(
+                &mut conn,
+                slot.task_id,
+                &slot.agent_name,
+                &block,
+                &pending_turn,
+                now_unix(),
+            )?;
+            return Ok(WorkerFallbackActivation::Settled);
+        }
+        fallback::FallbackInstallOutcome::Installed(intent) => intent,
+    };
+    let alternate_pending = PendingTurn {
+        provider: intent.pending_turn.provider.clone(),
+        model: intent.pending_turn.model.clone(),
+        effort: intent.pending_turn.effort.clone(),
+        prompt: intent.pending_turn.prompt.clone(),
+        turn_kind: intent.pending_turn.turn_kind.clone(),
+        continuation_id: None,
+        requested: intent.pending_turn.requested,
+    };
+    let alternate_kind = match resolve_worker_provider(&intent.pending_turn.model) {
+        Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
+        Ok(kind) => {
+            let reason = format!(
+                "fallback intent provider '{}' does not match model '{}' resolved as '{kind}'",
+                intent.pending_turn.provider, intent.pending_turn.model
+            );
+            let mut conn = quorum_core::db::open(&config.db_path)?;
+            let _ = tasks::dispose_dead_turn_runner(
+                &mut conn,
+                slot.task_id,
+                &slot.agent_name,
+                &runner_state::ProviderBlock {
+                    provider: intent.pending_turn.provider.clone(),
+                    reason,
+                },
+                &alternate_pending,
+                now_unix(),
+            )?;
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                Some(intent.agent_run_id),
+                Some(&intent.capability_run_id),
+                "fallback_route_invalid",
+            )
+            .await;
+            return Ok(WorkerFallbackActivation::Settled);
+        }
+        Err(error) => {
+            let mut conn = quorum_core::db::open(&config.db_path)?;
+            let _ = tasks::dispose_dead_turn_runner(
+                &mut conn,
+                slot.task_id,
+                &slot.agent_name,
+                &runner_state::ProviderBlock {
+                    provider: intent.pending_turn.provider.clone(),
+                    reason: format!("fallback route is not executable: {error}"),
+                },
+                &alternate_pending,
+                now_unix(),
+            )?;
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                Some(intent.agent_run_id),
+                Some(&intent.capability_run_id),
+                "fallback_route_invalid",
+            )
+            .await;
+            return Ok(WorkerFallbackActivation::Settled);
+        }
+    };
+    if alternate_kind == runner::AgentKind::Grok && intent.pending_turn.turn_kind != "initial" {
+        let mut conn = quorum_core::db::open(&config.db_path)?;
+        let _ = tasks::dispose_dead_turn_runner(
+            &mut conn,
+            slot.task_id,
+            &slot.agent_name,
+            &runner_state::ProviderBlock {
+                provider: intent.pending_turn.provider.clone(),
+                reason: "Grok fallback requires a fresh initial worker turn".into(),
+            },
+            &alternate_pending,
+            now_unix(),
+        )?;
+        settle_dormant_worker_turn_identity(
+            &config.db_path,
+            Some(intent.agent_run_id),
+            Some(&intent.capability_run_id),
+            "fallback_route_incompatible",
+        )
+        .await;
+        return Ok(WorkerFallbackActivation::Settled);
+    }
+    let session_id = agent::new_session_id();
+    let environment = managed_run_environment(
+        config,
+        &slot.agent_name,
+        Some(intent.capability_run_id.as_str()),
+    );
+    let launch = runner::LaunchRequest {
+        model: &intent.pending_turn.model,
+        effort: &intent.pending_turn.effort,
+        worktree: Path::new(&intent.worktree),
+        prompt: &intent.pending_turn.prompt,
+        environment: &environment,
+        mode: runner::LaunchMode::Normal,
+        // Cross-provider continuation is never valid.
+        continuation_id: None,
+    };
+    let launched = if alternate_kind == runner::AgentKind::Grok {
+        runner::RunnerProc::launch_internal_worker(
+            &runner::RunnerRequest {
+                launch,
+                task_id: slot.task_id,
+                role_assignment_id: assignment.id,
+                responsibility_key: &assignment.responsibility_key,
+                agent: &slot.agent_name,
+                role: "worker",
+                pending_turn: PendingTurn {
+                    provider: intent.pending_turn.provider.clone(),
+                    model: intent.pending_turn.model.clone(),
+                    effort: intent.pending_turn.effort.clone(),
+                    prompt: intent.pending_turn.prompt.clone(),
+                    turn_kind: intent.pending_turn.turn_kind.clone(),
+                    continuation_id: None,
+                    requested: intent.pending_turn.requested,
+                },
+            },
+            &runner_adapter_config(config, agent_bin_for_kind(config, alternate_kind)),
+        )
+        .await
+    } else {
+        runner::RunnerProc::launch(
+            &launch,
+            &runner_adapter_config(config, agent_bin_for_kind(config, alternate_kind)),
+        )
+        .await
+    };
+    let proc = match launched {
+        Ok(proc) => proc,
+        Err(error) => {
+            let alternate_pending = PendingTurn {
+                provider: intent.pending_turn.provider.clone(),
+                model: intent.pending_turn.model.clone(),
+                effort: intent.pending_turn.effort.clone(),
+                prompt: intent.pending_turn.prompt.clone(),
+                turn_kind: intent.pending_turn.turn_kind.clone(),
+                continuation_id: None,
+                requested: intent.pending_turn.requested,
+            };
+            let mut conn = quorum_core::db::open(&config.db_path)?;
+            let _ = tasks::dispose_dead_turn_runner(
+                &mut conn,
+                slot.task_id,
+                &slot.agent_name,
+                &runner_state::ProviderBlock {
+                    provider: alternate_pending.provider.clone(),
+                    reason: format!("fallback launch failed: {error}"),
+                },
+                &alternate_pending,
+                now_unix(),
+            )?;
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                Some(intent.agent_run_id),
+                Some(&intent.capability_run_id),
+                "fallback_launch_failed",
+            )
+            .await;
+            return Ok(WorkerFallbackActivation::Settled);
+        }
+    };
+
+    let session_started_at = now_unix();
+    let new_session_log = config.log_dir.as_ref().and_then(|log_dir| {
+        session_log::SessionLog::create(
+            log_dir,
+            &slot.agent_name,
+            "worker",
+            Some(slot.task_id),
+            &session_id,
+            &slot.remote_branch,
+            session_started_at,
+        )
+        .ok()
+    });
+    let journal_entry = JournalEntry {
+        agent: slot.agent_name.clone(),
+        role: "worker".into(),
+        task_id: Some(slot.task_id),
+        session_id: session_id.clone(),
+        worktree: Some(intent.worktree.clone()),
+        branch: Some(slot.remote_branch.clone()),
+        phase: "working".into(),
+        cost_tokens: 0,
+        agent_state: None,
+        cost_usd: 0.0,
+        log_dir: new_session_log
+            .as_ref()
+            .map(|log| log.dir().to_string_lossy().into()),
+        pid: proc.pid(),
+        pr: slot.pr,
+        rework_count: slot.rework_count as i32,
+        provider: Some(alternate_kind.to_string()),
+        continuation_id: None,
+        local_branch: Some(slot.branch.clone()),
+    };
+    let journal_path = config.db_path.clone();
+    let journal_result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&journal_path)?;
+        journal::upsert(&mut conn, &journal_entry)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("worker fallback journal join: {error}")))?;
+    if let Err(error) = journal_result {
+        let _ = proc.kill_and_reap().await;
+        let alternate_pending = PendingTurn {
+            provider: intent.pending_turn.provider.clone(),
+            model: intent.pending_turn.model.clone(),
+            effort: intent.pending_turn.effort.clone(),
+            prompt: intent.pending_turn.prompt.clone(),
+            turn_kind: intent.pending_turn.turn_kind.clone(),
+            continuation_id: None,
+            requested: intent.pending_turn.requested,
+        };
+        let mut conn = quorum_core::db::open(&config.db_path)?;
+        let _ = tasks::dispose_dead_turn_runner(
+            &mut conn,
+            slot.task_id,
+            &slot.agent_name,
+            &runner_state::ProviderBlock {
+                provider: alternate_pending.provider.clone(),
+                reason: format!("fallback journal failed: {error}"),
+            },
+            &alternate_pending,
+            now_unix(),
+        )?;
+        settle_dormant_worker_turn_identity(
+            &config.db_path,
+            Some(intent.agent_run_id),
+            Some(&intent.capability_run_id),
+            "fallback_journal_failed",
+        )
+        .await;
+        return Ok(WorkerFallbackActivation::Settled);
+    }
+
+    record_managed_usage_snapshot(
+        &config.db_path,
+        slot.agent_run_id,
+        managed_usage_record(slot, "worker"),
+    )
+    .await;
+    if let Some(log) = &mut slot.session_log {
+        log.finalize(None);
+    }
+    let old_process = std::mem::replace(&mut slot.proc, SlotProcess::running(proc));
+    let old_output = old_process.kill_and_reap().await;
+    persist_terminal_output(&mut slot.session_log, old_output);
+    slot.session_id = session_id;
+    slot.model = intent.pending_turn.model;
+    slot.effort = intent.pending_turn.effort;
+    slot.agent_run_id = Some(intent.agent_run_id);
+    slot.cap_run_id = Some(intent.capability_run_id);
+    slot.continuation_id = None;
+    slot.pending_prompt = intent.pending_turn.prompt;
+    slot.pending_turn_kind = intent.pending_turn.turn_kind;
+    slot.draining = true;
+    slot.pending_watchdog_breach = None;
+    slot.error_turn_count = 0;
+    slot.last_error_text = None;
+    slot.token_usage = runner::TokenUsage::default();
+    slot.last_terminal_usage = runner::TokenUsage::default();
+    slot.last_terminal_cost_usd = None;
+    // Per-run detailed telemetry rotates with agent_run_id. The legacy
+    // task-level scalar ceilings remain cumulative across provider fallback.
+    slot.live_stats = LiveStats::new();
+    let instant = std::time::Instant::now();
+    slot.turn_started_at = instant;
+    slot.last_event_at = instant;
+    slot.turn_ended_at = None;
+    slot.session_log = new_session_log;
+    log(&format!(
+        "worker {} fell back to provider {} model {} for task #{}",
+        slot.agent_name, alternate_kind, slot.model, slot.task_id
+    ));
+    Ok(WorkerFallbackActivation::Activated)
 }
 
 /// Gather task context from the DB and persist a structured lifecycle diagnostic.
@@ -24811,6 +25950,73 @@ mod tests {
             pending_prompt: "test prompt".into(),
             pending_turn_kind: "initial".into(),
         }
+    }
+
+    #[test]
+    fn reviewer_fallback_retains_exact_pending_turn_identity() {
+        let mut slot = make_dummy_slot();
+        slot.model = "claude-sonnet-4-6".into();
+        slot.effort = "medium".into();
+        slot.pending_prompt = "exact daemon-authored R2 prompt\nwith task contract".into();
+        slot.pending_turn_kind = "r2-review".into();
+        slot.continuation_id = Some("failed-provider-session".into());
+
+        let pending = reviewer_fallback_pending_turn(&slot);
+
+        assert_eq!(pending.provider, "claude");
+        assert_eq!(pending.model, "claude-sonnet-4-6");
+        assert_eq!(pending.effort, "medium");
+        assert_eq!(
+            pending.prompt,
+            "exact daemon-authored R2 prompt\nwith task contract"
+        );
+        assert_eq!(pending.turn_kind, "r2-review");
+        assert_eq!(
+            pending.continuation_id.as_deref(),
+            Some("failed-provider-session")
+        );
+        assert!(!pending.requested);
+    }
+
+    #[test]
+    fn worker_fallback_retains_exact_rework_turn_but_not_cross_provider_continuation() {
+        let mut slot = make_dummy_slot();
+        slot.model = "claude-sonnet-4-6".into();
+        slot.effort = "medium".into();
+        slot.pending_prompt = "exact blocking feedback\nplus immutable task context".into();
+        slot.pending_turn_kind = "rework".into();
+        slot.continuation_id = Some("failed-claude-session".into());
+
+        let pending = worker_fallback_pending_turn(&slot);
+        assert_eq!(pending.provider, "claude");
+        assert_eq!(pending.model, "claude-sonnet-4-6");
+        assert_eq!(pending.effort, "medium");
+        assert_eq!(
+            pending.prompt,
+            "exact blocking feedback\nplus immutable task context"
+        );
+        assert_eq!(pending.turn_kind, "rework");
+        assert_eq!(
+            pending.continuation_id.as_deref(),
+            Some("failed-claude-session")
+        );
+
+        let alternate = quorum_core::fallback_launch::PendingManagedTurn::for_fallback_profile(
+            &pending,
+            &quorum_core::role_assignments::ModelProfile {
+                id: "terra".into(),
+                provider: "codex".into(),
+                runner: "codex".into(),
+                model: "gpt-5.6-terra".into(),
+                effort: "high".into(),
+            },
+        );
+        assert_eq!(alternate.prompt, pending.prompt);
+        assert_eq!(alternate.turn_kind, "rework");
+        assert_eq!(alternate.provider, "codex");
+        assert_eq!(alternate.model, "gpt-5.6-terra");
+        // PendingManagedTurn intentionally has no continuation field: the
+        // fallback launch must start a fresh provider session.
     }
 
     #[tokio::test]

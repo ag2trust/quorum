@@ -2657,8 +2657,21 @@ Exclusions are derived rather than separately granted: `ProviderUnavailable` exc
 profile on that provider for the responsibility, while `ProfileUnavailable` excludes only that
 profile. `RetryableSameRoute`, `NonFailover`, `Unclassified`, and an attempt with no classified
 runner failure grant no alternate-route authority. Recording does not advance allocation,
-`rework_round`, task recovery attempts, or lifecycle state. Alternate selection and launch are
-not yet activated.
+`rework_round`, task recovery attempts, or lifecycle state. For managed workers and R1/R2
+reviewers, a pre-authoritative `ProviderUnavailable` or `ProfileUnavailable` failure installs and
+launches the deterministic eligible alternate before the ordinary failure transition. The logical
+agent, role assignment, task lease, worktree, exact pending prompt, and reviewer PR/head remain
+fixed; the alternate uses a newly attributed run and capability and never receives the failed
+provider's continuation. Installation revalidates lifecycle revision and lease under its write lock
+and yields to a pending submission or verdict. Repeated failures either select the next eligible
+route or converge on one provider-blocked outcome without spending rework or recovery budget.
+Claude and Codex alternates support both initial and rework turns. A managed Grok worker may
+fall back to either provider, but Grok is selectable as the alternate only for a fresh initial
+worker turn; a rework turn cannot enter Grok without its provider-issued initial-session handoff.
+
+The persisted launch intent protects the install-before-provider-call boundary. Startup replay of
+an intent committed before its process journal is written is not yet active; an interrupted launch
+therefore follows the existing fail-safe recovery path rather than being silently reconstructed.
 
 ### Verification gates
 
