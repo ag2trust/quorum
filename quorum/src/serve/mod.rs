@@ -6846,16 +6846,6 @@ async fn tick_decomposition(
                     )
                     .await?;
                 }
-                planner::PlannerPoll::SemanticRejected(summary) => {
-                    record_decomposition_attempt(
-                        config,
-                        graph_id,
-                        "proposal",
-                        "semantic-rejection",
-                        &summary,
-                    )
-                    .await?;
-                }
                 planner::PlannerPoll::Done(planner::PlannerResponse::Blocker {
                     category,
                     evidence,
