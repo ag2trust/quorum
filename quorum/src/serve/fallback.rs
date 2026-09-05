@@ -44,6 +44,11 @@ pub struct FallbackInstallInput<'a> {
     pub failed_run: FailedManagedRun<'a>,
     pub alternate_agent: &'a str,
     pub alternate_capability_run_id: &'a str,
+    /// Fresh provider-session identity written to the process journal in the
+    /// same transaction as the alternate run/capability/intent. Recovery can
+    /// therefore distinguish a committed fallback from the failed process it
+    /// replaces before any provider call occurs.
+    pub fallback_session_id: &'a str,
     pub reviewer_launch: Option<ReviewerLaunchEvidence<'a>>,
     pub worktree: &'a str,
     pub recorded_at: i64,
@@ -187,6 +192,7 @@ pub fn install(
                     created_at: input.issued_at,
                 },
             )?;
+            persist_pending_journal_tx(&tx, input, &profile)?;
             if !live_responsibility_has_no_outcome(&tx, input, input.alternate_agent)? {
                 return Ok(FallbackInstallOutcome::FailClosed);
             }
@@ -208,6 +214,38 @@ pub fn install(
         .ok_or_else(|| QuorumError::Io("committed fallback launch intent is missing".into())),
         outcome => Ok(outcome),
     }
+}
+
+fn persist_pending_journal_tx(
+    tx: &Transaction<'_>,
+    input: &FallbackInstallInput<'_>,
+    profile: &ModelProfile,
+) -> Result<()> {
+    if input.fallback_session_id.is_empty() || input.fallback_session_id.contains('\0') {
+        return Err(QuorumError::Usage(
+            "fallback session identity is invalid".into(),
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE journal
+         SET session_id=?1, phase='fallback-pending', pid=NULL, provider=?2,
+             continuation_id=NULL, updated_at=?3
+         WHERE agent=?4 AND task_id=?5 AND role=?6",
+        params![
+            input.fallback_session_id,
+            profile.provider,
+            input.recorded_at,
+            input.failed_run.agent,
+            input.assignment.task_id,
+            input.assignment.role,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(QuorumError::Io(
+            "fallback launch journal identity is missing or conflicts".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Re-prove the caller's lifecycle and lease observation under the same write
@@ -490,6 +528,15 @@ mod tests {
             [task_id, failed_run_id],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO journal(
+                 agent,role,task_id,session_id,worktree,branch,phase,cost_tokens,
+                 cost_usd,rework_count,provider,updated_at)
+             VALUES ('failed-agent','worker',?1,'failed-session',
+                     '/tmp/fallback-install-worktree','daemon/test','working',0,0,0,'codex',2)",
+            [task_id],
+        )
+        .unwrap();
         Fixture {
             dir,
             conn,
@@ -561,6 +608,7 @@ mod tests {
             },
             alternate_agent: "failed-agent",
             alternate_capability_run_id: "alternate-capability",
+            fallback_session_id: "fallback-session",
             reviewer_launch: None,
             worktree: "/tmp/fallback-install-worktree",
             recorded_at: 9,
@@ -844,6 +892,13 @@ mod tests {
         fixture
             .conn
             .execute(
+                "UPDATE journal SET role='reviewer',pr=7 WHERE agent='failed-agent'",
+                [],
+            )
+            .unwrap();
+        fixture
+            .conn
+            .execute(
                 "UPDATE run_capabilities SET role='reviewer' WHERE run_id='failed-capability'",
                 [],
             )
@@ -1005,6 +1060,7 @@ mod tests {
                             },
                             alternate_agent: "failed-agent",
                             alternate_capability_run_id: "alternate-capability",
+                            fallback_session_id: "fallback-session",
                             reviewer_launch: None,
                             worktree: "/tmp/fallback-install-worktree",
                             recorded_at: 9,

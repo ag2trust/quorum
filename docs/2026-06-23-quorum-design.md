@@ -2670,8 +2670,12 @@ fall back to either provider, but Grok is selectable as the alternate only for a
 worker turn; a rework turn cannot enter Grok without its provider-issued initial-session handoff.
 
 The persisted launch intent protects the install-before-provider-call boundary. Startup replay of
-an intent committed before its process journal is written is not yet active; an interrupted launch
-therefore follows the existing fail-safe recovery path rather than being silently reconstructed.
+an intent uses an atomically committed `fallback-pending` process-journal marker. Generic recovery
+preserves that exact run, capability, lease, and worktree instead of revoking or resetting them;
+the startup fallback pass then revalidates lifecycle and reviewer head authority and launches the
+stored turn verbatim. A launch-time provider/profile failure is recorded like any later failure and
+may advance to another bounded eligible route. Reviewer attachment transfers the task lease to the
+reviewer, so fallback currency can never be borrowed from a prior worker or replacement reviewer.
 
 ### Verification gates
 

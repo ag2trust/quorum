@@ -3652,6 +3652,12 @@ impl LiveStats {
 /// needed to launch the next exact turn.
 enum SlotProcess {
     Running(Box<runner::RunnerProc>),
+    /// A classified provider launch failed before a live process could be
+    /// installed. This variant exists only while the same provisioning call
+    /// attempts an alternate route; it is never retained in a live slot.
+    Failed {
+        kind: runner::AgentKind,
+    },
     Dormant {
         kind: runner::AgentKind,
         continuation_id: String,
@@ -3685,6 +3691,7 @@ impl SlotProcess {
     fn kind(&self) -> runner::AgentKind {
         match self {
             Self::Running(proc) => proc.kind(),
+            Self::Failed { kind } => *kind,
             Self::Dormant { kind, .. } => *kind,
         }
     }
@@ -3692,6 +3699,7 @@ impl SlotProcess {
     fn pid(&self) -> Option<i32> {
         match self {
             Self::Running(proc) => proc.pid(),
+            Self::Failed { .. } => None,
             Self::Dormant { .. } => None,
         }
     }
@@ -3699,6 +3707,7 @@ impl SlotProcess {
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         match self {
             Self::Running(proc) => proc.try_wait(),
+            Self::Failed { .. } => Ok(None),
             Self::Dormant { .. } => Ok(None),
         }
     }
@@ -3706,6 +3715,10 @@ impl SlotProcess {
     fn running_mut(&mut self) -> std::io::Result<&mut runner::RunnerProc> {
         match self {
             Self::Running(proc) => Ok(proc),
+            Self::Failed { kind } => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("failed {kind} launch has no live process"),
+            )),
             Self::Dormant {
                 kind,
                 continuation_id,
@@ -3721,6 +3734,7 @@ impl SlotProcess {
     fn worker_request(&self) -> Option<&runner::WorkerTurnRequest> {
         match self {
             Self::Running(proc) => proc.worker_request(),
+            Self::Failed { .. } => None,
             Self::Dormant { .. } => None,
         }
     }
@@ -3728,6 +3742,7 @@ impl SlotProcess {
     fn continuation_id(&self) -> Option<&str> {
         match self {
             Self::Running(_) => None,
+            Self::Failed { .. } => None,
             Self::Dormant {
                 continuation_id, ..
             } => Some(continuation_id),
@@ -3751,6 +3766,7 @@ impl SlotProcess {
         let old = std::mem::replace(self, Self::Running(Box::new(proc)));
         Ok(match old {
             Self::Running(old) => Some(*old),
+            Self::Failed { .. } => None,
             Self::Dormant { .. } => None,
         })
     }
@@ -3758,6 +3774,7 @@ impl SlotProcess {
     async fn kill_and_reap(self) -> Vec<runner::CapturedOutput> {
         match self {
             Self::Running(proc) => proc.kill_and_reap().await,
+            Self::Failed { .. } => Vec::new(),
             Self::Dormant { .. } => Vec::new(),
         }
     }
@@ -3865,6 +3882,7 @@ impl SlotState {
     ) -> Option<runner::RunnerFailure> {
         match &self.proc {
             SlotProcess::Running(proc) => proc.classify_pre_authoritative_exit(status),
+            SlotProcess::Failed { .. } => None,
             SlotProcess::Dormant { .. } => None,
         }
     }
@@ -3872,6 +3890,7 @@ impl SlotState {
     fn observed_pre_authoritative_failure(&self) -> Option<runner::RunnerFailure> {
         match &self.proc {
             SlotProcess::Running(proc) => proc.observed_pre_authoritative_failure(),
+            SlotProcess::Failed { .. } => None,
             SlotProcess::Dormant { .. } => None,
         }
     }
@@ -3884,6 +3903,7 @@ impl SlotState {
         let runner_kind = self.process_kind();
         let output = match &mut self.proc {
             SlotProcess::Running(proc) => proc.finalize_pre_authoritative_evidence().await,
+            SlotProcess::Failed { .. } => Vec::new(),
             SlotProcess::Dormant { .. } => Vec::new(),
         };
         let diagnostic = record_captured_terminal_usage(
@@ -3915,7 +3935,10 @@ impl SlotState {
     /// Park a completed turn-oriented runner while retaining its sticky worker
     /// slot. The caller owns reaping the returned completed process.
     fn become_dormant(&mut self) -> std::io::Result<runner::RunnerProc> {
-        if matches!(&self.proc, SlotProcess::Dormant { .. }) {
+        if matches!(
+            &self.proc,
+            SlotProcess::Dormant { .. } | SlotProcess::Failed { .. }
+        ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "cannot park an already dormant slot",
@@ -3925,7 +3948,9 @@ impl SlotState {
         let old = std::mem::replace(&mut self.proc, dormant);
         match old {
             SlotProcess::Running(proc) => Ok(*proc),
-            SlotProcess::Dormant { .. } => unreachable!("dormant slots returned above"),
+            SlotProcess::Dormant { .. } | SlotProcess::Failed { .. } => {
+                unreachable!("non-running slots returned above")
+            }
         }
     }
 
@@ -9662,6 +9687,15 @@ async fn tick_loop(
         )
         .await?;
     }
+    resume_pending_fallbacks(
+        config,
+        &wt_mgr,
+        &mut name_pool,
+        &mut workers,
+        &mut reviewers,
+        &mut lifetime_roster,
+    )
+    .await?;
     match reconcile_publication_source_refs(config, &wt_mgr, publication_ref_reconcile_cursor).await
     {
         Ok(next_cursor) => {
@@ -16753,6 +16787,11 @@ async fn settle_dormant_worker_feed_failure(
         SlotProcess::Running(_) => {
             return Ok(DormantWorkerFeedFailureDisposition::LiveProcess);
         }
+        SlotProcess::Failed { .. } => {
+            return Err(QuorumError::Io(
+                "failed launch placeholder escaped fallback provisioning".into(),
+            ));
+        }
     };
     let pending = PendingTurn {
         provider,
@@ -18253,6 +18292,7 @@ fn record_captured_terminal_usage(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn close_attachment_failed_reviewer_run(
     db_path: &Path,
@@ -18967,7 +19007,7 @@ async fn provision_reviewer_reserved(
     // it again after spawning: a second-boundary split would make a valid log
     // unreachable from the task detail run link.
     let session_started_at = now_unix();
-    let mut reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
+    let reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
             &reviewer_name,
@@ -19236,6 +19276,149 @@ async fn provision_reviewer_reserved(
     };
     let prompt = format!("{prompt}\n\n{task_contract}");
 
+    // Persist and bind the initial route before contacting the provider. A
+    // classified launch failure is still immutable run evidence and must be
+    // eligible for the same fallback retirement as a later process exit.
+    let reviewer_provider = reviewer_kind.to_string();
+    let reviewer_run_result = {
+        let p = config.db_path.clone();
+        let name = reviewer_name.clone();
+        let m = reviewer_model.clone();
+        let e = reviewer_effort.clone();
+        let prov = reviewer_provider;
+        let tid = worker.task_id;
+        let is_r2 = role.is_r2();
+        let review_cap = cap_run_id.clone();
+        let review_head = head_sha.to_string();
+        let assignment_id = assignment.id;
+        let spawned_at = session_started_at;
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::decomposition_review::persist_reviewer_run_if_current(
+                &mut conn,
+                tid,
+                &name,
+                &m,
+                &e,
+                &prov,
+                Some(assignment_id),
+                spawned_at,
+                is_r2.then_some("r2"),
+                &review_cap,
+                pr,
+                &review_head,
+            )?
+            .ok_or_else(|| QuorumError::Io("invalid immutable reviewer launch authority".into()))
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))
+    };
+    let reviewer_run_id = match reviewer_run_result {
+        Ok(Ok(run_id)) => run_id,
+        Ok(Err(error)) | Err(error) => {
+            log(&format!(
+                "{}: reviewer run persistence failed before attachment: {error}",
+                role.as_str().to_uppercase()
+            ));
+            fail_post_worktree_provision(
+                config,
+                wt_mgr,
+                name_pool,
+                unrecordable,
+                FailedProvisionScope {
+                    reviewer_name: &reviewer_name,
+                    worktree: &wt_path,
+                    branch: &branch,
+                    capability_run_id: Some(&cap_run_id),
+                    agent_run_id: None,
+                    process: None,
+                },
+                worker.task_id,
+                pr,
+                role,
+                head_sha,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    let reviewer_claim_result = {
+        let path = config.db_path.clone();
+        let name = reviewer_name.clone();
+        let task_id = worker.task_id;
+        let token = reservation.to_string();
+        let reserved_role = role.as_str().to_string();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&path)?;
+            tasks::attach_reserved_reviewer(
+                &mut conn,
+                task_id,
+                &token,
+                &reserved_role,
+                &name,
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("reviewer claim join: {error}")))
+    };
+    match reviewer_claim_result {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            log(&format!(
+                "ReviewerAttached was rejected after provisioning for task #{} PR #{pr}",
+                worker.task_id
+            ));
+            fail_post_worktree_provision(
+                config,
+                wt_mgr,
+                name_pool,
+                unrecordable,
+                FailedProvisionScope {
+                    reviewer_name: &reviewer_name,
+                    worktree: &wt_path,
+                    branch: &branch,
+                    capability_run_id: Some(&cap_run_id),
+                    agent_run_id: Some(reviewer_run_id),
+                    process: None,
+                },
+                worker.task_id,
+                pr,
+                role,
+                head_sha,
+            )
+            .await?;
+            return Ok(ReviewerProvisionOutcome::Unavailable);
+        }
+        Ok(Err(error)) | Err(error) => {
+            log(&format!(
+                "ReviewerAttached was rejected after provisioning for task #{} PR #{pr}: {error}",
+                worker.task_id
+            ));
+            fail_post_worktree_provision(
+                config,
+                wt_mgr,
+                name_pool,
+                unrecordable,
+                FailedProvisionScope {
+                    reviewer_name: &reviewer_name,
+                    worktree: &wt_path,
+                    branch: &branch,
+                    capability_run_id: Some(&cap_run_id),
+                    agent_run_id: Some(reviewer_run_id),
+                    process: None,
+                },
+                worker.task_id,
+                pr,
+                role,
+                head_sha,
+            )
+            .await?;
+            return Err(error);
+        }
+    }
+
     let reviewer_env = managed_run_environment(config, &reviewer_name, Some(cap_run_id.as_str()));
     let reviewer_agent_bin = agent_bin_for_kind(config, reviewer_kind);
     let continuation_id = runner_continuation_id(
@@ -19292,6 +19475,13 @@ async fn provision_reviewer_reserved(
                 match pid_journal {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) | Err(error) => {
+                        let _ = fail_reviewer_if_owner(
+                            &config.db_path,
+                            &reviewer_name,
+                            worker.task_id,
+                            "reviewer process journal failed after claim",
+                        )
+                        .await;
                         fail_post_worktree_provision(
                             config,
                             wt_mgr,
@@ -19302,7 +19492,7 @@ async fn provision_reviewer_reserved(
                                 worktree: &wt_path,
                                 branch: &branch,
                                 capability_run_id: Some(&cap_run_id),
-                                agent_run_id: None,
+                                agent_run_id: Some(reviewer_run_id),
                                 process: Some(proc),
                             },
                             worker.task_id,
@@ -19316,139 +19506,7 @@ async fn provision_reviewer_reserved(
                 }
             }
 
-            // Persist the run before attaching the reviewer. The run history is
-            // the durable identity-exclusion source, so attachment must never
-            // become visible without it. A crash after this insert is safe:
-            // recovery excludes the name even if ReviewerAttached never fired.
-            // Persist the exact provider that was authoritatively resolved and
-            // used to spawn the process; never silently fall back here.
-            let reviewer_provider = reviewer_kind.to_string();
-            let reviewer_run_result = {
-                let p = config.db_path.clone();
-                let name = reviewer_name.clone();
-                let m = reviewer_model.clone();
-                let e = reviewer_effort.clone();
-                let prov = reviewer_provider;
-                let tid = worker.task_id;
-                let is_r2 = role.is_r2();
-                let review_cap = cap_run_id.clone();
-                let review_head = head_sha.to_string();
-                let assignment_id = assignment.id;
-                let spawned_at = session_started_at;
-                tokio::task::spawn_blocking(move || -> Result<i64> {
-                    let mut conn = quorum_core::db::open(&p)?;
-                    quorum_core::decomposition_review::persist_reviewer_run_if_current(
-                        &mut conn,
-                        tid,
-                        &name,
-                        &m,
-                        &e,
-                        &prov,
-                        Some(assignment_id),
-                        spawned_at,
-                        is_r2.then_some("r2"),
-                        &review_cap,
-                        pr,
-                        &review_head,
-                    )?
-                    .ok_or_else(|| {
-                        QuorumError::Io("invalid immutable reviewer launch authority".into())
-                    })
-                })
-                .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))
-            };
-            let reviewer_run_id = match reviewer_run_result {
-                Ok(Ok(run_id)) => run_id,
-                Ok(Err(e)) | Err(e) => {
-                    log(&format!(
-                        "{}: reviewer run persistence failed before attachment: {e}",
-                        role.as_str().to_uppercase()
-                    ));
-                    fail_post_worktree_provision(
-                        config,
-                        wt_mgr,
-                        name_pool,
-                        unrecordable,
-                        FailedProvisionScope {
-                            reviewer_name: &reviewer_name,
-                            worktree: &wt_path,
-                            branch: &branch,
-                            capability_run_id: Some(&cap_run_id),
-                            agent_run_id: None,
-                            process: Some(proc),
-                        },
-                        worker.task_id,
-                        pr,
-                        role,
-                        head_sha,
-                    )
-                    .await?;
-                    return Err(e);
-                }
-            };
-
-            if let Err(e) = fire_event_result(
-                &config.db_path,
-                &reviewer_name,
-                worker.task_id,
-                &Event::ReviewerAttached {
-                    agent: reviewer_name.clone(),
-                },
-            )
-            .await
-            {
-                log(&format!(
-                    "{}: ReviewerAttached was rejected after provisioning: {e}",
-                    role.as_str().to_uppercase()
-                ));
-                // The terminal output belongs to the run-close record below, so
-                // this arm reaps the process itself and hands the funnel none.
-                let terminal_output = proc.kill_and_reap().await;
-                // Strikes are cleared only after a successful attach, so this
-                // failure still has its own budget to burn.
-                let strike = fail_post_worktree_provision(
-                    config,
-                    wt_mgr,
-                    name_pool,
-                    unrecordable,
-                    FailedProvisionScope {
-                        reviewer_name: &reviewer_name,
-                        worktree: &wt_path,
-                        branch: &branch,
-                        capability_run_id: Some(&cap_run_id),
-                        agent_run_id: None,
-                        process: None,
-                    },
-                    worker.task_id,
-                    pr,
-                    role,
-                    head_sha,
-                )
-                .await;
-                close_attachment_failed_reviewer_run(
-                    &config.db_path,
-                    reviewer_run_id,
-                    &reviewer_name,
-                    worker.task_id,
-                    pr,
-                    reviewer_kind,
-                    &reviewer_model,
-                    &reviewer_effort,
-                    &config.limits,
-                    &terminal_output,
-                )
-                .await;
-                persist_terminal_output(&mut reviewer_session_log, terminal_output);
-                strike?;
-                return Err(QuorumError::Io(format!(
-                    "reviewer attachment failed after provisioning: {e}"
-                )));
-            }
-
-            // Only a completed attachment clears the budget. Clearing before the
-            // lifecycle transition let a persistently rejected `ReviewerAttached`
-            // wipe every earlier strike and re-provision forever.
+            // Only a completed claim and launch clear the provisioning budget.
             let p = config.db_path.clone();
             let tid = worker.task_id;
             let role_str = role.as_str().to_string();
@@ -19561,6 +19619,93 @@ async fn provision_reviewer_reserved(
                 role.as_str().to_uppercase()
             );
             log(&reason);
+            let now_instant = std::time::Instant::now();
+            let mut failed_slot = SlotState {
+                agent_name: reviewer_name.clone(),
+                proc: SlotProcess::Failed {
+                    kind: reviewer_kind,
+                },
+                task_id: worker.task_id,
+                session_id,
+                model: reviewer_model,
+                effort: reviewer_effort,
+                worktree_path: wt_path,
+                remote_branch: branch.clone(),
+                branch,
+                draining: true,
+                pending_watchdog_breach: None,
+                pr: Some(pr),
+                rework_count: 0,
+                cost_tokens: 0,
+                limit_tokens: 0,
+                token_usage: runner::TokenUsage::default(),
+                last_terminal_usage: runner::TokenUsage::default(),
+                last_terminal_cost_usd: None,
+                cost_usd: 0.0,
+                task_started_at: now_instant,
+                turn_started_at: now_instant,
+                last_event_at: now_instant,
+                turn_ended_at: None,
+                agent_state: None,
+                session_log: reviewer_session_log,
+                live_stats: LiveStats::new(),
+                error_turn_count: 0,
+                last_error_text: Some(e.detail().to_string()),
+                agent_run_id: Some(reviewer_run_id),
+                cap_run_id: Some(cap_run_id.clone()),
+                r2_origin: role.is_r2(),
+                reviewed_head_sha: review_launch_head_sha(role, head_sha),
+                continuation_id: reviewer_continuation_id,
+                pending_prompt: prompt,
+                pending_turn_kind: if role.is_r2() {
+                    "r2-review".into()
+                } else {
+                    "review".into()
+                },
+            };
+            if matches!(
+                e.disposition(),
+                runner::FailureDisposition::ProviderUnavailable
+                    | runner::FailureDisposition::ProfileUnavailable
+            ) {
+                let observed_at = now_unix();
+                let currency = quorum_core::db::open(&config.db_path).and_then(|conn| {
+                    load_reviewer_fallback_currency(&conn, &failed_slot, observed_at)
+                })?;
+                match activate_reviewer_fallback(config, &mut failed_slot, &e, &currency).await? {
+                    ReviewerFallbackActivation::Activated => {
+                        reviewers.push(failed_slot);
+                        let p = config.db_path.clone();
+                        let tid = worker.task_id;
+                        let role_str = role.as_str().to_string();
+                        tokio::task::spawn_blocking(move || {
+                            if let Ok(mut conn) = quorum_core::db::open(&p) {
+                                let _ = quorum_core::provision_attempts::clear(
+                                    &mut conn, tid, pr, &role_str,
+                                );
+                            }
+                        })
+                        .await
+                        .ok();
+                        return Ok(ReviewerProvisionOutcome::Attached);
+                    }
+                    ReviewerFallbackActivation::Settled => {
+                        teardown_reviewer(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            failed_slot,
+                            "provider_blocked",
+                        )
+                        .await;
+                        return Ok(ReviewerProvisionOutcome::Failed(reason));
+                    }
+                    ReviewerFallbackActivation::NotInstalled => {}
+                }
+            }
+            let _ =
+                fail_reviewer_if_owner(&config.db_path, &reviewer_name, worker.task_id, &reason)
+                    .await;
             // The worktree, branch, journal row and capability were all created
             // before the provider CLI was even reached, and callers treat
             // `Failed` as "phase 5 retries next tick" with no strike of their
@@ -19573,10 +19718,10 @@ async fn provision_reviewer_reserved(
                 unrecordable,
                 FailedProvisionScope {
                     reviewer_name: &reviewer_name,
-                    worktree: &wt_path,
-                    branch: &branch,
+                    worktree: &failed_slot.worktree_path,
+                    branch: &failed_slot.branch,
                     capability_run_id: Some(&cap_run_id),
-                    agent_run_id: None,
+                    agent_run_id: Some(reviewer_run_id),
                     process: None,
                 },
                 worker.task_id,
@@ -20271,30 +20416,9 @@ async fn spawn_worker(
         }
     }
 
-    // #130: issue run capability for this worker (before spawn so env var is available).
-    // A silent issue failure would leave the worker holding a QUORUM_RUN_ID pointing at
-    // no row — every capability-validated submit would then exit 2 and only the compat
-    // (agent-name) path could save it. Log loudly so the operator sees the degrade.
+    // The capability is issued atomically with the initial run below, before
+    // spawn, so every classified launch failure has exact fallback authority.
     let cap_run_id = uuid::Uuid::new_v4().to_string();
-    {
-        let p = db_path.clone();
-        let rid = cap_run_id.clone();
-        let name = agent_name.clone();
-        let tid = task.id;
-        let issued_at = session_started_at;
-        let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = quorum_core::db::open(&p)?;
-            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", issued_at)
-        })
-        .await
-        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
-        if let Err(e) = issue_res {
-            log(&format!(
-                "worker capability issue failed for task {} agent {agent_name}: {e} — worker will fall back to compat auth",
-                task.id
-            ));
-        }
-    }
 
     let worker_env_vars = managed_run_environment(config, &agent_name, Some(cap_run_id.as_str()));
 
@@ -20373,6 +20497,36 @@ async fn spawn_worker(
         continuation_id,
     };
     let responsibility_key = worker_responsibility_key(task.id, task.revision);
+    let worker_run_id = {
+        let p = db_path.clone();
+        let name = agent_name.clone();
+        let m = resolved_model.clone();
+        let e = resolved_effort.clone();
+        let provider = resolved_kind.to_string();
+        let responsibility = responsibility_key.clone();
+        let tid = task.id;
+        let assignment_id = assignment.id;
+        let spawned_at = session_started_at;
+        let capability = cap_run_id.clone();
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::agent_runs::insert_worker_with_assignment_and_capability(
+                &mut conn,
+                tid,
+                &name,
+                &responsibility,
+                &m,
+                &e,
+                &provider,
+                &provider,
+                Some(assignment_id),
+                &capability,
+                spawned_at,
+            )
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("worker run persistence join: {error}")))??
+    };
     let spawn_result = if resolved_kind == runner::AgentKind::Grok && continuation_id.is_none() {
         // Grok publishes its provider session only in terminal `end`; retain
         // the exact worker identity so that handoff is durable before success.
@@ -20443,36 +20597,6 @@ async fn spawn_worker(
                 .ok();
             }
 
-            let provider_str = resolved_kind.to_string();
-            let worker_run_id = {
-                let p = db_path.clone();
-                let name = agent_name.clone();
-                let m = resolved_model.clone();
-                let e = resolved_effort.clone();
-                let prov = provider_str.clone();
-                let tid = task.id;
-                let assignment_id = assignment.id;
-                let spawned_at = session_started_at;
-                tokio::task::spawn_blocking(move || -> Result<i64> {
-                    let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert_worker_with_assignment(
-                        &conn,
-                        tid,
-                        &name,
-                        &responsibility_key,
-                        &m,
-                        &e,
-                        &prov,
-                        &prov,
-                        Some(assignment_id),
-                        spawned_at,
-                    )
-                })
-                .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                .ok()
-            };
-
             let now_instant = std::time::Instant::now();
             workers.push(SlotState {
                 agent_name,
@@ -20509,7 +20633,7 @@ async fn spawn_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 last_error_text: None,
-                agent_run_id: worker_run_id,
+                agent_run_id: Some(worker_run_id),
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
@@ -20525,15 +20649,91 @@ async fn spawn_worker(
         }
         Err(e) => {
             log(&format!("agent spawn failed: {e}"));
+            let now_instant = std::time::Instant::now();
+            let mut failed_slot = SlotState {
+                agent_name: agent_name.clone(),
+                proc: SlotProcess::Failed {
+                    kind: resolved_kind,
+                },
+                task_id: task.id,
+                session_id,
+                model: resolved_model,
+                effort: resolved_effort,
+                worktree_path: wt_path,
+                remote_branch: remote_branch.clone(),
+                branch,
+                draining: true,
+                pending_watchdog_breach: None,
+                pr: continuation_pr,
+                rework_count: retry_slot_rework_count(
+                    task.rework_round,
+                    retry_turn.as_ref(),
+                    daemon_rework_retry_requested(task.refs.as_deref()),
+                ),
+                cost_tokens: 0,
+                limit_tokens: 0,
+                token_usage: runner::TokenUsage::default(),
+                last_terminal_usage: runner::TokenUsage::default(),
+                last_terminal_cost_usd: None,
+                cost_usd: 0.0,
+                task_started_at: now_instant,
+                turn_started_at: now_instant,
+                last_event_at: now_instant,
+                turn_ended_at: None,
+                agent_state: None,
+                session_log: worker_session_log,
+                live_stats: LiveStats::new(),
+                error_turn_count: 0,
+                last_error_text: Some(e.detail().to_string()),
+                agent_run_id: Some(worker_run_id),
+                cap_run_id: Some(cap_run_id),
+                r2_origin: false,
+                reviewed_head_sha: None,
+                continuation_id: retry_turn
+                    .as_ref()
+                    .and_then(|retry| retry.continuation_id.clone()),
+                pending_prompt: prompt_text,
+                pending_turn_kind: retry_turn
+                    .as_ref()
+                    .map(|retry| retry.turn_kind.clone())
+                    .unwrap_or_else(|| "initial".into()),
+            };
+            if matches!(
+                e.disposition(),
+                runner::FailureDisposition::ProviderUnavailable
+                    | runner::FailureDisposition::ProfileUnavailable
+            ) {
+                let observed_at = now_unix();
+                let currency = quorum_core::db::open(&config.db_path).and_then(|conn| {
+                    load_worker_fallback_currency(&conn, &failed_slot, observed_at)
+                })?;
+                match activate_worker_fallback(config, &mut failed_slot, &e, &currency).await? {
+                    WorkerFallbackActivation::Activated => {
+                        workers.push(failed_slot);
+                        return Ok(true);
+                    }
+                    WorkerFallbackActivation::Settled => {
+                        cleanup_slot(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            failed_slot,
+                            None,
+                            "provider_blocked",
+                        )
+                        .await;
+                        return Ok(false);
+                    }
+                    WorkerFallbackActivation::NotInstalled => {}
+                }
+            }
             let strikes = poison_tracker.record_strike(task.id);
             if strikes >= MAX_POISON_STRIKES {
                 poison_task(&db_path, &agent_name, task.id, strikes, None).await;
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
-            wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
-            wt_mgr.delete_branch(worker_repo_dir, &branch).await;
-            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
+            cleanup_slot(config, wt_mgr, name_pool, failed_slot, None, "failed").await;
             return Ok(false);
         }
     }
@@ -20906,8 +21106,8 @@ fn load_reviewer_fallback_currency(
     let lease = conn
         .query_row(
             "SELECT id,target,holder,expires_at FROM claims
-             WHERE target=?1 AND active=1 AND expires_at>?2",
-            rusqlite::params![target, observed_at],
+             WHERE target=?1 AND holder=?2 AND active=1 AND expires_at>?3",
+            rusqlite::params![target, slot.agent_name, observed_at],
             |row| {
                 Ok(fallback_preflight::LeaseCurrency {
                     claim_id: row.get(0)?,
@@ -21007,6 +21207,7 @@ async fn activate_reviewer_fallback(
     let worktree = slot.worktree_path.to_string_lossy().into_owned();
     let disposition = failure.disposition();
     let alternate_capability_run_id = uuid::Uuid::new_v4().to_string();
+    let session_id = agent::new_session_id();
     let mut conn = quorum_core::db::open(&config.db_path)?;
     let (
         assignment_id,
@@ -21105,6 +21306,7 @@ async fn activate_reviewer_fallback(
             },
             alternate_agent: &same_agent,
             alternate_capability_run_id: &alternate_capability_run_id,
+            fallback_session_id: &session_id,
             reviewer_launch: Some(quorum_core::capabilities::ReviewerLaunchEvidence {
                 pr,
                 head_sha: &reviewed_head,
@@ -21171,7 +21373,6 @@ async fn activate_reviewer_fallback(
                 return Ok(ReviewerFallbackActivation::Settled);
             }
         };
-    let session_id = agent::new_session_id();
     let environment = managed_run_environment(
         config,
         &slot.agent_name,
@@ -21187,7 +21388,7 @@ async fn activate_reviewer_fallback(
             mode: runner::LaunchMode::Normal,
             // Cross-provider continuations are forbidden. The alternate gets
             // the exact pending turn in a new provider session.
-            continuation_id: None,
+            continuation_id: runner_continuation_id(alternate_kind, &session_id, None),
         },
         &runner_adapter_config(config, agent_bin_for_kind(config, alternate_kind)),
     )
@@ -21199,6 +21400,32 @@ async fn activate_reviewer_fallback(
                 "reviewer {} fallback process launch failed after durable installation: {error}",
                 slot.agent_name
             ));
+            if matches!(
+                error.disposition(),
+                runner::FailureDisposition::ProviderUnavailable
+                    | runner::FailureDisposition::ProfileUnavailable
+            ) {
+                let old = std::mem::replace(
+                    &mut slot.proc,
+                    SlotProcess::Failed {
+                        kind: alternate_kind,
+                    },
+                );
+                let old_output = old.kill_and_reap().await;
+                persist_terminal_output(&mut slot.session_log, old_output);
+                slot.model = intent.pending_turn.model;
+                slot.effort = intent.pending_turn.effort;
+                slot.agent_run_id = Some(intent.agent_run_id);
+                slot.cap_run_id = Some(intent.capability_run_id);
+                slot.continuation_id = None;
+                return Box::pin(activate_reviewer_fallback(
+                    config,
+                    slot,
+                    &error,
+                    expected_currency,
+                ))
+                .await;
+            }
             let _ = dispose_managed_process_exit(
                 &config.db_path,
                 tasks::ManagedRunRole::Reviewer,
@@ -21477,6 +21704,7 @@ async fn activate_worker_fallback(
     let same_agent = slot.agent_name.clone();
     let worktree = slot.worktree_path.to_string_lossy().into_owned();
     let alternate_capability_run_id = uuid::Uuid::new_v4().to_string();
+    let session_id = agent::new_session_id();
     let mut conn = quorum_core::db::open(&config.db_path)?;
     let (assignment_id, profile_id, provider, model, effort): ConfiguredRunRoute = conn.query_row(
         "SELECT role_assignment_id,configured_profile_id,configured_provider,
@@ -21563,6 +21791,7 @@ async fn activate_worker_fallback(
             },
             alternate_agent: &same_agent,
             alternate_capability_run_id: &alternate_capability_run_id,
+            fallback_session_id: &session_id,
             reviewer_launch: None,
             worktree: &worktree,
             recorded_at: installed_at,
@@ -21672,7 +21901,6 @@ async fn activate_worker_fallback(
         .await;
         return Ok(WorkerFallbackActivation::Settled);
     }
-    let session_id = agent::new_session_id();
     let environment = managed_run_environment(
         config,
         &slot.agent_name,
@@ -21686,7 +21914,7 @@ async fn activate_worker_fallback(
         environment: &environment,
         mode: runner::LaunchMode::Normal,
         // Cross-provider continuation is never valid.
-        continuation_id: None,
+        continuation_id: runner_continuation_id(alternate_kind, &session_id, None),
     };
     let launched = if alternate_kind == runner::AgentKind::Grok {
         runner::RunnerProc::launch_internal_worker(
@@ -21720,6 +21948,32 @@ async fn activate_worker_fallback(
     let proc = match launched {
         Ok(proc) => proc,
         Err(error) => {
+            if matches!(
+                error.disposition(),
+                runner::FailureDisposition::ProviderUnavailable
+                    | runner::FailureDisposition::ProfileUnavailable
+            ) {
+                let old = std::mem::replace(
+                    &mut slot.proc,
+                    SlotProcess::Failed {
+                        kind: alternate_kind,
+                    },
+                );
+                let old_output = old.kill_and_reap().await;
+                persist_terminal_output(&mut slot.session_log, old_output);
+                slot.model = intent.pending_turn.model;
+                slot.effort = intent.pending_turn.effort;
+                slot.agent_run_id = Some(intent.agent_run_id);
+                slot.cap_run_id = Some(intent.capability_run_id);
+                slot.continuation_id = None;
+                return Box::pin(activate_worker_fallback(
+                    config,
+                    slot,
+                    &error,
+                    expected_currency,
+                ))
+                .await;
+            }
             let alternate_pending = PendingTurn {
                 provider: intent.pending_turn.provider.clone(),
                 model: intent.pending_turn.model.clone(),
@@ -21866,6 +22120,297 @@ async fn activate_worker_fallback(
         slot.agent_name, alternate_kind, slot.model, slot.task_id
     ));
     Ok(WorkerFallbackActivation::Activated)
+}
+
+/// Replay fallback authority that was committed together with a
+/// `fallback-pending` journal marker before the prior daemon could finish its
+/// provider launch. Generic recovery preserves these rows and worktrees; this
+/// pass either installs a live slot, advances through another unavailable
+/// route, or settles the responsibility fail-safe.
+async fn resume_pending_fallbacks(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    reviewers: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+) -> Result<()> {
+    let recoveries = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        recovery::pending_fallback_recoveries(&conn)?
+    };
+    for recovery in recoveries {
+        let intent = recovery.intent;
+        let entry = recovery.entry;
+        let agent_name = recovery.agent;
+        let kind = resolve_managed_provider(&intent.pending_turn.model, "fallback recovery")?;
+        if kind.to_string() != intent.pending_turn.provider {
+            return Err(QuorumError::Io(format!(
+                "fallback recovery provider '{}' does not match model '{}'",
+                intent.pending_turn.provider, intent.pending_turn.model
+            )));
+        }
+        if kind == runner::AgentKind::Grok && intent.pending_turn.turn_kind != "initial" {
+            return Err(QuorumError::Io(
+                "fallback recovery cannot launch Grok for a non-initial worker turn".into(),
+            ));
+        }
+        let (assignment_id, sub_role): (i64, Option<String>) = {
+            let conn = quorum_core::db::open(&config.db_path)?;
+            conn.query_row(
+                "SELECT role_assignment_id,sub_role FROM agent_runs
+                 WHERE id=?1 AND task_id=?2 AND agent_name=?3 AND role=?4
+                   AND ended_at IS NULL",
+                rusqlite::params![intent.agent_run_id, intent.task_id, agent_name, intent.role],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        };
+        {
+            let mut conn = quorum_core::db::open(&config.db_path)?;
+            if !tasks::renew_fallback_recovery_lease(
+                &mut conn,
+                &agent_name,
+                intent.task_id,
+                &intent.role,
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )? {
+                return Err(QuorumError::Io(format!(
+                    "fallback recovery lost lifecycle or lease authority for task #{}",
+                    intent.task_id
+                )));
+            }
+        }
+        if let Some(head) = &intent.pr_head {
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            let pr_number = head.number;
+            let current = tokio::task::spawn_blocking(move || executor.head_sha(pr_number, &repo))
+                .await
+                .map_err(|error| {
+                    QuorumError::Io(format!("fallback recovery head join: {error}"))
+                })?;
+            if current.as_deref() != Some(head.head_sha.as_str()) {
+                return Err(QuorumError::Io(format!(
+                    "fallback recovery PR #{} head is no longer {}",
+                    head.number, head.head_sha
+                )));
+            }
+        }
+        let worktree = PathBuf::from(&intent.worktree);
+        let local_branch = entry
+            .local_branch
+            .clone()
+            .or_else(|| entry.branch.clone())
+            .ok_or_else(|| QuorumError::Io("fallback recovery is missing local branch".into()))?;
+        wt_mgr
+            .verify_exact_registration(&config.repo_dir, &worktree, &local_branch)
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!("fallback recovery worktree mismatch: {error}"))
+            })?;
+        let remote_branch = entry.branch.clone().unwrap_or_else(|| local_branch.clone());
+        let session_log = config.log_dir.as_ref().and_then(|log_dir| {
+            session_log::SessionLog::create(
+                log_dir,
+                &agent_name,
+                &intent.role,
+                Some(intent.task_id),
+                &entry.session_id,
+                &remote_branch,
+                now_unix(),
+            )
+            .ok()
+        });
+        let now_instant = std::time::Instant::now();
+        let mut slot = SlotState {
+            agent_name: agent_name.clone(),
+            proc: SlotProcess::Failed { kind },
+            task_id: intent.task_id,
+            session_id: entry.session_id.clone(),
+            model: intent.pending_turn.model.clone(),
+            effort: intent.pending_turn.effort.clone(),
+            worktree_path: worktree,
+            branch: local_branch,
+            remote_branch,
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: intent.pr_head.as_ref().map(|head| head.number).or(entry.pr),
+            rework_count: entry.rework_count.max(0) as u32,
+            cost_tokens: entry.cost_tokens,
+            limit_tokens: entry.cost_tokens,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: entry.cost_usd,
+            task_started_at: now_instant,
+            turn_started_at: now_instant,
+            last_event_at: now_instant,
+            turn_ended_at: None,
+            agent_state: entry.agent_state.clone(),
+            session_log,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id: Some(intent.agent_run_id),
+            cap_run_id: Some(intent.capability_run_id.clone()),
+            r2_origin: sub_role.as_deref() == Some("r2"),
+            reviewed_head_sha: intent.pr_head.as_ref().map(|head| head.head_sha.clone()),
+            continuation_id: None,
+            pending_prompt: intent.pending_turn.prompt.clone(),
+            pending_turn_kind: intent.pending_turn.turn_kind.clone(),
+        };
+        let environment = managed_run_environment(
+            config,
+            &slot.agent_name,
+            Some(intent.capability_run_id.as_str()),
+        );
+        let launch = runner::LaunchRequest {
+            model: &intent.pending_turn.model,
+            effort: &intent.pending_turn.effort,
+            worktree: &slot.worktree_path,
+            prompt: &intent.pending_turn.prompt,
+            environment: &environment,
+            mode: runner::LaunchMode::Normal,
+            continuation_id: runner_continuation_id(kind, &slot.session_id, None),
+        };
+        let launched = if kind == runner::AgentKind::Grok && intent.role == "worker" {
+            runner::RunnerProc::launch_internal_worker(
+                &runner::RunnerRequest {
+                    launch,
+                    task_id: intent.task_id,
+                    role_assignment_id: assignment_id,
+                    responsibility_key: &intent.responsibility_key,
+                    agent: &slot.agent_name,
+                    role: "worker",
+                    pending_turn: PendingTurn {
+                        provider: intent.pending_turn.provider.clone(),
+                        model: intent.pending_turn.model.clone(),
+                        effort: intent.pending_turn.effort.clone(),
+                        prompt: intent.pending_turn.prompt.clone(),
+                        turn_kind: intent.pending_turn.turn_kind.clone(),
+                        continuation_id: None,
+                        requested: intent.pending_turn.requested,
+                    },
+                },
+                &runner_adapter_config(config, agent_bin_for_kind(config, kind)),
+            )
+            .await
+        } else {
+            runner::RunnerProc::launch(
+                &launch,
+                &runner_adapter_config(config, agent_bin_for_kind(config, kind)),
+            )
+            .await
+        };
+        match launched {
+            Ok(proc) => {
+                let mut running_entry = entry.clone();
+                running_entry.phase = if intent.role == "worker" {
+                    "working".into()
+                } else {
+                    "reviewing".into()
+                };
+                running_entry.pid = proc.pid();
+                running_entry.log_dir = slot
+                    .session_log
+                    .as_ref()
+                    .map(|log| log.dir().to_string_lossy().into_owned());
+                let mut conn = quorum_core::db::open(&config.db_path)?;
+                if let Err(error) = journal::upsert(&mut conn, &running_entry) {
+                    let _ = proc.kill_and_reap().await;
+                    return Err(error);
+                }
+                slot.proc = SlotProcess::running(proc);
+                lifetime_roster.register(&slot.agent_name);
+                if intent.role == "worker" {
+                    workers.push(slot);
+                } else {
+                    reviewers.push(slot);
+                }
+                log(&format!(
+                    "recovery: resumed {} fallback for task #{} on {}",
+                    intent.role, intent.task_id, kind
+                ));
+            }
+            Err(error)
+                if matches!(
+                    error.disposition(),
+                    runner::FailureDisposition::ProviderUnavailable
+                        | runner::FailureDisposition::ProfileUnavailable
+                ) =>
+            {
+                if intent.role == "worker" {
+                    let currency = {
+                        let conn = quorum_core::db::open(&config.db_path)?;
+                        load_worker_fallback_currency(&conn, &slot, now_unix())?
+                    };
+                    match activate_worker_fallback(config, &mut slot, &error, &currency).await? {
+                        WorkerFallbackActivation::Activated => workers.push(slot),
+                        WorkerFallbackActivation::Settled => {
+                            cleanup_slot(config, wt_mgr, name_pool, slot, None, "provider_blocked")
+                                .await;
+                            continue;
+                        }
+                        WorkerFallbackActivation::NotInstalled => {
+                            return Err(QuorumError::Io(
+                                "committed worker fallback could not advance".into(),
+                            ));
+                        }
+                    }
+                } else {
+                    let currency = {
+                        let conn = quorum_core::db::open(&config.db_path)?;
+                        load_reviewer_fallback_currency(&conn, &slot, now_unix())?
+                    };
+                    match activate_reviewer_fallback(config, &mut slot, &error, &currency).await? {
+                        ReviewerFallbackActivation::Activated => reviewers.push(slot),
+                        ReviewerFallbackActivation::Settled => {
+                            teardown_reviewer(config, wt_mgr, name_pool, slot, "provider_blocked")
+                                .await;
+                            continue;
+                        }
+                        ReviewerFallbackActivation::NotInstalled => {
+                            return Err(QuorumError::Io(
+                                "committed reviewer fallback could not advance".into(),
+                            ));
+                        }
+                    }
+                }
+                lifetime_roster.register(&agent_name);
+            }
+            Err(error) => {
+                let _ = dispose_managed_process_exit(
+                    &config.db_path,
+                    if intent.role == "worker" {
+                        tasks::ManagedRunRole::Worker
+                    } else {
+                        tasks::ManagedRunRole::Reviewer
+                    },
+                    &agent_name,
+                    intent.task_id,
+                    Some(&intent.capability_run_id),
+                    &format!("fallback recovery launch failed: {error}"),
+                )
+                .await;
+                if intent.role == "worker" {
+                    cleanup_slot(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        slot,
+                        None,
+                        "fallback_launch_failed",
+                    )
+                    .await;
+                } else {
+                    teardown_reviewer(config, wt_mgr, name_pool, slot, "fallback_launch_failed")
+                        .await;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Gather task context from the DB and persist a structured lifecycle diagnostic.
@@ -26017,6 +26562,943 @@ mod tests {
         assert_eq!(alternate.model, "gpt-5.6-terra");
         // PendingManagedTurn intentionally has no continuation field: the
         // fallback launch must start a fresh provider session.
+    }
+
+    #[cfg(unix)]
+    fn live_fallback_test_config(
+        db_path: PathBuf,
+        root: &Path,
+        runner_program: &Path,
+        merge_executor: Arc<dyn merge::MergeExecutor>,
+    ) -> ServeConfig {
+        let profiles = std::collections::BTreeMap::from([
+            (
+                "a-primary".into(),
+                crate::serve_config::ModelProfile {
+                    runner: "codex".into(),
+                    model: "gpt-5.6-sol".into(),
+                    effort: "medium".into(),
+                },
+            ),
+            (
+                "b-alternate".into(),
+                crate::serve_config::ModelProfile {
+                    runner: "codex".into(),
+                    model: "gpt-5.6-terra".into(),
+                    effort: "high".into(),
+                },
+            ),
+        ]);
+        let pool = std::collections::BTreeMap::from([
+            ("a-primary".to_string(), 50),
+            ("b-alternate".to_string(), 50),
+        ]);
+        ServeConfig {
+            db_path,
+            cap: 1,
+            model_profiles: profiles,
+            routing: crate::serve_config::RoutingPolicy {
+                classifier: pool.clone(),
+                planner: pool.clone(),
+                arbiter: pool.clone(),
+                collector: pool.clone(),
+                worker: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+                reviewer: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+            },
+            repo_dir: root.to_path_buf(),
+            worktree_base: root.to_path_buf(),
+            names_file: None,
+            agent_bin: Some(runner_program.to_string_lossy().into_owned()),
+            merge_executor,
+            bare_agent: true,
+            limits: CostLimits::default(),
+            log_dir: None,
+            self_update_drain: false,
+            drain_timeout_secs: 1,
+            self_repo: None,
+            sha_poll_interval_secs: 60,
+            merge_checks_timeout_secs: 1,
+            merge_checks_poll_secs: 1,
+            repo: "owner/repo".into(),
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+            exit_when_gone: None,
+            required_jobs: Vec::new(),
+            master_ci_gate: false,
+            master_ci_timeout_secs: 1,
+            allowed_tools: None,
+            doctor_enabled: false,
+            resource_monitor: crate::resource_health::ResourceMonitorConfig::default(),
+            r2_enabled: false,
+            r2_target_per_stratum: 0,
+            r2_steady_state_p: 0.0,
+            max_rework: quorum_core::lifecycle::REWORK_CAP,
+            codex_sandbox: "danger-full-access".into(),
+            grok: Default::default(),
+            pr_target_program: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn live_fallback_runner(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let program = root.join("fallback-codex");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"fallback-thread\"}'\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        program
+    }
+
+    #[cfg(unix)]
+    fn seed_live_fallback_assignment(
+        config: &ServeConfig,
+        conn: &mut quorum_core::Connection,
+        task_id: i64,
+        responsibility: &str,
+        role: &str,
+        pr: Option<i64>,
+        stage: Option<&str>,
+    ) -> (quorum_core::role_assignments::RoleAssignment, i64, String) {
+        let pool = configured_routing_pool(config, role, Some(3), stage).unwrap();
+        let primary = &pool.profiles[0].profile;
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                 profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (?1,?2,?3,?4,?5,'3',?6,?7,?8,?9,?10,?11,?12,1)",
+            rusqlite::params![
+                responsibility,
+                task_id,
+                pr,
+                role,
+                stage,
+                primary.id,
+                primary.provider,
+                primary.runner,
+                primary.model,
+                primary.effort,
+                pool.pool_key,
+                pool.policy_generation,
+            ],
+        )
+        .unwrap();
+        let assignment = quorum_core::role_assignments::get(conn, conn.last_insert_rowid())
+            .unwrap()
+            .unwrap();
+        let agent = if role == "worker" {
+            "Fallback-Worker"
+        } else {
+            "Fallback-Reviewer"
+        };
+        conn.execute(
+            "INSERT INTO agent_runs(
+                 task_id,agent_name,role,model,effort,provider,role_assignment_id,spawned_at,
+                 sub_role,review_cap_run_id,review_pr,review_head_sha)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,2,?8,?9,?10,?11)",
+            rusqlite::params![
+                task_id,
+                agent,
+                role,
+                primary.model,
+                primary.effort,
+                primary.provider,
+                assignment.id,
+                stage.filter(|stage| *stage == "r2"),
+                (role == "reviewer").then_some("initial-cap"),
+                pr,
+                (role == "reviewer").then_some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ],
+        )
+        .unwrap();
+        let run_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at,agent_run_id)
+             VALUES ('initial-cap',?1,?2,?3,2,?4)",
+            rusqlite::params![task_id, agent, role, run_id],
+        )
+        .unwrap();
+        (assignment, run_id, agent.into())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_worker_fallback_swaps_run_capability_process_and_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let config = live_fallback_test_config(
+            root.path().join("worker.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let mut slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        drop(conn);
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(
+            activate_worker_fallback(&config, &mut slot, &failure, &currency)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Activated
+        );
+        assert_eq!(slot.model, "gpt-5.6-terra");
+        assert_ne!(slot.agent_run_id, Some(initial_run));
+        assert_ne!(slot.cap_run_id.as_deref(), Some("initial-cap"));
+        assert!(slot.pid().is_some());
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (attempts, active_runs, active_caps, phase, pid): (i64, i64, i64, String, Option<i32>) =
+            conn.query_row(
+                "SELECT
+                     (SELECT count(*) FROM routing_attempts WHERE responsibility_key=?1),
+                     (SELECT count(*) FROM agent_runs WHERE task_id=?2 AND ended_at IS NULL),
+                     (SELECT count(*) FROM run_capabilities WHERE task_id=?2 AND revoked_at IS NULL),
+                     phase,pid FROM journal WHERE agent='Fallback-Worker'",
+                rusqlite::params![responsibility, task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!((attempts, active_runs, active_caps), (1, 1, 1));
+        assert_eq!(phase, "working");
+        assert!(pid.is_some());
+        drop(conn);
+        let _ = slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_worker_fallback_chains_across_two_failed_routes() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let mut config = live_fallback_test_config(
+            root.path().join("worker-chain.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.worker.values_mut() {
+            pool.insert("a-primary".into(), 25);
+            pool.insert("c-tertiary".into(), 25);
+        }
+
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback chain",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let mut slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        drop(conn);
+
+        for (failed, expected_next) in [
+            ("primary profile unavailable", "gpt-5.6-terra"),
+            ("first alternate unavailable", "gpt-5.5"),
+        ] {
+            let failure = runner::RunnerFailure::classified(
+                runner::FailureDisposition::ProfileUnavailable,
+                failed,
+                std::io::ErrorKind::Other,
+            );
+            assert_eq!(
+                activate_worker_fallback(&config, &mut slot, &failure, &currency)
+                    .await
+                    .unwrap(),
+                WorkerFallbackActivation::Activated
+            );
+            assert_eq!(slot.model, expected_next);
+        }
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let evidence: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM routing_attempts WHERE responsibility_key=?1),
+                     (SELECT count(*) FROM fallback_launch_intents WHERE responsibility_key=?1),
+                     (SELECT count(*) FROM agent_runs WHERE task_id=?2 AND ended_at IS NULL),
+                     (SELECT count(*) FROM run_capabilities WHERE task_id=?2 AND revoked_at IS NULL)",
+                rusqlite::params![responsibility, task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(evidence, (2, 2, 1, 1));
+        drop(conn);
+        let _ = slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    struct FallbackHeadExecutor(String);
+
+    #[cfg(unix)]
+    impl merge::MergeExecutor for FallbackHeadExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_reviewer_fallback_requires_own_lease_and_swaps_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("reviewer-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let head_sha = "a".repeat(40);
+        let config = live_fallback_test_config(
+            root.path().join("reviewer.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(FallbackHeadExecutor(head_sha.clone())),
+        );
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "reviewer fallback",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Author",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at - 2,
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::tasks::apply_event(
+            &mut conn,
+            "Author",
+            task_id,
+            &Event::SignaledDone { pr: "77".into() },
+            observed_at - 1,
+        )
+        .unwrap();
+        quorum_core::tasks::reserve_reviewer_provision(
+            &mut conn,
+            task_id,
+            "fallback-review-reservation",
+            "r1",
+            observed_at,
+        )
+        .unwrap();
+        assert!(quorum_core::tasks::attach_reserved_reviewer(
+            &mut conn,
+            task_id,
+            "fallback-review-reservation",
+            "r1",
+            "Fallback-Reviewer",
+            3600,
+            observed_at,
+        )
+        .unwrap());
+        let responsibility = format!("reviewer:task:{task_id}:r1");
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "reviewer",
+            Some(77),
+            Some("r1"),
+        );
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "reviewer".into(),
+                task_id: Some(task_id),
+                session_id: "initial-review-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("review/pr-77".into()),
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(77),
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("review/pr-77".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let mut slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-review-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "review/pr-77".into(),
+            remote_branch: "review/pr-77".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: Some(77),
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: Some(head_sha),
+            continuation_id: None,
+            pending_prompt: "exact reviewer prompt".into(),
+            pending_turn_kind: "review".into(),
+        };
+        let currency = load_reviewer_fallback_currency(&conn, &slot, observed_at).unwrap();
+        conn.execute(
+            "UPDATE claims SET holder='Intruder' WHERE target=?1 AND active=1",
+            [tasks::lease_target(task_id)],
+        )
+        .unwrap();
+        assert!(load_reviewer_fallback_currency(&conn, &slot, observed_at).is_err());
+        conn.execute(
+            "UPDATE claims SET holder='Fallback-Reviewer' WHERE target=?1 AND active=1",
+            [tasks::lease_target(task_id)],
+        )
+        .unwrap();
+        drop(conn);
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary reviewer profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(
+            activate_reviewer_fallback(&config, &mut slot, &failure, &currency)
+                .await
+                .unwrap(),
+            ReviewerFallbackActivation::Activated
+        );
+        assert_eq!(slot.model, "gpt-5.6-terra");
+        assert_ne!(slot.agent_run_id, Some(initial_run));
+        assert_ne!(slot.cap_run_id.as_deref(), Some("initial-cap"));
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (attempts, active_runs, active_caps, holder, phase):
+            (i64, i64, i64, String, String) = conn
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM routing_attempts WHERE responsibility_key=?1),
+                     (SELECT count(*) FROM agent_runs WHERE task_id=?2 AND role='reviewer' AND ended_at IS NULL),
+                     (SELECT count(*) FROM run_capabilities WHERE task_id=?2 AND role='reviewer' AND revoked_at IS NULL),
+                     (SELECT holder FROM claims WHERE target=?3 AND active=1),
+                     phase FROM journal WHERE agent='Fallback-Reviewer'",
+                rusqlite::params![responsibility, task_id, tasks::lease_target(task_id)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!((attempts, active_runs, active_caps), (1, 1, 1));
+        assert_eq!(holder, "Fallback-Reviewer");
+        assert_eq!(phase, "reviewing");
+        drop(conn);
+        let _ = slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_preserves_and_replays_committed_fallback_intent() {
+        fn git(repo: &Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let worktree_base = root.path().join("worktrees");
+        let worktree = worktree_base.join("Fallback-Worker-t1");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&worktree_base).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "fallback recovery\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-m", "init"]);
+        let worktree_string = worktree.to_string_lossy().into_owned();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "daemon/fallback-worker",
+                &worktree_string,
+                "HEAD",
+            ],
+        );
+
+        let runner_program = live_fallback_runner(root.path());
+        let mut config = live_fallback_test_config(
+            root.path().join("recovery.db"),
+            &repo,
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.worktree_base = worktree_base;
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "fallback recovery",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "failed-session".into(),
+                worktree: Some(worktree_string.clone()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let slot = SlotState {
+            agent_name: agent_name.clone(),
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "failed-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree.clone(),
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact restart prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        let pool = configured_routing_pool(&config, "worker", Some(3), None).unwrap();
+        let pending = worker_fallback_pending_turn(&slot);
+        let installed = fallback::install(
+            &mut conn,
+            &fallback::FallbackInstallInput {
+                disposition: runner::FailureDisposition::ProfileUnavailable,
+                assignment: &assignment,
+                responsibility: quorum_core::role_assignments::AssignmentIdentity {
+                    task_id: assignment.task_id,
+                    responsibility_key: &assignment.responsibility_key,
+                    role: &assignment.role,
+                    pr_number: assignment.pr_number,
+                    review_stage: assignment.review_stage.as_deref(),
+                },
+                failed_route: &pool.profiles[0].profile,
+                pending_turn: &pending,
+                eligible_pool: &pool,
+                expected_currency: &currency,
+                current_currency: &currency,
+                observed_at,
+                failed_run: fallback_retire::FailedManagedRun {
+                    agent_run_id: initial_run,
+                    capability_run_id: "initial-cap",
+                    agent: &agent_name,
+                    ended_at: observed_at,
+                    end_reason: "fallback-route-unavailable",
+                },
+                alternate_agent: &agent_name,
+                alternate_capability_run_id: "recovery-cap",
+                fallback_session_id: "recovery-session",
+                reviewer_launch: None,
+                worktree: &worktree_string,
+                recorded_at: observed_at,
+                spawned_at: observed_at,
+                issued_at: observed_at,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            installed,
+            fallback::FallbackInstallOutcome::Installed(_)
+        ));
+        let marker: (String, String, Option<i32>) = conn
+            .query_row(
+                "SELECT phase,session_id,pid FROM journal WHERE agent=?1",
+                [&agent_name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            marker,
+            ("fallback-pending".into(), "recovery-session".into(), None)
+        );
+        drop(conn);
+
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut reviewers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recovery::recover(&config, &wt_mgr, &mut name_pool, &mut workers, &mut roster)
+            .await
+            .unwrap();
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (status, active_caps, marker_count): (String, i64, i64) = conn
+            .query_row(
+                "SELECT status,
+                        (SELECT count(*) FROM run_capabilities WHERE task_id=?1 AND revoked_at IS NULL),
+                        (SELECT count(*) FROM journal WHERE task_id=?1 AND phase='fallback-pending')
+                 FROM tasks WHERE id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "working");
+        assert_eq!((active_caps, marker_count), (1, 1));
+        drop(conn);
+
+        resume_pending_fallbacks(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+        assert_eq!(workers.len(), 1);
+        assert!(reviewers.is_empty());
+        assert_eq!(workers[0].model, "gpt-5.6-terra");
+        assert!(workers[0].pid().is_some());
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let phase: String = conn
+            .query_row(
+                "SELECT phase FROM journal WHERE agent='Fallback-Worker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "working");
+        drop(conn);
+        let worker = workers.pop().unwrap();
+        let _ = worker.kill_and_reap().await;
     }
 
     #[tokio::test]
