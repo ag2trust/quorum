@@ -1065,10 +1065,21 @@ pub fn attributed_retirement_target_tx(
                AND run.sub_role IS ?6
                AND (run.ended_at IS NULL OR (run.ended_at=?7 AND run.end_reason=?8))
                AND run.role_assignment_id=?9
-               AND run.configured_profile_id=?10
-               AND run.configured_provider=?11
-               AND run.configured_model=?12
-               AND run.configured_effort=?13
+               AND (
+                   (run.configured_profile_id=?10
+                    AND run.configured_provider=?11
+                    AND run.configured_model=?12
+                    AND run.configured_effort=?13)
+                   OR
+                   (run.configured_profile_id IS NULL
+                    AND run.configured_provider IS NULL
+                    AND run.configured_model IS NULL
+                    AND run.configured_effort IS NULL
+                    AND stored_assignment.profile_id=?10
+                    AND stored_assignment.provider=?11
+                    AND stored_assignment.model=?12
+                    AND stored_assignment.effort=?13)
+               )
                AND run.provider=?11
                AND run.model=?12
                AND run.effort=?13

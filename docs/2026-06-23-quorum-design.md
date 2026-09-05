@@ -1601,7 +1601,13 @@ Planning Agent and daemon-owned materialization described in
      until a subsequent successful run replaces them.
 2. **Bounded classifier turn** — a Haiku-class agent (`CLASSIFIER_MODEL` /
    `CLASSIFIER_EFFORT`) is spawned with an EMPTY tool allowlist (no Bash,
-   Read, Write, Edit, gh — response-only). 3-minute wall-clock cap.
+   Read, Write, Edit, gh — response-only). 3-minute wall-clock cap and hard
+   256 KiB provider-stdout / 64 KiB response-text caps apply before output is
+   normalized, retained, repaired, or salvaged; a cap violation is a loud
+   failure. A strict response parse failure gets exactly one separately bounded
+   repair turn using the same model and original prompt, plus the previous
+   response and exact parser error. No model call runs while a DB transaction
+   is open.
 3. **Structured output** — response must be
    `{"findings":[...],"followup_artifacts":[...]}` with each
    finding carrying `kind` (blocking/suggestion), `author_pushback`,
@@ -1610,13 +1616,23 @@ Planning Agent and daemon-owned materialization described in
    `{kind,id}` pointers to GitHub review/comment ids. Each artifact carries
    technical impact, scope relationship, concrete concern, non-blocking reason,
    affected behavior, desired outcome, verification expectations, and evidence.
-   Prose-only or evidence-free findings/artifacts are rejected by contract.
+   Prose-only or evidence-free findings/artifacts are rejected by contract. If
+   the repair response is still malformed but its envelope and each retained
+   element still pass strict parsing (including duplicate-field rejection), the
+   collector validates findings and artifacts independently, retaining only
+   valid entries. An artifact whose source finding was dropped is also dropped.
+   A salvaged run with at least one valid finding is stored as `success` with a
+   bounded error text listing dropped indices and reasons; excess array entries
+   are summarized after the per-type cap. No valid finding remains a loud failed
+   run. Evidence fields remain required and must point to fetched records in
+   both the normal and salvage paths.
 4. **Atomic idempotent write** — one transaction replaces analytics, inserts the
    PR's immutable artifact batch only when absent, and UPSERTs the successful
    `review_collection_runs` row. Re-interpretation may refresh analytics but
    never rewrites, duplicates, or resurrects an existing artifact batch.
 5. **Loud failure surface** — any pipeline error (fetch, classifier timeout,
-   classifier `is_error=true`, unparseable response, DB write) records a
+   classifier `is_error=true`, response unparseable after its repair and
+   unsalvageable, DB write) records a
    `review_collection_runs` row with `status='failed'` + error text and logs
    an `errors` row (`source='review-collector'`). The task lifecycle is
    NEVER touched on failure.
@@ -2641,8 +2657,25 @@ Exclusions are derived rather than separately granted: `ProviderUnavailable` exc
 profile on that provider for the responsibility, while `ProfileUnavailable` excludes only that
 profile. `RetryableSameRoute`, `NonFailover`, `Unclassified`, and an attempt with no classified
 runner failure grant no alternate-route authority. Recording does not advance allocation,
-`rework_round`, task recovery attempts, or lifecycle state. Alternate selection and launch are
-not yet activated.
+`rework_round`, task recovery attempts, or lifecycle state. For managed workers and R1/R2
+reviewers, a pre-authoritative `ProviderUnavailable` or `ProfileUnavailable` failure installs and
+launches the deterministic eligible alternate before the ordinary failure transition. The logical
+agent, role assignment, task lease, worktree, exact pending prompt, and reviewer PR/head remain
+fixed; the alternate uses a newly attributed run and capability and never receives the failed
+provider's continuation. Installation revalidates lifecycle revision and lease under its write lock
+and yields to a pending submission or verdict. Repeated failures either select the next eligible
+route or converge on one provider-blocked outcome without spending rework or recovery budget.
+Claude and Codex alternates support both initial and rework turns. A managed Grok worker may
+fall back to either provider, but Grok is selectable as the alternate only for a fresh initial
+worker turn; a rework turn cannot enter Grok without its provider-issued initial-session handoff.
+
+The persisted launch intent protects the install-before-provider-call boundary. Startup replay of
+an intent uses an atomically committed `fallback-pending` process-journal marker. Generic recovery
+preserves that exact run, capability, lease, and worktree instead of revoking or resetting them;
+the startup fallback pass then revalidates lifecycle and reviewer head authority and launches the
+stored turn verbatim. A launch-time provider/profile failure is recorded like any later failure and
+may advance to another bounded eligible route. Reviewer attachment transfers the task lease to the
+reviewer, so fallback currency can never be borrowed from a prior worker or replacement reviewer.
 
 ### Verification gates
 
@@ -3155,7 +3188,14 @@ changes.
   permit remote binding; remote delivery requires a separately designed secure transport.
   Each request opens, reads, and closes SQLite before responding. Dashboard task and run
   pages are bounded, stream reads are byte-capped, and `--log-dir` selects the daemon's
-  configured log root.
+  configured log root. Without that override, the web process loads the repository's serve
+  configuration and uses its `log_dir`, falling back to `~/.quorum/logs` only when unset.
+  Opening an active run starts at the current end of `stream.jsonl` and follows newly appended
+  provider records; recorded history is an explicit replay action. Provider start records are
+  visible immediately and a later completion record with the same item identity replaces the
+  in-progress row. The daemon uses a short cancellation-safe readiness poll for quiet Claude and
+  Codex streams so one inactive turn cannot delay event draining for the remaining active slots
+  by seconds; Grok retains its longer terminal-evidence window.
 - **Out of scope (YAGNI, v1):** general auth · multi-machine coordination · remote HTTP/MCP server ·
   message editing · threads beyond `topic` · PR/review mirroring · cross-repo bus ·
   presence-based claim eviction · arbitrary-byte (BLOB) payloads · **agent-name uniqueness

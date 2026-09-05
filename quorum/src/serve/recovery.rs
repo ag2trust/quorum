@@ -16,6 +16,7 @@
 
 use super::worktree::WorktreeManager;
 use super::{log, LifetimeRoster, LiveStats, ServeConfig, SlotProcess, SlotState};
+use quorum_core::fallback_launch::{self, FallbackLaunchIntent};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::lifecycle::Event;
 use quorum_core::runner_state::{self, ContinuationSlot};
@@ -41,6 +42,91 @@ struct DormantRecovery {
     rework_feedback: Option<String>,
     needs_review_claim: bool,
     needs_rework_claim: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingFallbackRecovery {
+    pub entry: JournalEntry,
+    pub intent: FallbackLaunchIntent,
+    pub agent: String,
+}
+
+/// Load only a fully linked, live fallback intent whose atomic journal marker
+/// still names the same agent, task, role, worktree, provider, run, and
+/// capability. A malformed marker is fatal: generic recovery must never
+/// revoke or reset authority it cannot prove safe to replay.
+pub(crate) fn pending_fallback_recoveries(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<PendingFallbackRecovery>> {
+    let entries = journal::list_in_flight(conn)?;
+    let mut recoveries = Vec::new();
+    for entry in entries
+        .into_iter()
+        .filter(|entry| entry.phase == "fallback-pending")
+    {
+        let task_id = entry
+            .task_id
+            .filter(|id| *id > 0)
+            .ok_or_else(|| QuorumError::Io("fallback-pending journal is missing task".into()))?;
+        if entry.pid.is_some()
+            || entry.session_id.is_empty()
+            || entry.continuation_id.is_some()
+            || !matches!(entry.role.as_str(), "worker" | "reviewer")
+        {
+            return Err(QuorumError::Io(format!(
+                "invalid fallback-pending journal shape for {}",
+                entry.agent
+            )));
+        }
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT intent.responsibility_key,intent.routing_attempt_id
+                 FROM fallback_launch_intents AS intent
+                 JOIN run_capabilities AS capability
+                   ON capability.run_id=intent.capability_run_id
+                  AND capability.agent_run_id=intent.agent_run_id
+                 JOIN agent_runs AS run ON run.id=intent.agent_run_id
+                 WHERE intent.task_id=?1 AND intent.role=?2
+                   AND intent.worktree=?3
+                   AND capability.agent=?4 AND capability.task_id=?1
+                   AND capability.role=?2 AND capability.revoked_at IS NULL
+                   AND run.agent_name=?4 AND run.task_id=?1 AND run.role=?2
+                   AND run.ended_at IS NULL
+                 ORDER BY intent.id DESC LIMIT 1",
+                rusqlite::params![
+                    task_id,
+                    entry.role,
+                    entry.worktree.as_deref().unwrap_or_default(),
+                    entry.agent,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (responsibility, attempt_id) = row.ok_or_else(|| {
+            QuorumError::Io(format!(
+                "fallback-pending journal for {} has no live intent",
+                entry.agent
+            ))
+        })?;
+        let intent = fallback_launch::reconstruct(conn, &responsibility, attempt_id)?
+            .ok_or_else(|| QuorumError::Io("live fallback intent disappeared".into()))?;
+        if entry.provider.as_deref() != Some(intent.pending_turn.provider.as_str())
+            || entry.worktree.as_deref() != Some(intent.worktree.as_str())
+            || (entry.role == "reviewer"
+                && entry.pr != intent.pr_head.as_ref().map(|head| head.number))
+        {
+            return Err(QuorumError::Io(format!(
+                "fallback-pending journal for {} conflicts with its intent",
+                entry.agent
+            )));
+        }
+        recoveries.push(PendingFallbackRecovery {
+            agent: entry.agent.clone(),
+            entry,
+            intent,
+        });
+    }
+    Ok(recoveries)
 }
 
 #[derive(Debug, Clone)]
@@ -740,6 +826,18 @@ pub(crate) async fn recover(
         .await
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     }?;
+    let pending_fallbacks = {
+        let conn = quorum_core::db::open(&db_path)?;
+        pending_fallback_recoveries(&conn)?
+    };
+    let pending_fallback_names = pending_fallbacks
+        .iter()
+        .map(|recovery| recovery.agent.clone())
+        .collect::<HashSet<_>>();
+    let pending_fallback_tasks = pending_fallbacks
+        .iter()
+        .map(|recovery| recovery.intent.task_id)
+        .collect::<HashSet<_>>();
 
     let dormant_entries = entries
         .iter()
@@ -777,6 +875,11 @@ pub(crate) async fn recover(
     // local too: even a caller that mishandled the error could not recycle the
     // identity for another task in this daemon process.
     reserve_dormant_names(&dormant_entries, name_pool, workers)?;
+    let pending_entries = pending_fallbacks
+        .iter()
+        .map(|recovery| recovery.entry.clone())
+        .collect::<Vec<_>>();
+    reserve_dormant_names(&pending_entries, name_pool, workers)?;
 
     // Decomposition planner views are ordinary temporary archives rather
     // than Git worktrees. Their exact path is journaled with the provider
@@ -842,7 +945,10 @@ pub(crate) async fn recover(
         let p = db_path.clone();
         let agents: Vec<String> = entries
             .iter()
-            .filter(|entry| !dormant_names.contains(&entry.agent))
+            .filter(|entry| {
+                !dormant_names.contains(&entry.agent)
+                    && !pending_fallback_names.contains(&entry.agent)
+            })
             .map(|entry| entry.agent.clone())
             .collect();
         let revoked = tokio::task::spawn_blocking(move || -> usize {
@@ -873,7 +979,10 @@ pub(crate) async fn recover(
         let p = db_path.clone();
         let stale_agents = entries
             .iter()
-            .filter(|entry| !dormant_names.contains(&entry.agent))
+            .filter(|entry| {
+                !dormant_names.contains(&entry.agent)
+                    && !pending_fallback_names.contains(&entry.agent)
+            })
             .map(|entry| entry.agent.clone())
             .collect::<Vec<_>>();
         let count = tokio::task::spawn_blocking(move || -> Result<usize> {
@@ -906,6 +1015,11 @@ pub(crate) async fn recover(
     let active_worktrees = recoveries
         .iter()
         .filter_map(|recovery| recovery.entry.worktree.as_deref())
+        .chain(
+            pending_fallbacks
+                .iter()
+                .map(|recovery| recovery.intent.worktree.as_str()),
+        )
         .collect::<Vec<_>>();
     let removed = wt_mgr
         .gc_orphaned(&config.repo_dir, &config.worktree_base, &active_worktrees)
@@ -939,6 +1053,13 @@ pub(crate) async fn recover(
         .unwrap_or_default();
 
         for task in tasks_in_state {
+            if pending_fallback_tasks.contains(&task.id) {
+                log(&format!(
+                    "recovery: preserving committed fallback intent for task #{}",
+                    task.id
+                ));
+                continue;
+            }
             if recovered_rework_tasks.contains(&task.id) {
                 log(&format!(
                     "recovery: preserving exact dormant rework continuation for task #{}",

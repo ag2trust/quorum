@@ -21,7 +21,12 @@ The same boundary applies inside a decomposition graph: if the task cannot compi
 preflight without editing files its non-goals reserve for a sibling task, the plan is wrong.
 Signal `blocked` with that contradiction instead of expanding scope. An out-of-boundary
 delivery is a graph-blocker: it fails the task, ends the review, and freezes the entire graph.
-Never submit with a failing preflight; report the failure instead.
+A red preflight is yours to investigate before you report it. If the failure is in code you
+touched or in tests covering it, fix it. If it is elsewhere, rerun that test once; if it
+passes, proceed and note the flake in the PR body. If it fails again, run it on a clean
+checkout of the base branch. If it fails there too, the base is broken: do not fix it, signal
+`blocked` with the test name and output. Signal `failed` only when your own deliverable cannot
+be completed after a bounded number of attempts. Never submit with a red gate.
 
 If blocked, failed, or awaiting input, signal the daemon:
 

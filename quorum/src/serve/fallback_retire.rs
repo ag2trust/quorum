@@ -40,6 +40,7 @@ pub struct FallbackRetireInput<'a> {
 /// reuse the original immutable routing-attempt row and leave recovery/rework
 /// accounting untouched. This function performs no provider, process, or
 /// network operation.
+#[allow(dead_code)] // The live installer uses the caller-owned transaction form below.
 pub fn retire(conn: &mut Connection, input: &FallbackRetireInput<'_>) -> Result<RouteExclusions> {
     let tx = quorum_core::db::begin_immediate(conn)?;
     let exclusions = retire_tx(&tx, input)?;
@@ -51,7 +52,7 @@ pub fn retire(conn: &mut Connection, input: &FallbackRetireInput<'_>) -> Result<
 ///
 /// The fallback installer owns the one write transaction that records failed
 /// route evidence, retires its authority, establishes an alternate route, and
-/// persists its restart-safe launch intent before any provider operation.
+/// persists its durable launch intent before any provider operation.
 pub fn retire_tx(tx: &Transaction<'_>, input: &FallbackRetireInput<'_>) -> Result<RouteExclusions> {
     validate_input(input)?;
     let task_id = input
