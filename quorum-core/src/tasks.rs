@@ -3839,10 +3839,11 @@ fn dispose_managed_exit_inner(
 /// Atomically distinguish a submitted turn-oriented worker from a provider
 /// failure or its durable explicit reaction.
 ///
-/// The immediate transaction serializes the Done-row check, journal reaction,
-/// and disposition write. A consumed `react` mailbox row is represented only
-/// in the journal, so reading it here prevents an explicit worker outcome
-/// from being misclassified as a provider failure.
+/// The immediate transaction serializes the Done-row check, durable worker
+/// reaction, and disposition write. A consumed `react` mailbox row is
+/// represented in the journal; a reaction committed after the daemon's
+/// mailbox snapshot remains unconsumed, so it must be read directly here
+/// before classifying the exited turn.
 pub fn dispose_dead_turn_runner(
     conn: &mut Connection,
     id: i64,
@@ -3906,15 +3907,34 @@ pub fn dispose_dead_turn_runner(
         return Ok(DeadTurnRunnerDisposition::OwnershipTransferred);
     }
 
-    let reaction: Option<String> = tx
+    let durable_reaction: Option<String> = tx
         .query_row(
-            "SELECT agent_state FROM journal
-             WHERE agent=?1 AND role='worker' AND task_id=?2",
+            "SELECT note FROM mailbox
+             WHERE agent=?1 AND kind='task_update' AND task_id=?2
+               AND consumed_at IS NULL
+             ORDER BY id DESC
+             LIMIT 1",
             params![agent, id],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()?
-        .flatten();
+        .map(|state| state.unwrap_or_else(|| "note".into()));
+    // Phase 2 projects consumed reactions into the journal. A durable row
+    // written after its Phase 1 snapshot cannot appear there yet; prefer that
+    // later reaction so the classification has the same last-reaction-wins
+    // semantics as mailbox delivery.
+    let reaction = match durable_reaction {
+        Some(state) => Some(state),
+        None => tx
+            .query_row(
+                "SELECT agent_state FROM journal
+                 WHERE agent=?1 AND role='worker' AND task_id=?2",
+                params![agent, id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten(),
+    };
     match reaction.as_deref() {
         Some("failed") => {
             return apply_event_tx(
@@ -3925,7 +3945,7 @@ pub fn dispose_dead_turn_runner(
                     reason: "failed".into(),
                 },
                 now,
-                |_| Ok(()),
+                |tx| consume_pending_worker_reactions_tx(tx, agent, id, now),
             )
             .map(|transition| DeadTurnRunnerDisposition::AgentFailed(Box::new(transition)));
         }
@@ -3950,6 +3970,7 @@ pub fn dispose_dead_turn_runner(
             crate::events::emit(&tx, "task_parked", &lease_target(id), reason, now)?;
             alert_owner_of_park(&tx, id, reason, now)?;
             crate::decomposition::block_graph_if_child_failed(&tx, id, reason, now)?;
+            consume_pending_worker_reactions_tx(&tx, agent, id, now)?;
             tx.commit()?;
             return Ok(DeadTurnRunnerDisposition::ReactionParked);
         }
@@ -3976,8 +3997,30 @@ pub fn dispose_dead_turn_runner(
         "UPDATE tasks SET refs=?2, updated_at=?3 WHERE id=?1",
         params![id, refs.to_string(), now],
     )?;
+    consume_pending_worker_reactions_tx(&tx, agent, id, now)?;
     tx.commit()?;
     Ok(DeadTurnRunnerDisposition::ProviderBlocked)
+}
+
+/// A turn-exit classifier may run after Phase 1 captured its mailbox batch.
+/// Consume the whole reaction sequence only in the same transaction that has
+/// applied its final state to the lifecycle. `BEGIN IMMEDIATE` excludes a
+/// concurrent `react`, and any later failure rolls this update back with the
+/// lifecycle disposition instead of dropping an unprojected reaction.
+fn consume_pending_worker_reactions_tx(
+    tx: &Transaction<'_>,
+    agent: &str,
+    task_id: i64,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE mailbox
+         SET consumed_at=?3
+         WHERE agent=?1 AND kind='task_update' AND task_id=?2
+           AND consumed_at IS NULL",
+        params![agent, task_id, now],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn set_parked_refs(
@@ -6869,6 +6912,24 @@ mod tests {
         .unwrap();
     }
 
+    fn append_worker_reaction(c: &mut Connection, task_id: i64, state: &str) -> i64 {
+        crate::mailbox::append(
+            c,
+            &crate::mailbox::MailboxRow {
+                agent: "worker".into(),
+                kind: crate::mailbox::MailboxKind::TaskUpdate,
+                task_id: Some(task_id),
+                pr: None,
+                verdict: None,
+                feedback: None,
+                note: Some(state.into()),
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn dead_turn_runner_failed_reaction_uses_agent_failed_not_provider_block() {
         let (_d, mut c) = open_tmp();
@@ -6966,6 +7027,112 @@ mod tests {
             let refs: serde_json::Value =
                 serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
             assert_eq!(refs["branch"], "daemon/worker-t1");
+        }
+    }
+
+    #[test]
+    fn dead_turn_runner_uses_reaction_committed_after_mailbox_snapshot() {
+        for state in ["failed", "blocked", "needs-info", "note"] {
+            let (_d, mut c) = open_tmp();
+            let id = create(
+                &mut c,
+                "boss",
+                "t",
+                None,
+                0,
+                None,
+                Some(r#"{"branch":"daemon/worker-t1"}"#),
+                None,
+                None,
+                1000,
+            )
+            .unwrap();
+            claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+            if state == "failed" {
+                c.execute(
+                    "UPDATE tasks SET recovery_attempts=?1 WHERE id=?2",
+                    params![MAX_RECOVERY_ATTEMPTS, id],
+                )
+                .unwrap();
+            }
+
+            // Simulate Phase 1 capturing an empty batch, then a supported
+            // `quorum react` committing before Phase 4 observes the dead
+            // turn. There is deliberately no journal projection.
+            assert!(crate::mailbox::poll_unconsumed(&c).unwrap().is_empty());
+            let reaction_id = append_worker_reaction(&mut c, id, state);
+            let journal_reaction: Option<String> = c
+                .query_row(
+                    "SELECT agent_state FROM journal
+                     WHERE agent='worker' AND role='worker' AND task_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap()
+                .flatten();
+            assert!(
+                journal_reaction.is_none(),
+                "the post-snapshot reaction must be classified from mailbox"
+            );
+
+            let disposition = dispose_dead_turn_runner(
+                &mut c,
+                id,
+                "worker",
+                &ProviderBlock {
+                    provider: "codex".into(),
+                    reason: "process exited".into(),
+                },
+                &dead_turn_retry(),
+                1001,
+            )
+            .unwrap();
+
+            match state {
+                "failed" => assert!(matches!(
+                    disposition,
+                    DeadTurnRunnerDisposition::AgentFailed(_)
+                )),
+                "blocked" | "needs-info" => {
+                    assert_eq!(disposition, DeadTurnRunnerDisposition::ReactionParked)
+                }
+                "note" => assert_eq!(disposition, DeadTurnRunnerDisposition::ProviderBlocked),
+                _ => unreachable!(),
+            }
+            assert!(
+                !crate::mailbox::has_unconsumed(
+                    &c,
+                    "worker",
+                    crate::mailbox::MailboxKind::TaskUpdate,
+                    id,
+                )
+                .unwrap(),
+                "the applied reaction must not become an unmatched phantom"
+            );
+            let consumed_at: Option<i64> = c
+                .query_row(
+                    "SELECT consumed_at FROM mailbox WHERE id=?1",
+                    [reaction_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(consumed_at, Some(1001));
+
+            let task = get(&c, id).unwrap().unwrap();
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            if matches!(state, "blocked" | "needs-info") {
+                assert_eq!(refs[PARKED_REASON_REF], state);
+                assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+            } else if state == "failed" {
+                assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+            } else {
+                assert_eq!(
+                    runner_state::provider_block(&refs).unwrap().reason,
+                    "process exited"
+                );
+            }
         }
     }
 

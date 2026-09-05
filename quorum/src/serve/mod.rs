@@ -10353,13 +10353,23 @@ async fn tick(
                     "awaiting-review"
                 };
                 let entry = slot_journal_entry(&workers[wi], "worker", phase);
-                tokio::task::spawn_blocking(move || -> Result<()> {
+                let projection = tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &entry)
                 })
                 .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                .ok();
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+                if let Err(error) = projection {
+                    // The mailbox row is the authoritative reaction until
+                    // its journal projection commits. Leave it pending so a
+                    // later tick, or dead-turn classification, can apply it
+                    // rather than silently discarding the worker outcome.
+                    log(&format!(
+                        "worker {} reaction projection failed; preserving task_update: {error}",
+                        workers[wi].agent_name
+                    ));
+                    continue;
+                }
             } else {
                 // #130: no passive agent handling — unmatched task_updates
                 // are consumed as phantoms.
