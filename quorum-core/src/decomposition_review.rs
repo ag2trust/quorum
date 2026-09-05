@@ -333,6 +333,16 @@ pub fn persist_reviewer_run_if_current(
         &parameters,
     )?;
     let id = tx.last_insert_rowid();
+    let bound = tx.execute(
+        "UPDATE run_capabilities
+         SET agent_run_id=?2
+         WHERE run_id=?1 AND task_id=?3 AND agent=?4 AND role='reviewer'
+           AND revoked_at IS NULL AND agent_run_id IS NULL",
+        params![cap_run_id, id, task_id, agent],
+    )?;
+    if bound != 1 {
+        return Ok(None);
+    }
     tx.commit()?;
     Ok(Some(id))
 }

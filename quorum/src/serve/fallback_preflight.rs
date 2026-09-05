@@ -90,7 +90,12 @@ pub fn preflight(input: &FallbackPreflightInput<'_>) -> FallbackPreflightOutcome
         || !input
             .assignment
             .matches_pool_generation(input.eligible_pool)
-        || input.assignment.profile_snapshot() != *input.failed_route
+        // The immutable assignment names the initially selected route. After
+        // one live fallback, the next failure belongs to an attributed
+        // alternate run under that same assignment, so admission must accept
+        // any exact profile in the assignment's immutable pool generation.
+        // Retirement re-proves that the concrete failed run/capability was
+        // actually launched with this profile under the write lock.
         || !pool_contains_exact(input.eligible_pool, input.failed_route)
         || !pending_turn_matches_route(input.pending_turn, input.failed_route)
     {
@@ -152,7 +157,10 @@ fn pool_contains_exact(pool: &ValidatedPool, route: &ModelProfile) -> bool {
 
 fn pending_turn_matches_route(turn: &PendingTurn, route: &ModelProfile) -> bool {
     runner_state::pending_turn_is_complete(turn)
-        && runner_state::pending_turn_is_resumable(turn)
+        // Fallback starts a new provider session from the exact daemon-owned
+        // prompt. A provider-issued continuation may never have arrived (for
+        // example, an initial Codex reviewer can fail before publishing its
+        // thread ID), and it is intentionally not passed to the alternate.
         && turn.provider == route.provider
         && turn.model == route.model
         && turn.effort == route.effort
@@ -321,7 +329,9 @@ mod tests {
         let pool = pool();
         let mut currency = currency();
         currency.lifecycle.status = "in-review".into();
-        let pending_turn = pending_turn();
+        let mut pending_turn = pending_turn();
+        pending_turn.turn_kind = "review".into();
+        pending_turn.continuation_id = None;
         let failed_route = profile();
         let mut reviewer_input = input(
             FailureDisposition::ProviderUnavailable,
@@ -342,6 +352,47 @@ mod tests {
         assert_eq!(
             preflight(&reviewer_input),
             FallbackPreflightOutcome::Authorized
+        );
+    }
+
+    #[test]
+    fn attributed_alternate_route_authorizes_a_later_fallback_hop() {
+        let assignment = assignment();
+        let mut pool = pool();
+        pool.profiles[0].percent = 50;
+        let alternate = ModelProfile {
+            id: "claude-alternate".into(),
+            provider: "claude".into(),
+            runner: "claude".into(),
+            model: "claude-sonnet-4-6".into(),
+            effort: "medium".into(),
+        };
+        pool.profiles.push(WeightedProfile {
+            profile: alternate.clone(),
+            percent: 50,
+        });
+        let currency = currency();
+        let turn = PendingTurn {
+            provider: alternate.provider.clone(),
+            model: alternate.model.clone(),
+            effort: alternate.effort.clone(),
+            prompt: "continue the exact managed turn".into(),
+            turn_kind: "rework".into(),
+            continuation_id: None,
+            requested: false,
+        };
+
+        assert_eq!(
+            preflight(&input(
+                FailureDisposition::ProfileUnavailable,
+                &assignment,
+                &pool,
+                &currency,
+                &currency,
+                &turn,
+                &alternate,
+            )),
+            FallbackPreflightOutcome::Authorized,
         );
     }
 

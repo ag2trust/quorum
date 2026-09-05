@@ -239,6 +239,66 @@ pub fn insert_worker_with_assignment(
     Ok(conn.last_insert_rowid())
 }
 
+/// Atomically issue the worker capability, persist the immutable initial
+/// assignment-backed run, and bind the two. The daemon invokes this before
+/// contacting the provider so both launch-time and later classified failures
+/// can retire the exact same authority without an observable half-bound gap.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_worker_with_assignment_and_capability(
+    conn: &mut Connection,
+    task_id: i64,
+    agent_name: &str,
+    responsibility_key: &str,
+    model: &str,
+    effort: &str,
+    provider: &str,
+    runner: &str,
+    role_assignment_id: Option<i64>,
+    capability_run_id: &str,
+    spawned_at: i64,
+) -> Result<i64> {
+    if capability_run_id.is_empty() || capability_run_id.contains('\0') {
+        return Err(QuorumError::Usage(
+            "initial worker capability identity is invalid".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    crate::capabilities::issue_tx(
+        &tx,
+        capability_run_id,
+        task_id,
+        agent_name,
+        "worker",
+        spawned_at,
+    )?;
+    let run_id = insert_worker_with_assignment(
+        &tx,
+        task_id,
+        agent_name,
+        responsibility_key,
+        model,
+        effort,
+        provider,
+        runner,
+        role_assignment_id,
+        spawned_at,
+    )?;
+    let bound = tx.execute(
+        "UPDATE run_capabilities
+         SET agent_run_id=?2
+         WHERE run_id=?1 AND task_id=?3 AND agent=?4 AND role='worker'
+           AND revoked_at IS NULL AND agent_run_id IS NULL",
+        params![capability_run_id, run_id, task_id, agent_name],
+    )?;
+    if bound != 1 {
+        return Err(QuorumError::Io(
+            "initial worker capability could not bind its immutable run".into(),
+        ));
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(run_id)
+}
+
 /// Create or reuse the agent_runs row that records the deterministic alternate
 /// route named by an immutable [`ValidatedFallbackAttribution`] token.
 ///
@@ -858,6 +918,88 @@ mod tests {
             worker_model(&c, tid).unwrap().as_deref(),
             Some("gpt-5.6-sol")
         );
+    }
+
+    #[test]
+    fn initial_worker_run_and_capability_bind_atomically() {
+        let (_d, mut c) = open_tmp();
+        let tid = crate::tasks::create(
+            &mut c, "boss", "routed", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        let responsibility_key = format!("worker:task:{tid}:revision:1");
+        c.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (42,?1,?2,'worker','sol','codex','codex','gpt-5.6-sol','high',
+                     'worker:M','g1',100)",
+            params![responsibility_key, tid],
+        )
+        .unwrap();
+        let run_id = insert_worker_with_assignment_and_capability(
+            &mut c,
+            tid,
+            "Routed",
+            &responsibility_key,
+            "gpt-5.6-sol",
+            "high",
+            "codex",
+            "codex",
+            Some(42),
+            "worker-cap",
+            101,
+        )
+        .unwrap();
+        let bound: (i64, String, String, String, Option<i64>) = c
+            .query_row(
+                "SELECT task_id,agent,role,run_id,agent_run_id
+                 FROM run_capabilities WHERE run_id='worker-cap'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            bound,
+            (
+                tid,
+                "Routed".into(),
+                "worker".into(),
+                "worker-cap".into(),
+                Some(run_id)
+            )
+        );
+
+        assert!(insert_worker_with_assignment_and_capability(
+            &mut c,
+            tid,
+            "Wrong",
+            &responsibility_key,
+            "different-model",
+            "high",
+            "codex",
+            "codex",
+            Some(42),
+            "rolled-back-cap",
+            102,
+        )
+        .is_err());
+        let leaked: i64 = c
+            .query_row(
+                "SELECT count(*) FROM run_capabilities WHERE run_id='rolled-back-cap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0);
     }
 
     #[test]

@@ -1258,6 +1258,71 @@ pub fn claim_provider_retry_rework(
     Ok(task)
 }
 
+/// Restore or extend the exact lease for a committed fallback intent during
+/// daemon startup. The task participant and lifecycle phase must still match;
+/// a competing live holder wins and leaves the intent unreplayed.
+pub fn renew_fallback_recovery_lease(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    role: &str,
+    ttl: i64,
+    now: i64,
+) -> Result<bool> {
+    if id <= 0 || agent.is_empty() || !matches!(role, "worker" | "reviewer") {
+        return Err(QuorumError::Usage(
+            "invalid fallback recovery lease identity".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let task_matches: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM tasks
+             WHERE id=?1 AND assignee=?2
+               AND ((?3='worker' AND status IN ('working','rework'))
+                    OR (?3='reviewer' AND status='in-review' AND reviewer=?2))
+         )",
+        params![id, agent, role],
+        |row| row.get(0),
+    )?;
+    if !task_matches {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let target = lease_target(id);
+    let competing: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM claims
+             WHERE target=?1 AND active=1 AND expires_at>?2 AND holder!=?3
+         )",
+        params![target, now, agent],
+        |row| row.get(0),
+    )?;
+    if competing {
+        tx.commit()?;
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE claims SET active=0
+         WHERE target=?1 AND active=1 AND expires_at<=?2",
+        params![target, now],
+    )?;
+    let renewed = tx.execute(
+        "UPDATE claims SET ts=?2,expires_at=?3
+         WHERE target=?1 AND holder=?4 AND active=1",
+        params![target, now, now + ttl, agent],
+    )?;
+    if renewed == 0 {
+        tx.execute(
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+             VALUES (?1,?2,?3,?4,1)",
+            params![target, agent, now, now + ttl],
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Daemon-private: restore the lease for an exact dormant worker whose
 /// awaiting-review lease expired while the daemon was down. The task must
 /// still be in `in-review` or `merging`, and no other live holder may exist.
@@ -1520,6 +1585,72 @@ pub fn reserve_reviewer_provision(
         return Ok(false);
     }
     inserted?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Attach the reviewer selected by one live daemon provisioning reservation
+/// and transfer the task-scoped lease to that exact identity. Unlike the
+/// generic claim selector, this supports the R1 -> R2 handoff where the R1
+/// reviewer remains recorded until R2 becomes authoritative.
+#[allow(clippy::too_many_arguments)]
+pub fn attach_reserved_reviewer(
+    conn: &mut Connection,
+    task_id: i64,
+    token: &str,
+    role: &str,
+    agent: &str,
+    ttl: i64,
+    now: i64,
+) -> Result<bool> {
+    if task_id <= 0
+        || token.is_empty()
+        || token.len() > 128
+        || token.contains('\0')
+        || !matches!(role, "r1" | "r2")
+        || agent.is_empty()
+        || agent.contains('\0')
+        || ttl <= 0
+    {
+        return Err(QuorumError::Usage(
+            "invalid reserved reviewer attachment".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET reviewer=?1,assignee=?1,updated_at=?2
+         WHERE id=?3 AND status='in-review'
+           AND (author IS NULL OR author!=?1)
+           AND EXISTS (
+               SELECT 1 FROM reviewer_provision_reservations
+               WHERE task_id=?3 AND token=?4 AND role=?5
+           )",
+        params![agent, now, task_id, token, role],
+    )?;
+    if changed != 1 {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let target = lease_target(task_id);
+    tx.execute(
+        "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
+        params![target],
+    )?;
+    tx.execute(
+        "INSERT INTO claims(target,holder,ts,expires_at,active)
+         VALUES (?1,?2,?3,?4,1)",
+        params![target, agent, now, now + ttl],
+    )?;
+    crate::events::emit(
+        &tx,
+        "reviewer_attached",
+        &target,
+        &format!("by {agent}"),
+        now,
+    )?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     tx.commit()?;
     Ok(true)
 }
@@ -2186,6 +2317,52 @@ pub fn record_ci_remediation_attempt(
              WHERE id=?1 AND status='rework' AND json_valid(refs)
                AND json_extract(refs, '$.ci_remediation_requested')=1
              RETURNING json_extract(refs, '$.ci_remediation_attempts')",
+            params![id, now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    tx.commit()?;
+    Ok(attempts)
+}
+
+/// Consume a failed-CI remediation request after its guarded worker claim
+/// cleanly loses because no eligible worker can own it. The attempt increment
+/// and request removal share one transaction, so the reconciler cannot retry
+/// the same PR head indefinitely between those two writes.
+///
+/// A task blocked on unfinished dependencies intentionally keeps its request:
+/// [`retain_blocked_remediation_retry`] restores that bounded retry once the
+/// dependencies are ready. A live remediation lease likewise belongs to a
+/// concurrent winner and must remain untouched.
+pub fn record_ci_remediation_claim_loss(
+    conn: &mut Connection,
+    id: i64,
+    now: i64,
+) -> Result<Option<i64>> {
+    let tx = begin_immediate(conn)?;
+    let attempts = tx
+        .query_row(
+            &format!(
+                "UPDATE tasks
+                 SET refs=json_remove(
+                         json_set(
+                             refs,
+                             '$.ci_remediation_attempts',
+                             COALESCE(json_extract(refs, '$.ci_remediation_attempts'), 0) + 1
+                         ),
+                         '$.ci_remediation_requested'
+                     ),
+                     updated_at=?2
+                 WHERE id=?1 AND status='rework' AND json_valid(refs)
+                   AND json_extract(refs, '$.ci_remediation_requested')=1
+                   AND {DEP_READY_CLAUSE}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM claims c
+                       WHERE c.target='task#' || tasks.id
+                         AND c.active=1 AND c.expires_at > ?2
+                   )
+                 RETURNING json_extract(refs, '$.ci_remediation_attempts')"
+            ),
             params![id, now],
             |row| row.get(0),
         )
@@ -8965,14 +9142,14 @@ mod tests {
             .unwrap();
         assert_eq!(claimed_events, 0);
         assert_eq!(row_count(&selector, "agent_runs", id), 0);
-        let claims: i64 = selector
+        let active_claims: i64 = selector
             .query_row(
-                "SELECT COUNT(*) FROM claims WHERE target=?1",
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
                 params![lease_target(id)],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(claims, 0);
+        assert_eq!(active_claims, 0);
     }
 
     #[test]
@@ -12744,6 +12921,66 @@ mod tests {
     }
 
     #[test]
+    fn failed_ci_remediation_claim_loss_consumes_the_request_once() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "ineligible failed-CI remediation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        // The reconciler can read a durable intent left on an ineligible
+        // rework row (for example a workerless review-only task). Keep the
+        // classifier incomplete so the guarded remediation claim cleanly
+        // refuses it without allocating a lease.
+        c.execute(
+            "UPDATE tasks
+             SET status='rework', refs=json_object(
+                 'ci_remediation_requested', json('true'),
+                 'ci_remediation_pr', 453,
+                 'ci_remediation_head_sha', 'abc123',
+                 'ci_remediation_feedback', 'fix failed CI',
+                 'ci_remediation_checks', json('[\"test\"]'),
+                 'ci_remediation_attempts', 0
+             )
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+
+        assert!(
+            claim_remediation_rework(&mut c, "REM1", id, TTL, 1100)
+                .unwrap()
+                .is_none(),
+            "the invalid task must cleanly refuse remediation eligibility"
+        );
+        assert_eq!(
+            record_ci_remediation_claim_loss(&mut c, id, 1101).unwrap(),
+            Some(1),
+            "the terminal claim-loss path must record its bounded attempt"
+        );
+        let task = get(&c, id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(
+            refs.get(CI_REMEDIATION_REQUESTED_REF).is_none(),
+            "a consumed request must not be selected again"
+        );
+        assert_eq!(refs[CI_REMEDIATION_ATTEMPTS_REF], 1);
+        assert_eq!(
+            record_ci_remediation_claim_loss(&mut c, id, 1102).unwrap(),
+            None,
+            "the same request must be terminal and idempotent across ticks"
+        );
+    }
+
+    #[test]
     fn ready_large_review_only_gets_atomic_review_and_remediation_authority() {
         let (_d, mut c) = open_tmp();
         for (index, (size, cx_est)) in [("L", 5), ("XL", 2)].into_iter().enumerate() {
@@ -12794,10 +13031,26 @@ mod tests {
             );
 
             let reviewer = format!("reviewer-{size}");
-            let attached = claim(&mut c, &reviewer, Some(id), &[], TTL, 1102 + offset)
-                .unwrap()
-                .expect("large review-only task must accept reviewer attachment");
+            assert!(attach_reserved_reviewer(
+                &mut c,
+                id,
+                &token,
+                "r1",
+                &reviewer,
+                TTL,
+                1102 + offset,
+            )
+            .unwrap());
+            let attached = get(&c, id).unwrap().unwrap();
             assert_eq!(attached.reviewer.as_deref(), Some(reviewer.as_str()));
+            let holder: String = c
+                .query_row(
+                    "SELECT holder FROM claims WHERE target=?1 AND active=1",
+                    [lease_target(id)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(holder, reviewer);
             assert!(release_reviewer_provision(&mut c, id, &token).unwrap());
 
             let rework =
@@ -12820,6 +13073,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parked, 0);
+    }
+
+    #[test]
+    fn reserved_r2_attachment_transfers_r1_lease_atomically() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "owner",
+            "two-stage review",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"pr":700,"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            Some(700),
+            1000,
+        )
+        .unwrap();
+        assert!(reserve_reviewer_provision(&mut c, id, "r1-token", "r1", 1001).unwrap());
+        assert!(attach_reserved_reviewer(&mut c, id, "r1-token", "r1", "R1", TTL, 1002,).unwrap());
+        assert!(release_reviewer_provision(&mut c, id, "r1-token").unwrap());
+
+        assert!(reserve_reviewer_provision(&mut c, id, "r2-token", "r2", 1003).unwrap());
+        assert!(attach_reserved_reviewer(&mut c, id, "r2-token", "r2", "R2", TTL, 1004,).unwrap());
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.reviewer.as_deref(), Some("R2"));
+        assert_eq!(task.assignee.as_deref(), Some("R2"));
+        let live: Vec<String> = {
+            let mut statement = c
+                .prepare("SELECT holder FROM claims WHERE target=?1 AND active=1")
+                .unwrap();
+            statement
+                .query_map([lease_target(id)], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(live, vec!["R2"]);
     }
 
     #[test]
@@ -12971,21 +13264,29 @@ mod tests {
         assert!(reserve_reviewer_provision(&mut c, frozen_review, "frozen", "r1", 1023,).unwrap());
         // Attaching that reviewer to the in-review PR is likewise allowed under
         // the freeze — reviewer attachment is in-flight continuation.
-        assert!(
-            claim(&mut c, "frozen", Some(frozen_review), &[], TTL, 1024,)
-                .unwrap()
-                .is_some()
-        );
+        assert!(attach_reserved_reviewer(
+            &mut c,
+            frozen_review,
+            "frozen",
+            "r1",
+            "frozen",
+            TTL,
+            1024,
+        )
+        .unwrap());
         // Existing rework/remediation, by contrast, MUST finish under the freeze
         // (same deadlock class as review): the retained worker's rework turn is
         // in-flight work the drain waits on, not a new start.
-        c.execute(
-            "UPDATE tasks SET status='rework',assignee=NULL WHERE id=?1",
-            [frozen_review],
+        apply_event(
+            &mut c,
+            "frozen",
+            frozen_review,
+            &Event::VerdictChanges,
+            1025,
         )
         .unwrap();
         assert!(
-            claim_remediation_rework(&mut c, "frozen", frozen_review, TTL, 1025)
+            claim_remediation_rework(&mut c, "frozen", frozen_review, TTL, 1026)
                 .unwrap()
                 .is_some()
         );
