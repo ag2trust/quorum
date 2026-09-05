@@ -293,7 +293,8 @@ pub enum Command {
         /// Loopback address (127.0.0.1 or ::1 only; remote serving is unsupported).
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
-        /// Session-log root. Defaults to ~/.quorum/logs; set this to the daemon's --log-dir.
+        /// Session-log root. Defaults to the repository's configured daemon log_dir, then
+        /// ~/.quorum/logs when the serve configuration does not set one.
         #[arg(long)]
         log_dir: Option<PathBuf>,
     },

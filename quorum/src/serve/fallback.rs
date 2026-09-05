@@ -22,7 +22,7 @@ use quorum_core::routing_attempts::{
     self, FallbackAttributionInput, RoutingAttempt, ValidatedFallbackAttribution,
 };
 use quorum_core::runner_state::{PendingTurn, ProviderBlock};
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 /// Immutable input for one possible fallback installation.
 ///
@@ -44,6 +44,11 @@ pub struct FallbackInstallInput<'a> {
     pub failed_run: FailedManagedRun<'a>,
     pub alternate_agent: &'a str,
     pub alternate_capability_run_id: &'a str,
+    /// Fresh provider-session identity written to the process journal in the
+    /// same transaction as the alternate run/capability/intent. Recovery can
+    /// therefore distinguish a committed fallback from the failed process it
+    /// replaces before any provider call occurs.
+    pub fallback_session_id: &'a str,
     pub reviewer_launch: Option<ReviewerLaunchEvidence<'a>>,
     pub worktree: &'a str,
     pub recorded_at: i64,
@@ -59,7 +64,7 @@ pub enum FallbackInstallOutcome {
     /// Lifecycle, lease, head, assignment, route, or pool evidence was stale
     /// or contradictory. No database mutation was made.
     FailClosed,
-    /// One alternate run, capability, and restart-safe descriptor were
+    /// One alternate run, capability, and durable launch descriptor were
     /// committed before this result was returned.
     Installed(Box<FallbackLaunchIntent>),
     /// The failed route was durably retired, but no alternate can receive
@@ -103,6 +108,9 @@ pub fn install(
         head_sha: head.head_sha.clone(),
     });
     let tx = quorum_core::db::begin_immediate(conn)?;
+    if !durable_currency_is_current(&tx, input)? {
+        return Ok(FallbackInstallOutcome::FailClosed);
+    }
     let exclusions = fallback_retire::retire_tx(
         &tx,
         &FallbackRetireInput {
@@ -125,6 +133,10 @@ pub fn install(
             return Err(QuorumError::Io(
                 "fallback launch intent replay conflicts with immutable evidence".into(),
             ));
+        }
+        let alternate_agent = capability_agent(&tx, &intent.capability_run_id)?;
+        if !live_responsibility_has_no_outcome(&tx, input, &alternate_agent)? {
+            return Ok(FallbackInstallOutcome::FailClosed);
         }
         tx.commit()?;
         return fallback_launch::reconstruct(
@@ -180,6 +192,10 @@ pub fn install(
                     created_at: input.issued_at,
                 },
             )?;
+            persist_pending_journal_tx(&tx, input, &profile)?;
+            if !live_responsibility_has_no_outcome(&tx, input, input.alternate_agent)? {
+                return Ok(FallbackInstallOutcome::FailClosed);
+            }
             (
                 intent.routing_attempt_id,
                 FallbackInstallOutcome::Installed(Box::new(intent)),
@@ -198,6 +214,137 @@ pub fn install(
         .ok_or_else(|| QuorumError::Io("committed fallback launch intent is missing".into())),
         outcome => Ok(outcome),
     }
+}
+
+fn persist_pending_journal_tx(
+    tx: &Transaction<'_>,
+    input: &FallbackInstallInput<'_>,
+    profile: &ModelProfile,
+) -> Result<()> {
+    if input.fallback_session_id.is_empty() || input.fallback_session_id.contains('\0') {
+        return Err(QuorumError::Usage(
+            "fallback session identity is invalid".into(),
+        ));
+    }
+    let changed = tx.execute(
+        "UPDATE journal
+         SET session_id=?1, phase='fallback-pending', pid=NULL, provider=?2,
+             continuation_id=NULL, updated_at=?3
+         WHERE agent=?4 AND task_id=?5 AND role=?6",
+        params![
+            input.fallback_session_id,
+            profile.provider,
+            input.recorded_at,
+            input.failed_run.agent,
+            input.assignment.task_id,
+            input.assignment.role,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(QuorumError::Io(
+            "fallback launch journal identity is missing or conflicts".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Re-prove the caller's lifecycle and lease observation under the same write
+/// lock that retires the failed route and installs its alternate. The
+/// in-memory preflight rejects an observation that was already stale; this
+/// second gate closes the check/write race before any authority changes.
+fn durable_currency_is_current(
+    tx: &Transaction<'_>,
+    input: &FallbackInstallInput<'_>,
+) -> Result<bool> {
+    let expected = input.expected_currency;
+    let lifecycle = tx
+        .query_row(
+            "SELECT status,revision FROM tasks WHERE id=?1",
+            [expected.lifecycle.task_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if lifecycle.as_ref()
+        != Some(&(
+            expected.lifecycle.status.clone(),
+            expected.lifecycle.generation,
+        ))
+    {
+        return Ok(false);
+    }
+    let lease = tx
+        .query_row(
+            "SELECT target,holder,expires_at FROM claims WHERE id=?1 AND active=1",
+            [expected.lease.claim_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(lease.as_ref()
+        == Some(&(
+            expected.lease.target.clone(),
+            expected.lease.holder.clone(),
+            expected.lease.expires_at,
+        ))
+        && expected.lease.expires_at > input.observed_at)
+}
+
+fn capability_agent(tx: &Transaction<'_>, run_id: &str) -> Result<String> {
+    tx.query_row(
+        "SELECT agent FROM run_capabilities WHERE run_id=?1 AND revoked_at IS NULL",
+        [run_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+/// Re-prove the exact logical participant still owns this responsibility only
+/// after the alternate run, capability, and launch intent exist in this
+/// transaction. Provider failover rotates executable authority, not the
+/// task-scoped agent identity. A managed outcome that arrived between process
+/// observation and this write wins and rolls the whole installation back.
+fn live_responsibility_has_no_outcome(
+    tx: &Transaction<'_>,
+    input: &FallbackInstallInput<'_>,
+    alternate_agent: &str,
+) -> Result<bool> {
+    let task_id = input.assignment.task_id.unwrap_or_default();
+    let failed_agent = input.failed_run.agent;
+    if failed_agent != alternate_agent {
+        return Ok(false);
+    }
+    Ok(match input.assignment.role.as_str() {
+        "worker" => tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM tasks
+                 WHERE id=?1 AND status IN ('working','rework') AND assignee=?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM mailbox
+                   WHERE agent=?2 AND kind='done' AND task_id=?1
+                     AND consumed_at IS NULL AND verdict IS NULL
+               ))",
+            params![task_id, failed_agent],
+            |row| row.get(0),
+        )?,
+        "reviewer" => tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM tasks
+                 WHERE id=?1 AND status='in-review' AND reviewer=?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM mailbox
+                   WHERE agent=?2 AND kind='done' AND task_id=?1
+                     AND consumed_at IS NULL AND verdict IS NOT NULL
+               ))",
+            params![task_id, failed_agent],
+            |row| row.get(0),
+        )?,
+        _ => return Ok(false),
+    })
 }
 
 fn launch_identity_is_current(input: &FallbackInstallInput<'_>) -> bool {
@@ -327,8 +474,17 @@ mod tests {
             1,
         )
         .unwrap();
-        conn.execute("UPDATE tasks SET status='working' WHERE id=?1", [task_id])
-            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='working',assignee='failed-agent' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+             VALUES (?1,'fallback-installer',1,100,1)",
+            [format!("task#{task_id}")],
+        )
+        .unwrap();
         let responsibility = format!("worker:task:{task_id}:revision:1");
         let primary = &pool.profiles[0].profile;
         conn.execute(
@@ -354,16 +510,14 @@ mod tests {
             .unwrap();
         conn.execute(
             "INSERT INTO agent_runs(
-                 task_id,agent_name,role,model,effort,provider,role_assignment_id,spawned_at,
-                 configured_profile_id,configured_provider,configured_model,configured_effort)
-             VALUES (?1,'failed-agent','worker',?2,?3,?4,?5,2,?6,?4,?2,?3)",
+                 task_id,agent_name,role,model,effort,provider,role_assignment_id,spawned_at)
+             VALUES (?1,'failed-agent','worker',?2,?3,?4,?5,2)",
             params![
                 task_id,
                 primary.model,
                 primary.effort,
                 primary.provider,
                 assignment.id,
-                primary.id,
             ],
         )
         .unwrap();
@@ -372,6 +526,15 @@ mod tests {
             "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at,agent_run_id)
              VALUES ('failed-capability',?1,'failed-agent','worker',2,?2)",
             [task_id, failed_run_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO journal(
+                 agent,role,task_id,session_id,worktree,branch,phase,cost_tokens,
+                 cost_usd,rework_count,provider,updated_at)
+             VALUES ('failed-agent','worker',?1,'failed-session',
+                     '/tmp/fallback-install-worktree','daemon/test','working',0,0,0,'codex',2)",
+            [task_id],
         )
         .unwrap();
         Fixture {
@@ -443,8 +606,9 @@ mod tests {
                 ended_at: 10,
                 end_reason: "fallback-route-unavailable",
             },
-            alternate_agent: "alternate-agent",
+            alternate_agent: "failed-agent",
             alternate_capability_run_id: "alternate-capability",
+            fallback_session_id: "fallback-session",
             reviewer_launch: None,
             worktree: "/tmp/fallback-install-worktree",
             recorded_at: 9,
@@ -531,6 +695,79 @@ mod tests {
     }
 
     #[test]
+    fn write_locked_currency_and_pending_outcome_races_fail_closed_without_retirement() {
+        let mut fixture = fixture(pool());
+        let currency = currency(fixture.task_id);
+        let turn = pending_turn();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET status='rework' WHERE id=?1",
+                [fixture.task_id],
+            )
+            .unwrap();
+        let before = state(&fixture.conn, fixture.task_id);
+        assert_eq!(
+            install(
+                &mut fixture.conn,
+                &input(
+                    &fixture.assignment,
+                    &fixture.pool,
+                    FailureDisposition::ProviderUnavailable,
+                    &currency,
+                    &currency,
+                    &turn,
+                ),
+            )
+            .unwrap(),
+            FallbackInstallOutcome::FailClosed
+        );
+        assert_eq!(state(&fixture.conn, fixture.task_id), before);
+
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET status='working' WHERE id=?1",
+                [fixture.task_id],
+            )
+            .unwrap();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO mailbox(agent,kind,task_id,created_at)
+                 VALUES ('failed-agent','done',?1,98)",
+                [fixture.task_id],
+            )
+            .unwrap();
+        let before = state(&fixture.conn, fixture.task_id);
+        assert_eq!(
+            install(
+                &mut fixture.conn,
+                &input(
+                    &fixture.assignment,
+                    &fixture.pool,
+                    FailureDisposition::ProviderUnavailable,
+                    &currency,
+                    &currency,
+                    &turn,
+                ),
+            )
+            .unwrap(),
+            FallbackInstallOutcome::FailClosed
+        );
+        assert_eq!(state(&fixture.conn, fixture.task_id), before);
+        assert_eq!(
+            fixture
+                .conn
+                .query_row("SELECT ended_at FROM agent_runs WHERE id=1", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                },)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn persists_replays_and_reconstructs_a_continuation_free_launch_descriptor() {
         let mut fixture = fixture(pool());
         let currency = currency(fixture.task_id);
@@ -548,7 +785,7 @@ mod tests {
         )
         .unwrap();
         let FallbackInstallOutcome::Installed(intent) = first else {
-            panic!("an alternate route must be installed");
+            panic!("an alternate route must be installed: {first:?}");
         };
         let intent = *intent;
         assert_eq!(intent.task_id, fixture.task_id);
@@ -566,6 +803,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(committed, Some(intent.clone()));
+        let (old_revoked_at, new_revoked_at, new_agent_run): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = fixture
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT revoked_at FROM run_capabilities WHERE run_id='failed-capability'),
+                    (SELECT revoked_at FROM run_capabilities WHERE run_id=?1),
+                    (SELECT agent_run_id FROM run_capabilities WHERE run_id=?1)",
+                [&intent.capability_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(old_revoked_at, Some(10));
+        assert_eq!(new_revoked_at, None);
+        assert_eq!(new_agent_run, Some(intent.agent_run_id));
 
         let mut replay_input = input(
             &fixture.assignment,
@@ -618,7 +873,7 @@ mod tests {
         fixture
             .conn
             .execute(
-                "UPDATE tasks SET status='in-review' WHERE id=?1",
+                "UPDATE tasks SET status='in-review',reviewer='failed-agent' WHERE id=?1",
                 [fixture.task_id],
             )
             .unwrap();
@@ -633,6 +888,13 @@ mod tests {
         fixture
             .conn
             .execute("UPDATE agent_runs SET role='reviewer' WHERE id=1", [])
+            .unwrap();
+        fixture
+            .conn
+            .execute(
+                "UPDATE journal SET role='reviewer',pr=7 WHERE agent='failed-agent'",
+                [],
+            )
             .unwrap();
         fixture
             .conn
@@ -655,7 +917,7 @@ mod tests {
             lease: super::fallback_preflight::LeaseCurrency {
                 claim_id: 1,
                 target: format!("task#{}", fixture.task_id),
-                holder: "reviewer-installer".into(),
+                holder: "fallback-installer".into(),
                 expires_at: 100,
             },
             head: Some(super::fallback_preflight::HeadCurrency {
@@ -677,6 +939,21 @@ mod tests {
             pr: 7,
             head_sha: &head_sha,
         });
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO mailbox(agent,kind,task_id,pr,verdict,created_at)
+                 VALUES ('failed-agent','done',?1,7,'approved',98)",
+                [fixture.task_id],
+            )
+            .unwrap();
+        assert_eq!(
+            install(&mut fixture.conn, &install_input).unwrap(),
+            FallbackInstallOutcome::FailClosed,
+            "a pending verdict must win the reviewer fallback race"
+        );
+        assert_eq!(state(&fixture.conn, fixture.task_id).0, 0);
+        fixture.conn.execute("DELETE FROM mailbox", []).unwrap();
         let outcome = install(&mut fixture.conn, &install_input).unwrap();
         let FallbackInstallOutcome::Installed(intent) = outcome else {
             panic!("a current reviewer target must be installed");
@@ -781,8 +1058,9 @@ mod tests {
                                 ended_at: 10,
                                 end_reason: "fallback-route-unavailable",
                             },
-                            alternate_agent: "alternate-agent",
+                            alternate_agent: "failed-agent",
                             alternate_capability_run_id: "alternate-capability",
+                            fallback_session_id: "fallback-session",
                             reviewer_launch: None,
                             worktree: "/tmp/fallback-install-worktree",
                             recorded_at: 9,

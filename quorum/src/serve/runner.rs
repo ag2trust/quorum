@@ -558,8 +558,10 @@ pub enum TurnMode {
 /// Provider-neutral inputs for starting one runner turn.
 ///
 /// Provider adapters translate this request into their private command specs.
-/// The model is resolved through [`AgentKind::for_model`]; callers cannot pair
-/// an arbitrary runner with a model or fall back after an adapter fails.
+/// The model is resolved through [`AgentKind::for_model`], so callers cannot
+/// pair an arbitrary runner with a model. Cross-provider fallback is installed
+/// by the lifecycle orchestrator as a fresh request; adapters never migrate a
+/// provider continuation themselves.
 pub struct LaunchRequest<'a> {
     pub model: &'a str,
     pub effort: &'a str,
