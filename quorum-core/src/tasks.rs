@@ -3931,7 +3931,10 @@ pub fn dispose_dead_turn_runner(
         }
         Some("blocked" | "needs-info") => {
             let reason = reaction.as_deref().expect("matched explicit reaction");
-            let refs = set_parked_refs(refs_raw.as_deref(), reason, "working", None)?;
+            // Preserve the lifecycle phase that the reacting worker owned.
+            // `task-retry` can only reopen `working`, while a rework retry
+            // must remain `rework` for its eventual `ReworkPushed` event.
+            let refs = set_parked_refs(refs_raw.as_deref(), reason, &status, None)?;
             tx.execute(
                 "UPDATE tasks
                  SET status='failed', assignee=NULL, refs=?2, updated_at=?3
@@ -6963,6 +6966,88 @@ mod tests {
             let refs: serde_json::Value =
                 serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
             assert_eq!(refs["branch"], "daemon/worker-t1");
+        }
+    }
+
+    #[test]
+    fn dead_turn_runner_rework_reaction_retry_preserves_rework_pushed_path() {
+        for state in ["blocked", "needs-info"] {
+            let (_d, mut c) = open_tmp();
+            let id = create(
+                &mut c,
+                "boss",
+                "t",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/worker-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                1000,
+            )
+            .unwrap();
+            claim(&mut c, "initial-worker", Some(id), &[], TTL, 1000).unwrap();
+            apply_event(
+                &mut c,
+                "initial-worker",
+                id,
+                &Event::SignaledDone { pr: "42".into() },
+                1001,
+            )
+            .unwrap();
+            apply_event(
+                &mut c,
+                "reviewer",
+                id,
+                &Event::ReviewerAttached {
+                    agent: "reviewer".into(),
+                },
+                1002,
+            )
+            .unwrap();
+            apply_event(&mut c, "reviewer", id, &Event::VerdictChanges, 1003).unwrap();
+            claim_remediation_rework(&mut c, "worker", id, TTL, 1004)
+                .unwrap()
+                .expect("rework worker must claim the reviewer remediation");
+            worker_reacts(&mut c, id, state);
+
+            let disposition = dispose_dead_turn_runner(
+                &mut c,
+                id,
+                "worker",
+                &ProviderBlock {
+                    provider: "codex".into(),
+                    reason: "process exited".into(),
+                },
+                &dead_turn_retry(),
+                1005,
+            )
+            .unwrap();
+
+            assert_eq!(disposition, DeadTurnRunnerDisposition::ReactionParked);
+            let parked = get(&c, id).unwrap().unwrap();
+            assert_eq!(parked.status, "failed");
+            let parked_refs: serde_json::Value =
+                serde_json::from_str(parked.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(parked_refs[PARKED_REASON_REF], state);
+            assert_eq!(parked_refs[PARKED_RESUME_STATUS_REF], "rework");
+
+            let retried = retry_parked(&mut c, id, "boss", true, 1006)
+                .unwrap()
+                .expect("reaction park must be retryable");
+            assert_eq!(retried.status, "rework");
+            let retry_refs: serde_json::Value =
+                serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(retry_refs[PARKED_REWORK_RETRY_REF], true);
+
+            claim_provider_retry_rework(&mut c, "retry-worker", id, TTL, 1007)
+                .unwrap()
+                .expect("retried rework must be claimable by its replacement worker");
+            let pushed =
+                apply_event(&mut c, "retry-worker", id, &Event::ReworkPushed, 1008).unwrap();
+            assert_eq!(pushed.task.status, "in-review");
         }
     }
 
