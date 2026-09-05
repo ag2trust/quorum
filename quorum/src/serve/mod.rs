@@ -10353,13 +10353,23 @@ async fn tick(
                     "awaiting-review"
                 };
                 let entry = slot_journal_entry(&workers[wi], "worker", phase);
-                tokio::task::spawn_blocking(move || -> Result<()> {
+                let projection = tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &entry)
                 })
                 .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                .ok();
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+                if let Err(error) = projection {
+                    // The mailbox row is the authoritative reaction until
+                    // its journal projection commits. Leave it pending so a
+                    // later tick, or dead-turn classification, can apply it
+                    // rather than silently discarding the worker outcome.
+                    log(&format!(
+                        "worker {} reaction projection failed; preserving task_update: {error}",
+                        workers[wi].agent_name
+                    ));
+                    continue;
+                }
             } else {
                 // #130: no passive agent handling — unmatched task_updates
                 // are consumed as phantoms.
@@ -14084,6 +14094,12 @@ async fn tick(
                     )
                     .await;
                 }
+                Ok(tasks::DeadTurnRunnerDisposition::AgentFailed(_)) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "failed").await;
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::ReactionParked) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
+                }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
                     if let Some(failure) = dead.observed_pre_authoritative_failure() {
                         log(&format!(
@@ -14349,6 +14365,14 @@ async fn tick(
                         TerminalUsageAction::TransferredOwnershipCleanup,
                     )
                     .await;
+                    continue;
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::AgentFailed(_)) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "failed").await;
+                    continue;
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::ReactionParked) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
@@ -16827,6 +16851,30 @@ async fn settle_dormant_worker_feed_failure(
     let reason = format!("dormant continuation launch failed: {error}");
     match dispose_dead_turn_runner_worker(&config.db_path, task_id, &agent, &reason, &pending).await
     {
+        Ok(tasks::DeadTurnRunnerDisposition::AgentFailed(_)) => {
+            let worker = workers.remove(worker_index);
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                worker.agent_run_id,
+                worker.cap_run_id.as_deref(),
+                "failed",
+            )
+            .await;
+            cleanup_slot(config, wt_mgr, name_pool, worker, None, "failed").await;
+            Ok(DormantWorkerFeedFailureDisposition::Settled)
+        }
+        Ok(tasks::DeadTurnRunnerDisposition::ReactionParked) => {
+            let worker = workers.remove(worker_index);
+            settle_dormant_worker_turn_identity(
+                &config.db_path,
+                worker.agent_run_id,
+                worker.cap_run_id.as_deref(),
+                "parked",
+            )
+            .await;
+            cleanup_slot(config, wt_mgr, name_pool, worker, None, "parked").await;
+            Ok(DormantWorkerFeedFailureDisposition::Settled)
+        }
         Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
             let worker = workers.remove(worker_index);
             settle_dormant_worker_turn_identity(
