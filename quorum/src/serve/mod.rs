@@ -37719,16 +37719,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .unwrap();
         let publication = published_completion(intent, 482);
 
-        let error = tasks::apply_published_worker_event(
+        let Err(error) = tasks::apply_published_worker_event(
             &mut conn,
             "Publisher",
             id,
             &Event::SignaledDone { pr: "482".into() },
             &publication,
             now_unix(),
-        )
-        .err()
-        .expect("an unrelated durable head must fail settlement");
+        ) else {
+            panic!("an unrelated durable head must fail settlement");
+        };
         assert!(error.to_string().contains("target authority changed"));
 
         let task = tasks::get(&conn, id).unwrap().unwrap();
