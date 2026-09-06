@@ -445,7 +445,12 @@ fn planning_attempt_history_is_consistent(
         }
         let count = &mut attempts_by_generation[generation as usize][kind_index];
         *count += 1;
-        if *count > 3 {
+        // A single generation can accumulate at most its own kind's cap before
+        // exhaustion or reset, so bound the per-generation count by the same
+        // constant the cumulative check below uses. A literal here would drift
+        // silently when a cap changes.
+        let per_generation_cap = [MAX_PROPOSAL_ATTEMPTS, MAX_PROVIDER_FAILURES][kind_index];
+        if *count > per_generation_cap {
             return Ok(false);
         }
         expected_ordinal[kind_index] += 1;
