@@ -15,9 +15,13 @@ use super::codex_agent::CodexProc;
 use super::grok_agent::{GrokAdapterConfig, GrokProc};
 use quorum_core::runner_state::{self, PendingTurn};
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 const DIAGNOSTIC_CAPACITY: usize = 256;
 const DIAGNOSTIC_LINE_BYTES: usize = 16 * 1024;
@@ -545,6 +549,143 @@ pub enum AgentKind {
     Grok,
 }
 
+/// One-shot authority to replace a waiting launch wrapper with its provider.
+///
+/// The read side is inherited by the wrapper alone. Dropping this handle
+/// closes the write side, which makes an unreleased wrapper exit without
+/// executing the provider. Claude's initial turn is retained here because a
+/// waiting wrapper cannot consume its stdin without risking a pipe-capacity
+/// deadlock before the daemon has committed its launch boundary.
+#[allow(dead_code)] // consumed when fallback launch orchestration is wired
+pub struct LaunchGate {
+    writer: File,
+    kind: AgentKind,
+    deferred_claude_turn: Option<String>,
+}
+
+#[allow(dead_code)] // consumed when fallback launch orchestration is wired
+impl LaunchGate {
+    fn new(kind: AgentKind) -> std::io::Result<(Self, File)> {
+        let mut fds = [-1; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Both descriptors become owned immediately, so every error after
+        // this point closes them through `File` drop rather than leaking an
+        // inherited writer that would keep the wrapper alive.
+        let read = unsafe { File::from_raw_fd(fds[0]) };
+        let writer = unsafe { File::from_raw_fd(fds[1]) };
+        for fd in [read.as_raw_fd(), writer.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags == -1
+                || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok((
+            Self {
+                writer,
+                kind,
+                deferred_claude_turn: None,
+            },
+            read,
+        ))
+    }
+
+    pub(crate) fn defer_claude_turn(mut self, turn: String) -> Self {
+        self.deferred_claude_turn = Some(turn);
+        self
+    }
+
+    /// Release exactly this process. `proc` is consumed so a gate cannot be
+    /// paired with a process from another launch; a mismatch instead closes
+    /// the pipe and fails before the provider can run.
+    pub async fn release(self, proc: RunnerProc) -> Result<RunnerProc, RunnerFailure> {
+        let LaunchGate {
+            mut writer,
+            kind,
+            deferred_claude_turn,
+        } = self;
+        if proc.kind() != kind {
+            let _ = proc.kill_and_reap().await;
+            return Err(RunnerFailure::classified(
+                FailureDisposition::NonFailover,
+                "launch gate does not belong to this provider process",
+                std::io::ErrorKind::InvalidInput,
+            ));
+        }
+        if let Err(error) = writer.write_all(b"release\n") {
+            drop(writer);
+            let _ = proc.kill_and_reap().await;
+            return Err(RunnerFailure::classified(
+                FailureDisposition::NonFailover,
+                format!("could not release {kind} launch gate: {error}"),
+                error.kind(),
+            ));
+        }
+        drop(writer);
+
+        match (deferred_claude_turn, proc) {
+            (Some(turn), RunnerProc::Claude(proc)) => proc
+                .feed_initial_turn(&turn)
+                .await
+                .map(RunnerProc::Claude)
+                .map_err(|error| classify_launch_error(AgentKind::Claude, error)),
+            (None, proc) => Ok(proc),
+            (Some(_), proc) => {
+                let _ = proc.kill_and_reap().await;
+                Err(RunnerFailure::classified(
+                    FailureDisposition::NonFailover,
+                    "Claude launch gate lost its Claude process",
+                    std::io::ErrorKind::InvalidInput,
+                ))
+            }
+        }
+    }
+}
+
+const GATE_READ_FD: libc::c_int = 3;
+const GATE_WRAPPER: &str = concat!(
+    "IFS= read -r quorum_launch_gate <&3 || exit 0\n",
+    "[ \"$quorum_launch_gate\" = release ] || exit 0\n",
+    "exec 3<&-\n",
+    "exec \"$@\""
+);
+
+/// Start a process-group leader that waits on a close-on-exec pipe before it
+/// replaces itself with `program`. Provider adapters append their normal argv,
+/// environment, cwd, and stdio configuration to the returned command.
+pub(crate) fn gated_command(
+    kind: AgentKind,
+    program: &str,
+) -> std::io::Result<(Command, LaunchGate)> {
+    let (gate, read) = LaunchGate::new(kind)?;
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(GATE_WRAPPER)
+        .arg("quorum-launch-gate")
+        .arg(program);
+    unsafe {
+        command.pre_exec(move || {
+            let read_fd = read.as_raw_fd();
+            if read_fd == GATE_READ_FD {
+                let flags = libc::fcntl(GATE_READ_FD, libc::F_GETFD);
+                if flags == -1
+                    || libc::fcntl(GATE_READ_FD, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(read_fd, GATE_READ_FD) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok((command, gate))
+}
+
 /// Process lifetime declared by a runner adapter. Lifecycle orchestration uses
 /// this capability instead of branching on a provider name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -768,6 +909,36 @@ impl RunnerProc {
         result.map_err(|error| classify_launch_error(kind, error))
     }
 
+    /// Launch a provider behind a one-shot daemon-owned gate. The returned
+    /// process is the waiting wrapper's process-group leader and is therefore
+    /// immediately killable; calling [`LaunchGate::release`] is the only path
+    /// that can execute the provider.
+    ///
+    /// Existing [`Self::launch`] callers intentionally remain ungated. This
+    /// dormant boundary is for fallback orchestration to use after its durable
+    /// launch decision is committed.
+    #[allow(dead_code)] // dormant fallback boundary; no lifecycle caller yet
+    pub async fn launch_gated(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> Result<(Self, LaunchGate), RunnerFailure> {
+        let kind = AgentKind::for_model(request.model).map_err(|error| {
+            RunnerFailure::new(FailureDisposition::Unclassified, error)
+                .with_io_kind(std::io::ErrorKind::InvalidInput)
+        })?;
+        let result = match kind {
+            AgentKind::Claude => AgentProc::launch_gated(request, config)
+                .await
+                .map(|(proc, gate)| (Self::Claude(proc), gate)),
+            AgentKind::Codex => CodexProc::launch_gated(request, config)
+                .map(|(proc, gate)| (Self::Codex(proc), gate)),
+            AgentKind::Grok => {
+                GrokProc::launch_gated(request, config).map(|(proc, gate)| (Self::Grok(proc), gate))
+            }
+        };
+        result.map_err(|error| classify_launch_error(kind, error))
+    }
+
     /// Restricted classifier launch whose deadline covers Claude's initial
     /// stdin feed as well as the returned slot lifetime. Single-turn adapters
     /// receive their prompt in argv and therefore have no pre-slot pipe wait.
@@ -928,6 +1099,18 @@ impl RunnerProc {
             Self::Claude(proc) => proc.pid(),
             Self::Codex(proc) => proc.pid(),
             Self::Grok(proc) => proc.pid(),
+        }
+    }
+
+    /// Spawn-time process-group leader. Unlike [`Self::pid`], this remains
+    /// available after `try_wait` reaps the leader so callers can still target
+    /// descendants that inherited its provider process group.
+    #[allow(dead_code)] // exposed for the future fallback launch owner
+    pub fn process_group_id(&self) -> i32 {
+        match self {
+            Self::Claude(proc) => proc.process_group_id(),
+            Self::Codex(proc) => proc.process_group_id(),
+            Self::Grok(proc) => proc.process_group_id(),
         }
     }
 
@@ -1584,6 +1767,236 @@ mod tests {
             }
         }
         unreachable!("bounded retry either launches the runner or returns its error")
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_file(path: &std::path::Path) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("fixture did not create {}", path.display()));
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_exit(proc: &mut RunnerProc) -> std::process::ExitStatus {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = proc.try_wait().unwrap() {
+                    return status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("gated wrapper did not exit")
+    }
+
+    #[cfg(unix)]
+    fn gate_config<'a>(executable: &'a str) -> AdapterConfig<'a> {
+        AdapterConfig {
+            executable: Some(executable),
+            claude_bare: true,
+            claude_allowed_tools: "Bash,Read",
+            codex_sandbox: "danger-full-access",
+            grok: Default::default(),
+        }
+    }
+
+    /// The gate starts a real process-group leader, but its provider argv,
+    /// environment, and deferred Claude stdin do not become observable until
+    /// the daemon-owned release handle writes its one allowed token.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gated_claude_launch_defers_provider_argv_environment_and_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = recording_runner(dir.path());
+        let environment = vec![("QUORUM_ADAPTER_TEST".into(), "gated-claude-env".into())];
+        let request = LaunchRequest {
+            model: "claude-sonnet-5",
+            effort: "high",
+            worktree: dir.path(),
+            prompt: "deferred Claude prompt",
+            environment: &environment,
+            mode: LaunchMode::Normal,
+            continuation_id: None,
+        };
+
+        let (proc, gate) =
+            RunnerProc::launch_gated(&request, &gate_config(runner.to_str().unwrap()))
+                .await
+                .expect("spawn gated Claude wrapper");
+        assert!(
+            proc.pid().is_some(),
+            "wrapper PID is available before release"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for name in ["args.log", "environment.log", "turn.log"] {
+            assert!(
+                !dir.path().join(name).exists(),
+                "provider ran before gate release: {name}"
+            );
+        }
+
+        let proc = gate.release(proc).await.expect("release gated Claude");
+        wait_for_file(&dir.path().join("turn.log")).await;
+        let args = std::fs::read_to_string(dir.path().join("args.log")).unwrap();
+        let argv: Vec<_> = args
+            .lines()
+            .map(|arg| {
+                arg.strip_prefix('<')
+                    .and_then(|arg| arg.strip_suffix('>'))
+                    .expect("recorded argv shape")
+            })
+            .collect();
+        let session_flag = argv
+            .iter()
+            .position(|arg| *arg == "--session-id")
+            .expect("Claude session argument");
+        let session_id = argv[session_flag + 1];
+        assert!(uuid::Uuid::parse_str(session_id).is_ok(), "{args}");
+        assert_eq!(
+            argv,
+            vec![
+                "-p",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "claude-sonnet-5",
+                "--effort",
+                "high",
+                "--session-id",
+                session_id,
+                "--add-dir",
+                dir.path().to_str().unwrap(),
+                "--permission-mode",
+                "dontAsk",
+                "--allowedTools",
+                "Bash,Read",
+                "--bare",
+            ],
+            "gated launch must preserve the exact Claude argv"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("environment.log"))
+                .unwrap()
+                .trim(),
+            "gated-claude-env"
+        );
+        let turn: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(dir.path().join("turn.log"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(turn["message"]["content"], "deferred Claude prompt");
+        proc.kill_and_reap().await;
+    }
+
+    /// Dropping the only writer models daemon death at the crash boundary. The
+    /// shell wrapper must observe EOF and exit without `exec`ing any provider.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreleased_gated_launch_exits_without_running_each_provider() {
+        for (model, continuation_id) in [
+            ("claude-sonnet-5", None),
+            ("gpt-5.6-terra", None),
+            (super::super::grok_agent::DEFAULT_MODEL, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let runner = recording_runner(dir.path());
+            let environment = vec![("QUORUM_ADAPTER_TEST".into(), "must-not-run".into())];
+            let request = LaunchRequest {
+                model,
+                effort: "high",
+                worktree: dir.path(),
+                prompt: "provider must not run",
+                environment: &environment,
+                mode: LaunchMode::Normal,
+                continuation_id,
+            };
+            let (mut proc, gate) =
+                RunnerProc::launch_gated(&request, &gate_config(runner.to_str().unwrap()))
+                    .await
+                    .unwrap_or_else(|error| panic!("spawn gated {model}: {error}"));
+            assert!(proc.pid().is_some(), "{model} wrapper has no PID");
+            assert_eq!(
+                proc.pid(),
+                Some(proc.process_group_id()),
+                "{model} wrapper is not its process-group leader"
+            );
+            assert_eq!(
+                unsafe { libc::killpg(proc.process_group_id(), 0) },
+                0,
+                "{model} wrapper process group is not killable"
+            );
+            drop(gate);
+            assert!(wait_for_exit(&mut proc).await.success(), "{model}");
+            assert!(
+                !dir.path().join("args.log").exists(),
+                "{model} provider ran after gate EOF"
+            );
+            proc.kill_and_reap().await;
+        }
+    }
+
+    /// Each adapter reaches its provider command once after release. This
+    /// checks the shared wrapper without depending on provider protocol
+    /// parsing: the marker is written by the executable itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn releasing_gated_launch_executes_each_provider_exactly_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for model in [
+            "claude-sonnet-5",
+            "gpt-5.6-terra",
+            super::super::grok_agent::DEFAULT_MODEL,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("provider-started");
+            let runner = dir.path().join("marker-runner");
+            std::fs::write(
+                &runner,
+                format!(
+                    "#!/bin/sh\nprintf started >> '{}'\nif [ \"$1\" = '-p' ]; then IFS= read -r _ || true; fi\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let environment = Vec::new();
+            let request = LaunchRequest {
+                model,
+                effort: "high",
+                worktree: dir.path(),
+                prompt: "one execution",
+                environment: &environment,
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            };
+            let (proc, gate) =
+                RunnerProc::launch_gated(&request, &gate_config(runner.to_str().unwrap()))
+                    .await
+                    .unwrap_or_else(|error| panic!("spawn gated {model}: {error}"));
+            assert!(!marker.exists(), "{model} ran before release");
+            let mut proc = gate
+                .release(proc)
+                .await
+                .unwrap_or_else(|error| panic!("release gated {model}: {error}"));
+            assert!(wait_for_exit(&mut proc).await.success(), "{model}");
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap().lines().count(),
+                1,
+                "{model} provider execution count"
+            );
+            proc.kill_and_reap().await;
+        }
     }
 
     #[cfg(unix)]

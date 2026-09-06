@@ -1,9 +1,10 @@
 //! AgentProc: spawn, feed, read, and kill one claude child process.
 
 use super::runner::{
-    capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
-    AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation,
-    FailureTracker, LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
+    capture_diagnostics, gated_command, tool_summary, ActivityKind, AdapterConfig, AgentEvent,
+    AgentKind, AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition,
+    FailureObservation, FailureTracker, LaunchGate, LaunchMode, LaunchRequest, NormalizedLine,
+    RunnerFailure, TokenUsage,
 };
 use super::stream::{self, Event};
 use std::path::PathBuf;
@@ -83,6 +84,45 @@ impl AgentProc {
         config: &AdapterConfig<'_>,
     ) -> std::io::Result<Self> {
         Self::launch_with_deadline(request, config, None).await
+    }
+
+    /// Spawn the persistent Claude transport behind a daemon release gate.
+    /// The initial turn stays with the gate until release: a waiting wrapper
+    /// cannot read Claude's stdin, so writing it early could fill the pipe
+    /// before the daemon has established its durable launch boundary.
+    #[allow(dead_code)] // dormant fallback boundary; no lifecycle caller yet
+    pub async fn launch_gated(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> std::io::Result<(Self, LaunchGate)> {
+        let spec = AgentSpec {
+            kind: AgentKind::Claude,
+            model: request.model.to_string(),
+            effort: request.effort.to_string(),
+            session_id: request
+                .continuation_id
+                .map(str::to_owned)
+                .unwrap_or_else(new_session_id),
+            worktree: request.worktree.to_path_buf(),
+            bare: config.claude_bare,
+            allowed_tools: config.claude_allowed_tools.to_string(),
+            env_vars: request.environment.to_vec(),
+        };
+        let (proc, gate) = match request.mode {
+            LaunchMode::Normal => Self::spawn_configured_gated(
+                &spec,
+                config.executable,
+                RestrictedMode::None,
+                request.agent_mcp_server(),
+            )?,
+            LaunchMode::Restricted => Self::spawn_configured_gated(
+                &spec,
+                config.executable,
+                RestrictedMode::ClosedBook,
+                None,
+            )?,
+        };
+        Ok((proc, gate.defer_claude_turn(user_turn(request.prompt))))
     }
 
     /// Launch a restricted role whose total turn deadline includes feeding
@@ -480,7 +520,110 @@ impl AgentProc {
             });
         }
 
-        let mut child = cmd.spawn()?;
+        Self::from_child(cmd.spawn()?)
+    }
+
+    fn spawn_configured_gated(
+        spec: &AgentSpec,
+        agent_bin: Option<&str>,
+        restricted: RestrictedMode,
+        agent_mcp: Option<AgentMcpServer>,
+    ) -> std::io::Result<(Self, LaunchGate)> {
+        let bin = agent_bin.unwrap_or("claude");
+        let (mut cmd, gate) = gated_command(AgentKind::Claude, bin)?;
+        cmd.arg("-p")
+            .arg("--input-format")
+            .arg("stream-json")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--verbose")
+            .arg("--model")
+            .arg(&spec.model)
+            .arg("--effort")
+            .arg(&spec.effort);
+
+        cmd.arg("--session-id").arg(&spec.session_id);
+
+        if let Some(server) = agent_mcp {
+            cmd.arg("--mcp-config")
+                .arg(claude_mcp_config(server))
+                .arg("--strict-mcp-config");
+        }
+
+        if restricted != RestrictedMode::None {
+            cmd.arg("--setting-sources")
+                .arg("")
+                .arg("--disable-slash-commands")
+                .arg("--tools")
+                .arg(match restricted {
+                    RestrictedMode::Planner => "Read,Glob,Grep",
+                    _ => "",
+                })
+                .arg("--no-session-persistence");
+            if restricted == RestrictedMode::Planner {
+                cmd.arg("--add-dir").arg(&spec.worktree);
+            }
+            let claude_md = spec.worktree.join("CLAUDE.md");
+            if claude_md.is_file() {
+                cmd.arg("--append-system-prompt-file").arg(&claude_md);
+            }
+        } else {
+            cmd.arg("--add-dir").arg(&spec.worktree);
+        }
+
+        let mcp_allowed_tool = match restricted {
+            RestrictedMode::Planner => crate::serve::runner::PLANNER_MCP_ALLOWED_TOOL,
+            _ => AGENT_MCP_ALLOWED_TOOL,
+        };
+        let allowed_tools = match agent_mcp {
+            Some(_) if spec.allowed_tools.is_empty() => mcp_allowed_tool.to_string(),
+            Some(_)
+                if !spec
+                    .allowed_tools
+                    .split(',')
+                    .any(|tool| tool == mcp_allowed_tool) =>
+            {
+                format!("{},{}", spec.allowed_tools, mcp_allowed_tool)
+            }
+            _ => spec.allowed_tools.clone(),
+        };
+        cmd.arg("--permission-mode")
+            .arg("dontAsk")
+            .arg("--allowedTools")
+            .arg(allowed_tools);
+
+        if spec.bare {
+            cmd.arg("--bare");
+        }
+
+        for (k, v) in &spec.env_vars {
+            cmd.env(k, v);
+        }
+        if agent_mcp.is_some() {
+            strip_managed_mcp_authority(&mut cmd);
+        }
+        if restricted == RestrictedMode::Planner && agent_mcp.is_none() {
+            strip_coordination_env(&mut cmd);
+        }
+
+        cmd.current_dir(&spec.worktree);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        Ok((Self::from_child(cmd.spawn()?)?, gate))
+    }
+
+    fn from_child(mut child: Child) -> std::io::Result<Self> {
         // `Child::id()` becomes `None` after `try_wait()` observes leader
         // exit, but descendants may still hold the process group's pipes.
         // Persist the group ID before any caller can reap the leader.
@@ -515,6 +658,17 @@ impl AgentProc {
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
         Ok(())
+    }
+
+    /// Complete the first deferred gated turn with the same bounded failure
+    /// diagnosis used by the normal launch path. Consuming `self` lets a
+    /// failed first write kill and reap the wrapper/provider group instead of
+    /// leaving a released process without a usable owner.
+    pub(crate) async fn feed_initial_turn(mut self, turn: &str) -> std::io::Result<Self> {
+        if let Err(error) = self.feed_turn(turn).await {
+            return Err(self.diagnose_first_turn_feed_failure(error, None).await);
+        }
+        Ok(self)
     }
 
     pub async fn feed_turn_until(
@@ -680,6 +834,11 @@ impl AgentProc {
 
     pub fn pid(&self) -> Option<i32> {
         self.child.id().map(|id| id as i32)
+    }
+
+    #[allow(dead_code)] // exposed for the future fallback launch owner
+    pub fn process_group_id(&self) -> i32 {
+        self.process_group_id
     }
 
     /// Non-blocking check for child exit. Returns `Some(status)` if the child
