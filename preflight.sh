@@ -13,7 +13,8 @@
 #   3. cargo clippy  — all targets and quorum-core/test-support
 #   4. cargo test    — compile/no-run then full execution, timed by the collector
 #   5. entrypoint    — host supervisor contract (when Docker inputs are present)
-#   6. container     — exact linux/amd64 build and real-container verification
+#   6. container     — exact linux/amd64 build when container-specific inputs change
+#                      (always runs in required CI; force locally with --docker)
 #
 # Process-oriented integration-test deadlines use QUORUM_TEST_TIMING_SCALE
 # (default 1; bounded at 10). The timing collector preserves it for Cargo test
@@ -21,7 +22,8 @@
 # QUORUM_TEST_TIMING_SCALE=3 rtk proxy ./preflight.sh.
 #
 # Usage:
-#   ./preflight.sh          # all six gates in the repository; four in policy fixtures
+#   ./preflight.sh          # local gates; container build only for container changes
+#   ./preflight.sh --docker # force all six gates, including the container build
 #   ./preflight.sh --quick  # gates 1+2 only (what the pre-push hook runs)
 
 set -u
@@ -34,9 +36,11 @@ CONTINUATION_BASE_SET=0
 PROPOSED_SHA=
 PROPOSED_SET=0
 HOOK_FORMAT_ONLY=0
+FORCE_DOCKER=0
 for arg in "$@"; do
   case "$arg" in
     --quick) QUICK=1 ;;
+    --docker) FORCE_DOCKER=1 ;;
     --continuation-from=*)
       [ "$CONTINUATION_SET" -eq 0 ] \
         || { printf 'preflight.sh: duplicate --continuation-from\n' >&2; exit 2; }
@@ -96,6 +100,69 @@ if [ "$HOOK_FORMAT_ONLY" -eq 1 ] \
     || [ "$PROPOSED_SET" -eq 1 ]; }; then
   printf 'preflight.sh: --hook-format-only conflicts with publication options\n' >&2
   exit 2
+fi
+if [ "$FORCE_DOCKER" -eq 1 ] && [ "$QUICK" -eq 1 ]; then
+  printf 'preflight.sh: --docker conflicts with --quick\n' >&2
+  exit 2
+fi
+
+# Full author gates are expensive and managed tasks use separate linked
+# worktrees, so per-worktree Cargo caches do not prevent concurrent suites.
+# Serialize local full runs through the repository's shared Git directory.
+# Python owns the advisory lock while a child preflight runs; kernel cleanup
+# therefore releases it after normal exit, signals, or crashes without stale
+# PID/lock-directory recovery. Quick hooks and CI remain independently
+# parallel: CI already schedules its required container verification itself.
+if [ "$QUICK" -eq 0 ] && [ "${_QUORUM_PREFLIGHT_LOCK_HELD:-0}" != 1 ] \
+  && [ -z "${CI:-}" ] && [ -z "${GITHUB_ACTIONS:-}" ]; then
+  PREFLIGHT_COMMON_GIT_DIR=$(git rev-parse --git-common-dir 2>/dev/null) \
+    || { printf 'preflight.sh: cannot resolve shared Git directory\n' >&2; exit 1; }
+  case "$PREFLIGHT_COMMON_GIT_DIR" in
+    /*) ;;
+    *)
+      PREFLIGHT_COMMON_GIT_DIR=$(cd "$PREFLIGHT_COMMON_GIT_DIR" && pwd -P) \
+        || { printf 'preflight.sh: cannot resolve shared Git directory\n' >&2; exit 1; }
+      ;;
+  esac
+  python3 - "$PREFLIGHT_COMMON_GIT_DIR/preflight-local.lock" "$0" "$@" <<'PY'
+import fcntl
+import os
+import signal
+import subprocess
+import sys
+
+lock_path = sys.argv[1]
+command = sys.argv[2:]
+child = None
+
+def forward(signum, _frame):
+    if child is None:
+        raise SystemExit(128 + signum)
+    try:
+        os.killpg(child.pid, signum)
+    except ProcessLookupError:
+        pass
+
+for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(handled_signal, forward)
+
+with open(lock_path, "a+", encoding="utf-8") as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("preflight.sh: waiting for another local full preflight", flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+    environment = os.environ.copy()
+    environment["_QUORUM_PREFLIGHT_LOCK_HELD"] = "1"
+    child = subprocess.Popen(command, env=environment, start_new_session=True)
+    returncode = child.wait()
+
+if returncode < 0:
+    raise SystemExit(128 - returncode)
+raise SystemExit(returncode)
+PY
+  exit $?
 fi
 
 fail() { printf '\nPREFLIGHT: FAIL (%s)\n' "$1"; exit 1; }
@@ -366,6 +433,55 @@ print(len(paths))
 PY
 }
 
+# Return success only when the branch or working tree changes the
+# container-specific packaging/runtime surface. Ordinary Rust changes retain
+# mandatory container coverage in CI without rebuilding linux/amd64 locally.
+# Git/query ambiguity is exit 2 so the caller can fail closed and run it.
+container_inputs_changed() {
+  python3 - "$1" <<'PY'
+import subprocess
+import sys
+
+base = sys.argv[1]
+
+try:
+    committed = subprocess.check_output(
+        ["git", "-c", "diff.renames=false", "diff", "--name-only", "-z", f"{base}...HEAD"],
+        stderr=subprocess.DEVNULL,
+    ).split(b"\0")[:-1]
+    status = subprocess.check_output(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all", "-z"],
+        stderr=subprocess.DEVNULL,
+    ).split(b"\0")
+    ignored = subprocess.check_output(
+        ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+        stderr=subprocess.DEVNULL,
+    ).split(b"\0")[:-1]
+except BaseException:
+    sys.exit(2)
+
+paths = set(committed) | set(ignored)
+index = 0
+try:
+    while index < len(status) - 1:
+        record = status[index]
+        index += 1
+        if len(record) < 4 or record[2:3] != b" ":
+            raise ValueError("malformed porcelain record")
+        paths.add(record[3:])
+        if record[:1] in (b"R", b"C") or record[1:2] in (b"R", b"C"):
+            paths.add(status[index])
+            index += 1
+except (IndexError, ValueError):
+    sys.exit(2)
+
+def container_specific(path):
+    return path in (b"Dockerfile", b".dockerignore") or path.startswith(b"docker/")
+
+sys.exit(0 if any(container_specific(path) for path in paths) else 1)
+PY
+}
+
 # --- Gate 1: branch base ------------------------------------------------------
 printf '=== preflight 1/4: branch base ===\n'
 if [ "$QUICK" -eq 0 ]; then
@@ -380,6 +496,7 @@ git fetch origin --quiet || fail "git fetch origin"
 git rev-parse --verify --quiet origin/main >/dev/null \
   || fail "origin/main not found — missing remote-tracking ref; gate cannot run"
 BASE_REF=origin/main
+CONTAINER_DIFF_BASE=origin/main
 INTEGRATION=0
 DEVELOP_BASED=0
 INERT_DIFF_BASE=
@@ -467,6 +584,7 @@ if [ "$INTEGRATION" -eq 0 ] \
   MAIN_FORK=$(git merge-base "$TIP" origin/main)
   if git merge-base --is-ancestor "$MAIN_FORK" "$DEVELOP_FORK"; then
     BASE_REF=origin/develop
+    CONTAINER_DIFF_BASE=origin/develop
     DEVELOP_BASED=1
   fi
 fi
@@ -477,6 +595,7 @@ else
   # Co-Authored-By sessions in that range mean the branch was cut from another
   # feature branch (#114) — rebase onto the applicable base before pushing.
   if [ -n "$CONTINUATION_FROM" ]; then
+    CONTAINER_DIFF_BASE=$CONTINUATION_BASE
     git cat-file -e "$CONTINUATION_FROM^{commit}" 2>/dev/null \
       || fail "continuation base is not a local commit"
     git merge-base --is-ancestor "$CONTINUATION_FROM" "$TIP" \
@@ -495,6 +614,7 @@ else
       git show -s --oneline $OWN_COMMITS
     fi
   elif [ -n "$CONFIGURED_CONTINUATION_FROM" ]; then
+    CONTAINER_DIFF_BASE=$CONFIGURED_CONTINUATION_BASE
     BASE_REF="$CONFIGURED_UPSTREAM_REF + $CONFIGURED_CONTINUATION_BASE"
     OWN_COMMITS=$(git rev-list "$TIP" --not \
       "$CONFIGURED_CONTINUATION_FROM" "$CONFIGURED_CONTINUATION_BASE")
@@ -574,7 +694,7 @@ PY
 
 FULL_GATE_FINGERPRINT=
 if FULL_GATE_FINGERPRINT=$(working_tree_fingerprint); then
-  if has_green_cache "$FULL_GATE_FINGERPRINT"; then
+  if [ "$FORCE_DOCKER" -eq 0 ] && has_green_cache "$FULL_GATE_FINGERPRINT"; then
     printf '\nPREFLIGHT: PASS (cached — tree unchanged since last green run)\n'
     exit 0
   fi
@@ -582,7 +702,7 @@ else
   printf 'preflight.sh: fingerprint unavailable; running full gates\n' >&2
 fi
 
-if [ -n "$INERT_DIFF_BASE" ] \
+if [ "$FORCE_DOCKER" -eq 0 ] && [ -n "$INERT_DIFF_BASE" ] \
   && INERT_DIFF_FILE_COUNT=$(inert_diff_file_count "$INERT_DIFF_BASE"); then
   printf '=== preflight 2/4: cargo fmt --all -- --check ===\n'
   cargo fmt --all -- --check || fail "cargo fmt"
@@ -624,35 +744,58 @@ fi
 TEST_EXECUTION_SUMMARY=$(test_execution_summary) \
   || fail "read test execution counts"
 
-# Keep Docker integration additive to the current timing collector. Fixtures
-# that exercise preflight policy without the image sources retain the four
-# Cargo gates; the repository's real full gate always runs all six.
-DOCKER_GATES=0
+# Keep the host entrypoint contract additive to the current timing collector.
+# The expensive cross-architecture image gate runs locally only for changes to
+# its packaging/runtime surface (or --docker), while required CI runs it for
+# every PR. Fixtures without the image sources retain the four Cargo gates.
+CONTAINER_GATE=0
+if [ "$FORCE_DOCKER" -eq 1 ] \
+  && { [ ! -f Dockerfile ] || [ ! -x docker/entrypoint_test.sh ] \
+    || [ ! -x docker/verify.sh ]; }; then
+  fail "--docker requires Dockerfile and executable container verification scripts"
+fi
 if [ -f Dockerfile ] && [ -x docker/entrypoint_test.sh ] \
   && [ -x docker/verify.sh ]; then
-  DOCKER_GATES=1
   printf '=== preflight 5/6: docker/entrypoint_test.sh ===\n'
   ./docker/entrypoint_test.sh || fail "entrypoint contract"
 
-  require_command docker
-  require_command sqlite3
-  docker buildx version >/dev/null 2>&1 \
-    || fail "Docker buildx is unavailable"
-  docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
+  RUN_CONTAINER_GATE=$FORCE_DOCKER
+  if [ "$RUN_CONTAINER_GATE" -eq 0 ]; then
+    if container_inputs_changed "$CONTAINER_DIFF_BASE"; then
+      RUN_CONTAINER_GATE=1
+    else
+      CONTAINER_CHANGE_STATUS=$?
+      if [ "$CONTAINER_CHANGE_STATUS" -ne 1 ]; then
+        printf 'preflight.sh: cannot classify container-specific changes; running container gate\n' >&2
+        RUN_CONTAINER_GATE=1
+      fi
+    fi
+  fi
 
-  printf '=== preflight 6/6: linux/amd64 container verification ===\n'
-  PREFLIGHT_IMAGE_TAG="quorum-preflight:$(date +%s)-$$"
-  cleanup_preflight_image() {
-    status=$?
-    trap - 0
-    docker image rm "$PREFLIGHT_IMAGE_TAG" >/dev/null 2>&1 || true
-    exit "$status"
-  }
-  trap cleanup_preflight_image 0
-  docker buildx build --load --platform linux/amd64 \
-    --tag "$PREFLIGHT_IMAGE_TAG" . || fail "Docker image build"
-  ./docker/verify.sh "$PREFLIGHT_IMAGE_TAG" \
-    || fail "Docker image verification"
+  if [ "$RUN_CONTAINER_GATE" -eq 1 ]; then
+    CONTAINER_GATE=1
+    require_command docker
+    require_command sqlite3
+    docker buildx version >/dev/null 2>&1 \
+      || fail "Docker buildx is unavailable"
+    docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
+
+    printf '=== preflight 6/6: linux/amd64 container verification ===\n'
+    PREFLIGHT_IMAGE_TAG="quorum-preflight:$(date +%s)-$$"
+    cleanup_preflight_image() {
+      status=$?
+      trap - 0
+      docker image rm "$PREFLIGHT_IMAGE_TAG" >/dev/null 2>&1 || true
+      exit "$status"
+    }
+    trap cleanup_preflight_image 0
+    docker buildx build --load --platform linux/amd64 \
+      --tag "$PREFLIGHT_IMAGE_TAG" . || fail "Docker image build"
+    ./docker/verify.sh "$PREFLIGHT_IMAGE_TAG" \
+      || fail "Docker image verification"
+  else
+    printf 'PREFLIGHT: skipping linux/amd64 container build — no container-specific changes (required CI still runs it; use --docker to force locally)\n'
+  fi
 fi
 
 if [ -n "$FULL_GATE_FINGERPRINT" ]; then
@@ -668,8 +811,11 @@ if [ -n "$FULL_GATE_FINGERPRINT" ]; then
   fi
 fi
 
-if [ "$DOCKER_GATES" -eq 1 ]; then
+if [ "$CONTAINER_GATE" -eq 1 ]; then
   printf '\nPREFLIGHT: PASS (all 6 gates green; %s)\n' "$TEST_EXECUTION_SUMMARY"
+elif [ -f Dockerfile ] && [ -x docker/entrypoint_test.sh ] \
+  && [ -x docker/verify.sh ]; then
+  printf '\nPREFLIGHT: PASS (local gates green; container verification deferred to required CI; %s)\n' "$TEST_EXECUTION_SUMMARY"
 else
   printf '\nPREFLIGHT: PASS (all 4 gates green; %s)\n' "$TEST_EXECUTION_SUMMARY"
 fi
