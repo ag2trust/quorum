@@ -836,16 +836,19 @@ fn concurrent_exhausted_decomposition_retry_has_one_atomic_winner() {
             let conn = quorum_core::db::open(&db).unwrap();
             conn.execute("UPDATE tasks SET status='failed' WHERE id=1", [])
                 .unwrap();
+            let max_provider = quorum_core::decomposition::MAX_PROVIDER_FAILURES;
             conn.execute(
-                "INSERT INTO task_decompositions(
+                &format!(
+                    "INSERT INTO task_decompositions(
                  source_task_id,state,active,freeze_active,planned_source_revision,
                  provider_failures,hold_code,hold_summary,created_at,updated_at)
-             VALUES (1,'held',0,0,1,3,'provider-attempts-exhausted',
-                     'planner transport failed',1,1)",
+             VALUES (1,'held',0,0,1,{max_provider},'provider-attempts-exhausted',
+                     'planner transport failed',1,1)"
+                ),
                 [],
             )
             .unwrap();
-            for ordinal in 1..=3 {
+            for ordinal in 1..=max_provider {
                 conn.execute(
                     "INSERT INTO decomposition_attempts(
                      graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
@@ -944,22 +947,26 @@ fn exhausted_decomposition_retry_cap_has_actionable_json() {
     let conn = quorum_core::db::open(&db).unwrap();
     conn.execute("UPDATE tasks SET status='failed' WHERE id=1", [])
         .unwrap();
+    let max_provider = quorum_core::decomposition::MAX_PROVIDER_FAILURES;
+    let max_retries = quorum_core::decomposition::MAX_OPERATOR_RETRIES;
     conn.execute(
-        "INSERT INTO task_decompositions(
+        &format!(
+            "INSERT INTO task_decompositions(
              source_task_id,state,planned_source_revision,provider_failures,
              operator_retry_count,hold_code,created_at,updated_at)
-         VALUES (1,'held',1,3,2,'provider-attempts-exhausted',1,1)",
+         VALUES (1,'held',1,{max_provider},{max_retries},'provider-attempts-exhausted',1,1)"
+        ),
         [],
     )
     .unwrap();
-    for generation in 0..=2 {
-        for offset in 1..=3 {
+    for generation in 0..=max_retries {
+        for offset in 1..=max_provider {
             conn.execute(
                 "INSERT INTO decomposition_attempts(
                      graph_id,source_revision,kind,ordinal,retry_generation,
                      reason_code,summary,created_at)
                  VALUES (1,1,'provider',?1,?2,'provider','failed',1)",
-                rusqlite::params![generation * 3 + offset, generation],
+                rusqlite::params![generation * max_provider + offset, generation],
             )
             .unwrap();
         }

@@ -5132,8 +5132,12 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
                            WHERE repository_graph.state IN ('active','blocked')
                               OR repository_graph.active=1)
            AND json_valid(t.refs) AND json_extract(t.refs,'$.cx_ready')=1
-           AND json_extract(t.refs,'$.cx_size') IN ('L','XL')
-           AND json_extract(t.refs,'$.cx_est') IN (4,5)
+           AND (
+                (json_extract(t.refs,'$.cx_size')='L'
+                 AND json_extract(t.refs,'$.cx_est')=5)
+             OR (json_extract(t.refs,'$.cx_size')='XL'
+                 AND json_extract(t.refs,'$.cx_est') IN (4,5))
+           )
            AND t.continue_pr IS NULL
            AND NOT EXISTS (SELECT 1 FROM task_decompositions d WHERE d.source_task_id=t.id)
            AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.task_id=t.id)
@@ -5923,7 +5927,7 @@ fn child_preclassification_rejection_detail(
 
 /// A planned child's size verdict is judged by the same implementation-size
 /// policy that dispatches root tasks, so a child the classifier calls `L` at
-/// complexity 3 or lower is accepted exactly as its root would be.
+/// complexity 4 or lower is accepted exactly as its root would be.
 fn child_size_is_rejected(result: &quorum_core::classify::TaskClassification) -> bool {
     !quorum_core::tasks::size_is_dispatchable(&result.size, result.cx_est)
 }
@@ -40090,7 +40094,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0,529);
              INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
              VALUES ('large-low','open',5,'owner',1,1,
-               '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+               '{\"cx_est\":5,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
              INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
              VALUES ('large-high','open',9,'owner',1,1,
                '{\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
@@ -40117,7 +40121,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0,529);
              INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
              VALUES ('plain complex large','open',1,'owner',1,1,
-               '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);"
+               '{\"cx_est\":5,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);"
         )
         .unwrap();
 
@@ -40157,9 +40161,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         .is_some();
                     let direct = continue_pr.is_some()
                         || matches!(size, "S" | "M")
-                        || (size == "L" && cx_est <= 3);
-                    let decomposition =
-                        continue_pr.is_none() && matches!(size, "L" | "XL") && cx_est >= 4;
+                        || (size == "L" && cx_est <= 4);
+                    let decomposition = continue_pr.is_none()
+                        && ((size == "L" && cx_est >= 5) || (size == "XL" && cx_est >= 4));
                     let parked = continue_pr.is_none() && size == "XL" && cx_est <= 3;
                     let shape = format!("size={size} cx_est={cx_est} continue={continue_pr:?}");
 
@@ -40278,7 +40282,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             3,
         )
         .unwrap();
-        for attempt in 0..3 {
+        let max_provider = quorum_core::decomposition::MAX_PROVIDER_FAILURES;
+        for attempt in 0..max_provider {
             assert!(quorum_core::decomposition::record_attempt(
                 &mut conn,
                 older_graph,
@@ -40289,7 +40294,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap()
             .is_some());
-            if attempt < 2 {
+            if attempt < max_provider - 1 {
                 assert!(quorum_core::decomposition::reacquire_freeze(
                     &mut conn,
                     older_graph,
@@ -40531,18 +40536,18 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "child a rejected by preclassification: ready=false (not_ready_reason: missing acceptance criteria)"
         );
 
-        // `L` at complexity 3 satisfies the shared implementation-size policy
+        // `L` at complexity 4 satisfies the shared implementation-size policy
         // exactly as a root task would; the child is accepted with its verdict.
         let mut large_but_simple = valid.clone();
         large_but_simple[1].size = "L".into();
-        large_but_simple[1].cx_est = 3;
+        large_but_simple[1].cx_est = 4;
         let accepted = planned_children(&proposal, &large_but_simple).unwrap();
         let accepted_refs: serde_json::Value =
             serde_json::from_str(&accepted[1].classification_refs).unwrap();
         assert_eq!(accepted_refs["cx_size"], "L");
-        assert_eq!(accepted_refs["cx_est"], 3);
+        assert_eq!(accepted_refs["cx_est"], 4);
 
-        for (size, cx_est) in [("L", 4), ("L", 5), ("XL", 2)] {
+        for (size, cx_est) in [("L", 5), ("XL", 2)] {
             let mut large = valid.clone();
             large[1].size = size.into();
             large[1].cx_est = cx_est;
@@ -40809,14 +40814,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             not_ready_reason: None,
             duplicate_of: vec![],
         };
-        for (size, cx_est) in [("S", 5), ("M", 5), ("L", 1), ("L", 3)] {
+        for (size, cx_est) in [("S", 5), ("M", 5), ("L", 1), ("L", 4)] {
             assert!(
                 child_preclassification_rejection_detail(&proposal[1], &verdict(size, cx_est))
                     .is_none(),
                 "{size}/{cx_est} must be accepted"
             );
         }
-        for (size, cx_est) in [("L", 4), ("L", 5), ("XL", 1), ("XL", 5)] {
+        for (size, cx_est) in [("L", 5), ("XL", 1), ("XL", 5)] {
             let detail =
                 child_preclassification_rejection_detail(&proposal[1], &verdict(size, cx_est))
                     .unwrap();
@@ -40826,8 +40831,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             );
         }
         let detail =
-            child_preclassification_rejection_detail(&proposal[1], &verdict("L", 4)).unwrap();
-        assert!(detail.contains("cx_est=4"));
+            child_preclassification_rejection_detail(&proposal[1], &verdict("L", 5)).unwrap();
+        assert!(detail.contains("cx_est=5"));
         // The planner sees the complete rejected delta and paths, not a
         // 128-byte prefix.
         assert!(detail.contains(&format!(
@@ -40835,7 +40840,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             proposal[1].implementation_delta
         )));
         assert!(detail.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
-        let summary = child_preclassification_rejection(&proposal[1], &verdict("L", 4)).unwrap();
+        let summary = child_preclassification_rejection(&proposal[1], &verdict("L", 5)).unwrap();
         assert!(summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
         assert!(summary.contains(&proposal[1].implementation_delta));
     }
@@ -41030,7 +41035,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let classifications = vec![
             quorum_core::classify::TaskClassification {
                 task_id: -1,
-                cx_est: 4,
+                cx_est: 5,
                 size: "L".into(),
                 size_reason: "independently deliverable storage and daemon orchestration seams"
                     .into(),
@@ -41053,7 +41058,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let summary = planned_children(&proposal, &classifications).unwrap_err();
         assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
         assert!(summary.contains(
-            "child storage-child: size=L cx_est=4 (size_reason=independently deliverable storage and daemon orchestration seams)"
+            "child storage-child: size=L cx_est=5 (size_reason=independently deliverable storage and daemon orchestration seams)"
         ));
         assert!(summary.contains(
             "child provider-child: size=XL cx_est=5 (size_reason=independently deliverable provider launch and restart reconstruction seams)"
@@ -41874,15 +41879,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[tokio::test]
-    async fn three_arbiter_blocking_changes_exhaust_and_fail_the_source() {
+    async fn arbiter_blocking_changes_exhaust_and_fail_the_source() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("exhaust.db");
         let proposal = arbiter_gate_proposal();
         let (source, graph) = arbiter_validating_graph(&db_path, "large", None, &proposal);
         let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
         let proposal_json = serde_json::to_string(&proposal).unwrap();
+        let max_proposal = quorum_core::decomposition::MAX_PROPOSAL_ATTEMPTS;
 
-        for round in 1..=3 {
+        for round in 1..=max_proposal {
             if round > 1 {
                 // The planner re-proposed; the daemon durably re-accepts before
                 // the next Arbiter round.
@@ -41891,7 +41897,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     &mut conn,
                     graph,
                     &proposal_json,
-                    (4 + round) as i64,
+                    4 + round,
                 )
                 .unwrap());
                 // The classifier runs (and accepts) before every Arbiter round.
@@ -41899,7 +41905,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     &mut conn,
                     graph,
                     &serde_json::to_string(&arbiter_gate_classifications()).unwrap(),
-                    (5 + round) as i64,
+                    5 + round,
                 )
                 .unwrap());
             }
@@ -41922,18 +41928,24 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
 
         let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
-        assert_eq!(attempts, 3);
+        assert_eq!(attempts, max_proposal);
         assert_eq!(state, "held");
         assert_eq!(hold.as_deref(), Some("proposal-attempts-exhausted"));
         assert_eq!(status, "failed");
-        assert_eq!(arbiter_gate_attempts(&db_path, graph).len(), 6);
-        assert_eq!(arbiter_gate_verdicts(&db_path, graph).len(), 3);
+        assert_eq!(
+            arbiter_gate_attempts(&db_path, graph).len(),
+            2 * max_proposal as usize
+        );
+        assert_eq!(
+            arbiter_gate_verdicts(&db_path, graph).len(),
+            max_proposal as usize
+        );
         assert_eq!(
             arbiter_gate_attempts(&db_path, graph)
                 .iter()
                 .filter(|(kind, _)| kind == "proposal")
                 .count(),
-            3
+            max_proposal as usize
         );
         let mut conn = quorum_core::db::open(&db_path).unwrap();
         assert_eq!(
@@ -43078,7 +43090,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     "verification_expectations": ["tests"], "prerequisites": ["a"]
                 }
             ]);
-            for attempt in 1..=2 {
+            // Accrue prior rejections up to one below the cap so the legacy
+            // replan happens while the aggregate is still retryable.
+            let prior_rejections = quorum_core::decomposition::MAX_PROPOSAL_ATTEMPTS - 1;
+            for attempt in 1..=prior_rejections {
                 quorum_core::decomposition::accept_proposal(
                     &mut conn,
                     graph,
@@ -43134,7 +43149,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .unwrap();
-            assert_eq!(state, ("planning".into(), None, 2), "phase {phase}");
+            assert_eq!(
+                state,
+                ("planning".into(), None, prior_rejections),
+                "phase {phase}"
+            );
             let attempts: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM decomposition_attempts WHERE graph_id=?1",
@@ -43142,7 +43161,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(attempts, 2, "compatibility reset charged phase {phase}");
+            assert_eq!(
+                attempts, prior_rejections,
+                "compatibility reset charged phase {phase}"
+            );
             assert_ne!(
                 tasks::get(&conn, source).unwrap().unwrap().status,
                 "failed",

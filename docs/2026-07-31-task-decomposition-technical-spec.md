@@ -234,7 +234,7 @@ CREATE TABLE decomposition_cleanup (
 
 Child prerequisites continue to use validated `tasks.depends_on`. Membership supplies source,
 planner, and plan-revision provenance. Attempt rows contain only bounded structured summaries:
-at most three semantic rejections and three provider failures per source revision. Full prompts
+at most two semantic rejections and two provider failures per source revision. Full prompts
 and transcripts are never stored. Cleanup intents make post-commit GitHub/filesystem cleanup
 idempotent and restartable.
 
@@ -316,7 +316,7 @@ A plan contains 2–8 uniquely keyed tasks. Each task has a title, concrete impl
 affected repository paths, observable outcome, acceptance criteria, applicable source constraints,
 verification expectations, explicit non-goals, byte-exact preserved literals, and prerequisite
 local keys or source dependency IDs. The planner receives the same agent execution-size rubric and
-shared dispatchability policy as the classifier: S/M at any complexity and L at complexity 3 or
+shared dispatchability policy as the classifier: S/M at any complexity and L at complexity 4 or
 lower. It inspects from source-named paths and symbols under bounded search/read guidance, and
 separates independently deliverable code or ownership seams rather than turning preserved outcomes
 into standalone work. A blocker must be concrete. Markdown wrappers, unknown fields, multiple
@@ -383,7 +383,7 @@ or a planner self-attestation check.
 All proposed children are classified together before any child row exists. Classification uses
 temporary proposal keys, not task IDs. Every result must be present, admission-ready,
 implementation work, nonduplicate, dispatchable under the shared size policy (S/M at any
-complexity, or L at complexity 3 or lower), and carry a nonempty, NUL-free `size_reason` bounded
+complexity, or L at complexity 4 or lower), and carry a nonempty, NUL-free `size_reason` bounded
 to 1 KiB. The reason names the concrete execution surfaces supporting the selected size. An L
 rationale names multiple owned seams or layers that remain one coherent outcome; an XL rationale
 identifies independently deliverable outcomes or seams requiring decomposition.

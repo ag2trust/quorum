@@ -413,7 +413,7 @@ const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
 
 /// SQL counterpart of [`size_is_dispatchable`] over the `refs` column of the
 /// enclosing `tasks` row. This is the single implementation-size policy:
-/// `S`/`M` at any complexity, or `L` at complexity 3 or lower. Every query that
+/// `S`/`M` at any complexity, or `L` at complexity 4 or lower. Every query that
 /// gates implementation work on classified size must interpolate this fragment
 /// instead of restating it, so the SQL and Rust policies cannot drift.
 macro_rules! size_dispatch_policy_sql {
@@ -421,7 +421,7 @@ macro_rules! size_dispatch_policy_sql {
         "(
     (json_extract(refs, '$.cx_size') IN ('S','M') OR (
         json_extract(refs, '$.cx_size')='L'
-        AND json_extract(refs, '$.cx_est') <= 3
+        AND json_extract(refs, '$.cx_est') <= 4
     ))
     AND NOT (json_extract(refs, '$.cx_est')=5
              AND json_extract(refs, '$.cx_size')='L')
@@ -4171,11 +4171,11 @@ pub fn classification_is_dispatchable(
 
 /// The single implementation-size dispatch policy shared by root-task dispatch
 /// and decomposition child preclassification: `S`/`M` at any complexity, or
-/// `L` at complexity 3 or lower. `L` at complexity 4 or 5 and every `XL`
+/// `L` at complexity 4 or lower. `L` at complexity 5 and every `XL`
 /// classification stay outside automatic implementation dispatch.
 /// [`SIZE_DISPATCH_POLICY_SQL`] is the SQL counterpart.
 pub fn size_is_dispatchable(size: &str, cx_est: i64) -> bool {
-    matches!(size, "S" | "M") || (size == "L" && cx_est <= 3)
+    matches!(size, "S" | "M") || (size == "L" && cx_est <= 4)
 }
 
 pub(crate) fn park_classified_task_tx(
@@ -8756,12 +8756,12 @@ mod tests {
             1,
         )
         .unwrap();
-        let complex_l = create(
+        let boundary_l = create(
             &mut conn,
             "owner",
-            "complex large",
+            "boundary large",
             None,
-            1,
+            50,
             None,
             Some(r#"{"cx_est":4,"cx_size":"L"}"#),
             None,
@@ -8769,11 +8769,31 @@ mod tests {
             2,
         )
         .unwrap();
+        let complex_l = create(
+            &mut conn,
+            "owner",
+            "complex large",
+            None,
+            1,
+            None,
+            Some(r#"{"cx_est":5,"cx_size":"L"}"#),
+            None,
+            None,
+            3,
+        )
+        .unwrap();
 
         let moderate_refs = get(&conn, moderate_l).unwrap().unwrap().refs;
         assert!(classification_is_complete(&moderate_refs));
         assert!(classification_is_dispatchable(&moderate_refs, false, None));
+        // L at complexity 4 is now directly dispatchable; only L at complexity 5
+        // (and every XL) stays outside automatic dispatch.
+        let boundary_refs = get(&conn, boundary_l).unwrap().unwrap().refs;
+        assert!(classification_is_dispatchable(&boundary_refs, false, None));
         assert!(claim(&mut conn, "moderate", Some(moderate_l), &[], TTL, 3)
+            .unwrap()
+            .is_some());
+        assert!(claim(&mut conn, "boundary", Some(boundary_l), &[], TTL, 5)
             .unwrap()
             .is_some());
         assert!(claim(&mut conn, "complex", Some(complex_l), &[], TTL, 4)
@@ -14875,7 +14895,7 @@ mod tests {
             ("M", 5, true),
             ("L", 1, true),
             ("L", 3, true),
-            ("L", 4, false),
+            ("L", 4, true),
             ("L", 5, false),
             ("XL", 1, false),
             ("XL", 3, false),
