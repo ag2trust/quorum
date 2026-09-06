@@ -69,9 +69,10 @@ pub(crate) fn pending_fallback_recoveries(
             .filter(|id| *id > 0)
             .ok_or_else(|| QuorumError::Io("fallback-pending journal is missing task".into()))?;
         // A crash can leave the marker behind after its provider process has
-        // started. Preserve that PID for restart cleanup/replay; the linked
-        // intent below remains the authority check.
+        // started. Preserve a positive PID for restart cleanup/replay; zero
+        // and negative process-group IDs are unsafe to pass to killpg.
         if entry.session_id.is_empty()
+            || entry.pid.is_some_and(|pid| pid <= 0)
             || entry.continuation_id.is_some()
             || !matches!(entry.role.as_str(), "worker" | "reviewer")
         {
@@ -1629,6 +1630,14 @@ mod tests {
         for (mutation, expected) in [
             (
                 "UPDATE journal SET continuation_id='not-a-fallback-continuation'",
+                "invalid fallback-pending journal shape",
+            ),
+            (
+                "UPDATE journal SET pid=0",
+                "invalid fallback-pending journal shape",
+            ),
+            (
+                "UPDATE journal SET pid=-1",
                 "invalid fallback-pending journal shape",
             ),
             ("DELETE FROM fallback_launch_intents", "has no live intent"),
