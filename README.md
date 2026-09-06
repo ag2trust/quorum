@@ -366,8 +366,11 @@ This is a non-binding view of ongoing directions, not a release schedule:
 ## Working on Quorum
 
 Contributor and agent instructions live in [`AGENTS.md`](AGENTS.md). The design record is
-[`docs/2026-06-23-quorum-design.md`](docs/2026-06-23-quorum-design.md). Run the full gate
-before submitting any change:
+[`docs/2026-06-23-quorum-design.md`](docs/2026-06-23-quorum-design.md). Run the full local gate
+before submitting any change. It serializes across linked worktrees so concurrent workers do
+not saturate one machine. The linux/amd64 container build runs locally for changes under
+`docker/`, `Dockerfile`, or `.dockerignore`; use `--docker` to force it. Required CI runs the
+container build and verification for every PR regardless:
 
 ```sh
 rtk proxy ./preflight.sh
