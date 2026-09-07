@@ -2316,7 +2316,7 @@ behavior and regression-only expectations remain criteria or non-goals rather th
 implementation work. A child that changes a function/API signature or shared type, trait, or
 struct shape must own every affected caller needed for its workspace build and preflight after
 its prerequisites merge; a definition/signature child must not reserve those callers for a
-sibling. A compile-closed seam that fits one dispatchable child (S or M, or L at complexity 3 or
+sibling. A compile-closed seam that fits one dispatchable child (S or M, or L at complexity 4 or
 lower) remains one child. The planner returns a `no_safe_split` blocker only when the closure
 cannot fit in one dispatchable child, rather than manufacturing definition and wiring siblings.
 Before any task row is created,

@@ -131,6 +131,16 @@ findings never do and never force a changes verdict. With zero BLOCKING findings
 more FOLLOW-UP findings, submit `approved --blocking 0`. Reviewers do not create or modify \
 Managed Tasks for follow-ups.\n";
 
+/// A reviewer turn that ends without `quorum submit` is a failed review, not a
+/// no-op. Shared by every reviewer prompt so a resumed thread that believes it
+/// already reviewed the current head re-signals instead of exiting silently.
+pub(super) const VERDICT_RESIGNAL_CONTRACT: &str = "\
+Verdict delivery: this review is complete only once your `submit` verdict for the current \
+PR head has been recorded. If this session was resumed and you believe you already reviewed \
+this exact head, the daemon holds no durable verdict for it (it would not have resumed you \
+otherwise): re-run the matching `submit` verdict for the current head. Never exit without \
+submitting — an exit with no verdict is treated as a failed review.\n";
+
 /// CI and author-side verification are daemon concerns, never review findings.
 /// This wording is shared by every reviewer prompt.
 pub(super) const REVIEWER_VERIFICATION_BOUNDARY: &str = "\
@@ -184,7 +194,8 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          Do NOT merge the PR yourself — the daemon handles merging.\n\
          Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
          approval as the merge account after your verdict.\n\
-         Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.\n\n\
+         {verdict_resignal}",
         name = spec.reviewer_name,
         pr = spec.pr,
         worker = spec.worker_agent,
@@ -192,6 +203,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
         finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
+        verdict_resignal = VERDICT_RESIGNAL_CONTRACT,
     )
 }
 
@@ -339,7 +351,8 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          Do NOT merge the PR yourself — the daemon handles merging.\n\
          Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
          approval as the merge account after your verdict.\n\
-         Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.\n\n\
+         {verdict_resignal}",
         name = spec.reviewer_name,
         pr = spec.pr,
         worker = spec.worker_agent,
@@ -347,6 +360,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
         finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
+        verdict_resignal = VERDICT_RESIGNAL_CONTRACT,
     )
 }
 
@@ -454,7 +468,8 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          Do NOT merge the PR yourself — the daemon handles merging.\n\
          Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
          approval as the merge account after your verdict.\n\
-         Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.\n\n\
+         {verdict_resignal}",
         name = spec.r2_name,
         pr = spec.pr,
         worker = spec.worker_agent,
@@ -463,6 +478,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
         finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
+        verdict_resignal = VERDICT_RESIGNAL_CONTRACT,
     )
 }
 
@@ -533,7 +549,8 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          Do NOT merge the PR yourself — the daemon handles merging.\n\
          Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
          approval as the merge account after your verdict.\n\
-         Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.\n\n\
+         {verdict_resignal}",
         name = spec.r2_name,
         pr = spec.pr,
         worker = spec.worker_agent,
@@ -542,6 +559,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
         finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
+        verdict_resignal = VERDICT_RESIGNAL_CONTRACT,
     )
 }
 
@@ -750,6 +768,45 @@ mod tests {
         assert!(contract.contains("Cancelled dependency parks are visible."));
         assert!(contract.contains("recovery attempt preserved PR #618"));
         assert!(contract.contains("not the generic PR title or body"));
+    }
+
+    /// Task #231 / PR #778: a resumed reviewer that exits without re-signaling
+    /// its verdict is a failed review. Every reviewer prompt must carry the
+    /// re-signal instruction so the guard does not drift between R1, R2,
+    /// Claude, Codex, and re-review turns.
+    #[test]
+    fn every_reviewer_prompt_requires_resignaling_a_verdict_instead_of_exiting() {
+        let r1 = ReviewerSpec {
+            pr: 778,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Reviewer-1".into(),
+        };
+        let r2 = R2ReviewSpec {
+            pr: 778,
+            worker_agent: "Worker-1".into(),
+            r1_reviewer: "Reviewer-1".into(),
+            r2_name: "Reviewer-2".into(),
+        };
+        let prompts = [
+            build_review_prompt_for_kind(AgentKind::Claude, &r1, "high"),
+            build_review_prompt_for_kind(AgentKind::Codex, &r1, "high"),
+            build_r2_review_prompt_for_kind(AgentKind::Claude, &r2, "high"),
+            build_r2_review_prompt_for_kind(AgentKind::Codex, &r2, "high"),
+            super::super::rereview_builder::build_rereview_turn(
+                "Reviewer-1",
+                778,
+                "Worker-1",
+                "high",
+            ),
+        ];
+        for prompt in prompts {
+            assert!(
+                prompt.contains("Verdict delivery:")
+                    && prompt.contains("re-run the matching `submit` verdict")
+                    && prompt.contains("Never exit without submitting"),
+                "prompt lacks the verdict re-signal guard: {prompt}"
+            );
+        }
     }
 
     #[test]

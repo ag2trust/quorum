@@ -4,7 +4,7 @@ use super::review_cycle_context::ReviewCycleContext;
 use super::review_ledger;
 use super::reviewer::{
     graph_review_contract, COMPLETE_REVIEW_CONTRACT, REVIEWER_VERIFICATION_BOUNDARY,
-    REVIEW_FINDING_CONTRACT,
+    REVIEW_FINDING_CONTRACT, VERDICT_RESIGNAL_CONTRACT,
 };
 
 /// Context shared by sticky re-review turns and replacement reviewer prompts.
@@ -80,7 +80,9 @@ pub fn build_rereview_turn_with_context(
          Do NOT merge the PR yourself — the daemon handles merging.\n\
          Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
          approval as the merge account after your verdict.\n\
-         Do NOT mark the task done yourself — the daemon handles task lifecycle.{graph_contract}",
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.\n\n\
+         {verdict_resignal}{graph_contract}",
+        verdict_resignal = VERDICT_RESIGNAL_CONTRACT,
         worker = worker_agent,
         name = reviewer_name,
         pr = pr,

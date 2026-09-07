@@ -5008,23 +5008,26 @@ mod tests {
             params![source],
         )
         .unwrap();
+        let max_provider = crate::decomposition::MAX_PROVIDER_FAILURES;
         c.execute(
-            "INSERT INTO task_decompositions(
+            &format!(
+                "INSERT INTO task_decompositions(
                  source_task_id,state,planned_source_revision,provider_failures,
                  operator_retry_count,hold_code,hold_summary,created_at,updated_at)
-             VALUES (?1,'held',1,3,1,'provider-attempts-exhausted',
-                     'bounded provider summary',100,100)",
+             VALUES (?1,'held',1,{max_provider},1,'provider-attempts-exhausted',
+                     'bounded provider summary',100,100)"
+            ),
             params![source],
         )
         .unwrap();
         let graph_id = c.last_insert_rowid();
-        for ordinal in 1..=6 {
+        for ordinal in 1..=(2 * max_provider) {
             c.execute(
                 "INSERT INTO decomposition_attempts(
                      graph_id,source_revision,kind,ordinal,retry_generation,
                      reason_code,summary,created_at)
                  VALUES (?1,1,'provider',?2,?3,'provider-failure','bounded',100)",
-                params![graph_id, ordinal, i64::from(ordinal > 3)],
+                params![graph_id, ordinal, i64::from(ordinal > max_provider)],
             )
             .unwrap();
         }
@@ -5054,7 +5057,10 @@ mod tests {
             .unwrap();
 
         c.execute(
-            "UPDATE task_decompositions SET provider_failures=2 WHERE id=?1",
+            &format!(
+                "UPDATE task_decompositions SET provider_failures={} WHERE id=?1",
+                max_provider - 1
+            ),
             [graph_id],
         )
         .unwrap();
@@ -5066,8 +5072,10 @@ mod tests {
         );
 
         c.execute(
-            "UPDATE task_decompositions
-             SET provider_failures=3,accepted_proposal_json='[]' WHERE id=?1",
+            &format!(
+                "UPDATE task_decompositions
+             SET provider_failures={max_provider},accepted_proposal_json='[]' WHERE id=?1"
+            ),
             [graph_id],
         )
         .unwrap();

@@ -68,8 +68,11 @@ pub(crate) fn pending_fallback_recoveries(
             .task_id
             .filter(|id| *id > 0)
             .ok_or_else(|| QuorumError::Io("fallback-pending journal is missing task".into()))?;
-        if entry.pid.is_some()
-            || entry.session_id.is_empty()
+        // A crash can leave the marker behind after its provider process has
+        // started. Preserve a positive PID for restart cleanup/replay; zero
+        // and negative process-group IDs are unsafe to pass to killpg.
+        if entry.session_id.is_empty()
+            || entry.pid.is_some_and(|pid| pid <= 0)
             || entry.continuation_id.is_some()
             || !matches!(entry.role.as_str(), "worker" | "reviewer")
         {
@@ -1507,6 +1510,151 @@ mod tests {
             config: dormant_test_config(db_path, repo, worktree_base),
             task_id,
             worktree,
+        }
+    }
+
+    fn linked_fallback_recovery_fixture(
+        pid: Option<i32>,
+    ) -> (rusqlite::Connection, tempfile::TempDir, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("fallback-recovery.db")).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "fallback recovery",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let responsibility = format!("worker:task:{task_id}:revision:1");
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,task_id,role,complexity,profile_id,provider,runner,
+                 model,effort,pool_key,policy_generation,created_at)
+             VALUES (?1,?2,'worker','M','fallback-route','codex','codex',
+                     'gpt-5.6-terra','medium','worker.M','fallback-recovery-test',1)",
+            rusqlite::params![responsibility, task_id],
+        )
+        .unwrap();
+        let assignment_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO routing_attempts(
+                 role_assignment_id,responsibility_key,profile_id,provider,runner,model,
+                 effort,pool_key,policy_generation,failure_disposition,recorded_at)
+             VALUES (?1,?2,'failed-route','claude','claude','claude-opus','high',
+                     'worker.M','fallback-recovery-test','provider-unavailable',2)",
+            rusqlite::params![assignment_id, responsibility],
+        )
+        .unwrap();
+        let attempt_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at)
+             VALUES (?1,'Fallback','worker','gpt-5.6-terra','medium','codex',3)",
+            [task_id],
+        )
+        .unwrap();
+        let agent_run_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at,agent_run_id)
+             VALUES ('fallback-capability',?1,'Fallback','worker',4,?2)",
+            rusqlite::params![task_id, agent_run_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fallback_launch_intents(
+                 responsibility_key,routing_attempt_id,task_id,role,worktree,
+                 pending_turn_json,agent_run_id,capability_run_id,created_at)
+             VALUES (?1,?2,?3,'worker','/tmp/fallback-worktree',?4,?5,
+                     'fallback-capability',5)",
+            rusqlite::params![
+                responsibility,
+                attempt_id,
+                task_id,
+                r#"{"provider":"codex","model":"gpt-5.6-terra","effort":"medium","prompt":"finish the exact managed turn","turn_kind":"initial","requested":false}"#,
+                agent_run_id,
+            ],
+        )
+        .unwrap();
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: "Fallback".into(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "fallback-session".into(),
+                worktree: Some("/tmp/fallback-worktree".into()),
+                branch: Some("daemon/fallback".into()),
+                phase: "fallback-pending".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback".into()),
+            },
+        )
+        .unwrap();
+        (conn, dir, task_id)
+    }
+
+    #[test]
+    fn pending_fallback_recoveries_preserve_linked_marker_pid() {
+        for pid in [None, Some(4242)] {
+            let (conn, _dir, task_id) = linked_fallback_recovery_fixture(pid);
+
+            let recoveries = pending_fallback_recoveries(&conn).unwrap();
+
+            assert_eq!(recoveries.len(), 1);
+            assert_eq!(recoveries[0].entry.pid, pid);
+            assert_eq!(recoveries[0].intent.task_id, task_id);
+            assert_eq!(
+                recoveries[0].intent.capability_run_id,
+                "fallback-capability"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_fallback_recoveries_reject_invalid_unlinked_and_conflicting_markers() {
+        for (mutation, expected) in [
+            (
+                "UPDATE journal SET continuation_id='not-a-fallback-continuation'",
+                "invalid fallback-pending journal shape",
+            ),
+            (
+                "UPDATE journal SET pid=0",
+                "invalid fallback-pending journal shape",
+            ),
+            (
+                "UPDATE journal SET pid=-1",
+                "invalid fallback-pending journal shape",
+            ),
+            ("DELETE FROM fallback_launch_intents", "has no live intent"),
+            (
+                "UPDATE journal SET provider='claude'",
+                "conflicts with its intent",
+            ),
+        ] {
+            let (conn, _dir, _) = linked_fallback_recovery_fixture(Some(4242));
+            conn.execute_batch(mutation).unwrap();
+
+            let error = pending_fallback_recoveries(&conn).unwrap_err();
+
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error after {mutation}: {error}"
+            );
         }
     }
 

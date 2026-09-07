@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-pub const MAX_PROPOSAL_ATTEMPTS: i64 = 3;
-pub const MAX_PROVIDER_FAILURES: i64 = 3;
+pub const MAX_PROPOSAL_ATTEMPTS: i64 = 2;
+pub const MAX_PROVIDER_FAILURES: i64 = 2;
 pub const MAX_OPERATOR_RETRIES: i64 = 2;
 pub const MIN_CHILDREN: usize = 2;
 pub const MAX_CHILDREN: usize = 8;
@@ -445,7 +445,12 @@ fn planning_attempt_history_is_consistent(
         }
         let count = &mut attempts_by_generation[generation as usize][kind_index];
         *count += 1;
-        if *count > 3 {
+        // A single generation can accumulate at most its own kind's cap before
+        // exhaustion or reset, so bound the per-generation count by the same
+        // constant the cumulative check below uses. A literal here would drift
+        // silently when a cap changes.
+        let per_generation_cap = [MAX_PROPOSAL_ATTEMPTS, MAX_PROVIDER_FAILURES][kind_index];
+        if *count > per_generation_cap {
             return Ok(false);
         }
         expected_ordinal[kind_index] += 1;
@@ -3249,7 +3254,7 @@ mod tests {
     }
 
     fn exhaust_planning(conn: &mut Connection, graph: i64, kind: &str, start: i64) {
-        for index in 0..3 {
+        for index in 0..MAX_PROVIDER_FAILURES {
             if index > 0 {
                 assert!(reacquire_freeze(conn, graph, start + index * 3).unwrap());
                 assert!(set_frozen_phase(
@@ -3548,7 +3553,7 @@ mod tests {
     fn materialize_graph_applies_the_shared_size_policy_to_children() {
         let (_dir, mut conn) = file_setup();
         let graph = begin(&mut conn);
-        for (size, cx_est) in [("L", 4), ("L", 5), ("XL", 2)] {
+        for (size, cx_est) in [("L", 5), ("XL", 2)] {
             let error = materialize_graph(
                 &mut conn,
                 graph,
@@ -3577,7 +3582,7 @@ mod tests {
             &mut conn,
             graph,
             1,
-            &[child("a", &[]), sized_child("b", "L", 3)],
+            &[child("a", &[]), sized_child("b", "L", 4)],
             4,
         )
         .unwrap()
@@ -4780,9 +4785,11 @@ mod tests {
     }
 
     #[test]
-    fn provider_failure_releases_freeze_and_third_failure_holds() {
+    fn provider_failure_releases_freeze_and_cap_failure_holds() {
         let mut conn = setup();
         let graph = begin(&mut conn);
+        // The first provider failure releases the freeze into backoff without
+        // holding the graph.
         assert_eq!(
             record_attempt(
                 &mut conn,
@@ -4803,14 +4810,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("provider-backoff".into(), 0));
-        assert!(reacquire_freeze(&mut conn, graph, 4).unwrap());
-        assert!(
-            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 5).unwrap()
-        );
-        record_attempt(&mut conn, graph, "provider", "timeout", "second", 6).unwrap();
-        assert!(reacquire_freeze(&mut conn, graph, 7).unwrap());
-        set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 8).unwrap();
-        record_attempt(&mut conn, graph, "provider", "timeout", "third", 9).unwrap();
+        // Drive the remaining budget; the MAX_PROVIDER_FAILURES-th failure holds.
+        for ordinal in 2..=MAX_PROVIDER_FAILURES {
+            let now = 2 + ordinal * 3;
+            assert!(reacquire_freeze(&mut conn, graph, now).unwrap());
+            assert!(set_frozen_phase(
+                &mut conn,
+                graph,
+                "freeze-requested",
+                "planning",
+                None,
+                now + 1
+            )
+            .unwrap());
+            assert!(record_attempt(
+                &mut conn,
+                graph,
+                "provider",
+                "timeout",
+                "later provider failure",
+                now + 2
+            )
+            .unwrap()
+            .is_some());
+        }
         let held: (String, i64, String) = conn
             .query_row(
                 "SELECT d.state,d.provider_failures,t.status
@@ -4819,7 +4842,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(held, ("held".into(), 3, "failed".into()));
+        assert_eq!(
+            held,
+            ("held".into(), MAX_PROVIDER_FAILURES, "failed".into())
+        );
     }
 
     #[test]
@@ -4855,30 +4881,32 @@ mod tests {
         )
         .unwrap());
 
-        assert!(record_attempt(
-            &mut conn,
-            graph,
-            "provider",
-            "planner-provider",
-            "second provider failure",
-            8,
-        )
-        .unwrap()
-        .is_some());
-        assert!(reacquire_freeze(&mut conn, graph, 9).unwrap());
-        assert!(
-            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 10,).unwrap()
-        );
-        assert!(record_attempt(
-            &mut conn,
-            graph,
-            "provider",
-            "planner-provider",
-            "third provider failure",
-            11,
-        )
-        .unwrap()
-        .is_some());
+        // The remaining provider failures exhaust the provider budget; the
+        // MAX_PROVIDER_FAILURES-th holds, leaving the proposal budget untouched.
+        for ordinal in 2..=MAX_PROVIDER_FAILURES {
+            if ordinal > 2 {
+                assert!(reacquire_freeze(&mut conn, graph, 6 + ordinal * 3).unwrap());
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "freeze-requested",
+                    "planning",
+                    None,
+                    7 + ordinal * 3,
+                )
+                .unwrap());
+            }
+            assert!(record_attempt(
+                &mut conn,
+                graph,
+                "provider",
+                "planner-provider",
+                "later provider failure",
+                8 + ordinal * 3,
+            )
+            .unwrap()
+            .is_some());
+        }
 
         let state: (String, i64, i64, String, String, i64, i64) = conn
             .query_row(
@@ -4964,7 +4992,7 @@ mod tests {
                 33,
             )
             .unwrap(),
-            Some(4)
+            Some(MAX_PROVIDER_FAILURES + 1)
         );
         let attempts: Vec<(i64, i64)> = conn
             .prepare(
@@ -4976,7 +5004,11 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(attempts, vec![(1, 0), (2, 0), (3, 0), (4, 1)]);
+        let mut expected_attempts: Vec<(i64, i64)> = (1..=MAX_PROVIDER_FAILURES)
+            .map(|ordinal| (ordinal, 0))
+            .collect();
+        expected_attempts.push((MAX_PROVIDER_FAILURES + 1, 1));
+        assert_eq!(attempts, expected_attempts);
         let events: i64 = conn
             .query_row(
                 "SELECT count(*) FROM events
@@ -5150,14 +5182,16 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(latest, (4, 1));
+        assert_eq!(latest, (MAX_PROPOSAL_ATTEMPTS + 1, 1));
     }
 
     #[test]
     fn exhausted_carried_proposal_budget_remains_operator_retryable() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        for attempt in 0..2 {
+        // Consume the proposal budget up to one below its cap so the operator
+        // retry carries a partial proposal count across the provider exhaustion.
+        for attempt in 0..MAX_PROPOSAL_ATTEMPTS - 1 {
             let phase = if attempt == 0 {
                 "preclassifying"
             } else {
@@ -5217,7 +5251,15 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(held, ("proposal-attempts-exhausted".into(), 3, 0, 1));
+        assert_eq!(
+            held,
+            (
+                "proposal-attempts-exhausted".into(),
+                MAX_PROPOSAL_ATTEMPTS,
+                0,
+                1
+            )
+        );
         assert!(matches!(
             retry_exhausted_planning(&mut conn, 1, "operator", 44).unwrap(),
             PlanningRetryOutcome::Retried { generation: 2, .. }
@@ -5228,38 +5270,41 @@ mod tests {
     fn exhausted_carried_provider_budget_remains_operator_retryable() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        assert!(record_attempt(
-            &mut conn,
-            graph,
-            "provider",
-            "timeout",
-            "first carried provider failure",
-            10,
-        )
-        .unwrap()
-        .is_some());
-        assert!(reacquire_freeze(&mut conn, graph, 11).unwrap());
-        assert!(
-            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 12,).unwrap()
-        );
-        assert!(record_attempt(
-            &mut conn,
-            graph,
-            "provider",
-            "timeout",
-            "second carried provider failure",
-            13,
-        )
-        .unwrap()
-        .is_some());
-        assert!(reacquire_freeze(&mut conn, graph, 14).unwrap());
+        // Consume the provider budget up to one below its cap so the operator
+        // retry carries a partial provider count across the proposal exhaustion.
+        for ordinal in 1..MAX_PROVIDER_FAILURES {
+            let now = 7 + ordinal * 3;
+            if ordinal > 1 {
+                assert!(reacquire_freeze(&mut conn, graph, now).unwrap());
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "freeze-requested",
+                    "planning",
+                    None,
+                    now + 1,
+                )
+                .unwrap());
+            }
+            assert!(record_attempt(
+                &mut conn,
+                graph,
+                "provider",
+                "timeout",
+                "carried provider failure",
+                now + 2,
+            )
+            .unwrap()
+            .is_some());
+        }
+        assert!(reacquire_freeze(&mut conn, graph, 16).unwrap());
         assert!(set_frozen_phase(
             &mut conn,
             graph,
             "freeze-requested",
             "preclassifying",
             None,
-            15,
+            17,
         )
         .unwrap());
         for attempt in 0..MAX_PROPOSAL_ATTEMPTS {
@@ -5321,7 +5366,15 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(held, ("provider-attempts-exhausted".into(), 0, 3, 1));
+        assert_eq!(
+            held,
+            (
+                "provider-attempts-exhausted".into(),
+                0,
+                MAX_PROVIDER_FAILURES,
+                1
+            )
+        );
         assert!(matches!(
             retry_exhausted_planning(&mut conn, 1, "operator", 44).unwrap(),
             PlanningRetryOutcome::Retried { generation: 2, .. }
@@ -5382,14 +5435,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(attempts, 3 * (MAX_OPERATOR_RETRIES + 1));
+        assert_eq!(attempts, MAX_PROVIDER_FAILURES * (MAX_OPERATOR_RETRIES + 1));
     }
 
     #[test]
     fn exhausted_planning_retry_rejects_corrupt_or_materialized_authority() {
         for mutation in [
             "UPDATE task_decompositions SET hold_code='scope-blocker' WHERE id=?1",
-            "UPDATE task_decompositions SET provider_failures=2 WHERE id=?1",
+            "UPDATE task_decompositions SET provider_failures=1 WHERE id=?1",
             "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
             "UPDATE task_decompositions SET accepted_plan_revision=1 WHERE id=?1",
             "UPDATE task_decompositions SET active=1 WHERE id=?1",
@@ -5402,7 +5455,9 @@ mod tests {
 
         let (conn, graph) = exhausted_provider();
         conn.execute(
-            "DELETE FROM decomposition_attempts WHERE graph_id=?1 AND ordinal=3",
+            &format!(
+                "DELETE FROM decomposition_attempts WHERE graph_id=?1 AND ordinal={MAX_PROVIDER_FAILURES}"
+            ),
             [graph],
         )
         .unwrap();
