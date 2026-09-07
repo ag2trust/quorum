@@ -2257,7 +2257,12 @@ fn persist_reviewer_pr_target(
     // freeze against its own drain — the same class as the reserve/claim gates.
     if !reservation_active
         || task.status != "in-review"
-        || !tasks::classification_is_dispatchable(&task.refs, task.review_only, task.continue_pr)
+        || !tasks::classification_is_dispatchable(
+            &task.refs,
+            task.review_only,
+            task.continue_pr,
+            task.terminal_leaf,
+        )
     {
         tx.commit()?;
         return Ok(false);
@@ -5249,6 +5254,7 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
         .query_row(
             "SELECT t.id,t.revision FROM tasks t
          WHERE t.status='open' AND t.assignee IS NULL AND t.review_only=0
+           AND t.terminal_leaf=0
            AND NOT EXISTS (SELECT 1 FROM task_decompositions repository_graph
                            WHERE repository_graph.state IN ('active','blocked')
                               OR repository_graph.active=1)
@@ -6046,11 +6052,10 @@ fn child_preclassification_rejection_detail(
     Some(detail)
 }
 
-/// A planned child's size verdict is judged by the same implementation-size
-/// policy that dispatches root tasks, so a child the classifier calls `L` at
-/// complexity 4 or lower is accepted exactly as its root would be.
+/// Generated children are terminal leaves, so every non-XL classification is
+/// accepted regardless of the root implementation-size policy.
 fn child_size_is_rejected(result: &quorum_core::classify::TaskClassification) -> bool {
-    !quorum_core::tasks::size_is_dispatchable(&result.size, result.cx_est)
+    !matches!(result.size.as_str(), "S" | "M" | "L")
 }
 
 /// Preserve every verdict from one complete preclassification batch. Each
@@ -6463,7 +6468,7 @@ async fn materialize_validated_proposal(
     let path = config.db_path.clone();
     let materialized = tokio::task::spawn_blocking(move || -> Result<Option<bool>> {
         let mut conn = quorum_core::db::open(&path)?;
-        match quorum_core::decomposition::materialize_graph(
+        match quorum_core::decomposition::materialize_terminal_children(
             &mut conn,
             graph_id,
             snapshot.source_revision,
@@ -8854,6 +8859,7 @@ async fn reconcile_remediation_retries(
                         &task.refs,
                         task.review_only,
                         task.continue_pr,
+                        task.terminal_leaf,
                     ) && remediation_retry_feedback(task.refs.as_deref()).is_some()
                 })
                 .collect())
@@ -15304,13 +15310,14 @@ async fn tick(
         // After a stateless recovery (or if a worker exited without being
         // tracked), in-review tasks with a PR but no live worker or reviewer
         // need a reviewer provisioned from the DB state alone.
-        // (task_id, pr, author, review_only, continue_pr, body, reviewer, refs)
+        // (task_id, pr, author, review_only, continue_pr, terminal_leaf, body, reviewer, refs)
         type OrphanRow = (
             i64,
             i64,
             String,
             bool,
             Option<i64>,
+            bool,
             Option<String>,
             Option<String>,
             Option<String>,
@@ -15330,6 +15337,7 @@ async fn tick(
                             author,
                             t.review_only,
                             t.continue_pr,
+                            t.terminal_leaf,
                             t.body,
                             t.reviewer,
                             t.refs,
@@ -15342,8 +15350,17 @@ async fn tick(
             .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             .unwrap_or_default()
         };
-        for (task_id, pr, author, review_only, continue_pr, body, reviewer, task_refs) in
-            &orphan_in_review
+        for (
+            task_id,
+            pr,
+            author,
+            review_only,
+            continue_pr,
+            terminal_leaf,
+            body,
+            reviewer,
+            task_refs,
+        ) in &orphan_in_review
         {
             let has_worker = workers.iter().any(|w| w.task_id == *task_id);
             let has_reviewer = reviewers.iter().any(|r| r.task_id == *task_id);
@@ -15515,8 +15532,12 @@ async fn tick(
                     if reviewer_respawn_backoff.blocks(*task_id, *pr, std::time::Instant::now()) {
                         continue;
                     }
-                    if !tasks::classification_is_dispatchable(task_refs, *review_only, *continue_pr)
-                    {
+                    if !tasks::classification_is_dispatchable(
+                        task_refs,
+                        *review_only,
+                        *continue_pr,
+                        *terminal_leaf,
+                    ) {
                         log(&format!(
                             "task #{task_id} PR #{pr}: awaiting complete dispatchable classification before review dispatch"
                         ));
@@ -20425,7 +20446,12 @@ async fn spawn_worker(
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
             }
-            if !tasks::classification_is_dispatchable(&t.refs, t.review_only, t.continue_pr) {
+            if !tasks::classification_is_dispatchable(
+                &t.refs,
+                t.review_only,
+                t.continue_pr,
+                t.terminal_leaf,
+            ) {
                 return false;
             }
             if t.review_only {
@@ -41789,6 +41815,34 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[test]
+    fn terminal_leaf_dispatches_directly_and_never_becomes_a_planning_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("terminal-leaf.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(
+                 title,status,priority,created_by,created_at,updated_at,refs,terminal_leaf
+             ) VALUES
+                 ('terminal L5','open',100,'owner',1,1,
+                  '{\"cx_est\":5,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',1),
+                 ('ordinary L5','open',1,'owner',1,1,
+                  '{\"cx_est\":5,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);"
+        )
+        .unwrap();
+
+        assert_eq!(
+            planning_candidate(&conn).unwrap(),
+            Some((2, 1)),
+            "the terminal leaf must be excluded while the equivalent ordinary task plans"
+        );
+        let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 2)
+            .unwrap()
+            .expect("terminal L5 leaf must dispatch directly");
+        assert_eq!(claimed.status, "working");
+        assert!(claimed.terminal_leaf);
+        assert_eq!(tasks::get(&conn, 2).unwrap().unwrap().status, "open");
+    }
+
+    #[test]
     fn planning_and_claim_partition_classified_shapes() {
         for size in ["S", "M", "L", "XL"] {
             for cx_est in 1..=5 {
@@ -42192,18 +42246,18 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "child a rejected by preclassification: ready=false (not_ready_reason: missing acceptance criteria)"
         );
 
-        // `L` at complexity 4 satisfies the shared implementation-size policy
-        // exactly as a root task would; the child is accepted with its verdict.
-        let mut large_but_simple = valid.clone();
-        large_but_simple[1].size = "L".into();
-        large_but_simple[1].cx_est = 4;
-        let accepted = planned_children(&proposal, &large_but_simple).unwrap();
+        // Generated children are terminal leaves, so a complex L remains
+        // accepted even though an ordinary L5 root must decompose.
+        let mut terminal_large = valid.clone();
+        terminal_large[1].size = "L".into();
+        terminal_large[1].cx_est = 5;
+        let accepted = planned_children(&proposal, &terminal_large).unwrap();
         let accepted_refs: serde_json::Value =
             serde_json::from_str(&accepted[1].classification_refs).unwrap();
         assert_eq!(accepted_refs["cx_size"], "L");
-        assert_eq!(accepted_refs["cx_est"], 4);
+        assert_eq!(accepted_refs["cx_est"], 5);
 
-        for (size, cx_est) in [("L", 5), ("XL", 2)] {
+        for (size, cx_est) in [("XL", 2), ("XL", 5)] {
             let mut large = valid.clone();
             large[1].size = size.into();
             large[1].cx_est = cx_est;
@@ -42459,7 +42513,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[test]
-    fn child_preclassification_uses_the_shared_size_policy_and_records_complexity() {
+    fn child_preclassification_accepts_terminal_l_and_records_complexity() {
         let proposal = composition_child_fixture();
         let verdict = |size: &str, cx_est: i64| quorum_core::classify::TaskClassification {
             task_id: -2,
@@ -42470,14 +42524,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             not_ready_reason: None,
             duplicate_of: vec![],
         };
-        for (size, cx_est) in [("S", 5), ("M", 5), ("L", 1), ("L", 4)] {
+        for (size, cx_est) in [("S", 5), ("M", 5), ("L", 1), ("L", 4), ("L", 5)] {
             assert!(
                 child_preclassification_rejection_detail(&proposal[1], &verdict(size, cx_est))
                     .is_none(),
                 "{size}/{cx_est} must be accepted"
             );
         }
-        for (size, cx_est) in [("L", 5), ("XL", 1), ("XL", 5)] {
+        for (size, cx_est) in [("XL", 1), ("XL", 5)] {
             let detail =
                 child_preclassification_rejection_detail(&proposal[1], &verdict(size, cx_est))
                     .unwrap();
@@ -42487,7 +42541,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             );
         }
         let detail =
-            child_preclassification_rejection_detail(&proposal[1], &verdict("L", 5)).unwrap();
+            child_preclassification_rejection_detail(&proposal[1], &verdict("XL", 5)).unwrap();
         assert!(detail.contains("cx_est=5"));
         // The planner sees the complete rejected delta and paths, not a
         // 128-byte prefix.
@@ -42496,7 +42550,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             proposal[1].implementation_delta
         )));
         assert!(detail.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
-        let summary = child_preclassification_rejection(&proposal[1], &verdict("L", 5)).unwrap();
+        let summary = child_preclassification_rejection(&proposal[1], &verdict("XL", 5)).unwrap();
         assert!(summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
         assert!(summary.contains(&proposal[1].implementation_delta));
     }
@@ -42793,7 +42847,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             quorum_core::classify::TaskClassification {
                 task_id: -1,
                 cx_est: 5,
-                size: "L".into(),
+                size: "XL".into(),
                 size_reason: "independently deliverable storage and daemon orchestration seams"
                     .into(),
                 ready: true,
@@ -42815,7 +42869,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let summary = planned_children(&proposal, &classifications).unwrap_err();
         assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
         assert!(summary.contains(
-            "child storage-child: size=L cx_est=5 (size_reason=independently deliverable storage and daemon orchestration seams)"
+            "child storage-child: size=XL cx_est=5 (size_reason=independently deliverable storage and daemon orchestration seams)"
         ));
         assert!(summary.contains(
             "child provider-child: size=XL cx_est=5 (size_reason=independently deliverable provider launch and restart reconstruction seams)"
@@ -42897,7 +42951,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             classifications.push(quorum_core::classify::TaskClassification {
                 task_id: -(index as i64) - 1,
                 cx_est: 5,
-                size: if index % 2 == 0 { "L" } else { "XL" }.into(),
+                size: "XL".into(),
                 size_reason: format!("size-seam-{index}-{}", "s".repeat(160)),
                 ready: false,
                 not_ready_reason: Some(format!("ready-{index}-{}", "r".repeat(160))),
@@ -42917,8 +42971,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 line.contains(&format!("not_ready_reason=ready-{index}-")),
                 "{line}"
             );
-            let size = if index % 2 == 0 { "L" } else { "XL" };
-            assert!(line.contains(&format!("size={size}")), "{line}");
+            assert!(line.contains("size=XL"), "{line}");
             assert!(
                 line.contains(&format!("size_reason=size-seam-{index}-")),
                 "{line}"

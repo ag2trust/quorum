@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 70). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 73). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -115,6 +115,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- v53: authoritative nullable target branch. Resolved to the daemon-configured
     -- base before first execution; immutable once populated.
     target_branch TEXT,
+    -- v73: generated decomposition children are terminal implementation leaves.
+    -- They may bypass the ordinary size dispatch policy, but can never plan children.
+    terminal_leaf INTEGER NOT NULL DEFAULT 0,
     -- v56: nullable per-task rework ceiling. Stamped from the daemon's
     -- `max_rework` config at first ownership; immutable once populated. NULL
     -- means unstamped and falls back to the compiled REWORK_CAP, preserving

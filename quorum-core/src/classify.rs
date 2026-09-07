@@ -1681,7 +1681,8 @@ mod tests {
         assert!(crate::tasks::classification_is_dispatchable(
             &task.refs,
             task.review_only,
-            task.continue_pr
+            task.continue_pr,
+            task.terminal_leaf,
         ));
         let active_claims: i64 = conn
             .query_row(
@@ -1934,7 +1935,8 @@ mod tests {
         assert!(crate::tasks::classification_is_dispatchable(
             &Some(refs.into()),
             false,
-            None
+            None,
+            false,
         ));
     }
 
@@ -1954,7 +1956,7 @@ mod tests {
         assert_eq!(tasks_missing_cx_all(&conn).unwrap()[0].id, task_id);
         let refs = crate::tasks::get(&conn, task_id).unwrap().unwrap().refs;
         assert!(!crate::tasks::classification_is_dispatchable(
-            &refs, false, None
+            &refs, false, None, false
         ));
     }
 
