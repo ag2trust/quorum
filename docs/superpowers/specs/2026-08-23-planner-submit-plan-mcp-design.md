@@ -9,7 +9,7 @@ The decomposition planner reports its plan as free text. `planner::parse_respons
 JSON object. Conversational providers prefix prose; task #58 graph 15 failed three
 consecutive attempts with `response must be exactly one JSON object without wrappers`
 although each transcript ended with a complete, valid plan. Each failure is a full
-respawn and consumes one of `MAX_PROVIDER_FAILURES = 3`.
+respawn and consumes one of `MAX_PROVIDER_FAILURES = 2`.
 
 ## Invariant introduced
 
