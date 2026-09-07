@@ -4415,103 +4415,13 @@ async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<LateRevi
             deferred |= outcome == GraphBlockerConsumeOutcome::RetryHeadUnavailable;
             continue;
         }
-        let (Some(task_id), Some(pr), Some(raw_verdict)) =
-            (row.task_id, row.pr, row.verdict.as_deref())
-        else {
-            continue;
-        };
-        if row.kind != mailbox::MailboxKind::Done {
-            continue;
-        }
-        let gated = crate::verdict::gate(Some(raw_verdict), row.payload.as_deref());
-        let verdict = match gated.verdict.as_deref() {
-            Some("approved") => tasks::LateReviewerVerdict::Approved,
-            Some("changes") => tasks::LateReviewerVerdict::Changes,
-            _ => continue,
-        };
-        let remediation_feedback =
-            (verdict == tasks::LateReviewerVerdict::Changes).then(|| {
-                match (&gated.demotion_reason, &row.feedback) {
-                    (Some(reason), Some(feedback)) => {
-                        format!("{reason}\n\nReviewer feedback:\n{feedback}")
-                    }
-                    (Some(reason), None) => reason.clone(),
-                    (None, Some(feedback)) => feedback.clone(),
-                    (None, None) => "Changes requested.".to_string(),
-                }
-            });
-        // A changed PR invalidates an approval, not a changes verdict. Changes
-        // must still enter durable rework before stateless recovery discards
-        // the reviewer journal identity; no approval is being stamped.
-        let reviewed_sha = if verdict == tasks::LateReviewerVerdict::Approved {
-            let p = config.db_path.clone();
-            let agent = row.agent.clone();
-            let reviewed_sha = tokio::task::spawn_blocking(move || -> Option<String> {
-                let conn = quorum_core::db::open(&p).ok()?;
-                let worktree: String = conn
-                    .query_row(
-                        "SELECT worktree FROM journal
-                         WHERE agent=?1 AND role='reviewer' AND task_id=?2 AND pr=?3",
-                        (&agent, task_id, pr),
-                        |r| r.get(0),
-                    )
-                    .ok()?;
-                let output = std::process::Command::new("git")
-                    .args(["rev-parse", "HEAD"])
-                    .current_dir(worktree)
-                    .output()
-                    .ok()?;
-                output
-                    .status
-                    .success()
-                    .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-            })
-            .await
-            .ok()
-            .flatten();
-            let Some(reviewed_sha) = reviewed_sha.filter(|sha| !sha.is_empty()) else {
-                continue;
-            };
-            let repo = config.repo_dir.clone();
-            let executor = Arc::clone(&config.merge_executor);
-            let current_sha = tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
-                .await
-                .ok()
-                .flatten();
-            if current_sha.as_deref() != Some(reviewed_sha.as_str()) {
-                log(&format!(
-                    "startup verdict recovery: PR #{pr} changed since {} reviewed it; retaining approval for fresh review",
-                    row.agent
-                ));
-                continue;
-            }
-            reviewed_sha
-        } else {
-            String::new()
-        };
-        let p = config.db_path.clone();
-        let agent = row.agent.clone();
-        let recovered = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let mut conn = quorum_core::db::open(&p)?;
-            tasks::recover_late_reviewer_verdict(
-                &mut conn,
-                mailbox_id,
-                &agent,
-                task_id,
-                pr,
-                verdict,
-                gated.blocking_count.unwrap_or(0) as i64,
-                &reviewed_sha,
-                remediation_feedback.as_deref(),
-                now_unix(),
-            )
-        })
-        .await
-        .map_err(|error| QuorumError::Io(format!("late reviewer recovery join: {error}")))??;
-        if recovered {
+        if let Some(verdict) = fold_late_reviewer_verdict(config, mailbox_id, &row).await? {
             log(&format!(
-                "startup verdict recovery: folded {} verdict for task #{task_id}, PR #{pr}",
-                row.agent
+                "startup verdict recovery: folded {} {} verdict for task {:?}, PR {:?}",
+                row.agent,
+                late_reviewer_verdict_label(verdict),
+                row.task_id,
+                row.pr
             ));
         }
     }
@@ -4520,6 +4430,119 @@ async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<LateRevi
     } else {
         LateReviewerRecovery::Settled
     })
+}
+
+fn late_reviewer_verdict_label(verdict: tasks::LateReviewerVerdict) -> &'static str {
+    match verdict {
+        tasks::LateReviewerVerdict::Approved => "approved",
+        tasks::LateReviewerVerdict::Changes => "changes",
+    }
+}
+
+/// Fold one durable reviewer verdict row through the same immediate core
+/// transaction startup recovery uses (`tasks::recover_late_reviewer_verdict`):
+/// validation, approval persistence/invalidation, lifecycle transition,
+/// remediation feedback, and mailbox consumption commit together. Returns the
+/// folded verdict, or `None` when the row is not a foldable verdict or the
+/// core predicate rejected it — in which case the row stays unconsumed.
+async fn fold_late_reviewer_verdict(
+    config: &ServeConfig,
+    mailbox_id: i64,
+    row: &mailbox::MailboxRow,
+) -> Result<Option<tasks::LateReviewerVerdict>> {
+    let (Some(task_id), Some(pr), Some(raw_verdict)) =
+        (row.task_id, row.pr, row.verdict.as_deref())
+    else {
+        return Ok(None);
+    };
+    if row.kind != mailbox::MailboxKind::Done {
+        return Ok(None);
+    }
+    let gated = crate::verdict::gate(Some(raw_verdict), row.payload.as_deref());
+    let verdict = match gated.verdict.as_deref() {
+        Some("approved") => tasks::LateReviewerVerdict::Approved,
+        Some("changes") => tasks::LateReviewerVerdict::Changes,
+        _ => return Ok(None),
+    };
+    let remediation_feedback = (verdict == tasks::LateReviewerVerdict::Changes).then(|| {
+        match (&gated.demotion_reason, &row.feedback) {
+            (Some(reason), Some(feedback)) => {
+                format!("{reason}\n\nReviewer feedback:\n{feedback}")
+            }
+            (Some(reason), None) => reason.clone(),
+            (None, Some(feedback)) => feedback.clone(),
+            (None, None) => "Changes requested.".to_string(),
+        }
+    });
+    // A changed PR invalidates an approval, not a changes verdict. Changes
+    // must still enter durable rework before stateless recovery discards
+    // the reviewer journal identity; no approval is being stamped.
+    let reviewed_sha = if verdict == tasks::LateReviewerVerdict::Approved {
+        let p = config.db_path.clone();
+        let agent = row.agent.clone();
+        let reviewed_sha = tokio::task::spawn_blocking(move || -> Option<String> {
+            let conn = quorum_core::db::open(&p).ok()?;
+            let worktree: String = conn
+                .query_row(
+                    "SELECT worktree FROM journal
+                     WHERE agent=?1 AND role='reviewer' AND task_id=?2 AND pr=?3",
+                    (&agent, task_id, pr),
+                    |r| r.get(0),
+                )
+                .ok()?;
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(worktree)
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(reviewed_sha) = reviewed_sha.filter(|sha| !sha.is_empty()) else {
+            return Ok(None);
+        };
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        let current_sha = tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+            .await
+            .ok()
+            .flatten();
+        if current_sha.as_deref() != Some(reviewed_sha.as_str()) {
+            log(&format!(
+                "startup verdict recovery: PR #{pr} changed since {} reviewed it; retaining approval for fresh review",
+                row.agent
+            ));
+            return Ok(None);
+        }
+        reviewed_sha
+    } else {
+        String::new()
+    };
+    let p = config.db_path.clone();
+    let agent = row.agent.clone();
+    let recovered = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::recover_late_reviewer_verdict(
+            &mut conn,
+            mailbox_id,
+            &agent,
+            task_id,
+            pr,
+            verdict,
+            gated.blocking_count.unwrap_or(0) as i64,
+            &reviewed_sha,
+            remediation_feedback.as_deref(),
+            now_unix(),
+        )
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("late reviewer recovery join: {error}")))??;
+    Ok(recovered.then_some(verdict))
 }
 
 fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
@@ -14280,58 +14303,7 @@ async fn tick(
     // During drain, agents that have finished their current turn (draining=false)
     // should be torn down immediately — no new reviewers/work will be spawned.
     if drain_state.draining {
-        let mut drain_workers: Vec<usize> = Vec::new();
-        for (i, w) in workers.iter().enumerate() {
-            if slot_is_graceful_drain_candidate(w) {
-                drain_workers.push(i);
-            }
-        }
-        for &i in drain_workers.iter().rev() {
-            let w = workers.remove(i);
-            log(&format!(
-                "DRAIN: tearing down idle worker {} (task #{})",
-                w.agent_name, w.task_id
-            ));
-            fire_event(
-                &db_path,
-                &w.agent_name,
-                w.task_id,
-                &Event::AgentFailed {
-                    reason: "daemon draining".into(),
-                },
-            )
-            .await;
-            cleanup_slot(config, wt_mgr, name_pool, w, None, "drain").await;
-        }
-
-        let mut drain_reviewers: Vec<usize> = Vec::new();
-        for (i, r) in reviewers.iter().enumerate() {
-            if slot_is_graceful_drain_candidate(r) {
-                drain_reviewers.push(i);
-            }
-        }
-        for &i in drain_reviewers.iter().rev() {
-            log(&format!(
-                "DRAIN: tearing down idle reviewer {}",
-                reviewers[i].agent_name
-            ));
-            let mutation = fail_reviewer_if_owner(
-                &db_path,
-                &reviewers[i].agent_name,
-                reviewers[i].task_id,
-                "daemon draining",
-            )
-            .await;
-            if mutation.is_none() {
-                log(&format!(
-                    "reviewer {} drain mutation failed — retaining slot for retry",
-                    reviewers[i].agent_name
-                ));
-                continue;
-            }
-            let r = reviewers.remove(i);
-            teardown_reviewer(config, wt_mgr, name_pool, r, "drain").await;
-        }
+        drain_idle_agents(config, wt_mgr, name_pool, workers, reviewers).await;
     }
 
     // ── Phase 4b: Detect dead workers/reviewers ────────────────────────
@@ -17741,6 +17713,246 @@ fn slot_is_error_refeed_candidate(slot: &SlotState) -> bool {
 /// Shared by worker and reviewer graceful drain selection.
 fn slot_is_graceful_drain_candidate(slot: &SlotState) -> bool {
     !slot.draining && !slot_has_pending_watchdog_outcome(slot)
+}
+
+/// Graceful drain tears down agents that have finished their current turn
+/// without failing a durable outcome out from under them:
+///
+/// - A worker whose task is already in review is cleaned up without a
+///   lifecycle mutation. An unconditional `AgentFailed` there releases the
+///   review lease and clears `tasks.reviewer`, which orphans the reviewer's
+///   verdict. Every other worker keeps the previous `AgentFailed` teardown.
+/// - A reviewer classifies its exit through the same exact-run disposition
+///   the dead-process path (Phase 4b) uses. A verdict row that landed after
+///   this tick's mailbox poll is folded atomically (the startup late-verdict
+///   path) before teardown. Failing it instead clears the review assignment,
+///   and the row is then consumed as an unmatched phantom on the next tick.
+async fn drain_idle_agents(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    reviewers: &mut Vec<SlotState>,
+) {
+    let db_path = &config.db_path;
+    let drain_workers: Vec<usize> = workers
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| slot_is_graceful_drain_candidate(w))
+        .map(|(i, _)| i)
+        .collect();
+    for &i in drain_workers.iter().rev() {
+        let w = workers.remove(i);
+        log(&format!(
+            "DRAIN: tearing down idle worker {} (task #{})",
+            w.agent_name, w.task_id
+        ));
+        if task_is_in_review(db_path, w.task_id).await {
+            // The worker no longer owns this phase. `InReview + AgentFailed`
+            // releases the task lease and clears `tasks.reviewer`, which
+            // orphans a verdict the reviewer has already made durable.
+            log(&format!(
+                "DRAIN: worker {} task #{} is in review — cleaning up without failing the review phase",
+                w.agent_name, w.task_id
+            ));
+        } else {
+            // Owned phases fail back to open as before; a task mid-merge is
+            // reset to in-review so approval recovery merges it from durable
+            // state after restart.
+            fire_event(
+                db_path,
+                &w.agent_name,
+                w.task_id,
+                &Event::AgentFailed {
+                    reason: "daemon draining".into(),
+                },
+            )
+            .await;
+        }
+        cleanup_slot(config, wt_mgr, name_pool, w, None, "drain").await;
+    }
+
+    let drain_reviewers: Vec<usize> = reviewers
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| slot_is_graceful_drain_candidate(r))
+        .map(|(i, _)| i)
+        .collect();
+    for &i in drain_reviewers.iter().rev() {
+        let agent_name = reviewers[i].agent_name.clone();
+        let task_id = reviewers[i].task_id;
+        log(&format!("DRAIN: tearing down idle reviewer {agent_name}"));
+        let Some(disposition) = dispose_managed_process_exit(
+            db_path,
+            tasks::ManagedRunRole::Reviewer,
+            &agent_name,
+            task_id,
+            reviewers[i].cap_run_id.as_deref(),
+            "daemon draining",
+        )
+        .await
+        else {
+            log(&format!(
+                "reviewer {agent_name} drain classification failed — retaining slot for retry"
+            ));
+            continue;
+        };
+        let folded = match disposition {
+            tasks::ManagedExitDisposition::OutcomePending
+                if reviewer_approval_already_recorded(db_path, &agent_name, task_id).await =>
+            {
+                // The live path already made this approval durable and then
+                // deliberately left the row pending when drain interrupted the
+                // merge-checks wait; restart adoption re-processes it. Folding
+                // it again would re-enter `merging` on top of that contract.
+                log(&format!(
+                    "DRAIN: reviewer {agent_name} approval is already durable; leaving its pending row for restart recovery — tearing down"
+                ));
+                None
+            }
+            tasks::ManagedExitDisposition::OutcomePending => {
+                match fold_pending_reviewer_verdict(config, &agent_name, task_id).await {
+                    Ok(Some(verdict)) => {
+                        log(&format!(
+                            "DRAIN: folded pending {} verdict from reviewer {agent_name} for task #{task_id} before teardown",
+                            late_reviewer_verdict_label(verdict)
+                        ));
+                        Some(verdict)
+                    }
+                    Ok(None) => {
+                        // Phase 2 consumes every row from a live reviewer it
+                        // still owns, so keep the slot only while the task is
+                        // still this reviewer's review. Off-phase (for
+                        // example `merging` after a drain-interrupted checks
+                        // wait deliberately left the approval row pending)
+                        // the old no-op failure path tore the slot down and
+                        // left the row for restart recovery; keep doing that.
+                        if reviewer_still_owns_review(db_path, &agent_name, task_id).await {
+                            log(&format!(
+                                "DRAIN: reviewer {agent_name} verdict is pending but not foldable yet — retaining slot for mailbox delivery"
+                            ));
+                            continue;
+                        }
+                        log(&format!(
+                            "DRAIN: reviewer {agent_name} verdict row stays pending for restart recovery (task #{task_id} no longer in review) — tearing down"
+                        ));
+                        None
+                    }
+                    Err(error) => {
+                        log(&format!(
+                            "DRAIN: reviewer {agent_name} verdict fold failed — retaining slot for retry: {error}"
+                        ));
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let r = reviewers.remove(i);
+        match folded {
+            Some(tasks::LateReviewerVerdict::Approved) => {
+                teardown_reviewer_after_recorded_outcome(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    r,
+                    "verdict:approved",
+                )
+                .await;
+            }
+            Some(tasks::LateReviewerVerdict::Changes) => {
+                teardown_reviewer_after_recorded_outcome(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    r,
+                    "verdict:changes",
+                )
+                .await;
+            }
+            None => teardown_reviewer(config, wt_mgr, name_pool, r, "drain").await,
+        }
+    }
+}
+
+async fn task_is_in_review(db_path: &Path, task_id: i64) -> bool {
+    let p = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&p).ok()?;
+        let task = tasks::get(&conn, task_id).ok()??;
+        Some(task.status == "in-review")
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+async fn reviewer_approval_already_recorded(db_path: &Path, agent: &str, task_id: i64) -> bool {
+    let p = db_path.to_path_buf();
+    let agent = agent.to_string();
+    tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&p).ok()?;
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM approvals
+                 WHERE task_id=?1 AND reviewer=?2 AND verdict='approved'
+             )",
+            rusqlite::params![task_id, agent],
+            |row| row.get::<_, bool>(0),
+        )
+        .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+async fn reviewer_still_owns_review(db_path: &Path, agent: &str, task_id: i64) -> bool {
+    let p = db_path.to_path_buf();
+    let agent = agent.to_string();
+    tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&p).ok()?;
+        let task = tasks::get(&conn, task_id).ok()??;
+        Some(task.status == "in-review" && task.reviewer.as_deref() == Some(agent.as_str()))
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
+/// Locate and fold the oldest unconsumed verdict row this reviewer wrote for
+/// its task. Returns the folded verdict, or `None` when no row folded (it
+/// then stays unconsumed for Phase 2 or startup recovery).
+async fn fold_pending_reviewer_verdict(
+    config: &ServeConfig,
+    agent: &str,
+    task_id: i64,
+) -> Result<Option<tasks::LateReviewerVerdict>> {
+    let p = config.db_path.clone();
+    let agent_owned = agent.to_string();
+    let pending =
+        tokio::task::spawn_blocking(move || -> Result<Option<(i64, mailbox::MailboxRow)>> {
+            let conn = quorum_core::db::open(&p)?;
+            Ok(mailbox::poll_unconsumed(&conn)?
+                .into_iter()
+                .find(|(_, row)| {
+                    row.agent == agent_owned
+                        && row.kind == mailbox::MailboxKind::Done
+                        && row.task_id == Some(task_id)
+                        && row.verdict.is_some()
+                }))
+        })
+        .await
+        .map_err(|error| {
+            QuorumError::Io(format!("pending reviewer verdict poll join: {error}"))
+        })??;
+    let Some((mailbox_id, row)) = pending else {
+        return Ok(None);
+    };
+    fold_late_reviewer_verdict(config, mailbox_id, &row).await
 }
 
 async fn persist_runner_provider_block(
@@ -39688,6 +39900,756 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
         }
+    }
+
+    // ── Graceful drain × pending reviewer verdict ──────────────────────
+
+    struct DrainVerdictFixture {
+        task_id: i64,
+        mailbox_id: i64,
+        reviewer_run_id: i64,
+    }
+
+    const DRAIN_REVIEWER: &str = "Hasp";
+    const DRAIN_AUTHOR: &str = "Author";
+    const DRAIN_REVIEWER_CAP: &str = "run-hasp";
+    const DRAIN_AUTHOR_CAP: &str = "run-author";
+    const DRAIN_PR: i64 = 42;
+
+    /// An in-review task whose managed reviewer already wrote a durable
+    /// verdict row that Phase 2 has not consumed yet (the row landed after
+    /// this tick's mailbox poll). The sticky worker keeps its capability.
+    #[cfg(unix)]
+    fn seed_drain_verdict_fixture(
+        db_path: &Path,
+        reviewer_worktree: &Path,
+        verdict: Option<&str>,
+        payload: Option<&str>,
+        feedback: Option<&str>,
+    ) -> DrainVerdictFixture {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let now = now_unix();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "drain verdict",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        tasks::claim(&mut conn, DRAIN_AUTHOR, Some(task_id), &[], 3600, now)
+            .unwrap()
+            .expect("author claim");
+        quorum_core::capabilities::issue(
+            &mut conn,
+            DRAIN_AUTHOR_CAP,
+            task_id,
+            DRAIN_AUTHOR,
+            "worker",
+            now,
+        )
+        .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            DRAIN_AUTHOR,
+            task_id,
+            &Event::SignaledDone {
+                pr: DRAIN_PR.to_string(),
+            },
+            now,
+        )
+        .unwrap();
+        tasks::claim(&mut conn, DRAIN_REVIEWER, Some(task_id), &[], 3600, now)
+            .unwrap()
+            .expect("reviewer claim");
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: DRAIN_REVIEWER.into(),
+                role: "reviewer".into(),
+                task_id: Some(task_id),
+                session_id: "review-run".into(),
+                worktree: Some(reviewer_worktree.to_string_lossy().into()),
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(DRAIN_PR),
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+        let reviewer_run_id = quorum_core::agent_runs::insert(
+            &conn,
+            task_id,
+            DRAIN_REVIEWER,
+            "reviewer",
+            "model",
+            "high",
+            "codex",
+            now,
+        )
+        .unwrap();
+        quorum_core::capabilities::issue(
+            &mut conn,
+            DRAIN_REVIEWER_CAP,
+            task_id,
+            DRAIN_REVIEWER,
+            "reviewer",
+            now,
+        )
+        .unwrap();
+        let mailbox_id = match verdict {
+            Some(verdict) => mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: DRAIN_REVIEWER.into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(DRAIN_PR),
+                    verdict: Some(verdict.into()),
+                    feedback: feedback.map(str::to_string),
+                    note: None,
+                    to_agent: None,
+                    payload: payload.map(str::to_string),
+                },
+            )
+            .unwrap(),
+            None => 0,
+        };
+        DrainVerdictFixture {
+            task_id,
+            mailbox_id,
+            reviewer_run_id,
+        }
+    }
+
+    /// The child exits on its own: test slots carry no process group, so
+    /// `kill_and_reap` can only reap a process that is already gone.
+    #[cfg(unix)]
+    async fn drain_test_slot(
+        agent: &str,
+        task_id: i64,
+        worktree: PathBuf,
+        cap_run_id: &str,
+        agent_run_id: Option<i64>,
+    ) -> SlotState {
+        let mut child = tokio::process::Command::new("true")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let now = std::time::Instant::now();
+        SlotState {
+            agent_name: agent.into(),
+            proc: SlotProcess::running(runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+                child,
+                stdin,
+                tokio::io::BufReader::new(stdout),
+            ))),
+            task_id,
+            session_id: agent::new_session_id(),
+            model: "claude-sonnet-5".into(),
+            effort: "high".into(),
+            worktree_path: worktree,
+            branch: format!("test-branch-{agent}"),
+            remote_branch: format!("test-branch-{agent}"),
+            draining: false,
+            pending_watchdog_breach: None,
+            pr: Some(DRAIN_PR),
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: Some(now),
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id,
+            cap_run_id: Some(cap_run_id.into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "initial".into(),
+            pending_turn_kind: "initial".into(),
+        }
+    }
+
+    fn mailbox_consumption(conn: &quorum_core::Connection, mailbox_id: i64) -> (i64, i64) {
+        let consumed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox WHERE id=?1 AND consumed_at IS NOT NULL",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unconsumed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox WHERE consumed_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (consumed, unconsumed)
+    }
+
+    fn task_event_count(conn: &quorum_core::Connection, task_id: i64, kind: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind=?2",
+            rusqlite::params![format!("task#{task_id}"), kind],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn agent_run_end_reason(conn: &quorum_core::Connection, run_id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT end_reason FROM agent_runs WHERE id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Incident 2026-09-06 (task #231 / PR #778): a Codex reviewer submitted
+    /// `changes` (blocking=1) after the tick's mailbox poll; graceful drain
+    /// then failed the reviewer, cleared the review assignment, and the row
+    /// was consumed as a phantom. The verdict must instead be folded before
+    /// teardown into the same durable rework state startup recovery uses.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_folds_pending_changes_verdict_instead_of_failing_reviewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drain-changes.db");
+        let worktree = dir.path().join("reviewer-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let fx = seed_drain_verdict_fixture(
+            &db_path,
+            &worktree,
+            Some("changes"),
+            Some(r#"{"blocking":1}"#),
+            Some("fix the lock ordering"),
+        );
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers: Vec<SlotState> = Vec::new();
+        let mut reviewers = vec![
+            drain_test_slot(
+                DRAIN_REVIEWER,
+                fx.task_id,
+                worktree.clone(),
+                DRAIN_REVIEWER_CAP,
+                Some(fx.reviewer_run_id),
+            )
+            .await,
+        ];
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert!(reviewers.is_empty(), "folded reviewer must be torn down");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework", "changes verdict must enter rework");
+        assert_eq!(task.rework_round, 1);
+        assert_eq!(task.assignee, None);
+        assert!(daemon_rework_retry_requested(task.refs.as_deref()));
+        assert_eq!(
+            remediation_retry_feedback(task.refs.as_deref()).as_deref(),
+            Some("fix the lock ordering")
+        );
+        assert_eq!(task_event_count(&conn, fx.task_id, "task_rework"), 1);
+        assert_eq!(
+            task_event_count(&conn, fx.task_id, "task_in_review"),
+            1,
+            "drain must not fire AgentFailed on a reviewer with a pending verdict"
+        );
+        assert_eq!(mailbox_consumption(&conn, fx.mailbox_id), (1, 0));
+        assert!(quorum_core::approvals::get_for_pr(&conn, DRAIN_PR)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            agent_run_end_reason(&conn, fx.reviewer_run_id).as_deref(),
+            Some("verdict:changes")
+        );
+        drop(conn);
+
+        // Restart: startup recovery finds nothing left to fold and the row is
+        // consumed exactly once.
+        let outcome = recover_late_reviewer_verdicts(&config).await.unwrap();
+        assert_eq!(outcome, LateReviewerRecovery::Settled);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(mailbox_consumption(&conn, fx.mailbox_id), (1, 0));
+        let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+    }
+
+    #[cfg(unix)]
+    fn init_reviewer_git_worktree(worktree: &Path) -> String {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(worktree)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "reviewed head"]);
+        run(&["rev-parse", "HEAD"])
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_folds_pending_approval_and_keeps_review_assignment_for_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drain-approved.db");
+        let worktree = dir.path().join("reviewer-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let head_sha = init_reviewer_git_worktree(&worktree);
+        let fx = seed_drain_verdict_fixture(
+            &db_path,
+            &worktree,
+            Some("approved"),
+            Some(r#"{"blocking":0}"#),
+            None,
+        );
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = Arc::new(FallbackHeadExecutor(head_sha.clone()));
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers: Vec<SlotState> = Vec::new();
+        let mut reviewers = vec![
+            drain_test_slot(
+                DRAIN_REVIEWER,
+                fx.task_id,
+                worktree.clone(),
+                DRAIN_REVIEWER_CAP,
+                Some(fx.reviewer_run_id),
+            )
+            .await,
+        ];
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert!(reviewers.is_empty(), "folded reviewer must be torn down");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(
+            task.reviewer.as_deref(),
+            Some(DRAIN_REVIEWER),
+            "approval must keep the review assignment for approval recovery"
+        );
+        let approval = quorum_core::approvals::get(&conn, DRAIN_PR, "r1")
+            .unwrap()
+            .expect("R1 approval must be durable before teardown");
+        assert_eq!(approval.verdict, "approved");
+        assert_eq!(approval.reviewer, DRAIN_REVIEWER);
+        assert_eq!(approval.approved_head_sha, head_sha);
+        assert_eq!(task_event_count(&conn, fx.task_id, "task_in_review"), 1);
+        assert_eq!(mailbox_consumption(&conn, fx.mailbox_id), (1, 0));
+        assert_eq!(
+            agent_run_end_reason(&conn, fx.reviewer_run_id).as_deref(),
+            Some("verdict:approved")
+        );
+        drop(conn);
+
+        let outcome = recover_late_reviewer_verdicts(&config).await.unwrap();
+        assert_eq!(outcome, LateReviewerRecovery::Settled);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(mailbox_consumption(&conn, fx.mailbox_id), (1, 0));
+        assert_eq!(
+            quorum_core::approvals::get_for_pr(&conn, DRAIN_PR)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Workers are torn down before reviewers. A sticky worker whose task is
+    /// already in review does not own the phase any more; failing it releases
+    /// the review lease and clears `tasks.reviewer`, which would make the
+    /// reviewer's pending verdict unfoldable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_keeps_review_assignment_when_idle_sticky_worker_is_torn_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drain-sticky.db");
+        let reviewer_wt = dir.path().join("reviewer-wt");
+        let worker_wt = dir.path().join("worker-wt");
+        std::fs::create_dir_all(&reviewer_wt).unwrap();
+        std::fs::create_dir_all(&worker_wt).unwrap();
+        let fx = seed_drain_verdict_fixture(
+            &db_path,
+            &reviewer_wt,
+            Some("changes"),
+            Some(r#"{"blocking":2}"#),
+            Some("two blockers"),
+        );
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers = vec![
+            drain_test_slot(DRAIN_AUTHOR, fx.task_id, worker_wt, DRAIN_AUTHOR_CAP, None).await,
+        ];
+        let mut reviewers = vec![
+            drain_test_slot(
+                DRAIN_REVIEWER,
+                fx.task_id,
+                reviewer_wt,
+                DRAIN_REVIEWER_CAP,
+                Some(fx.reviewer_run_id),
+            )
+            .await,
+        ];
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert!(workers.is_empty());
+        assert!(reviewers.is_empty());
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+        assert!(daemon_rework_retry_requested(task.refs.as_deref()));
+        assert_eq!(
+            remediation_retry_feedback(task.refs.as_deref()).as_deref(),
+            Some("two blockers")
+        );
+        assert_eq!(
+            task_event_count(&conn, fx.task_id, "task_in_review"),
+            1,
+            "idle worker teardown must not fire AgentFailed on an in-review task"
+        );
+        assert_eq!(task_event_count(&conn, fx.task_id, "task_rework"), 1);
+        assert_eq!(mailbox_consumption(&conn, fx.mailbox_id), (1, 0));
+    }
+
+    /// Negative path: the live approved path records the approval and, when
+    /// drain interrupts the merge-checks wait, deliberately leaves the row
+    /// pending for restart adoption. Drain must not fold it a second time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_leaves_already_recorded_approval_row_for_restart_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drain-recorded-approval.db");
+        let worktree = dir.path().join("reviewer-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let head_sha = init_reviewer_git_worktree(&worktree);
+        let fx = seed_drain_verdict_fixture(
+            &db_path,
+            &worktree,
+            Some("approved"),
+            Some(r#"{"blocking":0}"#),
+            None,
+        );
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            quorum_core::approvals::record(
+                &mut conn,
+                &quorum_core::approvals::Approval {
+                    pr_number: DRAIN_PR,
+                    review_role: "r1".into(),
+                    task_id: fx.task_id,
+                    author: DRAIN_AUTHOR.into(),
+                    reviewer: DRAIN_REVIEWER.into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: head_sha.clone(),
+                },
+            )
+            .unwrap();
+        }
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = Arc::new(FallbackHeadExecutor(head_sha));
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers: Vec<SlotState> = Vec::new();
+        let mut reviewers = vec![
+            drain_test_slot(
+                DRAIN_REVIEWER,
+                fx.task_id,
+                worktree,
+                DRAIN_REVIEWER_CAP,
+                Some(fx.reviewer_run_id),
+            )
+            .await,
+        ];
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert!(reviewers.is_empty());
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.reviewer.as_deref(), Some(DRAIN_REVIEWER));
+        assert_eq!(mailbox_consumption(&conn, fx.mailbox_id), (0, 1));
+        assert_eq!(
+            quorum_core::approvals::get_for_pr(&conn, DRAIN_PR)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            agent_run_end_reason(&conn, fx.reviewer_run_id).as_deref(),
+            Some("drain")
+        );
+    }
+
+    /// Negative path: a reviewer with no durable verdict is still failed by
+    /// drain, releasing the review assignment for restart re-provisioning.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_still_fails_idle_reviewer_without_pending_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drain-no-verdict.db");
+        let worktree = dir.path().join("reviewer-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let fx = seed_drain_verdict_fixture(&db_path, &worktree, None, None, None);
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers: Vec<SlotState> = Vec::new();
+        let mut reviewers = vec![
+            drain_test_slot(
+                DRAIN_REVIEWER,
+                fx.task_id,
+                worktree,
+                DRAIN_REVIEWER_CAP,
+                Some(fx.reviewer_run_id),
+            )
+            .await,
+        ];
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert!(reviewers.is_empty());
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.reviewer, None, "failed reviewer must release review");
+        assert_eq!(task_event_count(&conn, fx.task_id, "task_in_review"), 2);
+        assert_eq!(
+            agent_run_end_reason(&conn, fx.reviewer_run_id).as_deref(),
+            Some("drain")
+        );
+    }
+
+    /// Negative path: a drain-interrupted checks wait deliberately leaves the
+    /// R2 approval row pending with the task already `merging`. The fold
+    /// declines off-phase, and the reviewer must still be torn down with
+    /// `drain` (row untouched) instead of pinning the drain forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_tears_down_reviewer_whose_pending_row_is_deferred_off_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drain-off-phase.db");
+        let worktree = dir.path().join("reviewer-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let fx = seed_drain_verdict_fixture(
+            &db_path,
+            &worktree,
+            Some("approved"),
+            Some(r#"{"blocking":0}"#),
+            None,
+        );
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='merging' WHERE id=?1",
+                [fx.task_id],
+            )
+            .unwrap();
+        }
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers: Vec<SlotState> = Vec::new();
+        let mut reviewers = vec![
+            drain_test_slot(
+                DRAIN_REVIEWER,
+                fx.task_id,
+                worktree,
+                DRAIN_REVIEWER_CAP,
+                Some(fx.reviewer_run_id),
+            )
+            .await,
+        ];
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert!(
+            reviewers.is_empty(),
+            "off-phase reviewer must not pin drain"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "merging");
+        assert_eq!(task.reviewer.as_deref(), Some(DRAIN_REVIEWER));
+        assert_eq!(
+            mailbox_consumption(&conn, fx.mailbox_id),
+            (0, 1),
+            "deferred row stays pending for restart recovery"
+        );
+        assert!(quorum_core::approvals::get_for_pr(&conn, DRAIN_PR)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            agent_run_end_reason(&conn, fx.reviewer_run_id).as_deref(),
+            Some("drain")
+        );
+    }
+
+    /// Documented shutdown contract (see `cli_serve_merge_checks::
+    /// checks_pending_survives_restart`): an idle worker on a `merging` task
+    /// still resets it to in-review so approval recovery merges after restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_still_resets_merging_task_to_in_review_via_idle_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drain-merging-worker.db");
+        let worker_wt = dir.path().join("worker-wt");
+        let reviewer_wt = dir.path().join("reviewer-wt");
+        std::fs::create_dir_all(&worker_wt).unwrap();
+        let fx = seed_drain_verdict_fixture(&db_path, &reviewer_wt, None, None, None);
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='merging' WHERE id=?1",
+                [fx.task_id],
+            )
+            .unwrap();
+        }
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers = vec![
+            drain_test_slot(DRAIN_AUTHOR, fx.task_id, worker_wt, DRAIN_AUTHOR_CAP, None).await,
+        ];
+        let mut reviewers: Vec<SlotState> = Vec::new();
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert!(workers.is_empty());
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task_event_count(&conn, fx.task_id, "task_in_review"), 2);
+    }
+
+    /// Negative path: an idle worker that still owns a `working` task and has
+    /// no submission is failed back to open exactly as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_still_fails_idle_worker_that_owns_working_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drain-working.db");
+        let worktree = dir.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        create_active_task(&db_path, DRAIN_AUTHOR, "working");
+        issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers =
+            vec![drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await];
+        let mut reviewers: Vec<SlotState> = Vec::new();
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert!(workers.is_empty());
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 1);
     }
 
     fn issue_test_run(db_path: &Path, agent: &str, run_id: &str) {
