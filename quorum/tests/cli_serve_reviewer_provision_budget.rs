@@ -109,6 +109,29 @@ impl ServeHandle {
         extra_args: &[&str],
         agent_bin: &std::path::Path,
     ) -> Self {
+        Self::start_with_agent_bin_env(
+            home,
+            repo,
+            wt_base,
+            names,
+            merge_cmd,
+            extra_args,
+            agent_bin,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_agent_bin_env(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        wt_base: &std::path::Path,
+        names: &std::path::Path,
+        merge_cmd: &str,
+        extra_args: &[&str],
+        agent_bin: &std::path::Path,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
         let gh_shim = tempfile::tempdir().unwrap();
@@ -170,6 +193,7 @@ fi
             .env("QUORUM_REPO", "test/repo")
             .env("PATH", path)
             .env("QUORUM_TEST_REPO", repo)
+            .envs(extra_env.iter().copied())
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -655,6 +679,116 @@ fn persistent_reviewer_spawn_failure_stops_after_provision_budget() {
     assert_eq!(attempts, 3, "spawn failure must record provision strikes");
     let parked = get_task(home.path(), task_id);
     assert_eq!(parked.status, "failed", "task was not parked");
+    assert_eq!(parked.reviewer, None);
+    drop(handle);
+}
+
+/// Task #231 / PR #778: a reviewer that spawns fine, completes a turn, and
+/// exits cleanly without ever calling `quorum submit` used to record nothing in
+/// `reviewer_provision_attempts`, so the daemon re-provisioned it every tick
+/// until the 12-run lifetime cap parked the task. Each such exit must burn the
+/// per-head strike and pause before the next provision, so the orphan loop
+/// parks after three reviewers and never spawns a fourth.
+#[test]
+fn no_verdict_reviewer_exit_stops_after_provision_budget() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+
+    // A well-formed Claude stream-json reviewer that reads its turn, reports a
+    // completed result, and exits 0 without submitting a verdict — the exact
+    // shape of the incident (`fake_agent` always submits or stays resident).
+    let silent_reviewer = home.path().join("silent-reviewer.sh");
+    std::fs::write(
+        &silent_reviewer,
+        r#"#!/bin/sh
+IFS= read -r _line
+printf '{"type":"assistant","message":{"content":"No new review is due until the PR head changes."}}\n'
+printf '{"type":"result","result":"no new review due","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.001,"is_error":false}\n'
+exit 0
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&silent_reviewer, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut handle = ServeHandle::start_with_agent_bin_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+        &silent_reviewer,
+        // Keep the pause real but short so three cycles fit the test budget.
+        &[("QUORUM_TEST_REVIEWER_RESPAWN_BACKOFF_MS", "250")],
+    );
+    assert!(
+        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 90),
+        "no-verdict exits did not exhaust and park: {:?}",
+        handle.lines
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    handle.drain_pending_lines();
+
+    let no_verdict_exits = handle
+        .lines
+        .iter()
+        .filter(|line| line.contains("exited without a verdict for task #1 PR #42"))
+        .count();
+    assert_eq!(
+        no_verdict_exits, 3,
+        "each no-verdict exit must burn exactly one strike: {:?}",
+        handle.lines
+    );
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let attempts: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(attempts), 0) FROM reviewer_provision_attempts WHERE task_id=?1",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        attempts, 3,
+        "no-verdict exits must record provision strikes"
+    );
+    let reviewer_runs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1 AND role='reviewer'",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reviewer_runs, 3,
+        "the per-head budget must park before a fourth reviewer is spawned"
+    );
+    let parked = get_task(home.path(), task_id);
+    assert_eq!(parked.status, "failed", "task was not parked");
+    assert!(
+        parked
+            .refs
+            .as_deref()
+            .unwrap_or_default()
+            .contains("reviewer provision exhausted for orphan PR #42"),
+        "park reason missing from refs: {:?}",
+        parked.refs
+    );
     assert_eq!(parked.reviewer, None);
     drop(handle);
 }
