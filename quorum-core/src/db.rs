@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 71;
+pub const SCHEMA_VERSION: i64 = 72;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1333,6 +1333,15 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 [],
             )?;
         }
+        // v72 marks generated decomposition children as terminal leaves. This is
+        // additive: historic tasks remain ordinary roots, while new materialized
+        // children opt into the one-level decomposition boundary explicitly.
+        if current < 72 && !column_exists(conn, "tasks", "terminal_leaf")? {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN terminal_leaf INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1983,12 +1992,12 @@ mod tests {
             upgraded
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            71
+            SCHEMA_VERSION
         );
 
         let rerun = migrate(&upgraded).unwrap();
-        assert_eq!(rerun.migrated_from, 71);
-        assert_eq!(rerun.schema_version, 71);
+        assert_eq!(rerun.migrated_from, SCHEMA_VERSION);
+        assert_eq!(rerun.schema_version, SCHEMA_VERSION);
         let branches_after_rerun: Vec<(i64, Option<String>)> = [1, 2, 3, 4, 5, 6]
             .into_iter()
             .map(|id| {
@@ -2002,6 +2011,59 @@ mod tests {
             })
             .collect();
         assert_eq!(branches_after_rerun, branches);
+    }
+
+    #[test]
+    fn v71_to_v72_adds_terminal_leaf_once_with_default_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v71-terminal-leaf.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('legacy task','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE tasks DROP COLUMN terminal_leaf;
+                 PRAGMA user_version=71;",
+            )
+            .unwrap();
+            assert!(!column_exists(&raw, "tasks", "terminal_leaf").unwrap());
+        }
+
+        let upgraded = open(&path).unwrap();
+        assert!(column_exists(&upgraded, "tasks", "terminal_leaf").unwrap());
+        assert_eq!(
+            upgraded
+                .query_row("SELECT terminal_leaf FROM tasks WHERE id=1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0,
+            "migration must not reinterpret historic tasks as leaves"
+        );
+        assert_eq!(
+            upgraded
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "tasks", "terminal_leaf").unwrap());
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION,
+            "the second open must be a migration no-op"
+        );
     }
 
     #[test]

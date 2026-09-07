@@ -2311,8 +2311,39 @@ fn main() {
 mod tests {
     use super::{
         assemble_status_snapshot, parse_ttl, resolve_repo_override, resolve_web_log_dir,
-        tail_output_for_line, validate_external_poll_interval, wait_child_stdout,
+        tail_output_for_line, validate_external_poll_interval, wait_child_stdout, TaskGetView,
     };
+
+    #[test]
+    fn task_get_view_serializes_terminal_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("task-get.db")).unwrap();
+        let id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "terminal child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET terminal_leaf=1 WHERE id=?1", [id])
+            .unwrap();
+        let task = quorum_core::tasks::get_with_notes(&conn, id)
+            .unwrap()
+            .unwrap();
+
+        let json = serde_json::to_value(TaskGetView {
+            task: &task,
+            arbiter: None,
+        })
+        .unwrap();
+        assert_eq!(json["terminal_leaf"], true);
+    }
 
     #[test]
     fn web_log_dir_prefers_explicit_then_configured_then_home_default() {

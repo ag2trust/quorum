@@ -224,6 +224,9 @@ pub struct Task {
     pub edit_count: i64,
     pub continue_pr: Option<i64>,
     pub target_branch: Option<String>,
+    /// Generated decomposition children are terminal leaves. They dispatch
+    /// directly but never become another decomposition source.
+    pub terminal_leaf: bool,
     /// Per-task rework ceiling, stamped from the daemon's `max_rework` config at
     /// first ownership. `None` means unstamped — see [`Task::effective_rework_cap`].
     pub rework_cap: Option<i64>,
@@ -374,7 +377,7 @@ pub fn effect_name(e: &Effect) -> String {
 const COLS: &str = "id, title, body, status, priority, labels, assignee, created_by, \
                     created_at, updated_at, refs, depends_on, author, reviewer, \
                     rework_round, review_only, recovery_attempts, revision, edit_count, \
-                    continue_pr, target_branch, rework_cap";
+                    continue_pr, target_branch, terminal_leaf, rework_cap";
 
 const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
     SELECT 1 FROM json_each(depends_on) je
@@ -432,10 +435,12 @@ pub(crate) const SIZE_DISPATCH_POLICY_SQL: &str = size_dispatch_policy_sql!();
 
 // SQL counterpart of the implementation branch in
 // `classification_is_dispatchable`. Callers that need implementation work
-// additionally require `review_only=0`; continuation tasks remain eligible at
-// every classified size, just as they are in the Rust policy.
+// additionally require `review_only=0`; continuation tasks and terminal leaves
+// remain eligible outside the ordinary size policy. Terminal leaves still reject
+// XL, which is disallowed when a decomposition plan is accepted.
 const DIRECT_DISPATCH_CLAUSE: &str = concat!(
     "(review_only=1 OR continue_pr IS NOT NULL OR ",
+    "(terminal_leaf=1 AND json_extract(refs, '$.cx_size') != 'XL') OR ",
     size_dispatch_policy_sql!(),
     ")"
 );
@@ -463,7 +468,8 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         edit_count: r.get(18)?,
         continue_pr: r.get(19)?,
         target_branch: r.get(20)?,
-        rework_cap: r.get(21)?,
+        terminal_leaf: r.get::<_, i64>(21)? != 0,
+        rework_cap: r.get(22)?,
         ready: false,
     })
 }
@@ -4147,6 +4153,7 @@ pub fn classification_is_dispatchable(
     refs: &Option<String>,
     review_only: bool,
     continue_pr: Option<i64>,
+    terminal_leaf: bool,
 ) -> bool {
     if !classification_is_complete(refs) {
         return false;
@@ -4166,7 +4173,10 @@ pub fn classification_is_dispatchable(
     let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
     ready
         && (1..=5).contains(&cx)
-        && (review_only || continue_pr.is_some() || size_is_dispatchable(size, cx))
+        && (review_only
+            || continue_pr.is_some()
+            || (terminal_leaf && size != "XL")
+            || size_is_dispatchable(size, cx))
 }
 
 /// The single implementation-size dispatch policy shared by root-task dispatch
@@ -8785,11 +8795,21 @@ mod tests {
 
         let moderate_refs = get(&conn, moderate_l).unwrap().unwrap().refs;
         assert!(classification_is_complete(&moderate_refs));
-        assert!(classification_is_dispatchable(&moderate_refs, false, None));
+        assert!(classification_is_dispatchable(
+            &moderate_refs,
+            false,
+            None,
+            false
+        ));
         // L at complexity 4 is now directly dispatchable; only L at complexity 5
         // (and every XL) stays outside automatic dispatch.
         let boundary_refs = get(&conn, boundary_l).unwrap().unwrap().refs;
-        assert!(classification_is_dispatchable(&boundary_refs, false, None));
+        assert!(classification_is_dispatchable(
+            &boundary_refs,
+            false,
+            None,
+            false
+        ));
         assert!(claim(&mut conn, "moderate", Some(moderate_l), &[], TTL, 3)
             .unwrap()
             .is_some());
@@ -8826,7 +8846,8 @@ mod tests {
             assert!(classification_is_dispatchable(
                 &task.refs,
                 task.review_only,
-                task.continue_pr
+                task.continue_pr,
+                task.terminal_leaf,
             ));
             assert!(claim(
                 &mut conn,
@@ -13285,7 +13306,8 @@ mod tests {
             assert!(classification_is_dispatchable(
                 &task.refs,
                 task.review_only,
-                task.continue_pr
+                task.continue_pr,
+                task.terminal_leaf,
             ));
 
             let token = format!("review-{size}");
@@ -14917,7 +14939,7 @@ mod tests {
                 .unwrap();
             assert_eq!(sql_verdict, *expected, "sql policy for {size}/{cx_est}");
             assert_eq!(
-                classification_is_dispatchable(&Some(refs.clone()), false, None),
+                classification_is_dispatchable(&Some(refs.clone()), false, None, false),
                 *expected,
                 "root dispatch policy for {size}/{cx_est}"
             );
@@ -14925,11 +14947,41 @@ mod tests {
             assert!(classification_is_dispatchable(
                 &Some(refs.clone()),
                 true,
-                None
+                None,
+                false,
             ));
-            assert!(classification_is_dispatchable(&Some(refs), false, Some(9)));
+            assert!(classification_is_dispatchable(
+                &Some(refs),
+                false,
+                Some(9),
+                false
+            ));
         }
         assert!(DIRECT_DISPATCH_CLAUSE.contains(SIZE_DISPATCH_POLICY_SQL));
+    }
+
+    #[test]
+    fn task_detail_json_surfaces_terminal_leaf() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn,
+            "owner",
+            "terminal child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET terminal_leaf=1 WHERE id=?1", [id])
+            .unwrap();
+
+        let detail = get_with_notes(&conn, id).unwrap().unwrap();
+        let json = serde_json::to_value(detail).unwrap();
+        assert_eq!(json["terminal_leaf"], true);
     }
 
     #[test]

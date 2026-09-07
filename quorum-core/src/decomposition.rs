@@ -1298,8 +1298,8 @@ pub fn accept_classifications(
 }
 
 /// A generated child may materialize only when it is ready, not a duplicate,
-/// and its size verdict satisfies the same implementation-size policy that
-/// dispatches root tasks ([`crate::tasks::size_is_dispatchable`]).
+/// and not `XL`. Materialized children are terminal leaves, so `L` children
+/// are intentionally not subject to the root size-dispatch policy.
 fn classification_is_child_dispatchable(raw: &str) -> bool {
     let owned = Some(raw.to_owned());
     if !crate::tasks::classification_is_complete(&owned) {
@@ -1315,16 +1315,14 @@ fn classification_is_child_dispatchable(raw: &str) -> bool {
         .get("cx_dup_of")
         .and_then(|v| v.as_array())
         .is_some_and(|values| !values.is_empty());
-    let size_ok = match (size, cx_est) {
-        (Some(size), Some(cx_est)) => crate::tasks::size_is_dispatchable(size, cx_est),
-        _ => false,
-    };
+    let size_ok = matches!(size, Some("S" | "M" | "L")) && cx_est.is_some();
     size_ok && ready == Some(true) && !duplicate
 }
 
-/// Atomically create every generated task and member. The returned IDs follow
-/// proposal order. No child row can survive a failed validation or insert.
-pub fn materialize_graph(
+/// Atomically create every stored-plan child as a terminal implementation leaf.
+/// The returned IDs follow proposal order. No child row can survive a failed
+/// validation or insert.
+pub fn materialize_terminal_children(
     conn: &mut Connection,
     graph_id: i64,
     expected_source_revision: i64,
@@ -1465,8 +1463,8 @@ pub fn materialize_graph(
     for child in children {
         tx.execute(
             "INSERT INTO tasks(title,body,status,priority,labels,created_by,created_at,
-                 updated_at,refs,depends_on,target_branch)
-             VALUES (?1,?2,'open',?3,?4,?5,?6,?6,?7,'[]',?8)",
+                 updated_at,refs,depends_on,target_branch,terminal_leaf)
+             VALUES (?1,?2,'open',?3,?4,?5,?6,?6,?7,'[]',?8,1)",
             params![
                 child.title,
                 child.body,
@@ -1534,6 +1532,19 @@ pub fn materialize_graph(
     )?;
     tx.commit().map_err(map_sql_err)?;
     Ok(Some(ids))
+}
+
+/// Backwards-compatible name for stored-plan materialization. All generated
+/// children are terminal leaves; callers that accept a plan should prefer
+/// [`materialize_terminal_children`] to make that lifecycle boundary explicit.
+pub fn materialize_graph(
+    conn: &mut Connection,
+    graph_id: i64,
+    expected_source_revision: i64,
+    children: &[PlannedChild],
+    now: i64,
+) -> Result<Option<Vec<i64>>> {
+    materialize_terminal_children(conn, graph_id, expected_source_revision, children, now)
 }
 
 /// Cancel a source graph and revoke all unfinished generated execution
@@ -3550,10 +3561,10 @@ mod tests {
     }
 
     #[test]
-    fn materialize_graph_applies_the_shared_size_policy_to_children() {
+    fn materialize_terminal_children_marks_leaves_and_rejects_xl() {
         let (_dir, mut conn) = file_setup();
         let graph = begin(&mut conn);
-        for (size, cx_est) in [("L", 5), ("XL", 2)] {
+        for (size, cx_est) in [("XL", 2), ("XL", 5)] {
             let error = materialize_graph(
                 &mut conn,
                 graph,
@@ -3578,19 +3589,23 @@ mod tests {
             .unwrap(),
             0
         );
-        let ids = materialize_graph(
+        let ids = materialize_terminal_children(
             &mut conn,
             graph,
             1,
-            &[child("a", &[]), sized_child("b", "L", 4)],
+            &[child("a", &[]), sized_child("b", "L", 5)],
             4,
         )
         .unwrap()
         .unwrap();
         assert_eq!(ids.len(), 2);
-        let refs = crate::tasks::get(&conn, ids[1]).unwrap().unwrap().refs;
+        let task = crate::tasks::get(&conn, ids[1]).unwrap().unwrap();
+        assert!(task.terminal_leaf);
         assert!(crate::tasks::classification_is_dispatchable(
-            &refs, false, None
+            &task.refs,
+            task.review_only,
+            task.continue_pr,
+            task.terminal_leaf,
         ));
     }
 
