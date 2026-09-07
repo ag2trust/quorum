@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 73;
+pub const SCHEMA_VERSION: i64 = 74;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1365,6 +1365,18 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 [],
             )?;
         }
+        // v74 persists the classified proposal payload alongside each per-attempt
+        // eligibility record so the terminal-leaf best-attempt fallback can
+        // materialize a prior attempt directly without re-running the planner or
+        // classifier. Additive/observational; NULL on every historical row.
+        if current < 74 && !column_exists(conn, "decomposition_attempts", "plan_snapshot_json")? {
+            conn.execute(
+                "ALTER TABLE decomposition_attempts ADD COLUMN plan_snapshot_json TEXT
+                     CHECK(plan_snapshot_json IS NULL
+                           OR length(CAST(plan_snapshot_json AS BLOB)) <= 131072)",
+                [],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1500,10 +1512,11 @@ mod tests {
             "max_oversized_cx",
             "total_children",
             "submission_id",
+            "plan_snapshot_json",
         ] {
             assert!(
                 column_exists(&c, "decomposition_attempts", column).unwrap(),
-                "v72 column {column} must exist after two opens"
+                "decomposition_attempts column {column} must exist after two opens"
             );
         }
         let v: i64 = c
@@ -1565,6 +1578,36 @@ mod tests {
         ] {
             assert!(column_exists(&reopened, "decomposition_attempts", column).unwrap());
         }
+    }
+
+    /// A v73 database (schema fixed at `PRAGMA user_version=73` before v74's
+    /// per-attempt plan snapshot column landed) migrates forward on open and
+    /// the ALTER stays idempotent across a second open on the same file.
+    #[test]
+    fn v73_to_v74_adds_nullable_plan_snapshot_column_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v73-plan-snapshot.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE decomposition_attempts DROP COLUMN plan_snapshot_json;
+                 PRAGMA user_version=73;",
+            )
+            .unwrap();
+        }
+        let migrated = open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(column_exists(&migrated, "decomposition_attempts", "plan_snapshot_json").unwrap());
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "decomposition_attempts", "plan_snapshot_json").unwrap());
     }
 
     #[test]

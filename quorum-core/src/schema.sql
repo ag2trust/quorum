@@ -249,6 +249,14 @@ CREATE TABLE IF NOT EXISTS decomposition_attempts (
     max_oversized_cx INTEGER,
     total_children   INTEGER,
     submission_id    TEXT,
+    -- v74 (additive): serialized Vec<PlannedChild> for the terminal-leaf
+    -- best-attempt fallback. Populated on eligible size-only proposal
+    -- rejections whose classifier pairing succeeded; NULL on every other
+    -- attempt kind or where the classified payload was unavailable. Bounded to
+    -- hold a proposal payload plus its per-child classifications.
+    plan_snapshot_json TEXT
+        CHECK(plan_snapshot_json IS NULL
+              OR length(CAST(plan_snapshot_json AS BLOB)) <= 131072),
     UNIQUE (graph_id, source_revision, kind, ordinal)
 );
 
