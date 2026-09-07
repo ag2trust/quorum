@@ -7,9 +7,10 @@
 
 use super::codex_stream::{self, Event};
 use super::runner::{
-    capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
-    AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation,
-    FailureTracker, LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
+    capture_diagnostics, gated_command, tool_summary, ActivityKind, AdapterConfig, AgentEvent,
+    AgentKind, AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition,
+    FailureObservation, FailureTracker, LaunchGate, LaunchMode, LaunchRequest, NormalizedLine,
+    RunnerFailure, TokenUsage,
 };
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -186,6 +187,11 @@ fn planner_exec_args_configured(
 
 pub struct CodexProc {
     child: Child,
+    process_group_id: libc::pid_t,
+    /// The gated fallback wrapper must retain its leader's group after an
+    /// early leader reap. Existing non-gated callers keep their historical
+    /// child-ID cleanup behavior.
+    retain_process_group_after_leader_exit: bool,
     reader: BufReader<tokio::process::ChildStdout>,
     line_buffer: Vec<u8>,
     diagnostics: DiagnosticBuffer,
@@ -232,6 +238,53 @@ impl CodexProc {
             }
             LaunchMode::Restricted => Self::spawn_restricted(&spec, config.executable),
         }
+    }
+
+    /// Translate a neutral request into a one-shot gated Codex process. The
+    /// prompt remains in the exact provider argv, which the wrapper cannot
+    /// execute until the daemon releases its inherited pipe.
+    pub fn launch_gated(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> std::io::Result<(Self, LaunchGate)> {
+        if request.mode == LaunchMode::Restricted && request.continuation_id.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "restricted Codex launch cannot resume a prior thread",
+            ));
+        }
+        let (args, worktree) = if let Some(thread_id) = request.continuation_id {
+            (
+                resume_args_configured(
+                    thread_id,
+                    request.model,
+                    request.effort,
+                    request.prompt,
+                    request.agent_mcp_server(),
+                ),
+                request.worktree,
+            )
+        } else {
+            let spec = CodexSpec {
+                model: request.model.to_string(),
+                effort: request.effort.to_string(),
+                sandbox: config.codex_sandbox.to_string(),
+                worktree: request.worktree.to_path_buf(),
+                prompt: request.prompt.to_string(),
+                env_vars: request.environment.to_vec(),
+            };
+            let args = match request.mode {
+                LaunchMode::Normal => exec_args_configured(&spec, request.agent_mcp_server()),
+                LaunchMode::Restricted => restricted_exec_args(&spec),
+            };
+            (args, request.worktree)
+        };
+        Self::spawn_gated_command(
+            config.executable.unwrap_or("codex"),
+            args,
+            request.environment,
+            worktree,
+        )
     }
 
     pub fn normalize_line(raw: &str) -> NormalizedLine {
@@ -376,6 +429,10 @@ impl CodexProc {
             });
         }
         let mut child = cmd.spawn()?;
+        let process_group_id = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("spawned Codex process has no process-group ID"))?
+            as libc::pid_t;
         let reader = BufReader::new(child.stdout.take().expect("stdout was piped"));
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
         let failures = diagnostics.failures();
@@ -385,6 +442,8 @@ impl CodexProc {
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
         Ok(Self {
             child,
+            process_group_id,
+            retain_process_group_after_leader_exit: false,
             reader,
             line_buffer: Vec::new(),
             diagnostics,
@@ -416,6 +475,10 @@ impl CodexProc {
             });
         }
         let mut child = cmd.spawn()?;
+        let process_group_id = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("spawned Codex process has no process-group ID"))?
+            as libc::pid_t;
         let reader = BufReader::new(child.stdout.take().expect("stdout was piped"));
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
         let failures = diagnostics.failures();
@@ -425,6 +488,8 @@ impl CodexProc {
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
         Ok(Self {
             child,
+            process_group_id,
+            retain_process_group_after_leader_exit: false,
             reader,
             line_buffer: Vec::new(),
             diagnostics,
@@ -467,6 +532,10 @@ impl CodexProc {
         }
 
         let mut child = cmd.spawn()?;
+        let process_group_id = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("spawned Codex process has no process-group ID"))?
+            as libc::pid_t;
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
@@ -478,6 +547,8 @@ impl CodexProc {
 
         Ok(Self {
             child,
+            process_group_id,
+            retain_process_group_after_leader_exit: false,
             reader,
             line_buffer: Vec::new(),
             diagnostics,
@@ -517,6 +588,10 @@ impl CodexProc {
         }
 
         let mut child = cmd.spawn()?;
+        let process_group_id = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("spawned Codex process has no process-group ID"))?
+            as libc::pid_t;
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
@@ -528,12 +603,66 @@ impl CodexProc {
 
         Ok(Self {
             child,
+            process_group_id,
+            retain_process_group_after_leader_exit: false,
             reader,
             line_buffer: Vec::new(),
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
         })
+    }
+
+    fn spawn_gated_command(
+        codex_bin: &str,
+        args: Vec<String>,
+        env_vars: &[(String, String)],
+        worktree: &std::path::Path,
+    ) -> std::io::Result<(Self, LaunchGate)> {
+        let (mut cmd, gate) = gated_command(AgentKind::Codex, codex_bin)?;
+        cmd.args(args);
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+        cmd.current_dir(worktree)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn()?;
+        let process_group_id = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("spawned Codex process has no process-group ID"))?
+            as libc::pid_t;
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let reader = BufReader::new(stdout);
+        let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
+        let failures = diagnostics.failures();
+        let stderr_diagnostics = diagnostics.clone();
+        let stderr_task =
+            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
+        let gate = gate.bind(process_group_id);
+        Ok((
+            Self {
+                child,
+                process_group_id,
+                retain_process_group_after_leader_exit: true,
+                reader,
+                line_buffer: Vec::new(),
+                diagnostics,
+                failures,
+                stderr_task: Some(stderr_task),
+            },
+            gate,
+        ))
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
@@ -622,6 +751,10 @@ impl CodexProc {
         self.child.id().map(|id| id as i32)
     }
 
+    pub fn process_group_id(&self) -> i32 {
+        self.process_group_id
+    }
+
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
     }
@@ -631,7 +764,11 @@ impl CodexProc {
     }
 
     pub async fn kill_and_reap(mut self) -> Vec<CapturedOutput> {
-        if let Some(pid) = self.child.id() {
+        if self.retain_process_group_after_leader_exit {
+            unsafe {
+                libc::killpg(self.process_group_id, libc::SIGKILL);
+            }
+        } else if let Some(pid) = self.child.id() {
             unsafe {
                 libc::killpg(pid as libc::pid_t, libc::SIGKILL);
             }
@@ -818,6 +955,7 @@ mod tests {
             });
         }
         let mut child = command.spawn().unwrap();
+        let process_group_id = child.id().unwrap() as libc::pid_t;
         let reader = BufReader::new(child.stdout.take().unwrap());
         let stderr = BufReader::new(child.stderr.take().unwrap());
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
@@ -827,6 +965,8 @@ mod tests {
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
         CodexProc {
             child,
+            process_group_id,
+            retain_process_group_after_leader_exit: false,
             reader,
             line_buffer: Vec::new(),
             diagnostics,

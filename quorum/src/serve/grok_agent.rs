@@ -6,10 +6,10 @@
 //! Claude/Codex flags.
 
 use super::runner::{
-    capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
-    AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition, FailureObservation,
-    FailureTracker, LaunchMode, LaunchRequest, NormalizedLine, RunnerFailure, TokenUsage,
-    WorkerTurnRequest,
+    capture_diagnostics, gated_command, tool_summary, ActivityKind, AdapterConfig, AgentEvent,
+    AgentKind, AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition,
+    FailureObservation, FailureTracker, LaunchGate, LaunchMode, LaunchRequest, NormalizedLine,
+    RunnerFailure, TokenUsage, WorkerTurnRequest,
 };
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
@@ -1153,6 +1153,36 @@ impl GrokProc {
         Self::spawn_command(&spec, &args, request.agent_mcp_server(), config.executable)
     }
 
+    /// Spawn the official Grok command behind a daemon-owned one-shot gate.
+    /// Its prompt and resume identity retain the exact normal command shape;
+    /// only the wrapper runs before release.
+    #[allow(dead_code)] // dormant fallback boundary; no lifecycle caller yet
+    pub fn launch_gated(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> std::io::Result<(Self, LaunchGate)> {
+        if request.mode == LaunchMode::Restricted && request.continuation_id.is_some() {
+            return Err(invalid_input(
+                "restricted Grok launch cannot resume a prior session",
+            ));
+        }
+        let spec = GrokSpec {
+            model: request.model.to_string(),
+            effort: request.effort.to_string(),
+            worktree: request.worktree.to_path_buf(),
+            prompt: request.prompt.to_string(),
+            env_vars: request.environment.to_vec(),
+            sandbox: config.grok.sandbox.to_string(),
+            permission_mode: config.grok.permission_mode.to_string(),
+            max_turns: config.grok.max_turns,
+        };
+        let args = match request.continuation_id {
+            Some(session_id) => resume_args(session_id, &spec)?,
+            None => headless_args(&spec, request.mode)?,
+        };
+        Self::spawn_command_gated(&spec, &args, request.agent_mcp_server(), config.executable)
+    }
+
     #[cfg(test)]
     fn spawn(spec: &GrokSpec, grok_bin: Option<&str>) -> std::io::Result<Self> {
         let args = headless_args(spec, LaunchMode::Normal)?;
@@ -1237,6 +1267,80 @@ impl GrokProc {
             worker_request: None,
             _mcp_config_home: mcp_config_home,
         })
+    }
+
+    fn spawn_command_gated(
+        spec: &GrokSpec,
+        args: &[String],
+        agent_mcp: Option<AgentMcpServer>,
+        grok_bin: Option<&str>,
+    ) -> std::io::Result<(Self, LaunchGate)> {
+        let has_agent_mcp = agent_mcp.is_some();
+        let mcp_config_home = agent_mcp
+            .map(|server| GrokMcpConfigHome::create(spec, server))
+            .transpose()?;
+        let args = args_with_managed_sandbox(
+            args,
+            mcp_config_home
+                .as_ref()
+                .and_then(GrokMcpConfigHome::sandbox_profile),
+        )?;
+        let (mut command, gate) = gated_command(AgentKind::Grok, grok_bin.unwrap_or("grok"))?;
+        command.args(args);
+        if has_agent_mcp {
+            command.arg("--no-leader");
+        }
+        for (key, value) in &spec.env_vars {
+            command.env(key, value);
+        }
+        if let Some(home) = &mcp_config_home {
+            configure_managed_mcp_environment(&mut command, home, spec)?;
+        }
+        command
+            .current_dir(&spec.worktree)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = command.spawn()?;
+        let process_group_id = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("spawned Grok process has no process-group ID"))?
+            as libc::pid_t;
+        let reader = BoundedStdout::new(child.stdout.take().expect("stdout was piped"));
+        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Grok);
+        let failures = diagnostics.failures();
+        let stderr_diagnostics = diagnostics.clone();
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let stderr_task =
+            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
+        let gate = gate.bind(process_group_id);
+        Ok((
+            Self {
+                child,
+                process_group_id,
+                reader,
+                diagnostics,
+                failures,
+                stderr_task: Some(stderr_task),
+                pending_terminal: None,
+                terminal_rejected: false,
+                stdout_complete: false,
+                raw_drain_budget_exhausted: false,
+                terminal_exit_status: None,
+                worker_request: None,
+                _mcp_config_home: mcp_config_home,
+            },
+            gate,
+        ))
     }
 
     pub fn normalize_line(raw: &str) -> NormalizedLine {
@@ -1493,6 +1597,11 @@ impl GrokProc {
 
     pub fn pid(&self) -> Option<i32> {
         self.child.id().map(|id| id as i32)
+    }
+
+    #[allow(dead_code)] // exposed for the future fallback launch owner
+    pub fn process_group_id(&self) -> i32 {
+        self.process_group_id
     }
 
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
