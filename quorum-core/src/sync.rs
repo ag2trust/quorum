@@ -1001,13 +1001,13 @@ mod tests {
         let (_d, mut c) = open_tmp();
         let too_complex = make_task(&mut c, "large complex", 10, None, 100);
         c.execute(
-            "UPDATE tasks SET refs=json_set(refs,'$.cx_size','L','$.cx_est',4) WHERE id=?1",
+            "UPDATE tasks SET refs=json_set(refs,'$.cx_size','L','$.cx_est',5) WHERE id=?1",
             [too_complex],
         )
         .unwrap();
         let simple_large = make_task(&mut c, "large simple", 5, None, 100);
         c.execute(
-            "UPDATE tasks SET refs=json_set(refs,'$.cx_size','L','$.cx_est',3) WHERE id=?1",
+            "UPDATE tasks SET refs=json_set(refs,'$.cx_size','L','$.cx_est',4) WHERE id=?1",
             [simple_large],
         )
         .unwrap();
@@ -1015,7 +1015,7 @@ mod tests {
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(
             nxt.id, simple_large,
-            "L at complexity 4 is outside dispatch policy"
+            "L at complexity 5 is outside dispatch policy"
         );
     }
 

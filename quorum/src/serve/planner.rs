@@ -181,7 +181,7 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
     format!(
         "You are Quorum's repository-grounded implementation-boundary planner. Produce one \
          closed DAG of 2-8 independently deliverable implementation tasks. A child is accepted \
-         when the classifier sizes it S or M at any complexity, or L at complexity 3 or lower; \
+         when the classifier sizes it S or M at any complexity, or L at complexity 4 or lower; \
          aim for S or M. \
          Identify concrete implementation deltas and split at real code or ownership seams; do \
          not turn each desired product outcome into a separate task. Preserved behavior, \
@@ -216,7 +216,7 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          shared type, trait, or struct shape used outside that child's writable paths, that child \
          must own every affected caller. Do not split a definition/signature change from its \
          caller wiring, including by reserving those callers as a sibling's non-goal. A \
-         compile-closed seam that fits one dispatchable child (S or M, or L at complexity 3 or \
+         compile-closed seam that fits one dispatchable child (S or M, or L at complexity 4 or \
          lower) remains one child. Return the `no_safe_split` BLOCKER only when the closure \
          cannot fit in one dispatchable child, rather than manufacturing definition and wiring \
          siblings. \
@@ -3643,7 +3643,7 @@ mod tests {
         assert!(prompt.contains("raw file count or requirement count as a shortcut"));
         assert!(prompt.contains("compile-atomic API seam is one child"));
         assert!(prompt.contains(
-            "compile-closed seam that fits one dispatchable child (S or M, or L at complexity 3 or lower) remains one child"
+            "compile-closed seam that fits one dispatchable child (S or M, or L at complexity 4 or lower) remains one child"
         ));
         assert!(prompt.contains("Use at most 5 Grep/Glob calls and 10 Read calls"));
         assert!(prompt.contains("Arbiter judges that faithfulness"));
@@ -3768,7 +3768,7 @@ mod tests {
         assert!(prompt.contains("cycle detected"));
         assert!(prompt.contains(
             "A child is accepted when the classifier sizes it S or M at any complexity, or L at \
-             complexity 3 or lower"
+             complexity 4 or lower"
         ));
         assert!(prompt.contains(
             "A single-file composition child that wires together primitives delivered by its \
