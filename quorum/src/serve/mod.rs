@@ -477,6 +477,104 @@ impl UnrecordableStrikes {
     }
 }
 
+/// Pause before re-provisioning a reviewer whose managed process exited while
+/// it still owned the review and had produced no durable verdict.
+const REVIEWER_RESPAWN_BACKOFF_BASE: Duration = Duration::from_secs(30);
+/// Ceiling on that pause regardless of the strike count.
+const REVIEWER_RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Hard bound on tracked (task, PR) pairs; expired entries are pruned first.
+const REVIEWER_RESPAWN_BACKOFF_CAPACITY: usize = 256;
+#[cfg(debug_assertions)]
+const MIN_TEST_REVIEWER_RESPAWN_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Test-only override for the no-verdict re-provision pause, bounded the same
+/// way as `tick_pacing` so a fixture cannot disable the pause or extend it.
+#[cfg(debug_assertions)]
+fn reviewer_respawn_backoff_base() -> Duration {
+    let default_ms = REVIEWER_RESPAWN_BACKOFF_BASE.as_millis() as u64;
+    let millis = std::env::var("QUORUM_TEST_REVIEWER_RESPAWN_BACKOFF_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default_ms)
+        .clamp(
+            MIN_TEST_REVIEWER_RESPAWN_BACKOFF.as_millis() as u64,
+            default_ms,
+        );
+    Duration::from_millis(millis)
+}
+
+#[cfg(not(debug_assertions))]
+const fn reviewer_respawn_backoff_base() -> Duration {
+    REVIEWER_RESPAWN_BACKOFF_BASE
+}
+
+/// In-memory pause between a reviewer's no-verdict exit and the next reviewer
+/// provision for the same (task, PR).
+///
+/// The durable per-head strike in `reviewer_provision_attempts` is what parks
+/// the task after `MAX_REVIEWER_PROVISION_STRIKES`; this pause keeps those
+/// strikes from being burned one tick apart by a reviewer that keeps exiting
+/// cleanly without calling `quorum submit`. It is deliberately not durable: a
+/// daemon restart at worst re-provisions once more, and the durable budget
+/// still bounds the total.
+struct ReviewerRespawnBackoff {
+    until: HashMap<(i64, i64), std::time::Instant>,
+}
+
+impl ReviewerRespawnBackoff {
+    fn new() -> Self {
+        Self {
+            until: HashMap::new(),
+        }
+    }
+
+    /// Exponential in the per-head strike count, capped at the ceiling.
+    fn delay_for(strikes: i64) -> Duration {
+        let exponent = strikes.clamp(1, 16) - 1;
+        reviewer_respawn_backoff_base()
+            .saturating_mul(1u32 << exponent)
+            .min(REVIEWER_RESPAWN_BACKOFF_MAX)
+    }
+
+    /// Schedule the pause for `(task_id, pr)` and return its length.
+    fn record(&mut self, task_id: i64, pr: i64, strikes: i64, now: std::time::Instant) -> Duration {
+        self.until.retain(|_, until| *until > now);
+        let key = (task_id, pr);
+        if self.until.len() >= REVIEWER_RESPAWN_BACKOFF_CAPACITY && !self.until.contains_key(&key) {
+            if let Some(oldest) = self
+                .until
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(key, _)| *key)
+            {
+                self.until.remove(&oldest);
+            }
+        }
+        let delay = Self::delay_for(strikes);
+        self.until.insert(key, now + delay);
+        delay
+    }
+
+    /// Whether provisioning for `(task_id, pr)` must still wait at `now`.
+    /// An elapsed entry is dropped on observation.
+    fn blocks(&mut self, task_id: i64, pr: i64, now: std::time::Instant) -> bool {
+        let key = (task_id, pr);
+        match self.until.get(&key) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                self.until.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.until.len()
+    }
+}
+
 impl ClaimSkipLogLimiter {
     fn new() -> Self {
         Self {
@@ -9585,6 +9683,7 @@ async fn tick_loop(
     let mut claim_skip_logs = ClaimSkipLogLimiter::new();
     let mut graph_skip_logs = ClaimSkipLogLimiter::new();
     let mut unrecordable_strikes = UnrecordableStrikes::new();
+    let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
@@ -10148,6 +10247,7 @@ async fn tick_loop(
             &mut claim_skip_logs,
             &mut graph_skip_logs,
             &mut unrecordable_strikes,
+            &mut reviewer_respawn_backoff,
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -10271,6 +10371,8 @@ async fn tick(
     graph_skip_logs: &mut ClaimSkipLogLimiter,
     // In-memory backstop for strikes that cannot be written durably.
     unrecordable: &mut UnrecordableStrikes,
+    // Bounded pause after a reviewer's no-verdict exit before re-provisioning.
+    reviewer_respawn_backoff: &mut ReviewerRespawnBackoff,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
@@ -14661,6 +14763,13 @@ async fn tick(
                     "reviewer {} died after classification proved no verdict and active ownership of task #{} — recovering review",
                     dead.agent_name, dead.task_id
                 ));
+                strike_reviewer_no_verdict_exit(
+                    config,
+                    unrecordable,
+                    reviewer_respawn_backoff,
+                    &dead,
+                )
+                .await;
                 teardown_reviewer(
                     config,
                     wt_mgr,
@@ -14959,6 +15068,11 @@ async fn tick(
                     continue;
                 }
                 Ok(ProvisionDecision::Needed(role_str)) => {
+                    // A reviewer that just exited without a verdict burned a
+                    // strike; wait out its pause instead of respawning now.
+                    if reviewer_respawn_backoff.blocks(*task_id, *pr, std::time::Instant::now()) {
+                        continue;
+                    }
                     let role = if role_str == "r2" {
                         // Look up R1 reviewer info from durable approval
                         let r1_info = {
@@ -15317,6 +15431,11 @@ async fn tick(
                     continue;
                 }
                 Ok(ProvisionDecision::Needed(role_str)) => {
+                    // Same pause as the worker-side arm above: the orphan
+                    // path is where a restart-recovered reviewer loops.
+                    if reviewer_respawn_backoff.blocks(*task_id, *pr, std::time::Instant::now()) {
+                        continue;
+                    }
                     if !tasks::classification_is_dispatchable(task_refs, *review_only, *continue_pr)
                     {
                         log(&format!(
@@ -18556,10 +18675,10 @@ async fn record_reviewer_provision_strike(
     unrecordable: &mut UnrecordableStrikes,
     task_id: i64,
     pr: i64,
-    role: &ReviewRole,
+    role: &str,
     head_sha: &str,
 ) -> Result<i64> {
-    let role_str = role.as_str().to_string();
+    let role_str = role.to_string();
     let sha = head_sha.to_string();
     let recorded = {
         let p = config.db_path.clone();
@@ -18584,7 +18703,7 @@ async fn record_reviewer_provision_strike(
                 "{role_label}: could not record provision strike for task #{task_id} PR #{pr}: \
                  {error} (in-memory backstop {consecutive}/{MAX_REVIEWER_PROVISION_STRIKES}, \
                  not durable, reset on daemon restart)",
-                role_label = role.as_str().to_uppercase()
+                role_label = role.to_uppercase()
             ));
             if consecutive >= MAX_REVIEWER_PROVISION_STRIKES {
                 let parked = park_task(
@@ -18619,16 +18738,58 @@ async fn record_reviewer_provision_strike(
     log(&format!(
         "{role_label} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
          for task #{task_id} PR #{pr}",
-        role_label = role.as_str().to_uppercase()
+        role_label = role.to_uppercase()
     ));
     if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
         log(&format!(
             "{} provision budget exhausted for task #{task_id} PR #{pr} after {strikes} \
              consecutive failures; decide_provision will park it",
-            role.as_str().to_uppercase()
+            role.to_uppercase()
         ));
     }
     Ok(strikes)
+}
+
+/// A reviewer process that exited while it still owned the review and had
+/// produced no durable verdict (`ManagedExitDisposition::AgentFailed`) burns
+/// the same per-head provisioning strike as a spawn failure and schedules a
+/// bounded pause before the next provision.
+///
+/// Without this, a reviewer that launches fine but exits without calling
+/// `quorum submit` (e.g. a resumed thread deciding "no new review is due")
+/// records nothing in `reviewer_provision_attempts`, so the 3-strike per-head
+/// cap never fires and the daemon re-provisions every tick until the lifetime
+/// `MAX_TOTAL_REVIEWER_RUNS` cap parks the task.
+async fn strike_reviewer_no_verdict_exit(
+    config: &ServeConfig,
+    unrecordable: &mut UnrecordableStrikes,
+    respawn_backoff: &mut ReviewerRespawnBackoff,
+    dead: &SlotState,
+) {
+    let role = if dead.r2_origin { "r2" } else { "r1" };
+    let (Some(pr), Some(head_sha)) = (dead.pr, dead.reviewed_head_sha.as_deref()) else {
+        log(&format!(
+            "reviewer {} exited without a verdict for task #{} but recorded no PR head; \
+             skipping the per-head provision strike (lifetime reviewer-run cap still applies)",
+            dead.agent_name, dead.task_id
+        ));
+        return;
+    };
+    // An unrecordable strike is already logged and counted by the in-memory
+    // backstop; still pause so it is not retried every tick either.
+    let strikes =
+        record_reviewer_provision_strike(config, unrecordable, dead.task_id, pr, role, head_sha)
+            .await
+            .unwrap_or(1);
+    let delay = respawn_backoff.record(dead.task_id, pr, strikes, std::time::Instant::now());
+    log(&format!(
+        "reviewer {} exited without a verdict for task #{} PR #{pr} head {head_sha}: \
+         deferring the next {} provision by {:.1}s",
+        dead.agent_name,
+        dead.task_id,
+        role.to_uppercase(),
+        delay.as_secs_f64()
+    ));
 }
 
 /// Everything one post-worktree provisioning failure has to retire.
@@ -18661,8 +18822,15 @@ async fn fail_post_worktree_provision(
     role: &ReviewRole,
     head_sha: &str,
 ) -> Result<()> {
-    let strike =
-        record_reviewer_provision_strike(config, unrecordable, task_id, pr, role, head_sha).await;
+    let strike = record_reviewer_provision_strike(
+        config,
+        unrecordable,
+        task_id,
+        pr,
+        role.as_str(),
+        head_sha,
+    )
+    .await;
     cleanup_failed_reviewer_provision(
         config,
         wt_mgr,
@@ -19578,17 +19746,12 @@ async fn provision_reviewer_reserved(
                 }
             }
 
-            // Only a completed claim and launch clear the provisioning budget.
-            let p = config.db_path.clone();
-            let tid = worker.task_id;
-            let role_str = role.as_str().to_string();
-            tokio::task::spawn_blocking(move || {
-                if let Ok(mut conn) = quorum_core::db::open(&p) {
-                    let _ = quorum_core::provision_attempts::clear(&mut conn, tid, pr, &role_str);
-                }
-            })
-            .await
-            .ok();
+            // A completed claim and launch deliberately do NOT clear the per-head
+            // provisioning budget. The budget is cleared by a recorded approved
+            // verdict (Phase 2) or reset by a new head; a launched reviewer that
+            // exits without a verdict burns the same budget (task #231 / PR
+            // #778), so clearing here would restart the count on every spawn
+            // and make the per-head cap unreachable for that loop.
 
             // R2: stash metadata for audit recording when the reviewer finishes.
             if let ReviewRole::R2 {
@@ -19746,19 +19909,9 @@ async fn provision_reviewer_reserved(
                 })?;
                 match activate_reviewer_fallback(config, &mut failed_slot, &e, &currency).await? {
                     ReviewerFallbackActivation::Activated => {
+                        // Same as the direct launch above: activation is not a
+                        // verdict, so the per-head budget stays as it is.
                         reviewers.push(failed_slot);
-                        let p = config.db_path.clone();
-                        let tid = worker.task_id;
-                        let role_str = role.as_str().to_string();
-                        tokio::task::spawn_blocking(move || {
-                            if let Ok(mut conn) = quorum_core::db::open(&p) {
-                                let _ = quorum_core::provision_attempts::clear(
-                                    &mut conn, tid, pr, &role_str,
-                                );
-                            }
-                        })
-                        .await
-                        .ok();
                         return Ok(ReviewerProvisionOutcome::Attached);
                     }
                     ReviewerFallbackActivation::Settled => {
@@ -32141,6 +32294,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     let mut claim_skip_logs = ClaimSkipLogLimiter::new();
                     let mut graph_skip_logs = ClaimSkipLogLimiter::new();
                     let mut unrecordable_strikes = UnrecordableStrikes::new();
+                    let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
                     let mut drain_state = DrainState::new();
                     let mut lifetime_roster = LifetimeRoster::new();
                     for reviewer in &reviewers {
@@ -32165,6 +32319,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut claim_skip_logs,
                         &mut graph_skip_logs,
                         &mut unrecordable_strikes,
+                        &mut reviewer_respawn_backoff,
                         &mut drain_state,
                         &mut lifetime_roster,
                         &mut classifier_slot,
@@ -32183,6 +32338,314 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    /// One full tick over a reviewer whose process has already exited. Returns
+    /// the surviving reviewer slots and the in-memory respawn pause so tests can
+    /// assert the Phase 4b decision, not a log line.
+    fn tick_dead_reviewer_fixture(
+        config: ServeConfig,
+        mut name_pool: Pool,
+        fixture: Phase2ReviewerFixture,
+        cap_run_id: String,
+        pr: i64,
+    ) -> (Vec<SlotState>, ReviewerRespawnBackoff) {
+        std::thread::Builder::new()
+            .name("dead-reviewer-fixture".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let mut reviewers = vec![
+                        buffered_codex_reviewer_slot_for_phase2_test(
+                            &fixture.dir,
+                            &fixture.repo_dir,
+                            fixture.task_id,
+                            fixture.reviewer_run_id,
+                            &fixture.agent,
+                        )
+                        .await,
+                    ];
+                    reviewers[0].reviewed_head_sha = fixture.reviewed_head_sha;
+                    reviewers[0].cap_run_id = Some(cap_run_id);
+                    reviewers[0].pr = Some(pr);
+                    let wt_mgr = WorktreeManager::new();
+                    let mut workers = Vec::new();
+                    let mut pre_review_checks = HashMap::new();
+                    let mut pending_reviewer_resumes = HashMap::new();
+                    let mut poison_tracker = PoisonTracker::new();
+                    let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+                    let mut graph_skip_logs = ClaimSkipLogLimiter::new();
+                    let mut unrecordable_strikes = UnrecordableStrikes::new();
+                    let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
+                    let mut drain_state = DrainState::new();
+                    let mut lifetime_roster = LifetimeRoster::new();
+                    for reviewer in &reviewers {
+                        lifetime_roster.register(&reviewer.agent_name);
+                    }
+                    let mut classifier_slot = None;
+                    let mut decomposition_coordinator = DecompositionCoordinator::default();
+                    let mut classifier_consec_errors = 0;
+                    let mut classifier_backoff_until = None;
+                    let mut doctor_slot = None;
+                    let mut doctored_tasks = std::collections::HashSet::new();
+                    let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+                    tick(
+                        &config,
+                        &wt_mgr,
+                        &mut name_pool,
+                        &mut workers,
+                        &mut reviewers,
+                        &mut pre_review_checks,
+                        &mut pending_reviewer_resumes,
+                        &mut poison_tracker,
+                        &mut claim_skip_logs,
+                        &mut graph_skip_logs,
+                        &mut unrecordable_strikes,
+                        &mut reviewer_respawn_backoff,
+                        &mut drain_state,
+                        &mut lifetime_roster,
+                        &mut classifier_slot,
+                        &mut decomposition_coordinator,
+                        &mut classifier_consec_errors,
+                        &mut classifier_backoff_until,
+                        &mut doctor_slot,
+                        &mut doctored_tasks,
+                        &signal_count,
+                    )
+                    .await
+                    .unwrap();
+                    (reviewers, reviewer_respawn_backoff)
+                })
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// Seed an in-review task owned by `reviewer` with a live lease, a reviewer
+    /// run, and an active run capability, so a process exit classifies against
+    /// exact run ownership the way production teardown does.
+    fn seed_owned_review(
+        db_path: &Path,
+        reviewer: &str,
+        pr: i64,
+        cap_run_id: &str,
+        now: i64,
+    ) -> (i64, i64) {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "no-verdict reviewer exit",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+            .unwrap()
+            .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Author",
+            task_id,
+            &Event::SignaledDone { pr: pr.to_string() },
+            now + 1,
+        )
+        .unwrap();
+        tasks::claim(&mut conn, reviewer, Some(task_id), &[], 3600, now + 2)
+            .unwrap()
+            .unwrap();
+        let run_id = quorum_core::agent_runs::insert(
+            &conn,
+            task_id,
+            reviewer,
+            "reviewer",
+            "gpt-5.6-terra",
+            "high",
+            "codex",
+            now + 2,
+        )
+        .unwrap();
+        quorum_core::capabilities::issue(
+            &mut conn,
+            cap_run_id,
+            task_id,
+            reviewer,
+            "reviewer",
+            now + 2,
+        )
+        .unwrap();
+        (task_id, run_id)
+    }
+
+    /// Task #231 / PR #778: a reviewer that launches fine, exits cleanly, and
+    /// never calls `quorum submit` must burn the per-head provision strike and
+    /// schedule a pause, instead of being re-provisioned on the very next tick
+    /// with an empty `reviewer_provision_attempts` table.
+    #[cfg(unix)]
+    #[test]
+    fn no_verdict_reviewer_exit_burns_strike_and_defers_reprovision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no-verdict-exit.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id) =
+            seed_owned_review(&db_path, "NoVerdictReviewer", 464, "cap-no-verdict", now);
+        let config = pre_review_checks_config(db_path.clone(), repo_dir.clone());
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("NoVerdictReviewer").unwrap();
+
+        let (reviewers, mut backoff) = tick_dead_reviewer_fixture(
+            config,
+            name_pool,
+            Phase2ReviewerFixture {
+                dir: dir.path().to_path_buf(),
+                repo_dir,
+                task_id,
+                reviewer_run_id,
+                agent: "NoVerdictReviewer".into(),
+                reviewed_head_sha: Some("head-a".into()),
+            },
+            "cap-no-verdict".into(),
+            464,
+        );
+
+        assert!(
+            reviewers.is_empty(),
+            "the exited reviewer must be torn down"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "in-review",
+            "AgentFailed keeps the review open"
+        );
+        assert_eq!(task.reviewer, None, "the failed reviewer is released");
+        assert_eq!(
+            quorum_core::provision_attempts::get_attempts(&conn, task_id, 464, "r1", "head-a")
+                .unwrap(),
+            1,
+            "a no-verdict exit is one durable per-head provision strike"
+        );
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1,
+            "no replacement reviewer may be spawned in the same tick"
+        );
+        let now_instant = std::time::Instant::now();
+        assert!(
+            backoff.blocks(task_id, 464, now_instant),
+            "re-provision must wait out the pause"
+        );
+        assert!(
+            !backoff.blocks(
+                task_id,
+                464,
+                now_instant + ReviewerRespawnBackoff::delay_for(1)
+            ),
+            "the pause is bounded and elapses"
+        );
+    }
+
+    /// Negative path: a reviewer that exits after its verdict was consumed is a
+    /// completed run, not a no-verdict exit — it must not burn a strike or pause
+    /// the next provision.
+    #[cfg(unix)]
+    #[test]
+    fn reviewer_exit_after_consumed_verdict_records_no_strike() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("consumed-verdict-exit.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id) =
+            seed_owned_review(&db_path, "DoneReviewer", 465, "cap-done", now);
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let row_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "DoneReviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(465),
+                    verdict: Some("changes".into()),
+                    feedback: Some("fix the blocker".into()),
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            mailbox::mark_consumed(&mut conn, row_id).unwrap();
+            // The consumed changes verdict parked the task at the rework cap;
+            // the review phase is over before the process exit is observed.
+            conn.execute(
+                "UPDATE tasks SET status='failed', reviewer=NULL WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+        }
+        let config = pre_review_checks_config(db_path.clone(), repo_dir.clone());
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("DoneReviewer").unwrap();
+
+        let (reviewers, mut backoff) = tick_dead_reviewer_fixture(
+            config,
+            name_pool,
+            Phase2ReviewerFixture {
+                dir: dir.path().to_path_buf(),
+                repo_dir,
+                task_id,
+                reviewer_run_id,
+                agent: "DoneReviewer".into(),
+                reviewed_head_sha: Some("head-a".into()),
+            },
+            "cap-done".into(),
+            465,
+        );
+
+        assert!(reviewers.is_empty(), "the completed reviewer is cleaned up");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "failed",
+            "cleanup after a consumed verdict never transitions lifecycle"
+        );
+        let strikes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reviewer_provision_attempts WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(strikes, 0, "a recorded verdict is not a provision failure");
+        assert!(
+            !backoff.blocks(task_id, 465, std::time::Instant::now()),
+            "no pause is scheduled after a completed review"
+        );
     }
 
     #[cfg(unix)]
@@ -34795,6 +35258,130 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(
             is_reviewer_cap_exceeded(&conn, 1).unwrap(),
             "should be exceeded at {MAX_TOTAL_REVIEWER_RUNS} runs"
+        );
+    }
+
+    /// Three no-verdict exits for one head exhaust the per-head budget, so the
+    /// orphan-PR loop parks on `Exhausted` instead of spawning a fourth
+    /// reviewer and waiting for the 12-run lifetime cap.
+    #[test]
+    fn three_no_verdict_reviewer_exits_exhaust_provision_for_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "orphan no-verdict loop",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, 100)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "778".into() },
+                101,
+            )
+            .unwrap();
+            task_id
+        };
+        let config = pre_review_checks_config(db_path.clone(), dir.path().join("repo"));
+        let mut dead = make_dummy_slot();
+        dead.task_id = task_id;
+        dead.pr = Some(778);
+        dead.reviewed_head_sha = Some("head-778".into());
+        let mut unrecordable = UnrecordableStrikes::new();
+        let mut backoff = ReviewerRespawnBackoff::new();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        for strike in 1..=MAX_REVIEWER_PROVISION_STRIKES as i64 {
+            assert_eq!(
+                decide_provision(&conn, task_id, 778, "head-778").unwrap(),
+                ProvisionDecision::Needed("r1"),
+                "strike {strike} is still within budget"
+            );
+            runtime.block_on(strike_reviewer_no_verdict_exit(
+                &config,
+                &mut unrecordable,
+                &mut backoff,
+                &dead,
+            ));
+            assert_eq!(
+                quorum_core::provision_attempts::get_attempts(
+                    &conn, task_id, 778, "r1", "head-778"
+                )
+                .unwrap(),
+                strike
+            );
+        }
+        assert!(is_provision_exhausted(&conn, task_id, 778, "r1", "head-778").unwrap());
+        assert_eq!(
+            decide_provision(&conn, task_id, 778, "head-778").unwrap(),
+            ProvisionDecision::Exhausted,
+            "the third no-verdict exit parks the orphan PR instead of spawning again"
+        );
+        assert!(
+            !is_reviewer_cap_exceeded(&conn, task_id).unwrap(),
+            "exhaustion comes from the per-head budget, not the lifetime run cap"
+        );
+        assert_eq!(
+            decide_provision(&conn, task_id, 778, "head-779").unwrap(),
+            ProvisionDecision::Needed("r1"),
+            "a new head clears the per-head strikes"
+        );
+    }
+
+    #[test]
+    fn no_verdict_exit_backoff_is_exponential_bounded_and_elapses() {
+        let base = reviewer_respawn_backoff_base();
+        assert_eq!(ReviewerRespawnBackoff::delay_for(1), base);
+        assert_eq!(ReviewerRespawnBackoff::delay_for(2), base * 2);
+        assert_eq!(
+            ReviewerRespawnBackoff::delay_for(1_000),
+            REVIEWER_RESPAWN_BACKOFF_MAX.min(base * (1 << 15)),
+            "the pause never exceeds its ceiling"
+        );
+
+        let mut backoff = ReviewerRespawnBackoff::new();
+        let now = std::time::Instant::now();
+        let delay = backoff.record(7, 42, 1, now);
+        assert!(
+            backoff.blocks(7, 42, now),
+            "the next tick must not re-provision"
+        );
+        assert!(
+            backoff.blocks(7, 42, now + delay - Duration::from_millis(1)),
+            "still paused just before the deadline"
+        );
+        assert!(!backoff.blocks(7, 43, now), "another PR is unaffected");
+        assert!(!backoff.blocks(8, 42, now), "another task is unaffected");
+        assert!(!backoff.blocks(7, 42, now + delay), "the pause elapses");
+        assert_eq!(
+            backoff.len(),
+            0,
+            "an elapsed entry is dropped on observation"
+        );
+
+        for task in 0..(REVIEWER_RESPAWN_BACKOFF_CAPACITY as i64 + 8) {
+            backoff.record(task, 1, 1, now);
+        }
+        assert!(
+            backoff.len() <= REVIEWER_RESPAWN_BACKOFF_CAPACITY,
+            "tracked pairs stay bounded"
         );
     }
 
