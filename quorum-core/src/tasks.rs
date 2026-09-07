@@ -414,11 +414,11 @@ const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
       )
 ))";
 
-/// SQL counterpart of [`size_is_dispatchable`] over the `refs` column of the
-/// enclosing `tasks` row. This is the single implementation-size policy:
-/// `S`/`M` at any complexity, or `L` at complexity 4 or lower. Every query that
-/// gates implementation work on classified size must interpolate this fragment
-/// instead of restating it, so the SQL and Rust policies cannot drift.
+/// SQL counterpart of the ordinary root-task [`size_is_dispatchable`] policy
+/// over the enclosing `tasks` row. `S`/`M` dispatch at any complexity and `L`
+/// dispatches at complexity 4 or lower. Queries for ordinary root
+/// implementation work interpolate this fragment instead of restating it, so
+/// the SQL and Rust policies cannot drift.
 macro_rules! size_dispatch_policy_sql {
     () => {
         "(
@@ -4179,10 +4179,10 @@ pub fn classification_is_dispatchable(
             || size_is_dispatchable(size, cx))
 }
 
-/// The single implementation-size dispatch policy shared by root-task dispatch
-/// and decomposition child preclassification: `S`/`M` at any complexity, or
-/// `L` at complexity 4 or lower. `L` at complexity 5 and every `XL`
-/// classification stay outside automatic implementation dispatch.
+/// The ordinary root-task implementation-size dispatch policy: `S`/`M` at any
+/// complexity, or `L` at complexity 4 or lower. `L` at complexity 5 and every
+/// `XL` classification stay outside automatic root dispatch. Generated terminal
+/// leaves use their separate S/M/L plan-acceptance and direct-dispatch policy.
 /// [`SIZE_DISPATCH_POLICY_SQL`] is the SQL counterpart.
 pub fn size_is_dispatchable(size: &str, cx_est: i64) -> bool {
     matches!(size, "S" | "M") || (size == "L" && cx_est <= 4)

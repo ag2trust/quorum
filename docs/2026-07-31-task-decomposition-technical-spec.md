@@ -11,9 +11,10 @@ Large implementation tasks repeatedly discover blockers only after delivery has 
 single coding run cannot reliably hold, inspect, implement, and verify an L or XL outcome in
 one bounded session. Rework then becomes accidental planning.
 
-Quorum must turn each admission-ready L or XL implementation task into one bounded,
-preclassified DAG before implementation starts. Planning must preserve the source outcome,
-fail closed when safe boundaries cannot be found, and never expose a partial graph.
+Quorum must turn each planner-eligible root implementation task — L at complexity 5 or XL at
+complexity 4 or 5 — into one bounded, preclassified DAG before implementation starts. Planning
+must preserve the source outcome, fail closed when safe boundaries cannot be found, and never
+expose a partial graph.
 
 ## Scope and non-goals
 
@@ -31,7 +32,7 @@ cannot be decomposed.
 - **Admission ready:** classifier-owned determination that scope is sufficiently clear and
   bounded for its assigned path. It is independent of dependency completion.
 - **Runtime ready:** all task dependencies are done and every atomic claim guard passes.
-- **Source:** the original L/XL implementation task.
+- **Source:** the original planner-eligible root implementation task.
 - **Terminal leaf:** a generated task materialized with `tasks.terminal_leaf=1`. It dispatches
   directly under graph claim guards for a complete S/M/L classification at any valid complexity,
   but is never a decomposition source.
@@ -253,12 +254,13 @@ The migration is additive and forward-only under the normal `BEGIN IMMEDIATE` mi
 ## Admission and repository freeze
 
 The daemon selects planning candidates by priority, then task ID. A candidate must be an open,
-unclaimed, admission-ready L/XL root implementation task whose dependencies are done. It must not
-be review-only, PR-bound, or a terminal leaf. Review-only work always routes directly to reviewer
-provisioning at any classified size; S/M root implementation work follows normal dispatch
-regardless of complexity. The atomic planning transaction rechecks `review_only=0`,
-`continue_pr IS NULL`, and `terminal_leaf=0`, so neither special entry shape nor a generated leaf
-can become a decomposition source even if a stale caller selects it.
+unclaimed, admission-ready root implementation task whose dependencies are done and whose
+classification is L at complexity 5 or XL at complexity 4 or 5. It must not be review-only,
+PR-bound, or a terminal leaf. Review-only work always routes directly to reviewer provisioning at
+any classified size; S/M root implementation work follows normal dispatch regardless of
+complexity. The atomic planning transaction rechecks `review_only=0`, `continue_pr IS NULL`, and
+`terminal_leaf=0`, so neither special entry shape nor a generated leaf can become a decomposition
+source even if a stale caller selects it.
 
 Starting a cycle atomically moves the source to `planning`, records `freeze-requested`, and sets
 `freeze_active=1`. Every worker, reviewer, remediation, and merge-start authority check must

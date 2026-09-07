@@ -653,7 +653,7 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     let eligible: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM tasks
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
-           AND review_only=0 AND continue_pr IS NULL
+           AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0
            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
            AND NOT EXISTS (SELECT 1 FROM task_decompositions
                            WHERE state IN ('active','blocked') OR active=1))",
@@ -684,7 +684,7 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     let changed = tx.execute(
         "UPDATE tasks SET status='planning', updated_at=?3
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
-           AND review_only=0 AND continue_pr IS NULL",
+           AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0",
         params![input.source_task_id, input.expected_revision, input.now],
     )?;
     if changed != 1 {
@@ -719,7 +719,7 @@ pub fn begin_routed_planning(
     let eligible: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM tasks
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
-           AND review_only=0 AND continue_pr IS NULL
+           AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0
            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
            AND NOT EXISTS (SELECT 1 FROM task_decompositions
                            WHERE state IN ('active','blocked') OR active=1))",
@@ -745,7 +745,7 @@ pub fn begin_routed_planning(
     let changed = tx.execute(
         "UPDATE tasks SET status='planning',updated_at=?3
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
-           AND review_only=0 AND continue_pr IS NULL",
+           AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0",
         params![input.source_task_id, input.expected_revision, input.now],
     )?;
     if changed != 1 {
@@ -3409,13 +3409,15 @@ mod tests {
     }
 
     #[test]
-    fn planning_authority_rejects_review_only_and_continuation_sources() {
-        for (review_only, continue_pr) in [(1, None), (0, Some(529))] {
+    fn planning_authority_rejects_review_only_continuation_and_terminal_leaf_sources_cleanly() {
+        for (review_only, continue_pr, terminal_leaf) in
+            [(1, None, 0), (0, Some(529), 0), (0, None, 1)]
+        {
             for routed in [false, true] {
                 let (_dir, mut conn) = file_setup();
                 conn.execute(
-                    "UPDATE tasks SET review_only=?1,continue_pr=?2 WHERE id=1",
-                    params![review_only, continue_pr],
+                    "UPDATE tasks SET review_only=?1,continue_pr=?2,terminal_leaf=?3 WHERE id=1",
+                    params![review_only, continue_pr, terminal_leaf],
                 )
                 .unwrap();
 

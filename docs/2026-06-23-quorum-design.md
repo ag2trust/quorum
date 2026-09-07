@@ -2266,11 +2266,11 @@ filename. Runner-specific process options remain scoped under `[claude]`, `[code
 ### Bounded task decomposition
 
 A non-continuation, admission-ready, non-terminal-leaf implementation task is a decomposition
-source only when its classified size is L or XL and `cx_est` is 4 or 5. After its dependencies
-are done, the daemon serializes decomposition per repository: it stops new managed delivery,
-lets active delivery finish, and plans against the resulting frozen base. S/M implementation
-tasks dispatch normally regardless of complexity; non-continuation L tasks with `cx_est` 1–3 also
-dispatch directly to one worker. Every `continue_pr` task dispatches directly because only the source task carries authority
+source only when it is L at `cx_est` 5 or XL at `cx_est` 4 or 5. After its dependencies are done,
+the daemon serializes decomposition per repository: it stops new managed delivery, lets active
+delivery finish, and plans against the resulting frozen base. S/M implementation tasks dispatch
+normally regardless of complexity; non-continuation L tasks with `cx_est` 1–4 also dispatch
+directly to one worker. Every `continue_pr` task dispatches directly because only the source task carries authority
 to publish to the bound PR. Every review-only task dispatches directly to reviewer provisioning at
 any classified size because it has no implementation work to decompose. A non-continuation XL task
 with `cx_est` 1–3 violates the classification rubric and is parked with an explicit
@@ -2611,7 +2611,7 @@ labels are ignored.
   reject the task.
 - Direct dispatch and decomposition partition admission-ready implementation work. S/M root tasks
   dispatch directly for every valid `cx_est`; non-continuation L root tasks dispatch directly at
-  `cx_est` 1–3 and decompose at 4–5; non-continuation XL root tasks decompose at 4–5 and park at
+  `cx_est` 1–4 and decompose at 5; non-continuation XL root tasks decompose at 4–5 and park at
   1–3 as a rubric mismatch. In contrast, an accepted generated S/M/L child is a terminal leaf and
   dispatches directly at every valid complexity; XL rejects the plan before it can become a leaf.
   A terminal leaf never takes the decomposition route. A `continue_pr` task always takes the
