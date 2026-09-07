@@ -6192,6 +6192,13 @@ async fn reject_decomposition_proposal(
     eligibility: quorum_core::decomposition::AttemptEligibility,
     plan_snapshot: Option<Vec<quorum_core::decomposition::PlannedChild>>,
 ) -> Result<()> {
+    // Legacy eligible attempts (v72/v73 rows written before v74 landed) carry
+    // a submission_id and eligibility scores but no plan_snapshot_json. Rebuild
+    // their snapshot from the durable planner submission so the terminal-leaf
+    // fallback considers them alongside the current attempt when the budget
+    // exhausts. Idempotent and additive: nothing is rewritten and no NULL is
+    // introduced.
+    backfill_missing_plan_snapshots(config, graph_id).await?;
     let path = config.db_path.clone();
     let code = code.to_string();
     let summary = truncate_utf8_bytes(summary, DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES).to_string();
@@ -6212,6 +6219,125 @@ async fn reject_decomposition_proposal(
     .await
     .map_err(|error| QuorumError::Io(format!("proposal rejection join: {error}")))??;
     Ok(())
+}
+
+/// Rebuild a materialization-ready plan snapshot on any legacy (`v72/v73`)
+/// eligible proposal-rejection row for this graph that still lacks one. The
+/// classifier's exact per-child sizes are not persisted with the row, so the
+/// snapshot uses a synthesized fewest-L classification derived from the stored
+/// rank fields (safe because `eligible=1` guarantees the original classifier
+/// pair was S/M/L, ready, non-duplicate, and terminal-leaf children bypass the
+/// L/cx>4 dispatch gate). Runs before every rejection and is idempotent — the
+/// guarded UPDATE binds zero rows once a snapshot exists.
+async fn backfill_missing_plan_snapshots(config: &ServeConfig, graph_id: i64) -> Result<()> {
+    let db_path = config.db_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let attempts: Vec<(i64, String, i64)> = {
+            let conn = quorum_core::db::open(&db_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT a.id, a.submission_id, COALESCE(a.max_oversized_cx, 0)
+                 FROM decomposition_attempts a
+                 JOIN planner_submissions p ON p.run_id = a.submission_id
+                 WHERE a.graph_id = ?1 AND a.kind = 'proposal'
+                   AND a.eligible = 1 AND a.plan_snapshot_json IS NULL
+                   AND a.submission_id IS NOT NULL AND p.response_json IS NOT NULL",
+            )?;
+            let rows = stmt
+                .query_map([graph_id], |row| {
+                    let submission_id: String = row.get(1)?;
+                    Ok((row.get(0)?, submission_id, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            drop(conn);
+            rows
+        };
+        for (attempt_id, submission_id, max_oversized_cx) in attempts {
+            let snapshot_json = match synthesize_legacy_plan_snapshot(
+                &db_path,
+                &submission_id,
+                max_oversized_cx,
+            )? {
+                Some(json) => json,
+                None => continue,
+            };
+            let mut conn = quorum_core::db::open(&db_path)?;
+            let tx = quorum_core::db::begin_immediate(&mut conn)?;
+            tx.execute(
+                "UPDATE decomposition_attempts SET plan_snapshot_json = ?1
+                 WHERE id = ?2 AND plan_snapshot_json IS NULL",
+                rusqlite::params![snapshot_json, attempt_id],
+            )?;
+            tx.commit()?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("plan snapshot backfill join: {error}")))??;
+    Ok(())
+}
+
+/// Build a `Vec<PlannedChild>` JSON for a legacy eligible rejection by
+/// deserializing the durable planner submission and synthesizing one L/cx=N
+/// classification per proposed task (N = `max_oversized_cx` clamped to
+/// `[1, 5]`, defaulting to 4). Returns `None` when the submission is a
+/// non-plan envelope, the pair fails to build, or the row's eligibility
+/// promise cannot be honored — the legacy row then stays snapshotless and the
+/// fallback simply skips it.
+fn synthesize_legacy_plan_snapshot(
+    db_path: &std::path::Path,
+    submission_id: &str,
+    max_oversized_cx: i64,
+) -> Result<Option<String>> {
+    let conn = quorum_core::db::open(db_path)?;
+    let response_json: Option<String> = conn
+        .query_row(
+            "SELECT response_json FROM planner_submissions WHERE run_id = ?1",
+            [submission_id],
+            |row| row.get(0),
+        )
+        .ok();
+    drop(conn);
+    let Some(response_json) = response_json else {
+        return Ok(None);
+    };
+    let Ok(response) = serde_json::from_str::<planner::PlannerResponse>(&response_json) else {
+        return Ok(None);
+    };
+    let planner::PlannerResponse::Plan { tasks } = response else {
+        return Ok(None);
+    };
+    if !(2..=8).contains(&tasks.len()) {
+        return Ok(None);
+    }
+    let synthesized_cx = if (1..=5).contains(&max_oversized_cx) {
+        max_oversized_cx
+    } else {
+        4
+    };
+    let classifications: Vec<quorum_core::classify::TaskClassification> = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, _)| quorum_core::classify::TaskClassification {
+            task_id: -(index as i64) - 1,
+            cx_est: synthesized_cx,
+            size: "L".into(),
+            size_reason: "synthesized from persisted eligibility rank".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: Vec::new(),
+        })
+        .collect();
+    let paired: Vec<(
+        &planner::ProposedTask,
+        &quorum_core::classify::TaskClassification,
+    )> = tasks.iter().zip(classifications.iter()).collect();
+    let Ok(planned) = planned_children_from_classified(&paired) else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::to_string(&planned).map_err(|error| {
+        QuorumError::Io(format!("legacy plan snapshot serialize failed: {error}"))
+    })?))
 }
 
 /// Pair proposed children with their classifications and, if any child was
@@ -6302,6 +6428,45 @@ fn planned_children_from_classified(
             })
         })
         .collect()
+}
+
+/// Pair proposal + classifications and, when the pair is complete, compute
+/// the fewest-L eligibility plus a materialization-ready plan snapshot. The
+/// snapshot is Some only when the pair is `eligible=true` (all children S/M/L,
+/// ready, non-duplicate). Any rejection path that has a classified pair —
+/// size-only preclassification, Arbiter changes, materialization failure — can
+/// call this to persist the terminal-leaf fallback's candidate row.
+///
+/// A live all-S/M/L plan post-#781 no longer trips
+/// `aggregate_child_preclassification_rejections`, so `size_only_rejection_*`
+/// alone can't record eligibility for the plans the exhaustion path is meant
+/// to rescue (an Arbiter-blocking loop against L-only children). Storing
+/// eligibility from every rejection path with a classified pair keeps the
+/// fallback reachable from the live rejection surface.
+fn attempt_eligibility_and_snapshot_from_pair(
+    proposal: &[planner::ProposedTask],
+    classifications: &[quorum_core::classify::TaskClassification],
+) -> Option<(
+    quorum_core::decomposition::AttemptEligibility,
+    Option<Vec<quorum_core::decomposition::PlannedChild>>,
+)> {
+    let by_id: HashMap<i64, &quorum_core::classify::TaskClassification> = classifications
+        .iter()
+        .map(|result| (result.task_id, result))
+        .collect();
+    let mut classified = Vec::with_capacity(proposal.len());
+    for (index, task) in proposal.iter().enumerate() {
+        let id = -(index as i64) - 1;
+        let result = *by_id.get(&id)?;
+        classified.push((task, result));
+    }
+    let eligibility = attempt_eligibility_from_classified(&classified);
+    let snapshot = if eligibility.eligible {
+        planned_children_from_classified(&classified).ok()
+    } else {
+        None
+    };
+    Some((eligibility, snapshot))
 }
 
 /// Compute the per-attempt eligibility + fewest-L rank from a fully paired
@@ -6638,14 +6803,28 @@ async fn apply_arbiter_verdict(
         } => {
             if arbiter::has_blocking(&findings) {
                 let summary = summarize_arbiter_findings(&findings);
+                // An Arbiter-blocking verdict runs against a proposal that
+                // already survived preclassification, so the classified pair
+                // still identifies a materializable candidate for the
+                // terminal-leaf fallback. `attempt_eligibility_and_snapshot_from_pair`
+                // returns None only when the pair itself is broken (missing
+                // classification) — that is structural, not eligible.
+                let (eligibility, snapshot) =
+                    match attempt_eligibility_and_snapshot_from_pair(proposal, classifications) {
+                        Some(pair) => pair,
+                        None => (
+                            quorum_core::decomposition::AttemptEligibility::structural(),
+                            None,
+                        ),
+                    };
                 reject_decomposition_proposal(
                     config,
                     graph_id,
                     "validating",
                     "arbiter-changes",
                     &summary,
-                    quorum_core::decomposition::AttemptEligibility::structural(),
-                    None,
+                    eligibility,
+                    snapshot,
                 )
                 .await?;
                 Ok(false)
@@ -42733,6 +42912,292 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
     }
 
+    /// The shared helper the arbiter-changes and other classified-pair
+    /// rejection paths use. A clean L-only pair (no XL, no not-ready, no dup)
+    /// yields eligible=true and a materialization-ready snapshot even though
+    /// no preclassification-level rejection fired — that is the unreachable
+    /// gap the reviewer's finding named (aggregate_child_preclassification_
+    /// rejections stays silent for all-L, so the arbiter path was previously
+    /// the only way this pair could reject).
+    #[test]
+    fn attempt_eligibility_and_snapshot_from_pair_captures_arbiter_reachable_pairs() {
+        fn proposal(keys: &[&str]) -> Vec<planner::ProposedTask> {
+            keys.iter()
+                .map(|key| planner::ProposedTask {
+                    key: (*key).into(),
+                    title: (*key).into(),
+                    implementation_delta: "d".into(),
+                    affected_paths: vec![],
+                    observable_outcome: "o".into(),
+                    deliverables: writable_deliverables("src/x.rs"),
+                    acceptance_criteria: vec!["c".into()],
+                    source_constraints: vec![],
+                    verification_expectations: vec!["v".into()],
+                    prerequisites: vec![],
+                    ..Default::default()
+                })
+                .collect()
+        }
+        fn classify(
+            size: &str,
+            cx_est: i64,
+            index: i64,
+        ) -> quorum_core::classify::TaskClassification {
+            quorum_core::classify::TaskClassification {
+                task_id: -(index + 1),
+                cx_est,
+                size: size.into(),
+                size_reason: "reason".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }
+        }
+
+        // Two L/cx=4 children survived preclassification cleanly — this pair
+        // is what an Arbiter-changes rejection now feeds the fallback.
+        let two = proposal(&["a", "b"]);
+        let sizes = [classify("L", 4, 0), classify("L", 4, 1)];
+        let (eligibility, snapshot) = attempt_eligibility_and_snapshot_from_pair(&two, &sizes)
+            .expect("paired classifications parse");
+        assert!(eligibility.eligible);
+        assert_eq!(eligibility.oversized_count, Some(2));
+        let snapshot = snapshot.expect("eligible pair produces a snapshot");
+        let keys: Vec<&str> = snapshot
+            .iter()
+            .map(|child| child.local_key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["a", "b"]);
+
+        // An unpaired batch is structural, not eligible: no snapshot, no
+        // (eligibility, snapshot) tuple at all.
+        let unmatched = vec![classify("L", 4, 99)];
+        assert!(attempt_eligibility_and_snapshot_from_pair(&two, &unmatched).is_none());
+
+        // An XL child disqualifies the pair but the helper still returns Some
+        // (structural eligibility, no snapshot) — the caller's rejection path
+        // records the structural row.
+        let with_xl = proposal(&["a", "b", "c"]);
+        let sizes = [
+            classify("XL", 5, 0),
+            classify("L", 4, 1),
+            classify("M", 2, 2),
+        ];
+        let (eligibility, snapshot) =
+            attempt_eligibility_and_snapshot_from_pair(&with_xl, &sizes).expect("paired");
+        assert!(!eligibility.eligible);
+        assert!(snapshot.is_none());
+    }
+
+    /// Legacy v72/v73 rows (eligible=1 + submission_id + NULL snapshot) get
+    /// their snapshot rebuilt from the durable planner submission so the
+    /// terminal-leaf fallback can rank them alongside post-v74 rows. The
+    /// synthesized classification is L/cx=max_oversized_cx (clamped 1..=5,
+    /// defaulting to 4) — safe because eligible=1 promises the original pair
+    /// was S/M/L, ready, and non-duplicate.
+    #[test]
+    fn synthesize_legacy_plan_snapshot_rebuilds_from_planner_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy-snapshot.db");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        // Persist a plan envelope under a run id. Two tasks, one with a
+        // prerequisite so the synthesized snapshot's prerequisite_keys carry
+        // through to the PlannedChild.
+        let plan_response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [
+                {
+                    "key": "root",
+                    "title": "root delta",
+                    "implementation_delta": "",
+                    "affected_paths": [],
+                    "observable_outcome": "root works",
+                    "deliverables": [{"kind": "write", "path": "src/root.rs"}],
+                    "acceptance_criteria": ["c"],
+                    "source_constraints": [],
+                    "verification_expectations": ["v"],
+                    "non_goals": [],
+                    "prerequisites": [],
+                },
+                {
+                    "key": "wire",
+                    "title": "wire root",
+                    "implementation_delta": "",
+                    "affected_paths": [],
+                    "observable_outcome": "wired",
+                    "deliverables": [{"kind": "write", "path": "src/wire.rs"}],
+                    "acceptance_criteria": ["c"],
+                    "source_constraints": [],
+                    "verification_expectations": ["v"],
+                    "non_goals": [],
+                    "prerequisites": ["root"],
+                },
+            ],
+        });
+        conn.execute(
+            "INSERT INTO planner_submissions(run_id, graph_id, response_json, accepted_at)
+             VALUES ('legacy-run-1', 42, ?1, 500)",
+            [plan_response.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let snapshot_json = synthesize_legacy_plan_snapshot(&db_path, "legacy-run-1", 4)
+            .expect("synthesize succeeds")
+            .expect("plan envelope produces a snapshot");
+        let planned: Vec<quorum_core::decomposition::PlannedChild> =
+            serde_json::from_str(&snapshot_json).unwrap();
+        assert_eq!(planned.len(), 2);
+        assert_eq!(planned[0].local_key, "root");
+        assert!(planned[0].prerequisite_keys.is_empty());
+        assert_eq!(planned[1].local_key, "wire");
+        assert_eq!(planned[1].prerequisite_keys, vec!["root".to_string()]);
+        // Synthesized classification: L with cx_est matching max_oversized_cx,
+        // ready true, dispatchable as a terminal leaf.
+        let refs: serde_json::Value =
+            serde_json::from_str(&planned[0].classification_refs).unwrap();
+        assert_eq!(refs["cx_size"], "L");
+        assert_eq!(refs["cx_est"], 4);
+        assert_eq!(refs["cx_ready"], true);
+        assert_eq!(refs["cx_dup_of"], serde_json::json!([]));
+
+        // An unknown submission id yields None (the row stays snapshotless and
+        // the fallback skips it, matching the pre-fallback park behavior for
+        // that specific row).
+        assert!(synthesize_legacy_plan_snapshot(&db_path, "no-such-run", 4)
+            .unwrap()
+            .is_none());
+    }
+
+    /// The backfill helper populates every legacy eligible attempt's snapshot
+    /// in a single call and is idempotent under replay: a second pass writes
+    /// nothing new. Only eligible=1 + NULL snapshot + present submission_id
+    /// rows are backfilled; snapshotted rows and structural rows are
+    /// preserved.
+    #[tokio::test]
+    async fn backfill_missing_plan_snapshots_covers_legacy_rows_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("backfill.db");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        // Set up a source task and a decomposition graph.
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('src','planning','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let source: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,freeze_active,active,planned_source_revision,
+                 created_at,updated_at)
+             VALUES (?1,'planning',1,0,1,1,1)",
+            [source],
+        )
+        .unwrap();
+        let graph: i64 = conn.last_insert_rowid();
+
+        let plan_response = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [
+                {"key":"a","title":"a","implementation_delta":"","affected_paths":[],
+                 "observable_outcome":"o","deliverables":[{"kind":"write","path":"src/a.rs"}],
+                 "acceptance_criteria":["c"],"source_constraints":[],
+                 "verification_expectations":["v"],"non_goals":[],"prerequisites":[]},
+                {"key":"b","title":"b","implementation_delta":"","affected_paths":[],
+                 "observable_outcome":"o","deliverables":[{"kind":"write","path":"src/b.rs"}],
+                 "acceptance_criteria":["c"],"source_constraints":[],
+                 "verification_expectations":["v"],"non_goals":[],"prerequisites":[]},
+            ],
+        });
+        conn.execute(
+            "INSERT INTO planner_submissions(run_id, graph_id, response_json, accepted_at)
+             VALUES ('legacy-run', ?1, ?2, 100)",
+            rusqlite::params![graph, plan_response.to_string()],
+        )
+        .unwrap();
+
+        // Insert a legacy eligible attempt (eligible=1, submission_id set,
+        // plan_snapshot_json NULL) — the class of row the reviewer's finding #2
+        // asked us to recover.
+        conn.execute(
+            "INSERT INTO decomposition_attempts(
+                 graph_id,source_revision,kind,ordinal,retry_generation,
+                 reason_code,summary,created_at,
+                 eligible,oversized_count,max_oversized_cx,total_children,
+                 submission_id,plan_snapshot_json)
+             VALUES (?1,1,'proposal',1,0,'child-preclassification','legacy',200,
+                     1,2,4,2,'legacy-run',NULL)",
+            [graph],
+        )
+        .unwrap();
+        // Insert a structural attempt that must stay snapshotless (eligible=0)
+        // so the backfill does not overreach.
+        conn.execute(
+            "INSERT INTO decomposition_attempts(
+                 graph_id,source_revision,kind,ordinal,retry_generation,
+                 reason_code,summary,created_at,eligible)
+             VALUES (?1,1,'proposal',2,0,'deterministic-validation','structural',201,0)",
+            [graph],
+        )
+        .unwrap();
+        drop(conn);
+
+        let config = ServeConfig {
+            db_path: db_path.clone(),
+            ..pre_review_checks_config(db_path.clone(), dir.path().to_path_buf())
+        };
+
+        backfill_missing_plan_snapshots(&config, graph)
+            .await
+            .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let legacy_snapshot: Option<String> = conn
+            .query_row(
+                "SELECT plan_snapshot_json FROM decomposition_attempts
+                 WHERE graph_id=?1 AND ordinal=1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(legacy_snapshot.is_some(), "legacy row was backfilled");
+        let planned: Vec<quorum_core::decomposition::PlannedChild> =
+            serde_json::from_str(legacy_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(planned.len(), 2);
+        assert_eq!(planned[0].local_key, "a");
+
+        let structural_snapshot: Option<String> = conn
+            .query_row(
+                "SELECT plan_snapshot_json FROM decomposition_attempts
+                 WHERE graph_id=?1 AND ordinal=2",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            structural_snapshot.is_none(),
+            "structural attempts stay snapshotless"
+        );
+        drop(conn);
+
+        // Replay: the guarded UPDATE binds zero rows against a row that
+        // already has a snapshot, so the second pass is a clean no-op.
+        backfill_missing_plan_snapshots(&config, graph)
+            .await
+            .unwrap();
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let count_after: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM decomposition_attempts
+                 WHERE graph_id=?1 AND plan_snapshot_json IS NOT NULL",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after, 1);
+    }
+
     #[test]
     fn proposal_preclassification_rejection_rendering_survives_planner_retry_bounds() {
         let proposal = vec![planner::ProposedTask {
@@ -43765,8 +44230,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
     }
 
+    /// Task #230 fix: N successive Arbiter-blocking verdicts on a
+    /// preclassifier-clean pair now exhaust the proposal budget into the
+    /// terminal-leaf fallback instead of parking + failing the source. The
+    /// arbiter-changes path records eligibility + plan snapshot in the
+    /// rejection row (finding #1), so at exhaustion the fallback picks the
+    /// stored snapshot and materializes it as terminal leaves, activates the
+    /// graph, transitions the source to `decomposed`, and surfaces the
+    /// fallback in the alerts pane.
     #[tokio::test]
-    async fn arbiter_blocking_changes_exhaust_and_fail_the_source() {
+    async fn arbiter_blocking_changes_exhaustion_materializes_terminal_leaves() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("exhaust.db");
         let proposal = arbiter_gate_proposal();
@@ -43814,19 +44287,17 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap();
         }
 
+        // Fallback outcome: active graph, decomposed source, terminal-leaf
+        // children matching the proposal.
         let (state, attempts, hold, status) = arbiter_gate_state(&db_path, graph);
+        assert_eq!(state, "active");
+        assert_eq!(status, "decomposed");
         assert_eq!(attempts, max_proposal);
-        assert_eq!(state, "held");
-        assert_eq!(hold.as_deref(), Some("proposal-attempts-exhausted"));
-        assert_eq!(status, "failed");
-        assert_eq!(
-            arbiter_gate_attempts(&db_path, graph).len(),
-            2 * max_proposal as usize
-        );
-        assert_eq!(
-            arbiter_gate_verdicts(&db_path, graph).len(),
-            max_proposal as usize
-        );
+        assert!(hold.is_none(), "fallback clears any prior hold code");
+        assert_eq!(arbiter_gate_child_count(&db_path, source), (2, 2));
+
+        // Every rejection round still records its proposal + verdict pair for
+        // observability.
         assert_eq!(
             arbiter_gate_attempts(&db_path, graph)
                 .iter()
@@ -43834,35 +44305,47 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .count(),
             max_proposal as usize
         );
-        let mut conn = quorum_core::db::open(&db_path).unwrap();
         assert_eq!(
-            quorum_core::decomposition::retry_exhausted_planning(
-                &mut conn,
-                source,
-                "operator",
-                20,
-            )
-            .unwrap(),
-            quorum_core::decomposition::PlanningRetryOutcome::Retried {
-                graph_id: graph,
-                generation: 1,
-            },
-            "observational Arbiter verdict rows do not consume proposal retry budget"
+            arbiter_gate_verdicts(&db_path, graph).len(),
+            max_proposal as usize
         );
-        let resumed: (String, i64, i64, String) = conn
+
+        // Every arbiter-changes rejection persisted an eligible snapshot —
+        // this is what makes the fallback reachable from the live daemon.
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let eligible_with_snapshot: i64 = conn
             .query_row(
-                "SELECT d.state,d.proposal_attempts,d.operator_retry_count,t.status
-                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
-                 WHERE d.id=?1",
+                "SELECT count(*) FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='proposal'
+                   AND eligible=1 AND plan_snapshot_json IS NOT NULL",
                 [graph],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            resumed,
-            ("provider-backoff".into(), 0, 1, "planning".into())
-        );
-        assert_eq!(arbiter_gate_child_count(&db_path, source), (0, 0));
+        assert_eq!(eligible_with_snapshot, max_proposal);
+
+        // Audit event and owner alert message both fire in the same rejection
+        // transaction so `quorum log` and `quorum status` ALERTS surface the
+        // deliberate size-relaxed fallback.
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='decomposition_terminal_leaf_fallback'
+                   AND subject=?1",
+                [format!("task#{source}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+        let alert_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM messages
+                 WHERE kind='alert' AND recipient='owner' AND refs=?1",
+                [format!("task#{source}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alert_count, 1);
     }
 
     #[tokio::test]

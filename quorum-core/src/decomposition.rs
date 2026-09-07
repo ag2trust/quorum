@@ -1121,7 +1121,14 @@ pub fn reject_frozen_proposal(
     if next_count == MAX_PROPOSAL_ATTEMPTS {
         // Terminal-leaf fallback: prefer materializing the best eligible attempt
         // over parking the graph forever. The current attempt was inserted
-        // above, so it is included in the candidate pool automatically.
+        // above, so it is included in the candidate pool automatically. Bump
+        // `proposal_attempts` first so the durable rejection count reflects
+        // every rejection whether the fallback lands or the park path fires.
+        tx.execute(
+            "UPDATE task_decompositions SET proposal_attempts=?2,updated_at=?3
+             WHERE id=?1",
+            params![graph_id, next_count, now],
+        )?;
         if try_terminal_leaf_fallback(&tx, graph_id, source_revision, source_id, now)? {
             tx.commit().map_err(map_sql_err)?;
             return Ok(true);
@@ -1240,6 +1247,31 @@ fn try_terminal_leaf_fallback(
         &format!("task#{source_id}"),
         &body,
         now,
+    )?;
+    // Surface the fallback in `quorum status` ALERTS and the dashboard's
+    // needs_attention alert pane by persisting an owner-scoped alert message.
+    // The source moves to `decomposed` and the graph goes `active`, so neither
+    // planning_holds, blocked_tasks, nor merge_waits would carry this signal
+    // otherwise. Bounded body; TTL matches the ordinary alert lifetime.
+    let alert_body = format!(
+        "task #{source_id}: decomposition proposal budget exhausted; \
+         terminal-leaf fallback materialized {total_children} children \
+         from attempt {ordinal} (generation {retry_generation}, \
+         oversized_count={oversized_count}, max_oversized_cx={max_oversized_cx})"
+    );
+    tx.execute(
+        "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            now,
+            "system",
+            crate::feed::DEFAULT_TOPIC,
+            "alert",
+            &alert_body,
+            format!("task#{source_id}"),
+            now + crate::feed::DEFAULT_MESSAGE_TTL_SECS,
+            "owner",
+        ],
     )?;
     Ok(true)
 }
@@ -5055,7 +5087,7 @@ mod tests {
             .unwrap();
         assert_eq!((child_count, terminal_leaf_count), (3, 3));
 
-        // The audit event exists so status attention surfaces the fallback.
+        // The audit event exists so `quorum log` carries the fallback.
         let audit_count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM events
@@ -5065,6 +5097,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_count, 1);
+        // The owner-scoped alert message surfaces the fallback in
+        // `quorum status` ALERTS and the dashboard's `needs_attention` pane;
+        // it must appear in the same rejection transaction as the event.
+        let (alert_count, alert_body, alert_refs): (i64, String, Option<String>) = conn
+            .query_row(
+                "SELECT count(*),MAX(body),MAX(refs) FROM messages
+                 WHERE kind='alert' AND recipient='owner' AND refs='task#1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(alert_count, 1);
+        assert!(alert_body.contains("terminal-leaf fallback"));
+        assert_eq!(alert_refs.as_deref(), Some("task#1"));
     }
 
     /// Rank correctness: given attempts with distinct scores, the fallback
