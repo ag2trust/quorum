@@ -2110,6 +2110,79 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
     Ok(true)
 }
 
+/// SQL predicate for the final assigned recovery worker. `submitted` and
+/// `awaiting_merge` are graceful cleanup outcomes, so each needs the durable
+/// lifecycle handoff that made the cleanup truthful. The automatic path still
+/// requires live events; the explicit operator path intentionally relies on
+/// the same evidence after its event TTL has elapsed.
+fn final_recovery_worker_evidence_predicate(
+    require_live_events: bool,
+    require_handoff_and_merge: bool,
+) -> String {
+    let handoff_live = if require_live_events {
+        " AND handoff.expires_at>?3"
+    } else {
+        ""
+    };
+    let merging_live = if require_live_events {
+        " AND merging.expires_at>?3"
+    } else {
+        ""
+    };
+    let handoff_and_merge = if require_handoff_and_merge {
+        format!(
+            " AND EXISTS (
+                    SELECT 1 FROM events handoff
+                    JOIN events merging ON merging.subject=handoff.subject
+                                      AND merging.kind='task_merging'
+                                      AND merging.seq>handoff.seq
+                    WHERE handoff.subject='task#' || recovery.id
+                      AND handoff.kind='task_in_review'
+                      AND handoff.body='by ' || worker.agent_name
+                      AND handoff.ts BETWEEN worker.spawned_at AND worker.ended_at{handoff_live}
+                      {merging_live}
+                )"
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "AND (
+              (worker.end_reason='completed'
+               AND worker.ended_at<=recovery_target.resolved_at)
+              OR worker.end_reason='merged'
+              OR (
+                  worker.end_reason='submitted'
+                  AND EXISTS (
+                      SELECT 1 FROM events handoff
+                      WHERE handoff.subject='task#' || recovery.id
+                        AND handoff.kind='task_in_review'
+                        AND handoff.body='by ' || worker.agent_name
+                        AND handoff.ts BETWEEN worker.spawned_at AND worker.ended_at
+                        AND handoff.ts<=recovery_target.resolved_at{handoff_live}
+                  )
+              )
+              OR (
+                  worker.end_reason='awaiting_merge'
+                  AND EXISTS (
+                      SELECT 1 FROM events handoff
+                      JOIN events merging ON merging.subject=handoff.subject
+                                        AND merging.kind='task_merging'
+                                        AND merging.seq>handoff.seq
+                      WHERE handoff.subject='task#' || recovery.id
+                        AND handoff.kind='task_in_review'
+                        AND handoff.body='by ' || worker.agent_name
+                        AND handoff.ts BETWEEN worker.spawned_at AND worker.ended_at
+                        AND handoff.ts<=recovery_target.resolved_at
+                        AND merging.ts BETWEEN worker.spawned_at AND worker.ended_at{handoff_live}
+                        {merging_live}
+                  )
+              )
+            ){handoff_and_merge}"
+    )
+}
+
 /// Adopt the exact managed delivery of a continuation task for one failed
 /// generated child.
 ///
@@ -2128,9 +2201,11 @@ pub fn adopt_recovery_delivery(
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
+    let automatic_final_worker_evidence = final_recovery_worker_evidence_predicate(true, true);
     let delivery: Option<RecoveryDelivery> = tx
         .query_row(
-            "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
+            &format!(
+                "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
                     recovery_target.pr_number,recovery_target.head_sha
              FROM task_graph_members member
              JOIN task_decompositions graph ON graph.id=member.graph_id
@@ -2186,25 +2261,18 @@ pub fn adopt_recovery_delivery(
                     SELECT 1 FROM agent_runs worker
                     JOIN role_assignments assignment
                       ON assignment.id=worker.role_assignment_id
-                    JOIN events published
-                      ON published.subject='task#' || recovery.id
-                     AND published.kind='task_in_review'
-                     AND published.expires_at>?3
-                     AND published.body='by ' || worker.agent_name
-                     AND published.ts BETWEEN worker.spawned_at AND worker.ended_at
                     WHERE worker.task_id=recovery.id AND worker.role='worker'
                       AND worker.sub_role IS NULL AND worker.ended_at IS NOT NULL
-                      AND worker.end_reason='completed'
+                      AND worker.id=(
+                           SELECT MAX(latest_worker.id) FROM agent_runs latest_worker
+                           WHERE latest_worker.task_id=recovery.id
+                             AND latest_worker.role='worker'
+                             AND latest_worker.sub_role IS NULL
+                      )
                       AND assignment.task_id=recovery.id
                       AND assignment.role='worker'
                       AND assignment.pr_number IS NULL
-                      AND EXISTS (
-                           SELECT 1 FROM events merging
-                           WHERE merging.subject=published.subject
-                             AND merging.kind='task_merging'
-                             AND merging.expires_at>?3
-                             AND merging.seq>published.seq
-                      )
+                      {automatic_final_worker_evidence}
                )
                AND EXISTS (
                     SELECT 1 FROM agent_runs reviewer
@@ -2233,6 +2301,7 @@ pub fn adopt_recovery_delivery(
                       AND merging.kind='task_merging'
                       AND merging.expires_at>?3
             )",
+            ),
             params![original_child_id, recovery_task_id, now],
             |row| {
                 Ok(RecoveryDelivery {
@@ -2275,8 +2344,8 @@ pub fn adopt_recovery_delivery(
 /// This is the operator recovery path for a known pair, not a discovery
 /// mechanism and not general task equivalence. It substitutes durable daemon
 /// evidence for the automatic path's short-lived events: the final managed
-/// worker run must complete before the persisted final PR target or be merged,
-/// an approved managed
+/// worker run must be completed before the persisted final PR target, merged,
+/// or have the durable lifecycle handoff for its graceful cleanup outcome; an approved managed
 /// reviewer must be bound to that exact target head, and daemon-owned merged
 /// completion provenance must close the chain. Conflicting `source_task`
 /// metadata is rejected; absent metadata grants no authority beyond this
@@ -2304,9 +2373,11 @@ pub fn adopt_explicit_recovery_delivery(
     }
 
     let tx = begin_immediate(conn)?;
+    let explicit_final_worker_evidence = final_recovery_worker_evidence_predicate(false, false);
     let delivery: Option<RecoveryDelivery> = tx
         .query_row(
-            "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
+            &format!(
+                "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
                     recovery_target.pr_number,recovery_target.head_sha,
                     original.status='open',
                     json_extract(original.refs,'$.daemon_publication.branch'),
@@ -2478,9 +2549,6 @@ pub fn adopt_explicit_recovery_delivery(
                       ON assignment.id=worker.role_assignment_id
                     WHERE worker.task_id=recovery.id AND worker.role='worker'
                       AND worker.sub_role IS NULL AND worker.ended_at IS NOT NULL
-                      AND worker.end_reason IN ('completed','merged')
-                      AND (worker.end_reason='merged'
-                           OR worker.ended_at<=recovery_target.resolved_at)
                       AND worker.id=(
                            SELECT MAX(latest_worker.id) FROM agent_runs latest_worker
                            WHERE latest_worker.task_id=recovery.id
@@ -2490,6 +2558,7 @@ pub fn adopt_explicit_recovery_delivery(
                       AND assignment.task_id=recovery.id
                       AND assignment.role='worker'
                       AND assignment.pr_number IS NULL
+                      {explicit_final_worker_evidence}
                )
                AND EXISTS (
                     SELECT 1 FROM agent_runs reviewer
@@ -2515,6 +2584,7 @@ pub fn adopt_explicit_recovery_delivery(
                            OR (sampling.required=1 AND reviewer.sub_role='r2'
                             AND assignment.review_stage='r2'))
                )",
+            ),
             params![
                 input.original_child_id,
                 input.recovery_task_id,
@@ -4025,6 +4095,10 @@ mod tests {
         }
 
         fn add_final_worker_run(&mut self, end_reason: &str, ended_at: i64) {
+            self.add_final_worker_run_at(end_reason, 21, ended_at);
+        }
+
+        fn add_final_worker_run_at(&mut self, end_reason: &str, spawned_at: i64, ended_at: i64) {
             let assignment: i64 = self
                 .conn
                 .query_row(
@@ -4038,10 +4112,42 @@ mod tests {
                 .execute(
                     "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
                          role_assignment_id,spawned_at,ended_at,end_reason)
-                     VALUES (?1,'worker','worker','sol','high','codex',?2,21,?3,?4)",
-                    params![self.recovery, assignment, ended_at, end_reason],
+                     VALUES (?1,'worker','worker','sol','high','codex',?2,?3,?4,?5)",
+                    params![self.recovery, assignment, spawned_at, ended_at, end_reason],
                 )
                 .unwrap();
+        }
+
+        fn set_final_target_resolution(&mut self, resolved_at: i64) {
+            self.conn
+                .execute(
+                    "UPDATE pr_targets SET resolved_at=?2 WHERE task_id=?1",
+                    params![self.recovery, resolved_at],
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "UPDATE agent_runs SET spawned_at=?2
+                     WHERE task_id=?1 AND role='reviewer'",
+                    params![self.recovery, resolved_at],
+                )
+                .unwrap();
+        }
+
+        fn set_worker_handoff(&mut self, ts: i64) {
+            self.conn
+                .execute(
+                    "UPDATE events SET ts=?2
+                     WHERE subject='task#' || ?1 AND kind='task_in_review'",
+                    params![self.recovery, ts],
+                )
+                .unwrap();
+        }
+
+        fn make_graceful_worker_handoff(&mut self, end_reason: &str, ended_at: i64) {
+            self.set_final_target_resolution(25);
+            self.add_final_worker_run_at(end_reason, 21, ended_at);
+            self.set_worker_handoff(22);
         }
 
         fn explicit_adoption(&mut self, now: i64) -> bool {
@@ -7304,6 +7410,251 @@ mod tests {
             )
             .unwrap();
         assert_eq!(holds, (None, None));
+    }
+
+    #[test]
+    fn explicit_recovery_reactivates_generated_child_failure_after_submitted_handoff() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+        fixture.make_graceful_worker_handoff("submitted", 26);
+        fixture.block_on_modern_generated_child_failure();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks
+                 SET status='open',refs=json_set(
+                     refs,
+                     '$.cx_est',2,
+                     '$.cx_size','S',
+                     '$.cx_ready',json('true'),
+                     '$.cx_not_ready_reason',json('null')
+                 )
+                 WHERE id=?1",
+                [fixture.siblings[0]],
+            )
+            .unwrap();
+
+        assert!(fixture.explicit_adoption(90_000));
+        let state: (String, i64, Option<String>, String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT graph.state,graph.active,graph.hold_code,source.status,child.status
+                 FROM tasks child
+                 JOIN task_graph_members member ON member.task_id=child.id
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks source ON source.id=graph.source_task_id
+                 WHERE child.id=?1",
+                [fixture.original],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("active".into(), 1, None, "decomposed".into(), "done".into())
+        );
+        assert_eq!(
+            crate::tasks::list_implementation_ready_open(&fixture.conn)
+                .unwrap()
+                .iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            [fixture.siblings[0]]
+        );
+    }
+
+    #[test]
+    fn explicit_recovery_accepts_awaiting_merge_only_after_handoff_and_merging() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+        fixture.make_graceful_worker_handoff("awaiting_merge", 35);
+
+        assert!(fixture.explicit_adoption(90_000));
+        assert_graph_completed(
+            &fixture.conn,
+            fixture.graph,
+            1,
+            &[
+                fixture.siblings[0],
+                fixture.siblings[1],
+                fixture.siblings[2],
+                fixture.original,
+            ],
+        );
+
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+        fixture.make_graceful_worker_handoff("awaiting_merge", 29);
+
+        assert!(!fixture.explicit_adoption(90_000));
+        assert_eq!(
+            graph_mutation_state(&fixture.conn, fixture.graph, fixture.original),
+            ("active".into(), "failed".into(), 0),
+            "a merger after graceful worker cleanup is not its handoff evidence"
+        );
+    }
+
+    #[test]
+    fn explicit_recovery_submitted_handoff_fails_closed_without_exact_timely_evidence() {
+        let cases: Vec<(&str, RecoveryEvidenceMutation)> = vec![
+            (
+                "missing handoff",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "DELETE FROM events
+                             WHERE subject='task#' || ?1 AND kind='task_in_review'",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "handoff names another worker",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE events SET body='by another-worker'
+                             WHERE subject='task#' || ?1 AND kind='task_in_review'",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "handoff is outside the worker run",
+                Box::new(|fixture| fixture.set_worker_handoff(27)),
+            ),
+            (
+                "handoff follows final target resolution",
+                Box::new(|fixture| fixture.set_worker_handoff(26)),
+            ),
+            (
+                "submitted worker is not latest",
+                Box::new(|fixture| fixture.add_final_worker_run("drain", 27)),
+            ),
+            (
+                "submitted worker is unassigned",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET role_assignment_id=NULL
+                             WHERE id=(SELECT MAX(id) FROM agent_runs
+                                       WHERE task_id=?1 AND role='worker' AND sub_role IS NULL)",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "wrong approved head",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET review_head_sha=?2
+                             WHERE task_id=?1 AND role='reviewer'",
+                            params![fixture.recovery, ORIGINAL_HEAD],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "absent merged provenance",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET completion_provenance=NULL WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+        ];
+
+        for (name, mutate) in cases {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_explicit_eligible();
+            fixture.make_graceful_worker_handoff("submitted", 26);
+            fixture.block_on_modern_generated_child_failure();
+            mutate(&mut fixture);
+
+            assert!(!fixture.explicit_adoption(90_000), "{name}");
+            let state: (String, String, String, Option<String>, i64, i64, i64) = fixture
+                .conn
+                .query_row(
+                    "SELECT child.status,graph.state,source.status,child.completion_provenance,
+                            (SELECT count(*) FROM decomposition_attempts
+                             WHERE graph_id=graph.id AND kind='recovery'),
+                            (SELECT count(*) FROM events
+                             WHERE kind='task_graph_unblocked' AND subject='task#' || child.id),
+                            (SELECT count(*) FROM events
+                             WHERE kind='task_done' AND subject='task#' || child.id)
+                     FROM tasks child
+                     JOIN task_graph_members member ON member.task_id=child.id
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     JOIN tasks source ON source.id=graph.source_task_id
+                     WHERE child.id=?1",
+                    [fixture.original],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                (
+                    "failed".into(),
+                    "blocked".into(),
+                    "decomposed".into(),
+                    None,
+                    0,
+                    0,
+                    0
+                ),
+                "{name} must be a clean negative"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_recovery_accepts_graceful_worker_handoffs_with_live_merge_evidence() {
+        for (end_reason, ended_at) in [("submitted", 26), ("awaiting_merge", 35)] {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_graceful_worker_handoff(end_reason, ended_at);
+
+            assert!(fixture.adoption(), "{end_reason}");
+            assert_graph_completed(
+                &fixture.conn,
+                fixture.graph,
+                1,
+                &[
+                    fixture.siblings[0],
+                    fixture.siblings[1],
+                    fixture.siblings[2],
+                    fixture.original,
+                ],
+            );
+        }
     }
 
     #[test]

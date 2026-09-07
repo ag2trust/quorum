@@ -2468,10 +2468,14 @@ or blocked, with `active=1`), or for the failed child named by a modern structur
 `generated-child-failed` block while siblings remain. The automatic path's immediate transaction requires the same repository and PR,
 creator-selected `continue_pr`, explicit `source_task` provenance, live daemon publication and
 merge events (`expires_at > now`), immutable managed-review authority, and one consistent PR
-target/approved head SHA. It changes only the failed child and records recovery provenance while
-preserving the PR; on a blocked graph it leaves the graph blocked and active. Missing or expired
-evidence, replay, and losing concurrent callers are clean no-ops with no events; the winner emits
-bounded child-completion events once.
+target/approved head SHA. Its final assigned worker must be `completed` before the final target
+resolves, `merged`, or a graceful cleanup with the same durable handoff rule used by explicit
+adoption: `submitted` requires a live `task_in_review` event naming that worker within its run and
+at or before target resolution; `awaiting_merge` additionally requires the later live
+`task_merging` event within that run. It changes only the failed child and records recovery
+provenance while preserving the PR; on a blocked graph it leaves the graph blocked and active.
+Missing or expired evidence, replay, and losing concurrent callers are clean no-ops with no
+events; the winner emits bounded child-completion events once.
 
 For a coordinator/operator-selected incident pair, `quorum decomposition-adopt-recovery
 --original-child-id <child> --recovery-task-id <continuation> --by <operator>` is the sole explicit
@@ -2481,9 +2485,11 @@ repository and PR identity, creator-selected continuation authority,
 and exact target/head agreement. It permits absent `source_task` metadata because the caller has
 named the exact pair, but rejects conflicting metadata. Instead of expiring feed events it requires
 the durable daemon chain: the final assigned worker run is either `completed` before the persisted
-final PR target or `merged` (which may end after that target resolves), an assigned approved
-reviewer bound to that exact target head and sampling decision, and merged
-completion provenance. Success writes the operator, source, child, recovery task, PR, and head to
+final PR target, `merged` (which may end after that target resolves), `submitted` with a
+`task_in_review` event naming that worker within its run and at or before target resolution, or
+`awaiting_merge` with that exact handoff plus its later `task_merging` event within the run. An
+assigned approved reviewer bound to that exact target head and sampling decision, and merged
+completion provenance, close the chain. Success writes the operator, source, child, recovery task, PR, and head to
 the decomposition recovery ledger and child recovery projection before final-child completion. On
 an active graph this is ordinary completion. On a blocked graph a `boundary-violation` hold is
 eligible only when its JSON `affected_task` exactly equals the named failed child; the same
