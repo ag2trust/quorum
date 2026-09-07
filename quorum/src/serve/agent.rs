@@ -620,7 +620,9 @@ impl AgentProc {
             });
         }
 
-        Ok((Self::from_child(cmd.spawn()?)?, gate))
+        let proc = Self::from_child(cmd.spawn()?)?;
+        let gate = gate.bind(proc.process_group_id());
+        Ok((proc, gate))
     }
 
     fn from_child(mut child: Child) -> std::io::Result<Self> {

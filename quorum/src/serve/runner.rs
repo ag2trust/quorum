@@ -549,22 +549,17 @@ pub enum AgentKind {
     Grok,
 }
 
-/// One-shot authority to replace a waiting launch wrapper with its provider.
-///
-/// The read side is inherited by the wrapper alone. Dropping this handle
-/// closes the write side, which makes an unreleased wrapper exit without
-/// executing the provider. Claude's initial turn is retained here because a
-/// waiting wrapper cannot consume its stdin without risking a pipe-capacity
-/// deadlock before the daemon has committed its launch boundary.
+/// Unbound gate half returned by [`gated_command`]. Adapters bind it to the
+/// process-group id of the wrapper they just spawned; only the resulting
+/// [`LaunchGate`] can release that exact process.
 #[allow(dead_code)] // consumed when fallback launch orchestration is wired
-pub struct LaunchGate {
+pub(crate) struct GateHandle {
     writer: File,
     kind: AgentKind,
-    deferred_claude_turn: Option<String>,
 }
 
 #[allow(dead_code)] // consumed when fallback launch orchestration is wired
-impl LaunchGate {
+impl GateHandle {
     fn new(kind: AgentKind) -> std::io::Result<(Self, File)> {
         let mut fds = [-1; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -583,35 +578,74 @@ impl LaunchGate {
                 return Err(std::io::Error::last_os_error());
             }
         }
-        Ok((
-            Self {
-                writer,
-                kind,
-                deferred_claude_turn: None,
-            },
-            read,
-        ))
+        Ok((Self { writer, kind }, read))
     }
 
+    /// Bind the release authority to a spawned wrapper's process-group id.
+    /// The pgid is captured from `child.id()` before any reap, matches
+    /// [`RunnerProc::process_group_id`] for the same wrapper, and remains
+    /// stable across leader exit — so [`LaunchGate::release`] can compare it
+    /// to the caller-supplied process without relying on `pid()` staying live.
+    pub(crate) fn bind(self, bound_pgid: i32) -> LaunchGate {
+        LaunchGate {
+            writer: self.writer,
+            kind: self.kind,
+            bound_pgid,
+            deferred_claude_turn: None,
+        }
+    }
+}
+
+/// One-shot authority to replace a waiting launch wrapper with its provider.
+///
+/// The read side is inherited by the wrapper alone. Dropping this handle
+/// closes the write side, which makes an unreleased wrapper exit without
+/// executing the provider. Claude's initial turn is retained here because a
+/// waiting wrapper cannot consume its stdin without risking a pipe-capacity
+/// deadlock before the daemon has committed its launch boundary.
+#[allow(dead_code)] // consumed when fallback launch orchestration is wired
+pub struct LaunchGate {
+    writer: File,
+    kind: AgentKind,
+    bound_pgid: i32,
+    deferred_claude_turn: Option<String>,
+}
+
+#[allow(dead_code)] // consumed when fallback launch orchestration is wired
+impl LaunchGate {
     pub(crate) fn defer_claude_turn(mut self, turn: String) -> Self {
         self.deferred_claude_turn = Some(turn);
         self
     }
 
-    /// Release exactly this process. `proc` is consumed so a gate cannot be
-    /// paired with a process from another launch; a mismatch instead closes
-    /// the pipe and fails before the provider can run.
+    /// Release exactly the process this gate was bound to. A wrong provider
+    /// kind or a mismatched process-group id is rejected before the release
+    /// token is ever written: the mistaken process is killed and reaped, and
+    /// dropping the writer at end of scope also EOFs the wrapper this gate
+    /// really owned so it exits without executing its provider. The daemon
+    /// therefore never keeps a released process it does not actually track.
     pub async fn release(self, proc: RunnerProc) -> Result<RunnerProc, RunnerFailure> {
         let LaunchGate {
             mut writer,
             kind,
+            bound_pgid,
             deferred_claude_turn,
         } = self;
         if proc.kind() != kind {
+            drop(writer);
             let _ = proc.kill_and_reap().await;
             return Err(RunnerFailure::classified(
                 FailureDisposition::NonFailover,
                 "launch gate does not belong to this provider process",
+                std::io::ErrorKind::InvalidInput,
+            ));
+        }
+        if proc.process_group_id() != bound_pgid {
+            drop(writer);
+            let _ = proc.kill_and_reap().await;
+            return Err(RunnerFailure::classified(
+                FailureDisposition::NonFailover,
+                "launch gate does not belong to this process group",
                 std::io::ErrorKind::InvalidInput,
             ));
         }
@@ -659,8 +693,8 @@ const GATE_WRAPPER: &str = concat!(
 pub(crate) fn gated_command(
     kind: AgentKind,
     program: &str,
-) -> std::io::Result<(Command, LaunchGate)> {
-    let (gate, read) = LaunchGate::new(kind)?;
+) -> std::io::Result<(Command, GateHandle)> {
+    let (gate, read) = GateHandle::new(kind)?;
     let mut command = Command::new("/bin/sh");
     command
         .arg("-c")
@@ -1996,6 +2030,107 @@ mod tests {
                 "{model} provider execution count"
             );
             proc.kill_and_reap().await;
+        }
+    }
+
+    /// Two same-provider gated launches must not be cross-releasable. The
+    /// `AgentKind` check alone cannot tell them apart, so the pgid binding is
+    /// the only signal that prevents `gate_a.release(proc_b)` from executing
+    /// wrapper A's provider while handing wrapper B back to the daemon.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crossed_same_provider_gate_pair_rejects_release_and_kills_both_wrappers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for model in [
+            "claude-sonnet-5",
+            "gpt-5.6-terra",
+            super::super::grok_agent::DEFAULT_MODEL,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("provider-started");
+            let runner = dir.path().join("marker-runner");
+            std::fs::write(
+                &runner,
+                format!(
+                    "#!/bin/sh\nprintf started >> '{}'\nif [ \"$1\" = '-p' ]; then IFS= read -r _ || true; fi\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let environment = Vec::new();
+            let cfg = gate_config(runner.to_str().unwrap());
+            let make_request = || LaunchRequest {
+                model,
+                effort: "high",
+                worktree: dir.path(),
+                prompt: "must not run",
+                environment: &environment,
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            };
+
+            let (proc_a, gate_a) = RunnerProc::launch_gated(&make_request(), &cfg)
+                .await
+                .unwrap_or_else(|error| panic!("spawn gated {model} A: {error}"));
+            let (proc_b, gate_b) = RunnerProc::launch_gated(&make_request(), &cfg)
+                .await
+                .unwrap_or_else(|error| panic!("spawn gated {model} B: {error}"));
+
+            let kind_a = proc_a.kind();
+            let kind_b = proc_b.kind();
+            let pgid_a = proc_a.process_group_id();
+            let pgid_b = proc_b.process_group_id();
+            assert_eq!(kind_a, kind_b, "{model}: same-provider pair required");
+            assert_ne!(
+                pgid_a, pgid_b,
+                "{model}: each launch must own its own process group"
+            );
+
+            let err_a = gate_a
+                .release(proc_b)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{model}: crossed release must fail"));
+            assert!(
+                err_a.detail().contains("process group"),
+                "{model}: unexpected detail {}",
+                err_a.detail()
+            );
+            let err_b = gate_b
+                .release(proc_a)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{model}: reverse crossed release must fail"));
+            assert!(
+                err_b.detail().contains("process group"),
+                "{model}: unexpected detail {}",
+                err_b.detail()
+            );
+
+            // Wrapper shells that saw EOF may still be dying; give them a
+            // bounded window to reach the scheduler before probing.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            for pgid in [pgid_a, pgid_b] {
+                loop {
+                    if unsafe { libc::killpg(pgid, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{model}: process group {pgid} outlived rejected release"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+
+            assert!(
+                !marker.exists(),
+                "{model}: crossed release must not execute either provider"
+            );
         }
     }
 

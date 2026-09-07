@@ -1322,6 +1322,7 @@ impl GrokProc {
         let stderr = child.stderr.take().expect("stderr was piped");
         let stderr_task =
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
+        let gate = gate.bind(process_group_id);
         Ok((
             Self {
                 child,
