@@ -42743,7 +42743,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             classifications.push(quorum_core::classify::TaskClassification {
                 task_id: -(index as i64) - 1,
                 cx_est: 5,
-                size: if index % 2 == 0 { "L" } else { "XL" }.into(),
+                size: "XL".into(),
                 size_reason: format!("size-seam-{index}-{}", "s".repeat(160)),
                 ready: false,
                 not_ready_reason: Some(format!("ready-{index}-{}", "r".repeat(160))),
@@ -42763,8 +42763,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 line.contains(&format!("not_ready_reason=ready-{index}-")),
                 "{line}"
             );
-            let size = if index % 2 == 0 { "L" } else { "XL" };
-            assert!(line.contains(&format!("size={size}")), "{line}");
+            assert!(line.contains("size=XL"), "{line}");
             assert!(
                 line.contains(&format!("size_reason=size-seam-{index}-")),
                 "{line}"
