@@ -223,7 +223,7 @@ pub struct BeginRoutedPlanning<'a> {
     pub now: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedChild {
     pub local_key: String,
     pub title: String,
@@ -1022,6 +1022,7 @@ impl AttemptEligibility {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn reject_frozen_proposal(
     conn: &mut Connection,
     graph_id: i64,
@@ -1029,6 +1030,7 @@ pub fn reject_frozen_proposal(
     reason_code: &str,
     summary: &str,
     eligibility: AttemptEligibility,
+    plan_snapshot: Option<&[PlannedChild]>,
     now: i64,
 ) -> Result<bool> {
     if !matches!(expected_phase, "validating" | "preclassifying") {
@@ -1044,6 +1046,21 @@ pub fn reject_frozen_proposal(
             "invalid bounded decomposition attempt".into(),
         ));
     }
+    // The snapshot is stored only alongside an eligible size-only rejection; a
+    // structural rejection has no classified pair to materialize from. Reject a
+    // mismatched pairing loudly rather than silently drop the snapshot.
+    if plan_snapshot.is_some() && !eligibility.eligible {
+        return Err(QuorumError::Usage(
+            "plan snapshot recorded on ineligible attempt".into(),
+        ));
+    }
+    let plan_snapshot_json = match plan_snapshot {
+        Some(children) => Some(
+            serde_json::to_string(children)
+                .map_err(|error| QuorumError::Io(format!("plan snapshot serialize: {error}")))?,
+        ),
+        None => None,
+    };
 
     let tx = begin_immediate(conn)?;
     let row: Option<(i64, i64, i64, i64, Option<String>)> = tx
@@ -1082,8 +1099,9 @@ pub fn reject_frozen_proposal(
     tx.execute(
         "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
              retry_generation,reason_code,summary,created_at,
-             eligible,oversized_count,max_oversized_cx,total_children,submission_id)
-         VALUES (?1,?2,'proposal',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+             eligible,oversized_count,max_oversized_cx,total_children,submission_id,
+             plan_snapshot_json)
+         VALUES (?1,?2,'proposal',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             graph_id,
             source_revision,
@@ -1097,9 +1115,17 @@ pub fn reject_frozen_proposal(
             eligibility.max_oversized_cx,
             eligibility.total_children,
             submission_id,
+            plan_snapshot_json,
         ],
     )?;
     if next_count == MAX_PROPOSAL_ATTEMPTS {
+        // Terminal-leaf fallback: prefer materializing the best eligible attempt
+        // over parking the graph forever. The current attempt was inserted
+        // above, so it is included in the candidate pool automatically.
+        if try_terminal_leaf_fallback(&tx, graph_id, source_revision, source_id, now)? {
+            tx.commit().map_err(map_sql_err)?;
+            return Ok(true);
+        }
         tx.execute(
             "UPDATE task_decompositions SET state='held',freeze_active=0,
                  proposal_attempts=?2,accepted_proposal_json=NULL,
@@ -1124,6 +1150,97 @@ pub fn reject_frozen_proposal(
         )?;
     }
     tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
+/// Kind for the terminal-leaf fallback audit event. Emitted inside the same
+/// rejection transaction that materializes the fallback plan so a reader can
+/// never see the size-relaxed materialization without its provenance.
+pub const TERMINAL_LEAF_FALLBACK_EVENT: &str = "decomposition_terminal_leaf_fallback";
+
+/// Pick the best eligible past attempt for this graph/source_revision and
+/// materialize its stored plan as terminal leaves inside the caller's
+/// transaction. Returns `Ok(true)` when the fallback landed and the caller
+/// should commit without parking; `Ok(false)` when no eligible attempt with a
+/// materializable snapshot exists (park exactly as before).
+///
+/// Selection order (task #230): min oversized_count → min max_oversized_cx →
+/// min total_children → most recent generation → most recent ordinal. Only the
+/// top-ranked candidate is attempted: a stored snapshot is written from a
+/// classifier pair that already survived preclassification, so a later
+/// materialization failure is a lifecycle-invariant break, not a routine loss.
+fn try_terminal_leaf_fallback(
+    tx: &Transaction<'_>,
+    graph_id: i64,
+    source_revision: i64,
+    source_id: i64,
+    now: i64,
+) -> Result<bool> {
+    let candidate: Option<(i64, i64, i64, i64, i64, String)> = tx
+        .query_row(
+            "SELECT ordinal,retry_generation,
+                    COALESCE(oversized_count,0),
+                    COALESCE(max_oversized_cx,0),
+                    COALESCE(total_children,0),
+                    plan_snapshot_json
+             FROM decomposition_attempts
+             WHERE graph_id=?1 AND source_revision=?2 AND kind='proposal'
+               AND eligible=1 AND plan_snapshot_json IS NOT NULL
+             ORDER BY oversized_count ASC, max_oversized_cx ASC, total_children ASC,
+                      retry_generation DESC, ordinal DESC
+             LIMIT 1",
+            params![graph_id, source_revision],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        ordinal,
+        retry_generation,
+        oversized_count,
+        max_oversized_cx,
+        total_children,
+        snapshot_json,
+    )) = candidate
+    else {
+        return Ok(false);
+    };
+    let children: Vec<PlannedChild> = serde_json::from_str(&snapshot_json).map_err(|error| {
+        QuorumError::Io(format!("stored plan snapshot did not deserialize: {error}"))
+    })?;
+    validate_planned_children(&children)?;
+    let materialized =
+        materialize_terminal_children_in_tx(tx, graph_id, source_revision, &children, now)?;
+    if materialized.is_none() {
+        return Ok(false);
+    }
+    let body = serde_json::json!({
+        "graph_id": graph_id,
+        "source_task_id": source_id,
+        "source_revision": source_revision,
+        "attempt_ordinal": ordinal,
+        "retry_generation": retry_generation,
+        "oversized_count": oversized_count,
+        "max_oversized_cx": max_oversized_cx,
+        "total_children": total_children,
+        "reason": "size-relaxed terminal-leaf fallback after proposal-budget exhaustion",
+    })
+    .to_string();
+    crate::events::emit(
+        tx,
+        TERMINAL_LEAF_FALLBACK_EVENT,
+        &format!("task#{source_id}"),
+        &body,
+        now,
+    )?;
     Ok(true)
 }
 
@@ -1370,6 +1487,27 @@ pub fn materialize_terminal_children(
     children: &[PlannedChild],
     now: i64,
 ) -> Result<Option<Vec<i64>>> {
+    validate_planned_children(children)?;
+    let tx = begin_immediate(conn)?;
+    let ids = match materialize_terminal_children_in_tx(
+        &tx,
+        graph_id,
+        expected_source_revision,
+        children,
+        now,
+    )? {
+        Some(ids) => ids,
+        None => return Ok(None),
+    };
+    tx.commit().map_err(map_sql_err)?;
+    Ok(Some(ids))
+}
+
+/// Structural validation on a planned-child slice, shared by both the
+/// standalone materialization and the in-tx best-attempt fallback so a stored
+/// snapshot cannot bypass the classifier/DAG gates by side-loading through the
+/// exhaustion path.
+fn validate_planned_children(children: &[PlannedChild]) -> Result<()> {
     if !(MIN_CHILDREN..=MAX_CHILDREN).contains(&children.len()) {
         return Err(QuorumError::Usage(
             "a decomposition requires 2 to 8 children".into(),
@@ -1423,8 +1561,20 @@ pub fn materialize_terminal_children(
             "decomposition graph contains a cycle".into(),
         ));
     }
+    Ok(())
+}
 
-    let tx = begin_immediate(conn)?;
+/// The guarded materialization body inside a caller-owned transaction, so the
+/// exhaustion-path terminal-leaf fallback can serialize it with the same
+/// bounded rejection write that today parks the graph. The caller must have
+/// already run [`validate_planned_children`] and must commit on `Ok(Some(_))`.
+fn materialize_terminal_children_in_tx(
+    tx: &Transaction<'_>,
+    graph_id: i64,
+    expected_source_revision: i64,
+    children: &[PlannedChild],
+    now: i64,
+) -> Result<Option<Vec<i64>>> {
     let aggregate: Option<MaterializationSource> = tx
         .query_row(
             "SELECT d.source_task_id,d.planned_source_revision,d.plan_revision,
@@ -1571,7 +1721,6 @@ pub fn materialize_terminal_children(
          WHERE id=?1 AND status='planning'",
         params![source_id, now],
     )?;
-    tx.commit().map_err(map_sql_err)?;
     Ok(Some(ids))
 }
 
@@ -4663,6 +4812,7 @@ mod tests {
             "arbiter-changes",
             "blocking finding",
             AttemptEligibility::structural(),
+            None,
             7,
         )
         .unwrap());
@@ -4715,6 +4865,7 @@ mod tests {
             "child-preclassification",
             "child a rejected by preclassification: size L",
             AttemptEligibility::structural(),
+            None,
             4,
         )
         .unwrap());
@@ -4756,6 +4907,7 @@ mod tests {
             "child-preclassification",
             "two L/cx=4 children",
             eligible,
+            None,
             4,
         )
         .unwrap());
@@ -4790,6 +4942,7 @@ mod tests {
             "child-preclassification",
             "invalid classification pairing",
             AttemptEligibility::structural(),
+            None,
             6,
         )
         .unwrap());
@@ -4804,6 +4957,462 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (0, None, None, None));
+    }
+
+    fn sized_snapshot_child(key: &str, size: &str, cx_est: i64) -> PlannedChild {
+        PlannedChild {
+            local_key: key.into(),
+            title: format!("child {key}"),
+            body: format!("deliver {key}"),
+            labels: Some("[\"type:implementation\",\"generated:decomposition\"]".into()),
+            classification_refs: format!(
+                r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}}"#
+            ),
+            prerequisite_keys: vec![],
+            source_dependency_ids: vec![],
+        }
+    }
+
+    /// The task #230 primary happy-path: N size-only L/cx=4 rejections
+    /// (`N = MAX_PROPOSAL_ATTEMPTS`) exhaust the proposal budget, so the
+    /// exhaustion transition materializes the current attempt's stored
+    /// snapshot as terminal leaves instead of parking the graph. Assert state
+    /// (rows/status), NOT log lines.
+    #[test]
+    fn exhaustion_materializes_best_attempt_when_at_least_one_is_eligible() {
+        let (_dir, mut conn) = file_setup();
+        let graph = begin(&mut conn);
+
+        let make_snapshot = || {
+            vec![
+                sized_snapshot_child("a", "L", 4),
+                sized_snapshot_child("b", "L", 4),
+                sized_snapshot_child("c", "L", 4),
+            ]
+        };
+        let eligibility = AttemptEligibility {
+            eligible: true,
+            oversized_count: Some(3),
+            max_oversized_cx: Some(4),
+            total_children: Some(3),
+        };
+
+        for ordinal in 1..=MAX_PROPOSAL_ATTEMPTS {
+            let phase = if ordinal == 1 {
+                "preclassifying"
+            } else {
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "planning",
+                    "validating",
+                    None,
+                    100 + ordinal,
+                )
+                .unwrap());
+                "validating"
+            };
+            conn.execute(
+                "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                [graph],
+            )
+            .unwrap();
+            let snapshot = make_snapshot();
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "child-preclassification",
+                "size-only rejection",
+                eligibility,
+                Some(&snapshot),
+                200 + ordinal,
+            )
+            .unwrap());
+        }
+
+        // Graph is not held/failed; it is active with terminal-leaf children.
+        let state: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("active".into(), 1, "decomposed".into()));
+        let (child_count, terminal_leaf_count): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*),
+                        (SELECT count(*) FROM tasks t
+                         JOIN task_graph_members m ON m.task_id=t.id
+                         WHERE m.graph_id=?1 AND m.active=1 AND t.terminal_leaf=1)
+                 FROM task_graph_members WHERE graph_id=?1 AND active=1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((child_count, terminal_leaf_count), (3, 3));
+
+        // The audit event exists so status attention surfaces the fallback.
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind=?1 AND subject='task#1' AND body LIKE '%size-relaxed%'",
+                [TERMINAL_LEAF_FALLBACK_EVENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 1);
+    }
+
+    /// Rank correctness: given attempts with distinct scores, the fallback
+    /// materializes the one with the lowest `(oversized_count,
+    /// max_oversized_cx, total_children)`. The current attempt is worst; a
+    /// prior best-scoring attempt wins.
+    #[test]
+    fn exhaustion_picks_the_lowest_score_across_attempts() {
+        let (_dir, mut conn) = file_setup();
+        let graph = begin(&mut conn);
+
+        // Attempt 1: oversized_count=1 (best). Snapshot has one L, one M.
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        let best = vec![
+            sized_snapshot_child("best-a", "M", 2),
+            sized_snapshot_child("best-b", "L", 4),
+        ];
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "preclassifying",
+            "child-preclassification",
+            "one L",
+            AttemptEligibility {
+                eligible: true,
+                oversized_count: Some(1),
+                max_oversized_cx: Some(4),
+                total_children: Some(2),
+            },
+            Some(&best),
+            10,
+        )
+        .unwrap());
+
+        // Attempt 2: oversized_count=2 (worst). Snapshot has two Ls with
+        // max_oversized_cx=5 so a rank-tie mutation would flip it.
+        assert!(set_frozen_phase(&mut conn, graph, "planning", "validating", None, 20).unwrap());
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        let worst = vec![
+            sized_snapshot_child("worst-a", "L", 5),
+            sized_snapshot_child("worst-b", "L", 5),
+        ];
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "validating",
+            "child-preclassification",
+            "two Ls",
+            AttemptEligibility {
+                eligible: true,
+                oversized_count: Some(2),
+                max_oversized_cx: Some(5),
+                total_children: Some(2),
+            },
+            Some(&worst),
+            21,
+        )
+        .unwrap());
+
+        let members: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT local_key FROM task_graph_members
+                     WHERE graph_id=?1 AND active=1 ORDER BY local_key",
+                )
+                .unwrap();
+            stmt.query_map([graph], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            members,
+            vec!["best-a".to_string(), "best-b".to_string()],
+            "the lowest-oversized-count attempt is materialized, not the current one"
+        );
+
+        let audit_body: String = conn
+            .query_row(
+                "SELECT body FROM events WHERE kind=?1",
+                [TERMINAL_LEAF_FALLBACK_EVENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(audit_body.contains("\"oversized_count\":1"));
+        assert!(audit_body.contains("\"attempt_ordinal\":1"));
+    }
+
+    /// Tie-break on `max_oversized_cx`: two attempts both have
+    /// `oversized_count=1`, but one is L/cx=5 and one is L/cx=4. The
+    /// lower-cx attempt wins.
+    #[test]
+    fn exhaustion_ties_on_max_oversized_cx() {
+        let (_dir, mut conn) = file_setup();
+        let graph = begin(&mut conn);
+
+        // Attempt 1: cx=5.
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        let higher_cx = vec![
+            sized_snapshot_child("cx5-a", "M", 2),
+            sized_snapshot_child("cx5-b", "L", 5),
+        ];
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "preclassifying",
+            "child-preclassification",
+            "L cx=5",
+            AttemptEligibility {
+                eligible: true,
+                oversized_count: Some(1),
+                max_oversized_cx: Some(5),
+                total_children: Some(2),
+            },
+            Some(&higher_cx),
+            10,
+        )
+        .unwrap());
+
+        // Attempt 2: cx=4 wins the tie.
+        assert!(set_frozen_phase(&mut conn, graph, "planning", "validating", None, 20).unwrap());
+        conn.execute(
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        let lower_cx = vec![
+            sized_snapshot_child("cx4-a", "M", 2),
+            sized_snapshot_child("cx4-b", "L", 4),
+        ];
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "validating",
+            "child-preclassification",
+            "L cx=4",
+            AttemptEligibility {
+                eligible: true,
+                oversized_count: Some(1),
+                max_oversized_cx: Some(4),
+                total_children: Some(2),
+            },
+            Some(&lower_cx),
+            21,
+        )
+        .unwrap());
+
+        let members: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT local_key FROM task_graph_members
+                     WHERE graph_id=?1 AND active=1 ORDER BY local_key",
+                )
+                .unwrap();
+            stmt.query_map([graph], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(members, vec!["cx4-a".to_string(), "cx4-b".to_string()]);
+    }
+
+    /// Negative: every attempt is ineligible (structural / XL child), so the
+    /// exhaustion transition parks the graph and fails the source exactly as
+    /// before task #230. The audit event never fires because no fallback ran.
+    #[test]
+    fn exhaustion_parks_when_no_attempt_is_eligible() {
+        let (_dir, mut conn) = file_setup();
+        let graph = begin(&mut conn);
+
+        for (index, phase) in ["preclassifying", "validating"].iter().enumerate() {
+            let ordinal = (index as i64) + 1;
+            if index > 0 {
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "planning",
+                    "validating",
+                    None,
+                    100 + ordinal,
+                )
+                .unwrap());
+            }
+            conn.execute(
+                "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                [graph],
+            )
+            .unwrap();
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "child-preclassification",
+                "XL child or structural failure",
+                AttemptEligibility::structural(),
+                None,
+                200 + ordinal,
+            )
+            .unwrap());
+        }
+
+        let state: (String, i64, Option<String>, String) = conn
+            .query_row(
+                "SELECT d.state,d.freeze_active,d.hold_code,t.status
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "held".into(),
+                0,
+                Some("proposal-attempts-exhausted".into()),
+                "failed".into()
+            )
+        );
+        let member_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_graph_members WHERE graph_id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(member_count, 0);
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind=?1",
+                [TERMINAL_LEAF_FALLBACK_EVENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 0);
+    }
+
+    /// Replay-safety: once materialization has landed, a repeated rejection
+    /// call against the same graph is a clean no-op — no duplicate children,
+    /// no second audit row. The guarded `active=0 AND freeze_active=1` update
+    /// inside materialize + the `state=?` guard on the outer query bind zero
+    /// rows.
+    #[test]
+    fn exhaustion_fallback_is_idempotent_under_replay() {
+        let (_dir, mut conn) = file_setup();
+        let graph = begin(&mut conn);
+
+        for (index, phase) in ["preclassifying", "validating"].iter().enumerate() {
+            let ordinal = (index as i64) + 1;
+            if index > 0 {
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "planning",
+                    "validating",
+                    None,
+                    100 + ordinal,
+                )
+                .unwrap());
+            }
+            conn.execute(
+                "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                [graph],
+            )
+            .unwrap();
+            let snapshot = vec![
+                sized_snapshot_child("r-a", "L", 4),
+                sized_snapshot_child("r-b", "L", 4),
+            ];
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "child-preclassification",
+                "size-only rejection",
+                AttemptEligibility {
+                    eligible: true,
+                    oversized_count: Some(2),
+                    max_oversized_cx: Some(4),
+                    total_children: Some(2),
+                },
+                Some(&snapshot),
+                200 + ordinal,
+            )
+            .unwrap());
+        }
+
+        let child_count_before: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_graph_members WHERE graph_id=?1 AND active=1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_count_before, 2);
+
+        // Replay attempt with the same inputs. The graph is now 'active' with
+        // active=1, so the outer state guard binds zero rows and the call is
+        // a clean no-op.
+        let snapshot = vec![
+            sized_snapshot_child("r-a", "L", 4),
+            sized_snapshot_child("r-b", "L", 4),
+        ];
+        assert!(!reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "validating",
+            "child-preclassification",
+            "replayed",
+            AttemptEligibility {
+                eligible: true,
+                oversized_count: Some(2),
+                max_oversized_cx: Some(4),
+                total_children: Some(2),
+            },
+            Some(&snapshot),
+            999,
+        )
+        .unwrap());
+
+        let child_count_after: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_graph_members WHERE graph_id=?1 AND active=1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_count_after, 2);
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind=?1",
+                [TERMINAL_LEAF_FALLBACK_EVENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 1);
     }
 
     #[test]
@@ -4868,6 +5477,7 @@ mod tests {
                 "deterministic-validation",
                 &summary,
                 AttemptEligibility::structural(),
+                None,
                 ordinal * 10 + 1,
             )
             .unwrap());
@@ -5016,6 +5626,7 @@ mod tests {
             "deterministic-validation",
             "proposal exceeds its allowed size",
             AttemptEligibility::structural(),
+            None,
             7,
         )
         .unwrap());
@@ -5278,6 +5889,7 @@ mod tests {
                 "semantic",
                 "proposal rejected",
                 AttemptEligibility::structural(),
+                None,
                 ordinal * 10 + 1,
             )
             .unwrap());
@@ -5312,6 +5924,7 @@ mod tests {
             "semantic",
             "new rejection",
             AttemptEligibility::structural(),
+            None,
             43,
         )
         .unwrap());
@@ -5354,6 +5967,7 @@ mod tests {
                 "semantic",
                 "carried proposal rejection",
                 AttemptEligibility::structural(),
+                None,
                 11 + attempt,
             )
             .unwrap());
@@ -5381,6 +5995,7 @@ mod tests {
             "semantic",
             "exhaust carried proposal budget",
             AttemptEligibility::structural(),
+            None,
             43,
         )
         .unwrap());
@@ -5477,6 +6092,7 @@ mod tests {
                 "semantic",
                 "proposal rejection before carried provider exhaustion",
                 AttemptEligibility::structural(),
+                None,
                 30 + attempt,
             )
             .unwrap());
