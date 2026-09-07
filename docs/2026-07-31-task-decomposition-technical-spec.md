@@ -22,8 +22,9 @@ graph-aware scheduling, graph cancellation/recovery, and read-only graph status.
 
 It does not add a general workflow engine, recursive decomposition, owner approval of valid
 plans, manual graph editing, cross-repository graphs, or planner delivery authority. Review-only
-L/XL work is held for external splitting. Generated tasks are always S or M and cannot be
-decomposed.
+L/XL work is held for external splitting. Generated tasks are terminal leaves: accepted S, M, and
+L children dispatch directly, while XL rejects the plan before materialization. Terminal leaves
+cannot be decomposed.
 
 ## Terms
 
@@ -31,6 +32,9 @@ decomposed.
   bounded for its assigned path. It is independent of dependency completion.
 - **Runtime ready:** all task dependencies are done and every atomic claim guard passes.
 - **Source:** the original L/XL implementation task.
+- **Terminal leaf:** a generated task materialized with `tasks.terminal_leaf=1`. It dispatches
+  directly under graph claim guards for a complete S/M/L classification at any valid complexity,
+  but is never a decomposition source.
 - **Planning cycle:** durable pre-materialization state for one source revision.
 - **Task graph:** the one atomically materialized set of generated tasks and prerequisite edges.
 - **Active graph:** a materialized graph not completed or cancelled. A blocked graph remains
@@ -147,12 +151,14 @@ blocked until the source transition commits.
 Use authoritative tables rather than `tasks.refs`. Refs remain a projection for compatibility
 and display, not lifecycle authority.
 
-Add `revision INTEGER NOT NULL DEFAULT 1` and `edit_count INTEGER NOT NULL DEFAULT 0` to
-`tasks`. Every externally editable task advances `revision` with compare-and-swap semantics;
-the three-edit cap is enforced for a task once classification is pending or complete. Classifier
-input captures the revision and its write transaction stores results only while it still
-matches. This task-level authority exists before Quorum knows whether a task is L/XL and lets an
-edit invalidate an in-flight classifier turn without first creating decomposition state.
+Add `revision INTEGER NOT NULL DEFAULT 1`, `edit_count INTEGER NOT NULL DEFAULT 0`, and
+`terminal_leaf INTEGER NOT NULL DEFAULT 0` to `tasks`. Every externally editable task advances
+`revision` with compare-and-swap semantics; the three-edit cap is enforced for a task once
+classification is pending or complete. Classifier input captures the revision and its write
+transaction stores results only while it still matches. This task-level authority exists before
+Quorum knows whether a task is L/XL and lets an edit invalidate an in-flight classifier turn
+without first creating decomposition state. The additive terminal-leaf default preserves every
+existing task as an ordinary root; only atomic plan materialization writes `terminal_leaf=1`.
 
 ### `task_decompositions`
 
@@ -247,11 +253,12 @@ The migration is additive and forward-only under the normal `BEGIN IMMEDIATE` mi
 ## Admission and repository freeze
 
 The daemon selects planning candidates by priority, then task ID. A candidate must be an open,
-unclaimed, admission-ready L/XL implementation task whose dependencies are done. It must not be
-review-only or generated work. Review-only work always routes directly to reviewer provisioning
-at any classified size; S/M implementation work follows normal dispatch regardless of complexity.
-The atomic planning transaction rechecks `review_only=0` and `continue_pr IS NULL`, so neither
-PR-bound entry shape can become a decomposition source even if a stale caller selects it.
+unclaimed, admission-ready L/XL root implementation task whose dependencies are done. It must not
+be review-only, PR-bound, or a terminal leaf. Review-only work always routes directly to reviewer
+provisioning at any classified size; S/M root implementation work follows normal dispatch
+regardless of complexity. The atomic planning transaction rechecks `review_only=0`,
+`continue_pr IS NULL`, and `terminal_leaf=0`, so neither special entry shape nor a generated leaf
+can become a decomposition source even if a stale caller selects it.
 
 Starting a cycle atomically moves the source to `planning`, records `freeze-requested`, and sets
 `freeze_active=1`. Every worker, reviewer, remediation, and merge-start authority check must
@@ -315,12 +322,13 @@ or:
 A plan contains 2–8 uniquely keyed tasks. Each task has a title, concrete implementation delta,
 affected repository paths, observable outcome, acceptance criteria, applicable source constraints,
 verification expectations, explicit non-goals, byte-exact preserved literals, and prerequisite
-local keys or source dependency IDs. The planner receives the same agent execution-size rubric and
-shared dispatchability policy as the classifier: S/M at any complexity and L at complexity 4 or
-lower. It inspects from source-named paths and symbols under bounded search/read guidance, and
-separates independently deliverable code or ownership seams rather than turning preserved outcomes
-into standalone work. A blocker must be concrete. Markdown wrappers, unknown fields, multiple
-outcomes, oversized output, malformed JSON, and sandbox violations are provider failures.
+local keys or source dependency IDs. The planner receives the root execution-size rubric plus the
+terminal-leaf child policy: a generated child may be S, M, or L at any valid complexity, while XL
+is rejected at plan acceptance. It inspects from source-named paths and symbols under bounded
+search/read guidance, and separates independently deliverable code or ownership seams rather than
+turning preserved outcomes into standalone work. A blocker must be concrete. Markdown wrappers,
+unknown fields, multiple outcomes, oversized output, malformed JSON, and sandbox violations are
+provider failures.
 
 Literal preservation is byte-exact and bounded by the 8 KiB `preserved_literals` field and an
 8 KiB aggregate across all extracted values. Inline/fenced Markdown code uses matching backtick
@@ -382,9 +390,9 @@ or a planner self-attestation check.
 
 All proposed children are classified together before any child row exists. Classification uses
 temporary proposal keys, not task IDs. Every result must be present, admission-ready,
-implementation work, nonduplicate, dispatchable under the shared size policy (S/M at any
-complexity, or L at complexity 4 or lower), and carry a nonempty, NUL-free `size_reason` bounded
-to 1 KiB. The reason names the concrete execution surfaces supporting the selected size. An L
+implementation work, nonduplicate, and classified S, M, or L at a valid complexity, with a
+nonempty, NUL-free `size_reason` bounded to 1 KiB. XL rejects the entire proposal at plan
+acceptance. The reason names the concrete execution surfaces supporting the selected size. An L
 rationale names multiple owned seams or layers that remain one coherent outcome; an XL rationale
 identifies independently deliverable outcomes or seams requiring decomposition.
 Complexity and size are orthogonal agent-facing dimensions. Complexity measures the hardest
@@ -411,7 +419,7 @@ Planning Blocker is immediately held, consumes neither budget, and receives no s
 source state, freeze ownership, plan limits, classifications, graph uniqueness, and repository
 active-graph uniqueness. It then:
 
-1. creates all children with inherited priority and creator;
+1. creates all children with inherited priority and creator, each with `terminal_leaf=1`;
 2. attaches final independent classifications and planner provenance;
 3. resolves local keys and writes all prerequisite edges;
 4. writes every membership row;
@@ -426,9 +434,11 @@ constraints and creates nothing.
 ## Graph scheduling and child delivery
 
 Generated tasks use the ordinary independent implementation, review, rework, and protected
-merge lifecycle. Their precomputed classification supplies their own provider/model routing.
-Review prompts include the assigned source requirements and direct prerequisites and prohibit
-moving sibling scope into the reviewed child.
+merge lifecycle. Each is a terminal leaf, so its precomputed S/M/L classification dispatches
+directly without applying the root size gate; it is never eligible for decomposition. Their
+precomputed classification supplies their own provider/model routing. Review prompts include the
+assigned source requirements and direct prerequisites and prohibit moving sibling scope into the
+reviewed child.
 
 Inside the atomic claim transaction, a generated child additionally requires:
 

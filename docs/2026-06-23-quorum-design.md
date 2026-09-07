@@ -2265,16 +2265,25 @@ filename. Runner-specific process options remain scoped under `[claude]`, `[code
 
 ### Bounded task decomposition
 
-A non-continuation, admission-ready implementation task is a decomposition source only when its
-classified size is L or XL and `cx_est` is 4 or 5. After its dependencies are done, the daemon
-serializes decomposition per repository: it stops new managed delivery, lets active delivery
-finish, and plans against the resulting frozen base. S/M implementation tasks dispatch normally
-regardless of complexity; non-continuation L tasks with `cx_est` 1–3 also dispatch directly to one
-worker. Every `continue_pr` task dispatches directly because only the source task carries authority
+A non-continuation, admission-ready, non-terminal-leaf implementation task is a decomposition
+source only when its classified size is L or XL and `cx_est` is 4 or 5. After its dependencies
+are done, the daemon serializes decomposition per repository: it stops new managed delivery,
+lets active delivery finish, and plans against the resulting frozen base. S/M implementation
+tasks dispatch normally regardless of complexity; non-continuation L tasks with `cx_est` 1–3 also
+dispatch directly to one worker. Every `continue_pr` task dispatches directly because only the source task carries authority
 to publish to the bound PR. Every review-only task dispatches directly to reviewer provisioning at
 any classified size because it has no implementation work to decompose. A non-continuation XL task
 with `cx_est` 1–3 violates the classification rubric and is parked with an explicit
 reclassify-or-rescope reason.
+
+Accepted plans materialize generated children as durable terminal leaves (`tasks.terminal_leaf=1`).
+The child admission policy intentionally differs from the root policy: a complete S, M, or L child
+classification is accepted at every valid complexity, including L at `cx_est` 4 or 5. An XL child
+classification rejects the plan before materialization. A terminal leaf dispatches directly to a
+worker under its graph claim guards, rather than through the root size-dispatch gate, and it is
+excluded from planning-source selection even when its classification would otherwise qualify it
+for decomposition. This is the one-level decomposition boundary; a terminal leaf never creates or
+re-enters a decomposition graph.
 
 Planning uses the profile selected from the planner routing pool. The planner receives a
 read-only repository view and bounded source context but no network, database, coordination
@@ -2316,9 +2325,9 @@ behavior and regression-only expectations remain criteria or non-goals rather th
 implementation work. A child that changes a function/API signature or shared type, trait, or
 struct shape must own every affected caller needed for its workspace build and preflight after
 its prerequisites merge; a definition/signature child must not reserve those callers for a
-sibling. A compile-closed seam that fits one dispatchable child (S or M, or L at complexity 4 or
-lower) remains one child. The planner returns a `no_safe_split` blocker only when the closure
-cannot fit in one dispatchable child, rather than manufacturing definition and wiring siblings.
+sibling. A compile-closed seam that fits one terminal child classified S, M, or L remains one
+child. The planner returns a `no_safe_split` blocker only when the closure cannot fit in one
+terminal child, rather than manufacturing definition and wiring siblings.
 Before any task row is created,
 deterministic validation checks the closed shape, references, cycles, prohibited synthetic
 integration work, mechanically visible compile-atomic signature-seam reservations, and the
@@ -2330,12 +2339,12 @@ plan is coherent — is judged by the Arbiter plan-review gate (below), not by a
 literal match. Once deterministic validation passes, the complete proposal is classified as one
 closed-book batch (`preclassifying`) *before* the Arbiter reviews it (`validating`): the
 classifier is cheap and rejects most oversized plans, so the expensive Arbiter run is spent only
-on classifier-accepted proposals. Every child must be
-admission-ready, nonduplicate, and sized within the same implementation-size policy that
-dispatches root tasks directly: S or M at any complexity, or L at `cx_est` 1–3. One Rust
-predicate and one SQL fragment define that policy for dispatch, sync, materialization, and child
-preclassification, so the daemon cannot reject a child it would have dispatched as a root. The
-classifier receives each planned child's whole contract in a stable order (delta, paths,
+on classifier-accepted proposals. Every child must be admission-ready, nonduplicate, and
+classified S, M, or L at a valid complexity. XL rejects the entire proposal at plan acceptance.
+This is deliberately not the root dispatch policy: materialization persists `terminal_leaf=1` for
+every accepted child, the direct-dispatch predicate recognizes that marker, and planning-source
+selection excludes it. The classifier receives each planned child's whole contract in a stable
+order (delta, paths,
 deliverables, non-goals, outcome, criteria, constraints, verification), bounded per field rather
 than truncated as one blob, with every prerequisite rendered as its sibling or source title so
 responsibilities delivered by dependencies are not counted against the child's own surface.
@@ -2430,20 +2439,22 @@ process creation. The same transaction checks task phase, classification, and pl
 planning freeze acquisition excludes live reservations. The daemon releases the reservation only
 after reviewer attachment or complete failed-provision cleanup.
 
-One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task, classification,
-edge, membership/provenance row, source `planning -> decomposed` transition, and active-graph
-record. It then releases the freeze. Partial materialization is never visible. A partial unique
-index permits one materialized active or blocked graph per repository, and source uniqueness
-permits only one graph aggregate per source. Generated work is one level only and is immutable
-after materialization.
+One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task with
+`terminal_leaf=1`, classification, edge, membership/provenance row, source `planning ->
+decomposed` transition, and active-graph record. It then releases the freeze. Partial
+materialization is never visible. A partial unique index permits one materialized active or
+blocked graph per repository, and source uniqueness permits only one graph aggregate per source.
+Generated work is one level only and is immutable after materialization.
 
 Generated tasks inherit the source task's immutable `target_branch` at materialization; a NULL
 source target yields NULL child targets and preserves the legacy configured-base fallback.
 Generated tasks retain ordinary independent implementation, review, rework, and protected merge.
-Their atomic claim additionally requires an active decomposed source, done prerequisites, no
-failed sibling or graph blocker, and fewer than two active implementation siblings. Eligible graph
-children sort before unrelated new work, but reserve no idle capacity and never interrupt active
-unrelated work. Active siblings may finish after another child fails; no later child may start.
+As terminal leaves, they dispatch directly regardless of the root size-dispatch policy and cannot
+be selected as decomposition sources. Their atomic claim additionally requires an active
+decomposed source, done prerequisites, no failed sibling or graph blocker, and fewer than two
+active implementation siblings. Eligible graph children sort before unrelated new work, but
+reserve no idle capacity and never interrupt active unrelated work. Active siblings may finish
+after another child fails; no later child may start.
 
 A reviewer may submit a capability-bound, closed graph-blocker verdict only for a genuine safety
 or authority boundary violation: a change that would grant authority, break restricted-role or
@@ -2598,15 +2609,17 @@ labels are ignored.
   does not inspect source, Git, CI, or external systems. Readiness is permissive: ordinary
   repository discovery and bounded engineering choices are execution work, not a reason to
   reject the task.
-- Direct dispatch and decomposition partition admission-ready implementation work. S/M tasks
-  dispatch directly for every valid `cx_est`; non-continuation L tasks dispatch directly at
-  `cx_est` 1–3 and decompose at 4–5; non-continuation XL tasks decompose at 4–5 and park at 1–3
-  as a rubric mismatch. A `continue_pr` task always takes the direct route and never the
-  decomposition route, regardless of classified size. A review-only task likewise always takes
-  the direct reviewer route at any classified size. The daemon atomically parks an unready
-  classification. Parking writes the standard refs, note, and event with no claim, run, or error
-  row; an explicit retry requests reclassification of remaining work and a newly dispatchable
-  result restores the saved lifecycle status.
+- Direct dispatch and decomposition partition admission-ready implementation work. S/M root tasks
+  dispatch directly for every valid `cx_est`; non-continuation L root tasks dispatch directly at
+  `cx_est` 1–3 and decompose at 4–5; non-continuation XL root tasks decompose at 4–5 and park at
+  1–3 as a rubric mismatch. In contrast, an accepted generated S/M/L child is a terminal leaf and
+  dispatches directly at every valid complexity; XL rejects the plan before it can become a leaf.
+  A terminal leaf never takes the decomposition route. A `continue_pr` task always takes the
+  direct route and never the decomposition route, regardless of classified size. A review-only
+  task likewise always takes the direct reviewer route at any classified size. The daemon
+  atomically parks an unready classification. Parking writes the standard refs, note, and event
+  with no claim, run, or error row; an explicit retry requests reclassification of remaining work
+  and a newly dispatchable result restores the saved lifecycle status.
 - A new worker assignment selects from the complexity-specific worker routing pool. Task
   creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`
