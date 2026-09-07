@@ -238,6 +238,14 @@ CREATE TABLE IF NOT EXISTS decomposition_attempts (
     reason_code      TEXT NOT NULL,
     summary          TEXT NOT NULL,
     created_at       INTEGER NOT NULL,
+    -- v72 (observational, additive): per-attempt eligibility/rank the future
+    -- fewest-L best-attempt fallback reads. Populated on proposal rejections
+    -- only; NULL on every other attempt kind.
+    eligible         INTEGER,
+    oversized_count  INTEGER,
+    max_oversized_cx INTEGER,
+    total_children   INTEGER,
+    submission_id    TEXT,
     UNIQUE (graph_id, source_revision, kind, ordinal)
 );
 

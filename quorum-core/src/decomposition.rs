@@ -996,12 +996,39 @@ pub fn record_attempt(
 /// The attempt evidence and retry/hold transition are committed together so a
 /// rejected proposal can never become runnable or lose its actionable reason
 /// across a crash. `Ok(false)` is a clean loss of graph or source authority.
+/// Per-attempt eligibility + fewest-L rank a proposal rejection persists into
+/// `decomposition_attempts`. `structural()` is the "not eligible, no plan
+/// context" default the non-classified rejection sites pass in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttemptEligibility {
+    pub eligible: bool,
+    pub oversized_count: Option<i64>,
+    pub max_oversized_cx: Option<i64>,
+    pub total_children: Option<i64>,
+}
+
+impl AttemptEligibility {
+    /// A rejection that does not meet the size-only criterion (structural /
+    /// DAG / provider / invalid JSON) and has no computed plan metrics. Stored
+    /// as `eligible=0` with NULL rank fields so the fewest-L fallback can
+    /// distinguish "unknown" from a real zero-oversized eligible plan.
+    pub fn structural() -> Self {
+        Self {
+            eligible: false,
+            oversized_count: None,
+            max_oversized_cx: None,
+            total_children: None,
+        }
+    }
+}
+
 pub fn reject_frozen_proposal(
     conn: &mut Connection,
     graph_id: i64,
     expected_phase: &str,
     reason_code: &str,
     summary: &str,
+    eligibility: AttemptEligibility,
     now: i64,
 ) -> Result<bool> {
     if !matches!(expected_phase, "validating" | "preclassifying") {
@@ -1019,18 +1046,26 @@ pub fn reject_frozen_proposal(
     }
 
     let tx = begin_immediate(conn)?;
-    let row: Option<(i64, i64, i64, i64)> = tx
+    let row: Option<(i64, i64, i64, i64, Option<String>)> = tx
         .query_row(
             "SELECT d.source_task_id,d.planned_source_revision,d.proposal_attempts,
-                    d.operator_retry_count
+                    d.operator_retry_count,d.planner_session_id
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
              WHERE d.id=?1 AND d.state=?2 AND d.freeze_active=1 AND d.active=0
                AND t.status='planning' AND t.revision=d.planned_source_revision",
             params![graph_id, expected_phase],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((source_id, source_revision, attempts, retry_generation)) = row else {
+    let Some((source_id, source_revision, attempts, retry_generation, submission_id)) = row else {
         return Ok(false);
     };
     if attempts >= MAX_PROPOSAL_ATTEMPTS {
@@ -1046,8 +1081,9 @@ pub fn reject_frozen_proposal(
     let next_count = attempts + 1;
     tx.execute(
         "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
-             retry_generation,reason_code,summary,created_at)
-         VALUES (?1,?2,'proposal',?3,?4,?5,?6,?7)",
+             retry_generation,reason_code,summary,created_at,
+             eligible,oversized_count,max_oversized_cx,total_children,submission_id)
+         VALUES (?1,?2,'proposal',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![
             graph_id,
             source_revision,
@@ -1055,7 +1091,12 @@ pub fn reject_frozen_proposal(
             retry_generation,
             reason_code,
             summary,
-            now
+            now,
+            i64::from(eligibility.eligible),
+            eligibility.oversized_count,
+            eligibility.max_oversized_cx,
+            eligibility.total_children,
+            submission_id,
         ],
     )?;
     if next_count == MAX_PROPOSAL_ATTEMPTS {
@@ -4604,6 +4645,7 @@ mod tests {
             "validating",
             "arbiter-changes",
             "blocking finding",
+            AttemptEligibility::structural(),
             7,
         )
         .unwrap());
@@ -4655,6 +4697,7 @@ mod tests {
             "preclassifying",
             "child-preclassification",
             "child a rejected by preclassification: size L",
+            AttemptEligibility::structural(),
             4,
         )
         .unwrap());
@@ -4667,6 +4710,83 @@ mod tests {
             "a rejected proposal cannot be advanced into the Arbiter phase"
         );
         assert_eq!(accepted_columns(&conn, graph).0, "planning");
+    }
+
+    /// Size-only rejections persist an eligible=1 row with the fewest-L
+    /// rank fields; structural/DAG/provider/invalid-JSON rejections persist
+    /// eligible=0 with NULL rank fields.
+    #[test]
+    fn proposal_rejection_persists_per_attempt_eligibility_and_rank() {
+        let mut conn = setup();
+        let graph = planning_graph(&mut conn);
+        conn.execute(
+            "UPDATE task_decompositions SET planner_session_id='run-1' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert!(accept_proposal(&mut conn, graph, "[]", 3).unwrap());
+
+        let eligible = AttemptEligibility {
+            eligible: true,
+            oversized_count: Some(2),
+            max_oversized_cx: Some(4),
+            total_children: Some(3),
+        };
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "preclassifying",
+            "child-preclassification",
+            "two L/cx=4 children",
+            eligible,
+            4,
+        )
+        .unwrap());
+
+        let row: (i64, Option<i64>, Option<i64>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT eligible,oversized_count,max_oversized_cx,total_children,submission_id
+                 FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='proposal'
+                 ORDER BY ordinal DESC LIMIT 1",
+                [graph],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, (1, Some(2), Some(4), Some(3), Some("run-1".into())));
+
+        // A structural rejection on the next attempt persists eligible=0 with
+        // NULL rank fields (no plan context was known at rejection time).
+        assert!(accept_proposal(&mut conn, graph, "[]", 5).unwrap());
+        assert!(reject_frozen_proposal(
+            &mut conn,
+            graph,
+            "preclassifying",
+            "child-preclassification",
+            "invalid classification pairing",
+            AttemptEligibility::structural(),
+            6,
+        )
+        .unwrap());
+        let row: (i64, Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT eligible,oversized_count,max_oversized_cx,total_children
+                 FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='proposal'
+                 ORDER BY ordinal DESC LIMIT 1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (0, None, None, None));
     }
 
     #[test]
@@ -4730,6 +4850,7 @@ mod tests {
                 phase,
                 "deterministic-validation",
                 &summary,
+                AttemptEligibility::structural(),
                 ordinal * 10 + 1,
             )
             .unwrap());
@@ -4877,6 +4998,7 @@ mod tests {
             "preclassifying",
             "deterministic-validation",
             "proposal exceeds its allowed size",
+            AttemptEligibility::structural(),
             7,
         )
         .unwrap());
@@ -5138,6 +5260,7 @@ mod tests {
                 phase,
                 "semantic",
                 "proposal rejected",
+                AttemptEligibility::structural(),
                 ordinal * 10 + 1,
             )
             .unwrap());
@@ -5171,6 +5294,7 @@ mod tests {
             "validating",
             "semantic",
             "new rejection",
+            AttemptEligibility::structural(),
             43,
         )
         .unwrap());
@@ -5212,6 +5336,7 @@ mod tests {
                 phase,
                 "semantic",
                 "carried proposal rejection",
+                AttemptEligibility::structural(),
                 11 + attempt,
             )
             .unwrap());
@@ -5238,6 +5363,7 @@ mod tests {
             "validating",
             "semantic",
             "exhaust carried proposal budget",
+            AttemptEligibility::structural(),
             43,
         )
         .unwrap());
@@ -5333,6 +5459,7 @@ mod tests {
                 phase,
                 "semantic",
                 "proposal rejection before carried provider exhaustion",
+                AttemptEligibility::structural(),
                 30 + attempt,
             )
             .unwrap());
