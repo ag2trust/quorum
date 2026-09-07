@@ -6189,6 +6189,7 @@ async fn reject_decomposition_proposal(
     from: &'static str,
     code: &str,
     summary: &str,
+    eligibility: quorum_core::decomposition::AttemptEligibility,
 ) -> Result<()> {
     let path = config.db_path.clone();
     let code = code.to_string();
@@ -6201,6 +6202,7 @@ async fn reject_decomposition_proposal(
             from,
             &code,
             &summary,
+            eligibility,
             now_unix(),
         )?;
         Ok(())
@@ -6208,6 +6210,68 @@ async fn reject_decomposition_proposal(
     .await
     .map_err(|error| QuorumError::Io(format!("proposal rejection join: {error}")))??;
     Ok(())
+}
+
+/// Pair proposed children with their classifications and, if any child was
+/// rejected by preclassification, return the aggregate rejection summary + the
+/// per-attempt eligibility record. `None` means either pairing failed
+/// (structural) or no size/ready/duplicate rejection fired at all — both cases
+/// leave the caller responsible for the appropriate structural rejection.
+fn size_only_rejection_with_eligibility<'a>(
+    proposal: &'a [planner::ProposedTask],
+    classifications: &'a [quorum_core::classify::TaskClassification],
+) -> Option<(String, quorum_core::decomposition::AttemptEligibility)> {
+    let by_id: HashMap<i64, &quorum_core::classify::TaskClassification> = classifications
+        .iter()
+        .map(|result| (result.task_id, result))
+        .collect();
+    let mut classified = Vec::with_capacity(proposal.len());
+    for (index, task) in proposal.iter().enumerate() {
+        let id = -(index as i64) - 1;
+        let result = *by_id.get(&id)?;
+        classified.push((task, result));
+    }
+    let summary = aggregate_child_preclassification_rejections(&classified)?;
+    Some((summary, attempt_eligibility_from_classified(&classified)))
+}
+
+/// Compute the per-attempt eligibility + fewest-L rank from a fully paired
+/// classification batch. The rejection set must be size-only (no XL child, no
+/// non-size dimension failed, plan has at least two children) to be eligible;
+/// oversized_count/max_oversized_cx rank the plan among size-only candidates
+/// by counting `L`/`cx_est>=4` children.
+fn attempt_eligibility_from_classified(
+    classified: &[(
+        &planner::ProposedTask,
+        &quorum_core::classify::TaskClassification,
+    )],
+) -> quorum_core::decomposition::AttemptEligibility {
+    let total_children = classified.len() as i64;
+    let mut oversized_count = 0i64;
+    let mut max_oversized_cx = 0i64;
+    let mut has_xl = false;
+    let mut has_non_size_reject = false;
+    for (_task, result) in classified {
+        if result.size.eq_ignore_ascii_case("XL") {
+            has_xl = true;
+        }
+        if !result.ready || !result.duplicate_of.is_empty() {
+            has_non_size_reject = true;
+        }
+        if result.size.eq_ignore_ascii_case("L") && result.cx_est >= 4 {
+            oversized_count += 1;
+            if result.cx_est > max_oversized_cx {
+                max_oversized_cx = result.cx_est;
+            }
+        }
+    }
+    let eligible = !has_xl && !has_non_size_reject && total_children >= 2;
+    quorum_core::decomposition::AttemptEligibility {
+        eligible,
+        oversized_count: Some(oversized_count),
+        max_oversized_cx: Some(max_oversized_cx),
+        total_children: Some(total_children),
+    }
 }
 
 /// Cap on the number of blocking findings folded into a rework summary. Keeps
@@ -6348,6 +6412,23 @@ async fn materialize_validated_proposal(
     proposal: &[planner::ProposedTask],
     classifications: &[quorum_core::classify::TaskClassification],
 ) -> Result<bool> {
+    // Surface a size-only rejection with its computed eligibility before falling
+    // through to planned_children, whose remaining error paths (missing
+    // classification, invalid source dependency) are structural.
+    if let Some((summary, eligibility)) =
+        size_only_rejection_with_eligibility(proposal, classifications)
+    {
+        reject_decomposition_proposal(
+            config,
+            graph_id,
+            "validating",
+            "child-preclassification",
+            &summary,
+            eligibility,
+        )
+        .await?;
+        return Ok(false);
+    }
     let children = match planned_children(proposal, classifications) {
         Ok(children) if !children.is_empty() => children,
         Ok(_) => {
@@ -6357,6 +6438,7 @@ async fn materialize_validated_proposal(
                 "validating",
                 "child-preclassification",
                 "approved proposal has no classified children to materialize",
+                quorum_core::decomposition::AttemptEligibility::structural(),
             )
             .await?;
             return Ok(false);
@@ -6368,6 +6450,7 @@ async fn materialize_validated_proposal(
                 "validating",
                 "child-preclassification",
                 &summary,
+                quorum_core::decomposition::AttemptEligibility::structural(),
             )
             .await?;
             return Ok(false);
@@ -6422,6 +6505,7 @@ async fn materialize_validated_proposal(
                 "validating",
                 "materialization-rejected",
                 "approved proposal is not materializable as classified",
+                quorum_core::decomposition::AttemptEligibility::structural(),
             )
             .await?;
             Ok(false)
@@ -6487,6 +6571,7 @@ async fn apply_arbiter_verdict(
                     "validating",
                     "arbiter-changes",
                     &summary,
+                    quorum_core::decomposition::AttemptEligibility::structural(),
                 )
                 .await?;
                 Ok(false)
@@ -7161,29 +7246,50 @@ async fn tick_decomposition(
                     // (size, readiness, duplicates) before the Arbiter is ever
                     // spawned: a rejected classification returns the proposal to
                     // the planner retry path without spending an Arbiter run.
-                    let result = classifier::parse_validated_response(&text, &expected).and_then(
-                        |classifications| {
-                            planned_children(
-                                coordinator.proposal.as_deref().unwrap_or_default(),
-                                &classifications,
+                    // Split parse from planned_children so an invalid-JSON
+                    // (structural) failure is distinguishable from a size-only
+                    // aggregate rejection at eligibility-record time.
+                    let parsed = classifier::parse_validated_response(&text, &expected);
+                    let proposal = coordinator.proposal.as_deref().unwrap_or_default();
+                    let rejection = match &parsed {
+                        Err(summary) => Some((
+                            summary.clone(),
+                            quorum_core::decomposition::AttemptEligibility::structural(),
+                        )),
+                        Ok(classifications) => {
+                            size_only_rejection_with_eligibility(proposal, classifications).or_else(
+                                || {
+                                    planned_children(proposal, classifications).err().map(
+                                        |summary| {
+                                            (
+                                        summary,
+                                        quorum_core::decomposition::AttemptEligibility::structural(
+                                        ),
+                                    )
+                                        },
+                                    )
+                                },
                             )
-                            .map(|_| classifications)
-                        },
-                    );
-                    match result {
-                        Err(summary) => {
+                        }
+                    };
+                    match (parsed, rejection) {
+                        (_, Some((summary, eligibility))) => {
                             reject_decomposition_proposal(
                                 config,
                                 graph_id,
                                 "preclassifying",
                                 "child-preclassification",
                                 &summary,
+                                eligibility,
                             )
                             .await?;
                             coordinator.proposal = None;
                             coordinator.classifications = None;
                         }
-                        Ok(classifications) => {
+                        (Err(_), None) => {
+                            unreachable!("parse error always yields a rejection")
+                        }
+                        (Ok(classifications), None) => {
                             // Persist the accepted batch next to the proposal and
                             // advance `preclassifying` -> `validating` in one
                             // guarded write, so the Arbiter reviews and the daemon
@@ -7631,6 +7737,7 @@ async fn tick_decomposition(
                 "preclassifying",
                 "deterministic-validation",
                 &error.to_string(),
+                quorum_core::decomposition::AttemptEligibility::structural(),
             )
             .await?;
             coordinator.proposal = None;
@@ -42448,6 +42555,107 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(summary.contains(&proposal[1].implementation_delta));
     }
 
+    /// The fewest-L eligibility helper ranks a size-only rejection by counting
+    /// L/cx≥4 children and refuses eligibility as soon as any XL, non-size
+    /// dimension, or missing pairing appears. These numbers feed the future
+    /// best-attempt fallback; the helper is verified in isolation here so the
+    /// coordinator wiring (test above via decomposition::tests) only has to
+    /// prove persistence.
+    #[test]
+    fn attempt_eligibility_from_classified_ranks_size_only_rejections() {
+        fn proposal(keys: &[&str]) -> Vec<planner::ProposedTask> {
+            keys.iter()
+                .map(|key| planner::ProposedTask {
+                    key: (*key).into(),
+                    title: (*key).into(),
+                    implementation_delta: "d".into(),
+                    affected_paths: vec![],
+                    observable_outcome: "o".into(),
+                    deliverables: writable_deliverables("src/x.rs"),
+                    acceptance_criteria: vec!["c".into()],
+                    source_constraints: vec![],
+                    verification_expectations: vec!["v".into()],
+                    prerequisites: vec![],
+                    ..Default::default()
+                })
+                .collect()
+        }
+        fn classify(
+            size: &str,
+            cx_est: i64,
+            index: i64,
+        ) -> quorum_core::classify::TaskClassification {
+            quorum_core::classify::TaskClassification {
+                task_id: -(index + 1),
+                cx_est,
+                size: size.into(),
+                size_reason: "reason".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }
+        }
+
+        // Size-only, 3-child plan with two L/cx=4 children → eligible=1 and
+        // rank fields match the spec's expected values.
+        let three = proposal(&["a", "b", "c"]);
+        let sizes = [
+            classify("L", 4, 0),
+            classify("L", 4, 1),
+            classify("M", 2, 2),
+        ];
+        let eligibility = attempt_eligibility_from_classified(
+            &three.iter().zip(sizes.iter()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            eligibility,
+            quorum_core::decomposition::AttemptEligibility {
+                eligible: true,
+                oversized_count: Some(2),
+                max_oversized_cx: Some(4),
+                total_children: Some(3),
+            }
+        );
+
+        // A single XL child disqualifies the plan.
+        let with_xl = [
+            classify("XL", 3, 0),
+            classify("L", 4, 1),
+            classify("M", 2, 2),
+        ];
+        let eligibility = attempt_eligibility_from_classified(
+            &three.iter().zip(with_xl.iter()).collect::<Vec<_>>(),
+        );
+        assert!(!eligibility.eligible);
+
+        // A non-size dimension (not-ready) disqualifies the plan.
+        let mut not_ready = classify("M", 2, 0);
+        not_ready.ready = false;
+        let sizes = [not_ready, classify("L", 4, 1), classify("M", 2, 2)];
+        let eligibility = attempt_eligibility_from_classified(
+            &three.iter().zip(sizes.iter()).collect::<Vec<_>>(),
+        );
+        assert!(!eligibility.eligible);
+
+        // A one-child plan is never eligible: the future fallback needs at
+        // least two children to be worth dispatching.
+        let single = proposal(&["a"]);
+        let sizes = [classify("L", 5, 0)];
+        let eligibility = attempt_eligibility_from_classified(
+            &single.iter().zip(sizes.iter()).collect::<Vec<_>>(),
+        );
+        assert!(!eligibility.eligible);
+        assert_eq!(eligibility.total_children, Some(1));
+
+        // Missing pairing (structural failure) — the wrapping helper returns
+        // None so the caller falls back to `structural()`.
+        let unmatched = vec![classify("L", 4, 99)];
+        assert!(
+            size_only_rejection_with_eligibility(&single, &unmatched).is_none(),
+            "unpaired classifications must not report eligibility"
+        );
+    }
+
     #[test]
     fn proposal_preclassification_rejection_rendering_survives_planner_retry_bounds() {
         let proposal = vec![planner::ProposedTask {
@@ -44709,6 +44917,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     "preclassifying",
                     "prior-semantic-rejection",
                     "proposal rejected by the prior binary",
+                    quorum_core::decomposition::AttemptEligibility::structural(),
                     5 + attempt * 2,
                 )
                 .unwrap());

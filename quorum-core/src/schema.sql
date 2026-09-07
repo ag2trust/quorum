@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 72). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 73). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- v53: authoritative nullable target branch. Resolved to the daemon-configured
     -- base before first execution; immutable once populated.
     target_branch TEXT,
-    -- v72: generated decomposition children are terminal implementation leaves.
+    -- v73: generated decomposition children are terminal implementation leaves.
     -- They may bypass the ordinary size dispatch policy, but can never plan children.
     terminal_leaf INTEGER NOT NULL DEFAULT 0,
     -- v56: nullable per-task rework ceiling. Stamped from the daemon's
@@ -241,6 +241,14 @@ CREATE TABLE IF NOT EXISTS decomposition_attempts (
     reason_code      TEXT NOT NULL,
     summary          TEXT NOT NULL,
     created_at       INTEGER NOT NULL,
+    -- v72 (observational, additive): per-attempt eligibility/rank the future
+    -- fewest-L best-attempt fallback reads. Populated on proposal rejections
+    -- only; NULL on every other attempt kind.
+    eligible         INTEGER,
+    oversized_count  INTEGER,
+    max_oversized_cx INTEGER,
+    total_children   INTEGER,
+    submission_id    TEXT,
     UNIQUE (graph_id, source_revision, kind, ordinal)
 );
 

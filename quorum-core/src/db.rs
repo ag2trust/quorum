@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 72;
+pub const SCHEMA_VERSION: i64 = 73;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1333,10 +1333,33 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 [],
             )?;
         }
-        // v72 marks generated decomposition children as terminal leaves. This is
+        // v72 = per-attempt decomposition-eligibility + fewest-L rank columns.
+        // Additive/observational; no backfill. `CREATE TABLE IF NOT EXISTS` in
+        // SCHEMA_SQL is a no-op for existing tables, so each column must be
+        // ALTERed in with a `column_exists` guard for idempotency.
+        for column in [
+            "eligible",
+            "oversized_count",
+            "max_oversized_cx",
+            "total_children",
+        ] {
+            if current < 72 && !column_exists(conn, "decomposition_attempts", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE decomposition_attempts ADD COLUMN {column} INTEGER"),
+                    [],
+                )?;
+            }
+        }
+        if current < 72 && !column_exists(conn, "decomposition_attempts", "submission_id")? {
+            conn.execute(
+                "ALTER TABLE decomposition_attempts ADD COLUMN submission_id TEXT",
+                [],
+            )?;
+        }
+        // v73 marks generated decomposition children as terminal leaves. This is
         // additive: historic tasks remain ordinary roots, while new materialized
         // children opt into the one-level decomposition boundary explicitly.
-        if current < 72 && !column_exists(conn, "tasks", "terminal_leaf")? {
+        if current < 73 && !column_exists(conn, "tasks", "terminal_leaf")? {
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN terminal_leaf INTEGER NOT NULL DEFAULT 0",
                 [],
@@ -1470,10 +1493,78 @@ mod tests {
         }
         assert!(column_exists(&c, "run_capabilities", "agent_run_id").unwrap());
         assert!(column_exists(&c, "daemon_lock", "instance_id").unwrap());
+        assert!(column_exists(&c, "tasks", "terminal_leaf").unwrap());
+        for column in [
+            "eligible",
+            "oversized_count",
+            "max_oversized_cx",
+            "total_children",
+            "submission_id",
+        ] {
+            assert!(
+                column_exists(&c, "decomposition_attempts", column).unwrap(),
+                "v72 column {column} must exist after two opens"
+            );
+        }
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// A v71 database (schema fixed at `PRAGMA user_version=71` before v72's
+    /// eligibility columns landed) migrates forward on open. The migration
+    /// must remain idempotent across a second open on the same file so a
+    /// mid-migration crash or a supervisor restart never re-ALTERs an already
+    /// migrated column.
+    #[test]
+    fn v71_to_v72_adds_nullable_eligibility_columns_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v71-eligibility.db");
+        // First open lands the shipped SCHEMA_VERSION; wind PRAGMA back to 71
+        // and drop the new columns so the v72 branch has to run.
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE decomposition_attempts DROP COLUMN eligible;
+                 ALTER TABLE decomposition_attempts DROP COLUMN oversized_count;
+                 ALTER TABLE decomposition_attempts DROP COLUMN max_oversized_cx;
+                 ALTER TABLE decomposition_attempts DROP COLUMN total_children;
+                 ALTER TABLE decomposition_attempts DROP COLUMN submission_id;
+                 PRAGMA user_version=71;",
+            )
+            .unwrap();
+        }
+        let migrated = open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        for column in [
+            "eligible",
+            "oversized_count",
+            "max_oversized_cx",
+            "total_children",
+            "submission_id",
+        ] {
+            assert!(column_exists(&migrated, "decomposition_attempts", column).unwrap());
+        }
+        // Second open must not re-ALTER (idempotent).
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        for column in [
+            "eligible",
+            "oversized_count",
+            "max_oversized_cx",
+            "total_children",
+            "submission_id",
+        ] {
+            assert!(column_exists(&reopened, "decomposition_attempts", column).unwrap());
+        }
     }
 
     #[test]
@@ -2014,9 +2105,9 @@ mod tests {
     }
 
     #[test]
-    fn v71_to_v72_adds_terminal_leaf_once_with_default_zero() {
+    fn v72_to_v73_adds_terminal_leaf_once_with_default_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v71-terminal-leaf.db");
+        let path = dir.path().join("v72-terminal-leaf.db");
         {
             let conn = open(&path).unwrap();
             conn.execute(
@@ -2030,7 +2121,7 @@ mod tests {
             let raw = Connection::open(&path).unwrap();
             raw.execute_batch(
                 "ALTER TABLE tasks DROP COLUMN terminal_leaf;
-                 PRAGMA user_version=71;",
+                 PRAGMA user_version=72;",
             )
             .unwrap();
             assert!(!column_exists(&raw, "tasks", "terminal_leaf").unwrap());
