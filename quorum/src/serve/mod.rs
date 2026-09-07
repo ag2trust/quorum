@@ -8543,6 +8543,7 @@ async fn resume_reviewer_after_ci(
             "review-cycle context changed before re-review feed for task #{task_id}"
         )));
     }
+    install_reviewer_rereview_pending_turn(&mut reviewers[reviewer_index], &rereview_turn);
     if let Err(error) = reviewers[reviewer_index]
         .live_process_mut()
         .map_err(|error| QuorumError::Io(format!("reviewer has no live process: {error}")))?
@@ -16554,9 +16555,23 @@ async fn feed_worker_turn(
         }
         Ok(())
     } else {
+        let recovered_startup = slot.pending_turn_kind == "recovered-rework";
+        if !recovered_startup && should_replace_pending_prompt(raw_prompt) {
+            slot.pending_prompt = raw_prompt.to_string();
+            slot.pending_turn_kind = if slot.pr.is_some() {
+                "rework".into()
+            } else {
+                "continuation".into()
+            };
+        }
         let turn = agent::user_turn(raw_prompt);
         slot.live_process_mut()?.feed_turn(&turn).await
     }
+}
+
+fn install_reviewer_rereview_pending_turn(slot: &mut SlotState, rereview_turn: &str) {
+    slot.pending_prompt = rereview_turn.to_string();
+    slot.pending_turn_kind = "rereview".into();
 }
 
 #[derive(Debug)]
@@ -27248,6 +27263,18 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_rereview_feed_updates_pending_fallback_turn() {
+        let mut slot = make_dummy_slot();
+        let rereview_turn = "Re-review the exact updated diff\nwith the current task contract.";
+
+        install_reviewer_rereview_pending_turn(&mut slot, rereview_turn);
+
+        let pending = reviewer_fallback_pending_turn(&slot);
+        assert_eq!(pending.prompt, rereview_turn);
+        assert_eq!(pending.turn_kind, "rereview");
+    }
+
+    #[test]
     fn worker_fallback_retains_exact_rework_turn_but_not_cross_provider_continuation() {
         let mut slot = make_dummy_slot();
         slot.model = "claude-sonnet-4-6".into();
@@ -27286,6 +27313,22 @@ mod tests {
         assert_eq!(alternate.model, "gpt-5.6-terra");
         // PendingManagedTurn intentionally has no continuation field: the
         // fallback launch must start a fresh provider session.
+    }
+
+    #[tokio::test]
+    async fn persistent_worker_rework_feed_updates_pending_fallback_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = make_live_pre_review_ci_slot(42, dir.path().join("worktree")).await;
+        let config = pre_review_ci_test_config(dir.path().join("quorum.db"), dir.path().into());
+        let rework_turn = "Fix the exact current reviewer finding.";
+
+        feed_worker_turn(&mut slot, rework_turn, &config)
+            .await
+            .unwrap();
+        let pending = worker_fallback_pending_turn(&slot);
+        assert_eq!(pending.prompt, rework_turn);
+        assert_eq!(pending.turn_kind, "rework");
+        slot.kill_and_reap().await;
     }
 
     #[cfg(unix)]
