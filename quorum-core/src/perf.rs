@@ -2884,16 +2884,28 @@ fn classify_runner_ending(reason: &str) -> RunnerEnding {
         RunnerEnding::Normal
     } else if matches!(
         reason,
+        // These are literal failure teardown reasons written by the managed
+        // worker/reviewer paths. Keep this closed: an unfamiliar persisted
+        // reason must remain an explicit coverage gap below.
         "failed"
             | "crashed"
             | "agent_failed"
             | "idle_reaped"
+            | "idle"
+            | "killed"
             | "provider_blocked"
+            | "provision-failed"
             | "journal-handoff-failed"
             | "fallback-route-unavailable"
+            | "fallback_launch_failed"
             | "attachment-failed"
             | "graph-blocker"
             | "r2-spawn-error"
+            | "verdict:none"
+            | "daemon_push_failed"
+            | "daemon_push_rejected"
+            | "error_retries"
+            | "remediation_lease_unavailable"
     ) {
         RunnerEnding::Abnormal
     } else {
@@ -5283,6 +5295,51 @@ mod tests {
         assert_eq!(intent.abnormal_runner_ending_count, Some(1));
         assert!(intent.incident_count.is_none());
         assert!(!intent.coverage.incident);
+    }
+
+    #[test]
+    fn facts_no_verdict_reviewer_ending_is_abnormal_and_unknown_stays_a_gap() {
+        // The reviewer mailbox failure path durably closes its managed run
+        // with `verdict:none`. It is a known failure, unlike arbitrary future
+        // stored text, and both cases must remain distinguishable on SQLite.
+        let (_d, mut c) = open_tmp();
+        let task_id = seed_ordinary(&mut c, 1_600);
+        let reviewer_run = crate::agent_runs::insert_reviewer_with_launch(
+            &c,
+            task_id,
+            "reviewer",
+            "gpt-review",
+            "high",
+            "codex",
+            None,
+            1_100,
+            None,
+            "reviewer-cap",
+            99,
+            &format!("{task_id:040x}"),
+        )
+        .unwrap()
+        .unwrap();
+        crate::agent_runs::close(&c, reviewer_run, 1_130, "verdict:none").unwrap();
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent = &report.intents[0];
+        assert_eq!(intent.abnormal_runner_ending_count, Some(1));
+        assert!(intent.coverage.abnormal_runner_ending);
+
+        c.execute(
+            "UPDATE agent_runs SET end_reason='future-unrecognized-reason' WHERE id=?1",
+            [reviewer_run],
+        )
+        .unwrap();
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent = &report.intents[0];
+        assert!(intent.abnormal_runner_ending_count.is_none());
+        assert!(!intent.coverage.abnormal_runner_ending);
     }
 
     #[test]
