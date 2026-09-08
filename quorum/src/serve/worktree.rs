@@ -37,6 +37,19 @@ pub enum DependencyBaseVerification {
     Missing { merge_commit_sha: String },
 }
 
+/// Result of verifying that an existing dependent branch already contains
+/// every done dependency's merge commit. Used at resume/replay to test
+/// dependency inclusion by ancestry instead of tip-equality with the
+/// (moving) base. `NotFound` means the branch has no local or remote head;
+/// the caller may then treat provisioning as a fresh cut from the verified
+/// base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchAncestryVerification {
+    Verified,
+    NotFound,
+    Missing { merge_commit_sha: String },
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PublicationRefReconcileResult {
     pub kept: usize,
@@ -761,6 +774,81 @@ impl WorktreeManager {
         }
 
         Ok(DependencyBaseVerification::Verified { base_sha })
+    }
+
+    /// Resolve `branch` (preferring the local ref, then `origin/<branch>`)
+    /// and verify every `merge_commits` entry is an ancestor of that head.
+    /// Base staleness is a merge-time concern, so at resume the correct test
+    /// is whether the branch itself already contains the dependency merges,
+    /// not whether its recorded provenance equals the current base tip.
+    pub async fn verify_branch_contains_commits(
+        &self,
+        repo_dir: &Path,
+        branch: &str,
+        merge_commits: &[String],
+    ) -> Result<BranchAncestryVerification, String> {
+        let _guard = self.lock.lock().await;
+        let head_sha = match self
+            .resolve_ref_unlocked(repo_dir, &format!("refs/heads/{branch}"))
+            .await?
+        {
+            Some(sha) => sha,
+            None => match self
+                .resolve_ref_unlocked(repo_dir, &format!("refs/remotes/origin/{branch}"))
+                .await?
+            {
+                Some(sha) => sha,
+                None => return Ok(BranchAncestryVerification::NotFound),
+            },
+        };
+        for merge_commit_sha in merge_commits {
+            let mut cmd = self.git_cmd(repo_dir);
+            cmd.args(["merge-base", "--is-ancestor", merge_commit_sha, &head_sha]);
+            let out = run_git(
+                cmd,
+                self.local_timeout,
+                "git verify branch dependency ancestry",
+            )
+            .await?;
+            if out.status.success() {
+                continue;
+            }
+            // Exit 1 = not an ancestor; 128 = object not in this repo (the
+            // dependency merge SHA was never fetched into the daemon clone).
+            // Either way the branch does not durably contain the dependency;
+            // the caller parks with the named commit rather than reusing it.
+            if matches!(out.status.code(), Some(1) | Some(128)) {
+                return Ok(BranchAncestryVerification::Missing {
+                    merge_commit_sha: merge_commit_sha.clone(),
+                });
+            }
+            return Err(format!(
+                "cannot verify dependency merge commit {merge_commit_sha} against {branch}@{head_sha}: {}",
+                git_diagnostic(&out.stderr)
+            ));
+        }
+        Ok(BranchAncestryVerification::Verified)
+    }
+
+    async fn resolve_ref_unlocked(
+        &self,
+        repo_dir: &Path,
+        reference: &str,
+    ) -> Result<Option<String>, String> {
+        let mut cmd = self.git_cmd(repo_dir);
+        cmd.args(["rev-parse", "--verify", reference]);
+        let out = run_git(cmd, self.local_timeout, "git rev-parse branch resolve").await?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let sha = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .to_ascii_lowercase();
+        if sha.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(sha))
+        }
     }
 
     /// Refresh and merge the configured base into an exact continuation PR
@@ -2055,6 +2143,148 @@ mod tests {
         )
         .status
         .success());
+    }
+
+    #[tokio::test]
+    async fn verify_branch_contains_commits_prefers_local_head() {
+        // A resumed dependent branch is authoritative in the daemon clone
+        // (that is what `provision()` reuses). Local head must be checked
+        // before falling back to `origin/<branch>` — otherwise the ancestry
+        // test would read a stale remote view of the same branch.
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("worker");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let dep_commit = {
+            let d = source.to_string_lossy().to_string();
+            assert!(StdCommand::new("git")
+                .args(["-C", &d, "commit", "--allow-empty", "-m", "dep"])
+                .status()
+                .unwrap()
+                .success());
+            let sha = git_rev_parse(&source, "HEAD");
+            assert!(StdCommand::new("git")
+                .args(["-C", &d, "push", "origin", "main"])
+                .status()
+                .unwrap()
+                .success());
+            sha
+        };
+        // Advance origin/main with an unrelated commit AFTER cutting the
+        // child branch, so the branch's provenance no longer equals the
+        // current base tip but ancestry to the dep is preserved.
+        let w = worker.to_string_lossy().to_string();
+        assert!(StdCommand::new("git")
+            .args(["-C", &w, "fetch", "-q", "origin"])
+            .status()
+            .unwrap()
+            .success());
+        let branch = "daemon/child-t7";
+        assert!(StdCommand::new("git")
+            .args(["-C", &w, "checkout", "-q", "-b", branch, "origin/main"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &w, "checkout", "-q", "main"])
+            .status()
+            .unwrap()
+            .success());
+        {
+            let d = source.to_string_lossy().to_string();
+            assert!(StdCommand::new("git")
+                .args(["-C", &d, "commit", "--allow-empty", "-m", "unrelated"])
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["-C", &d, "push", "origin", "main"])
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let mgr = WorktreeManager::new();
+        let outcome = mgr
+            .verify_branch_contains_commits(&worker, branch, std::slice::from_ref(&dep_commit))
+            .await
+            .unwrap();
+        assert_eq!(outcome, BranchAncestryVerification::Verified);
+    }
+
+    #[tokio::test]
+    async fn verify_branch_contains_commits_reports_missing() {
+        // A branch cut BEFORE the dependency merge cannot contain it. The
+        // helper must name the missing merge commit so the caller can park
+        // with a diagnostic that points to the exact dependency.
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("worker");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let w = worker.to_string_lossy().to_string();
+        let branch = "daemon/stale-child-t8";
+        assert!(StdCommand::new("git")
+            .args(["-C", &w, "checkout", "-q", "-b", branch])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &w, "checkout", "-q", "main"])
+            .status()
+            .unwrap()
+            .success());
+        // Introduce and push the dep merge only AFTER the stale branch is
+        // cut. The child never fetched or descended from it.
+        let d = source.to_string_lossy().to_string();
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "dep"])
+            .status()
+            .unwrap()
+            .success());
+        let dep_commit = git_rev_parse(&source, "HEAD");
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "push", "origin", "main"])
+            .status()
+            .unwrap()
+            .success());
+
+        let mgr = WorktreeManager::new();
+        let outcome = mgr
+            .verify_branch_contains_commits(&worker, branch, std::slice::from_ref(&dep_commit))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            BranchAncestryVerification::Missing {
+                merge_commit_sha: dep_commit,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_branch_contains_commits_reports_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("worker");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let mgr = WorktreeManager::new();
+        let outcome = mgr
+            .verify_branch_contains_commits(&worker, "daemon/gone-t9", &["0".repeat(40)])
+            .await
+            .unwrap();
+        assert_eq!(outcome, BranchAncestryVerification::NotFound);
     }
 
     #[tokio::test]
