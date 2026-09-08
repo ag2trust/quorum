@@ -533,36 +533,59 @@ impl InclusionReason {
     }
 }
 
-struct CandidateRow {
-    id: i64,
-    review_only: i64,
-}
-
-/// Load terminal candidate rows in a bounded, deterministic order. Ordering by
-/// `id` keeps repeated runs stable and keeps allocations bounded via LIMIT.
-fn load_facts_candidates(
+/// Load bounded ordinary (`review_only = 0`) implementation intent ids in a
+/// deterministic order. Filtering at the SQL layer keeps the sentinel LIMIT
+/// dedicated to intent capacity — review-only rows can never squeeze ordinary
+/// tasks out of the returned set.
+fn load_ordinary_intent_ids(
     conn: &Connection,
     since: Option<i64>,
     limit: usize,
-) -> Result<Vec<CandidateRow>> {
+) -> Result<Vec<i64>> {
     let since_val = since.unwrap_or(0);
     let mut stmt = conn.prepare(
-        "SELECT id, review_only \
+        "SELECT id \
          FROM tasks \
          WHERE status IN ('done','failed','cancelled') \
            AND updated_at >= ?1 \
+           AND review_only = 0 \
          ORDER BY id ASC \
          LIMIT ?2",
     )?;
     let rows = stmt
-        .query_map(rusqlite::params![since_val, limit as i64], |r| {
-            Ok(CandidateRow {
-                id: r.get(0)?,
-                review_only: r.get(1)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .query_map(rusqlite::params![since_val, limit as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
     Ok(rows)
+}
+
+/// Aggregate counts over the terminal cohort partitioned by `review_only`.
+/// One bounded query, one row read — no per-row allocation.
+struct CandidateCounts {
+    ordinary: i64,
+    review_only: i64,
+}
+
+fn count_candidates(conn: &Connection, since: Option<i64>) -> Result<CandidateCounts> {
+    let since_val = since.unwrap_or(0);
+    let (ordinary, review_only) = conn.query_row(
+        "SELECT \
+             SUM(CASE WHEN review_only = 0 THEN 1 ELSE 0 END), \
+             SUM(CASE WHEN review_only = 1 THEN 1 ELSE 0 END) \
+         FROM tasks \
+         WHERE status IN ('done','failed','cancelled') \
+           AND updated_at >= ?1",
+        rusqlite::params![since_val],
+        |r| {
+            Ok((
+                r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            ))
+        },
+    )?;
+    Ok(CandidateCounts {
+        ordinary,
+        review_only,
+    })
 }
 
 fn new_intent_facts(task_id: i64, reason: InclusionReason) -> IntentFacts {
@@ -614,10 +637,17 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         max_contributing_tasks_per_intent: MAX_CONTRIBUTING_TASKS_PER_INTENT,
     };
 
-    // Cap the candidate load at MAX_INTENTS + 1 so truncation is detectable
-    // without loading unbounded rows.
-    let candidates = load_facts_candidates(conn, since, MAX_INTENTS + 1)?;
-    let candidate_count = candidates.len() as i64;
+    // Bounded aggregate counts over the whole cohort (one row read) — used
+    // to compute candidate/excluded accounting without unbounded allocation.
+    let counts = count_candidates(conn, since)?;
+    let candidate_count = counts.ordinary + counts.review_only;
+
+    // Bounded fetch of ordinary intents only: LIMIT is dedicated to intent
+    // capacity so review-only rows can never displace ordinary tasks near
+    // the sentinel. The +1 sentinel lets us detect truncation without loading
+    // an unbounded row set.
+    let ordinary_ids = load_ordinary_intent_ids(conn, since, MAX_INTENTS + 1)?;
+    let truncated = ordinary_ids.len() > MAX_INTENTS;
 
     let base_reason = if include_all {
         InclusionReason::EligibleIncludeAll
@@ -625,27 +655,28 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         InclusionReason::EligibleTerminal
     };
 
-    let mut intents: Vec<IntentFacts> = Vec::new();
+    let mut intents: Vec<IntentFacts> = Vec::with_capacity(ordinary_ids.len().min(MAX_INTENTS));
+    for id in ordinary_ids.iter().take(MAX_INTENTS).copied() {
+        intents.push(new_intent_facts(id, base_reason));
+    }
+
     let mut excluded_reasons: BTreeMap<String, i64> = BTreeMap::new();
-
-    for cand in candidates {
-        // Truncation guard: additional candidates beyond MAX_INTENTS are
-        // tallied under excluded-truncated rather than materialized.
-        if intents.len() >= MAX_INTENTS {
-            *excluded_reasons
-                .entry(InclusionReason::ExcludedTruncated.as_str().to_string())
-                .or_insert(0) += 1;
-            continue;
+    if counts.review_only > 0 {
+        excluded_reasons.insert(
+            InclusionReason::ExcludedReviewOnly.as_str().to_string(),
+            counts.review_only,
+        );
+    }
+    if truncated {
+        // Bounded aggregate lets us report the exact truncated excess without
+        // loading the overflow tail.
+        let overflow = (counts.ordinary - MAX_INTENTS as i64).max(0);
+        if overflow > 0 {
+            excluded_reasons.insert(
+                InclusionReason::ExcludedTruncated.as_str().to_string(),
+                overflow,
+            );
         }
-
-        if cand.review_only != 0 {
-            *excluded_reasons
-                .entry(InclusionReason::ExcludedReviewOnly.as_str().to_string())
-                .or_insert(0) += 1;
-            continue;
-        }
-
-        intents.push(new_intent_facts(cand.id, base_reason));
     }
 
     let included_count = intents.len() as i64;
@@ -1569,6 +1600,60 @@ mod tests {
             r.intents.len() <= MAX_INTENTS,
             "returned intents must not exceed MAX_INTENTS"
         );
+    }
+
+    /// Regression: review-only rows earlier in id order must never consume
+    /// the bounded intent scan and silently omit later ordinary tasks. Prior
+    /// implementation LIMIT'd on the raw terminal set before filtering
+    /// review_only in memory, which could displace ordinary tasks near the
+    /// sentinel. Exercised at the SQL level with a small explicit limit so
+    /// the ordering pathology is directly observable without a
+    /// MAX_INTENTS-sized fixture.
+    #[test]
+    fn facts_overflow_ordering_review_only_does_not_displace_ordinary() {
+        let (_d, mut c) = open_tmp();
+        // Five review-only rows with the lowest ids — under a raw-terminal
+        // ORDER BY id LIMIT 3, these would fill the scan and hide the
+        // ordinary rows entirely.
+        let r1 = seed_review_only(&mut c, 1601);
+        let r2 = seed_review_only(&mut c, 1602);
+        let r3 = seed_review_only(&mut c, 1603);
+        let r4 = seed_review_only(&mut c, 1604);
+        let r5 = seed_review_only(&mut c, 1605);
+        // Three ordinary rows follow.
+        let o1 = seed_ordinary(&mut c, 1700);
+        let o2 = seed_ordinary(&mut c, 1701);
+        let o3 = seed_ordinary(&mut c, 1702);
+        assert!(
+            r5 < o1,
+            "seed order must place review-only ids before ordinary"
+        );
+
+        // Direct SQL guard: fetching ordinary intents with a sentinel of 3
+        // must return exactly the three ordinary ids, in stable order.
+        let ids = load_ordinary_intent_ids(&c, None, 3).unwrap();
+        assert_eq!(ids, vec![o1, o2, o3]);
+
+        // End-to-end accounting: candidate = 5 + 3, all three ordinary rows
+        // are included, review-only rows are tallied by reason code.
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.counts.candidate, 8);
+        assert_eq!(r.counts.included, 3);
+        assert_eq!(r.counts.excluded, 5);
+        assert_eq!(
+            r.excluded_reasons.get("excluded-review-only").copied(),
+            Some(5)
+        );
+        // No spurious truncated tally when we are well under MAX_INTENTS.
+        assert!(!r.excluded_reasons.contains_key("excluded-truncated"));
+        let included_ids: Vec<i64> = r
+            .intents
+            .iter()
+            .map(|i| i.contributing_task_ids[0])
+            .collect();
+        assert_eq!(included_ids, vec![o1, o2, o3]);
+        // Silence unused-binding warnings for the review-only ids.
+        let _ = (r1, r2, r3, r4);
     }
 
     #[test]
