@@ -562,6 +562,9 @@ pub enum Command {
         /// Emit JSON instead of a table.
         #[arg(long)]
         json: bool,
+        /// Emit the versioned read-only facts report (requires `--json`).
+        #[arg(long, requires = "json", conflicts_with = "by")]
+        facts: bool,
     },
     /// Classify tasks: assign complexity, size, readiness, readiness reason,
     /// and duplicate candidates. Primarily driven by the daemon; this command
