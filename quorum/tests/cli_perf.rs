@@ -64,8 +64,15 @@ fn perf_facts_json_emits_versioned_report_honors_all_and_does_not_write() {
         .success();
 
     let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
-    conn.execute("UPDATE tasks SET status = 'done' WHERE id = 1", [])
-        .unwrap();
+    conn.execute(
+        "UPDATE tasks \
+         SET status = 'done', \
+             completion_provenance = 'merged', \
+             refs = '{\"merge_commit_sha\":\"0123456789abcdef0123456789abcdef01234567\"}' \
+         WHERE id = 1",
+        [],
+    )
+    .unwrap();
     conn.execute(
         "UPDATE perf_watermark SET watermark = ?1 WHERE id = 1",
         [i64::MAX],

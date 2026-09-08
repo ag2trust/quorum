@@ -3,7 +3,9 @@
 //! Computes aggregate metrics from the `tasks` table (terminal tasks only: done, failed,
 //! cancelled). Model/effort resolved from `agent_runs` (earliest worker spawn per task),
 //! falling back to caller-supplied defaults for orphan tasks. Complexity derived from
-//! `complexity:*` labels.
+//! `complexity:*` labels. The separate facts surface below deliberately has a
+//! stricter, delivery-evidence-based inclusion policy; it does not affect the
+//! legacy aggregate report.
 
 use crate::db::map_sql_err;
 use crate::error::Result;
@@ -372,10 +374,9 @@ pub fn perf_with(
 
 // ── facts report scaffold (perf-facts-v1) ──────────────────────────────────
 //
-// Read-only fact surface siblings populate. Types declare every fact field up
-// front so lineage/terminal/enrichment tasks only fill in evidence and flip
-// coverage flags. A JSON null with a false coverage flag is distinguishable
-// from a measured zero.
+// Read-only fact surface. Types declare every fact field up front. A JSON null
+// with a false coverage flag is distinguishable from a measured zero or from a
+// fact that was deliberately found to be unavailable.
 
 pub const FACTS_VERSION: &str = "perf-facts-v1";
 
@@ -430,9 +431,9 @@ pub struct FieldCoverage {
     pub uncovered: i64,
 }
 
-/// One row per ordinary managed implementation task. Every evidence field is
-/// initialized to JSON null with the matching coverage flag false — enrichment
-/// siblings flip flags only when they successfully fill in real evidence.
+/// One row per managed intent. Inclusion is resolved exclusively from durable
+/// task, graph, and merge evidence; excluded candidates remain visible with a
+/// bounded reason code rather than disappearing from the report.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct IntentFacts {
     pub intent_id: String,
@@ -510,9 +511,14 @@ impl IntentCoverage {
 #[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "kebab-case")]
 pub enum InclusionReason {
-    EligibleTerminal,
-    EligibleIncludeAll,
+    IncludedVerifiedMerge,
+    IncludedIrrecoverableFailure,
+    ExcludedDuplicate,
+    ExcludedIntakeDeclined,
+    ExcludedHousekeepingCancellation,
     ExcludedReviewOnly,
+    ExcludedManualCompletion,
+    ExcludedUnknownDelivery,
     ExcludedPreWatermark,
     ExcludedTruncated,
     ExcludedNonTerminal,
@@ -520,13 +526,21 @@ pub enum InclusionReason {
 
 impl InclusionReason {
     pub fn is_included(&self) -> bool {
-        matches!(self, Self::EligibleTerminal | Self::EligibleIncludeAll)
+        matches!(
+            self,
+            Self::IncludedVerifiedMerge | Self::IncludedIrrecoverableFailure
+        )
     }
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::EligibleTerminal => "eligible-terminal",
-            Self::EligibleIncludeAll => "eligible-include-all",
+            Self::IncludedVerifiedMerge => "included-verified-merge",
+            Self::IncludedIrrecoverableFailure => "included-irrecoverable-failure",
+            Self::ExcludedDuplicate => "excluded-duplicate",
+            Self::ExcludedIntakeDeclined => "excluded-intake-declined",
+            Self::ExcludedHousekeepingCancellation => "excluded-housekeeping-cancellation",
             Self::ExcludedReviewOnly => "excluded-review-only",
+            Self::ExcludedManualCompletion => "excluded-manual-completion",
+            Self::ExcludedUnknownDelivery => "excluded-unknown-delivery",
             Self::ExcludedPreWatermark => "excluded-pre-watermark",
             Self::ExcludedTruncated => "excluded-truncated",
             Self::ExcludedNonTerminal => "excluded-non-terminal",
@@ -534,59 +548,58 @@ impl InclusionReason {
     }
 }
 
-/// Load bounded ordinary (`review_only = 0`) implementation intent ids in a
-/// deterministic order. Filtering at the SQL layer keeps the sentinel LIMIT
-/// dedicated to intent capacity — review-only rows can never squeeze ordinary
-/// tasks out of the returned set.
-fn load_ordinary_intent_ids(
+/// The durable fields used to resolve one facts candidate. Raw refs never
+/// leave this reader; they are inspected only through fixed, fail-closed
+/// predicates below.
+#[derive(Debug, Clone)]
+struct FactsTaskRow {
+    id: i64,
+    status: String,
+    review_only: bool,
+    completion_provenance: Option<String>,
+    refs: Option<String>,
+}
+
+/// Load bounded facts candidates in deterministic order. Unlike the legacy
+/// aggregate, facts must make nonterminal and review-only exclusions visible,
+/// so this intentionally reads every task status.
+fn load_facts_candidate_tasks(
     conn: &Connection,
     since: Option<i64>,
     limit: usize,
-) -> Result<Vec<i64>> {
+) -> Result<Vec<FactsTaskRow>> {
     let since_val = since.unwrap_or(0);
     let mut stmt = conn.prepare(
-        "SELECT id \
+        "SELECT id,status,review_only,completion_provenance,refs \
          FROM tasks \
-         WHERE status IN ('done','failed','cancelled') \
-           AND updated_at >= ?1 \
-           AND review_only = 0 \
+         WHERE updated_at >= ?1 \
          ORDER BY id ASC \
          LIMIT ?2",
     )?;
     let rows = stmt
-        .query_map(rusqlite::params![since_val, limit as i64], |r| r.get(0))?
-        .collect::<rusqlite::Result<Vec<i64>>>()?;
+        .query_map(rusqlite::params![since_val, limit as i64], |r| {
+            Ok(FactsTaskRow {
+                id: r.get(0)?,
+                status: r.get(1)?,
+                review_only: r.get::<_, i64>(2)? != 0,
+                completion_provenance: r.get(3)?,
+                refs: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
-/// Aggregate counts over the terminal cohort partitioned by `review_only`.
-/// One bounded query, one row read — no per-row allocation.
-struct CandidateCounts {
-    ordinary: i64,
-    review_only: i64,
-}
-
-fn count_candidates(conn: &Connection, since: Option<i64>) -> Result<CandidateCounts> {
+/// Exact raw candidate count. The returned rows are capped separately; any
+/// overflow is explicitly reported as `excluded-truncated`.
+fn count_candidates(conn: &Connection, since: Option<i64>) -> Result<i64> {
     let since_val = since.unwrap_or(0);
-    let (ordinary, review_only) = conn.query_row(
-        "SELECT \
-             SUM(CASE WHEN review_only = 0 THEN 1 ELSE 0 END), \
-             SUM(CASE WHEN review_only = 1 THEN 1 ELSE 0 END) \
-         FROM tasks \
-         WHERE status IN ('done','failed','cancelled') \
-           AND updated_at >= ?1",
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE updated_at >= ?1",
         rusqlite::params![since_val],
-        |r| {
-            Ok((
-                r.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-            ))
-        },
+        |r| r.get(0),
     )?;
-    Ok(CandidateCounts {
-        ordinary,
-        review_only,
-    })
+    Ok(count)
 }
 
 fn new_intent_facts(
@@ -619,6 +632,387 @@ fn new_intent_facts(
         review_quality: None,
         coverage: IntentCoverage::default(),
     }
+}
+
+#[derive(Debug)]
+struct ResolvedIntent {
+    reason: InclusionReason,
+    terminal_outcome: Option<String>,
+    terminal_evidence: Option<serde_json::Value>,
+    merge_provenance: Option<String>,
+}
+
+impl ResolvedIntent {
+    fn terminal(reason: InclusionReason, outcome: &str, rows: &[&FactsTaskRow]) -> Self {
+        Self {
+            reason,
+            terminal_outcome: Some(outcome.to_string()),
+            terminal_evidence: Some(terminal_evidence(rows, &[])),
+            merge_provenance: None,
+        }
+    }
+
+    fn nonterminal() -> Self {
+        Self::nonterminal_with_reason(InclusionReason::ExcludedNonTerminal)
+    }
+
+    fn nonterminal_with_reason(reason: InclusionReason) -> Self {
+        Self {
+            reason,
+            terminal_outcome: None,
+            terminal_evidence: None,
+            merge_provenance: None,
+        }
+    }
+}
+
+/// Extract a refs object only when it is a well-formed JSON object. A malformed
+/// or scalar retained value is unknown evidence, never a basis for a positive
+/// classification.
+fn refs_object(row: &FactsTaskRow) -> Option<serde_json::Map<String, serde_json::Value>> {
+    serde_json::from_str::<serde_json::Value>(row.refs.as_deref()?)
+        .ok()?
+        .as_object()
+        .cloned()
+}
+
+/// A daemon merge identifier is intentionally not reader-validated as a
+/// hexadecimal Git SHA: the lifecycle writer accepts any non-empty, NUL-free
+/// immutable identifier for enterprise and test providers too.
+fn valid_merge_identifier(identifier: &str) -> bool {
+    !identifier.is_empty() && !identifier.contains('\0')
+}
+
+fn valid_merge_commit_sha(row: &FactsTaskRow) -> Option<String> {
+    if row.status != "done" || row.completion_provenance.as_deref() != Some("merged") {
+        return None;
+    }
+    let value = refs_object(row)?;
+    let sha = value.get("merge_commit_sha")?.as_str()?;
+    // Match the daemon writer's persisted contract: GitHub normally supplies
+    // a hexadecimal SHA, but the lifecycle primitive intentionally accepts
+    // any non-empty, NUL-free immutable merge identifier (including test and
+    // enterprise-provider identifiers). Do not invent a stricter reader-only
+    // format that would discard a valid daemon completion.
+    valid_merge_identifier(sha).then(|| sha.to_string())
+}
+
+fn has_duplicate_cancellation_evidence(row: &FactsTaskRow) -> bool {
+    row.status == "cancelled"
+        && refs_object(row)
+            .and_then(|refs| refs.get("cx_dup_of").cloned())
+            .and_then(|value| value.as_array().cloned())
+            .is_some_and(|ids| {
+                !ids.is_empty() && ids.iter().all(|id| id.as_i64().is_some_and(|id| id > 0))
+            })
+}
+
+fn has_intake_decline_cancellation_evidence(row: &FactsTaskRow) -> bool {
+    if row.status != "cancelled" {
+        return false;
+    }
+    let Some(refs) = refs_object(row) else {
+        return false;
+    };
+    refs.get("cx_ready").and_then(serde_json::Value::as_bool) == Some(false)
+        && refs
+            .get("cx_not_ready_reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reason| !reason.trim().is_empty() && !reason.contains('\0'))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkDisposition {
+    NotParked,
+    Retryable,
+    DeliveryUnknown,
+    Malformed,
+}
+
+/// This mirrors the durable portion of `task-retry` admission without making
+/// a lifecycle decision. A parked row with a supported resume target remains
+/// active work for facts purposes; a merged-PR park is not credited because it
+/// lacks daemon-owned merged completion and a merge commit witness.
+fn parked_disposition(row: &FactsTaskRow) -> ParkDisposition {
+    if row.status != "failed" {
+        return ParkDisposition::NotParked;
+    }
+    let Some(refs) = refs_object(row) else {
+        return ParkDisposition::NotParked;
+    };
+    // `task-retry` uses SQLite `json_extract(...)=1`, which admits the
+    // retained JSON numeric representation as well as JSON true. Mirror that
+    // exact lifecycle-compatible truth set; a string such as "1" remains
+    // malformed evidence and cannot grant a continuation here.
+    let parked = refs
+        .get("daemon_parked")
+        .is_some_and(|value| value.as_bool() == Some(true) || value.as_f64() == Some(1.0));
+    if !parked {
+        return ParkDisposition::NotParked;
+    }
+    if refs
+        .get("daemon_publication_failure_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("pr-merged")
+    {
+        return ParkDisposition::DeliveryUnknown;
+    }
+    match refs
+        .get("daemon_resume_status")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("open" | "working" | "rework" | "in-review" | "merging") => ParkDisposition::Retryable,
+        _ => ParkDisposition::Malformed,
+    }
+}
+
+fn has_requested_continuation(row: &FactsTaskRow) -> bool {
+    let Some(refs) = refs_object(row) else {
+        return false;
+    };
+    // `runner_retry` is canonical when present; its neutral requested=false
+    // state must suppress stale legacy Codex bits. Reuse the daemon's shared
+    // compatibility predicate rather than OR-ing the two representations.
+    crate::runner_state::retry_requested(&serde_json::Value::Object(refs.clone()))
+        // Both daemon remediation markers are admitted only from `rework`.
+        // In particular, `rework_approved_merge` can retain its marker after
+        // the lifecycle turns a merge conflict at the rework cap into
+        // `failed`; that stale retained fact is not an available recovery.
+        || (row.status == "rework"
+            && (refs
+                .get("daemon_rework_retry_requested")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                || refs
+                    .get("ci_remediation_requested")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)))
+}
+
+/// A cancelled dependency makes every parked retry/continuation path
+/// unsatisfiable. Reuse the lifecycle's exact guard under the facts snapshot
+/// rather than approximating its JSON dependency traversal here.
+fn load_unsatisfiable_parked_task_ids(
+    conn: &Connection,
+    candidate_tasks: &[FactsTaskRow],
+) -> Result<HashSet<i64>> {
+    let mut unsatisfiable = HashSet::new();
+    for row in candidate_tasks {
+        if parked_disposition(row) == ParkDisposition::Retryable
+            && !crate::tasks::cancelled_dep_ids(conn, row.id)?.is_empty()
+        {
+            unsatisfiable.insert(row.id);
+        }
+    }
+    Ok(unsatisfiable)
+}
+
+fn has_supported_recovery(
+    row: &FactsTaskRow,
+    recoverable_graph_task_ids: &HashSet<i64>,
+    unsatisfiable_parked_task_ids: &HashSet<i64>,
+) -> bool {
+    !unsatisfiable_parked_task_ids.contains(&row.id)
+        && (recoverable_graph_task_ids.contains(&row.id)
+            || has_requested_continuation(row)
+            || parked_disposition(row) == ParkDisposition::Retryable)
+}
+
+fn terminal_evidence(rows: &[&FactsTaskRow], merge_commit_shas: &[String]) -> serde_json::Value {
+    let tasks: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "task_id": row.id,
+                "status": row.status,
+                "completion_provenance": row.completion_provenance,
+            })
+        })
+        .collect();
+    let mut evidence = serde_json::json!({ "tasks": tasks });
+    if !merge_commit_shas.is_empty() {
+        evidence["merge_commit_shas"] = serde_json::json!(merge_commit_shas);
+    }
+    evidence
+}
+
+/// Preserve a terminal status only when every collapsed row agrees. A graph
+/// intent with mixed terminal statuses is durable but ambiguous, so facts must
+/// retain `unknown` rather than borrowing an outcome from an arbitrary row.
+fn shared_terminal_outcome(rows: &[&FactsTaskRow]) -> String {
+    let Some(outcome) = rows.first().map(|row| row.status.as_str()) else {
+        return "unknown".to_string();
+    };
+    if matches!(outcome, "done" | "failed" | "cancelled")
+        && rows.iter().all(|row| row.status == outcome)
+    {
+        outcome.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Return only merge witnesses that the immutable explicit-adoption ledger
+/// has already correlated to both sides of a one-to-one recovery pair. The
+/// nested task ref alone is deliberately insufficient: `build_lineage_snapshot`
+/// populated these pairs only after validating accepted graph membership,
+/// daemon-owned merged completions, and the matching ledger entry.
+fn recovery_merge_witnesses(lineage: &LineageSnapshot) -> HashMap<i64, String> {
+    let mut witnesses = HashMap::new();
+    for pairs in lineage.original_to_recoveries.values() {
+        let [pair] = pairs.as_slice() else {
+            continue;
+        };
+        let Some(merged_head_sha) = pair
+            .merged_head_sha
+            .as_deref()
+            .filter(|sha| valid_merge_identifier(sha))
+        else {
+            continue;
+        };
+        // The one durable delivery belongs to the adopted original and the
+        // completed recovery task; both collapse into the same intent.
+        witnesses.insert(pair.original_task_id, merged_head_sha.to_string());
+        witnesses.insert(pair.recovery_task_id, merged_head_sha.to_string());
+    }
+    witnesses
+}
+
+fn verified_merge_witness(
+    row: &FactsTaskRow,
+    recovery_merge_witnesses: &HashMap<i64, String>,
+) -> Option<String> {
+    valid_merge_commit_sha(row).or_else(|| recovery_merge_witnesses.get(&row.id).cloned())
+}
+
+fn dedup_merge_witnesses(witnesses: Vec<String>) -> Vec<String> {
+    let mut distinct = Vec::with_capacity(witnesses.len());
+    for witness in witnesses {
+        if !distinct.contains(&witness) {
+            distinct.push(witness);
+        }
+    }
+    distinct
+}
+
+/// Resolve one collapsed intent from bounded, durable state only. The order is
+/// intentional: exclusions that establish non-delivery take precedence over a
+/// terminal-looking status, and ambiguous evidence is never promoted to a
+/// delivered or failed result.
+fn resolve_intent(
+    rows: &[&FactsTaskRow],
+    recoverable_graph_task_ids: &HashSet<i64>,
+    unsatisfiable_parked_task_ids: &HashSet<i64>,
+    completed_graph_source_task_ids: &HashSet<i64>,
+    recovery_merge_witnesses: &HashMap<i64, String>,
+) -> ResolvedIntent {
+    debug_assert!(!rows.is_empty());
+
+    if rows.iter().any(|row| row.review_only) {
+        if rows.iter().any(|row| {
+            !matches!(row.status.as_str(), "done" | "failed" | "cancelled")
+                || has_supported_recovery(
+                    row,
+                    recoverable_graph_task_ids,
+                    unsatisfiable_parked_task_ids,
+                )
+        }) {
+            return ResolvedIntent::nonterminal_with_reason(InclusionReason::ExcludedReviewOnly);
+        }
+        return ResolvedIntent::terminal(
+            InclusionReason::ExcludedReviewOnly,
+            &shared_terminal_outcome(rows),
+            rows,
+        );
+    }
+    if rows
+        .iter()
+        .any(|row| has_duplicate_cancellation_evidence(row))
+    {
+        return ResolvedIntent::terminal(InclusionReason::ExcludedDuplicate, "cancelled", rows);
+    }
+    if rows
+        .iter()
+        .any(|row| has_intake_decline_cancellation_evidence(row))
+    {
+        return ResolvedIntent::terminal(
+            InclusionReason::ExcludedIntakeDeclined,
+            "cancelled",
+            rows,
+        );
+    }
+    if rows.iter().any(|row| row.status == "cancelled") {
+        return ResolvedIntent::terminal(
+            InclusionReason::ExcludedHousekeepingCancellation,
+            "cancelled",
+            rows,
+        );
+    }
+    if rows
+        .iter()
+        .any(|row| row.completion_provenance.as_deref() == Some("manual"))
+    {
+        return ResolvedIntent::terminal(InclusionReason::ExcludedManualCompletion, "done", rows);
+    }
+    if rows.iter().any(|row| {
+        !matches!(row.status.as_str(), "done" | "failed")
+            || has_supported_recovery(
+                row,
+                recoverable_graph_task_ids,
+                unsatisfiable_parked_task_ids,
+            )
+    }) {
+        return ResolvedIntent::nonterminal();
+    }
+    if rows.iter().any(|row| {
+        matches!(
+            parked_disposition(row),
+            ParkDisposition::DeliveryUnknown | ParkDisposition::Malformed
+        )
+    }) {
+        return ResolvedIntent::terminal(InclusionReason::ExcludedUnknownDelivery, "unknown", rows);
+    }
+    // A merged-completion marker on anything other than a done row is
+    // contradictory retained evidence. It cannot establish either delivery or
+    // failure, so preserve the ambiguity rather than guessing from status.
+    if rows
+        .iter()
+        .any(|row| row.status != "done" && row.completion_provenance.as_deref() == Some("merged"))
+    {
+        return ResolvedIntent::terminal(InclusionReason::ExcludedUnknownDelivery, "unknown", rows);
+    }
+    if rows.iter().any(|row| row.status == "failed") {
+        return ResolvedIntent::terminal(
+            InclusionReason::IncludedIrrecoverableFailure,
+            "failed",
+            rows,
+        );
+    }
+
+    let merge_commit_shas: Option<Vec<String>> = rows
+        .iter()
+        .filter(|row| {
+            // A completed decomposition source is a daemon-owned aggregate,
+            // not a delivery-bearing task. Its `done` status is the durable
+            // graph-completion witness; each accepted child still needs its
+            // own merged completion and merge identifier below.
+            !(completed_graph_source_task_ids.contains(&row.id)
+                && row.status == "done"
+                && row.completion_provenance.is_none())
+        })
+        .map(|row| verified_merge_witness(row, recovery_merge_witnesses))
+        .collect::<Option<Vec<_>>>()
+        .map(dedup_merge_witnesses);
+    if let Some(merge_commit_shas) = merge_commit_shas.filter(|shas| !shas.is_empty()) {
+        return ResolvedIntent {
+            reason: InclusionReason::IncludedVerifiedMerge,
+            terminal_outcome: Some("done".to_string()),
+            terminal_evidence: Some(terminal_evidence(rows, &merge_commit_shas)),
+            merge_provenance: Some("merged".to_string()),
+        };
+    }
+
+    ResolvedIntent::terminal(InclusionReason::ExcludedUnknownDelivery, "unknown", rows)
 }
 
 /// Membership row: a task_id that is a generated child of a source task
@@ -902,6 +1296,76 @@ fn build_lineage_snapshot(conn: &Connection, cohort_ids: &[i64]) -> Result<Linea
     })
 }
 
+/// Find candidate tasks with a durable graph continuation path. Active and
+/// blocked graphs are live by their `active` sentinel. A held, pre-
+/// materialization source is also nonterminal only when it passes the exact
+/// bounded `task-retry` eligibility check; other held graphs stay terminal.
+fn load_recoverable_graph_task_ids(
+    conn: &Connection,
+    task_ids: &[i64],
+    now: i64,
+) -> Result<HashSet<i64>> {
+    let mut recoverable = HashSet::new();
+    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
+        let placeholders = sql_placeholders(batch.len());
+        let sql = format!(
+            "SELECT m.task_id \
+             FROM task_graph_members m \
+             JOIN task_decompositions d ON d.id=m.graph_id \
+             WHERE m.task_id IN ({placeholders}) \
+               AND m.active=1 AND d.active=1 \
+             UNION \
+             SELECT d.source_task_id \
+             FROM task_decompositions d \
+             WHERE d.source_task_id IN ({placeholders}) AND d.active=1 \
+             LIMIT ?"
+        );
+        let mut params = batch.to_vec();
+        params.extend_from_slice(batch);
+        params.push(batch.len().saturating_mul(2) as i64);
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(params), |row| row.get::<_, i64>(0))?;
+        recoverable.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+    }
+    // Reuse the lifecycle predicate rather than approximating its hold code,
+    // attempt-history, and retry-budget evidence in this read-only report.
+    // The facts cohort is capped, and the predicate itself examines one graph
+    // with bounded attempt history, so this remains a bounded scan.
+    for &task_id in task_ids {
+        if crate::decomposition::exhausted_planning_retry_is_eligible(conn, task_id, now)? {
+            recoverable.insert(task_id);
+        }
+    }
+    Ok(recoverable)
+}
+
+/// A completed graph source is a durable aggregate completion, not an
+/// independent merge. Restrict this exception to sources with accepted live
+/// membership so a retained `done` row never becomes delivery evidence alone.
+fn load_completed_graph_source_task_ids(
+    conn: &Connection,
+    task_ids: &[i64],
+) -> Result<HashSet<i64>> {
+    let mut completed = HashSet::new();
+    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
+        let placeholders = sql_placeholders(batch.len());
+        let sql = format!(
+            "SELECT d.source_task_id \
+             FROM task_decompositions d \
+             WHERE d.source_task_id IN ({placeholders}) \
+               AND d.state='completed' AND d.active=0 AND d.freeze_active=0 \
+               AND EXISTS (SELECT 1 FROM task_graph_members m \
+                           WHERE m.graph_id=d.id AND m.active=1 \
+                             AND m.plan_revision=d.accepted_plan_revision)"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows =
+            statement.query_map(params_from_iter(batch.iter()), |row| row.get::<_, i64>(0))?;
+        completed.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+    }
+    Ok(completed)
+}
+
 /// Walk (recovery → original) then (child → source) until we reach a task
 /// that is neither a recovery target nor a graph child. Cycle-guarded with
 /// a bounded step count so a pathological refs blob cannot spin forever.
@@ -923,6 +1387,25 @@ fn canonical_root(task_id: i64, lineage: &LineageSnapshot) -> i64 {
         break;
     }
     current
+}
+
+/// A completed graph aggregate can establish delivery only after every
+/// accepted child is present in the bounded facts cohort. The lineage scan
+/// reads this small, daemon-capped member set even when one child lies just
+/// beyond the raw task cap, so never infer that the in-cap subset is complete.
+fn completed_graph_has_omitted_member(
+    root: i64,
+    cohort_tasks: &HashMap<i64, FactsTaskRow>,
+    lineage: &LineageSnapshot,
+) -> bool {
+    lineage
+        .source_to_children
+        .get(&root)
+        .is_some_and(|children| {
+            children
+                .iter()
+                .any(|child| !cohort_tasks.contains_key(&child.task_id))
+        })
 }
 
 /// Build the JSON evidence blob for a collapsed intent's lineage. `members`
@@ -1026,32 +1509,49 @@ fn build_lineage_evidence(
 /// same database state.
 struct CohortSnapshot {
     watermark: Option<i64>,
-    counts: CandidateCounts,
-    ordinary_ids: Vec<i64>,
+    candidate_count: i64,
+    candidate_tasks: Vec<FactsTaskRow>,
     lineage: LineageSnapshot,
+    recoverable_graph_task_ids: HashSet<i64>,
+    unsatisfiable_parked_task_ids: HashSet<i64>,
+    completed_graph_source_task_ids: HashSet<i64>,
 }
 
-/// Take the watermark, aggregate counts, and bounded ordinary-id scan under
+/// Take the watermark, aggregate counts, and bounded candidate scan under
 /// a single WAL read snapshot so their totals are internally consistent —
 /// even if a daemon lifecycle write commits between conceptual steps. If the
 /// caller already owns a transaction, its existing snapshot is reused
 /// instead of nesting a second.
 fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSnapshot> {
+    let now = crate::clock::now();
     let read = |c: &Connection| -> Result<CohortSnapshot> {
         let watermark = read_watermark(c)?;
         let since = if include_all { None } else { watermark };
         // First SELECT establishes the snapshot; subsequent reads see it.
-        let counts = count_candidates(c, since)?;
-        let ordinary_ids = load_ordinary_intent_ids(c, since, MAX_INTENTS + 1)?;
+        let candidate_count = count_candidates(c, since)?;
+        let candidate_tasks = load_facts_candidate_tasks(c, since, MAX_INTENTS + 1)?;
         // The sentinel row detects truncation but is not part of the facts
         // cohort, so lineage reads never expand beyond MAX_INTENTS ids.
-        let lineage =
-            build_lineage_snapshot(c, &ordinary_ids[..ordinary_ids.len().min(MAX_INTENTS)])?;
+        let capped_ids: Vec<i64> = candidate_tasks
+            .iter()
+            .take(MAX_INTENTS)
+            .map(|task| task.id)
+            .collect();
+        let lineage = build_lineage_snapshot(c, &capped_ids)?;
+        let recoverable_graph_task_ids = load_recoverable_graph_task_ids(c, &capped_ids, now)?;
+        let unsatisfiable_parked_task_ids = load_unsatisfiable_parked_task_ids(
+            c,
+            &candidate_tasks[..candidate_tasks.len().min(MAX_INTENTS)],
+        )?;
+        let completed_graph_source_task_ids = load_completed_graph_source_task_ids(c, &capped_ids)?;
         Ok(CohortSnapshot {
             watermark,
-            counts,
-            ordinary_ids,
+            candidate_count,
+            candidate_tasks,
             lineage,
+            recoverable_graph_task_ids,
+            unsatisfiable_parked_task_ids,
+            completed_graph_source_task_ids,
         })
     };
     if !conn.is_autocommit() {
@@ -1064,10 +1564,10 @@ fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSn
 }
 
 /// Read-only facts surface for `quorum perf`. Returns a deterministic,
-/// bounded `FactsReport` with one intent per ordinary managed implementation
-/// task in the cohort. All evidence fields are initialized to JSON null; the
-/// per-field coverage flags stay false until enrichment siblings populate
-/// them.
+/// bounded `FactsReport` with one resolved intent per candidate lineage. A
+/// terminal task is included only for a daemon-owned merged completion with a
+/// valid merge commit witness, or for a durable, irrecoverable failure. Every
+/// other candidate remains visible as an excluded intent with a bounded code.
 ///
 /// Cohort selection is prospective by default via `perf_watermark`;
 /// `include_all` bypasses that boundary. All DB reads happen inside one
@@ -1081,9 +1581,12 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
     let snap = read_cohort_snapshot(conn, include_all)?;
     let CohortSnapshot {
         watermark,
-        counts,
-        ordinary_ids,
+        candidate_count,
+        candidate_tasks,
         lineage,
+        recoverable_graph_task_ids,
+        unsatisfiable_parked_task_ids,
+        completed_graph_source_task_ids,
     } = snap;
 
     let cohort = CohortDefinition {
@@ -1095,24 +1598,26 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         max_intents: MAX_INTENTS,
         max_contributing_tasks_per_intent: MAX_CONTRIBUTING_TASKS_PER_INTENT,
     };
+    // Extract only immutable-ledger-correlated recovery delivery witnesses
+    // after the short read snapshot has ended. Bare nested refs never enter
+    // terminal classification.
+    let recovery_merge_witnesses = recovery_merge_witnesses(&lineage);
 
-    let candidate_count = counts.ordinary + counts.review_only;
-    let truncated = ordinary_ids.len() > MAX_INTENTS;
+    let truncated = candidate_tasks.len() > MAX_INTENTS;
 
-    let base_reason = if include_all {
-        InclusionReason::EligibleIncludeAll
-    } else {
-        InclusionReason::EligibleTerminal
-    };
-
-    // Collapse ordinary cohort tasks into their canonical intent roots via
+    // Collapse capped cohort tasks into their canonical intent roots via
     // durable lineage (graph membership, recovery-delivery provenance).
     // Group by root_id in BTreeMap ordering for deterministic output.
-    let capped_ids: Vec<i64> = ordinary_ids.iter().take(MAX_INTENTS).copied().collect();
+    let capped_tasks: Vec<FactsTaskRow> = candidate_tasks.into_iter().take(MAX_INTENTS).collect();
+    let tasks_by_id: HashMap<i64, FactsTaskRow> = capped_tasks
+        .iter()
+        .cloned()
+        .map(|task| (task.id, task))
+        .collect();
     let mut groups: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
-    for id in &capped_ids {
-        let root = canonical_root(*id, &lineage);
-        groups.entry(root).or_default().push(*id);
+    for task in &capped_tasks {
+        let root = canonical_root(task.id, &lineage);
+        groups.entry(root).or_default().push(task.id);
     }
 
     let mut intents: Vec<IntentFacts> = Vec::with_capacity(groups.len());
@@ -1120,12 +1625,49 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         members.sort();
         let members_for_evidence = members.clone();
         let evidence = build_lineage_evidence(root, &members_for_evidence, &lineage);
+        let member_rows: Vec<&FactsTaskRow> = members
+            .iter()
+            .map(|id| {
+                tasks_by_id
+                    .get(id)
+                    .expect("lineage groups are derived from capped candidate ids")
+            })
+            .collect();
+        let resolved = if completed_graph_source_task_ids.contains(&root)
+            && completed_graph_has_omitted_member(root, &tasks_by_id, &lineage)
+        {
+            // The source is a completed aggregate, but a durable accepted
+            // child is outside this facts cohort. Classify the partial graph
+            // explicitly as truncated/unknown rather than crediting only its
+            // in-cap merged children.
+            let reason = if truncated {
+                InclusionReason::ExcludedTruncated
+            } else {
+                // A child excluded by the prospective watermark is not a
+                // cap overflow, but it still leaves delivery incomplete.
+                InclusionReason::ExcludedUnknownDelivery
+            };
+            ResolvedIntent::terminal(reason, "unknown", &member_rows)
+        } else {
+            resolve_intent(
+                &member_rows,
+                &recoverable_graph_task_ids,
+                &unsatisfiable_parked_task_ids,
+                &completed_graph_source_task_ids,
+                &recovery_merge_witnesses,
+            )
+        };
         // Clip contributing task ids to the per-intent bound.
         let contributing: Vec<i64> = members
             .into_iter()
             .take(MAX_CONTRIBUTING_TASKS_PER_INTENT)
             .collect();
-        let mut intent = new_intent_facts(root, contributing, base_reason);
+        let mut intent = new_intent_facts(root, contributing, resolved.reason);
+        intent.terminal_outcome = resolved.terminal_outcome;
+        intent.terminal_evidence = resolved.terminal_evidence;
+        intent.merge_provenance = resolved.merge_provenance;
+        intent.coverage.terminal = intent.terminal_evidence.is_some();
+        intent.coverage.merge_provenance = intent.merge_provenance.is_some();
         // Populate lineage only when a durable collapse relation exists.
         // Standalone / shared-PR-only / malformed provenance leaves
         // lineage_evidence null and coverage.lineage false — an explicit
@@ -1139,31 +1681,32 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
     }
 
     let mut excluded_reasons: BTreeMap<String, i64> = BTreeMap::new();
-    if counts.review_only > 0 {
-        excluded_reasons.insert(
-            InclusionReason::ExcludedReviewOnly.as_str().to_string(),
-            counts.review_only,
-        );
+    for intent in &intents {
+        if !intent.included {
+            *excluded_reasons
+                .entry(intent.reason.as_str().to_string())
+                .or_default() += 1;
+        }
     }
     if truncated {
         // Bounded aggregate lets us report the exact truncated excess without
-        // loading the overflow tail.
-        let overflow = (counts.ordinary - MAX_INTENTS as i64).max(0);
+        // loading the overflow tail. Those raw candidates cannot be resolved,
+        // so they are explicitly excluded rather than silently omitted.
+        let overflow = (candidate_count - MAX_INTENTS as i64).max(0);
         if overflow > 0 {
-            excluded_reasons.insert(
-                InclusionReason::ExcludedTruncated.as_str().to_string(),
-                overflow,
-            );
+            *excluded_reasons
+                .entry(InclusionReason::ExcludedTruncated.as_str().to_string())
+                .or_default() += overflow;
         }
     }
 
-    // `included` counts terminal cohort tasks that contributed to some
-    // emitted intent (either as root or as folded detail). With collapse it
-    // may exceed `intents.len()` — the intent count is available separately
-    // via `intents.len()`. For non-collapsed cohorts this preserves the
-    // historical `included == intents.len()` identity.
-    let included_count = capped_ids.len() as i64;
-    let excluded_count = candidate_count - included_count;
+    // These counts are derived from the resolved per-intent flags. Raw rows
+    // beyond the cap are surfaced as `excluded-truncated`, preserving the
+    // `included + excluded == candidate` invariant without an unbounded read.
+    let included_count = intents.iter().filter(|intent| intent.included).count() as i64;
+    let overflow = (candidate_count - MAX_INTENTS as i64).max(0);
+    let excluded_count = intents.iter().filter(|intent| !intent.included).count() as i64 + overflow;
+    let resolved_candidate_count = intents.len() as i64 + overflow;
 
     // Coverage summary: iterate each intent's flags and tally covered vs
     // uncovered per named field. Order comes from `IntentCoverage::iter_named`
@@ -1192,7 +1735,7 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         cohort,
         query_limits,
         counts: CohortCounts {
-            candidate: candidate_count,
+            candidate: resolved_candidate_count,
             included: included_count,
             excluded: excluded_count,
         },
@@ -1843,7 +2386,16 @@ mod tests {
     }
 
     fn seed_ordinary(conn: &mut Connection, updated_at: i64) -> i64 {
-        seed_task(conn, "done", None, 0, None, 1000, updated_at)
+        let id = seed_task(conn, "open", None, 0, None, 1000, updated_at);
+        crate::tasks::close_after_merge_with_merge_commit_sha(
+            conn,
+            id,
+            "merged for facts fixture",
+            &format!("{id:040x}"),
+            updated_at,
+        )
+        .unwrap();
+        id
     }
 
     fn seed_review_only(conn: &mut Connection, updated_at: i64) -> i64 {
@@ -1910,7 +2462,7 @@ mod tests {
         assert_eq!(r.intents[1].intent_id, format!("intent-{t2}"));
         for intent in &r.intents {
             assert!(intent.included);
-            assert_eq!(intent.reason, InclusionReason::EligibleTerminal);
+            assert_eq!(intent.reason, InclusionReason::IncludedVerifiedMerge);
             assert_eq!(intent.contributing_task_ids.len(), 1);
         }
     }
@@ -1950,10 +2502,11 @@ mod tests {
             !i.coverage.lineage,
             "standalone lineage must remain an explicit coverage gap"
         );
-        // Every other evidence field remains null — enrichment is a sibling's job.
-        assert!(i.terminal_outcome.is_none());
-        assert!(i.terminal_evidence.is_none());
-        assert!(i.merge_provenance.is_none());
+        // Terminal evidence comes from the durable merged completion. The
+        // remaining enrichment fields retain their explicit null coverage gaps.
+        assert_eq!(i.terminal_outcome.as_deref(), Some("done"));
+        assert!(i.terminal_evidence.is_some());
+        assert_eq!(i.merge_provenance.as_deref(), Some("merged"));
         assert!(i.complexity.is_none());
         assert!(i.complexity_provenance.is_none());
         assert!(i.config_evidence.is_none());
@@ -1967,15 +2520,25 @@ mod tests {
         assert!(i.replan_count.is_none());
         assert!(i.incident_count.is_none());
         assert!(i.review_quality.is_none());
-        // Every coverage flag stays false — nothing is covered on a standalone
-        // intent until sibling enrichment lands.
+        // Terminal and merge-provenance are resolved here; all enrichment
+        // siblings remain uncovered.
         for (name, covered) in i.coverage.iter_named() {
-            assert!(!covered, "coverage.{name} must default to false");
+            assert_eq!(
+                covered,
+                matches!(name, "terminal" | "merge_provenance"),
+                "coverage.{name}"
+            );
         }
-        // Coverage summary reflects that: every field is uncovered==1.
+        // Coverage summary reflects the two resolved fields precisely.
         for (name, fc) in &r.coverage.fields {
-            assert_eq!(fc.covered, 0, "field {name} covered count");
-            assert_eq!(fc.uncovered, 1, "field {name} uncovered count");
+            let expected_covered =
+                i64::from(matches!(name.as_str(), "terminal" | "merge_provenance"));
+            assert_eq!(fc.covered, expected_covered, "field {name} covered count");
+            assert_eq!(
+                fc.uncovered,
+                1 - expected_covered,
+                "field {name} uncovered count"
+            );
         }
         // Serialization proves null lineage is on the wire — enrichment
         // consumers cannot mistake it for a measured value.
@@ -2040,7 +2603,10 @@ mod tests {
         assert_eq!(default.cohort.watermark, Some(5000));
         assert_eq!(default.counts.candidate, 1);
         assert_eq!(default.counts.included, 1);
-        assert_eq!(default.intents[0].reason, InclusionReason::EligibleTerminal);
+        assert_eq!(
+            default.intents[0].reason,
+            InclusionReason::IncludedVerifiedMerge
+        );
 
         let all = perf_facts(&c, true).unwrap();
         assert!(!all.cohort.prospective_only);
@@ -2049,7 +2615,7 @@ mod tests {
         assert_eq!(all.counts.candidate, 2);
         assert_eq!(all.counts.included, 2);
         for intent in &all.intents {
-            assert_eq!(intent.reason, InclusionReason::EligibleIncludeAll);
+            assert_eq!(intent.reason, InclusionReason::IncludedVerifiedMerge);
         }
     }
 
@@ -2087,6 +2653,971 @@ mod tests {
         let _ = perf_facts(&c, true).unwrap();
         let after = snapshot_db_state(&c);
         assert_eq!(before, after, "perf_facts must not write to any table");
+    }
+
+    #[test]
+    fn facts_verified_merge_includes_terminal_evidence_and_real_provenance() {
+        let (_d, mut c) = open_tmp();
+        let task_id = seed_ordinary(&mut c, 1600);
+        let expected_sha = format!("{task_id:040x}");
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        let after = snapshot_db_state(&c);
+
+        assert_eq!(before, after, "facts reads must not mutate SQLite state");
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 1,
+                excluded: 0
+            }
+        );
+        let intent = &report.intents[0];
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedVerifiedMerge);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("done"));
+        assert_eq!(intent.merge_provenance.as_deref(), Some("merged"));
+        assert!(intent.coverage.terminal);
+        assert!(intent.coverage.merge_provenance);
+        assert_eq!(
+            intent.terminal_evidence.as_ref().unwrap()["merge_commit_shas"],
+            serde_json::json!([expected_sha])
+        );
+    }
+
+    #[test]
+    fn facts_excludes_cancellation_manual_close_and_review_without_reducing_delivery() {
+        let (_d, mut c) = open_tmp();
+        let delivered = seed_ordinary(&mut c, 1600);
+        let cancelled = seed_task(&mut c, "cancelled", None, 0, None, 1000, 1700);
+        let duplicate = seed_task(&mut c, "cancelled", None, 0, None, 1000, 1710);
+        set_refs(
+            &c,
+            duplicate,
+            &serde_json::json!({ "cx_dup_of": [delivered] }).to_string(),
+        );
+        let intake_declined = seed_task(&mut c, "cancelled", None, 0, None, 1000, 1720);
+        set_refs(
+            &c,
+            intake_declined,
+            r#"{"cx_ready":false,"cx_not_ready_reason":"missing owner decision"}"#,
+        );
+        let manual = seed_task(&mut c, "open", None, 0, None, 1000, 1800);
+        crate::tasks::close_manual(&mut c, "owner", manual, "resolved elsewhere", None, 1800)
+            .unwrap();
+        let review_only = seed_review_only(&mut c, 1900);
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 6,
+                included: 1,
+                excluded: 5
+            }
+        );
+        assert_eq!(
+            report
+                .excluded_reasons
+                .get(InclusionReason::ExcludedHousekeepingCancellation.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .excluded_reasons
+                .get(InclusionReason::ExcludedDuplicate.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .excluded_reasons
+                .get(InclusionReason::ExcludedIntakeDeclined.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .excluded_reasons
+                .get(InclusionReason::ExcludedManualCompletion.as_str()),
+            Some(&1)
+        );
+        assert_eq!(
+            report
+                .excluded_reasons
+                .get(InclusionReason::ExcludedReviewOnly.as_str()),
+            Some(&1)
+        );
+        let by_task: HashMap<i64, &IntentFacts> = report
+            .intents
+            .iter()
+            .map(|intent| (intent.contributing_task_ids[0], intent))
+            .collect();
+        assert!(by_task[&delivered].included);
+        assert_eq!(
+            by_task[&cancelled].reason,
+            InclusionReason::ExcludedHousekeepingCancellation
+        );
+        assert_eq!(
+            by_task[&duplicate].reason,
+            InclusionReason::ExcludedDuplicate
+        );
+        assert_eq!(
+            by_task[&intake_declined].reason,
+            InclusionReason::ExcludedIntakeDeclined
+        );
+        assert_eq!(
+            by_task[&manual].reason,
+            InclusionReason::ExcludedManualCompletion
+        );
+        assert_eq!(
+            by_task[&review_only].reason,
+            InclusionReason::ExcludedReviewOnly
+        );
+        assert!(by_task[&manual].merge_provenance.is_none());
+    }
+
+    #[test]
+    fn facts_includes_only_irrecoverable_failed_terminal() {
+        let (_d, mut c) = open_tmp();
+        let failed = seed_task(&mut c, "failed", None, 0, None, 1000, 1600);
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 1,
+                excluded: 0
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![failed]);
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedIrrecoverableFailure);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("failed"));
+        assert!(intent.terminal_evidence.is_some());
+        assert!(intent.merge_provenance.is_none());
+        assert!(intent.coverage.terminal);
+        assert!(!intent.coverage.merge_provenance);
+    }
+
+    #[test]
+    fn facts_missing_or_contradictory_delivery_evidence_is_unknown() {
+        let (_d, mut c) = open_tmp();
+        let missing = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+        let contradictory = seed_task(&mut c, "failed", None, 0, None, 1000, 1610);
+        c.execute(
+            "UPDATE tasks SET completion_provenance='merged', \
+             refs=json_object('merge_commit_sha','merge-42') WHERE id=?1",
+            [contradictory],
+        )
+        .unwrap();
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 2,
+                included: 0,
+                excluded: 2
+            }
+        );
+        for intent in &report.intents {
+            assert!(
+                matches!(intent.contributing_task_ids[0], id if id == missing || id == contradictory)
+            );
+            assert!(!intent.included);
+            assert_eq!(intent.reason, InclusionReason::ExcludedUnknownDelivery);
+            assert_eq!(intent.terminal_outcome.as_deref(), Some("unknown"));
+            assert!(intent.terminal_evidence.is_some());
+            assert!(intent.merge_provenance.is_none());
+        }
+    }
+
+    #[test]
+    fn facts_excludes_active_and_retryable_work_as_nonterminal() {
+        let (_d, mut c) = open_tmp();
+        let open = seed_task(&mut c, "open", None, 0, None, 1000, 1600);
+        let working = seed_task(&mut c, "working", None, 0, None, 1000, 1610);
+        let in_review = seed_task(&mut c, "in-review", None, 0, None, 1000, 1620);
+        let rework = seed_task(&mut c, "rework", None, 0, None, 1000, 1630);
+        let decomposed = seed_task(&mut c, "decomposed", None, 0, None, 1000, 1640);
+        seed_decomposition(&c, decomposed, 1);
+        let parked = seed_task(&mut c, "failed", None, 0, None, 1000, 1650);
+        set_refs(
+            &c,
+            parked,
+            r#"{"daemon_parked":true,"daemon_resume_status":"open"}"#,
+        );
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 6,
+                included: 0,
+                excluded: 6
+            }
+        );
+        assert_eq!(
+            report
+                .excluded_reasons
+                .get(InclusionReason::ExcludedNonTerminal.as_str()),
+            Some(&6)
+        );
+        let expected = [open, working, in_review, rework, decomposed, parked];
+        for intent in &report.intents {
+            assert!(expected.contains(&intent.contributing_task_ids[0]));
+            assert!(!intent.included);
+            assert_eq!(intent.reason, InclusionReason::ExcludedNonTerminal);
+            assert!(intent.terminal_outcome.is_none());
+            assert!(intent.terminal_evidence.is_none());
+            assert!(!intent.coverage.terminal);
+        }
+    }
+
+    #[test]
+    fn facts_excludes_numeric_parked_failure_accepted_by_task_retry() {
+        let (_d, mut c) = open_tmp();
+        let parked = seed_task(&mut c, "failed", None, 0, None, 1000, 1650);
+        // SQLite's `json_extract(...)=1` task-retry predicate deliberately
+        // accepts this retained numeric encoding, not just JSON true.
+        set_refs(
+            &c,
+            parked,
+            r#"{"daemon_parked":1,"daemon_resume_status":"open"}"#,
+        );
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 0,
+                excluded: 1,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![parked]);
+        assert!(!intent.included);
+        assert_eq!(intent.reason, InclusionReason::ExcludedNonTerminal);
+        assert!(intent.terminal_outcome.is_none());
+        assert!(intent.terminal_evidence.is_none());
+
+        // Prove the same persisted row remains admitted by the lifecycle,
+        // rather than merely duplicating a look-alike JSON predicate here.
+        assert!(crate::tasks::retry_parked(
+            &mut c,
+            parked,
+            "retry-owner",
+            true,
+            crate::clock::now(),
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn facts_includes_parked_failure_with_cancelled_dependency() {
+        let (_d, mut c) = open_tmp();
+        let cancelled_dependency = seed_task(&mut c, "cancelled", None, 0, None, 1000, 1600);
+        let parked = seed_task(&mut c, "failed", None, 0, None, 1000, 1650);
+        c.execute(
+            "UPDATE tasks SET depends_on=?2,refs=?3 WHERE id=?1",
+            rusqlite::params![
+                parked,
+                format!("[{cancelled_dependency}]"),
+                r#"{"daemon_parked":1,"daemon_resume_status":"open"}"#,
+            ],
+        )
+        .unwrap();
+
+        // Prove the exact lifecycle recovery path refuses this durable
+        // dependency state before facts classifies it as irrecoverable.
+        assert!(crate::tasks::retry_parked(
+            &mut c,
+            parked,
+            "retry-owner",
+            true,
+            crate::clock::now(),
+        )
+        .unwrap()
+        .is_none());
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 2,
+                included: 1,
+                excluded: 1,
+            }
+        );
+        let by_task: HashMap<i64, &IntentFacts> = report
+            .intents
+            .iter()
+            .map(|intent| (intent.contributing_task_ids[0], intent))
+            .collect();
+        let intent = by_task[&parked];
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedIrrecoverableFailure);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("failed"));
+        assert!(intent.terminal_evidence.is_some());
+        assert!(intent.merge_provenance.is_none());
+        assert_eq!(
+            by_task[&cancelled_dependency].reason,
+            InclusionReason::ExcludedHousekeepingCancellation
+        );
+    }
+
+    #[test]
+    fn facts_keeps_retryable_review_only_park_nonterminal() {
+        let (_d, mut c) = open_tmp();
+        let review = seed_review_only(&mut c, 1650);
+        c.execute(
+            "UPDATE tasks SET status='failed',refs=?2 WHERE id=?1",
+            rusqlite::params![
+                review,
+                r#"{"daemon_parked":true,"daemon_resume_status":"in-review"}"#
+            ],
+        )
+        .unwrap();
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 0,
+                excluded: 1,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![review]);
+        assert!(!intent.included);
+        assert_eq!(intent.reason, InclusionReason::ExcludedReviewOnly);
+        assert!(intent.terminal_outcome.is_none());
+        assert!(intent.terminal_evidence.is_none());
+        assert!(intent.merge_provenance.is_none());
+
+        // This is the lifecycle-compatible pre-review-CI park form, not a
+        // look-alike status: retry restores it to the review phase.
+        let retried =
+            crate::tasks::retry_parked(&mut c, review, "retry-owner", true, crate::clock::now())
+                .unwrap()
+                .unwrap();
+        assert_eq!(retried.status, "in-review");
+    }
+
+    #[test]
+    fn facts_preserves_durable_terminal_review_only_outcomes() {
+        let (_d, mut c) = open_tmp();
+        let failed = seed_review_only(&mut c, 1650);
+        let cancelled = seed_review_only(&mut c, 1660);
+        c.execute(
+            "UPDATE tasks SET status='in-review' WHERE id IN (?1,?2)",
+            rusqlite::params![failed, cancelled],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::tasks::apply_event(
+                &mut c,
+                "daemon",
+                failed,
+                &crate::lifecycle::Event::PrFoundClosed,
+                1670,
+            )
+            .unwrap()
+            .task
+            .status,
+            "failed"
+        );
+        assert_eq!(
+            crate::tasks::apply_event(
+                &mut c,
+                "daemon",
+                cancelled,
+                &crate::lifecycle::Event::Cancelled {
+                    by: "test-owner".to_string(),
+                },
+                1680,
+            )
+            .unwrap()
+            .task
+            .status,
+            "cancelled"
+        );
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 2,
+                included: 0,
+                excluded: 2,
+            }
+        );
+        let by_task: HashMap<i64, &IntentFacts> = report
+            .intents
+            .iter()
+            .map(|intent| (intent.contributing_task_ids[0], intent))
+            .collect();
+        for (task_id, outcome) in [(failed, "failed"), (cancelled, "cancelled")] {
+            let intent = by_task[&task_id];
+            assert!(!intent.included);
+            assert_eq!(intent.reason, InclusionReason::ExcludedReviewOnly);
+            assert_eq!(intent.terminal_outcome.as_deref(), Some(outcome));
+            assert_eq!(
+                intent.terminal_evidence.as_ref().unwrap()["tasks"][0]["status"],
+                serde_json::json!(outcome)
+            );
+            assert!(intent.merge_provenance.is_none());
+        }
+    }
+
+    #[test]
+    fn facts_includes_merge_conflict_rework_cap_failure_with_stale_retry_marker() {
+        let (_d, mut c) = open_tmp();
+        let task = seed_task(
+            &mut c,
+            "merging",
+            None,
+            i64::from(crate::lifecycle::REWORK_CAP),
+            Some("reviewer"),
+            1000,
+            1650,
+        );
+        set_refs(&c, task, r#"{"pr":419,"daemon_merge_retry":"attempting"}"#);
+
+        // This durable path intentionally retains the marker after the
+        // transition reaches `failed`; only `rework` is lifecycle-admitted
+        // for its remediation retry.
+        let transition = crate::tasks::rework_approved_merge(
+            &mut c,
+            task,
+            419,
+            "merge conflict at rework cap",
+            1660,
+        )
+        .unwrap();
+        assert_eq!(transition.task.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(transition.task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_rework_retry_requested"], true);
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 1,
+                excluded: 0,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![task]);
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedIrrecoverableFailure);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("failed"));
+        assert_eq!(
+            intent.terminal_evidence.as_ref().unwrap()["tasks"][0]["status"],
+            serde_json::json!("failed")
+        );
+        assert!(intent.merge_provenance.is_none());
+    }
+
+    #[test]
+    fn facts_completed_decomposition_uses_merged_child_provenance() {
+        let (_d, mut c) = open_tmp();
+        let source = seed_task(&mut c, "decomposed", None, 0, None, 1000, 1600);
+        let first_child = seed_task(&mut c, "open", None, 0, None, 1000, 1610);
+        let final_child = seed_task(&mut c, "open", None, 0, None, 1000, 1620);
+        let graph = seed_decomposition(&c, source, 1);
+        seed_graph_member(&c, graph, first_child, "first", 1);
+        seed_graph_member(&c, graph, final_child, "final", 1);
+
+        let first_sha = format!("{first_child:040x}");
+        let final_sha = format!("{final_child:040x}");
+        assert!(crate::tasks::close_after_merge_with_merge_commit_sha(
+            &mut c,
+            first_child,
+            "first merged child",
+            &first_sha,
+            1630,
+        )
+        .unwrap());
+        assert!(crate::tasks::close_after_merge_with_merge_commit_sha(
+            &mut c,
+            final_child,
+            "final merged child",
+            &final_sha,
+            1640,
+        )
+        .unwrap());
+
+        let completed: (String, i64, String, Option<String>) = c
+            .query_row(
+                "SELECT d.state,d.active,t.status,t.completion_provenance
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(completed, ("completed".into(), 0, "done".into(), None));
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 1,
+                excluded: 0,
+            }
+        );
+        let intent = &report.intents[0];
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedVerifiedMerge);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("done"));
+        assert_eq!(intent.merge_provenance.as_deref(), Some("merged"));
+        assert_eq!(
+            intent.terminal_evidence.as_ref().unwrap()["merge_commit_shas"],
+            serde_json::json!([first_sha, final_sha])
+        );
+    }
+
+    #[test]
+    fn facts_completed_graph_with_overflow_member_is_not_credited_partially() {
+        let (_d, mut c) = open_tmp();
+        let source = seed_task(&mut c, "decomposed", None, 0, None, 1000, 1600);
+        let merged_child = seed_task(&mut c, "open", None, 0, None, 1000, 1610);
+
+        // Fill the raw facts cohort through MAX_INTENTS. The accepted manual
+        // child below then lands exactly in the overflow tail.
+        let tx = crate::db::begin_immediate(&mut c).unwrap();
+        for _ in 0..(MAX_INTENTS - 2) {
+            tx.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at) \
+                 VALUES ('filler','open','boss',1000,1620)",
+                [],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let manual_child = seed_task(&mut c, "open", None, 0, None, 1000, 1630);
+
+        let graph = seed_decomposition(&c, source, 1);
+        seed_graph_member(&c, graph, merged_child, "merged", 1);
+        seed_graph_member(&c, graph, manual_child, "manual-overflow", 1);
+        assert!(crate::tasks::close_manual(
+            &mut c,
+            "manual-owner",
+            manual_child,
+            "manual delivery fixture",
+            None,
+            1640,
+        )
+        .unwrap()
+        .is_some());
+        let merged_sha = format!("{merged_child:040x}");
+        assert!(crate::tasks::close_after_merge_with_merge_commit_sha(
+            &mut c,
+            merged_child,
+            "merged child",
+            &merged_sha,
+            1650,
+        )
+        .unwrap());
+
+        let completion: (String, i64, String, Option<String>) = c
+            .query_row(
+                "SELECT d.state,d.active,t.status,t.completion_provenance
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(completion, ("completed".into(), 0, "done".into(), None));
+        let manual_provenance: String = c
+            .query_row(
+                "SELECT completion_provenance FROM tasks WHERE id=?1",
+                [manual_child],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            manual_provenance,
+            crate::tasks::COMPLETION_PROVENANCE_MANUAL
+        );
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: MAX_INTENTS as i64,
+                included: 0,
+                excluded: MAX_INTENTS as i64,
+            }
+        );
+        let graph_intent = report
+            .intents
+            .iter()
+            .find(|intent| intent.intent_id == format!("intent-{source}"))
+            .unwrap();
+        assert_eq!(
+            graph_intent.contributing_task_ids,
+            vec![source, merged_child]
+        );
+        assert!(!graph_intent.included);
+        assert_eq!(graph_intent.reason, InclusionReason::ExcludedTruncated);
+        assert_eq!(graph_intent.terminal_outcome.as_deref(), Some("unknown"));
+        assert!(graph_intent.terminal_evidence.is_some());
+        assert!(graph_intent.merge_provenance.is_none());
+        assert_eq!(
+            graph_intent.lineage_evidence.as_ref().unwrap()["generated_child_task_ids"],
+            serde_json::json!([merged_child, manual_child])
+        );
+        // One exclusion is the incomplete graph and one is its omitted raw
+        // candidate; neither is silently promoted to verified delivery.
+        assert_eq!(
+            report
+                .excluded_reasons
+                .get(InclusionReason::ExcludedTruncated.as_str()),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn facts_includes_completed_explicit_recovery_graph_with_ledger_witness() {
+        let (_d, mut c) = open_tmp();
+        const PR: i64 = 526;
+        const ORIGINAL_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const RECOVERY_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let source = seed_task(&mut c, "decomposed", None, 0, None, 1, 10);
+        let original = seed_task(&mut c, "failed", None, 0, None, 2, 20);
+        let graph = seed_decomposition(&c, source, 1);
+        seed_graph_member(&c, graph, original, "failed-child", 1);
+        set_refs(&c, original, &serde_json::json!({ "pr": PR }).to_string());
+        c.execute(
+            "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at) \
+             VALUES (?1,?2,'daemon/recovery',?3,0,8)",
+            rusqlite::params![original, PR, ORIGINAL_HEAD],
+        )
+        .unwrap();
+
+        // This recovery intentionally has no top-level merge_commit_sha. The
+        // durable explicit-adoption ledger, written below by the lifecycle,
+        // is the only recovery merge witness the facts reader may use.
+        let recovery = seed_task(&mut c, "done", None, 0, None, 9, 40);
+        set_refs(
+            &c,
+            recovery,
+            &serde_json::json!({ "pr": PR, "source_task": original }).to_string(),
+        );
+        c.execute(
+            "UPDATE tasks SET completion_provenance=?2,continue_pr=?3 WHERE id=?1",
+            rusqlite::params![recovery, crate::tasks::COMPLETION_PROVENANCE_MERGED, PR],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at) \
+             VALUES (?1,?2,'daemon/recovery',?3,0,25)",
+            rusqlite::params![recovery, PR, RECOVERY_HEAD],
+        )
+        .unwrap();
+
+        c.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                 profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (?1,?2,NULL,'worker',NULL,'M','worker','codex','codex','sol','high',
+                     'worker','test',9)",
+            rusqlite::params![format!("worker:task:{recovery}:revision:1"), recovery],
+        )
+        .unwrap();
+        let worker_assignment = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+                 role_assignment_id,spawned_at,ended_at,end_reason)
+             VALUES (?1,'worker','worker','sol','high','codex',?2,10,20,'completed')",
+            rusqlite::params![recovery, worker_assignment],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                 profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (?1,?2,?3,'reviewer','r1','M','reviewer','codex','codex','sol','high',
+                     'reviewer','test',26)",
+            rusqlite::params![format!("reviewer:task:{recovery}:r1"), recovery, PR],
+        )
+        .unwrap();
+        let reviewer_assignment = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+                 role_assignment_id,spawned_at,ended_at,end_reason,review_cap_run_id,
+                 review_pr,review_head_sha)
+             VALUES (?1,'reviewer','reviewer','sol','high','codex',?2,26,35,
+                     'verdict:approved','review-cap',?3,?4)",
+            rusqlite::params![recovery, reviewer_assignment, PR, RECOVERY_HEAD],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO r2_sampling_decisions(pr_number,head_sha,task_id,required,created_at)
+             VALUES (?1,?2,?3,0,25)",
+            rusqlite::params![PR, RECOVERY_HEAD, recovery],
+        )
+        .unwrap();
+
+        assert!(crate::decomposition::adopt_explicit_recovery_delivery(
+            &mut c,
+            &crate::decomposition::ExplicitRecoveryAdoption {
+                original_child_id: original,
+                recovery_task_id: recovery,
+                authorized_by: "test-operator",
+                now: 50,
+            },
+        )
+        .unwrap());
+        let completion: (String, i64, String, Option<String>) = c
+            .query_row(
+                "SELECT d.state,d.active,t.status,t.completion_provenance
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(completion, ("completed".into(), 0, "done".into(), None));
+        let has_top_level_witness: Option<String> = c
+            .query_row(
+                "SELECT json_extract(refs,'$.merge_commit_sha') FROM tasks WHERE id=?1",
+                [original],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_top_level_witness.is_none());
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 1,
+                excluded: 0,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(
+            intent.contributing_task_ids,
+            vec![source, original, recovery]
+        );
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedVerifiedMerge);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("done"));
+        assert_eq!(intent.merge_provenance.as_deref(), Some("merged"));
+        assert_eq!(
+            intent.terminal_evidence.as_ref().unwrap()["merge_commit_shas"],
+            serde_json::json!([RECOVERY_HEAD])
+        );
+    }
+
+    #[test]
+    fn facts_excludes_retry_eligible_held_planning_source_as_nonterminal() {
+        let (_d, mut c) = open_tmp();
+        let source = seed_task(&mut c, "open", None, 0, None, 1000, 1600);
+        let graph = crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "test-model",
+                frozen_base_sha: "0123456789abcdef0123456789abcdef01234567",
+                now: 1610,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(crate::decomposition::record_attempt(
+            &mut c,
+            graph,
+            "provider",
+            "test-timeout",
+            "first bounded planner timeout",
+            1620,
+        )
+        .unwrap()
+        .is_some());
+        assert!(crate::decomposition::reacquire_freeze(&mut c, graph, 1630).unwrap());
+        assert!(crate::decomposition::set_frozen_phase(
+            &mut c,
+            graph,
+            "freeze-requested",
+            "planning",
+            None,
+            1640,
+        )
+        .unwrap());
+        assert!(crate::decomposition::record_attempt(
+            &mut c,
+            graph,
+            "provider",
+            "test-timeout",
+            "second bounded planner timeout",
+            1650,
+        )
+        .unwrap()
+        .is_some());
+        assert!(crate::decomposition::exhausted_planning_retry_is_eligible(
+            &c,
+            source,
+            crate::clock::now(),
+        )
+        .unwrap());
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 0,
+                excluded: 1,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![source]);
+        assert!(!intent.included);
+        assert_eq!(intent.reason, InclusionReason::ExcludedNonTerminal);
+        assert!(intent.terminal_outcome.is_none());
+        assert!(intent.terminal_evidence.is_none());
+    }
+
+    #[test]
+    fn facts_includes_non_retryable_held_failure_with_neutral_canonical_retry() {
+        let (_d, mut c) = open_tmp();
+        let source = seed_task(&mut c, "open", None, 0, None, 1000, 1600);
+        let refs = r#"{"runner_retry":{"provider":"codex","model":"gpt-5","effort":"high","prompt":"finish","turn_kind":"rework","continuation_id":"thread-new","requested":false},"codex_retry_requested":true}"#;
+        set_refs(&c, source, refs);
+        let graph = crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "test-model",
+                frozen_base_sha: "0123456789abcdef0123456789abcdef01234567",
+                now: 1610,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // Exhaust the initial generation, then exhaust each lifecycle-issued
+        // operator retry. Planning never rewrites the canonical retry record.
+        let mut now = 1620;
+        for generation in 0..=crate::decomposition::MAX_OPERATOR_RETRIES {
+            if generation > 0 {
+                assert!(crate::decomposition::reacquire_freeze(&mut c, graph, now).unwrap());
+                now += 10;
+                assert!(crate::decomposition::set_frozen_phase(
+                    &mut c,
+                    graph,
+                    "freeze-requested",
+                    "planning",
+                    None,
+                    now,
+                )
+                .unwrap());
+                now += 10;
+            }
+            assert!(crate::decomposition::record_attempt(
+                &mut c,
+                graph,
+                "provider",
+                "test-timeout",
+                "bounded planner timeout",
+                now,
+            )
+            .unwrap()
+            .is_some());
+            now += 10;
+            assert!(crate::decomposition::reacquire_freeze(&mut c, graph, now).unwrap());
+            now += 10;
+            assert!(crate::decomposition::set_frozen_phase(
+                &mut c,
+                graph,
+                "freeze-requested",
+                "planning",
+                None,
+                now,
+            )
+            .unwrap());
+            now += 10;
+            assert!(crate::decomposition::record_attempt(
+                &mut c,
+                graph,
+                "provider",
+                "test-timeout",
+                "bounded planner timeout",
+                now,
+            )
+            .unwrap()
+            .is_some());
+            now += 10;
+            if generation < crate::decomposition::MAX_OPERATOR_RETRIES {
+                assert!(matches!(
+                    crate::decomposition::retry_exhausted_planning(
+                        &mut c,
+                        source,
+                        "operator",
+                        now,
+                    )
+                    .unwrap(),
+                    crate::decomposition::PlanningRetryOutcome::Retried { .. }
+                ));
+                now += 10;
+            }
+        }
+        assert!(!crate::decomposition::exhausted_planning_retry_is_eligible(
+            &c,
+            source,
+            crate::clock::now(),
+        )
+        .unwrap());
+        assert_eq!(
+            crate::decomposition::retry_exhausted_planning(&mut c, source, "operator", now)
+                .unwrap(),
+            crate::decomposition::PlanningRetryOutcome::RetryCapExhausted {
+                retry_count: crate::decomposition::MAX_OPERATOR_RETRIES,
+            }
+        );
+        let persisted_refs: String = c
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [source], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(persisted_refs, refs);
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 1,
+                excluded: 0,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![source]);
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedIrrecoverableFailure);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("failed"));
+        assert!(intent.terminal_evidence.is_some());
+        assert!(intent.merge_provenance.is_none());
     }
 
     #[test]
@@ -2134,13 +3665,9 @@ mod tests {
             "seed order must place review-only ids before ordinary"
         );
 
-        // Direct SQL guard: fetching ordinary intents with a sentinel of 3
-        // must return exactly the three ordinary ids, in stable order.
-        let ids = load_ordinary_intent_ids(&c, None, 3).unwrap();
-        assert_eq!(ids, vec![o1, o2, o3]);
-
         // End-to-end accounting: candidate = 5 + 3, all three ordinary rows
-        // are included, review-only rows are tallied by reason code.
+        // are included, while every review-only row remains visible with its
+        // bounded exclusion reason.
         let r = perf_facts(&c, false).unwrap();
         assert_eq!(r.counts.candidate, 8);
         assert_eq!(r.counts.included, 3);
@@ -2154,6 +3681,7 @@ mod tests {
         let included_ids: Vec<i64> = r
             .intents
             .iter()
+            .filter(|intent| intent.included)
             .map(|i| i.contributing_task_ids[0])
             .collect();
         assert_eq!(included_ids, vec![o1, o2, o3]);
@@ -2237,9 +3765,14 @@ mod tests {
         // Serializing a code goes through the kebab-case enum discriminants
         // — no free-form text can appear in the wire form.
         for r in [
-            InclusionReason::EligibleTerminal,
-            InclusionReason::EligibleIncludeAll,
+            InclusionReason::IncludedVerifiedMerge,
+            InclusionReason::IncludedIrrecoverableFailure,
+            InclusionReason::ExcludedDuplicate,
+            InclusionReason::ExcludedIntakeDeclined,
+            InclusionReason::ExcludedHousekeepingCancellation,
             InclusionReason::ExcludedReviewOnly,
+            InclusionReason::ExcludedManualCompletion,
+            InclusionReason::ExcludedUnknownDelivery,
             InclusionReason::ExcludedPreWatermark,
             InclusionReason::ExcludedTruncated,
             InclusionReason::ExcludedNonTerminal,
@@ -2400,11 +3933,12 @@ mod tests {
             ev.get("generated_child_task_ids").unwrap(),
             &serde_json::json!([c1, c2])
         );
-        // All three terminal tasks contributed; nothing was excluded as
-        // "children folded away".
-        assert_eq!(r.counts.candidate, 3);
-        assert_eq!(r.counts.included, 3);
-        assert_eq!(r.counts.excluded, 0);
+        // The graph remains active in this fixture, so the collapsed intent
+        // is explicitly nonterminal rather than a guessed delivery.
+        assert_eq!(r.counts.candidate, 1);
+        assert_eq!(r.counts.included, 0);
+        assert_eq!(r.counts.excluded, 1);
+        assert_eq!(intent.reason, InclusionReason::ExcludedNonTerminal);
         // No child id ever surfaces as an independent intent_id.
         for i in &r.intents {
             assert_ne!(i.intent_id, format!("intent-{c1}"));
@@ -2441,9 +3975,12 @@ mod tests {
         assert_eq!(r.intents.len(), 1);
         let intent = &r.intents[0];
         assert_eq!(intent.intent_id, format!("intent-{s}"));
-        // S itself is not in the terminal cohort — but children still fold to S.
-        assert_eq!(intent.contributing_task_ids, vec![c1, c2]);
+        // Facts surfaces the still-working source as nonterminal while the
+        // children remain folded under its durable graph root.
+        assert_eq!(intent.contributing_task_ids, vec![s, c1, c2]);
         assert_eq!(intent.lineage_root_task_id, Some(s));
+        assert!(!intent.included);
+        assert_eq!(intent.reason, InclusionReason::ExcludedNonTerminal);
     }
 
     #[test]
@@ -2490,9 +4027,9 @@ mod tests {
         // Expected intents: one collapsed (source_s + orig_x + recovery_y), and two
         // independent (shared_a, shared_b) — total 3.
         assert_eq!(r.intents.len(), 3, "recovery folds, shared-PR does not");
-        assert_eq!(r.counts.candidate, 5);
-        assert_eq!(r.counts.included, 5);
-        assert_eq!(r.counts.excluded, 0);
+        assert_eq!(r.counts.candidate, 3);
+        assert_eq!(r.counts.included, 0);
+        assert_eq!(r.counts.excluded, 3);
 
         // Find each intent by intent_id.
         let by_id: HashMap<&str, &IntentFacts> = r
