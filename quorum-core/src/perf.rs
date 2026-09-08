@@ -1703,6 +1703,25 @@ struct AttributionSnapshot {
     capped_review_collection_task_ids: HashSet<i64>,
     review_findings_by_task: HashMap<i64, Vec<ReviewFindingFact>>,
     capped_review_finding_task_ids: HashSet<i64>,
+    // These roles execute outside `agent_runs`. Their durable terminal
+    // evidence still proves a model invocation, so it participates in
+    // token/timing completeness even though it has no managed interval id.
+    non_managed_invocations_by_task: HashMap<i64, BTreeMap<String, i64>>,
+    capped_non_managed_invocation_task_ids: HashSet<i64>,
+}
+
+fn note_non_managed_invocation(snapshot: &mut AttributionSnapshot, task_id: i64, purpose: &str) {
+    let count = snapshot
+        .non_managed_invocations_by_task
+        .entry(task_id)
+        .or_default()
+        .entry(purpose.to_string())
+        .or_default();
+    if !add_metric(count, 1) {
+        snapshot
+            .capped_non_managed_invocation_task_ids
+            .insert(task_id);
+    }
 }
 
 fn present_text(value: &str) -> bool {
@@ -2123,6 +2142,7 @@ fn load_attribution_snapshot(conn: &Connection, task_ids: &[i64]) -> Result<Attr
     }
     load_active_run_facts(conn, task_ids, &mut snapshot)?;
     load_token_usage_facts(conn, task_ids, &mut snapshot)?;
+    load_non_managed_invocation_facts(conn, task_ids, &mut snapshot)?;
     load_planning_incident_facts(conn, task_ids, &mut snapshot)?;
     load_review_quality_facts(conn, task_ids, &mut snapshot)?;
     Ok(snapshot)
@@ -2136,47 +2156,35 @@ fn load_active_run_facts(
     task_ids: &[i64],
     snapshot: &mut AttributionSnapshot,
 ) -> Result<()> {
-    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
-        let placeholders = sql_placeholders(batch.len());
-        let sql = format!(
-            "SELECT task_id,id,role,spawned_at,ended_at,end_reason,row_num FROM (
-                 SELECT task_id,id,role,spawned_at,ended_at,end_reason,
-                        ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY id) AS row_num
-                 FROM agent_runs
-                 WHERE task_id IN ({placeholders})
-                   AND role IN ('worker','reviewer')
-             ) WHERE row_num <= ?
-             ORDER BY task_id,id"
-        );
-        let mut values = batch.to_vec();
-        values.push((MAX_ATTRIBUTION_ATTEMPTS_PER_TASK + 1) as i64);
-        let mut statement = conn.prepare(&sql)?;
+    // Do not rank a task's complete history merely to discard its tail. Each
+    // indexed task lookup stops at the bounded prefix plus one overflow probe;
+    // ordering is immaterial to token matching, duration sums, and incidents.
+    let mut statement = conn.prepare(
+        "SELECT id,role,spawned_at,ended_at,end_reason
+         FROM agent_runs
+         WHERE task_id=?1 AND role IN ('worker','reviewer')
+         LIMIT ?2",
+    )?;
+    for &task_id in task_ids {
         let rows = statement
-            .query_map(params_from_iter(values), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    ActiveRunFact {
-                        id: row.get(1)?,
-                        role: row.get(2)?,
-                        spawned_at: row.get(3)?,
-                        ended_at: row.get(4)?,
-                        end_reason: row.get(5)?,
-                    },
-                    row.get::<_, i64>(6)?,
-                ))
-            })?
+            .query_map(
+                [task_id, (MAX_ATTRIBUTION_ATTEMPTS_PER_TASK + 1) as i64],
+                |row| {
+                    Ok(ActiveRunFact {
+                        id: row.get(0)?,
+                        role: row.get(1)?,
+                        spawned_at: row.get(2)?,
+                        ended_at: row.get(3)?,
+                        end_reason: row.get(4)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (task_id, run, row_num) in rows {
-            if row_num > MAX_ATTRIBUTION_ATTEMPTS_PER_TASK as i64 {
-                snapshot.capped_active_run_task_ids.insert(task_id);
-            } else {
-                snapshot
-                    .active_runs_by_task
-                    .entry(task_id)
-                    .or_default()
-                    .push(run);
-            }
+        if rows.len() > MAX_ATTRIBUTION_ATTEMPTS_PER_TASK {
+            snapshot.capped_active_run_task_ids.insert(task_id);
+            continue;
         }
+        snapshot.active_runs_by_task.insert(task_id, rows);
     }
     Ok(())
 }
@@ -2186,54 +2194,84 @@ fn load_token_usage_facts(
     task_ids: &[i64],
     snapshot: &mut AttributionSnapshot,
 ) -> Result<()> {
-    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
-        let placeholders = sql_placeholders(batch.len());
-        let sql = format!(
-            "SELECT task_id,agent_run_id,purpose,uncached_input_tokens,cached_input_tokens,
-                    cache_write_input_tokens,output_tokens,reasoning_tokens,row_num
-             FROM (
-                 SELECT mapping.task_id,usage.agent_run_id,usage.purpose,
-                        usage.uncached_input_tokens,usage.cached_input_tokens,
-                        usage.cache_write_input_tokens,usage.output_tokens,usage.reasoning_tokens,
-                        ROW_NUMBER() OVER (PARTITION BY mapping.task_id ORDER BY usage.id) AS row_num
-                 FROM token_usage_run_tasks mapping
-                 JOIN token_usage_runs usage ON usage.id=mapping.run_id
-                 WHERE mapping.task_id IN ({placeholders})
-             ) WHERE row_num <= ?
-             ORDER BY task_id,row_num"
-        );
-        let mut values = batch.to_vec();
-        values.push((MAX_TOKEN_USAGE_ROWS_PER_TASK + 1) as i64);
-        let mut statement = conn.prepare(&sql)?;
+    let mut statement = conn.prepare(
+        "SELECT usage.agent_run_id,usage.purpose,usage.uncached_input_tokens,
+                usage.cached_input_tokens,usage.cache_write_input_tokens,
+                usage.output_tokens,usage.reasoning_tokens
+         FROM token_usage_run_tasks mapping
+         JOIN token_usage_runs usage ON usage.id=mapping.run_id
+         WHERE mapping.task_id=?1
+         LIMIT ?2",
+    )?;
+    for &task_id in task_ids {
         let rows = statement
-            .query_map(params_from_iter(values), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    TokenUsageFact {
-                        agent_run_id: row.get(1)?,
-                        purpose: row.get(2)?,
+            .query_map(
+                [task_id, (MAX_TOKEN_USAGE_ROWS_PER_TASK + 1) as i64],
+                |row| {
+                    Ok(TokenUsageFact {
+                        agent_run_id: row.get(0)?,
+                        purpose: row.get(1)?,
                         usage: crate::token_usage::TokenUsage {
-                            uncached_input_tokens: row.get(3)?,
-                            cached_input_tokens: row.get(4)?,
-                            cache_write_input_tokens: row.get(5)?,
-                            output_tokens: row.get(6)?,
-                            reasoning_tokens: row.get(7)?,
+                            uncached_input_tokens: row.get(2)?,
+                            cached_input_tokens: row.get(3)?,
+                            cache_write_input_tokens: row.get(4)?,
+                            output_tokens: row.get(5)?,
+                            reasoning_tokens: row.get(6)?,
                         },
-                    },
-                    row.get::<_, i64>(8)?,
-                ))
-            })?
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (task_id, usage, row_num) in rows {
-            if row_num > MAX_TOKEN_USAGE_ROWS_PER_TASK as i64 {
-                snapshot.capped_token_usage_task_ids.insert(task_id);
-            } else {
-                snapshot
-                    .token_usage_by_task
-                    .entry(task_id)
-                    .or_default()
-                    .push(usage);
+        if rows.len() > MAX_TOKEN_USAGE_ROWS_PER_TASK {
+            snapshot.capped_token_usage_task_ids.insert(task_id);
+            continue;
+        }
+        snapshot.token_usage_by_task.insert(task_id, rows);
+    }
+    Ok(())
+}
+
+/// Planner and decomposition-classifier outcomes are durable invocation
+/// evidence without an `agent_runs` row. Read each source task through a
+/// bounded prefix/probe so their missing telemetry cannot certify a partial
+/// aggregate, while a long retained planner history cannot extend this WAL
+/// snapshot.
+fn load_non_managed_invocation_facts(
+    conn: &Connection,
+    task_ids: &[i64],
+    snapshot: &mut AttributionSnapshot,
+) -> Result<()> {
+    let mut planners = conn.prepare(
+        "SELECT submission.run_id
+         FROM task_decompositions AS graph
+         JOIN planner_submissions AS submission ON submission.graph_id=graph.id
+         WHERE graph.source_task_id=?1
+         LIMIT ?2",
+    )?;
+    let mut classifier = conn.prepare(
+        "SELECT 1
+         FROM task_decompositions
+         WHERE source_task_id=?1 AND accepted_classifications_json IS NOT NULL
+         LIMIT 1",
+    )?;
+    for &task_id in task_ids {
+        let planner_rows = planners
+            .query_map(
+                [task_id, (MAX_ATTRIBUTION_ATTEMPTS_PER_TASK + 1) as i64],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if planner_rows.len() > MAX_ATTRIBUTION_ATTEMPTS_PER_TASK {
+            snapshot
+                .capped_non_managed_invocation_task_ids
+                .insert(task_id);
+        } else {
+            for _ in planner_rows {
+                note_non_managed_invocation(snapshot, task_id, "planner");
             }
+        }
+        if classifier.exists([task_id])? {
+            note_non_managed_invocation(snapshot, task_id, "classifier");
         }
     }
     Ok(())
@@ -2247,36 +2285,33 @@ fn load_planning_incident_facts(
     // The task_decompositions counters are current retry budgets. They reset
     // when planning is retried, whereas decomposition_attempts retains every
     // proposal/provider event across those generations.
-    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
-        let placeholders = sql_placeholders(batch.len());
-        let sql = format!(
-            "SELECT source_task_id,kind,row_num FROM (
-                 SELECT graph.source_task_id,attempt.kind,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY graph.source_task_id ORDER BY attempt.id
-                        ) AS row_num
-                 FROM task_decompositions AS graph
-                 JOIN decomposition_attempts AS attempt ON attempt.graph_id=graph.id
-                 WHERE graph.source_task_id IN ({placeholders})
-                   AND attempt.kind IN ('proposal','provider')
-             ) WHERE row_num <= ?
-             ORDER BY source_task_id,row_num"
-        );
-        let mut values = batch.to_vec();
-        values.push((MAX_PLANNING_INCIDENT_ROWS_PER_TASK + 1) as i64);
-        let mut statement = conn.prepare(&sql)?;
+    let mut statement = conn.prepare(
+        "SELECT attempt.kind
+         FROM task_decompositions AS graph
+         JOIN decomposition_attempts AS attempt ON attempt.graph_id=graph.id
+         WHERE graph.source_task_id=?1
+           AND attempt.kind IN ('proposal','provider','verdict')
+         LIMIT ?2",
+    )?;
+    for &task_id in task_ids {
         let rows = statement
-            .query_map(params_from_iter(values), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
+            .query_map(
+                [task_id, (MAX_PLANNING_INCIDENT_ROWS_PER_TASK + 1) as i64],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (task_id, kind, row_num) in rows {
-            if row_num > MAX_PLANNING_INCIDENT_ROWS_PER_TASK as i64 {
-                snapshot.capped_planning_incident_task_ids.insert(task_id);
+        if rows.len() > MAX_PLANNING_INCIDENT_ROWS_PER_TASK {
+            snapshot.capped_planning_incident_task_ids.insert(task_id);
+            snapshot
+                .capped_non_managed_invocation_task_ids
+                .insert(task_id);
+            continue;
+        }
+        for kind in rows {
+            // Every durable verdict attempt is emitted by the arbiter after a
+            // provider turn. Its interval is not persisted in agent_runs.
+            if kind == "verdict" {
+                note_non_managed_invocation(snapshot, task_id, "arbiter");
                 continue;
             }
             let current = snapshot
@@ -2308,83 +2343,66 @@ fn load_review_quality_facts(
     task_ids: &[i64],
     snapshot: &mut AttributionSnapshot,
 ) -> Result<()> {
-    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
-        let placeholders = sql_placeholders(batch.len());
-        let collections_sql = format!(
-            "SELECT task_id,pr_number,status,findings_count,row_num FROM (
-                 SELECT task_id,pr_number,status,findings_count,
-                        ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY pr_number) AS row_num
-                 FROM review_collection_runs
-                 WHERE task_id IN ({placeholders})
-             ) WHERE row_num <= ?
-             ORDER BY task_id,pr_number"
-        );
-        let mut values = batch.to_vec();
-        values.push((MAX_REVIEW_COLLECTION_ROWS_PER_TASK + 1) as i64);
-        let mut statement = conn.prepare(&collections_sql)?;
-        let collections = statement
-            .query_map(params_from_iter(values), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    ReviewCollectionFact {
-                        pr_number: row.get(1)?,
-                        status: row.get(2)?,
-                        findings_count: row.get(3)?,
-                    },
-                    row.get::<_, i64>(4)?,
-                ))
-            })?
+    let mut collections_statement = conn.prepare(
+        "SELECT pr_number,status,findings_count
+         FROM review_collection_runs
+         WHERE task_id=?1
+         LIMIT ?2",
+    )?;
+    let mut findings_statement = conn.prepare(
+        "SELECT pr_number,kind,author_pushback,pushback_accepted,addressed_status
+         FROM review_findings
+         WHERE task_id=?1
+         LIMIT ?2",
+    )?;
+    for &task_id in task_ids {
+        let collections = collections_statement
+            .query_map(
+                [task_id, (MAX_REVIEW_COLLECTION_ROWS_PER_TASK + 1) as i64],
+                |row| {
+                    Ok(ReviewCollectionFact {
+                        pr_number: row.get(0)?,
+                        status: row.get(1)?,
+                        findings_count: row.get(2)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (task_id, collection, row_num) in collections {
-            if row_num > MAX_REVIEW_COLLECTION_ROWS_PER_TASK as i64 {
-                snapshot.capped_review_collection_task_ids.insert(task_id);
-            } else {
-                snapshot
-                    .review_collections_by_task
-                    .entry(task_id)
-                    .or_default()
-                    .push(collection);
+        if collections.len() > MAX_REVIEW_COLLECTION_ROWS_PER_TASK {
+            snapshot.capped_review_collection_task_ids.insert(task_id);
+            snapshot
+                .capped_non_managed_invocation_task_ids
+                .insert(task_id);
+        } else {
+            for _ in &collections {
+                // A canonical collector result still proves one invocation;
+                // its independent telemetry must be present before token
+                // coverage can be certified.
+                note_non_managed_invocation(snapshot, task_id, "collector");
             }
+            snapshot
+                .review_collections_by_task
+                .insert(task_id, collections);
         }
 
-        let findings_sql = format!(
-            "SELECT task_id,pr_number,kind,author_pushback,pushback_accepted,addressed_status,row_num
-             FROM (
-                 SELECT task_id,pr_number,kind,author_pushback,pushback_accepted,addressed_status,
-                        ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY id) AS row_num
-                 FROM review_findings
-                 WHERE task_id IN ({placeholders})
-             ) WHERE row_num <= ?
-             ORDER BY task_id,row_num"
-        );
-        let mut values = batch.to_vec();
-        values.push((MAX_REVIEW_FINDINGS_PER_TASK + 1) as i64);
-        let mut statement = conn.prepare(&findings_sql)?;
-        let findings = statement
-            .query_map(params_from_iter(values), |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    ReviewFindingFact {
-                        pr_number: row.get(1)?,
-                        kind: row.get(2)?,
-                        author_pushback: row.get::<_, i64>(3)? != 0,
-                        pushback_accepted: row.get::<_, Option<i64>>(4)?.map(|value| value != 0),
-                        addressed_status: row.get(5)?,
-                    },
-                    row.get::<_, i64>(6)?,
-                ))
-            })?
+        let findings = findings_statement
+            .query_map(
+                [task_id, (MAX_REVIEW_FINDINGS_PER_TASK + 1) as i64],
+                |row| {
+                    Ok(ReviewFindingFact {
+                        pr_number: row.get(0)?,
+                        kind: row.get(1)?,
+                        author_pushback: row.get::<_, i64>(2)? != 0,
+                        pushback_accepted: row.get::<_, Option<i64>>(3)?.map(|value| value != 0),
+                        addressed_status: row.get(4)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (task_id, finding, row_num) in findings {
-            if row_num > MAX_REVIEW_FINDINGS_PER_TASK as i64 {
-                snapshot.capped_review_finding_task_ids.insert(task_id);
-            } else {
-                snapshot
-                    .review_findings_by_task
-                    .entry(task_id)
-                    .or_default()
-                    .push(finding);
-            }
+        if findings.len() > MAX_REVIEW_FINDINGS_PER_TASK {
+            snapshot.capped_review_finding_task_ids.insert(task_id);
+        } else {
+            snapshot.review_findings_by_task.insert(task_id, findings);
         }
     }
     Ok(())
@@ -2687,15 +2705,38 @@ fn supported_token_purpose(purpose: &str) -> bool {
     )
 }
 
+fn has_durable_classifier_invocation(task: &FactsTaskRow) -> bool {
+    if !crate::tasks::classification_is_complete(&task.refs) {
+        return false;
+    }
+    let Some(refs) = refs_object(task) else {
+        return false;
+    };
+    refs.get("cx_by")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(present_text)
+}
+
+fn add_expected_invocation(
+    expected: &mut BTreeMap<String, i64>,
+    purpose: &str,
+    count: i64,
+) -> bool {
+    add_metric(expected.entry(purpose.to_string()).or_default(), count)
+}
+
 fn populate_token_facts(
     intent: &mut IntentFacts,
     members: &[i64],
+    task_evidence_by_id: &HashMap<i64, FactsTaskRow>,
     attribution: &AttributionSnapshot,
 ) {
     let mut role_totals: BTreeMap<String, TokenTotals> = BTreeMap::new();
     let mut total = TokenTotals::default();
     let mut expected_managed_runs = HashSet::new();
     let mut observed_managed_runs = HashSet::new();
+    let mut expected_non_managed = BTreeMap::new();
+    let mut observed_non_managed = BTreeMap::new();
     let mut complete = true;
     let mut has_usage = false;
 
@@ -2705,6 +2746,26 @@ fn populate_token_facts(
         }
         if attribution.capped_active_run_task_ids.contains(&task_id) {
             complete = false;
+        }
+        if attribution
+            .capped_non_managed_invocation_task_ids
+            .contains(&task_id)
+        {
+            complete = false;
+        }
+        if task_evidence_by_id
+            .get(&task_id)
+            .is_some_and(has_durable_classifier_invocation)
+            && !add_expected_invocation(&mut expected_non_managed, "classifier", 1)
+        {
+            complete = false;
+        }
+        if let Some(invocations) = attribution.non_managed_invocations_by_task.get(&task_id) {
+            for (purpose, count) in invocations {
+                if !add_expected_invocation(&mut expected_non_managed, purpose, *count) {
+                    complete = false;
+                }
+            }
         }
         if let Some(runs) = attribution.active_runs_by_task.get(&task_id) {
             expected_managed_runs.extend(runs.iter().map(|run| run.id));
@@ -2746,12 +2807,26 @@ fn populate_token_facts(
                     // Managed worker/reviewer telemetry has a durable run id.
                     complete = false;
                 }
-                None => {}
+                None => {
+                    if !add_metric(
+                        observed_non_managed
+                            .entry(usage.purpose.clone())
+                            .or_default(),
+                        1,
+                    ) {
+                        complete = false;
+                    }
+                }
             }
         }
     }
 
-    if !has_usage || observed_managed_runs != expected_managed_runs {
+    if !has_usage
+        || observed_managed_runs != expected_managed_runs
+        || expected_non_managed
+            .iter()
+            .any(|(purpose, expected)| observed_non_managed.get(purpose).unwrap_or(&0) < expected)
+    {
         complete = false;
     }
     if !complete {
@@ -2815,6 +2890,37 @@ fn populate_timing_facts(
                 Some(latest_updated_at.map_or(task.updated_at, |value| value.max(task.updated_at)));
         }
         if attribution.capped_active_run_task_ids.contains(&task_id) {
+            active_complete = false;
+        }
+        if attribution
+            .capped_non_managed_invocation_task_ids
+            .contains(&task_id)
+            || attribution
+                .non_managed_invocations_by_task
+                .get(&task_id)
+                .is_some_and(|invocations| !invocations.is_empty())
+            || has_durable_classifier_invocation(task)
+        {
+            // Planner/classifier/arbiter/collector work has no durable
+            // invocation interval. Never fill that gap with queue, task, or
+            // worker/reviewer wall time.
+            active_complete = false;
+        }
+        if attribution
+            .token_usage_by_task
+            .get(&task_id)
+            .into_iter()
+            .flatten()
+            .any(|usage| {
+                usage.agent_run_id.is_none()
+                    && matches!(
+                        usage.purpose.as_str(),
+                        "planner" | "classifier" | "arbiter" | "collector"
+                    )
+            })
+        {
+            // Telemetry itself is durable proof of a non-managed model turn,
+            // but carries no interval from which active time can be derived.
             active_complete = false;
         }
         for run in attribution
@@ -3364,7 +3470,12 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         let attribution_members =
             attribution_members_for_intent(root, &members_for_evidence, &lineage);
         populate_attribution(&mut intent, &attribution_members, &attribution);
-        populate_token_facts(&mut intent, &attribution_members, &attribution);
+        populate_token_facts(
+            &mut intent,
+            &attribution_members,
+            &task_evidence_by_id,
+            &attribution,
+        );
         populate_timing_facts(
             &mut intent,
             &attribution_members,
@@ -5458,6 +5569,216 @@ mod tests {
         assert!(!intent.coverage.collector_failure);
         assert!(intent.incident_count.is_none());
         assert!(!intent.coverage.incident);
+    }
+
+    #[test]
+    fn facts_planner_invocation_requires_telemetry_and_interval_coverage() {
+        // A submit_plan row is durable proof that the source planner ran, but
+        // planner telemetry is best-effort and planners have no agent_runs
+        // interval. Worker evidence must not make either partial aggregate
+        // look complete.
+        let (_d, mut c) = open_tmp();
+        let task_id = seed_ordinary(&mut c, 1_600);
+        let worker_assignment = seed_assignment(&c, task_id, "worker", None, None, "worker");
+        let worker_run = seed_attributed_run(
+            &c,
+            task_id,
+            "worker",
+            "worker",
+            "gpt-worker",
+            "codex",
+            "high",
+            worker_assignment,
+            None,
+            10,
+            30,
+            "merged",
+        );
+        crate::token_usage::record(
+            &mut c,
+            Some(worker_run),
+            "worker",
+            &[task_id],
+            None,
+            "codex",
+            "gpt-worker",
+            "high",
+            crate::token_usage::TokenUsage {
+                uncached_input_tokens: 7,
+                ..Default::default()
+            },
+            100,
+        )
+        .unwrap();
+
+        let planner_assignment = seed_assignment(&c, task_id, "planner", None, None, "planner");
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 planner_provider,planner_model,planner_assignment_id,created_at,updated_at)
+             VALUES (?1,'completed',0,0,1,'codex','gpt-planner',?2,1,1)",
+            rusqlite::params![task_id, planner_assignment],
+        )
+        .unwrap();
+        let graph_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+             VALUES ('planner-coverage-run',?1,'planner','planner',1)",
+            [task_id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO planner_submissions(run_id,graph_id,response_json,rejections,accepted_at)
+             VALUES ('planner-coverage-run',?1,'[]',0,2)",
+            [graph_id],
+        )
+        .unwrap();
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent = &report.intents[0];
+        assert!(intent.role_tokens_usd.is_none());
+        assert!(!intent.coverage.role_tokens_usd);
+        assert!(intent.active_model_secs.is_none());
+        assert!(!intent.coverage.active_model_secs);
+        assert_eq!(intent.wall_secs, Some(600));
+        assert!(intent.coverage.wall_secs);
+
+        crate::token_usage::record(
+            &mut c,
+            None,
+            "planner",
+            &[task_id],
+            None,
+            "codex",
+            "gpt-planner",
+            "high",
+            crate::token_usage::TokenUsage {
+                uncached_input_tokens: 11,
+                ..Default::default()
+            },
+            101,
+        )
+        .unwrap();
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent = &report.intents[0];
+        assert_eq!(
+            intent.role_tokens_usd.as_ref().unwrap()["roles"]["planner"]["uncached_input_tokens"],
+            11
+        );
+        assert!(intent.coverage.role_tokens_usd);
+        // Adding a planner snapshot closes only the token gap. It cannot
+        // fabricate the planner's active interval from the worker or wall.
+        assert!(intent.active_model_secs.is_none());
+        assert!(!intent.coverage.active_model_secs);
+    }
+
+    #[test]
+    fn facts_per_task_prefix_probes_mark_every_overflow_uncovered() {
+        // Each fixture exceeds its loader by exactly one row. The facts reader
+        // needs only that bounded prefix and its probe to fail closed; it must
+        // not rank or materialize the retained tail to discover overflow.
+        let (_d, mut c) = open_tmp();
+        let active_task = seed_ordinary(&mut c, 1_600);
+        let token_task = seed_ordinary(&mut c, 1_700);
+        let planning_task = seed_ordinary(&mut c, 1_800);
+        let collection_task = seed_ordinary(&mut c, 1_900);
+        let finding_task = seed_ordinary(&mut c, 2_000);
+
+        for ordinal in 0..=MAX_ATTRIBUTION_ATTEMPTS_PER_TASK {
+            c.execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at,ended_at,end_reason)
+                 VALUES (?1,?2,'worker','gpt','high','codex',?3,?4,'done')",
+                rusqlite::params![
+                    active_task,
+                    format!("overflow-worker-{ordinal}"),
+                    ordinal as i64,
+                    ordinal as i64 + 1,
+                ],
+            )
+            .unwrap();
+        }
+        for ordinal in 0..=MAX_TOKEN_USAGE_ROWS_PER_TASK {
+            crate::token_usage::record(
+                &mut c,
+                None,
+                "classifier",
+                &[token_task],
+                None,
+                "codex",
+                "gpt",
+                "high",
+                crate::token_usage::TokenUsage {
+                    uncached_input_tokens: ordinal as i64,
+                    ..Default::default()
+                },
+                ordinal as i64,
+            )
+            .unwrap();
+        }
+
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,created_at,updated_at)
+             VALUES (?1,'completed',0,0,1,1,1)",
+            [planning_task],
+        )
+        .unwrap();
+        let graph_id = c.last_insert_rowid();
+        for ordinal in 0..=MAX_PLANNING_INCIDENT_ROWS_PER_TASK {
+            c.execute(
+                "INSERT INTO decomposition_attempts(
+                     graph_id,source_revision,kind,ordinal,retry_generation,
+                     reason_code,summary,created_at)
+                 VALUES (?1,1,'proposal',?2,0,'overflow','fixture',?2)",
+                rusqlite::params![graph_id, ordinal as i64],
+            )
+            .unwrap();
+        }
+        for ordinal in 0..=MAX_REVIEW_COLLECTION_ROWS_PER_TASK {
+            c.execute(
+                "INSERT INTO review_collection_runs(
+                     pr_number,task_id,status,collector_model,collector_version,
+                     findings_count,attempted_at,completed_at)
+                 VALUES (?1,?2,'success','test','v1',0,1,1)",
+                rusqlite::params![10_000 + ordinal as i64, collection_task],
+            )
+            .unwrap();
+        }
+        for ordinal in 0..=MAX_REVIEW_FINDINGS_PER_TASK {
+            c.execute(
+                "INSERT INTO review_findings(
+                     pr_number,task_id,reviewer,kind,author_pushback,text,source_endpoint,created_at)
+                 VALUES (?1,?2,'r','suggestion',0,'overflow','pulls',1)",
+                rusqlite::params![20_000 + ordinal as i64, finding_task],
+            )
+            .unwrap();
+        }
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent_for = |task_id| {
+            report
+                .intents
+                .iter()
+                .find(|intent| intent.intent_id == format!("intent-{task_id}"))
+                .unwrap()
+        };
+        assert!(intent_for(active_task).active_model_secs.is_none());
+        assert!(!intent_for(active_task).coverage.active_model_secs);
+        assert!(intent_for(token_task).role_tokens_usd.is_none());
+        assert!(!intent_for(token_task).coverage.role_tokens_usd);
+        assert!(intent_for(planning_task).replan_count.is_none());
+        assert!(!intent_for(planning_task).coverage.replan);
+        assert!(intent_for(collection_task).review_quality.is_none());
+        assert!(!intent_for(collection_task).coverage.review_quality);
+        assert!(intent_for(finding_task).review_quality.is_none());
+        assert!(!intent_for(finding_task).coverage.review_quality);
     }
 
     #[test]
