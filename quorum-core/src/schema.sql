@@ -1042,6 +1042,11 @@ CREATE TABLE IF NOT EXISTS planner_submissions (
     rejections    INTEGER NOT NULL DEFAULT 0,
     accepted_at   INTEGER
 );
+-- v75: facts reads planner invocation evidence by graph. This exact lookup
+-- index keeps its per-source prefix/probe bounded even with retained planner
+-- submissions for unrelated graphs.
+CREATE INDEX IF NOT EXISTS planner_submissions_graph_id
+    ON planner_submissions(graph_id);
 
 -- v61: durable storage for GitHub collaboration attempts, their agent operation outbox, and
 -- pending-review publication ownership. Runtime claiming/execution is deliberately separate.
