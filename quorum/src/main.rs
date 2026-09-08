@@ -1731,7 +1731,18 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
             Ok(0)
         }
-        cli::Command::Perf { by, all, json } => {
+        cli::Command::Perf {
+            by,
+            all,
+            json,
+            facts,
+        } => {
+            if facts {
+                let conn = quorum_core::db::open(&paths::db_path()?)?;
+                let report = quorum_core::perf::perf_facts(&conn, all)?;
+                output::emit(&report);
+                return Ok(0);
+            }
             let cut = match by.as_deref() {
                 None => quorum_core::perf::PerfCut::Default,
                 Some("complexity") => quorum_core::perf::PerfCut::Complexity,

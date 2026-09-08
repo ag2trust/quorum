@@ -1688,6 +1688,27 @@ restarts and binary upgrades (persisted in SQLite, read on every `perf` call).
 Historical collector artifacts (collection runs, findings, errors) created by a
 prior backfill are retained as audit data but do not affect the default report.
 
+**Performance facts report (#249):** `quorum perf --facts --json [--all]` is a
+versioned, read-only evidence surface. `--facts` requires `--json` and conflicts
+with the aggregate-report cut `--by`; invalid combinations are usage errors
+(exit 2). It uses the same prospective-by-default cohort as `perf`, and `--all`
+bypasses the watermark for historical inclusion.
+
+The JSON report has the stable top-level shape
+`{facts_version, cohort, query_limits, counts, coverage, excluded_reasons, intents}`
+with `facts_version: "perf-facts-v1"`. `cohort` declares the watermark and
+whether the request is prospective-only; `query_limits` declares the bounded
+intent and contributing-task limits; `counts`, `coverage`, and
+`excluded_reasons` make selection and evidence completeness auditable. Each
+`intents` entry represents one ordinary managed terminal implementation task,
+with its identity, contributing task IDs, inclusion reason, evidence fields,
+and per-field coverage flags. Uncollected evidence is represented explicitly as
+JSON `null` with a false coverage flag, rather than fabricated values.
+
+This report only reads durable task evidence. It is not a QPS calculation,
+score or leaderboard, budget/weight definition, or durable analytics snapshot;
+it performs no writes and does not establish any of those future contracts.
+
 ## Built-in coding runners: Claude, Codex, and Grok Build
 
 **Date:** 2026-07-24 (provider-neutral launch and recovery state 2026-08-05)
