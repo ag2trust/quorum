@@ -2957,9 +2957,9 @@ fn complete_graph_if_final_child_with_explicit_recovery(
     allow_legacy_publication_recovery: bool,
     allow_modern_generated_child_recovery: bool,
 ) -> Result<bool> {
-    let graph: Option<(i64, i64)> = tx
+    let graph: Option<(i64, i64, String)> = tx
         .query_row(
-            "SELECT d.id,d.source_task_id
+            "SELECT d.id,d.source_task_id,d.state
              FROM task_graph_members m
              JOIN task_decompositions d ON d.id=m.graph_id
              WHERE m.task_id=?1 AND m.active=1 AND d.active=1
@@ -3000,10 +3000,10 @@ fn complete_graph_if_final_child_with_explicit_recovery(
                 allow_legacy_publication_recovery,
                 allow_modern_generated_child_recovery
             ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((graph_id, source_id)) = graph else {
+    let Some((graph_id, source_id, graph_state)) = graph else {
         return Ok(false);
     };
     let unfinished: bool = tx.query_row(
@@ -3014,7 +3014,7 @@ fn complete_graph_if_final_child_with_explicit_recovery(
         |row| row.get(0),
     )?;
     if unfinished {
-        if !allow_modern_generated_child_recovery {
+        if !allow_modern_generated_child_recovery || graph_state != "blocked" {
             return Ok(false);
         }
         let graph_reactivated = tx.execute(
