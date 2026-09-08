@@ -21536,6 +21536,281 @@ type ConfiguredRunRoute = (
     Option<String>,
 );
 
+/// The durable identity installed by `fallback::install` before a provider is
+/// allowed to execute.  The pending marker is deliberately narrower than a
+/// normal journal upsert: a stale fallback launch must not overwrite a newer
+/// session that reused the same agent name.
+struct FallbackJournalPromotion<'a> {
+    db_path: &'a Path,
+    agent: &'a str,
+    role: &'a str,
+    task_id: i64,
+    session_id: &'a str,
+    worktree: &'a str,
+    provider: &'a str,
+    working_phase: &'a str,
+    log_dir: Option<&'a str>,
+}
+
+impl FallbackJournalPromotion<'_> {
+    /// Record the wrapper's process-group leader while it is still unable to
+    /// execute its provider.  Recovery can therefore reap exactly this group
+    /// if the daemon dies before the gate is released.
+    async fn record_pending_process_group(&self, process_group_id: i32) -> Result<()> {
+        if process_group_id <= 0 {
+            return Err(QuorumError::Io(
+                "fallback launch wrapper has an invalid process-group ID".into(),
+            ));
+        }
+        let db_path = self.db_path.to_path_buf();
+        let agent = self.agent.to_string();
+        let role = self.role.to_string();
+        let task_id = self.task_id;
+        let session_id = self.session_id.to_string();
+        let worktree = self.worktree.to_string();
+        let provider = self.provider.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&db_path)?;
+            let tx = quorum_core::db::begin_immediate(&mut conn)?;
+            let changed = tx.execute(
+                "UPDATE journal
+                 SET pid=?1,updated_at=?2
+                 WHERE agent=?3 AND role=?4 AND task_id=?5 AND session_id=?6
+                   AND worktree=?7 AND provider=?8 AND phase='fallback-pending'
+                   AND pid IS NULL AND continuation_id IS NULL",
+                rusqlite::params![
+                    process_group_id,
+                    now_unix(),
+                    agent,
+                    role,
+                    task_id,
+                    session_id,
+                    worktree,
+                    provider,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(QuorumError::Io(
+                    "fallback-pending journal identity changed before process-group commit".into(),
+                ));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("fallback PID journal join: {error}")))?
+    }
+
+    /// Only a released wrapper that still owns its exact pending marker may
+    /// become a normal working/reviewing process.  Keep this write separate
+    /// from gate release: no provider or process call occurs in its immediate
+    /// transaction.
+    async fn promote_released_process_group(&self, process_group_id: i32) -> Result<()> {
+        let db_path = self.db_path.to_path_buf();
+        let agent = self.agent.to_string();
+        let role = self.role.to_string();
+        let task_id = self.task_id;
+        let session_id = self.session_id.to_string();
+        let worktree = self.worktree.to_string();
+        let provider = self.provider.to_string();
+        let phase = self.working_phase.to_string();
+        let log_dir = self.log_dir.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&db_path)?;
+            let tx = quorum_core::db::begin_immediate(&mut conn)?;
+            let changed = tx.execute(
+                "UPDATE journal
+                 SET phase=?1,log_dir=?2,updated_at=?3
+                 WHERE agent=?4 AND role=?5 AND task_id=?6 AND session_id=?7
+                   AND worktree=?8 AND provider=?9 AND phase='fallback-pending'
+                   AND pid=?10 AND continuation_id IS NULL",
+                rusqlite::params![
+                    phase,
+                    log_dir,
+                    now_unix(),
+                    agent,
+                    role,
+                    task_id,
+                    session_id,
+                    worktree,
+                    provider,
+                    process_group_id,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(QuorumError::Io(
+                    "fallback-pending journal identity changed before release promotion".into(),
+                ));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("fallback promotion journal join: {error}")))?
+    }
+}
+
+fn fallback_launch_failure(detail: impl Into<String>) -> runner::RunnerFailure {
+    runner::RunnerFailure::classified(
+        runner::FailureDisposition::NonFailover,
+        detail,
+        std::io::ErrorKind::InvalidInput,
+    )
+}
+
+fn routed_provider_executable(
+    config: &ServeConfig,
+    kind: runner::AgentKind,
+    worktree: &Path,
+) -> std::result::Result<String, runner::RunnerFailure> {
+    let path = std::env::var_os("PATH");
+    routed_provider_executable_in_path(config, kind, worktree, path.as_deref())
+}
+
+/// Resolve a routed executable using the provider child's PATH semantics.
+///
+/// Tests pass an explicit PATH so route validation remains deterministic; the
+/// production caller above supplies the daemon environment inherited by the
+/// child.  Relative and empty PATH components must be relative to `worktree`,
+/// because every provider adapter sets that as the child current directory.
+fn routed_provider_executable_in_path(
+    config: &ServeConfig,
+    kind: runner::AgentKind,
+    worktree: &Path,
+    path: Option<&std::ffi::OsStr>,
+) -> std::result::Result<String, runner::RunnerFailure> {
+    let requested = agent_bin_for_kind(config, kind).unwrap_or(match kind {
+        runner::AgentKind::Claude => "claude",
+        runner::AgentKind::Codex => "codex",
+        runner::AgentKind::Grok => "grok",
+    });
+    if requested.is_empty() || requested.contains('\0') {
+        return Err(fallback_launch_failure(format!(
+            "routed {kind} executable is empty or invalid"
+        )));
+    }
+
+    // Returning absolute candidates closes the cwd race between validation
+    // and exec.  It also gives bare routes the same interpretation as the
+    // adapter, which calls `current_dir(worktree)` on its child command.
+    let worktree_base = if worktree.is_absolute() {
+        worktree.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                fallback_launch_failure(format!("cannot resolve fallback worktree: {error}"))
+            })?
+            .join(worktree)
+    };
+    let requested_path = Path::new(requested);
+    let explicit_path = requested_path.is_absolute() || requested_path.components().count() > 1;
+    let candidates = if explicit_path {
+        // Configured relative paths are relative to the managed worktree.
+        // `PathBuf::join` retains an absolute requested path unchanged.
+        let base = worktree_base;
+        vec![base.join(requested_path)]
+    } else {
+        path.map(|path| {
+            std::env::split_paths(path)
+                .map(|directory| {
+                    let directory = if directory.is_absolute() {
+                        directory
+                    } else {
+                        // An empty PATH entry means the current directory;
+                        // relative entries have the same base.  The adapter's
+                        // current directory is the managed worktree, not the
+                        // daemon process cwd.
+                        worktree_base.join(directory)
+                    };
+                    directory.join(requested_path)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+    };
+    for candidate in candidates {
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::PermissionsExt;
+            metadata.is_file()
+                && metadata.permissions().mode() & 0o111 != 0
+                && std::ffi::CString::new(candidate.as_os_str().as_bytes())
+                    .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 })
+        };
+        #[cfg(not(unix))]
+        let executable = metadata.is_file();
+        if executable {
+            let display = candidate.display().to_string();
+            return candidate.into_os_string().into_string().map_err(|_| {
+                fallback_launch_failure(format!(
+                    "routed {kind} executable '{}' is not valid UTF-8",
+                    display
+                ))
+            });
+        }
+    }
+
+    Err(fallback_launch_failure(format!(
+        "routed {kind} executable '{requested}' is missing or not executable"
+    )))
+}
+
+/// Start a fallback provider behind the daemon gate and make the process
+/// recoverable before releasing it.  The caller owns lifecycle disposition,
+/// but this helper always reaps a wrapper if either durable setup or release
+/// promotion fails, so an uncommitted process never gains managed authority.
+async fn launch_and_commit_fallback(
+    config: &ServeConfig,
+    kind: runner::AgentKind,
+    launch: &runner::LaunchRequest<'_>,
+    grok_worker_request: Option<runner::WorkerTurnRequest>,
+    journal: FallbackJournalPromotion<'_>,
+) -> std::result::Result<runner::RunnerProc, runner::RunnerFailure> {
+    let executable = routed_provider_executable(config, kind, launch.worktree)?;
+    let adapter = runner_adapter_config(config, Some(&executable));
+    let (mut proc, gate) = runner::RunnerProc::launch_gated(launch, &adapter).await?;
+
+    if let Some(worker_request) = grok_worker_request {
+        match &mut proc {
+            runner::RunnerProc::Grok(proc) => proc.set_worker_request(worker_request),
+            _ => {
+                drop(gate);
+                let _ = proc.kill_and_reap().await;
+                return Err(fallback_launch_failure(
+                    "gated fallback worker identity does not belong to Grok",
+                ));
+            }
+        }
+    }
+
+    let process_group_id = proc.process_group_id();
+    if let Err(error) = journal.record_pending_process_group(process_group_id).await {
+        // Dropping the gate EOFs the waiting wrapper before it can exec the
+        // provider; kill/reap also covers a wrapper that raced its EOF.
+        drop(gate);
+        let _ = proc.kill_and_reap().await;
+        return Err(fallback_launch_failure(format!(
+            "fallback launch PID journal failed: {error}"
+        )));
+    }
+
+    let proc = gate.release(proc).await?;
+    if let Err(error) = journal
+        .promote_released_process_group(process_group_id)
+        .await
+    {
+        let _ = proc.kill_and_reap().await;
+        return Err(fallback_launch_failure(format!(
+            "fallback launch promotion failed: {error}"
+        )));
+    }
+    Ok(proc)
+}
+
 fn load_reviewer_fallback_currency(
     conn: &quorum_core::Connection,
     slot: &SlotState,
@@ -22090,6 +22365,70 @@ fn worker_fallback_pending_turn(slot: &SlotState) -> PendingTurn {
     }
 }
 
+/// The launch helper has already reaped any gated wrapper by the time this
+/// runs.  Retire the fresh fallback capability and its pending marker before
+/// returning control to the worker teardown path, so a failed launch cannot
+/// be replayed after the responsibility has been settled.
+async fn settle_failed_worker_fallback(
+    config: &ServeConfig,
+    slot: &SlotState,
+    agent_run_id: i64,
+    capability_run_id: &str,
+    pending_turn: &PendingTurn,
+    reason: String,
+    end_reason: &str,
+) -> Result<WorkerFallbackActivation> {
+    let mut conn = quorum_core::db::open(&config.db_path)?;
+    let _ = tasks::dispose_dead_turn_runner(
+        &mut conn,
+        slot.task_id,
+        &slot.agent_name,
+        &runner_state::ProviderBlock {
+            provider: pending_turn.provider.clone(),
+            reason,
+        },
+        pending_turn,
+        now_unix(),
+    )?;
+    drop(conn);
+    settle_dormant_worker_turn_identity(
+        &config.db_path,
+        Some(agent_run_id),
+        Some(capability_run_id),
+        end_reason,
+    )
+    .await;
+
+    let db_path = config.db_path.clone();
+    let agent = slot.agent_name.clone();
+    let task_id = slot.task_id;
+    let cleared = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        tx.execute(
+            "DELETE FROM journal
+             WHERE agent=?1 AND role='worker' AND task_id=?2
+               AND phase='fallback-pending'",
+            rusqlite::params![agent, task_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await;
+    match cleared {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!(
+            "worker {} fallback settlement could not clear its pending journal: {error}",
+            slot.agent_name
+        )),
+        Err(error) => log(&format!(
+            "worker {} fallback settlement journal cleanup join failed: {error}",
+            slot.agent_name
+        )),
+    }
+    Ok(WorkerFallbackActivation::Settled)
+}
+
 fn load_worker_fallback_currency(
     conn: &quorum_core::Connection,
     slot: &SlotState,
@@ -22287,71 +22626,41 @@ async fn activate_worker_fallback(
                 "fallback intent provider '{}' does not match model '{}' resolved as '{kind}'",
                 intent.pending_turn.provider, intent.pending_turn.model
             );
-            let mut conn = quorum_core::db::open(&config.db_path)?;
-            let _ = tasks::dispose_dead_turn_runner(
-                &mut conn,
-                slot.task_id,
-                &slot.agent_name,
-                &runner_state::ProviderBlock {
-                    provider: intent.pending_turn.provider.clone(),
-                    reason,
-                },
+            return settle_failed_worker_fallback(
+                config,
+                slot,
+                intent.agent_run_id,
+                &intent.capability_run_id,
                 &alternate_pending,
-                now_unix(),
-            )?;
-            settle_dormant_worker_turn_identity(
-                &config.db_path,
-                Some(intent.agent_run_id),
-                Some(&intent.capability_run_id),
+                reason,
                 "fallback_route_invalid",
             )
             .await;
-            return Ok(WorkerFallbackActivation::Settled);
         }
         Err(error) => {
-            let mut conn = quorum_core::db::open(&config.db_path)?;
-            let _ = tasks::dispose_dead_turn_runner(
-                &mut conn,
-                slot.task_id,
-                &slot.agent_name,
-                &runner_state::ProviderBlock {
-                    provider: intent.pending_turn.provider.clone(),
-                    reason: format!("fallback route is not executable: {error}"),
-                },
+            return settle_failed_worker_fallback(
+                config,
+                slot,
+                intent.agent_run_id,
+                &intent.capability_run_id,
                 &alternate_pending,
-                now_unix(),
-            )?;
-            settle_dormant_worker_turn_identity(
-                &config.db_path,
-                Some(intent.agent_run_id),
-                Some(&intent.capability_run_id),
+                format!("fallback route is not executable: {error}"),
                 "fallback_route_invalid",
             )
             .await;
-            return Ok(WorkerFallbackActivation::Settled);
         }
     };
     if alternate_kind == runner::AgentKind::Grok && intent.pending_turn.turn_kind != "initial" {
-        let mut conn = quorum_core::db::open(&config.db_path)?;
-        let _ = tasks::dispose_dead_turn_runner(
-            &mut conn,
-            slot.task_id,
-            &slot.agent_name,
-            &runner_state::ProviderBlock {
-                provider: intent.pending_turn.provider.clone(),
-                reason: "Grok fallback requires a fresh initial worker turn".into(),
-            },
+        return settle_failed_worker_fallback(
+            config,
+            slot,
+            intent.agent_run_id,
+            &intent.capability_run_id,
             &alternate_pending,
-            now_unix(),
-        )?;
-        settle_dormant_worker_turn_identity(
-            &config.db_path,
-            Some(intent.agent_run_id),
-            Some(&intent.capability_run_id),
+            "Grok fallback requires a fresh initial worker turn".into(),
             "fallback_route_incompatible",
         )
         .await;
-        return Ok(WorkerFallbackActivation::Settled);
     }
     let environment = managed_run_environment(
         config,
@@ -22368,38 +22677,59 @@ async fn activate_worker_fallback(
         // Cross-provider continuation is never valid.
         continuation_id: runner_continuation_id(alternate_kind, &session_id, None),
     };
-    let launched = if alternate_kind == runner::AgentKind::Grok {
-        runner::RunnerProc::launch_internal_worker(
-            &runner::RunnerRequest {
-                launch,
-                task_id: slot.task_id,
-                role_assignment_id: assignment.id,
-                responsibility_key: &assignment.responsibility_key,
-                agent: &slot.agent_name,
-                role: "worker",
-                pending_turn: PendingTurn {
-                    provider: intent.pending_turn.provider.clone(),
-                    model: intent.pending_turn.model.clone(),
-                    effort: intent.pending_turn.effort.clone(),
-                    prompt: intent.pending_turn.prompt.clone(),
-                    turn_kind: intent.pending_turn.turn_kind.clone(),
-                    continuation_id: None,
-                    requested: intent.pending_turn.requested,
-                },
-            },
-            &runner_adapter_config(config, agent_bin_for_kind(config, alternate_kind)),
+    let grok_worker_request =
+        (alternate_kind == runner::AgentKind::Grok).then(|| runner::WorkerTurnRequest {
+            task_id: slot.task_id,
+            role_assignment_id: assignment.id,
+            responsibility_key: assignment.responsibility_key.clone(),
+            agent: slot.agent_name.clone(),
+            role: "worker".into(),
+            provider: alternate_kind.to_string(),
+            runner: alternate_kind.to_string(),
+            model: intent.pending_turn.model.clone(),
+            effort: intent.pending_turn.effort.clone(),
+            pending_turn: alternate_pending.clone(),
+        });
+    let session_started_at = now_unix();
+    let mut new_session_log = config.log_dir.as_ref().and_then(|log_dir| {
+        session_log::SessionLog::create(
+            log_dir,
+            &slot.agent_name,
+            "worker",
+            Some(slot.task_id),
+            &session_id,
+            &slot.remote_branch,
+            session_started_at,
         )
-        .await
-    } else {
-        runner::RunnerProc::launch(
-            &launch,
-            &runner_adapter_config(config, agent_bin_for_kind(config, alternate_kind)),
-        )
-        .await
-    };
-    let proc = match launched {
+        .ok()
+    });
+    let log_dir = new_session_log
+        .as_ref()
+        .map(|log| log.dir().to_string_lossy().into_owned());
+    let proc = match launch_and_commit_fallback(
+        config,
+        alternate_kind,
+        &launch,
+        grok_worker_request,
+        FallbackJournalPromotion {
+            db_path: &config.db_path,
+            agent: &slot.agent_name,
+            role: "worker",
+            task_id: slot.task_id,
+            session_id: &session_id,
+            worktree: &intent.worktree,
+            provider: &intent.pending_turn.provider,
+            working_phase: "working",
+            log_dir: log_dir.as_deref(),
+        },
+    )
+    .await
+    {
         Ok(proc) => proc,
         Err(error) => {
+            if let Some(log) = &mut new_session_log {
+                log.finalize(None);
+            }
             if matches!(
                 error.disposition(),
                 runner::FailureDisposition::ProviderUnavailable
@@ -22426,111 +22756,18 @@ async fn activate_worker_fallback(
                 ))
                 .await;
             }
-            let alternate_pending = PendingTurn {
-                provider: intent.pending_turn.provider.clone(),
-                model: intent.pending_turn.model.clone(),
-                effort: intent.pending_turn.effort.clone(),
-                prompt: intent.pending_turn.prompt.clone(),
-                turn_kind: intent.pending_turn.turn_kind.clone(),
-                continuation_id: None,
-                requested: intent.pending_turn.requested,
-            };
-            let mut conn = quorum_core::db::open(&config.db_path)?;
-            let _ = tasks::dispose_dead_turn_runner(
-                &mut conn,
-                slot.task_id,
-                &slot.agent_name,
-                &runner_state::ProviderBlock {
-                    provider: alternate_pending.provider.clone(),
-                    reason: format!("fallback launch failed: {error}"),
-                },
+            return settle_failed_worker_fallback(
+                config,
+                slot,
+                intent.agent_run_id,
+                &intent.capability_run_id,
                 &alternate_pending,
-                now_unix(),
-            )?;
-            settle_dormant_worker_turn_identity(
-                &config.db_path,
-                Some(intent.agent_run_id),
-                Some(&intent.capability_run_id),
+                format!("fallback launch failed: {error}"),
                 "fallback_launch_failed",
             )
             .await;
-            return Ok(WorkerFallbackActivation::Settled);
         }
     };
-
-    let session_started_at = now_unix();
-    let new_session_log = config.log_dir.as_ref().and_then(|log_dir| {
-        session_log::SessionLog::create(
-            log_dir,
-            &slot.agent_name,
-            "worker",
-            Some(slot.task_id),
-            &session_id,
-            &slot.remote_branch,
-            session_started_at,
-        )
-        .ok()
-    });
-    let journal_entry = JournalEntry {
-        agent: slot.agent_name.clone(),
-        role: "worker".into(),
-        task_id: Some(slot.task_id),
-        session_id: session_id.clone(),
-        worktree: Some(intent.worktree.clone()),
-        branch: Some(slot.remote_branch.clone()),
-        phase: "working".into(),
-        cost_tokens: 0,
-        agent_state: None,
-        cost_usd: 0.0,
-        log_dir: new_session_log
-            .as_ref()
-            .map(|log| log.dir().to_string_lossy().into()),
-        pid: proc.pid(),
-        pr: slot.pr,
-        rework_count: slot.rework_count as i32,
-        provider: Some(alternate_kind.to_string()),
-        continuation_id: None,
-        local_branch: Some(slot.branch.clone()),
-    };
-    let journal_path = config.db_path.clone();
-    let journal_result = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = quorum_core::db::open(&journal_path)?;
-        journal::upsert(&mut conn, &journal_entry)
-    })
-    .await
-    .map_err(|error| QuorumError::Io(format!("worker fallback journal join: {error}")))?;
-    if let Err(error) = journal_result {
-        let _ = proc.kill_and_reap().await;
-        let alternate_pending = PendingTurn {
-            provider: intent.pending_turn.provider.clone(),
-            model: intent.pending_turn.model.clone(),
-            effort: intent.pending_turn.effort.clone(),
-            prompt: intent.pending_turn.prompt.clone(),
-            turn_kind: intent.pending_turn.turn_kind.clone(),
-            continuation_id: None,
-            requested: intent.pending_turn.requested,
-        };
-        let mut conn = quorum_core::db::open(&config.db_path)?;
-        let _ = tasks::dispose_dead_turn_runner(
-            &mut conn,
-            slot.task_id,
-            &slot.agent_name,
-            &runner_state::ProviderBlock {
-                provider: alternate_pending.provider.clone(),
-                reason: format!("fallback journal failed: {error}"),
-            },
-            &alternate_pending,
-            now_unix(),
-        )?;
-        settle_dormant_worker_turn_identity(
-            &config.db_path,
-            Some(intent.agent_run_id),
-            Some(&intent.capability_run_id),
-            "fallback_journal_failed",
-        )
-        .await;
-        return Ok(WorkerFallbackActivation::Settled);
-    }
 
     record_managed_usage_snapshot(
         &config.db_path,
@@ -27424,6 +27661,317 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn seed_gated_fallback_journal(db_path: &Path, worktree: &Path) {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: "Gated-Fallback".into(),
+                role: "worker".into(),
+                task_id: Some(1),
+                session_id: "gated-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/gated-fallback".into()),
+                phase: "fallback-pending".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/gated-fallback".into()),
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn gated_fallback_journal<'a>(
+        db_path: &'a Path,
+        worktree: &'a Path,
+    ) -> FallbackJournalPromotion<'a> {
+        FallbackJournalPromotion {
+            db_path,
+            agent: "Gated-Fallback",
+            role: "worker",
+            task_id: 1,
+            session_id: "gated-session",
+            worktree: worktree.to_str().unwrap(),
+            provider: "codex",
+            working_phase: "working",
+            log_dir: None,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_group_reaped(process_group_id: i32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if unsafe { libc::killpg(process_group_id, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fallback process group {process_group_id} survived failed launch promotion"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_provider_started_once(marker: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(marker) {
+                assert_eq!(contents, "started", "provider must execute exactly once");
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "released fallback provider did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gated_fallback_validates_missing_and_nonexecutable_routes_before_promotion() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner = live_fallback_runner(root.path());
+        let mut config = live_fallback_test_config(
+            root.path().join("gated-route.db"),
+            root.path(),
+            &runner,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        seed_gated_fallback_journal(&config.db_path, &worktree);
+        let nonexecutable = root.path().join("not-executable");
+        std::fs::write(&nonexecutable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&nonexecutable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let environment = Vec::new();
+
+        for route in [root.path().join("missing-codex"), nonexecutable] {
+            config.agent_bin = Some(route.to_string_lossy().into_owned());
+            let error = match launch_and_commit_fallback(
+                &config,
+                runner::AgentKind::Codex,
+                &runner::LaunchRequest {
+                    model: "gpt-5.6-terra",
+                    effort: "high",
+                    worktree: &worktree,
+                    prompt: "must not execute",
+                    environment: &environment,
+                    mode: runner::LaunchMode::Normal,
+                    continuation_id: None,
+                },
+                None,
+                gated_fallback_journal(&config.db_path, &worktree),
+            )
+            .await
+            {
+                Ok(proc) => {
+                    let _ = proc.kill_and_reap().await;
+                    panic!("invalid routed executable must fail before promotion");
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error.detail().contains("missing or not executable"),
+                "{error}"
+            );
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            let marker: (String, Option<i32>) = conn
+                .query_row(
+                    "SELECT phase,pid FROM journal WHERE agent='Gated-Fallback'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(marker, ("fallback-pending".into(), None));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routed_provider_executable_uses_worktree_for_relative_and_empty_path_entries() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        let tools = worktree.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let runner = live_fallback_runner(root.path());
+        let mut config = live_fallback_test_config(
+            root.path().join("worktree-path.db"),
+            root.path(),
+            &runner,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.agent_bin = Some("fallback-codex".into());
+
+        let relative = tools.join("fallback-codex");
+        std::fs::write(&relative, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&relative, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = routed_provider_executable_in_path(
+            &config,
+            runner::AgentKind::Codex,
+            &worktree,
+            Some(OsString::from("tools").as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(Path::new(&resolved), relative);
+
+        let empty = worktree.join("fallback-codex");
+        std::fs::write(&empty, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty_path = OsString::from(":/definitely/not/a/provider-directory");
+        let resolved = routed_provider_executable_in_path(
+            &config,
+            runner::AgentKind::Codex,
+            &worktree,
+            Some(empty_path.as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(Path::new(&resolved), empty);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gated_fallback_commits_process_group_before_releasing_provider_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let started = root.path().join("provider-started");
+        let runner = root.path().join("marker-codex");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf started >> '{}'\nexec sleep 30\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = live_fallback_test_config(
+            root.path().join("gated-success.db"),
+            root.path(),
+            &runner,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        seed_gated_fallback_journal(&config.db_path, &worktree);
+        let environment = Vec::new();
+        let proc = launch_and_commit_fallback(
+            &config,
+            runner::AgentKind::Codex,
+            &runner::LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: &worktree,
+                prompt: "execute once after the durable gate commit",
+                environment: &environment,
+                mode: runner::LaunchMode::Normal,
+                continuation_id: None,
+            },
+            None,
+            gated_fallback_journal(&config.db_path, &worktree),
+        )
+        .await
+        .unwrap();
+        let process_group_id = proc.process_group_id();
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let marker: (String, i32) = conn
+            .query_row(
+                "SELECT phase,pid FROM journal WHERE agent='Gated-Fallback'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(marker, ("working".into(), process_group_id));
+        drop(conn);
+        assert_provider_started_once(&started).await;
+        let _ = proc.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gated_fallback_promotion_failure_reaps_released_process_group() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner = root.path().join("marker-codex");
+        std::fs::write(&runner, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = live_fallback_test_config(
+            root.path().join("gated-promotion.db"),
+            root.path(),
+            &runner,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        seed_gated_fallback_journal(&config.db_path, &worktree);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_gated_fallback_promotion
+             BEFORE UPDATE OF phase ON journal
+             WHEN NEW.phase='working'
+             BEGIN SELECT RAISE(ABORT, 'promotion rejected'); END",
+        )
+        .unwrap();
+        drop(conn);
+        let environment = Vec::new();
+        let error = match launch_and_commit_fallback(
+            &config,
+            runner::AgentKind::Codex,
+            &runner::LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: &worktree,
+                prompt: "execute once after release",
+                environment: &environment,
+                mode: runner::LaunchMode::Normal,
+                continuation_id: None,
+            },
+            None,
+            gated_fallback_journal(&config.db_path, &worktree),
+        )
+        .await
+        {
+            Ok(proc) => {
+                let _ = proc.kill_and_reap().await;
+                panic!("promotion failure must reap the released provider group");
+            }
+            Err(error) => error,
+        };
+        assert!(error.detail().contains("promotion failed"), "{error}");
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let marker: (String, i32) = conn
+            .query_row(
+                "SELECT phase,pid FROM journal WHERE agent='Gated-Fallback'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(marker.0, "fallback-pending");
+        drop(conn);
+        assert_process_group_reaped(marker.1).await;
+    }
+
+    #[cfg(unix)]
     fn seed_live_fallback_assignment(
         config: &ServeConfig,
         conn: &mut quorum_core::Connection,
@@ -27639,6 +28187,201 @@ mod tests {
         assert!(pid.is_some());
         drop(conn);
         let _ = slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_worker_fallback_promotion_failure_reaps_and_settles_alternate_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let config = live_fallback_test_config(
+            root.path().join("worker-promotion-failure.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback promotion failure",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        // The promotion write fails after release.  The delete trigger records
+        // the exact durable group ID before settlement removes the marker, so
+        // this activation-level test can prove both reaping and authority
+        // cleanup without retaining a recoverable pending journal row.
+        conn.execute_batch(
+            "CREATE TABLE failed_fallback_groups(pgid INTEGER NOT NULL);
+             CREATE TRIGGER reject_live_fallback_promotion
+             BEFORE UPDATE OF phase ON journal
+             WHEN NEW.phase='working'
+             BEGIN SELECT RAISE(ABORT, 'promotion rejected'); END;
+             CREATE TRIGGER record_failed_fallback_group
+             BEFORE DELETE ON journal
+             WHEN OLD.agent='Fallback-Worker' AND OLD.role='worker'
+                  AND OLD.phase='fallback-pending'
+             BEGIN INSERT INTO failed_fallback_groups(pgid) VALUES (OLD.pid); END;",
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let mut slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        drop(conn);
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+
+        assert_eq!(
+            activate_worker_fallback(&config, &mut slot, &failure, &currency)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Settled
+        );
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (
+            ended_alternate_runs,
+            active_alternate_runs,
+            revoked_alternate_caps,
+            active_alternate_caps,
+            pending_markers,
+            process_group_id,
+        ): (i64, i64, i64, i64, i64, i32) = conn
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM agent_runs
+                      WHERE task_id=?1 AND id != ?2 AND ended_at IS NOT NULL
+                        AND end_reason='fallback_launch_failed'),
+                     (SELECT count(*) FROM agent_runs
+                      WHERE task_id=?1 AND id != ?2 AND ended_at IS NULL),
+                     (SELECT count(*) FROM run_capabilities
+                      WHERE task_id=?1 AND agent_run_id != ?2 AND revoked_at IS NOT NULL),
+                     (SELECT count(*) FROM run_capabilities
+                      WHERE task_id=?1 AND agent_run_id != ?2 AND revoked_at IS NULL),
+                     (SELECT count(*) FROM journal
+                      WHERE agent='Fallback-Worker' AND role='worker' AND task_id=?1
+                        AND phase='fallback-pending'),
+                     (SELECT pgid FROM failed_fallback_groups)",
+                rusqlite::params![task_id, initial_run],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                ended_alternate_runs,
+                active_alternate_runs,
+                revoked_alternate_caps,
+                active_alternate_caps,
+                pending_markers,
+            ),
+            (1, 0, 1, 0, 0),
+            "the failed alternate must not retain lifecycle authority"
+        );
+        drop(conn);
+        assert_process_group_reaped(process_group_id).await;
     }
 
     #[cfg(unix)]
