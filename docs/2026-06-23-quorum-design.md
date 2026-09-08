@@ -2472,8 +2472,12 @@ target/approved head SHA. Its final assigned worker must be `completed` before t
 resolves, `merged`, or a graceful cleanup with the same durable handoff rule used by explicit
 adoption: `submitted` requires a live `task_in_review` event naming that worker within its run and
 at or before target resolution; `awaiting_merge` additionally requires the later live
-`task_merging` event within that run. It changes only the failed child and records recovery
-provenance while preserving the PR; on a blocked graph it leaves the graph blocked and active.
+`task_merging` event within that run. Both adoption paths also require the recovery task's durable
+top-level `refs.merge_commit_sha` to be a non-empty, NUL-free 40- or 64-hex Git SHA, then atomically
+project that exact SHA to the adopted child's top-level `refs.merge_commit_sha`. Recovery provenance
+retains the approved PR head separately and never substitutes it for the merge commit. It changes
+only the failed child and records recovery provenance while preserving the PR; on a blocked graph it
+leaves the graph blocked and active.
 Missing or expired evidence, replay, and losing concurrent callers are clean no-ops with no
 events; the winner emits bounded child-completion events once.
 
