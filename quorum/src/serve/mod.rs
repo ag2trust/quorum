@@ -36765,7 +36765,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 None,
                 0,
                 None,
-                Some(&serde_json::json!({ "pr": 701 }).to_string()),
+                // PR refs remain compatible with the durable string encoding;
+                // recovery must still fetch and conditionally stamp this row.
+                Some(&serde_json::json!({ "pr": "701" }).to_string()),
                 None,
                 None,
                 now_unix(),

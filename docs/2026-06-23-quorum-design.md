@@ -394,11 +394,12 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   fresh branch/PR. A `pr-merged` classification is delivery evidence: the park is terminal
   and retry refuses to restore it (§ Explicit cancellation and durable parking). When the
   continuation PR belongs to a failed active graph child, creation stamps that exact child as
-  `refs.source_task` if the ref is absent; this is recovery provenance, not caller authority.
+  `refs.source_task` if the ref is absent; this is recovery provenance, not caller authority,
+  and creator/assignee metadata replacement preserves it.
 - ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
   `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
   dependency gating, and reviewer attachment are all preserved as internal functions.
-- `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Creator/agent updates may not add, replace, or remove `refs.pr`; that association is daemon-owned. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through run-scoped `submit`. See § Daemon-only execution.)**
+- `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Creator/agent updates may not add, replace, or remove `refs.pr` or persisted `refs.source_task`; those are daemon-owned association and recovery provenance. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through run-scoped `submit`. See § Daemon-only execution.)**
 - `quorum task-close --agent <id> --task-id <n> --reason-stdin|--reason-file` → explicit
   manual/external terminal close (merged by hand, fixed elsewhere, obsolete). From any
   state except `done`/`cancelled`, but never an active decomposition source, which must use
@@ -817,7 +818,8 @@ only through an explicit outside request)
   allocation provenance. If a completed dependency has `refs.pr` but no SHA (for example, it
   was manually closed after a recovery), the daemon resolves its merged PR outside the DB
   transaction, falling back to an exact GitHub merge subject match on `origin/<base>`, then conditionally stamps
-  the still-missing ref under the write lock. An open or unmerged PR parks the dependent with
+  the still-missing ref under the write lock. The durable PR ref may be either an integer or a
+  canonical decimal string. An open or unmerged PR parks the dependent with
   the named dependency and PR; no SHA is invented. A just-merged commit absent from the fetched
   ref is a bounded, claim-free deferral. The daemon never cuts the dependent branch from an
   unverifiable base.

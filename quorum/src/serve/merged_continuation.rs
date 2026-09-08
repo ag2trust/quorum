@@ -568,6 +568,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creator_metadata_update_preserves_source_task_for_automatic_reconciliation() {
+        let fixture = IncidentFixture::new();
+        let mut conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute("UPDATE tasks SET status='open' WHERE id=320", [])
+            .unwrap();
+        let revision: i64 = conn
+            .query_row("SELECT revision FROM tasks WHERE id=320", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let updated = quorum_core::tasks::update(
+            &mut conn,
+            "owner",
+            320,
+            &quorum_core::tasks::TaskUpdate {
+                refs: Some(r#"{"ticket":"REC-1"}"#),
+                expected_revision: Some(revision),
+                ..Default::default()
+            },
+            NOW,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(updated.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["source_task"], 307);
+        assert_eq!(refs["ticket"], "REC-1");
+        conn.execute("UPDATE tasks SET status='done' WHERE id=320", [])
+            .unwrap();
+        drop(conn);
+
+        let outcome = reconcile(fixture.db_path.clone(), NOW).await.unwrap();
+        assert_eq!(outcome.adopted, 1);
+        assert_incident_released(&fixture);
+    }
+
+    #[tokio::test]
     async fn production_wiring_is_startup_fail_open_and_tick_error_propagating() {
         let directory_instead_of_database = tempfile::tempdir().unwrap();
         let startup = super::super::reconcile_merged_continuations(

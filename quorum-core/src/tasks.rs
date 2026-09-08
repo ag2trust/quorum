@@ -590,23 +590,25 @@ fn preserve_classifier_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
 ) -> Option<String> {
-    preserve_protected_refs(existing, replacement, false)
+    preserve_protected_refs(existing, replacement, false, false)
 }
 
 /// Creator and assignee metadata replacement cannot mutate or erase durable
-/// runner state. The daemon uses `preserve_classifier_refs` directly so its
-/// authoritative refs path can still replace or clear these keys.
+/// runner state or recovery provenance. The daemon uses
+/// `preserve_classifier_refs` directly so its authoritative refs path can
+/// still replace or clear these keys.
 fn preserve_creator_protected_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
 ) -> Option<String> {
-    preserve_protected_refs(existing, replacement, true)
+    preserve_protected_refs(existing, replacement, true, true)
 }
 
 fn preserve_protected_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
     preserve_runner_state: bool,
+    preserve_recovery_provenance: bool,
 ) -> Option<String> {
     let replacement = replacement?;
     let mut next: serde_json::Value =
@@ -636,7 +638,8 @@ fn preserve_protected_refs(
             );
             let runner_state =
                 preserve_runner_state && (key.starts_with("runner_") || key.starts_with("codex_"));
-            if classifier_or_pr || runner_state {
+            let recovery_provenance = preserve_recovery_provenance && key == "source_task";
+            if classifier_or_pr || runner_state || recovery_provenance {
                 next_map.insert(key, value);
             }
         }
@@ -744,10 +747,13 @@ fn extract_pr_from_refs(refs: &Option<String>) -> Option<String> {
 pub fn extract_pr_number(refs: &Option<String>) -> Option<i64> {
     let s = refs.as_deref()?;
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    v.get("pr").and_then(|p| {
-        p.as_i64()
-            .or_else(|| p.as_str().and_then(|s| s.parse().ok()))
-    })
+    v.get("pr").and_then(pr_number_from_json)
+}
+
+fn pr_number_from_json(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
 pub fn extract_repo(refs: &Option<String>) -> Option<String> {
@@ -1033,7 +1039,8 @@ pub fn create_with_continue_pr_and_target_branch(
                    AND graph.active=1 AND graph.state IN ('active','blocked')
                    AND original.status='failed'
                    AND json_valid(COALESCE(original.refs, '{}'))
-                   AND json_extract(original.refs, '$.pr')=?1
+                   AND (json_extract(original.refs, '$.pr')=?1
+                        OR json_extract(original.refs, '$.pr')=CAST(?1 AS TEXT))
                  ORDER BY original.id LIMIT 1",
                 [pr],
                 |row| row.get::<_, i64>(0),
@@ -1980,7 +1987,7 @@ pub fn dependency_merge_commits(
             .map(|refs| {
                 let pr_number = refs
                     .get("pr")
-                    .and_then(serde_json::Value::as_i64)
+                    .and_then(pr_number_from_json)
                     .filter(|pr| *pr > 0);
                 let merge_commit_sha = refs
                     .get(MERGE_COMMIT_SHA_REF)
@@ -2022,7 +2029,8 @@ pub fn record_dependency_merge_commit(
              updated_at=?4
          WHERE id=?1 AND status='done'
            AND json_valid(COALESCE(refs, '{}'))
-           AND json_extract(refs, '$.pr')=?2
+           AND (json_extract(refs, '$.pr')=?2
+                OR json_extract(refs, '$.pr')=CAST(?2 AS TEXT))
            AND json_extract(refs, '$.merge_commit_sha') IS NULL",
         params![task_id, pr_number, merge_commit_sha, now],
     )?;
@@ -8231,7 +8239,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_pr_stamps_failed_graph_child_as_recovery_source() {
+    fn continue_pr_stamps_string_pr_child_and_preserves_recovery_source_on_edits() {
         let (_d, mut c) = open_tmp();
         let source = create(
             &mut c, "owner", "source", None, 0, None, None, None, None, 1,
@@ -8244,7 +8252,7 @@ mod tests {
             None,
             0,
             None,
-            Some(r#"{"pr":77}"#),
+            Some(r#"{"pr":"77"}"#),
             None,
             None,
             1,
@@ -8289,6 +8297,45 @@ mod tests {
                 .unwrap();
         assert_eq!(refs["source_task"], child);
         assert_eq!(refs["ticket"], "REC-1");
+
+        // A creator can replace ordinary metadata before delivery. That must
+        // neither remove the daemon-stamped pair nor stop automatic recovery.
+        let metadata = update(
+            &mut c,
+            "owner",
+            recovery,
+            &TaskUpdate {
+                refs: Some(r#"{"ticket":"REC-2"}"#),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            3,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(metadata.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["source_task"], child);
+        assert_eq!(refs["ticket"], "REC-2");
+
+        // Classifier-invalidating content edits take the same creator refs
+        // path and must preserve the recovery pair too.
+        let edited = update(
+            &mut c,
+            "owner",
+            recovery,
+            &TaskUpdate {
+                body: Some("continue the recovered child"),
+                refs: Some(r#"{"ticket":"REC-3"}"#),
+                expected_revision: Some(2),
+                ..Default::default()
+            },
+            4,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(edited.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["source_task"], child);
+        assert_eq!(refs["ticket"], "REC-3");
     }
 
     #[test]
