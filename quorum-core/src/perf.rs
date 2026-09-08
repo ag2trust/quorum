@@ -1598,6 +1598,7 @@ struct ManagedAttemptFact {
     spawned_at: i64,
     ended_at: Option<i64>,
     end_reason: Option<String>,
+    task_status: String,
     assignment: AssignmentFact,
     routing_attempt: Option<RoutingAttemptFact>,
     configured_profile_id: Option<String>,
@@ -1616,6 +1617,7 @@ struct PlannerAttemptFact {
 struct AttributionSnapshot {
     managed_by_task: HashMap<i64, Vec<ManagedAttemptFact>>,
     latest_worker_run_by_task: HashMap<i64, i64>,
+    incomplete_managed_task_ids: HashSet<i64>,
     planners_by_task: HashMap<i64, Vec<PlannerAttemptFact>>,
 }
 
@@ -1655,18 +1657,32 @@ fn complete_routing_attempt(attempt: &RoutingAttemptFact) -> bool {
     .all(present_text)
 }
 
+fn complete_managed_attempt(attempt: &ManagedAttemptFact) -> bool {
+    attempt.assignment.task_id == Some(attempt.task_id)
+        && attempt.assignment.role == attempt.role
+        && complete_assignment(&attempt.assignment)
+        && [
+            attempt.agent_name.as_str(),
+            attempt.model.as_str(),
+            attempt.provider.as_str(),
+            attempt.effort.as_str(),
+        ]
+        .into_iter()
+        .all(present_text)
+}
+
 fn managed_attempt_value(attempt: &ManagedAttemptFact) -> serde_json::Value {
     serde_json::json!({
         "task_id": attempt.task_id,
         "attempt_id": attempt.agent_run_id,
         "role_assignment_id": attempt.assignment.id,
         "routing_attempt_id": attempt.routing_attempt.as_ref().map(|route| route.id),
-        "agent": attempt.agent_name,
+        "agent": present_text(&attempt.agent_name).then_some(attempt.agent_name.as_str()),
         "role": attempt.role,
         "review_stage": attempt.assignment.review_stage,
-        "model": attempt.model,
-        "provider": attempt.provider,
-        "effort": attempt.effort,
+        "model": present_text(&attempt.model).then_some(attempt.model.as_str()),
+        "provider": present_text(&attempt.provider).then_some(attempt.provider.as_str()),
+        "effort": present_text(&attempt.effort).then_some(attempt.effort.as_str()),
         "spawned_at": attempt.spawned_at,
         "ended_at": attempt.ended_at,
         "end_reason": attempt.end_reason,
@@ -1766,13 +1782,21 @@ fn planner_config_value(attempt: &PlannerAttemptFact) -> serde_json::Value {
     assignment_config_value(&attempt.assignment, None)
 }
 
+fn is_final_submitting_worker(attempt: &ManagedAttemptFact) -> bool {
+    matches!(
+        attempt.end_reason.as_deref(),
+        Some("submitted" | "awaiting_merge" | "completed" | "merged")
+    ) || (attempt.ended_at.is_none()
+        && matches!(attempt.task_status.as_str(), "in-review" | "merging"))
+}
+
 fn load_attribution_snapshot(conn: &Connection, task_ids: &[i64]) -> Result<AttributionSnapshot> {
     let mut snapshot = AttributionSnapshot::default();
     for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
         let placeholders = sql_placeholders(batch.len());
         let sql = format!(
             "SELECT task_id,agent_run_id,agent_name,role,model,provider,effort,spawned_at,ended_at,
-                    end_reason,configured_profile_id,
+                    end_reason,task_status,configured_profile_id,
                     assignment_id,responsibility_key,assignment_task_id,pr_number,
                     assignment_role,review_stage,assignment_profile_id,assignment_provider,
                     assignment_runner,assignment_model,assignment_effort,assignment_pool_key,
@@ -1782,6 +1806,7 @@ fn load_attribution_snapshot(conn: &Connection, task_ids: &[i64]) -> Result<Attr
              FROM (
                  SELECT ar.task_id,ar.id AS agent_run_id,ar.agent_name,ar.role,ar.model,
                         ar.provider,ar.effort,ar.spawned_at,ar.ended_at,ar.end_reason,
+                        task.status AS task_status,
                         ar.configured_profile_id,
                         assignment.id AS assignment_id,
                         assignment.responsibility_key,
@@ -1806,6 +1831,7 @@ fn load_attribution_snapshot(conn: &Connection, task_ids: &[i64]) -> Result<Attr
                         route.policy_generation AS routing_policy_generation,
                         ROW_NUMBER() OVER (PARTITION BY ar.task_id ORDER BY ar.id DESC) AS row_num
                  FROM agent_runs ar
+                 JOIN tasks task ON task.id=ar.task_id
                  JOIN role_assignments assignment
                    ON assignment.id=ar.role_assignment_id
                   AND assignment.task_id=ar.task_id
@@ -1825,30 +1851,30 @@ fn load_attribution_snapshot(conn: &Connection, task_ids: &[i64]) -> Result<Attr
         let rows = statement
             .query_map(params_from_iter(params), |row| {
                 let assignment = AssignmentFact {
-                    id: row.get(11)?,
-                    responsibility_key: row.get(12)?,
-                    task_id: row.get(13)?,
-                    pr_number: row.get(14)?,
-                    role: row.get(15)?,
-                    review_stage: row.get(16)?,
-                    profile_id: row.get(17)?,
-                    provider: row.get(18)?,
-                    runner: row.get(19)?,
-                    model: row.get(20)?,
-                    effort: row.get(21)?,
-                    pool_key: row.get(22)?,
-                    policy_generation: row.get(23)?,
+                    id: row.get(12)?,
+                    responsibility_key: row.get(13)?,
+                    task_id: row.get(14)?,
+                    pr_number: row.get(15)?,
+                    role: row.get(16)?,
+                    review_stage: row.get(17)?,
+                    profile_id: row.get(18)?,
+                    provider: row.get(19)?,
+                    runner: row.get(20)?,
+                    model: row.get(21)?,
+                    effort: row.get(22)?,
+                    pool_key: row.get(23)?,
+                    policy_generation: row.get(24)?,
                 };
-                let routing_attempt = match row.get::<_, Option<i64>>(24)? {
+                let routing_attempt = match row.get::<_, Option<i64>>(25)? {
                     Some(id) => Some(RoutingAttemptFact {
                         id,
-                        profile_id: row.get(25)?,
-                        provider: row.get(26)?,
-                        runner: row.get(27)?,
-                        model: row.get(28)?,
-                        effort: row.get(29)?,
-                        pool_key: row.get(30)?,
-                        policy_generation: row.get(31)?,
+                        profile_id: row.get(26)?,
+                        provider: row.get(27)?,
+                        runner: row.get(28)?,
+                        model: row.get(29)?,
+                        effort: row.get(30)?,
+                        pool_key: row.get(31)?,
+                        policy_generation: row.get(32)?,
                     }),
                     None => None,
                 };
@@ -1863,7 +1889,8 @@ fn load_attribution_snapshot(conn: &Connection, task_ids: &[i64]) -> Result<Attr
                     spawned_at: row.get(7)?,
                     ended_at: row.get(8)?,
                     end_reason: row.get(9)?,
-                    configured_profile_id: row.get(10)?,
+                    task_status: row.get(10)?,
+                    configured_profile_id: row.get(11)?,
                     assignment,
                     routing_attempt,
                 })
@@ -1871,17 +1898,11 @@ fn load_attribution_snapshot(conn: &Connection, task_ids: &[i64]) -> Result<Attr
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for attempt in rows {
             // An agent run records what actually executed. Do not borrow a
-            // provider/model/effort from its assignment when that execution
-            // evidence is incomplete.
-            if attempt.assignment.task_id != Some(attempt.task_id)
-                || attempt.assignment.role != attempt.role
-                || !complete_assignment(&attempt.assignment)
-                || !present_text(&attempt.agent_name)
-                || !present_text(&attempt.model)
-                || !present_text(&attempt.provider)
-                || !present_text(&attempt.effort)
-            {
-                continue;
+            // provider/model/effort from its assignment when the execution
+            // evidence is incomplete. Retain the bounded attempt instead so
+            // its JSON nulls and coverage gap remain visible to consumers.
+            if !complete_managed_attempt(&attempt) {
+                snapshot.incomplete_managed_task_ids.insert(attempt.task_id);
             }
             snapshot
                 .managed_by_task
@@ -1889,6 +1910,35 @@ fn load_attribution_snapshot(conn: &Connection, task_ids: &[i64]) -> Result<Attr
                 .or_default()
                 .push(attempt);
         }
+
+        // An agent run with no exact durable assignment cannot be rendered as
+        // an attributed attempt. It still makes the compound attribution and
+        // configuration evidence incomplete; do not silently report the
+        // remaining linked runs as complete.
+        let incomplete_sql = format!(
+            "SELECT task_id FROM (
+                 SELECT ar.task_id,
+                        CASE WHEN assignment.id IS NULL THEN 1 ELSE 0 END AS missing_assignment,
+                        ROW_NUMBER() OVER (PARTITION BY ar.task_id ORDER BY ar.id DESC) AS row_num
+                 FROM agent_runs ar
+                 LEFT JOIN role_assignments assignment
+                   ON assignment.id=ar.role_assignment_id
+                  AND assignment.task_id=ar.task_id
+                  AND assignment.role=ar.role
+                 WHERE ar.task_id IN ({placeholders})
+                   AND ar.role IN ('worker','reviewer')
+             )
+             WHERE row_num <= ? AND missing_assignment=1"
+        );
+        let mut params = batch.to_vec();
+        params.push(MAX_ATTRIBUTION_ATTEMPTS_PER_TASK as i64);
+        let mut statement = conn.prepare(&incomplete_sql)?;
+        let incomplete_task_ids = statement
+            .query_map(params_from_iter(params), |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        snapshot
+            .incomplete_managed_task_ids
+            .extend(incomplete_task_ids);
 
         let latest_sql = format!(
             "SELECT task_id,MAX(id) FROM agent_runs
@@ -2030,6 +2080,34 @@ fn root_complexity_facts(
     ))
 }
 
+/// Attribution uses the full small durable lineage relation, while the public
+/// contributing-task list remains capped to the prospective cohort. A graph
+/// source can predate the watermark, so omitting it here would lose the
+/// planner/worker/reviewer facts that belong to the collapsed intent.
+fn attribution_members_for_intent(
+    root: i64,
+    cohort_members: &[i64],
+    lineage: &LineageSnapshot,
+) -> Vec<i64> {
+    let mut members: BTreeSet<i64> = cohort_members.iter().copied().collect();
+    members.insert(root);
+    if let Some(children) = lineage.source_to_children.get(&root) {
+        members.extend(children.iter().map(|child| child.task_id));
+        for child in children {
+            if let Some(recoveries) = lineage.original_to_recoveries.get(&child.task_id) {
+                members.extend(recoveries.iter().map(|pair| pair.recovery_task_id));
+            }
+        }
+    }
+    if let Some(recoveries) = lineage.original_to_recoveries.get(&root) {
+        members.extend(recoveries.iter().map(|pair| pair.recovery_task_id));
+    }
+    members
+        .into_iter()
+        .take(MAX_CONTRIBUTING_TASKS_PER_INTENT)
+        .collect()
+}
+
 fn populate_attribution(
     intent: &mut IntentFacts,
     members: &[i64],
@@ -2040,20 +2118,27 @@ fn populate_attribution(
     let mut planners = Vec::new();
     let mut final_workers: Vec<&ManagedAttemptFact> = Vec::new();
     let mut config_inputs: BTreeMap<(i64, Option<i64>), serde_json::Value> = BTreeMap::new();
-    let mut config_complete = true;
+    let mut config_complete = !members
+        .iter()
+        .any(|task_id| attribution.incomplete_managed_task_ids.contains(task_id));
+    let mut attempts_complete = config_complete;
     let mut has_contribution = false;
 
     for &task_id in members {
         if let Some(runs) = attribution.managed_by_task.get(&task_id) {
             for run in runs {
                 has_contribution = true;
+                if !complete_managed_attempt(run) {
+                    attempts_complete = false;
+                    config_complete = false;
+                }
                 let attempt = managed_attempt_value(run);
                 match run.role.as_str() {
                     "worker" => {
                         if attribution.latest_worker_run_by_task.get(&task_id)
                             == Some(&run.agent_run_id)
-                            && matches!(run.end_reason.as_deref(), Some("completed" | "merged"))
-                            && run.ended_at.is_some()
+                            && complete_managed_attempt(run)
+                            && is_final_submitting_worker(run)
                         {
                             final_workers.push(run);
                         }
@@ -2092,18 +2177,17 @@ fn populate_attribution(
             "reviewer": reviewers,
             "planner": planners,
         }));
-        intent.coverage.contributing_attempts = true;
+        intent.coverage.contributing_attempts = attempts_complete;
     }
     // A final submitting worker is the final managed worker turn for a task
-    // that actually completed/merged. Across a collapsed intent, the latest
-    // such durable completion is the final submission; rework and fallback
-    // turns remain visible in `contributing_attempts` rather than replacing it.
-    if let Some(final_worker) = final_workers.into_iter().max_by_key(|run| {
-        (
-            run.ended_at.expect("final-worker candidates have ended_at"),
-            run.agent_run_id,
-        )
-    }) {
+    // that durably submitted, awaits merge, completed, or merged. Across a
+    // collapsed intent, the latest such turn is the final submission; rework
+    // and fallback turns remain visible in `contributing_attempts` rather
+    // than replacing it.
+    if let Some(final_worker) = final_workers
+        .into_iter()
+        .max_by_key(|run| (run.ended_at.unwrap_or(run.spawned_at), run.agent_run_id))
+    {
         intent.final_worker = Some(managed_attempt_value(final_worker));
         intent.coverage.final_worker = true;
     }
@@ -2136,11 +2220,18 @@ fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSn
             .map(|task| task.id)
             .collect();
         let lineage = build_lineage_snapshot(c, &capped_ids)?;
-        // Include durable graph roots as well as cohort rows: a child can be
-        // inside a prospective cohort while its source predates the watermark,
-        // and planner attribution belongs to that source task.
+        // Include all bounded durable lineage members as well as cohort rows:
+        // a child can be inside a prospective cohort while its source or a
+        // sibling/recovery predates the watermark, and attribution belongs to
+        // the collapsed intent rather than only its public cohort members.
         let mut attribution_task_ids: BTreeSet<i64> = capped_ids.iter().copied().collect();
         attribution_task_ids.extend(lineage.source_to_children.keys().copied());
+        attribution_task_ids.extend(
+            lineage
+                .source_to_children
+                .values()
+                .flat_map(|children| children.iter().map(|child| child.task_id)),
+        );
         attribution_task_ids.extend(
             lineage
                 .recovery_to_original
@@ -2303,8 +2394,9 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
             intent.complexity_provenance = Some(provenance);
             intent.coverage.complexity = true;
         }
-        let contribution_task_ids = intent.contributing_task_ids.clone();
-        populate_attribution(&mut intent, &contribution_task_ids, &attribution);
+        let attribution_members =
+            attribution_members_for_intent(root, &members_for_evidence, &lineage);
+        populate_attribution(&mut intent, &attribution_members, &attribution);
         intents.push(intent);
     }
 
@@ -3435,7 +3527,10 @@ mod tests {
         assert!(intent.complexity.is_none());
         assert!(intent.complexity_provenance.is_none());
         assert!(intent.final_worker.is_none());
-        assert!(intent.contributing_attempts.is_none());
+        let attempts = intent.contributing_attempts.as_ref().unwrap();
+        assert_eq!(attempts["worker"][0]["agent"], "missing-model-worker");
+        assert_eq!(attempts["worker"][0]["model"], serde_json::Value::Null);
+        assert_eq!(attempts["worker"][0]["effort"], serde_json::Value::Null);
         assert!(intent.config_evidence.is_none());
         assert!(!intent.coverage.complexity);
         assert!(!intent.coverage.final_worker);
@@ -3450,12 +3545,238 @@ mod tests {
             "complexity",
             "complexity_provenance",
             "final_worker",
-            "contributing_attempts",
             "config_evidence",
             "lineage_evidence",
         ] {
             assert_eq!(wire[field], serde_json::Value::Null, "{field}");
         }
+    }
+
+    #[test]
+    fn facts_final_worker_accepts_submission_lifecycle_evidence() {
+        // The lifecycle closes workers as submitted or awaiting_merge before
+        // task completion; a still-open worker on an in-review task is also
+        // a durable submission. All three must be eligible final workers.
+        let (_d, mut c) = open_tmp();
+        let submitted_task = seed_ordinary(&mut c, 1600);
+        let submitted_assignment =
+            seed_assignment(&c, submitted_task, "worker", None, None, "submitted");
+        let submitted_run = seed_attributed_run(
+            &c,
+            submitted_task,
+            "submitted-worker",
+            "worker",
+            "submitted-model",
+            "codex",
+            "high",
+            submitted_assignment,
+            None,
+            10,
+            20,
+            "submitted",
+        );
+
+        let awaiting_task = seed_ordinary(&mut c, 1700);
+        let awaiting_assignment =
+            seed_assignment(&c, awaiting_task, "worker", None, None, "awaiting");
+        let awaiting_run = seed_attributed_run(
+            &c,
+            awaiting_task,
+            "awaiting-worker",
+            "worker",
+            "awaiting-model",
+            "codex",
+            "high",
+            awaiting_assignment,
+            None,
+            30,
+            40,
+            "awaiting_merge",
+        );
+
+        let live_task = seed_task(&mut c, "in-review", None, 0, None, 1000, 1800);
+        let live_assignment = seed_assignment(&c, live_task, "worker", None, None, "live");
+        let live_run = seed_attributed_run(
+            &c,
+            live_task,
+            "live-submitted-worker",
+            "worker",
+            "live-model",
+            "codex",
+            "high",
+            live_assignment,
+            None,
+            50,
+            51,
+            "ignored-after-open",
+        );
+        c.execute(
+            "UPDATE agent_runs SET ended_at=NULL,end_reason=NULL WHERE id=?1",
+            [live_run],
+        )
+        .unwrap();
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must not write");
+        for (task_id, run_id, agent) in [
+            (submitted_task, submitted_run, "submitted-worker"),
+            (awaiting_task, awaiting_run, "awaiting-worker"),
+            (live_task, live_run, "live-submitted-worker"),
+        ] {
+            let intent = report
+                .intents
+                .iter()
+                .find(|intent| intent.intent_id == format!("intent-{task_id}"))
+                .unwrap();
+            assert_eq!(intent.final_worker.as_ref().unwrap()["attempt_id"], run_id);
+            assert_eq!(intent.final_worker.as_ref().unwrap()["agent"], agent);
+            assert!(intent.coverage.final_worker);
+        }
+    }
+
+    #[test]
+    fn facts_mixed_incomplete_managed_runs_keep_nulls_and_coverage_gaps() {
+        // A complete earlier rework and an incomplete later fallback belong to
+        // one intent. The latter must not disappear and make the compound
+        // attempt/config evidence look complete.
+        let (_d, mut c) = open_tmp();
+        let task_id = seed_ordinary(&mut c, 1600);
+        let assignment = seed_assignment(&c, task_id, "worker", None, None, "primary");
+        let valid_run = seed_attributed_run(
+            &c,
+            task_id,
+            "first-worker",
+            "worker",
+            "first-model",
+            "codex",
+            "high",
+            assignment,
+            None,
+            10,
+            20,
+            "completed",
+        );
+        let incomplete_run = seed_attributed_run(
+            &c,
+            task_id,
+            "missing-model-worker",
+            "worker",
+            "",
+            "codex",
+            "",
+            assignment,
+            None,
+            30,
+            40,
+            "merged",
+        );
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must not write");
+        let intent = &report.intents[0];
+        let attempts = intent.contributing_attempts.as_ref().unwrap()["worker"]
+            .as_array()
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0]["attempt_id"], valid_run);
+        assert_eq!(attempts[1]["attempt_id"], incomplete_run);
+        assert_eq!(attempts[1]["model"], serde_json::Value::Null);
+        assert_eq!(attempts[1]["effort"], serde_json::Value::Null);
+        assert!(intent.final_worker.is_none());
+        assert!(intent.config_evidence.is_none());
+        assert!(!intent.coverage.final_worker);
+        assert!(!intent.coverage.contributing_attempts);
+        assert!(!intent.coverage.config);
+    }
+
+    #[test]
+    fn facts_pre_watermark_graph_root_keeps_attribution_out_of_public_cohort() {
+        // The source predates the prospective watermark, but its planner,
+        // worker, reviewer, and policy evidence belongs to the child intent.
+        // The public contributing ids remain cohort-only.
+        let (_d, mut c) = open_tmp();
+        c.execute("UPDATE perf_watermark SET watermark=1600 WHERE id=1", [])
+            .unwrap();
+        let source = seed_task(&mut c, "decomposed", None, 0, None, 1000, 1500);
+        let child = seed_ordinary(&mut c, 1700);
+        let graph_id = seed_decomposition(&c, source, 1);
+        seed_graph_member(&c, graph_id, child, "current-child", 1);
+
+        let worker_assignment = seed_assignment(&c, source, "worker", None, None, "source");
+        let worker_run = seed_attributed_run(
+            &c,
+            source,
+            "source-worker",
+            "worker",
+            "source-worker-model",
+            "codex",
+            "high",
+            worker_assignment,
+            None,
+            10,
+            20,
+            "submitted",
+        );
+        let reviewer_assignment =
+            seed_assignment(&c, source, "reviewer", Some("r1"), Some(88), "source-r1");
+        let reviewer_run = seed_attributed_run(
+            &c,
+            source,
+            "source-reviewer",
+            "reviewer",
+            "source-review-model",
+            "codex",
+            "high",
+            reviewer_assignment,
+            None,
+            21,
+            30,
+            "verdict:approved",
+        );
+        let planner_assignment = seed_assignment(&c, source, "planner", None, None, "source-plan");
+        c.execute(
+            "UPDATE task_decompositions SET planner_assignment_id=?2 WHERE id=?1",
+            rusqlite::params![graph_id, planner_assignment],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+             VALUES ('pre-watermark-planner',?1,'source-planner','planner',1)",
+            [source],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO planner_submissions(run_id,graph_id,response_json,rejections,accepted_at)
+             VALUES ('pre-watermark-planner',?1,'[]',0,2)",
+            [graph_id],
+        )
+        .unwrap();
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must not write");
+        assert_eq!(report.counts.candidate, 1);
+        let intent = report
+            .intents
+            .iter()
+            .find(|intent| intent.intent_id == format!("intent-{source}"))
+            .unwrap();
+        assert_eq!(intent.contributing_task_ids, vec![child]);
+        let attempts = intent.contributing_attempts.as_ref().unwrap();
+        assert_eq!(attempts["worker"][0]["attempt_id"], worker_run);
+        assert_eq!(attempts["reviewer"][0]["attempt_id"], reviewer_run);
+        assert_eq!(
+            attempts["planner"][0]["attempt_id"],
+            "pre-watermark-planner"
+        );
+        assert!(intent.coverage.contributing_attempts);
+        assert!(intent.coverage.config);
+        assert_eq!(
+            intent.final_worker.as_ref().unwrap()["attempt_id"],
+            worker_run
+        );
     }
 
     #[test]
