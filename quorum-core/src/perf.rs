@@ -1546,15 +1546,17 @@ struct CohortSnapshot {
     lineage: LineageSnapshot,
     root_tasks: HashMap<i64, FactsTaskRow>,
     attribution: AttributionSnapshot,
+    capped_attribution_task_ids: HashSet<i64>,
     recoverable_graph_task_ids: HashSet<i64>,
     unsatisfiable_parked_task_ids: HashSet<i64>,
     completed_graph_source_task_ids: HashSet<i64>,
 }
 
-// Attribution is deliberately capped per task. Facts are a reporting surface,
-// not an unbounded replay of a task's complete execution history; retaining
-// the newest attempts is enough to identify the final worker while keeping the
-// short WAL snapshot bounded.
+// Attribution is deliberately capped both globally and per task. Facts are a
+// reporting surface, not an unbounded replay of a task's complete execution
+// history. The global cap bounds retained managed attempts to 65,536 and
+// planner attempts to the same number under the per-task cap below.
+const MAX_ATTRIBUTION_TASKS_PER_SNAPSHOT: usize = 1_024;
 const MAX_ATTRIBUTION_ATTEMPTS_PER_TASK: usize = 64;
 
 #[derive(Debug, Clone)]
@@ -2108,6 +2110,18 @@ fn attribution_members_for_intent(
         .collect()
 }
 
+/// A global attribution cap makes the omitted lineage member unknown, not
+/// absent. Do not emit a subset of an intent's role/configuration evidence as
+/// if it were complete; JSON null plus false coverage is the explicit gap.
+fn clear_capped_attribution(intent: &mut IntentFacts) {
+    intent.final_worker = None;
+    intent.contributing_attempts = None;
+    intent.config_evidence = None;
+    intent.coverage.final_worker = false;
+    intent.coverage.contributing_attempts = false;
+    intent.coverage.config = false;
+}
+
 fn populate_attribution(
     intent: &mut IntentFacts,
     members: &[i64],
@@ -2238,7 +2252,15 @@ fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSn
                 .values()
                 .flat_map(|pair| [pair.original_task_id, pair.recovery_task_id]),
         );
-        let attribution_task_ids: Vec<i64> = attribution_task_ids.into_iter().collect();
+        let capped_attribution_task_ids: HashSet<i64> = attribution_task_ids
+            .iter()
+            .skip(MAX_ATTRIBUTION_TASKS_PER_SNAPSHOT)
+            .copied()
+            .collect();
+        let attribution_task_ids: Vec<i64> = attribution_task_ids
+            .into_iter()
+            .take(MAX_ATTRIBUTION_TASKS_PER_SNAPSHOT)
+            .collect();
         let root_task_ids: Vec<i64> = lineage.source_to_children.keys().copied().collect();
         let root_tasks = load_facts_tasks_by_id(c, &root_task_ids)?;
         let attribution = load_attribution_snapshot(c, &attribution_task_ids)?;
@@ -2255,6 +2277,7 @@ fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSn
             lineage,
             root_tasks,
             attribution,
+            capped_attribution_task_ids,
             recoverable_graph_task_ids,
             unsatisfiable_parked_task_ids,
             completed_graph_source_task_ids,
@@ -2292,6 +2315,7 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         lineage,
         root_tasks,
         attribution,
+        capped_attribution_task_ids,
         recoverable_graph_task_ids,
         unsatisfiable_parked_task_ids,
         completed_graph_source_task_ids,
@@ -2397,6 +2421,12 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         let attribution_members =
             attribution_members_for_intent(root, &members_for_evidence, &lineage);
         populate_attribution(&mut intent, &attribution_members, &attribution);
+        if attribution_members
+            .iter()
+            .any(|task_id| capped_attribution_task_ids.contains(task_id))
+        {
+            clear_capped_attribution(&mut intent);
+        }
         intents.push(intent);
     }
 
@@ -3777,6 +3807,111 @@ mod tests {
             intent.final_worker.as_ref().unwrap()["attempt_id"],
             worker_run
         );
+    }
+
+    #[test]
+    fn facts_global_attribution_cap_marks_expanded_intent_uncovered() {
+        // Reach the global cap through real bounded graph expansion: every
+        // prospective child loads its pre-watermark source plus all accepted
+        // siblings. The final root has durable worker evidence, but two of
+        // its children fall beyond the snapshot cap, so its attribution must
+        // be explicitly unavailable rather than a partial subset.
+        let (_d, mut c) = open_tmp();
+        c.execute("UPDATE perf_watermark SET watermark=1500 WHERE id=1", [])
+            .unwrap();
+        let graph_count =
+            MAX_ATTRIBUTION_TASKS_PER_SNAPSHOT / (crate::decomposition::MAX_CHILDREN + 1) + 1;
+        let mut first_root = None;
+        let mut cap_affected_root = None;
+        for graph_index in 0..graph_count {
+            let source = seed_task(&mut c, "decomposed", None, 0, None, 1000, 1000);
+            let graph_id = seed_decomposition(&c, source, 1);
+            for child_index in 0..crate::decomposition::MAX_CHILDREN {
+                let child = seed_ordinary(&mut c, 1600);
+                seed_graph_member(
+                    &c,
+                    graph_id,
+                    child,
+                    &format!("child-{graph_index}-{child_index}"),
+                    1,
+                );
+            }
+            c.execute(
+                "UPDATE task_decompositions SET state='completed',active=0 WHERE id=?1",
+                [graph_id],
+            )
+            .unwrap();
+            if graph_index == 0 {
+                first_root = Some(source);
+            }
+            if graph_index + 1 == graph_count {
+                cap_affected_root = Some(source);
+            }
+        }
+        let first_root = first_root.unwrap();
+        let cap_affected_root = cap_affected_root.unwrap();
+        let first_assignment = seed_assignment(&c, first_root, "worker", None, None, "first");
+        let first_run = seed_attributed_run(
+            &c,
+            first_root,
+            "first-root-worker",
+            "worker",
+            "first-root-model",
+            "codex",
+            "high",
+            first_assignment,
+            None,
+            10,
+            20,
+            "submitted",
+        );
+        let capped_assignment =
+            seed_assignment(&c, cap_affected_root, "worker", None, None, "capped");
+        seed_attributed_run(
+            &c,
+            cap_affected_root,
+            "capped-root-worker",
+            "worker",
+            "capped-root-model",
+            "codex",
+            "high",
+            capped_assignment,
+            None,
+            30,
+            40,
+            "submitted",
+        );
+
+        let before = snapshot_db_state(&c);
+        let snapshot = read_cohort_snapshot(&c, false).unwrap();
+        assert_eq!(snapshot.capped_attribution_task_ids.len(), 2);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must not write");
+        assert_eq!(report.intents.len(), graph_count);
+        let covered = report
+            .intents
+            .iter()
+            .find(|intent| intent.intent_id == format!("intent-{first_root}"))
+            .unwrap();
+        assert_eq!(
+            covered.final_worker.as_ref().unwrap()["attempt_id"],
+            first_run
+        );
+        assert!(covered.coverage.final_worker);
+        assert!(covered.coverage.contributing_attempts);
+        assert!(covered.coverage.config);
+
+        let capped = report
+            .intents
+            .iter()
+            .find(|intent| intent.intent_id == format!("intent-{cap_affected_root}"))
+            .unwrap();
+        assert!(capped.final_worker.is_none());
+        assert!(capped.contributing_attempts.is_none());
+        assert!(capped.config_evidence.is_none());
+        assert!(!capped.coverage.final_worker);
+        assert!(!capped.coverage.contributing_attempts);
+        assert!(!capped.coverage.config);
     }
 
     #[test]
