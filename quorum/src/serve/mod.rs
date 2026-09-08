@@ -21663,6 +21663,22 @@ fn routed_provider_executable(
     kind: runner::AgentKind,
     worktree: &Path,
 ) -> std::result::Result<String, runner::RunnerFailure> {
+    let path = std::env::var_os("PATH");
+    routed_provider_executable_in_path(config, kind, worktree, path.as_deref())
+}
+
+/// Resolve a routed executable using the provider child's PATH semantics.
+///
+/// Tests pass an explicit PATH so route validation remains deterministic; the
+/// production caller above supplies the daemon environment inherited by the
+/// child.  Relative and empty PATH components must be relative to `worktree`,
+/// because every provider adapter sets that as the child current directory.
+fn routed_provider_executable_in_path(
+    config: &ServeConfig,
+    kind: runner::AgentKind,
+    worktree: &Path,
+    path: Option<&std::ffi::OsStr>,
+) -> std::result::Result<String, runner::RunnerFailure> {
     let requested = agent_bin_for_kind(config, kind).unwrap_or(match kind {
         runner::AgentKind::Claude => "claude",
         runner::AgentKind::Codex => "codex",
@@ -21674,43 +21690,43 @@ fn routed_provider_executable(
         )));
     }
 
+    // Returning absolute candidates closes the cwd race between validation
+    // and exec.  It also gives bare routes the same interpretation as the
+    // adapter, which calls `current_dir(worktree)` on its child command.
+    let worktree_base = if worktree.is_absolute() {
+        worktree.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                fallback_launch_failure(format!("cannot resolve fallback worktree: {error}"))
+            })?
+            .join(worktree)
+    };
     let requested_path = Path::new(requested);
     let explicit_path = requested_path.is_absolute() || requested_path.components().count() > 1;
     let candidates = if explicit_path {
-        // Adapters set the child cwd to the managed worktree, so resolve a
-        // configured relative path there before validating and passing it to
-        // the gated wrapper.  Returning an absolute path closes the cwd race
-        // between validation and exec.
-        let base = if worktree.is_absolute() {
-            worktree.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|error| {
-                    fallback_launch_failure(format!("cannot resolve fallback worktree: {error}"))
-                })?
-                .join(worktree)
-        };
+        // Configured relative paths are relative to the managed worktree.
+        // `PathBuf::join` retains an absolute requested path unchanged.
+        let base = worktree_base;
         vec![base.join(requested_path)]
     } else {
-        let current_dir = std::env::current_dir().map_err(|error| {
-            fallback_launch_failure(format!("cannot resolve fallback executable path: {error}"))
-        })?;
-        std::env::var_os("PATH")
-            .map(|path| {
-                std::env::split_paths(&path)
-                    .map(|directory| {
-                        let directory = if directory.as_os_str().is_empty() {
-                            current_dir.clone()
-                        } else if directory.is_absolute() {
-                            directory
-                        } else {
-                            current_dir.join(directory)
-                        };
-                        directory.join(requested_path)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
+        path.map(|path| {
+            std::env::split_paths(path)
+                .map(|directory| {
+                    let directory = if directory.is_absolute() {
+                        directory
+                    } else {
+                        // An empty PATH entry means the current directory;
+                        // relative entries have the same base.  The adapter's
+                        // current directory is the managed worktree, not the
+                        // daemon process cwd.
+                        worktree_base.join(directory)
+                    };
+                    directory.join(requested_path)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
     };
     for candidate in candidates {
         let Ok(metadata) = std::fs::metadata(&candidate) else {
@@ -27786,6 +27802,51 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn routed_provider_executable_uses_worktree_for_relative_and_empty_path_entries() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        let tools = worktree.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let runner = live_fallback_runner(root.path());
+        let mut config = live_fallback_test_config(
+            root.path().join("worktree-path.db"),
+            root.path(),
+            &runner,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.agent_bin = Some("fallback-codex".into());
+
+        let relative = tools.join("fallback-codex");
+        std::fs::write(&relative, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&relative, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = routed_provider_executable_in_path(
+            &config,
+            runner::AgentKind::Codex,
+            &worktree,
+            Some(OsString::from("tools").as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(Path::new(&resolved), relative);
+
+        let empty = worktree.join("fallback-codex");
+        std::fs::write(&empty, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty_path = OsString::from(":/definitely/not/a/provider-directory");
+        let resolved = routed_provider_executable_in_path(
+            &config,
+            runner::AgentKind::Codex,
+            &worktree,
+            Some(empty_path.as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(Path::new(&resolved), empty);
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn gated_fallback_commits_process_group_before_releasing_provider_once() {
         use std::os::unix::fs::PermissionsExt;
@@ -28126,6 +28187,201 @@ mod tests {
         assert!(pid.is_some());
         drop(conn);
         let _ = slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_worker_fallback_promotion_failure_reaps_and_settles_alternate_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let config = live_fallback_test_config(
+            root.path().join("worker-promotion-failure.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback promotion failure",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        // The promotion write fails after release.  The delete trigger records
+        // the exact durable group ID before settlement removes the marker, so
+        // this activation-level test can prove both reaping and authority
+        // cleanup without retaining a recoverable pending journal row.
+        conn.execute_batch(
+            "CREATE TABLE failed_fallback_groups(pgid INTEGER NOT NULL);
+             CREATE TRIGGER reject_live_fallback_promotion
+             BEFORE UPDATE OF phase ON journal
+             WHEN NEW.phase='working'
+             BEGIN SELECT RAISE(ABORT, 'promotion rejected'); END;
+             CREATE TRIGGER record_failed_fallback_group
+             BEFORE DELETE ON journal
+             WHEN OLD.agent='Fallback-Worker' AND OLD.role='worker'
+                  AND OLD.phase='fallback-pending'
+             BEGIN INSERT INTO failed_fallback_groups(pgid) VALUES (OLD.pid); END;",
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let mut slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        drop(conn);
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+
+        assert_eq!(
+            activate_worker_fallback(&config, &mut slot, &failure, &currency)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Settled
+        );
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (
+            ended_alternate_runs,
+            active_alternate_runs,
+            revoked_alternate_caps,
+            active_alternate_caps,
+            pending_markers,
+            process_group_id,
+        ): (i64, i64, i64, i64, i64, i32) = conn
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM agent_runs
+                      WHERE task_id=?1 AND id != ?2 AND ended_at IS NOT NULL
+                        AND end_reason='fallback_launch_failed'),
+                     (SELECT count(*) FROM agent_runs
+                      WHERE task_id=?1 AND id != ?2 AND ended_at IS NULL),
+                     (SELECT count(*) FROM run_capabilities
+                      WHERE task_id=?1 AND agent_run_id != ?2 AND revoked_at IS NOT NULL),
+                     (SELECT count(*) FROM run_capabilities
+                      WHERE task_id=?1 AND agent_run_id != ?2 AND revoked_at IS NULL),
+                     (SELECT count(*) FROM journal
+                      WHERE agent='Fallback-Worker' AND role='worker' AND task_id=?1
+                        AND phase='fallback-pending'),
+                     (SELECT pgid FROM failed_fallback_groups)",
+                rusqlite::params![task_id, initial_run],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                ended_alternate_runs,
+                active_alternate_runs,
+                revoked_alternate_caps,
+                active_alternate_caps,
+                pending_markers,
+            ),
+            (1, 0, 1, 0, 0),
+            "the failed alternate must not retain lifecycle authority"
+        );
+        drop(conn);
+        assert_process_group_reaped(process_group_id).await;
     }
 
     #[cfg(unix)]
