@@ -395,7 +395,8 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   and retry refuses to restore it (§ Explicit cancellation and durable parking). When the
   continuation PR belongs to a failed active graph child, creation stamps that exact child as
   `refs.source_task` if the ref is absent; this is recovery provenance, not caller authority,
-  and creator/assignee metadata replacement preserves it.
+  and creator/assignee metadata replacement preserves it. Recovery discovery and adoption compare
+  `refs.pr` to the durable PR target as either an integer or canonical decimal string.
 - ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
   `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
   dependency gating, and reviewer attachment are all preserved as internal functions.

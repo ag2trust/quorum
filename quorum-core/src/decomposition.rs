@@ -2389,8 +2389,13 @@ pub fn adopt_recovery_delivery(
                       AND sibling_task.status!='done'
                )
                AND json_valid(original.refs)
-               AND json_type(original.refs,'$.pr')='integer'
-               AND json_extract(original.refs,'$.pr')=original_target.pr_number
+               AND (
+                    (json_type(original.refs,'$.pr')='integer'
+                     AND json_extract(original.refs,'$.pr')=original_target.pr_number)
+                    OR
+                    (json_type(original.refs,'$.pr')='text'
+                     AND json_extract(original.refs,'$.pr')=CAST(original_target.pr_number AS TEXT))
+               )
                AND original_target.pr_number=recovery_target.pr_number
                AND original_target.head_ref!=''
                AND length(original_target.head_sha) IN (40,64)
@@ -2398,8 +2403,13 @@ pub fn adopt_recovery_delivery(
                AND recovery.status='done' AND recovery.review_only=0
                AND recovery.continue_pr=recovery_target.pr_number
                AND json_valid(recovery.refs)
-               AND json_type(recovery.refs,'$.pr')='integer'
-               AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number
+               AND (
+                    (json_type(recovery.refs,'$.pr')='integer'
+                     AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number)
+                    OR
+                    (json_type(recovery.refs,'$.pr')='text'
+                     AND json_extract(recovery.refs,'$.pr')=CAST(recovery_target.pr_number AS TEXT))
+               )
                AND json_type(recovery.refs,'$.source_task')='integer'
                AND json_extract(recovery.refs,'$.source_task')=original.id
                AND json_type(recovery.refs,'$.daemon_publication') IS NULL
@@ -2586,8 +2596,13 @@ pub fn adopt_explicit_recovery_delivery(
                             )
                         )
                         AND json_valid(original.refs)
-                        AND json_type(original.refs,'$.pr')='integer'
-                        AND json_extract(original.refs,'$.pr')=original_target.pr_number
+                        AND (
+                            (json_type(original.refs,'$.pr')='integer'
+                             AND json_extract(original.refs,'$.pr')=original_target.pr_number)
+                            OR
+                            (json_type(original.refs,'$.pr')='text'
+                             AND json_extract(original.refs,'$.pr')=CAST(original_target.pr_number AS TEXT))
+                        )
                         AND original_target.pr_number=recovery_target.pr_number
                         AND original_target.head_ref!=''
                         AND original_target.head_ref=recovery_target.head_ref
@@ -2666,8 +2681,13 @@ pub fn adopt_explicit_recovery_delivery(
                AND recovery.completion_provenance=?3
                AND recovery.continue_pr=recovery_target.pr_number
                AND json_valid(recovery.refs)
-               AND json_type(recovery.refs,'$.pr')='integer'
-               AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number
+               AND (
+                    (json_type(recovery.refs,'$.pr')='integer'
+                     AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number)
+                    OR
+                    (json_type(recovery.refs,'$.pr')='text'
+                     AND json_extract(recovery.refs,'$.pr')=CAST(recovery_target.pr_number AS TEXT))
+               )
                AND (
                     json_type(recovery.refs,'$.source_task') IS NULL
                     OR (
@@ -4166,6 +4186,17 @@ mod tests {
                 .execute(
                     "UPDATE pr_targets SET resolved_at=20 WHERE task_id=?1",
                     [self.recovery],
+                )
+                .unwrap();
+        }
+
+        fn store_pr_as_canonical_string(&mut self) {
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET refs=json_set(refs,'$.pr',CAST(?2 AS TEXT))
+                     WHERE id IN (?1,?3)",
+                    params![self.original, RECOVERY_PR, self.recovery],
                 )
                 .unwrap();
         }
@@ -8223,6 +8254,57 @@ mod tests {
     fn explicit_recovery_adopts_failed_child_with_pending_siblings() {
         let mut fixture = RecoveryFixture::new();
         fixture.make_explicit_eligible();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks
+                 SET status='open',refs=json_set(
+                     refs,
+                     '$.cx_est',2,
+                     '$.cx_size','S',
+                     '$.cx_ready',json('true'),
+                     '$.cx_not_ready_reason',json('null')
+                 )
+                 WHERE id=?1",
+                [fixture.siblings[0]],
+            )
+            .unwrap();
+
+        assert!(fixture.explicit_adoption(90_000));
+        let state: (String, String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT original.status,graph.state,source.status
+                 FROM tasks original
+                 JOIN task_graph_members member ON member.task_id=original.id
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks source ON source.id=graph.source_task_id
+                 WHERE original.id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("done".into(), "active".into(), "decomposed".into()));
+    }
+
+    #[test]
+    fn explicit_recovery_adopts_string_pr_child_with_pending_siblings() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.store_pr_as_canonical_string();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET completion_provenance=?2 WHERE id=?1",
+                params![fixture.recovery, crate::tasks::COMPLETION_PROVENANCE_MERGED],
+            )
+            .unwrap();
+        fixture
+            .conn
+            .execute(
+                "UPDATE pr_targets SET resolved_at=20 WHERE task_id=?1",
+                [fixture.recovery],
+            )
+            .unwrap();
         fixture
             .conn
             .execute(

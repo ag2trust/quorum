@@ -20952,7 +20952,7 @@ async fn spawn_worker(
     // may report a merged PR before its base ref reaches this clone. Fetch and
     // prove each recorded merge commit before any branch/provenance/worktree
     // allocation. A propagation lag releases the claim for a bounded retry.
-    let verified_dependency_base = match verify_dependency_base_before_allocation(
+    let dependency_base_admission = match verify_dependency_base_before_allocation(
         config,
         &db_path,
         wt_mgr,
@@ -20961,8 +20961,28 @@ async fn spawn_worker(
         &agent_name,
         effective_base_branch,
     )
-    .await?
+    .await
     {
+        Ok(admission) => admission,
+        Err(error) => {
+            // This check runs after the atomic claim so fallback Git failures
+            // must settle that authority before the tick can move on. Leaving
+            // it working would retain both the lease and this name with no
+            // worker slot to renew or release either one.
+            let reason = format!("dependency base admission failed before allocation: {error}");
+            persist_provisioning_failure(&db_path, task.id, &reason).await;
+            park_task(
+                &db_path,
+                task.id,
+                &reason,
+                if retrying_rework { "rework" } else { "open" },
+            )
+            .await;
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
+            return Ok(false);
+        }
+    };
+    let verified_dependency_base = match dependency_base_admission {
         DependencyBaseAdmission::NotRequired => None,
         DependencyBaseAdmission::Verified { base_sha } => Some(base_sha),
         DependencyBaseAdmission::Deferred => {
@@ -36878,6 +36898,117 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
         assert_eq!(recorded_provenance, stale_provenance);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dependency_git_fallback_failure_after_claim_parks_and_releases_worker_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dependency-fallback-failure.db");
+        let (dependency_id, child_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let dependency_id = tasks::create(
+                &mut conn,
+                "owner",
+                "manually closed dependency",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":703}"#),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done' WHERE id=?1",
+                [dependency_id],
+            )
+            .unwrap();
+            let child_id = tasks::create(
+                &mut conn,
+                "owner",
+                "dependent",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                Some(&format!("[{dependency_id}]")),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            (dependency_id, child_id)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = Arc::new(UnknownDependencyMergeStatusExecutor);
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+
+        assert!(
+            !spawn_worker(
+                &config,
+                &WorktreeManager::new(),
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+            )
+            .await
+            .unwrap(),
+            "a fallback git transport error must settle the claimed task"
+        );
+        assert!(
+            workers.is_empty(),
+            "the failed fallback must not create a worker slot"
+        );
+        assert_eq!(
+            names.in_use_count(),
+            0,
+            "the claimed worker identity must return to the pool"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let child = tasks::get(&conn, child_id).unwrap().unwrap();
+        assert_eq!(child.status, "failed");
+        assert_eq!(child.assignee, None);
+        let refs: serde_json::Value = serde_json::from_str(child.refs.as_deref().unwrap()).unwrap();
+        assert!(
+            refs[quorum_core::tasks::PARKED_REASON_REF]
+                .as_str()
+                .is_some_and(|reason| reason.contains(&format!(
+                    "dependency #{dependency_id}, PR #703 merge lookup failed"
+                ))),
+            "fallback failure needs a durable operator-visible reason: {refs}"
+        );
+        let active_claims: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM claims WHERE target=?1 AND active=1",
+                [quorum_core::tasks::lease_target(child_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_claims, 0,
+            "the 3600-second claim must be deactivated"
+        );
+        let claim_events: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE subject=?1 AND kind='task_claimed'",
+                [quorum_core::tasks::lease_target(child_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            claim_events, 1,
+            "the regression must exercise post-claim cleanup"
+        );
     }
 
     #[cfg(unix)]
