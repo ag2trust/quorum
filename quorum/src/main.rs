@@ -22,6 +22,7 @@ mod web;
 
 use clap::Parser;
 use quorum_core::error::{QuorumError, Result};
+use serve::merge::MergeExecutor as _;
 
 const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
 const MIN_EXTERNAL_POLL_INTERVAL_SECS: u64 = 30;
@@ -429,6 +430,12 @@ fn resolve_gh_repo(repo_dir: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn manual_close_reason_marks_obsolete(reason: &str) -> bool {
+    reason
+        .split(|ch: char| !ch.is_alphanumeric())
+        .any(|word| word.eq_ignore_ascii_case("obsolete"))
 }
 
 /// Wait for a spawned child with a timeout. Returns stdout on success, None on
@@ -1177,8 +1184,61 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     "--reason-stdin or --reason-file is required for `task-close`".into(),
                 )
             })?;
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            match quorum_core::tasks::close_manual(&mut conn, &agent, task_id, &reason, now)? {
+            let db_path = paths::db_path()?;
+            let conn = quorum_core::db::open(&db_path)?;
+            let pr = quorum_core::tasks::task_pr_reference(&conn, task_id)?;
+            drop(conn);
+            // This network lookup deliberately precedes the close transaction:
+            // task-close must never keep a SQLite write lock while asking
+            // GitHub whether its retained PR actually merged.
+            let merge_commit_sha = if let Some(pr) = pr {
+                let repo_dir = std::env::current_dir().map_err(|error| {
+                    QuorumError::Io(format!(
+                        "cannot resolve task-close repository directory: {error}"
+                    ))
+                })?;
+                let executor = serve::merge::GhMergeExecutor {
+                    token_file: None,
+                    gh_repo: None,
+                };
+                match executor.merge_commit_status(pr, &repo_dir) {
+                    serve::merge::MergeCommitStatus::Merged {
+                        merge_commit_sha: Some(sha),
+                    } => Some(sha),
+                    serve::merge::MergeCommitStatus::Merged {
+                        merge_commit_sha: None,
+                    } => {
+                        return Err(QuorumError::Io(format!(
+                            "PR #{pr} is merged but GitHub did not return its merge commit SHA"
+                        )));
+                    }
+                    serve::merge::MergeCommitStatus::Open
+                        if !manual_close_reason_marks_obsolete(&reason) =>
+                    {
+                        return Err(QuorumError::Usage(format!(
+                            "PR #{pr} is still open; task-close requires a reason explicitly marking the task obsolete"
+                        )));
+                    }
+                    serve::merge::MergeCommitStatus::Open
+                    | serve::merge::MergeCommitStatus::Closed => None,
+                    serve::merge::MergeCommitStatus::Unknown => {
+                        return Err(QuorumError::Io(format!(
+                            "could not determine whether PR #{pr} is merged; refusing manual close"
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
+            let mut conn = quorum_core::db::open(&db_path)?;
+            match quorum_core::tasks::close_manual(
+                &mut conn,
+                &agent,
+                task_id,
+                &reason,
+                merge_commit_sha.as_deref(),
+                now,
+            )? {
                 Some(task) => {
                     let compact = quorum_core::tasks::TaskCompact::from(&task);
                     output::emit(&compact);

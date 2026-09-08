@@ -1668,6 +1668,159 @@ fn depends_on_gates_claim_end_to_end() {
     assert_eq!(unblocked.as_ref().unwrap().id, 2);
 }
 
+#[cfg(unix)]
+fn write_gh_pr_state_shim(dir: &std::path::Path, response: &str) {
+    let shim = dir.join("gh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"pr view\"*) echo '{response}' ;;\n  *) exit 1 ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    let status = std::process::Command::new("chmod")
+        .args(["+x", shim.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn task_close_records_merged_pr_sha_and_unblocks_dependents() {
+    let home = tempfile::tempdir().unwrap();
+    let shim_dir = tempfile::tempdir().unwrap();
+    write_gh_pr_state_shim(
+        shim_dir.path(),
+        r#"{"state":"MERGED","mergeCommit":{"oid":"6d57fa14"}}"#,
+    );
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "owner",
+            "--title",
+            "recovered dependency",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "owner",
+            "--title",
+            "dependent",
+            "--depends-on",
+            "[1]",
+        ])
+        .assert()
+        .success();
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE tasks SET status='failed',refs=json_object('pr',77) WHERE id=1",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    quorum(home.path())
+        .env("PATH", format!("{}:{path}", shim_dir.path().display()))
+        .args([
+            "task-close",
+            "--agent",
+            "owner",
+            "--task-id",
+            "1",
+            "--reason-stdin",
+        ])
+        .write_stdin("merged by hand\n")
+        .assert()
+        .success();
+
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let refs: String = conn
+        .query_row("SELECT refs FROM tasks WHERE id=1", [], |row| row.get(0))
+        .unwrap();
+    let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+    assert_eq!(refs["merge_commit_sha"], "6d57fa14");
+    let dependency_status: String = conn
+        .query_row("SELECT status FROM tasks WHERE id=1", [], |row| row.get(0))
+        .unwrap();
+    let dependent_status: String = conn
+        .query_row("SELECT status FROM tasks WHERE id=2", [], |row| row.get(0))
+        .unwrap();
+    drop(conn);
+    assert_eq!(dependency_status, "done");
+    assert_eq!(
+        common::try_claim_task(home.path(), "worker", Some(2), 3600).map(|task| task.id),
+        Some(2),
+        "the manual merge close must make the dependency claimable; dependent status: {dependent_status}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn task_close_rejects_open_pr_unless_reason_marks_task_obsolete() {
+    let home = tempfile::tempdir().unwrap();
+    let shim_dir = tempfile::tempdir().unwrap();
+    write_gh_pr_state_shim(shim_dir.path(), r#"{"state":"OPEN","mergeCommit":null}"#);
+    quorum(home.path())
+        .args(["task-create", "--created-by", "owner", "--title", "open PR"])
+        .assert()
+        .success();
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    conn.execute("UPDATE tasks SET refs=json_object('pr',78) WHERE id=1", [])
+        .unwrap();
+    drop(conn);
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    quorum(home.path())
+        .env("PATH", format!("{}:{path}", shim_dir.path().display()))
+        .args([
+            "task-close",
+            "--agent",
+            "owner",
+            "--task-id",
+            "1",
+            "--reason-stdin",
+        ])
+        .write_stdin("merged elsewhere\n")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("PR #78 is still open"));
+
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let status: String = conn
+        .query_row("SELECT status FROM tasks WHERE id=1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(status, "open");
+    drop(conn);
+
+    quorum(home.path())
+        .env("PATH", format!("{}:{path}", shim_dir.path().display()))
+        .args([
+            "task-close",
+            "--agent",
+            "owner",
+            "--task-id",
+            "1",
+            "--reason-stdin",
+        ])
+        .write_stdin("obsolete: superseded by another change\n")
+        .assert()
+        .success();
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let refs: String = conn
+        .query_row("SELECT refs FROM tasks WHERE id=1", [], |row| row.get(0))
+        .unwrap();
+    let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+    assert!(refs.get("merge_commit_sha").is_none());
+}
+
 #[test]
 fn task_get_surfaces_depends_on_and_ready() {
     let home = tempfile::tempdir().unwrap();

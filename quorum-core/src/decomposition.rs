@@ -2500,7 +2500,7 @@ pub fn adopt_recovery_delivery(
 }
 
 /// Explicitly authorize the exact durable delivery of a completed managed
-/// continuation for the final failed member of an active decomposition, a
+/// continuation for a failed member of an active decomposition, a
 /// boundary-violation-blocked decomposition when that block names this child,
 /// or a modern generated-child-failed block that names this child. The latter
 /// restores graph authority when siblings still need to finish.
@@ -2662,23 +2662,6 @@ pub fn adopt_explicit_recovery_delivery(
                     )
                )
                AND source.status='decomposed'
-               AND (
-                    NOT EXISTS (
-                        SELECT 1 FROM task_graph_members sibling
-                        JOIN tasks sibling_task ON sibling_task.id=sibling.task_id
-                        WHERE sibling.graph_id=graph.id AND sibling.active=1
-                          AND sibling.task_id!=original.id
-                          AND sibling_task.status!='done'
-                    )
-                    OR (
-                        CASE WHEN graph.state='blocked'
-                                  AND graph.hold_code='generated-child-failed'
-                                  AND json_valid(graph.hold_summary)
-                             THEN json_type(graph.hold_summary,'$.affected_task')='integer'
-                                  AND json_extract(graph.hold_summary,'$.affected_task')=original.id
-                             ELSE 0 END
-                    )
-               )
                AND recovery.status='done' AND recovery.review_only=0
                AND recovery.completion_provenance=?3
                AND recovery.continue_pr=recovery_target.pr_number
@@ -8223,6 +8206,43 @@ mod tests {
     }
 
     #[test]
+    fn explicit_recovery_adopts_failed_child_with_pending_siblings() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks
+                 SET status='open',refs=json_set(
+                     refs,
+                     '$.cx_est',2,
+                     '$.cx_size','S',
+                     '$.cx_ready',json('true'),
+                     '$.cx_not_ready_reason',json('null')
+                 )
+                 WHERE id=?1",
+                [fixture.siblings[0]],
+            )
+            .unwrap();
+
+        assert!(fixture.explicit_adoption(90_000));
+        let state: (String, String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT original.status,graph.state,source.status
+                 FROM tasks original
+                 JOIN task_graph_members member ON member.task_id=original.id
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks source ON source.id=graph.source_task_id
+                 WHERE original.id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("done".into(), "active".into(), "decomposed".into()));
+    }
+
+    #[test]
     fn explicit_recovery_completes_modern_generated_child_failure_when_final() {
         let mut fixture = RecoveryFixture::new();
         fixture.make_explicit_eligible();
@@ -8891,18 +8911,6 @@ mod tests {
                         .unwrap();
                 }),
             ),
-            (
-                "unfinished sibling",
-                Box::new(|fixture| {
-                    fixture
-                        .conn
-                        .execute(
-                            "UPDATE tasks SET status='open' WHERE id=?1",
-                            [fixture.siblings[0]],
-                        )
-                        .unwrap();
-                }),
-            ),
         ];
 
         for (name, mutate) in cases {
@@ -9465,7 +9473,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let error = crate::tasks::close_manual(&mut conn, "owner", 1, "obsolete", 5).unwrap_err();
+        let error =
+            crate::tasks::close_manual(&mut conn, "owner", 1, "obsolete", None, 5).unwrap_err();
         assert!(matches!(error, QuorumError::Usage(_)));
         let state: (String, i64, String) = conn
             .query_row(
@@ -9492,7 +9501,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        crate::tasks::close_manual(&mut conn, "owner", ids[0], "fixed elsewhere", 5)
+        crate::tasks::close_manual(&mut conn, "owner", ids[0], "fixed elsewhere", None, 5)
             .unwrap()
             .unwrap();
         let midway: (String, String) = conn
@@ -9505,7 +9514,7 @@ mod tests {
             .unwrap();
         assert_eq!(midway, ("active".into(), "decomposed".into()));
 
-        crate::tasks::close_manual(&mut conn, "owner", ids[1], "merged externally", 6)
+        crate::tasks::close_manual(&mut conn, "owner", ids[1], "merged externally", None, 6)
             .unwrap()
             .unwrap();
         assert_graph_completed(&conn, graph, 1, &ids);

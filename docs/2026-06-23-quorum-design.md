@@ -392,7 +392,9 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   same atomic UPDATE, records `refs.abandoned_publication={pr,branch,local_sha,continue_pr}`
   as a bounded audit trail so the orphaned PR stays traceable, and the next dispatch mints a
   fresh branch/PR. A `pr-merged` classification is delivery evidence: the park is terminal
-  and retry refuses to restore it (§ Explicit cancellation and durable parking).
+  and retry refuses to restore it (§ Explicit cancellation and durable parking). When the
+  continuation PR belongs to a failed active graph child, creation stamps that exact child as
+  `refs.source_task` if the ref is absent; this is recovery provenance, not caller authority.
 - ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
   `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
   dependency gating, and reviewer attachment are all preserved as internal functions.
@@ -403,8 +405,10 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   graph cancellation — `failed` is included, because a task whose PR landed outside the
   managed lifecycle has no other route to `done` and its dependents stay parked until it
   gets there (`compute_ready` counts only `done`). Closing a generated child performs final
-  graph/source reconciliation in the same transaction. Reason REQUIRED. Sets `done` but
-  records `completion_provenance=manual` without removing `refs.pr`, and emits
+  graph/source reconciliation in the same transaction. If its retained PR is merged,
+  `task-close` records that immutable merge SHA in `refs.merge_commit_sha`; it refuses an open
+  PR unless the required reason explicitly marks the task obsolete. Reason REQUIRED. Sets `done`
+  but records `completion_provenance=manual` without removing `refs.pr`, and emits
   `task_closed_manual` event
   (never `task_done`) — the audit log distinction is the guardrail. Owner/manual use;
   agents finishing work must use `quorum submit` (`quorum done` is a deprecated alias).
@@ -809,10 +813,13 @@ only through an explicit outside request)
   `refs.merge_commit_sha`. Before allocating a dependent task's branch or worktree, the
   daemon fetches its authoritative target branch and requires every dependency's recorded
   merge commit to be an ancestor of that fetched base SHA; that exact verified SHA is the
-  allocation provenance. A just-merged commit absent from the fetched ref is a bounded,
-  claim-free deferral (logged once); after three attempts, or when a completed dependency
-  lacks its merge SHA, the task parks loudly with the named commit/dependency. The daemon
-  never cuts the dependent branch from an unverifiable base.
+  allocation provenance. If a completed dependency has `refs.pr` but no SHA (for example, it
+  was manually closed after a recovery), the daemon resolves its merged PR outside the DB
+  transaction, falling back to a matching merge on `origin/<base>`, then conditionally stamps
+  the still-missing ref under the write lock. An open or unmerged PR parks the dependent with
+  the named dependency and PR; no SHA is invented. A just-merged commit absent from the fetched
+  ref is a bounded, claim-free deferral. The daemon never cuts the dependent branch from an
+  unverifiable base.
 - **Concurrency cap:** `--cap N` limits the daemon to N concurrent tasks (≤ 2N agents:
   one worker + one reviewer per task).
 - **No passive execution (v2).** External/interactive agents cannot claim, execute,
@@ -2495,8 +2502,8 @@ naming that child can restore the graph's existing sibling authority. Neither pa
 grants new authority beyond the materialized graph.
 
 A narrow incident-recovery primitive may adopt the exact merged delivery of a done managed
-continuation task for the final failed member of an otherwise complete live graph (`state` active
-or blocked, with `active=1`), or for the failed child named by a modern structured
+continuation task for a failed member of a live graph (`state` active or blocked, with `active=1`),
+including while sibling children remain pending, or for the failed child named by a modern structured
 `generated-child-failed` block while siblings remain. The automatic path's immediate transaction requires the same repository and PR,
 creator-selected `continue_pr`, explicit `source_task` provenance, live daemon publication and
 merge events (`expires_at > now`), immutable managed-review authority, and one consistent PR
@@ -2508,10 +2515,11 @@ bounded child-completion events once.
 For a coordinator/operator-selected incident pair, `quorum decomposition-adopt-recovery
 --original-child-id <child> --recovery-task-id <continuation> --by <operator>` is the sole explicit
 recovery-authority surface. The same `BEGIN IMMEDIATE` transaction rechecks active membership,
-failed-child state (and final-child state except for the structured generated-child-failed case),
+failed-child state,
 repository and PR identity, creator-selected continuation authority,
 and exact target/head agreement. It permits absent `source_task` metadata because the caller has
-named the exact pair, but rejects conflicting metadata. Instead of expiring feed events it requires
+named the exact pair, but rejects conflicting metadata; normal `--continue-pr` creation stamps the
+failed child's source provenance when that exact relationship is already known. Instead of expiring feed events it requires
 the durable daemon chain: the final assigned worker run is either `completed` before the persisted
 final PR target or `merged` (which may end after that target resolves), an assigned approved
 reviewer bound to that exact target head and sampling decision, and merged

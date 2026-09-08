@@ -20567,6 +20567,7 @@ enum DependencyBaseAdmission {
 }
 
 async fn verify_dependency_base_before_allocation(
+    config: &ServeConfig,
     db_path: &Path,
     wt_mgr: &WorktreeManager,
     repo_dir: &Path,
@@ -20574,28 +20575,129 @@ async fn verify_dependency_base_before_allocation(
     agent_name: &str,
     base_branch: &str,
 ) -> Result<DependencyBaseAdmission> {
-    let dependencies = {
+    let load_dependencies = || {
         let db_path = db_path.to_path_buf();
         let depends_on = task.depends_on.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<tasks::DependencyMergeCommit>> {
             let conn = quorum_core::db::open(&db_path)?;
             tasks::dependency_merge_commits(&conn, depends_on.as_deref())
         })
-        .await
-        .map_err(|error| QuorumError::Io(format!("dependency merge lookup join: {error}")))??
     };
+    let mut dependencies = load_dependencies()
+        .await
+        .map_err(|error| QuorumError::Io(format!("dependency merge lookup join: {error}")))??;
     if dependencies.is_empty() {
         return Ok(DependencyBaseAdmission::NotRequired);
     }
+
+    // A manual close can legitimately make a dependency done after the PR
+    // already merged. Recover that immutable witness before allocation. All
+    // GitHub/Git work completes before the tiny guarded SQLite write below.
+    for dependency in dependencies
+        .iter()
+        .filter(|dependency| dependency.merge_commit_sha.is_none())
+    {
+        let Some(pr_number) = dependency.pr_number else {
+            continue;
+        };
+        let repo = repo_dir.to_path_buf();
+        let executor = Arc::clone(&config.merge_executor);
+        let status =
+            tokio::task::spawn_blocking(move || executor.merge_commit_status(pr_number, &repo))
+                .await
+                .map_err(|error| QuorumError::Io(format!("dependency PR lookup join: {error}")))?;
+        let merge_commit_sha = match status {
+            merge::MergeCommitStatus::Merged {
+                merge_commit_sha: Some(sha),
+            } => Some(sha),
+            merge::MergeCommitStatus::Merged {
+                merge_commit_sha: None,
+            } => wt_mgr
+                .find_merged_pr_commit(repo_dir, base_branch, pr_number)
+                .await
+                .map_err(|error| {
+                    QuorumError::Io(format!(
+                        "dependency #{}, PR #{pr_number} merge lookup failed: {error}",
+                        dependency.task_id
+                    ))
+                })?,
+            merge::MergeCommitStatus::Open => {
+                let reason = format!(
+                    "dependency #{} is done but PR #{pr_number} is still open",
+                    dependency.task_id
+                );
+                require_park_task(
+                    db_path,
+                    task.id,
+                    &reason,
+                    if task.status == "rework" {
+                        "rework"
+                    } else {
+                        "open"
+                    },
+                )
+                .await?;
+                log(&format!("PARKED: task #{}: {reason}", task.id));
+                return Ok(DependencyBaseAdmission::Deferred);
+            }
+            merge::MergeCommitStatus::Closed => {
+                let reason = format!(
+                    "dependency #{} is done but PR #{pr_number} closed without merging",
+                    dependency.task_id
+                );
+                require_park_task(
+                    db_path,
+                    task.id,
+                    &reason,
+                    if task.status == "rework" {
+                        "rework"
+                    } else {
+                        "open"
+                    },
+                )
+                .await?;
+                log(&format!("PARKED: task #{}: {reason}", task.id));
+                return Ok(DependencyBaseAdmission::Deferred);
+            }
+            merge::MergeCommitStatus::Unknown => None,
+        };
+        let Some(merge_commit_sha) = merge_commit_sha else {
+            continue;
+        };
+        let db_path = db_path.to_path_buf();
+        let task_id = dependency.task_id;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&db_path)?;
+            tasks::record_dependency_merge_commit(
+                &mut conn,
+                task_id,
+                pr_number,
+                &merge_commit_sha,
+                now_unix(),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("dependency merge stamp join: {error}")))??;
+    }
+    dependencies = load_dependencies()
+        .await
+        .map_err(|error| QuorumError::Io(format!("dependency merge reload join: {error}")))??;
 
     let missing_record = dependencies
         .iter()
         .find(|dependency| dependency.merge_commit_sha.is_none());
     let reason = if let Some(dependency) = missing_record {
-        format!(
-            "dependency #{} is done but has no recorded merge commit SHA",
-            dependency.task_id
-        )
+        match dependency.pr_number {
+            Some(pr) => format!(
+                "dependency #{} is done but PR #{pr} has no recoverable merge commit SHA",
+                dependency.task_id
+            ),
+            None => format!(
+                "dependency #{} is done but has no recorded merge commit SHA",
+                dependency.task_id
+            ),
+        }
     } else {
         let merge_commits = dependencies
             .iter()
@@ -20851,6 +20953,7 @@ async fn spawn_worker(
     // prove each recorded merge commit before any branch/provenance/worktree
     // allocation. A propagation lag releases the claim for a bounded retry.
     let verified_dependency_base = match verify_dependency_base_before_allocation(
+        config,
         &db_path,
         wt_mgr,
         worker_repo_dir,
@@ -28169,6 +28272,54 @@ mod tests {
 
         fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
             Some(self.0.clone())
+        }
+    }
+
+    #[cfg(unix)]
+    struct DependencyMergeStatusExecutor(String);
+
+    #[cfg(unix)]
+    impl merge::MergeExecutor for DependencyMergeStatusExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn merge_commit_status(&self, _pr: i64, _repo_dir: &Path) -> merge::MergeCommitStatus {
+            merge::MergeCommitStatus::Merged {
+                merge_commit_sha: Some(self.0.clone()),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct OpenDependencyMergeStatusExecutor;
+
+    #[cfg(unix)]
+    impl merge::MergeExecutor for OpenDependencyMergeStatusExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn merge_commit_status(&self, _pr: i64, _repo_dir: &Path) -> merge::MergeCommitStatus {
+            merge::MergeCommitStatus::Open
         }
     }
 
@@ -36536,7 +36687,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn verified_dependency_base_parks_stale_branch_allocation() {
+    async fn manual_merge_close_dependency_is_stamped_before_stale_branch_allocation_check() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
         let remote = dir.path().join("remote.git");
@@ -36600,21 +36751,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         let db_path = dir.path().join("quorum.db");
         let worktree = dir.path().join("stale-allocation-worktree");
-        let child_id = {
+        let (dependency_id, child_id) = {
             let mut conn = quorum_core::db::open(&db_path).unwrap();
             let dependency_id = tasks::create(
                 &mut conn,
                 "owner",
-                "merged dependency",
+                "manually closed merged dependency",
                 None,
                 0,
                 None,
-                Some(
-                    &serde_json::json!({
-                        "merge_commit_sha": merge_commit,
-                    })
-                    .to_string(),
-                ),
+                Some(&serde_json::json!({ "pr": 701 }).to_string()),
                 None,
                 None,
                 now_unix(),
@@ -36650,10 +36796,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 now_unix(),
             )
             .unwrap());
-            child_id
+            (dependency_id, child_id)
         };
 
         let mut config = pre_review_ci_test_config(db_path.clone(), worker.clone());
+        config.merge_executor = Arc::new(DependencyMergeStatusExecutor(merge_commit.clone()));
         config.worktree_base = dir.path().join("worktrees");
         let mut names = Pool::new_generated();
         let mut workers = Vec::new();
@@ -36700,6 +36847,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
 
         let conn = quorum_core::db::open(&db_path).unwrap();
+        let dependency_refs: String = conn
+            .query_row(
+                "SELECT refs FROM tasks WHERE id=?1",
+                [dependency_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dependency_refs: serde_json::Value = serde_json::from_str(&dependency_refs).unwrap();
+        assert_eq!(dependency_refs["merge_commit_sha"], merge_commit);
         let child = tasks::get(&conn, child_id).unwrap().unwrap();
         assert_eq!(child.status, "failed");
         let refs: serde_json::Value = serde_json::from_str(child.refs.as_deref().unwrap()).unwrap();
@@ -36715,6 +36871,95 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
         assert_eq!(recorded_provenance, stale_provenance);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_pr_on_manually_closed_dependency_parks_child_without_fabricating_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dependency-open-pr.db");
+        let (dependency_id, child) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let dependency_id = tasks::create(
+                &mut conn,
+                "owner",
+                "manually closed dependency",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":702}"#),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done' WHERE id=?1",
+                [dependency_id],
+            )
+            .unwrap();
+            let child_id = tasks::create(
+                &mut conn,
+                "owner",
+                "dependent",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                Some(&format!("[{dependency_id}]")),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let child = tasks::claim(
+                &mut conn,
+                "worker",
+                Some(child_id),
+                &[],
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )
+            .unwrap()
+            .unwrap();
+            (dependency_id, child)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = Arc::new(OpenDependencyMergeStatusExecutor);
+
+        assert!(matches!(
+            verify_dependency_base_before_allocation(
+                &config,
+                &db_path,
+                &WorktreeManager::new(),
+                dir.path(),
+                &child,
+                "worker",
+                "main",
+            )
+            .await
+            .unwrap(),
+            DependencyBaseAdmission::Deferred
+        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let dependency_refs: String = conn
+            .query_row(
+                "SELECT refs FROM tasks WHERE id=?1",
+                [dependency_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dependency_refs: serde_json::Value = serde_json::from_str(&dependency_refs).unwrap();
+        assert!(dependency_refs.get("merge_commit_sha").is_none());
+        let parked = tasks::get(&conn, child.id).unwrap().unwrap();
+        assert_eq!(parked.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(parked.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs[quorum_core::tasks::PARKED_REASON_REF],
+            format!("dependency #{dependency_id} is done but PR #702 is still open")
+        );
     }
 
     #[cfg(unix)]

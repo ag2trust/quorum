@@ -763,6 +763,63 @@ impl WorktreeManager {
         Ok(DependencyBaseVerification::Verified { base_sha })
     }
 
+    /// Recover a GitHub-style merge commit from the fetched target branch when
+    /// GitHub reports a PR as merged before its `mergeCommit` metadata has
+    /// propagated. This is deliberately a bounded, read-only lookup from the
+    /// caller's perspective: it refreshes only the tracking ref and never
+    /// allocates a branch or worktree.
+    pub async fn find_merged_pr_commit(
+        &self,
+        repo_dir: &Path,
+        base_branch: &str,
+        pr_number: i64,
+    ) -> Result<Option<String>, String> {
+        if pr_number <= 0 {
+            return Err("PR number must be positive".into());
+        }
+        let _guard = self.lock.lock().await;
+        let remote_ref = format!("refs/heads/{base_branch}");
+        let tracking_ref = format!("refs/remotes/origin/{base_branch}");
+        let refspec = format!("+{remote_ref}:{tracking_ref}");
+        let mut fetch = self.git_cmd(repo_dir);
+        fetch.args(["fetch", "origin", &refspec]);
+        let fetched = run_git(
+            fetch,
+            self.fetch_timeout,
+            "git fetch dependency merge lookup",
+        )
+        .await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {remote_ref} failed: {}",
+                git_diagnostic(&fetched.stderr)
+            ));
+        }
+
+        let base_ref = format!("origin/{base_branch}");
+        let marker = format!("#{pr_number}");
+        let mut log = self.git_cmd(repo_dir);
+        log.args([
+            "log",
+            "--merges",
+            "--format=%H",
+            "--max-count=1",
+            "--grep",
+            &marker,
+            "--fixed-strings",
+            &base_ref,
+        ]);
+        let output = run_git(log, self.local_timeout, "git find dependency PR merge").await?;
+        if !output.status.success() {
+            return Err(format!(
+                "git log merge lookup failed: {}",
+                git_diagnostic(&output.stderr)
+            ));
+        }
+        let sha = git_diagnostic(&output.stdout);
+        Ok((!sha.is_empty()).then_some(sha))
+    }
+
     /// Refresh and merge the configured base into an exact continuation PR
     /// checkout. A content conflict is a prepared worker state, not a setup
     /// failure: Git leaves `MERGE_HEAD` plus the index/worktree conflicts for
@@ -2027,7 +2084,7 @@ mod tests {
                 "--no-ff",
                 "dependency",
                 "-m",
-                "merge dependency"
+                "Merge pull request #701 from dependency"
             ])
             .status()
             .unwrap()
@@ -2055,6 +2112,19 @@ mod tests {
         )
         .status
         .success());
+        assert_eq!(
+            mgr.find_merged_pr_commit(&worker, "main", 701)
+                .await
+                .unwrap(),
+            Some(base_sha),
+            "the GitHub metadata fallback must find the PR's merge commit on the fetched base"
+        );
+        assert_eq!(
+            mgr.find_merged_pr_commit(&worker, "main", 702)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
