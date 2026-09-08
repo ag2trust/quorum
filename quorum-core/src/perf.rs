@@ -7,8 +7,8 @@
 
 use crate::db::map_sql_err;
 use crate::error::Result;
-use rusqlite::Connection;
 use rusqlite::OptionalExtension;
+use rusqlite::{params_from_iter, Connection};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -630,9 +630,9 @@ struct GraphChildInfo {
     source_task_id: i64,
 }
 
-/// Recovery adoption row: only accepted when durable `$.recovery_delivery`
-/// provenance is self-consistent (source_task equals the row it lives on)
-/// and names a distinct recovery task.
+/// Recovery adoption row. Its fields are emitted as evidence only after the
+/// reader has matched the immutable accepted-member relation, daemon-owned
+/// completion provenance, and the daemon's explicit-adoption ledger entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecoveryPairInfo {
     recovery_task_id: i64,
@@ -642,10 +642,9 @@ struct RecoveryPairInfo {
 }
 
 /// Durable lineage relations captured under the same WAL snapshot as the
-/// cohort reads. Absent from either map ⇒ no collapse; presence follows a
-/// row we can point at (an active graph member, or a self-consistent
-/// `$.recovery_delivery` object). Never derived from titles, labels,
-/// matching PRs, or `continue_pr`.
+/// cohort reads. Absent from either map ⇒ no collapse. Relations are confined
+/// to the capped facts cohort and its necessary graph roots; they are never
+/// derived from titles, labels, matching PRs, or `continue_pr`.
 struct LineageSnapshot {
     /// Every active graph child → the source task that owns its graph.
     child_to_source: HashMap<i64, i64>,
@@ -657,108 +656,242 @@ struct LineageSnapshot {
     original_to_recoveries: BTreeMap<i64, Vec<RecoveryPairInfo>>,
 }
 
-/// Read all active graph memberships joined to their source task. Bounded
-/// by the number of decompositions that exist; the daemon caps this
-/// aggressively (one active graph per source) so a single scan is safe.
-fn load_graph_members(conn: &Connection) -> Result<Vec<GraphChildInfo>> {
-    let mut stmt = conn.prepare(
-        "SELECT tgm.task_id, tgm.graph_id, td.source_task_id \
-         FROM task_graph_members tgm \
-         JOIN task_decompositions td ON td.id = tgm.graph_id \
-         WHERE tgm.active = 1 \
-         ORDER BY td.source_task_id, tgm.task_id",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(GraphChildInfo {
-                task_id: r.get(0)?,
-                graph_id: r.get(1)?,
-                source_task_id: r.get(2)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+/// Every lineage query uses a small parameter batch rather than a full task
+/// history scan. The caps below also bound rows held in the facts snapshot:
+/// each accepted graph has at most `MAX_CHILDREN` members, while seeing two
+/// recovery mappings for one original is enough to reject it as ambiguous.
+const LINEAGE_ID_BATCH: usize = 256;
+const MAX_GRAPH_MEMBERS_PER_LINEAGE_ROOT: usize = crate::decomposition::MAX_CHILDREN;
+const MAX_RECOVERY_MAPPINGS_PER_ORIGINAL: usize = 2;
+
+fn sql_placeholders(len: usize) -> String {
+    std::iter::repeat_n("?", len).collect::<Vec<_>>().join(",")
 }
 
-/// Read every task carrying a durable `$.recovery_delivery` object and
-/// return only the self-consistent, non-degenerate pairs. A row that
-/// disagrees with its own id, omits `recovery_task`, or points recovery
-/// at itself is discarded — collapse never fabricates lineage from a
-/// partial or malformed refs blob.
-///
-/// Gate on `completion_provenance = 'merged'`. That top-level column is
-/// CHECK-constrained to `('merged','manual')` and is only ever written
-/// from daemon-owned lifecycle paths (`tasks.rs` merge finalization and
-/// `decomposition::finalize_recovery_delivery`). Agent-writable task
-/// updates cannot forge this signal, so pairing it with a self-consistent
-/// `$.recovery_delivery` object rules out a working-agent-fabricated refs
-/// blob that would otherwise pass the shape check. `status='done'` is
-/// implied by the constraint that finalization only sets provenance while
-/// transitioning to done — asserted here defensively.
-fn load_recovery_deliveries(conn: &Connection) -> Result<Vec<RecoveryPairInfo>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, \
-                json_extract(refs, '$.recovery_delivery.source_task'), \
-                json_extract(refs, '$.recovery_delivery.recovery_task'), \
-                json_extract(refs, '$.recovery_delivery.pr'), \
-                json_extract(refs, '$.recovery_delivery.merged_head_sha') \
-         FROM tasks \
-         WHERE json_type(refs, '$.recovery_delivery') IS NOT NULL \
-           AND completion_provenance = 'merged' \
-           AND status = 'done' \
-         ORDER BY id",
-    )?;
+/// Look up only cohort tasks that are accepted generated children, to find
+/// the roots that may need sibling evidence. `task_id` is UNIQUE in the
+/// membership schema; the LIMIT is nevertheless retained as a hard reader
+/// bound if a legacy/corrupt database violates that contract.
+fn load_graph_member_roots(conn: &Connection, task_ids: &[i64]) -> Result<Vec<GraphChildInfo>> {
     let mut out = Vec::new();
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, Option<i64>>(1)?,
-            r.get::<_, Option<i64>>(2)?,
-            r.get::<_, Option<i64>>(3)?,
-            r.get::<_, Option<String>>(4)?,
-        ))
-    })?;
-    for row in rows {
-        let (task_id, source_task, recovery_task, pr_number, merged_head_sha) = row?;
-        // Only accept a self-consistent pair naming a distinct recovery task.
-        let (Some(orig), Some(rec)) = (source_task, recovery_task) else {
-            continue;
-        };
-        if orig != task_id || rec == orig {
-            continue;
-        }
-        out.push(RecoveryPairInfo {
-            recovery_task_id: rec,
-            original_task_id: orig,
-            pr_number,
-            merged_head_sha,
-        });
+    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
+        let placeholders = sql_placeholders(batch.len());
+        let sql = format!(
+            "SELECT member.task_id,member.graph_id,graph.source_task_id \
+             FROM task_graph_members member \
+             JOIN task_decompositions graph ON graph.id=member.graph_id \
+             WHERE member.task_id IN ({placeholders}) \
+               AND member.active=1 \
+               AND member.plan_revision=graph.accepted_plan_revision \
+               AND (graph.active=1 OR graph.state='completed') \
+             ORDER BY member.task_id \
+             LIMIT ?"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let mut params = batch.to_vec();
+        params.push(batch.len() as i64);
+        let rows = statement.query_map(params_from_iter(params), |row| {
+            Ok(GraphChildInfo {
+                task_id: row.get(0)?,
+                graph_id: row.get(1)?,
+                source_task_id: row.get(2)?,
+            })
+        })?;
+        out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
     }
     Ok(out)
 }
 
-fn build_lineage_snapshot(conn: &Connection) -> Result<LineageSnapshot> {
-    let members = load_graph_members(conn)?;
-    let mut child_to_source: HashMap<i64, i64> = HashMap::with_capacity(members.len());
-    let mut source_to_children: BTreeMap<i64, Vec<GraphChildInfo>> = BTreeMap::new();
-    for m in members {
-        child_to_source.insert(m.task_id, m.source_task_id);
-        source_to_children
-            .entry(m.source_task_id)
-            .or_default()
-            .push(m);
+/// Read accepted members only for roots derived from the capped cohort. A
+/// source with more than the daemon's declared child cap is malformed and is
+/// excluded by the caller; the extra row makes that condition observable
+/// without allocating its complete history.
+fn load_graph_members_for_roots(
+    conn: &Connection,
+    root_ids: &[i64],
+) -> Result<Vec<GraphChildInfo>> {
+    let mut out = Vec::new();
+    for batch in root_ids.chunks(LINEAGE_ID_BATCH) {
+        let placeholders = sql_placeholders(batch.len());
+        let sql = format!(
+            "SELECT member.task_id,member.graph_id,graph.source_task_id \
+             FROM task_decompositions graph \
+             JOIN task_graph_members member ON member.graph_id=graph.id \
+             WHERE graph.source_task_id IN ({placeholders}) \
+               AND member.active=1 \
+               AND member.plan_revision=graph.accepted_plan_revision \
+               AND (graph.active=1 OR graph.state='completed') \
+             ORDER BY graph.source_task_id,member.task_id \
+             LIMIT ?"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let mut params = batch.to_vec();
+        params.push(
+            batch
+                .len()
+                .saturating_mul(MAX_GRAPH_MEMBERS_PER_LINEAGE_ROOT + 1) as i64,
+        );
+        let rows = statement.query_map(params_from_iter(params), |row| {
+            Ok(GraphChildInfo {
+                task_id: row.get(0)?,
+                graph_id: row.get(1)?,
+                source_task_id: row.get(2)?,
+            })
+        })?;
+        out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
     }
+    Ok(out)
+}
 
-    let pairs = load_recovery_deliveries(conn)?;
-    let mut recovery_to_original: HashMap<i64, RecoveryPairInfo> =
-        HashMap::with_capacity(pairs.len());
-    let mut original_to_recoveries: BTreeMap<i64, Vec<RecoveryPairInfo>> = BTreeMap::new();
-    for p in pairs {
-        recovery_to_original.insert(p.recovery_task_id, p.clone());
-        original_to_recoveries
-            .entry(p.original_task_id)
+/// Read only recovery ledger rows whose original task is in the capped
+/// cohort or an accepted member of one of its roots. Mutable task refs are
+/// corroborating fields, never authority: a row is accepted only when the
+/// original is an accepted generated child, both tasks have daemon-owned
+/// merged completion, and the immutable daemon-written explicit-adoption
+/// ledger names the exact same pair and delivery evidence.
+fn load_recovery_deliveries(
+    conn: &Connection,
+    original_ids: &[i64],
+) -> Result<Vec<RecoveryPairInfo>> {
+    let mut out = Vec::new();
+    for batch in original_ids.chunks(LINEAGE_ID_BATCH) {
+        let placeholders = sql_placeholders(batch.len());
+        let sql = format!(
+            "SELECT original.id, \
+                    json_extract(original.refs,'$.recovery_delivery.recovery_task'), \
+                    json_extract(original.refs,'$.recovery_delivery.pr'), \
+                    json_extract(original.refs,'$.recovery_delivery.merged_head_sha') \
+             FROM tasks original \
+             JOIN task_graph_members member ON member.task_id=original.id \
+             JOIN task_decompositions graph ON graph.id=member.graph_id \
+             JOIN tasks recovery \
+               ON recovery.id=json_extract(original.refs,'$.recovery_delivery.recovery_task') \
+             JOIN decomposition_attempts adoption \
+               ON adoption.graph_id=graph.id \
+              AND adoption.source_revision=graph.planned_source_revision \
+              AND adoption.kind='recovery' \
+              AND adoption.reason_code='explicit-delivery-adoption' \
+             WHERE original.id IN ({placeholders}) \
+               AND original.status='done' \
+               AND original.completion_provenance='merged' \
+               AND recovery.status='done' \
+               AND recovery.completion_provenance='merged' \
+               AND member.active=1 \
+               AND member.plan_revision=graph.accepted_plan_revision \
+               AND (graph.active=1 OR graph.state='completed') \
+               AND json_valid(original.refs) \
+               AND json_type(original.refs,'$.recovery_delivery.source_task')='integer' \
+               AND json_extract(original.refs,'$.recovery_delivery.source_task')=original.id \
+               AND json_type(original.refs,'$.recovery_delivery.recovery_task')='integer' \
+               AND json_extract(original.refs,'$.recovery_delivery.recovery_task')!=original.id \
+               AND json_type(original.refs,'$.recovery_delivery.pr')='integer' \
+               AND json_type(original.refs,'$.recovery_delivery.merged_head_sha')='text' \
+               AND json_valid(adoption.summary) \
+               AND json_type(adoption.summary,'$.authority')='text' \
+               AND json_extract(adoption.summary,'$.authority')='explicit-operator' \
+               AND json_type(adoption.summary,'$.original_child')='integer' \
+               AND json_extract(adoption.summary,'$.original_child')=original.id \
+               AND json_type(adoption.summary,'$.recovery_task')='integer' \
+               AND json_extract(adoption.summary,'$.recovery_task')=
+                   json_extract(original.refs,'$.recovery_delivery.recovery_task') \
+               AND json_type(adoption.summary,'$.decomposition_source')='integer' \
+               AND json_extract(adoption.summary,'$.decomposition_source')=graph.source_task_id \
+               AND json_type(adoption.summary,'$.pr')='integer' \
+               AND json_extract(adoption.summary,'$.pr')=
+                   json_extract(original.refs,'$.recovery_delivery.pr') \
+               AND json_type(adoption.summary,'$.merged_head_sha')='text' \
+               AND json_extract(adoption.summary,'$.merged_head_sha')=
+                   json_extract(original.refs,'$.recovery_delivery.merged_head_sha') \
+             ORDER BY original.id,adoption.id \
+             LIMIT ?"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let mut params = batch.to_vec();
+        params.push(
+            batch
+                .len()
+                .saturating_mul(MAX_RECOVERY_MAPPINGS_PER_ORIGINAL) as i64,
+        );
+        let rows = statement.query_map(params_from_iter(params), |row| {
+            Ok(RecoveryPairInfo {
+                original_task_id: row.get(0)?,
+                recovery_task_id: row.get(1)?,
+                pr_number: Some(row.get(2)?),
+                merged_head_sha: Some(row.get(3)?),
+            })
+        })?;
+        out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+    }
+    Ok(out)
+}
+
+fn build_lineage_snapshot(conn: &Connection, cohort_ids: &[i64]) -> Result<LineageSnapshot> {
+    // The first query discovers roots for cohort children. It is keyed by
+    // `task_graph_members.task_id` (UNIQUE), so completed-graph retained
+    // members cannot turn this into a history traversal.
+    let direct_members = load_graph_member_roots(conn, cohort_ids)?;
+    let mut root_ids: BTreeSet<i64> = cohort_ids.iter().copied().collect();
+    root_ids.extend(direct_members.iter().map(|member| member.source_task_id));
+    let root_ids: Vec<i64> = root_ids.into_iter().collect();
+
+    // Then read only members of those roots. Invalid over-cap roots are
+    // discarded wholesale, so a truncated/corrupt relation can never become
+    // a partial, guessed lineage mapping.
+    let root_members = load_graph_members_for_roots(conn, &root_ids)?;
+    let mut source_to_children: BTreeMap<i64, Vec<GraphChildInfo>> = BTreeMap::new();
+    for member in root_members {
+        source_to_children
+            .entry(member.source_task_id)
             .or_default()
-            .push(p);
+            .push(member);
+    }
+    source_to_children.retain(|_, members| {
+        if members.len() > MAX_GRAPH_MEMBERS_PER_LINEAGE_ROOT {
+            return false;
+        }
+        members.sort_by_key(|member| member.task_id);
+        true
+    });
+    let child_to_source: HashMap<i64, i64> = source_to_children
+        .iter()
+        .flat_map(|(&source, members)| members.iter().map(move |member| (member.task_id, source)))
+        .collect();
+
+    // A recovery relation can affect a cohort original or a sibling of one
+    // of its roots, but nothing else. This caps the ledger read to the facts
+    // cohort plus at most MAX_CHILDREN per derived root.
+    let mut recovery_original_ids: BTreeSet<i64> = cohort_ids.iter().copied().collect();
+    recovery_original_ids.extend(
+        source_to_children
+            .values()
+            .flat_map(|members| members.iter().map(|member| member.task_id)),
+    );
+    let recovery_original_ids: Vec<i64> = recovery_original_ids.into_iter().collect();
+    let pairs = load_recovery_deliveries(conn, &recovery_original_ids)?;
+
+    // A recovery/original must be one-to-one. The ledger normally enforces
+    // this by construction; if retained or malformed data presents a
+    // duplicate/conflict, reject every implicated mapping instead of letting
+    // insertion order choose a winner.
+    let mut original_counts: HashMap<i64, usize> = HashMap::new();
+    let mut recovery_counts: HashMap<i64, usize> = HashMap::new();
+    for pair in &pairs {
+        *original_counts.entry(pair.original_task_id).or_default() += 1;
+        *recovery_counts.entry(pair.recovery_task_id).or_default() += 1;
+    }
+    let mut recovery_to_original = HashMap::new();
+    let mut original_to_recoveries: BTreeMap<i64, Vec<RecoveryPairInfo>> = BTreeMap::new();
+    for pair in pairs {
+        if original_counts[&pair.original_task_id] != 1
+            || recovery_counts[&pair.recovery_task_id] != 1
+        {
+            continue;
+        }
+        recovery_to_original.insert(pair.recovery_task_id, pair.clone());
+        original_to_recoveries
+            .entry(pair.original_task_id)
+            .or_default()
+            .push(pair);
     }
 
     Ok(LineageSnapshot {
@@ -910,7 +1043,10 @@ fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSn
         // First SELECT establishes the snapshot; subsequent reads see it.
         let counts = count_candidates(c, since)?;
         let ordinary_ids = load_ordinary_intent_ids(c, since, MAX_INTENTS + 1)?;
-        let lineage = build_lineage_snapshot(c)?;
+        // The sentinel row detects truncation but is not part of the facts
+        // cohort, so lineage reads never expand beyond MAX_INTENTS ids.
+        let lineage =
+            build_lineage_snapshot(c, &ordinary_ids[..ordinary_ids.len().min(MAX_INTENTS)])?;
         Ok(CohortSnapshot {
             watermark,
             counts,
@@ -2128,12 +2264,10 @@ mod tests {
     //     terminal children.
     //
     //   proof #5a — exact recovery adoption:
-    //     original X (terminal, refs.$.recovery_delivery names source_task=X,
-    //     recovery_task=Y, AND row carries the daemon-owned adoption stamp
-    //     status='done' + completion_provenance='merged') + recovery Y
-    //     (terminal). Y collapses into X's intent — one top-level intent,
-    //     X and Y both attributable. The daemon-owned column is what makes
-    //     the refs blob load-bearing; a self-consistent refs alone is not.
+    //     original X is an accepted generated child, its immutable daemon
+    //     recovery ledger names Y, and both have merged completion provenance.
+    //     Y collapses through X into the source intent. Mutable delivery refs
+    //     corroborate that ledger evidence but cannot establish it alone.
     //
     //   proof #5b — shared-PR / continuation without provenance:
     //     tasks A and B share a PR reference (refs.$.pr = 42) or a
@@ -2142,12 +2276,10 @@ mod tests {
     //     whose lineage evidence is JSON null (coverage.lineage=false).
     //     Title/labels/matching PR/continue_pr never trigger collapse.
     //
-    //   proof #5c — forged refs without daemon adoption:
-    //     a self-consistent refs.$.recovery_delivery blob written on a row
-    //     whose completion_provenance is NULL (or 'manual') never triggers
-    //     collapse. Only the daemon's own finalization sets
-    //     completion_provenance='merged', so the gate distinguishes
-    //     daemon-attested lineage from agent-writable metadata.
+    //   proof #5c — forged refs without exact adoption:
+    //     a normal task may carry a self-consistent recovery_delivery blob
+    //     and merged completion provenance, but stays independent unless the
+    //     accepted-member and exact ledger predicates also hold.
 
     fn seed_decomposition(conn: &Connection, source_task_id: i64, plan_revision: i64) -> i64 {
         conn.execute(
@@ -2183,22 +2315,61 @@ mod tests {
         .unwrap();
     }
 
-    /// Test-only helper: stamp the row with the exact daemon-owned adoption
-    /// signal (`completion_provenance = 'merged'`, `status = 'done'`) so
-    /// `$.recovery_delivery` reads pass the collapse gate. Sibling helper
-    /// `set_refs` seeds the refs blob; without this stamp collapse must not
-    /// happen — that is the negative path exercised by
-    /// `facts_recovery_delivery_without_daemon_provenance_does_not_collapse`.
-    fn stamp_daemon_recovery_adoption(conn: &Connection, task_id: i64) {
-        let changed = conn
-            .execute(
-                "UPDATE tasks \
-                 SET status = 'done', completion_provenance = 'merged' \
-                 WHERE id = ?1",
-                rusqlite::params![task_id],
+    /// Seed the durable evidence written by the daemon's explicit recovery
+    /// adoption: accepted generated-child membership is supplied separately,
+    /// both completions are daemon-merged, and the immutable recovery ledger
+    /// agrees exactly with the persisted delivery fields.
+    fn record_explicit_recovery_adoption(
+        conn: &Connection,
+        graph_id: i64,
+        original_task_id: i64,
+        recovery_task_id: i64,
+    ) {
+        let (source_task_id, source_revision, refs): (i64, i64, String) = conn
+            .query_row(
+                "SELECT source_task_id,planned_source_revision,refs
+                 FROM task_decompositions JOIN tasks ON tasks.id=?2
+                 WHERE task_decompositions.id=?1",
+                rusqlite::params![graph_id, original_task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(changed, 1, "daemon adoption stamp must land on one row");
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        let pr = refs["recovery_delivery"]["pr"].as_i64().unwrap();
+        let merged_head_sha = refs["recovery_delivery"]["merged_head_sha"]
+            .as_str()
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done',completion_provenance='merged'
+             WHERE id IN (?1,?2)",
+            rusqlite::params![original_task_id, recovery_task_id],
+        )
+        .unwrap();
+        let ordinal: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(ordinal),0)+1 FROM decomposition_attempts
+                 WHERE graph_id=?1 AND source_revision=?2 AND kind='recovery'",
+                rusqlite::params![graph_id, source_revision],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let summary = serde_json::json!({
+            "authority": "explicit-operator",
+            "authorized_by": "test-operator",
+            "decomposition_source": source_task_id,
+            "original_child": original_task_id,
+            "recovery_task": recovery_task_id,
+            "pr": pr,
+            "merged_head_sha": merged_head_sha,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
+                 retry_generation,reason_code,summary,created_at)
+             VALUES (?1,?2,'recovery',?3,0,'explicit-delivery-adoption',?4,1800)",
+            rusqlite::params![graph_id, source_revision, ordinal, summary],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2286,11 +2457,14 @@ mod tests {
         //       refs.$.recovery_delivery. They stay independent.
         let (_d, mut c) = open_tmp();
 
-        // Lineage A: exact recovery adoption. Daemon has stamped the row
-        // `status='done'` with `completion_provenance='merged'` — that is the
-        // gate perf reads accept; agent-writable refs alone are never enough.
+        // Lineage A: exact recovery adoption. The original is an accepted
+        // generated child, and the daemon-owned recovery ledger agrees with
+        // the merged delivery fields — refs alone are never enough.
+        let source_s = seed_ordinary(&mut c, 1550);
         let orig_x = seed_ordinary(&mut c, 1600);
         let recovery_y = seed_ordinary(&mut c, 1650);
+        let graph_id = seed_decomposition(&c, source_s, 1);
+        seed_graph_member(&c, graph_id, orig_x, "child-x", 1);
         let x_refs = serde_json::json!({
             "recovery_delivery": {
                 "source_task": orig_x,
@@ -2302,7 +2476,7 @@ mod tests {
         })
         .to_string();
         set_refs(&c, orig_x, &x_refs);
-        stamp_daemon_recovery_adoption(&c, orig_x);
+        record_explicit_recovery_adoption(&c, graph_id, orig_x, recovery_y);
 
         // Lineage B: shared PR / continue_pr but no recovery_delivery.
         let shared_a = seed_ordinary(&mut c, 1700);
@@ -2313,11 +2487,11 @@ mod tests {
         set_refs(&c, shared_b, &b_refs);
 
         let r = perf_facts(&c, false).unwrap();
-        // Expected intents: one collapsed (orig_x + recovery_y), and two
+        // Expected intents: one collapsed (source_s + orig_x + recovery_y), and two
         // independent (shared_a, shared_b) — total 3.
         assert_eq!(r.intents.len(), 3, "recovery folds, shared-PR does not");
-        assert_eq!(r.counts.candidate, 4);
-        assert_eq!(r.counts.included, 4);
+        assert_eq!(r.counts.candidate, 5);
+        assert_eq!(r.counts.included, 5);
         assert_eq!(r.counts.excluded, 0);
 
         // Find each intent by intent_id.
@@ -2328,13 +2502,19 @@ mod tests {
             .collect();
 
         // The collapsed recovery intent.
-        let collapsed_id = format!("intent-{orig_x}");
+        let collapsed_id = format!("intent-{source_s}");
         let collapsed = by_id.get(collapsed_id.as_str()).unwrap();
-        assert_eq!(collapsed.contributing_task_ids, vec![orig_x, recovery_y]);
-        assert_eq!(collapsed.lineage_root_task_id, Some(orig_x));
+        assert_eq!(
+            collapsed.contributing_task_ids,
+            vec![source_s, orig_x, recovery_y]
+        );
+        assert_eq!(collapsed.lineage_root_task_id, Some(source_s));
         assert!(collapsed.coverage.lineage);
         let ev = collapsed.lineage_evidence.as_ref().unwrap();
-        assert_eq!(ev.get("kind").unwrap(), &serde_json::json!("recovery"));
+        assert_eq!(
+            ev.get("kind").unwrap(),
+            &serde_json::json!("decomposed+recovery")
+        );
         let pairs = ev.get("recovery_pairs").unwrap().as_array().unwrap();
         assert_eq!(pairs.len(), 1);
         assert_eq!(
@@ -2377,8 +2557,8 @@ mod tests {
         // A refs.$.recovery_delivery whose source_task disagrees with the row
         // it lives on, or whose recovery_task is missing, must NOT be used
         // to collapse anything — partial provenance is treated as unknown,
-        // never guessed. Even the daemon-owned adoption stamp cannot rescue
-        // a malformed blob: shape guards run first, so the row is discarded.
+        // never guessed. The exact ledger predicate includes these fields,
+        // so a malformed row cannot become a recovery mapping.
         let (_d, mut c) = open_tmp();
         let a = seed_ordinary(&mut c, 1600);
         let b = seed_ordinary(&mut c, 1650);
@@ -2391,9 +2571,8 @@ mod tests {
         })
         .to_string();
         set_refs(&c, a, &bogus);
-        // Even with the daemon adoption stamp present, the malformed blob is
-        // rejected by the shape guard — no collapse, no lineage evidence.
-        stamp_daemon_recovery_adoption(&c, a);
+        // A malformed blob has no matching immutable adoption ledger entry,
+        // so it is rejected as unknown lineage rather than guessed.
 
         let r = perf_facts(&c, false).unwrap();
         // Neither task collapses — two independent top-level intents, both
@@ -2415,22 +2594,20 @@ mod tests {
         }
     }
 
-    /// Negative-path proof for finding 1: an ordinary task that carries a
-    /// self-consistent `$.recovery_delivery` object but lacks the
-    /// daemon-owned adoption signal (`completion_provenance = 'merged'`) is
-    /// treated as unknown lineage, never as a collapse relation. Without the
-    /// gate a working-agent-writable refs blob could group any two
-    /// unrelated terminal tasks.
+    /// Negative-path proof for finding 1: ordinary daemon-merged completion
+    /// is not recovery adoption. An agent may write a self-consistent
+    /// `$.recovery_delivery` object before normal merge finalization, so the
+    /// immutable accepted-child relation plus explicit adoption ledger are
+    /// both required to make the mutable refs relevant at all.
     #[test]
-    fn facts_recovery_delivery_without_daemon_provenance_does_not_collapse() {
+    fn facts_ordinary_merged_recovery_forgery_does_not_collapse() {
         let (_d, mut c) = open_tmp();
         let forger = seed_ordinary(&mut c, 1600);
         let victim = seed_ordinary(&mut c, 1650);
-        // Self-consistent shape — but no daemon adoption stamp. The row
-        // stays at whatever the seed status is (`done`, but with
-        // `completion_provenance` NULL because the seed row never went
-        // through daemon finalization). An agent writing this refs blob
-        // must not induce a collapse.
+        // Self-consistent agent-writable shape plus the same daemon-owned
+        // merged completion a normal task receives. This must still not
+        // induce a collapse because neither task is an accepted graph child
+        // with a matching explicit adoption ledger entry.
         let forged = serde_json::json!({
             "recovery_delivery": {
                 "source_task": forger,
@@ -2441,8 +2618,11 @@ mod tests {
         })
         .to_string();
         set_refs(&c, forger, &forged);
-        // Sanity check: the seed helper does not touch completion_provenance,
-        // so it is NULL — the row is not daemon-attested adoption.
+        c.execute(
+            "UPDATE tasks SET completion_provenance='merged' WHERE id IN (?1,?2)",
+            rusqlite::params![forger, victim],
+        )
+        .unwrap();
         let provenance: Option<String> = c
             .query_row(
                 "SELECT completion_provenance FROM tasks WHERE id = ?1",
@@ -2450,16 +2630,13 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(
-            provenance.is_none(),
-            "seed row must lack the daemon adoption stamp — the whole point of this test"
-        );
+        assert_eq!(provenance.as_deref(), Some("merged"));
 
         let r = perf_facts(&c, false).unwrap();
         assert_eq!(
             r.intents.len(),
             2,
-            "agent-writable refs cannot forge collapse"
+            "ordinary merged refs cannot forge recovery adoption"
         );
         let ids: Vec<i64> = r
             .intents
@@ -2474,8 +2651,9 @@ mod tests {
         }
     }
 
-    /// The gate rejects `completion_provenance = 'manual'` — only the
-    /// daemon-owned merged-adoption path counts.
+    /// The gate rejects `completion_provenance = 'manual'`; merged
+    /// completion is necessary but the exact adoption relation is also
+    /// required.
     #[test]
     fn facts_recovery_delivery_manual_provenance_does_not_collapse() {
         let (_d, mut c) = open_tmp();
@@ -2522,9 +2700,7 @@ mod tests {
         })
         .to_string();
         set_refs(&c, x, &x_refs);
-        // Daemon has adopted X's recovery Y — stamp the row so the gate
-        // treats the refs blob as durable evidence.
-        stamp_daemon_recovery_adoption(&c, x);
+        record_explicit_recovery_adoption(&c, graph_id, x, y);
 
         let r = perf_facts(&c, false).unwrap();
         assert_eq!(r.intents.len(), 1);
@@ -2550,6 +2726,176 @@ mod tests {
     }
 
     #[test]
+    fn facts_duplicate_or_conflicting_recovery_mappings_fail_closed() {
+        // Three otherwise-valid daemon ledger entries all name recovery Y:
+        // two duplicate X→Y entries and one conflicting Z→Y entry. The
+        // reader must not select a last writer; Y stays independent with an
+        // explicit lineage coverage gap, while the valid decomposition alone
+        // still groups its generated children under S.
+        let (_d, mut c) = open_tmp();
+        let s = seed_ordinary(&mut c, 1600);
+        let x = seed_ordinary(&mut c, 1650);
+        let z = seed_ordinary(&mut c, 1700);
+        let y = seed_ordinary(&mut c, 1750);
+        let graph_id = seed_decomposition(&c, s, 1);
+        seed_graph_member(&c, graph_id, x, "child-x", 1);
+        seed_graph_member(&c, graph_id, z, "child-z", 1);
+        for (original, pr, sha) in [(x, 7, "head-x"), (z, 8, "head-z")] {
+            set_refs(
+                &c,
+                original,
+                &serde_json::json!({
+                    "recovery_delivery": {
+                        "source_task": original,
+                        "recovery_task": y,
+                        "pr": pr,
+                        "merged_head_sha": sha,
+                    }
+                })
+                .to_string(),
+            );
+        }
+        record_explicit_recovery_adoption(&c, graph_id, x, y);
+        record_explicit_recovery_adoption(&c, graph_id, x, y);
+        record_explicit_recovery_adoption(&c, graph_id, z, y);
+
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.intents.len(), 2);
+        let by_id: HashMap<&str, &IntentFacts> = r
+            .intents
+            .iter()
+            .map(|intent| (intent.intent_id.as_str(), intent))
+            .collect();
+        let decomposed = by_id.get(format!("intent-{s}").as_str()).unwrap();
+        assert_eq!(decomposed.contributing_task_ids, vec![s, x, z]);
+        assert!(decomposed.coverage.lineage);
+        assert!(
+            decomposed
+                .lineage_evidence
+                .as_ref()
+                .unwrap()
+                .get("recovery_pairs")
+                .is_none(),
+            "ambiguous recovery rows must not leak into decomposition evidence"
+        );
+        let independent = by_id.get(format!("intent-{y}").as_str()).unwrap();
+        assert_eq!(independent.contributing_task_ids, vec![y]);
+        assert!(independent.lineage_root_task_id.is_none());
+        assert!(independent.lineage_evidence.is_none());
+        assert!(!independent.coverage.lineage);
+    }
+
+    #[test]
+    fn facts_lineage_selection_is_scoped_and_member_capped() {
+        // Real SQLite regression for both bounds: unrelated retained graphs
+        // never enter a snapshot rooted at `current_source`, and a malformed
+        // root can contribute only MAX_CHILDREN + 1 probe rows before being
+        // rejected rather than materialized in full.
+        let (_d, mut c) = open_tmp();
+        let current_source = seed_ordinary(&mut c, 1600);
+        let current_a = seed_ordinary(&mut c, 1650);
+        let current_b = seed_ordinary(&mut c, 1700);
+        let current_recovery = seed_ordinary(&mut c, 1750);
+        let current_graph = seed_decomposition(&c, current_source, 1);
+        seed_graph_member(&c, current_graph, current_a, "current-a", 1);
+        seed_graph_member(&c, current_graph, current_b, "current-b", 1);
+        set_refs(
+            &c,
+            current_a,
+            &serde_json::json!({
+                "recovery_delivery": {
+                    "source_task": current_a,
+                    "recovery_task": current_recovery,
+                    "pr": 7,
+                    "merged_head_sha": "current-head",
+                }
+            })
+            .to_string(),
+        );
+        record_explicit_recovery_adoption(&c, current_graph, current_a, current_recovery);
+        c.execute(
+            "UPDATE task_decompositions SET state='completed',active=0 WHERE id=?1",
+            rusqlite::params![current_graph],
+        )
+        .unwrap();
+
+        let historical_source = seed_ordinary(&mut c, 100);
+        let historical_graph = seed_decomposition(&c, historical_source, 1);
+        c.execute(
+            "UPDATE task_decompositions SET state='completed',active=0 WHERE id=?1",
+            rusqlite::params![historical_graph],
+        )
+        .unwrap();
+        let mut historical_children = Vec::new();
+        for index in 0..(MAX_GRAPH_MEMBERS_PER_LINEAGE_ROOT + 3) {
+            let child = seed_ordinary(&mut c, 100 + index as i64);
+            seed_graph_member(
+                &c,
+                historical_graph,
+                child,
+                &format!("historical-{index}"),
+                1,
+            );
+            historical_children.push(child);
+        }
+        let historical_recovery = seed_ordinary(&mut c, 200);
+        set_refs(
+            &c,
+            historical_children[0],
+            &serde_json::json!({
+                "recovery_delivery": {
+                    "source_task": historical_children[0],
+                    "recovery_task": historical_recovery,
+                    "pr": 8,
+                    "merged_head_sha": "historical-head",
+                }
+            })
+            .to_string(),
+        );
+        record_explicit_recovery_adoption(
+            &c,
+            historical_graph,
+            historical_children[0],
+            historical_recovery,
+        );
+
+        let scoped = build_lineage_snapshot(&c, &[current_a]).unwrap();
+        assert_eq!(scoped.child_to_source.len(), 2);
+        assert_eq!(
+            scoped.child_to_source.get(&current_a),
+            Some(&current_source)
+        );
+        assert_eq!(
+            scoped.child_to_source.get(&current_b),
+            Some(&current_source)
+        );
+        assert_eq!(scoped.source_to_children.len(), 1);
+        assert_eq!(scoped.recovery_to_original.len(), 1);
+        assert_eq!(
+            scoped
+                .recovery_to_original
+                .get(&current_recovery)
+                .unwrap()
+                .original_task_id,
+            current_a
+        );
+        assert!(!scoped
+            .recovery_to_original
+            .contains_key(&historical_recovery));
+        assert!(!scoped
+            .child_to_source
+            .values()
+            .any(|&id| id == historical_source));
+
+        let capped = load_graph_members_for_roots(&c, &[historical_source]).unwrap();
+        assert_eq!(
+            capped.len(),
+            MAX_GRAPH_MEMBERS_PER_LINEAGE_ROOT + 1,
+            "the extra row is only an over-cap probe, never an unbounded history read"
+        );
+    }
+
+    #[test]
     fn facts_collapse_paths_do_not_write() {
         // Real-SQLite proof that the collapse read paths (graph members and
         // refs.$.recovery_delivery scans) leave the database unchanged.
@@ -2560,11 +2906,16 @@ mod tests {
         let graph_id = seed_decomposition(&c, s, 1);
         seed_graph_member(&c, graph_id, x, "child-a", 1);
         let x_refs = serde_json::json!({
-            "recovery_delivery": { "source_task": x, "recovery_task": y }
+            "recovery_delivery": {
+                "source_task": x,
+                "recovery_task": y,
+                "pr": 7,
+                "merged_head_sha": "deadbeef"
+            }
         })
         .to_string();
         set_refs(&c, x, &x_refs);
-        stamp_daemon_recovery_adoption(&c, x);
+        record_explicit_recovery_adoption(&c, graph_id, x, y);
 
         let before = snapshot_db_state(&c);
         let _ = perf_facts(&c, false).unwrap();
