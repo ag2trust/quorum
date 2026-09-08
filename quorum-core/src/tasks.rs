@@ -97,6 +97,10 @@ pub const MAX_DEPENDENCY_BASE_WAIT_ATTEMPTS: i64 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyMergeCommit {
     pub task_id: i64,
+    /// The completed dependency's PR, when durable task metadata associates
+    /// one. A missing merge SHA can be recovered from this authoritative PR
+    /// before a dependent branch is allocated.
+    pub pr_number: Option<i64>,
     pub merge_commit_sha: Option<String>,
 }
 
@@ -569,6 +573,11 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
             "refs key 'pr' is daemon-owned; use --review-pr or --continue-pr".into(),
         ));
     }
+    if object.contains_key("source_task") {
+        return Err(QuorumError::Usage(
+            "refs key 'source_task' is daemon-owned recovery provenance".into(),
+        ));
+    }
     if object.contains_key(MERGE_RETRY_REF) {
         return Err(QuorumError::Usage(format!(
             "refs key '{MERGE_RETRY_REF}' is daemon-owned; use task-retry"
@@ -581,23 +590,25 @@ fn preserve_classifier_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
 ) -> Option<String> {
-    preserve_protected_refs(existing, replacement, false)
+    preserve_protected_refs(existing, replacement, false, false)
 }
 
 /// Creator and assignee metadata replacement cannot mutate or erase durable
-/// runner state. The daemon uses `preserve_classifier_refs` directly so its
-/// authoritative refs path can still replace or clear these keys.
+/// runner state or recovery provenance. The daemon uses
+/// `preserve_classifier_refs` directly so its authoritative refs path can
+/// still replace or clear these keys.
 fn preserve_creator_protected_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
 ) -> Option<String> {
-    preserve_protected_refs(existing, replacement, true)
+    preserve_protected_refs(existing, replacement, true, true)
 }
 
 fn preserve_protected_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
     preserve_runner_state: bool,
+    preserve_recovery_provenance: bool,
 ) -> Option<String> {
     let replacement = replacement?;
     let mut next: serde_json::Value =
@@ -627,7 +638,8 @@ fn preserve_protected_refs(
             );
             let runner_state =
                 preserve_runner_state && (key.starts_with("runner_") || key.starts_with("codex_"));
-            if classifier_or_pr || runner_state {
+            let recovery_provenance = preserve_recovery_provenance && key == "source_task";
+            if classifier_or_pr || runner_state || recovery_provenance {
                 next_map.insert(key, value);
             }
         }
@@ -735,10 +747,13 @@ fn extract_pr_from_refs(refs: &Option<String>) -> Option<String> {
 pub fn extract_pr_number(refs: &Option<String>) -> Option<i64> {
     let s = refs.as_deref()?;
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    v.get("pr").and_then(|p| {
-        p.as_i64()
-            .or_else(|| p.as_str().and_then(|s| s.parse().ok()))
-    })
+    v.get("pr").and_then(pr_number_from_json)
+}
+
+fn pr_number_from_json(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
 pub fn extract_repo(refs: &Option<String>) -> Option<String> {
@@ -1007,10 +1022,41 @@ pub fn create_with_continue_pr_and_target_branch(
     }
     crate::agents::touch(&tx, created_by, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    // A continuation of a failed generated child is a recovery candidate for
+    // that exact child, not merely another task that happens to use the same
+    // PR. Stamp the durable provenance while creating the continuation so the
+    // evidence-gated adoption path can later distinguish the named pair. The
+    // graph predicates keep inactive/old plans from influencing new work.
+    let recovery_source_task = continue_pr
+        .map(|pr| {
+            tx.query_row(
+                "SELECT original.id
+                 FROM task_graph_members member
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks original ON original.id=member.task_id
+                 WHERE member.active=1
+                   AND member.plan_revision=graph.accepted_plan_revision
+                   AND graph.active=1 AND graph.state IN ('active','blocked')
+                   AND original.status='failed'
+                   AND json_valid(COALESCE(original.refs, '{}'))
+                   AND (json_extract(original.refs, '$.pr')=?1
+                        OR json_extract(original.refs, '$.pr')=CAST(?1 AS TEXT))
+                 ORDER BY original.id LIMIT 1",
+                [pr],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        })
+        .transpose()?;
     tx.execute(
         "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
          created_at, updated_at, refs, depends_on, review_only, continue_pr, target_branch) \
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?7, ?8, ?9, ?10, ?11, ?12)",
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?7,
+                 CASE WHEN ?13 IS NOT NULL
+                           AND json_extract(COALESCE(?8, '{}'), '$.source_task') IS NULL
+                      THEN json_set(COALESCE(?8, '{}'), '$.source_task', ?13)
+                      ELSE ?8 END,
+                 ?9, ?10, ?11, ?12)",
         params![
             title,
             body,
@@ -1024,6 +1070,7 @@ pub fn create_with_continue_pr_and_target_branch(
             review_only,
             continue_pr,
             target_branch,
+            recovery_source_task,
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -1911,9 +1958,9 @@ pub fn complete_detected_merge(
     })
 }
 
-/// Load the durable merge commit recorded for each dependency. A `done` task
-/// without a recorded commit is deliberately returned as `None`: callers must
-/// defer rather than silently allocate a child from an unverifiable base.
+/// Load durable merge and PR metadata for each dependency. A `done` task
+/// without a recorded commit remains `None` until the serving layer resolves
+/// its retained PR; callers must never silently allocate from that state.
 pub fn dependency_merge_commits(
     conn: &Connection,
     depends_on: Option<&str>,
@@ -1933,22 +1980,62 @@ pub fn dependency_merge_commits(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let merge_commit_sha = row
+        let (pr_number, merge_commit_sha) = row
             .filter(|(status, _)| status == "done")
             .and_then(|(_, refs)| refs)
             .and_then(|refs| serde_json::from_str::<serde_json::Value>(&refs).ok())
-            .and_then(|refs| {
-                refs.get(MERGE_COMMIT_SHA_REF)
+            .map(|refs| {
+                let pr_number = refs
+                    .get("pr")
+                    .and_then(pr_number_from_json)
+                    .filter(|pr| *pr > 0);
+                let merge_commit_sha = refs
+                    .get(MERGE_COMMIT_SHA_REF)
                     .and_then(serde_json::Value::as_str)
                     .filter(|sha| !sha.is_empty() && !sha.contains('\0'))
-                    .map(str::to_owned)
-            });
+                    .map(str::to_owned);
+                (pr_number, merge_commit_sha)
+            })
+            .unwrap_or((None, None));
         result.push(DependencyMergeCommit {
             task_id,
+            pr_number,
             merge_commit_sha,
         });
     }
     Ok(result)
+}
+
+/// Persist a merge commit recovered for a completed dependency. The PR lookup
+/// happens before this function; this short transaction only joins that
+/// external evidence to the exact still-done task. An existing value wins so
+/// a retry or racing daemon never rewrites provenance.
+pub fn record_dependency_merge_commit(
+    conn: &mut Connection,
+    task_id: i64,
+    pr_number: i64,
+    merge_commit_sha: &str,
+    now: i64,
+) -> Result<bool> {
+    if pr_number <= 0 || merge_commit_sha.is_empty() || merge_commit_sha.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "dependency merge commit evidence is invalid".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(COALESCE(refs, '{}'), '$.merge_commit_sha', ?3),
+             updated_at=?4
+         WHERE id=?1 AND status='done'
+           AND json_valid(COALESCE(refs, '{}'))
+           AND (json_extract(refs, '$.pr')=?2
+                OR json_extract(refs, '$.pr')=CAST(?2 AS TEXT))
+           AND json_extract(refs, '$.merge_commit_sha') IS NULL",
+        params![task_id, pr_number, merge_commit_sha, now],
+    )?;
+    tx.commit()?;
+    Ok(changed == 1)
 }
 
 /// Fail closed from an admitted merge attempt to ordinary review. Only the
@@ -5582,11 +5669,16 @@ pub fn close_manual(
     agent: &str,
     id: i64,
     reason: &str,
+    merge_commit_sha: Option<&str>,
     now: i64,
 ) -> Result<Option<Task>> {
+    if merge_commit_sha.is_some_and(|sha| sha.is_empty() || sha.contains('\0')) {
+        return Err(QuorumError::BadInput(
+            "merge commit SHA must be non-empty and contain no NUL".into(),
+        ));
+    }
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
-    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     let active_graph_source: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM task_decompositions
          WHERE source_task_id=?1 AND active=1 AND state IN ('active','blocked'))",
@@ -5601,14 +5693,29 @@ pub fn close_manual(
     }
     let n = tx.execute(
         "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2,
-                          completion_provenance=?3
+                          completion_provenance=?3,
+                          refs=CASE
+                              WHEN ?4 IS NOT NULL
+                                   AND json_extract(COALESCE(refs, '{}'), '$.merge_commit_sha')
+                                       IS NULL
+                              THEN json_set(
+                                  COALESCE(refs, '{}'), '$.merge_commit_sha', ?4
+                              )
+                              ELSE refs
+                          END
          WHERE id=?1 AND status NOT IN ('done', 'cancelled')",
-        params![id, now, COMPLETION_PROVENANCE_MANUAL],
+        params![id, now, COMPLETION_PROVENANCE_MANUAL, merge_commit_sha],
     )?;
     if n == 0 {
+        crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
         tx.commit()?;
         return Ok(None);
     }
+    // Mark this dependency done before the opportunistic failed-dependency
+    // sweep. A recovered failed task can otherwise cause the same write to
+    // park all of its dependents just before this manual resolution unblocks
+    // them, leaving a graph stranded despite a valid merged PR.
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     deactivate_lease(&tx, id, now)?;
     tx.execute(
         "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, ?3, ?4)",
@@ -5621,7 +5728,7 @@ pub fn close_manual(
         &format!("by {agent}: {reason}"),
         now,
     )?;
-    crate::decomposition::complete_graph_if_final_child(&tx, id, now)?;
+    crate::decomposition::complete_graph_after_manual_close(&tx, id, now)?;
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -8132,6 +8239,106 @@ mod tests {
     }
 
     #[test]
+    fn continue_pr_stamps_string_pr_child_and_preserves_recovery_source_on_edits() {
+        let (_d, mut c) = open_tmp();
+        let source = create(
+            &mut c, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let child = create(
+            &mut c,
+            "owner",
+            "failed child",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":"77"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", [child])
+            .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,created_at,updated_at
+             ) VALUES (?1,'blocked',1,0,1,1,1,1,1)",
+            [source],
+        )
+        .unwrap();
+        let graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'child',1,1)",
+            params![graph, child],
+        )
+        .unwrap();
+
+        let recovery = create_with_continue_pr(
+            &mut c,
+            "owner",
+            "continue child PR",
+            None,
+            0,
+            None,
+            Some(r#"{"ticket":"REC-1"}"#),
+            None,
+            None,
+            Some(77),
+            2,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(get(&c, recovery).unwrap().unwrap().refs.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(refs["source_task"], child);
+        assert_eq!(refs["ticket"], "REC-1");
+
+        // A creator can replace ordinary metadata before delivery. That must
+        // neither remove the daemon-stamped pair nor stop automatic recovery.
+        let metadata = update(
+            &mut c,
+            "owner",
+            recovery,
+            &TaskUpdate {
+                refs: Some(r#"{"ticket":"REC-2"}"#),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            3,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(metadata.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["source_task"], child);
+        assert_eq!(refs["ticket"], "REC-2");
+
+        // Classifier-invalidating content edits take the same creator refs
+        // path and must preserve the recovery pair too.
+        let edited = update(
+            &mut c,
+            "owner",
+            recovery,
+            &TaskUpdate {
+                body: Some("continue the recovered child"),
+                refs: Some(r#"{"ticket":"REC-3"}"#),
+                expected_revision: Some(2),
+                ..Default::default()
+            },
+            4,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(edited.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["source_task"], child);
+        assert_eq!(refs["ticket"], "REC-3");
+    }
+
+    #[test]
     fn review_only_verdict_changes_reworks() {
         // #159: review_only + changes → rework (remediation workers).
         let (_d, mut c) = open_tmp();
@@ -8587,7 +8794,7 @@ mod tests {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
-        let t = close_manual(&mut c, "owner", id, "fixed elsewhere", 1001)
+        let t = close_manual(&mut c, "owner", id, "fixed elsewhere", None, 1001)
             .unwrap()
             .unwrap();
         assert_eq!(t.status, "done");
@@ -8602,7 +8809,7 @@ mod tests {
     fn close_manual_from_open() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
-        let t = close_manual(&mut c, "owner", id, "obsolete", 1001)
+        let t = close_manual(&mut c, "owner", id, "obsolete", None, 1001)
             .unwrap()
             .unwrap();
         assert_eq!(t.status, "done");
@@ -8615,7 +8822,7 @@ mod tests {
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         cancel(&mut c, "A", id, 1001).unwrap();
         assert!(
-            close_manual(&mut c, "owner", id, "too late", 1002)
+            close_manual(&mut c, "owner", id, "too late", None, 1002)
                 .unwrap()
                 .is_none(),
             "already cancelled — should return None"
@@ -8643,7 +8850,7 @@ mod tests {
             .unwrap();
         assert!(!get(&c, child).unwrap().unwrap().ready);
 
-        let t = close_manual(&mut c, "owner", dep, "PR merged by hand", 1001)
+        let t = close_manual(&mut c, "owner", dep, "PR merged by hand", None, 1001)
             .unwrap()
             .unwrap();
         assert_eq!(t.status, "done");
@@ -8654,11 +8861,212 @@ mod tests {
     }
 
     #[test]
+    fn close_manual_reactivates_the_named_generated_child_failure_hold() {
+        let (_d, mut c) = open_tmp();
+        let source = create(
+            &mut c, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let resolved = create(
+            &mut c,
+            "owner",
+            "resolved child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let sibling = create(
+            &mut c,
+            "owner",
+            "pending sibling",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", [resolved])
+            .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,hold_code,hold_summary,created_at,updated_at
+             ) VALUES (?1,'blocked',1,0,1,1,1,'generated-child-failed',?2,1,1)",
+            params![
+                source,
+                serde_json::json!({"affected_task": resolved, "reason": "worker failed"})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        let graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'resolved',1,1),(?1,?3,'sibling',1,1)",
+            params![graph, resolved, sibling],
+        )
+        .unwrap();
+
+        close_manual(&mut c, "owner", resolved, "merged by hand", None, 2)
+            .unwrap()
+            .unwrap();
+
+        let graph_state: (String, Option<String>, Option<String>) = c
+            .query_row(
+                "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(graph_state, ("active".into(), None, None));
+        assert!(
+            list_implementation_ready_open(&c)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == sibling),
+            "the formerly held sibling must dispatch on the next daemon tick"
+        );
+        assert_eq!(
+            claim(&mut c, "worker", Some(sibling), &[], TTL, 3)
+                .unwrap()
+                .map(|task| task.id),
+            Some(sibling)
+        );
+        let unblocked: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='task_graph_unblocked' AND subject=?1",
+                [lease_target(resolved)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unblocked, 1);
+    }
+
+    #[test]
+    fn close_manual_does_not_clear_another_childs_generated_failure_hold() {
+        let (_d, mut c) = open_tmp();
+        let source = create(
+            &mut c, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let named = create(
+            &mut c,
+            "owner",
+            "named failed child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let closed = create(
+            &mut c,
+            "owner",
+            "other failed child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let sibling = create(
+            &mut c,
+            "owner",
+            "pending sibling",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed' WHERE id IN (?1,?2)",
+            params![named, closed],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,hold_code,hold_summary,created_at,updated_at
+             ) VALUES (?1,'blocked',1,0,1,1,1,'generated-child-failed',?2,1,1)",
+            params![
+                source,
+                serde_json::json!({"affected_task": named, "reason": "worker failed"}).to_string()
+            ],
+        )
+        .unwrap();
+        let graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'named',1,1),(?1,?3,'closed',1,1),(?1,?4,'sibling',1,1)",
+            params![graph, named, closed, sibling],
+        )
+        .unwrap();
+
+        close_manual(&mut c, "owner", closed, "fixed elsewhere", None, 2)
+            .unwrap()
+            .unwrap();
+
+        let graph_state: (String, String) = c
+            .query_row(
+                "SELECT state,hold_code FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            graph_state,
+            ("blocked".into(), "generated-child-failed".into())
+        );
+        assert!(
+            !list_implementation_ready_open(&c)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == sibling),
+            "a close unrelated to the held child must not release the graph"
+        );
+        let unblocked: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_graph_unblocked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unblocked, 0);
+    }
+
+    #[test]
     fn close_manual_emits_distinct_event() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
-        close_manual(&mut c, "owner", id, "merged by hand", 1001).unwrap();
+        close_manual(&mut c, "owner", id, "merged by hand", None, 1001).unwrap();
         let events = crate::events::list(&c, 0, Some(&lease_target(id)), 100, 2000).unwrap();
         assert!(
             events.iter().any(|e| e.kind == "task_closed_manual"),
@@ -9929,6 +10337,8 @@ mod tests {
         }
         let pr_err = validate_creator_refs(Some(r#"{"pr":42,"repo":"o/r"}"#)).unwrap_err();
         assert!(format!("{pr_err}").contains("--continue-pr"));
+        let source_err = validate_creator_refs(Some(r#"{"source_task":42}"#)).unwrap_err();
+        assert!(format!("{source_err}").contains("recovery provenance"));
         let retry_err =
             validate_creator_refs(Some(r#"{"daemon_merge_retry":"requested"}"#)).unwrap_err();
         assert!(format!("{retry_err}").contains("task-retry"));
@@ -11806,6 +12216,7 @@ mod tests {
             commits,
             vec![DependencyMergeCommit {
                 task_id: dependency,
+                pr_number: None,
                 merge_commit_sha: Some("deadbeef".into()),
             }]
         );
@@ -12398,7 +12809,7 @@ mod tests {
             .unwrap()
             .is_none());
         update_refs_daemon(&mut conn, id, r#"{"codex_provider_blocked":true}"#, 12).unwrap();
-        close_manual(&mut conn, "owner", id, "obsolete", 13).unwrap();
+        close_manual(&mut conn, "owner", id, "obsolete", None, 13).unwrap();
         assert!(retry_provider_blocked(&mut conn, id, "operator", 14)
             .unwrap()
             .is_none());

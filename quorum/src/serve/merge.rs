@@ -135,6 +135,16 @@ pub enum DefaultBranchStatus {
     Unknown,
 }
 
+/// The observable PR state used by recovery paths that need to distinguish a
+/// genuinely unmerged PR from transiently unavailable merge metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeCommitStatus {
+    Merged { merge_commit_sha: Option<String> },
+    Open,
+    Closed,
+    Unknown,
+}
+
 /// Trait for executing PR merges. The default implementation posts a formal
 /// GitHub approval review (`gh pr review --approve`) then calls `gh pr merge`.
 /// Tests inject a mock via [`CommandMergeExecutor::command`].
@@ -147,6 +157,18 @@ pub trait MergeExecutor: Send + Sync {
     /// conservative rather than inventing a commit identity.
     fn merge_commit_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
         None
+    }
+
+    /// Resolve whether a PR has merged before attempting to recover missing
+    /// dependency provenance. Test executors that only supply a merge SHA keep
+    /// their established meaning; the GitHub executor reports the real state.
+    fn merge_commit_status(&self, pr: i64, repo_dir: &Path) -> MergeCommitStatus {
+        match self.merge_commit_sha(pr, repo_dir) {
+            Some(merge_commit_sha) => MergeCommitStatus::Merged {
+                merge_commit_sha: Some(merge_commit_sha),
+            },
+            None => MergeCommitStatus::Unknown,
+        }
     }
 
     fn wait_for_checks(
@@ -772,6 +794,25 @@ fn parse_merge_commit_sha(json_str: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn parse_merge_commit_status(json_str: &str) -> MergeCommitStatus {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return MergeCommitStatus::Unknown;
+    };
+    match json.get("state").and_then(serde_json::Value::as_str) {
+        Some("MERGED") => MergeCommitStatus::Merged {
+            merge_commit_sha: json
+                .get("mergeCommit")
+                .and_then(|value| value.get("oid"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|sha| !sha.is_empty() && !sha.contains('\0'))
+                .map(str::to_owned),
+        },
+        Some("OPEN") => MergeCommitStatus::Open,
+        Some("CLOSED") => MergeCommitStatus::Closed,
+        _ => MergeCommitStatus::Unknown,
+    }
+}
+
 /// Parse the `--jq .isDraft` output of `gh pr view` (bare `true`/`false`).
 /// Anything that isn't exactly `true` is treated as not-draft (fail-safe:
 /// a query hiccup skips the undraft and behaves as it did before this guard).
@@ -907,6 +948,21 @@ impl MergeExecutor for GhMergeExecutor {
             return None;
         }
         parse_merge_commit_sha(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    fn merge_commit_status(&self, pr: i64, repo_dir: &Path) -> MergeCommitStatus {
+        let pr = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &["pr", "view", &pr, "--json", "state,mergeCommit"],
+            repo_dir,
+        );
+        let Ok(output) = cmd.output() else {
+            return MergeCommitStatus::Unknown;
+        };
+        if !output.status.success() {
+            return MergeCommitStatus::Unknown;
+        }
+        parse_merge_commit_status(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn wait_for_checks(

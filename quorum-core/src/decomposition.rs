@@ -2389,8 +2389,13 @@ pub fn adopt_recovery_delivery(
                       AND sibling_task.status!='done'
                )
                AND json_valid(original.refs)
-               AND json_type(original.refs,'$.pr')='integer'
-               AND json_extract(original.refs,'$.pr')=original_target.pr_number
+               AND (
+                    (json_type(original.refs,'$.pr')='integer'
+                     AND json_extract(original.refs,'$.pr')=original_target.pr_number)
+                    OR
+                    (json_type(original.refs,'$.pr')='text'
+                     AND json_extract(original.refs,'$.pr')=CAST(original_target.pr_number AS TEXT))
+               )
                AND original_target.pr_number=recovery_target.pr_number
                AND original_target.head_ref!=''
                AND length(original_target.head_sha) IN (40,64)
@@ -2398,8 +2403,13 @@ pub fn adopt_recovery_delivery(
                AND recovery.status='done' AND recovery.review_only=0
                AND recovery.continue_pr=recovery_target.pr_number
                AND json_valid(recovery.refs)
-               AND json_type(recovery.refs,'$.pr')='integer'
-               AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number
+               AND (
+                    (json_type(recovery.refs,'$.pr')='integer'
+                     AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number)
+                    OR
+                    (json_type(recovery.refs,'$.pr')='text'
+                     AND json_extract(recovery.refs,'$.pr')=CAST(recovery_target.pr_number AS TEXT))
+               )
                AND json_type(recovery.refs,'$.source_task')='integer'
                AND json_extract(recovery.refs,'$.source_task')=original.id
                AND json_type(recovery.refs,'$.daemon_publication') IS NULL
@@ -2500,7 +2510,7 @@ pub fn adopt_recovery_delivery(
 }
 
 /// Explicitly authorize the exact durable delivery of a completed managed
-/// continuation for the final failed member of an active decomposition, a
+/// continuation for a failed member of an active decomposition, a
 /// boundary-violation-blocked decomposition when that block names this child,
 /// or a modern generated-child-failed block that names this child. The latter
 /// restores graph authority when siblings still need to finish.
@@ -2586,8 +2596,13 @@ pub fn adopt_explicit_recovery_delivery(
                             )
                         )
                         AND json_valid(original.refs)
-                        AND json_type(original.refs,'$.pr')='integer'
-                        AND json_extract(original.refs,'$.pr')=original_target.pr_number
+                        AND (
+                            (json_type(original.refs,'$.pr')='integer'
+                             AND json_extract(original.refs,'$.pr')=original_target.pr_number)
+                            OR
+                            (json_type(original.refs,'$.pr')='text'
+                             AND json_extract(original.refs,'$.pr')=CAST(original_target.pr_number AS TEXT))
+                        )
                         AND original_target.pr_number=recovery_target.pr_number
                         AND original_target.head_ref!=''
                         AND original_target.head_ref=recovery_target.head_ref
@@ -2662,29 +2677,17 @@ pub fn adopt_explicit_recovery_delivery(
                     )
                )
                AND source.status='decomposed'
-               AND (
-                    NOT EXISTS (
-                        SELECT 1 FROM task_graph_members sibling
-                        JOIN tasks sibling_task ON sibling_task.id=sibling.task_id
-                        WHERE sibling.graph_id=graph.id AND sibling.active=1
-                          AND sibling.task_id!=original.id
-                          AND sibling_task.status!='done'
-                    )
-                    OR (
-                        CASE WHEN graph.state='blocked'
-                                  AND graph.hold_code='generated-child-failed'
-                                  AND json_valid(graph.hold_summary)
-                             THEN json_type(graph.hold_summary,'$.affected_task')='integer'
-                                  AND json_extract(graph.hold_summary,'$.affected_task')=original.id
-                             ELSE 0 END
-                    )
-               )
                AND recovery.status='done' AND recovery.review_only=0
                AND recovery.completion_provenance=?3
                AND recovery.continue_pr=recovery_target.pr_number
                AND json_valid(recovery.refs)
-               AND json_type(recovery.refs,'$.pr')='integer'
-               AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number
+               AND (
+                    (json_type(recovery.refs,'$.pr')='integer'
+                     AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number)
+                    OR
+                    (json_type(recovery.refs,'$.pr')='text'
+                     AND json_extract(recovery.refs,'$.pr')=CAST(recovery_target.pr_number AS TEXT))
+               )
                AND (
                     json_type(recovery.refs,'$.source_task') IS NULL
                     OR (
@@ -2915,10 +2918,24 @@ pub(crate) fn complete_graph_if_final_child(
     complete_graph_if_final_child_with_boundary_recovery(tx, task_id, now, false)
 }
 
+/// Manual resolution of the child named by a structured generated-child hold
+/// restores the graph while other children remain pending. The hold's named
+/// child is part of the predicate, so a close of any other child leaves the
+/// graph blocked. This keeps the manual close transactional with the same
+/// durable graph reconciliation as the task state change.
+pub(crate) fn complete_graph_after_manual_close(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    now: i64,
+) -> Result<bool> {
+    complete_graph_if_final_child_with_explicit_recovery(tx, task_id, now, false, false, true)
+}
+
 /// The explicit operator recovery path may complete a blocked graph when the
 /// persisted boundary blocker names the adopted child. For a modern structured
 /// generated-child-failed hold naming that child, it instead reactivates the
-/// graph while siblings remain. Ordinary child completion cannot clear a block.
+/// graph while siblings remain. Ordinary child completion cannot clear a block;
+/// manual close has its own narrowly authorized path for that structured hold.
 fn complete_graph_after_explicit_recovery(
     tx: &Transaction<'_>,
     task_id: i64,
@@ -2960,9 +2977,9 @@ fn complete_graph_if_final_child_with_explicit_recovery(
     allow_legacy_publication_recovery: bool,
     allow_modern_generated_child_recovery: bool,
 ) -> Result<bool> {
-    let graph: Option<(i64, i64)> = tx
+    let graph: Option<(i64, i64, String)> = tx
         .query_row(
-            "SELECT d.id,d.source_task_id
+            "SELECT d.id,d.source_task_id,d.state
              FROM task_graph_members m
              JOIN task_decompositions d ON d.id=m.graph_id
              WHERE m.task_id=?1 AND m.active=1 AND d.active=1
@@ -3003,10 +3020,10 @@ fn complete_graph_if_final_child_with_explicit_recovery(
                 allow_legacy_publication_recovery,
                 allow_modern_generated_child_recovery
             ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((graph_id, source_id)) = graph else {
+    let Some((graph_id, source_id, graph_state)) = graph else {
         return Ok(false);
     };
     let unfinished: bool = tx.query_row(
@@ -3017,7 +3034,7 @@ fn complete_graph_if_final_child_with_explicit_recovery(
         |row| row.get(0),
     )?;
     if unfinished {
-        if !allow_modern_generated_child_recovery {
+        if !allow_modern_generated_child_recovery || graph_state != "blocked" {
             return Ok(false);
         }
         let graph_reactivated = tx.execute(
@@ -3033,14 +3050,14 @@ fn complete_graph_if_final_child_with_explicit_recovery(
         )?;
         if graph_reactivated != 1 {
             return Err(QuorumError::Io(
-                "generated-child recovery graph changed during adoption transaction".into(),
+                "generated-child recovery graph changed during resolution transaction".into(),
             ));
         }
         crate::events::emit(
             tx,
             "task_graph_unblocked",
             &format!("task#{task_id}"),
-            "explicit recovery delivery restored graph authority",
+            "structured generated-child resolution restored graph authority",
             now,
         )?;
         return Ok(true);
@@ -4169,6 +4186,17 @@ mod tests {
                 .execute(
                     "UPDATE pr_targets SET resolved_at=20 WHERE task_id=?1",
                     [self.recovery],
+                )
+                .unwrap();
+        }
+
+        fn store_pr_as_canonical_string(&mut self) {
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET refs=json_set(refs,'$.pr',CAST(?2 AS TEXT))
+                     WHERE id IN (?1,?3)",
+                    params![self.original, RECOVERY_PR, self.recovery],
                 )
                 .unwrap();
         }
@@ -8223,6 +8251,94 @@ mod tests {
     }
 
     #[test]
+    fn explicit_recovery_adopts_failed_child_with_pending_siblings() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_eligible();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks
+                 SET status='open',refs=json_set(
+                     refs,
+                     '$.cx_est',2,
+                     '$.cx_size','S',
+                     '$.cx_ready',json('true'),
+                     '$.cx_not_ready_reason',json('null')
+                 )
+                 WHERE id=?1",
+                [fixture.siblings[0]],
+            )
+            .unwrap();
+
+        assert!(fixture.explicit_adoption(90_000));
+        let state: (String, String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT original.status,graph.state,source.status
+                 FROM tasks original
+                 JOIN task_graph_members member ON member.task_id=original.id
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks source ON source.id=graph.source_task_id
+                 WHERE original.id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("done".into(), "active".into(), "decomposed".into()));
+    }
+
+    #[test]
+    fn explicit_recovery_adopts_string_pr_child_with_pending_siblings() {
+        let mut fixture = RecoveryFixture::new();
+        fixture.store_pr_as_canonical_string();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET completion_provenance=?2 WHERE id=?1",
+                params![fixture.recovery, crate::tasks::COMPLETION_PROVENANCE_MERGED],
+            )
+            .unwrap();
+        fixture
+            .conn
+            .execute(
+                "UPDATE pr_targets SET resolved_at=20 WHERE task_id=?1",
+                [fixture.recovery],
+            )
+            .unwrap();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks
+                 SET status='open',refs=json_set(
+                     refs,
+                     '$.cx_est',2,
+                     '$.cx_size','S',
+                     '$.cx_ready',json('true'),
+                     '$.cx_not_ready_reason',json('null')
+                 )
+                 WHERE id=?1",
+                [fixture.siblings[0]],
+            )
+            .unwrap();
+
+        assert!(fixture.explicit_adoption(90_000));
+        let state: (String, String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT original.status,graph.state,source.status
+                 FROM tasks original
+                 JOIN task_graph_members member ON member.task_id=original.id
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks source ON source.id=graph.source_task_id
+                 WHERE original.id=?1",
+                [fixture.original],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("done".into(), "active".into(), "decomposed".into()));
+    }
+
+    #[test]
     fn explicit_recovery_completes_modern_generated_child_failure_when_final() {
         let mut fixture = RecoveryFixture::new();
         fixture.make_explicit_eligible();
@@ -8891,18 +9007,6 @@ mod tests {
                         .unwrap();
                 }),
             ),
-            (
-                "unfinished sibling",
-                Box::new(|fixture| {
-                    fixture
-                        .conn
-                        .execute(
-                            "UPDATE tasks SET status='open' WHERE id=?1",
-                            [fixture.siblings[0]],
-                        )
-                        .unwrap();
-                }),
-            ),
         ];
 
         for (name, mutate) in cases {
@@ -9465,7 +9569,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let error = crate::tasks::close_manual(&mut conn, "owner", 1, "obsolete", 5).unwrap_err();
+        let error =
+            crate::tasks::close_manual(&mut conn, "owner", 1, "obsolete", None, 5).unwrap_err();
         assert!(matches!(error, QuorumError::Usage(_)));
         let state: (String, i64, String) = conn
             .query_row(
@@ -9492,7 +9597,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        crate::tasks::close_manual(&mut conn, "owner", ids[0], "fixed elsewhere", 5)
+        crate::tasks::close_manual(&mut conn, "owner", ids[0], "fixed elsewhere", None, 5)
             .unwrap()
             .unwrap();
         let midway: (String, String) = conn
@@ -9505,7 +9610,7 @@ mod tests {
             .unwrap();
         assert_eq!(midway, ("active".into(), "decomposed".into()));
 
-        crate::tasks::close_manual(&mut conn, "owner", ids[1], "merged externally", 6)
+        crate::tasks::close_manual(&mut conn, "owner", ids[1], "merged externally", None, 6)
             .unwrap()
             .unwrap();
         assert_graph_completed(&conn, graph, 1, &ids);

@@ -22,6 +22,7 @@ mod web;
 
 use clap::Parser;
 use quorum_core::error::{QuorumError, Result};
+use serve::merge::MergeExecutor as _;
 
 const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
 const MIN_EXTERNAL_POLL_INTERVAL_SECS: u64 = 30;
@@ -429,6 +430,39 @@ fn resolve_gh_repo(repo_dir: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn manual_close_reason_marks_obsolete(reason: &str) -> bool {
+    let words = reason
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+
+    // `obsolete:` is an explicit operator marker. Otherwise require an
+    // affirmative declaration about the task itself, rather than treating an
+    // incidental or negated mention (for example, "not obsolete") as
+    // authorization to close an open PR.
+    matches!(words.first().map(String::as_str), Some("obsolete"))
+        || words.windows(3).any(|words| {
+            matches!(
+                words,
+                [subject, copula, obsolete]
+                    if matches!(subject.as_str(), "task" | "this" | "it")
+                        && matches!(copula.as_str(), "is" | "was")
+                        && obsolete == "obsolete"
+            )
+        })
+        || words.windows(4).any(|words| {
+            matches!(
+                words,
+                [article, subject, copula, obsolete]
+                    if matches!(article.as_str(), "the" | "this")
+                        && subject == "task"
+                        && matches!(copula.as_str(), "is" | "was")
+                        && obsolete == "obsolete"
+            )
+        })
 }
 
 /// Wait for a spawned child with a timeout. Returns stdout on success, None on
@@ -1177,8 +1211,57 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     "--reason-stdin or --reason-file is required for `task-close`".into(),
                 )
             })?;
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            match quorum_core::tasks::close_manual(&mut conn, &agent, task_id, &reason, now)? {
+            let repo = paths::resolve_repo()?;
+            let db_path = paths::db_path_for_repo(&repo)?;
+            let conn = quorum_core::db::open(&db_path)?;
+            let pr = quorum_core::tasks::task_pr_reference(&conn, task_id)?;
+            drop(conn);
+            // This network lookup deliberately precedes the close transaction:
+            // task-close must never keep a SQLite write lock while asking
+            // GitHub whether its retained PR actually merged.
+            let merge_commit_sha = if let Some(pr) = pr {
+                let executor = serve::merge::GhMergeExecutor {
+                    token_file: None,
+                    gh_repo: Some(repo),
+                };
+                match executor.merge_commit_status(pr, std::path::Path::new(".")) {
+                    serve::merge::MergeCommitStatus::Merged {
+                        merge_commit_sha: Some(sha),
+                    } => Some(sha),
+                    serve::merge::MergeCommitStatus::Merged {
+                        merge_commit_sha: None,
+                    } => {
+                        return Err(QuorumError::Io(format!(
+                            "PR #{pr} is merged but GitHub did not return its merge commit SHA"
+                        )));
+                    }
+                    serve::merge::MergeCommitStatus::Open
+                        if !manual_close_reason_marks_obsolete(&reason) =>
+                    {
+                        return Err(QuorumError::Usage(format!(
+                            "PR #{pr} is still open; task-close requires a reason explicitly marking the task obsolete"
+                        )));
+                    }
+                    serve::merge::MergeCommitStatus::Open
+                    | serve::merge::MergeCommitStatus::Closed => None,
+                    serve::merge::MergeCommitStatus::Unknown => {
+                        return Err(QuorumError::Io(format!(
+                            "could not determine whether PR #{pr} is merged; refusing manual close"
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
+            let mut conn = quorum_core::db::open(&db_path)?;
+            match quorum_core::tasks::close_manual(
+                &mut conn,
+                &agent,
+                task_id,
+                &reason,
+                merge_commit_sha.as_deref(),
+                now,
+            )? {
                 Some(task) => {
                     let compact = quorum_core::tasks::TaskCompact::from(&task);
                     output::emit(&compact);
