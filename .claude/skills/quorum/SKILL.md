@@ -100,10 +100,9 @@ The classifier uses this shared complexity rubric:
 - 5: Very complex — new architectural boundary or subsystem with novel interface tradeoffs
 
 Do not encode PR workflow or lifecycle authority in generic `refs`, titles, labels, or task
-body. In particular, this shipped CLI has no public successor-task creation interface for
-durable `source_task` provenance. Do not manufacture `refs.source_task`; `--continue-pr` alone
-preserves a PR but does not create automatic provenance-backed recovery discovery. A named,
-evidence-gated `decomposition-adopt-recovery` remains available for the exact pair.
+body. Do not manufacture `refs.source_task`: when `--continue-pr` names the PR of a failed active
+graph child, task creation stamps that exact provenance itself. A named, evidence-gated
+`decomposition-adopt-recovery` remains available for the exact pair.
 
 ### Recover without losing authority or PR work
 
@@ -143,9 +142,9 @@ daemon attempts publication (or before creating the `--continue-pr` task).
 
 For a failed generated graph child, do not infer equivalence from matching text or a shared PR.
 Only after the exact managed continuation is completed and merged may an operator adopt that
-named pair. The command rechecks final-child graph membership, repository, PR, head, managed
+named pair. The command rechecks failed-child graph membership, repository, PR, head, managed
 worker/reviewer, and merged-completion evidence. `source_task` provenance must agree when
-present, but may be absent because the operator names the exact child and recovery task:
+present; `--continue-pr` creation stamps it automatically for a matching failed graph child:
 
 ```sh
 quorum decomposition-adopt-recovery \

@@ -339,8 +339,13 @@ fn select_candidate(
            AND member.plan_revision=graph.accepted_plan_revision
            AND graph.state IN ('active','blocked') AND graph.active=1
            AND source.status='decomposed'
-           AND json_type(recovery.refs,'$.pr')='integer'
-           AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number
+           AND (
+                (json_type(recovery.refs,'$.pr')='integer'
+                 AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number)
+                OR
+                (json_type(recovery.refs,'$.pr')='text'
+                 AND json_extract(recovery.refs,'$.pr')=CAST(recovery_target.pr_number AS TEXT))
+           )
            AND EXISTS (
                SELECT 1 FROM events published
                WHERE published.subject='task#' || recovery.id
@@ -563,6 +568,71 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(outcome.adopted, 1);
+        assert_incident_released(&fixture);
+    }
+
+    #[tokio::test]
+    async fn string_pr_recovery_reconciles_after_pending_sibling_completes() {
+        let fixture = IncidentFixture::new();
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET refs=json_set(refs,'$.pr',CAST(?1 AS TEXT))
+             WHERE id IN (307,320)",
+            [PR],
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='open' WHERE id=304", [])
+            .unwrap();
+        drop(conn);
+
+        let early = reconcile(fixture.db_path.clone(), NOW).await.unwrap();
+        assert_eq!(early.adopted, 0, "pending siblings defer adoption");
+
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=304", [])
+            .unwrap();
+        quorum_core::events::emit(&conn, "task_done", "task#304", "by system", NOW + 1).unwrap();
+        drop(conn);
+
+        let settled = reconcile(fixture.db_path.clone(), NOW + 1).await.unwrap();
+        assert_eq!(settled.adopted, 1);
+        assert_incident_released(&fixture);
+    }
+
+    #[tokio::test]
+    async fn creator_metadata_update_preserves_source_task_for_automatic_reconciliation() {
+        let fixture = IncidentFixture::new();
+        let mut conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute("UPDATE tasks SET status='open' WHERE id=320", [])
+            .unwrap();
+        let revision: i64 = conn
+            .query_row("SELECT revision FROM tasks WHERE id=320", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let updated = quorum_core::tasks::update(
+            &mut conn,
+            "owner",
+            320,
+            &quorum_core::tasks::TaskUpdate {
+                refs: Some(r#"{"ticket":"REC-1"}"#),
+                expected_revision: Some(revision),
+                ..Default::default()
+            },
+            NOW,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(updated.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["source_task"], 307);
+        assert_eq!(refs["ticket"], "REC-1");
+        conn.execute("UPDATE tasks SET status='done' WHERE id=320", [])
+            .unwrap();
+        drop(conn);
+
+        let outcome = reconcile(fixture.db_path.clone(), NOW).await.unwrap();
         assert_eq!(outcome.adopted, 1);
         assert_incident_released(&fixture);
     }
