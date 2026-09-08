@@ -676,6 +676,13 @@ fn refs_object(row: &FactsTaskRow) -> Option<serde_json::Map<String, serde_json:
         .cloned()
 }
 
+/// A daemon merge identifier is intentionally not reader-validated as a
+/// hexadecimal Git SHA: the lifecycle writer accepts any non-empty, NUL-free
+/// immutable identifier for enterprise and test providers too.
+fn valid_merge_identifier(identifier: &str) -> bool {
+    !identifier.is_empty() && !identifier.contains('\0')
+}
+
 fn valid_merge_commit_sha(row: &FactsTaskRow) -> Option<String> {
     if row.status != "done" || row.completion_provenance.as_deref() != Some("merged") {
         return None;
@@ -687,7 +694,7 @@ fn valid_merge_commit_sha(row: &FactsTaskRow) -> Option<String> {
     // any non-empty, NUL-free immutable merge identifier (including test and
     // enterprise-provider identifiers). Do not invent a stricter reader-only
     // format that would discard a valid daemon completion.
-    (!sha.is_empty() && !sha.contains('\0')).then(|| sha.to_string())
+    valid_merge_identifier(sha).then(|| sha.to_string())
 }
 
 fn has_duplicate_cancellation_evidence(row: &FactsTaskRow) -> bool {
@@ -733,11 +740,14 @@ fn parked_disposition(row: &FactsTaskRow) -> ParkDisposition {
     let Some(refs) = refs_object(row) else {
         return ParkDisposition::NotParked;
     };
-    if refs
+    // `task-retry` uses SQLite `json_extract(...)=1`, which admits the
+    // retained JSON numeric representation as well as JSON true. Mirror that
+    // exact lifecycle-compatible truth set; a string such as "1" remains
+    // malformed evidence and cannot grant a continuation here.
+    let parked = refs
         .get("daemon_parked")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-    {
+        .is_some_and(|value| value.as_bool() == Some(true) || value.as_f64() == Some(1.0));
+    if !parked {
         return ParkDisposition::NotParked;
     }
     if refs
@@ -796,6 +806,49 @@ fn terminal_evidence(rows: &[&FactsTaskRow], merge_commit_shas: &[String]) -> se
     evidence
 }
 
+/// Return only merge witnesses that the immutable explicit-adoption ledger
+/// has already correlated to both sides of a one-to-one recovery pair. The
+/// nested task ref alone is deliberately insufficient: `build_lineage_snapshot`
+/// populated these pairs only after validating accepted graph membership,
+/// daemon-owned merged completions, and the matching ledger entry.
+fn recovery_merge_witnesses(lineage: &LineageSnapshot) -> HashMap<i64, String> {
+    let mut witnesses = HashMap::new();
+    for pairs in lineage.original_to_recoveries.values() {
+        let [pair] = pairs.as_slice() else {
+            continue;
+        };
+        let Some(merged_head_sha) = pair
+            .merged_head_sha
+            .as_deref()
+            .filter(|sha| valid_merge_identifier(sha))
+        else {
+            continue;
+        };
+        // The one durable delivery belongs to the adopted original and the
+        // completed recovery task; both collapse into the same intent.
+        witnesses.insert(pair.original_task_id, merged_head_sha.to_string());
+        witnesses.insert(pair.recovery_task_id, merged_head_sha.to_string());
+    }
+    witnesses
+}
+
+fn verified_merge_witness(
+    row: &FactsTaskRow,
+    recovery_merge_witnesses: &HashMap<i64, String>,
+) -> Option<String> {
+    valid_merge_commit_sha(row).or_else(|| recovery_merge_witnesses.get(&row.id).cloned())
+}
+
+fn dedup_merge_witnesses(witnesses: Vec<String>) -> Vec<String> {
+    let mut distinct = Vec::with_capacity(witnesses.len());
+    for witness in witnesses {
+        if !distinct.contains(&witness) {
+            distinct.push(witness);
+        }
+    }
+    distinct
+}
+
 /// Resolve one collapsed intent from bounded, durable state only. The order is
 /// intentional: exclusions that establish non-delivery take precedence over a
 /// terminal-looking status, and ambiguous evidence is never promoted to a
@@ -804,6 +857,7 @@ fn resolve_intent(
     rows: &[&FactsTaskRow],
     recoverable_graph_task_ids: &HashSet<i64>,
     completed_graph_source_task_ids: &HashSet<i64>,
+    recovery_merge_witnesses: &HashMap<i64, String>,
 ) -> ResolvedIntent {
     debug_assert!(!rows.is_empty());
 
@@ -889,8 +943,9 @@ fn resolve_intent(
                 && row.status == "done"
                 && row.completion_provenance.is_none())
         })
-        .map(|row| valid_merge_commit_sha(row))
-        .collect();
+        .map(|row| verified_merge_witness(row, recovery_merge_witnesses))
+        .collect::<Option<Vec<_>>>()
+        .map(dedup_merge_witnesses);
     if let Some(merge_commit_shas) = merge_commit_shas.filter(|shas| !shas.is_empty()) {
         return ResolvedIntent {
             reason: InclusionReason::IncludedVerifiedMerge,
@@ -1460,6 +1515,10 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         max_intents: MAX_INTENTS,
         max_contributing_tasks_per_intent: MAX_CONTRIBUTING_TASKS_PER_INTENT,
     };
+    // Extract only immutable-ledger-correlated recovery delivery witnesses
+    // after the short read snapshot has ended. Bare nested refs never enter
+    // terminal classification.
+    let recovery_merge_witnesses = recovery_merge_witnesses(&lineage);
 
     let truncated = candidate_tasks.len() > MAX_INTENTS;
 
@@ -1495,6 +1554,7 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
             &member_rows,
             &recoverable_graph_task_ids,
             &completed_graph_source_task_ids,
+            &recovery_merge_witnesses,
         );
         // Clip contributing task ids to the per-intent bound.
         let contributing: Vec<i64> = members
@@ -2716,6 +2776,47 @@ mod tests {
     }
 
     #[test]
+    fn facts_excludes_numeric_parked_failure_accepted_by_task_retry() {
+        let (_d, mut c) = open_tmp();
+        let parked = seed_task(&mut c, "failed", None, 0, None, 1000, 1650);
+        // SQLite's `json_extract(...)=1` task-retry predicate deliberately
+        // accepts this retained numeric encoding, not just JSON true.
+        set_refs(
+            &c,
+            parked,
+            r#"{"daemon_parked":1,"daemon_resume_status":"open"}"#,
+        );
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 0,
+                excluded: 1,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![parked]);
+        assert!(!intent.included);
+        assert_eq!(intent.reason, InclusionReason::ExcludedNonTerminal);
+        assert!(intent.terminal_outcome.is_none());
+        assert!(intent.terminal_evidence.is_none());
+
+        // Prove the same persisted row remains admitted by the lifecycle,
+        // rather than merely duplicating a look-alike JSON predicate here.
+        assert!(crate::tasks::retry_parked(
+            &mut c,
+            parked,
+            "retry-owner",
+            true,
+            crate::clock::now(),
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
     fn facts_completed_decomposition_uses_merged_child_provenance() {
         let (_d, mut c) = open_tmp();
         let source = seed_task(&mut c, "decomposed", None, 0, None, 1000, 1600);
@@ -2772,6 +2873,142 @@ mod tests {
         assert_eq!(
             intent.terminal_evidence.as_ref().unwrap()["merge_commit_shas"],
             serde_json::json!([first_sha, final_sha])
+        );
+    }
+
+    #[test]
+    fn facts_includes_completed_explicit_recovery_graph_with_ledger_witness() {
+        let (_d, mut c) = open_tmp();
+        const PR: i64 = 526;
+        const ORIGINAL_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const RECOVERY_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let source = seed_task(&mut c, "decomposed", None, 0, None, 1, 10);
+        let original = seed_task(&mut c, "failed", None, 0, None, 2, 20);
+        let graph = seed_decomposition(&c, source, 1);
+        seed_graph_member(&c, graph, original, "failed-child", 1);
+        set_refs(&c, original, &serde_json::json!({ "pr": PR }).to_string());
+        c.execute(
+            "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at) \
+             VALUES (?1,?2,'daemon/recovery',?3,0,8)",
+            rusqlite::params![original, PR, ORIGINAL_HEAD],
+        )
+        .unwrap();
+
+        // This recovery intentionally has no top-level merge_commit_sha. The
+        // durable explicit-adoption ledger, written below by the lifecycle,
+        // is the only recovery merge witness the facts reader may use.
+        let recovery = seed_task(&mut c, "done", None, 0, None, 9, 40);
+        set_refs(
+            &c,
+            recovery,
+            &serde_json::json!({ "pr": PR, "source_task": original }).to_string(),
+        );
+        c.execute(
+            "UPDATE tasks SET completion_provenance=?2,continue_pr=?3 WHERE id=?1",
+            rusqlite::params![recovery, crate::tasks::COMPLETION_PROVENANCE_MERGED, PR],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at) \
+             VALUES (?1,?2,'daemon/recovery',?3,0,25)",
+            rusqlite::params![recovery, PR, RECOVERY_HEAD],
+        )
+        .unwrap();
+
+        c.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                 profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (?1,?2,NULL,'worker',NULL,'M','worker','codex','codex','sol','high',
+                     'worker','test',9)",
+            rusqlite::params![format!("worker:task:{recovery}:revision:1"), recovery],
+        )
+        .unwrap();
+        let worker_assignment = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+                 role_assignment_id,spawned_at,ended_at,end_reason)
+             VALUES (?1,'worker','worker','sol','high','codex',?2,10,20,'completed')",
+            rusqlite::params![recovery, worker_assignment],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                 profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (?1,?2,?3,'reviewer','r1','M','reviewer','codex','codex','sol','high',
+                     'reviewer','test',26)",
+            rusqlite::params![format!("reviewer:task:{recovery}:r1"), recovery, PR],
+        )
+        .unwrap();
+        let reviewer_assignment = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+                 role_assignment_id,spawned_at,ended_at,end_reason,review_cap_run_id,
+                 review_pr,review_head_sha)
+             VALUES (?1,'reviewer','reviewer','sol','high','codex',?2,26,35,
+                     'verdict:approved','review-cap',?3,?4)",
+            rusqlite::params![recovery, reviewer_assignment, PR, RECOVERY_HEAD],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO r2_sampling_decisions(pr_number,head_sha,task_id,required,created_at)
+             VALUES (?1,?2,?3,0,25)",
+            rusqlite::params![PR, RECOVERY_HEAD, recovery],
+        )
+        .unwrap();
+
+        assert!(crate::decomposition::adopt_explicit_recovery_delivery(
+            &mut c,
+            &crate::decomposition::ExplicitRecoveryAdoption {
+                original_child_id: original,
+                recovery_task_id: recovery,
+                authorized_by: "test-operator",
+                now: 50,
+            },
+        )
+        .unwrap());
+        let completion: (String, i64, String, Option<String>) = c
+            .query_row(
+                "SELECT d.state,d.active,t.status,t.completion_provenance
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(completion, ("completed".into(), 0, "done".into(), None));
+        let has_top_level_witness: Option<String> = c
+            .query_row(
+                "SELECT json_extract(refs,'$.merge_commit_sha') FROM tasks WHERE id=?1",
+                [original],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_top_level_witness.is_none());
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 1,
+                excluded: 0,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(
+            intent.contributing_task_ids,
+            vec![source, original, recovery]
+        );
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedVerifiedMerge);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("done"));
+        assert_eq!(intent.merge_provenance.as_deref(), Some("merged"));
+        assert_eq!(
+            intent.terminal_evidence.as_ref().unwrap()["merge_commit_shas"],
+            serde_json::json!([RECOVERY_HEAD])
         );
     }
 
