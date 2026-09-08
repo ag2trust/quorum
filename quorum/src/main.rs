@@ -1184,7 +1184,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     "--reason-stdin or --reason-file is required for `task-close`".into(),
                 )
             })?;
-            let db_path = paths::db_path()?;
+            let repo = paths::resolve_repo()?;
+            let db_path = paths::db_path_for_repo(&repo)?;
             let conn = quorum_core::db::open(&db_path)?;
             let pr = quorum_core::tasks::task_pr_reference(&conn, task_id)?;
             drop(conn);
@@ -1192,16 +1193,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             // task-close must never keep a SQLite write lock while asking
             // GitHub whether its retained PR actually merged.
             let merge_commit_sha = if let Some(pr) = pr {
-                let repo_dir = std::env::current_dir().map_err(|error| {
-                    QuorumError::Io(format!(
-                        "cannot resolve task-close repository directory: {error}"
-                    ))
-                })?;
                 let executor = serve::merge::GhMergeExecutor {
                     token_file: None,
-                    gh_repo: None,
+                    gh_repo: Some(repo),
                 };
-                match executor.merge_commit_status(pr, &repo_dir) {
+                match executor.merge_commit_status(pr, std::path::Path::new(".")) {
                     serve::merge::MergeCommitStatus::Merged {
                         merge_commit_sha: Some(sha),
                     } => Some(sha),

@@ -1674,7 +1674,7 @@ fn write_gh_pr_state_shim(dir: &std::path::Path, response: &str) {
     std::fs::write(
         &shim,
         format!(
-            "#!/bin/sh\ncase \"$*\" in\n  *\"pr view\"*) echo '{response}' ;;\n  *) exit 1 ;;\nesac\n"
+            "#!/bin/sh\nif [ -n \"$QUORUM_GH_ARGS_FILE\" ]; then\n  printf '%s\\n' \"$*\" > \"$QUORUM_GH_ARGS_FILE\"\nfi\ncase \"$*\" in\n  *\"pr view\"*) echo '{response}' ;;\n  *) exit 1 ;;\nesac\n"
         ),
     )
     .unwrap();
@@ -1819,6 +1819,61 @@ fn task_close_rejects_open_pr_unless_reason_marks_task_obsolete() {
         .unwrap();
     let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
     assert!(refs.get("merge_commit_sha").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn task_close_binds_pr_lookup_to_the_quorum_repo_not_the_cwd() {
+    let home = tempfile::tempdir().unwrap();
+    let shim_dir = tempfile::tempdir().unwrap();
+    let args_file = shim_dir.path().join("gh-args");
+    let other_checkout = tempfile::tempdir().unwrap();
+    write_gh_pr_state_shim(
+        shim_dir.path(),
+        r#"{"state":"MERGED","mergeCommit":{"oid":"6d57fa14"}}"#,
+    );
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "owner",
+            "--title",
+            "recovered dependency",
+        ])
+        .assert()
+        .success();
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE tasks SET status='failed',refs=json_object('pr',79) WHERE id=1",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    quorum(home.path())
+        .current_dir(other_checkout.path())
+        .env("PATH", format!("{}:{path}", shim_dir.path().display()))
+        .env("QUORUM_GH_ARGS_FILE", &args_file)
+        .args([
+            "task-close",
+            "--agent",
+            "owner",
+            "--task-id",
+            "1",
+            "--reason-stdin",
+        ])
+        .write_stdin("merged by hand\n")
+        .assert()
+        .success();
+
+    let args = std::fs::read_to_string(args_file).unwrap();
+    assert!(args.contains("pr view 79"));
+    assert!(
+        args.contains("-R test/repo"),
+        "task-close must query the QUORUM_REPO-selected GitHub repository: {args}"
+    );
 }
 
 #[test]

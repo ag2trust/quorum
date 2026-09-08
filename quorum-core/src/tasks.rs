@@ -5720,7 +5720,7 @@ pub fn close_manual(
         &format!("by {agent}: {reason}"),
         now,
     )?;
-    crate::decomposition::complete_graph_if_final_child(&tx, id, now)?;
+    crate::decomposition::complete_graph_after_manual_close(&tx, id, now)?;
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -8811,6 +8811,207 @@ mod tests {
             compute_ready(&c, &get(&c, child).unwrap().unwrap().depends_on).unwrap(),
             "dependent must become ready once the failed head closes to done"
         );
+    }
+
+    #[test]
+    fn close_manual_reactivates_the_named_generated_child_failure_hold() {
+        let (_d, mut c) = open_tmp();
+        let source = create(
+            &mut c, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let resolved = create(
+            &mut c,
+            "owner",
+            "resolved child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let sibling = create(
+            &mut c,
+            "owner",
+            "pending sibling",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", [resolved])
+            .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,hold_code,hold_summary,created_at,updated_at
+             ) VALUES (?1,'blocked',1,0,1,1,1,'generated-child-failed',?2,1,1)",
+            params![
+                source,
+                serde_json::json!({"affected_task": resolved, "reason": "worker failed"})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        let graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'resolved',1,1),(?1,?3,'sibling',1,1)",
+            params![graph, resolved, sibling],
+        )
+        .unwrap();
+
+        close_manual(&mut c, "owner", resolved, "merged by hand", None, 2)
+            .unwrap()
+            .unwrap();
+
+        let graph_state: (String, Option<String>, Option<String>) = c
+            .query_row(
+                "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(graph_state, ("active".into(), None, None));
+        assert!(
+            list_implementation_ready_open(&c)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == sibling),
+            "the formerly held sibling must dispatch on the next daemon tick"
+        );
+        assert_eq!(
+            claim(&mut c, "worker", Some(sibling), &[], TTL, 3)
+                .unwrap()
+                .map(|task| task.id),
+            Some(sibling)
+        );
+        let unblocked: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='task_graph_unblocked' AND subject=?1",
+                [lease_target(resolved)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unblocked, 1);
+    }
+
+    #[test]
+    fn close_manual_does_not_clear_another_childs_generated_failure_hold() {
+        let (_d, mut c) = open_tmp();
+        let source = create(
+            &mut c, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let named = create(
+            &mut c,
+            "owner",
+            "named failed child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let closed = create(
+            &mut c,
+            "owner",
+            "other failed child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let sibling = create(
+            &mut c,
+            "owner",
+            "pending sibling",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed' WHERE id IN (?1,?2)",
+            params![named, closed],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,hold_code,hold_summary,created_at,updated_at
+             ) VALUES (?1,'blocked',1,0,1,1,1,'generated-child-failed',?2,1,1)",
+            params![
+                source,
+                serde_json::json!({"affected_task": named, "reason": "worker failed"}).to_string()
+            ],
+        )
+        .unwrap();
+        let graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'named',1,1),(?1,?3,'closed',1,1),(?1,?4,'sibling',1,1)",
+            params![graph, named, closed, sibling],
+        )
+        .unwrap();
+
+        close_manual(&mut c, "owner", closed, "fixed elsewhere", None, 2)
+            .unwrap()
+            .unwrap();
+
+        let graph_state: (String, String) = c
+            .query_row(
+                "SELECT state,hold_code FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            graph_state,
+            ("blocked".into(), "generated-child-failed".into())
+        );
+        assert!(
+            !list_implementation_ready_open(&c)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == sibling),
+            "a close unrelated to the held child must not release the graph"
+        );
+        let unblocked: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_graph_unblocked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unblocked, 0);
     }
 
     #[test]

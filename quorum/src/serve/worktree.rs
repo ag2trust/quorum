@@ -797,16 +797,19 @@ impl WorktreeManager {
         }
 
         let base_ref = format!("origin/{base_branch}");
-        let marker = format!("#{pr_number}");
+        // The GitHub-created merge subject carries the PR number as a complete
+        // token. Do not use a substring such as `#79`: it could select #799
+        // and incorrectly attest an unrelated dependency merge.
+        let marker = format!("^Merge pull request #{pr_number} from ");
         let mut log = self.git_cmd(repo_dir);
         log.args([
             "log",
             "--merges",
             "--format=%H",
             "--max-count=1",
+            "--extended-regexp",
             "--grep",
             &marker,
-            "--fixed-strings",
             &base_ref,
         ]);
         let output = run_git(log, self.local_timeout, "git find dependency PR merge").await?;
@@ -2116,7 +2119,7 @@ mod tests {
             mgr.find_merged_pr_commit(&worker, "main", 701)
                 .await
                 .unwrap(),
-            Some(base_sha),
+            Some(base_sha.clone()),
             "the GitHub metadata fallback must find the PR's merge commit on the fetched base"
         );
         assert_eq!(
@@ -2124,6 +2127,63 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+
+        // A substring match for #701 would incorrectly select this newer
+        // #7019 merge. The fallback must preserve the exact dependency PR.
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "dependency-prefix"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "commit",
+                "--allow-empty",
+                "-m",
+                "dependency-prefix"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "merge",
+                "--no-ff",
+                "dependency-prefix",
+                "-m",
+                "Merge pull request #7019 from dependency-prefix",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let prefix_merge = git_rev_parse(&source, "HEAD");
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "push", "origin", "main"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            mgr.find_merged_pr_commit(&worker, "main", 701)
+                .await
+                .unwrap(),
+            Some(base_sha),
+            "#701 must not match the newer #7019 merge"
+        );
+        assert_eq!(
+            mgr.find_merged_pr_commit(&worker, "main", 7019)
+                .await
+                .unwrap(),
+            Some(prefix_merge)
         );
     }
 

@@ -2898,10 +2898,24 @@ pub(crate) fn complete_graph_if_final_child(
     complete_graph_if_final_child_with_boundary_recovery(tx, task_id, now, false)
 }
 
+/// Manual resolution of the child named by a structured generated-child hold
+/// restores the graph while other children remain pending. The hold's named
+/// child is part of the predicate, so a close of any other child leaves the
+/// graph blocked. This keeps the manual close transactional with the same
+/// durable graph reconciliation as the task state change.
+pub(crate) fn complete_graph_after_manual_close(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    now: i64,
+) -> Result<bool> {
+    complete_graph_if_final_child_with_explicit_recovery(tx, task_id, now, false, false, true)
+}
+
 /// The explicit operator recovery path may complete a blocked graph when the
 /// persisted boundary blocker names the adopted child. For a modern structured
 /// generated-child-failed hold naming that child, it instead reactivates the
-/// graph while siblings remain. Ordinary child completion cannot clear a block.
+/// graph while siblings remain. Ordinary child completion cannot clear a block;
+/// manual close has its own narrowly authorized path for that structured hold.
 fn complete_graph_after_explicit_recovery(
     tx: &Transaction<'_>,
     task_id: i64,
@@ -3016,14 +3030,14 @@ fn complete_graph_if_final_child_with_explicit_recovery(
         )?;
         if graph_reactivated != 1 {
             return Err(QuorumError::Io(
-                "generated-child recovery graph changed during adoption transaction".into(),
+                "generated-child recovery graph changed during resolution transaction".into(),
             ));
         }
         crate::events::emit(
             tx,
             "task_graph_unblocked",
             &format!("task#{task_id}"),
-            "explicit recovery delivery restored graph authority",
+            "structured generated-child resolution restored graph authority",
             now,
         )?;
         return Ok(true);

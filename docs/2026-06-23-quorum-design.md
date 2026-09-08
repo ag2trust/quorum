@@ -405,7 +405,8 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   graph cancellation — `failed` is included, because a task whose PR landed outside the
   managed lifecycle has no other route to `done` and its dependents stay parked until it
   gets there (`compute_ready` counts only `done`). Closing a generated child performs final
-  graph/source reconciliation in the same transaction. If its retained PR is merged,
+  graph/source reconciliation in the same transaction; closing the child named by a structured
+  `generated-child-failed` hold clears that hold and restores its pending siblings. If its retained PR is merged,
   `task-close` records that immutable merge SHA in `refs.merge_commit_sha`; it refuses an open
   PR unless the required reason explicitly marks the task obsolete. Reason REQUIRED. Sets `done`
   but records `completion_provenance=manual` without removing `refs.pr`, and emits
@@ -815,7 +816,7 @@ only through an explicit outside request)
   merge commit to be an ancestor of that fetched base SHA; that exact verified SHA is the
   allocation provenance. If a completed dependency has `refs.pr` but no SHA (for example, it
   was manually closed after a recovery), the daemon resolves its merged PR outside the DB
-  transaction, falling back to a matching merge on `origin/<base>`, then conditionally stamps
+  transaction, falling back to an exact GitHub merge subject match on `origin/<base>`, then conditionally stamps
   the still-missing ref under the write lock. An open or unmerged PR parks the dependent with
   the named dependency and PR; no SHA is invented. A just-merged commit absent from the fetched
   ref is a bounded, claim-free deferral. The daemon never cuts the dependent branch from an

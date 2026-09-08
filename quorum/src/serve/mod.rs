@@ -20612,7 +20612,8 @@ async fn verify_dependency_base_before_allocation(
             } => Some(sha),
             merge::MergeCommitStatus::Merged {
                 merge_commit_sha: None,
-            } => wt_mgr
+            }
+            | merge::MergeCommitStatus::Unknown => wt_mgr
                 .find_merged_pr_commit(repo_dir, base_branch, pr_number)
                 .await
                 .map_err(|error| {
@@ -20659,7 +20660,6 @@ async fn verify_dependency_base_before_allocation(
                 log(&format!("PARKED: task #{}: {reason}", task.id));
                 return Ok(DependencyBaseAdmission::Deferred);
             }
-            merge::MergeCommitStatus::Unknown => None,
         };
         let Some(merge_commit_sha) = merge_commit_sha else {
             continue;
@@ -28276,10 +28276,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    struct DependencyMergeStatusExecutor(String);
+    struct UnknownDependencyMergeStatusExecutor;
 
     #[cfg(unix)]
-    impl merge::MergeExecutor for DependencyMergeStatusExecutor {
+    impl merge::MergeExecutor for UnknownDependencyMergeStatusExecutor {
         fn merge(
             &self,
             _pr: i64,
@@ -28294,9 +28294,7 @@ mod tests {
         }
 
         fn merge_commit_status(&self, _pr: i64, _repo_dir: &Path) -> merge::MergeCommitStatus {
-            merge::MergeCommitStatus::Merged {
-                merge_commit_sha: Some(self.0.clone()),
-            }
+            merge::MergeCommitStatus::Unknown
         }
     }
 
@@ -36687,7 +36685,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn manual_merge_close_dependency_is_stamped_before_stale_branch_allocation_check() {
+    async fn unknown_github_dependency_status_uses_git_fallback_before_stale_branch_allocation_check(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
         let remote = dir.path().join("remote.git");
@@ -36744,7 +36743,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         git(&source, &["checkout", "-q", "main"]);
         git(
             &source,
-            &["merge", "--no-ff", "dependency", "-m", "merge dependency"],
+            &[
+                "merge",
+                "--no-ff",
+                "dependency",
+                "-m",
+                "Merge pull request #701 from dependency",
+            ],
         );
         let merge_commit = git(&source, &["rev-parse", "HEAD"]);
         git(&source, &["push", "-q", "origin", "main"]);
@@ -36800,7 +36805,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         };
 
         let mut config = pre_review_ci_test_config(db_path.clone(), worker.clone());
-        config.merge_executor = Arc::new(DependencyMergeStatusExecutor(merge_commit.clone()));
+        config.merge_executor = Arc::new(UnknownDependencyMergeStatusExecutor);
         config.worktree_base = dir.path().join("worktrees");
         let mut names = Pool::new_generated();
         let mut workers = Vec::new();
