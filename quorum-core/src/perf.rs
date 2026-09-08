@@ -1708,6 +1708,10 @@ struct AttributionSnapshot {
     // token/timing completeness even though it has no managed interval id.
     non_managed_invocations_by_task: HashMap<i64, BTreeMap<String, i64>>,
     capped_non_managed_invocation_task_ids: HashSet<i64>,
+    // A future durable producer reason may prove that an invocation happened
+    // without saying which role produced it. Keep its aggregate explicitly
+    // unknown rather than crediting a partial role-token total.
+    incomplete_non_managed_invocation_task_ids: HashSet<i64>,
 }
 
 fn note_non_managed_invocation(snapshot: &mut AttributionSnapshot, task_id: i64, purpose: &str) {
@@ -2254,6 +2258,18 @@ fn load_non_managed_invocation_facts(
          WHERE source_task_id=?1 AND accepted_classifications_json IS NOT NULL
          LIMIT 1",
     )?;
+    // Proposal rejections retain the classifier turn after a retry clears the
+    // current accepted classification. Provider failures retain the role that
+    // was reaped with best-effort telemetry. Include both in completeness so a
+    // later successful turn cannot certify a partial token aggregate.
+    let mut retained_attempts = conn.prepare(
+        "SELECT attempt.kind,attempt.reason_code
+         FROM task_decompositions AS graph
+         JOIN decomposition_attempts AS attempt ON attempt.graph_id=graph.id
+         WHERE graph.source_task_id=?1
+           AND attempt.kind IN ('proposal','provider','blocker')
+         LIMIT ?2",
+    )?;
     for &task_id in task_ids {
         let planner_rows = planners
             .query_map(
@@ -2272,6 +2288,64 @@ fn load_non_managed_invocation_facts(
         }
         if classifier.exists([task_id])? {
             note_non_managed_invocation(snapshot, task_id, "classifier");
+        }
+        let attempts = retained_attempts
+            .query_map(
+                [task_id, (MAX_ATTRIBUTION_ATTEMPTS_PER_TASK + 1) as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if attempts.len() > MAX_ATTRIBUTION_ATTEMPTS_PER_TASK {
+            snapshot
+                .capped_non_managed_invocation_task_ids
+                .insert(task_id);
+            continue;
+        }
+        for (kind, reason_code) in attempts {
+            match kind.as_str() {
+                // `reject_decomposition_proposal` writes a proposal attempt
+                // only after its classifier turn. It remains after retries
+                // discard `accepted_classifications_json`.
+                "proposal" => note_non_managed_invocation(snapshot, task_id, "classifier"),
+                "provider" => match reason_code.as_str() {
+                    // These failures occur after the corresponding model
+                    // process is reaped, so any best-effort token snapshot is
+                    // required before the role aggregate is complete.
+                    "planner-provider" => note_non_managed_invocation(snapshot, task_id, "planner"),
+                    "classifier-provider" => {
+                        note_non_managed_invocation(snapshot, task_id, "classifier")
+                    }
+                    // Arbiter terminal outcomes have a paired durable verdict
+                    // row, which `load_planning_incident_facts` accounts for.
+                    // The remaining listed failures happen before a provider
+                    // invocation is started.
+                    "arbiter-provider"
+                    | "planner-prompt"
+                    | "frozen-view"
+                    | "planner-spawn"
+                    | "classifier-spawn"
+                    | "arbiter-frozen-view"
+                    | "arbiter-spawn" => {}
+                    // Do not guess a role for a future producer value.
+                    _ => {
+                        snapshot
+                            .incomplete_non_managed_invocation_task_ids
+                            .insert(task_id);
+                    }
+                },
+                // Planner blockers are terminal model responses. The two
+                // named exceptions are recorded after an arbiter/materialize
+                // path already accounted for elsewhere.
+                "blocker"
+                    if !matches!(
+                        reason_code.as_str(),
+                        "arbiter-reject-source" | "materialization-authority-lost"
+                    ) =>
+                {
+                    note_non_managed_invocation(snapshot, task_id, "planner")
+                }
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -2750,6 +2824,9 @@ fn populate_token_facts(
         if attribution
             .capped_non_managed_invocation_task_ids
             .contains(&task_id)
+            || attribution
+                .incomplete_non_managed_invocation_task_ids
+                .contains(&task_id)
         {
             complete = false;
         }
@@ -2895,6 +2972,9 @@ fn populate_timing_facts(
         if attribution
             .capped_non_managed_invocation_task_ids
             .contains(&task_id)
+            || attribution
+                .incomplete_non_managed_invocation_task_ids
+                .contains(&task_id)
             || attribution
                 .non_managed_invocations_by_task
                 .get(&task_id)
@@ -5738,6 +5818,135 @@ mod tests {
     }
 
     #[test]
+    fn facts_retained_classifier_and_provider_attempts_require_every_token_snapshot() {
+        // Retained planning attempts are the only durable trace after a retry
+        // clears current classifier state or a failed provider turn produces
+        // no submission. One later/partial snapshot must not certify either
+        // role-token aggregate or active-model time.
+        let (_d, mut c) = open_tmp();
+        let classifier_retry_task = seed_ordinary(&mut c, 1_600);
+        let planner_failed_task = seed_ordinary(&mut c, 1_700);
+        let classifier_failed_task = seed_ordinary(&mut c, 1_800);
+
+        let seed_worker_usage = |conn: &mut Connection, task_id: i64| {
+            let assignment = seed_assignment(conn, task_id, "worker", None, None, "worker");
+            let run = seed_attributed_run(
+                conn,
+                task_id,
+                "worker",
+                "worker",
+                "gpt-worker",
+                "codex",
+                "high",
+                assignment,
+                None,
+                10,
+                30,
+                "merged",
+            );
+            crate::token_usage::record(
+                conn,
+                Some(run),
+                "worker",
+                &[task_id],
+                None,
+                "codex",
+                "gpt-worker",
+                "high",
+                crate::token_usage::TokenUsage {
+                    uncached_input_tokens: 7,
+                    ..Default::default()
+                },
+                100,
+            )
+            .unwrap();
+        };
+        seed_worker_usage(&mut c, classifier_retry_task);
+        seed_worker_usage(&mut c, planner_failed_task);
+        seed_worker_usage(&mut c, classifier_failed_task);
+
+        // The retained proposal is the rejected first classifier invocation;
+        // the current accepted batch is a second invocation. Only the latter
+        // has telemetry, so the classifier subtotal is deliberately unknown.
+        let classifier_retry_graph = seed_decomposition(&c, classifier_retry_task, 1);
+        c.execute(
+            "UPDATE task_decompositions
+             SET active=0,accepted_classifications_json='[]' WHERE id=?1",
+            [classifier_retry_graph],
+        )
+        .unwrap();
+        seed_decomposition_attempt(
+            &c,
+            classifier_retry_graph,
+            "proposal",
+            1,
+            "classifier-rejected",
+        );
+        crate::token_usage::record(
+            &mut c,
+            None,
+            "classifier",
+            &[classifier_retry_task],
+            None,
+            "codex",
+            "gpt-classifier",
+            "high",
+            crate::token_usage::TokenUsage {
+                uncached_input_tokens: 11,
+                ..Default::default()
+            },
+            101,
+        )
+        .unwrap();
+
+        // Provider-failure attempts are recorded after their model process is
+        // reaped. Neither failure below has a best-effort snapshot, even
+        // though the managed worker evidence is complete.
+        let planner_failed_graph = seed_decomposition(&c, planner_failed_task, 1);
+        c.execute(
+            "UPDATE task_decompositions SET active=0 WHERE id=?1",
+            [planner_failed_graph],
+        )
+        .unwrap();
+        seed_decomposition_attempt(&c, planner_failed_graph, "provider", 1, "planner-provider");
+        let classifier_failed_graph = seed_decomposition(&c, classifier_failed_task, 1);
+        c.execute(
+            "UPDATE task_decompositions SET active=0 WHERE id=?1",
+            [classifier_failed_graph],
+        )
+        .unwrap();
+        seed_decomposition_attempt(
+            &c,
+            classifier_failed_graph,
+            "provider",
+            1,
+            "classifier-provider",
+        );
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent_for = |task_id| {
+            report
+                .intents
+                .iter()
+                .find(|intent| intent.intent_id == format!("intent-{task_id}"))
+                .unwrap()
+        };
+        for task_id in [
+            classifier_retry_task,
+            planner_failed_task,
+            classifier_failed_task,
+        ] {
+            let intent = intent_for(task_id);
+            assert!(intent.role_tokens_usd.is_none(), "task {task_id}");
+            assert!(!intent.coverage.role_tokens_usd, "task {task_id}");
+            assert!(intent.active_model_secs.is_none(), "task {task_id}");
+            assert!(!intent.coverage.active_model_secs, "task {task_id}");
+        }
+    }
+
+    #[test]
     fn planner_invocation_probe_uses_graph_index_with_unrelated_history() {
         // The facts snapshot asks by source task, then joins submissions by
         // graph id. Retained planner rows for unrelated graphs must not turn
@@ -7226,6 +7435,23 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    fn seed_decomposition_attempt(
+        conn: &Connection,
+        graph_id: i64,
+        kind: &str,
+        ordinal: i64,
+        reason_code: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO decomposition_attempts(
+                 graph_id,source_revision,kind,ordinal,retry_generation,
+                 reason_code,summary,created_at)
+             VALUES (?1,1,?2,?3,0,?4,'fixture',1)",
+            rusqlite::params![graph_id, kind, ordinal, reason_code],
+        )
+        .unwrap();
     }
 
     fn seed_graph_member(
