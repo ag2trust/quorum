@@ -10,7 +10,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerfCut {
@@ -589,10 +589,14 @@ fn count_candidates(conn: &Connection, since: Option<i64>) -> Result<CandidateCo
     })
 }
 
-fn new_intent_facts(task_id: i64, reason: InclusionReason) -> IntentFacts {
+fn new_intent_facts(
+    root_task_id: i64,
+    contributing_task_ids: Vec<i64>,
+    reason: InclusionReason,
+) -> IntentFacts {
     IntentFacts {
-        intent_id: format!("intent-{task_id}"),
-        contributing_task_ids: vec![task_id],
+        intent_id: format!("intent-{root_task_id}"),
+        contributing_task_ids,
         included: reason.is_included(),
         reason,
         lineage_root_task_id: None,
@@ -617,13 +621,259 @@ fn new_intent_facts(task_id: i64, reason: InclusionReason) -> IntentFacts {
     }
 }
 
-/// Materialized snapshot of the three cohort reads. Captured under one WAL
-/// read transaction so aggregate/scan/watermark all reflect the same
-/// database state.
+/// Membership row: a task_id that is a generated child of a source task
+/// through an active graph member row. Carries the graph_id for evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphChildInfo {
+    task_id: i64,
+    graph_id: i64,
+    source_task_id: i64,
+}
+
+/// Recovery adoption row: only accepted when durable `$.recovery_delivery`
+/// provenance is self-consistent (source_task equals the row it lives on)
+/// and names a distinct recovery task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryPairInfo {
+    recovery_task_id: i64,
+    original_task_id: i64,
+    pr_number: Option<i64>,
+    merged_head_sha: Option<String>,
+}
+
+/// Durable lineage relations captured under the same WAL snapshot as the
+/// cohort reads. Absent from either map ⇒ no collapse; presence follows a
+/// row we can point at (an active graph member, or a self-consistent
+/// `$.recovery_delivery` object). Never derived from titles, labels,
+/// matching PRs, or `continue_pr`.
+struct LineageSnapshot {
+    /// Every active graph child → the source task that owns its graph.
+    child_to_source: HashMap<i64, i64>,
+    /// Every accepted recovery task → the original it delivered against.
+    recovery_to_original: HashMap<i64, RecoveryPairInfo>,
+    /// Source task id → its active graph children (for evidence).
+    source_to_children: BTreeMap<i64, Vec<GraphChildInfo>>,
+    /// Original task id → all recovery pairs claiming that original.
+    original_to_recoveries: BTreeMap<i64, Vec<RecoveryPairInfo>>,
+}
+
+/// Read all active graph memberships joined to their source task. Bounded
+/// by the number of decompositions that exist; the daemon caps this
+/// aggressively (one active graph per source) so a single scan is safe.
+fn load_graph_members(conn: &Connection) -> Result<Vec<GraphChildInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT tgm.task_id, tgm.graph_id, td.source_task_id \
+         FROM task_graph_members tgm \
+         JOIN task_decompositions td ON td.id = tgm.graph_id \
+         WHERE tgm.active = 1 \
+         ORDER BY td.source_task_id, tgm.task_id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(GraphChildInfo {
+                task_id: r.get(0)?,
+                graph_id: r.get(1)?,
+                source_task_id: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Read every task carrying a durable `$.recovery_delivery` object and
+/// return only the self-consistent, non-degenerate pairs. A row that
+/// disagrees with its own id, omits `recovery_task`, or points recovery
+/// at itself is discarded — collapse never fabricates lineage from a
+/// partial or malformed refs blob.
+fn load_recovery_deliveries(conn: &Connection) -> Result<Vec<RecoveryPairInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, \
+                json_extract(refs, '$.recovery_delivery.source_task'), \
+                json_extract(refs, '$.recovery_delivery.recovery_task'), \
+                json_extract(refs, '$.recovery_delivery.pr'), \
+                json_extract(refs, '$.recovery_delivery.merged_head_sha') \
+         FROM tasks \
+         WHERE json_type(refs, '$.recovery_delivery') IS NOT NULL \
+         ORDER BY id",
+    )?;
+    let mut out = Vec::new();
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (task_id, source_task, recovery_task, pr_number, merged_head_sha) = row?;
+        // Only accept a self-consistent pair naming a distinct recovery task.
+        let (Some(orig), Some(rec)) = (source_task, recovery_task) else {
+            continue;
+        };
+        if orig != task_id || rec == orig {
+            continue;
+        }
+        out.push(RecoveryPairInfo {
+            recovery_task_id: rec,
+            original_task_id: orig,
+            pr_number,
+            merged_head_sha,
+        });
+    }
+    Ok(out)
+}
+
+fn build_lineage_snapshot(conn: &Connection) -> Result<LineageSnapshot> {
+    let members = load_graph_members(conn)?;
+    let mut child_to_source: HashMap<i64, i64> = HashMap::with_capacity(members.len());
+    let mut source_to_children: BTreeMap<i64, Vec<GraphChildInfo>> = BTreeMap::new();
+    for m in members {
+        child_to_source.insert(m.task_id, m.source_task_id);
+        source_to_children
+            .entry(m.source_task_id)
+            .or_default()
+            .push(m);
+    }
+
+    let pairs = load_recovery_deliveries(conn)?;
+    let mut recovery_to_original: HashMap<i64, RecoveryPairInfo> =
+        HashMap::with_capacity(pairs.len());
+    let mut original_to_recoveries: BTreeMap<i64, Vec<RecoveryPairInfo>> = BTreeMap::new();
+    for p in pairs {
+        recovery_to_original.insert(p.recovery_task_id, p.clone());
+        original_to_recoveries
+            .entry(p.original_task_id)
+            .or_default()
+            .push(p);
+    }
+
+    Ok(LineageSnapshot {
+        child_to_source,
+        recovery_to_original,
+        source_to_children,
+        original_to_recoveries,
+    })
+}
+
+/// Walk (recovery → original) then (child → source) until we reach a task
+/// that is neither a recovery target nor a graph child. Cycle-guarded with
+/// a bounded step count so a pathological refs blob cannot spin forever.
+fn canonical_root(task_id: i64, lineage: &LineageSnapshot) -> i64 {
+    let mut current = task_id;
+    let mut seen: HashSet<i64> = HashSet::new();
+    for _ in 0..8 {
+        if !seen.insert(current) {
+            break;
+        }
+        if let Some(pair) = lineage.recovery_to_original.get(&current) {
+            current = pair.original_task_id;
+            continue;
+        }
+        if let Some(&src) = lineage.child_to_source.get(&current) {
+            current = src;
+            continue;
+        }
+        break;
+    }
+    current
+}
+
+/// Build the JSON evidence blob for a collapsed intent's lineage. `members`
+/// is the sorted list of terminal-cohort task ids that fold into `root`;
+/// every claim is backed by a durable relation captured in `lineage`.
+fn build_lineage_evidence(
+    root: i64,
+    members: &[i64],
+    lineage: &LineageSnapshot,
+) -> serde_json::Value {
+    let children = lineage.source_to_children.get(&root);
+
+    // Gather all recovery pairs whose original is either the root itself
+    // or one of the root's graph children — these are the pairs that
+    // fold into this intent.
+    let mut relevant_originals: BTreeSet<i64> = BTreeSet::new();
+    if lineage.original_to_recoveries.contains_key(&root) {
+        relevant_originals.insert(root);
+    }
+    if let Some(cs) = children {
+        for c in cs {
+            if lineage.original_to_recoveries.contains_key(&c.task_id) {
+                relevant_originals.insert(c.task_id);
+            }
+        }
+    }
+    let mut recovery_pairs: Vec<&RecoveryPairInfo> = Vec::new();
+    for orig in &relevant_originals {
+        if let Some(rs) = lineage.original_to_recoveries.get(orig) {
+            for p in rs {
+                recovery_pairs.push(p);
+            }
+        }
+    }
+
+    let has_children = children.map(|v| !v.is_empty()).unwrap_or(false);
+    let has_recovery = !recovery_pairs.is_empty();
+
+    let kind = match (has_children, has_recovery) {
+        (true, true) => "decomposed+recovery",
+        (true, false) => "decomposed",
+        (false, true) => "recovery",
+        (false, false) => "standalone",
+    };
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("kind".to_string(), serde_json::Value::String(kind.into()));
+    obj.insert("root_task_id".to_string(), serde_json::json!(root));
+    obj.insert("member_task_ids".to_string(), serde_json::json!(members));
+
+    if let Some(cs) = children {
+        if !cs.is_empty() {
+            let graph_ids: BTreeSet<i64> = cs.iter().map(|c| c.graph_id).collect();
+            let child_ids: Vec<i64> = cs.iter().map(|c| c.task_id).collect();
+            obj.insert("source_task_id".to_string(), serde_json::json!(root));
+            obj.insert(
+                "graph_ids".to_string(),
+                serde_json::json!(graph_ids.into_iter().collect::<Vec<i64>>()),
+            );
+            obj.insert(
+                "generated_child_task_ids".to_string(),
+                serde_json::json!(child_ids),
+            );
+        }
+    }
+
+    if !recovery_pairs.is_empty() {
+        let pairs_json: Vec<serde_json::Value> = recovery_pairs
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "original_task_id": p.original_task_id,
+                    "recovery_task_id": p.recovery_task_id,
+                    "pr_number": p.pr_number,
+                    "merged_head_sha": p.merged_head_sha,
+                })
+            })
+            .collect();
+        obj.insert(
+            "recovery_pairs".to_string(),
+            serde_json::Value::Array(pairs_json),
+        );
+    }
+
+    serde_json::Value::Object(obj)
+}
+
+/// Materialized snapshot of the cohort reads plus durable lineage
+/// relations. Captured under one WAL read transaction so counts, ids,
+/// graph memberships, and recovery-delivery provenance all reflect the
+/// same database state.
 struct CohortSnapshot {
     watermark: Option<i64>,
     counts: CandidateCounts,
     ordinary_ids: Vec<i64>,
+    lineage: LineageSnapshot,
 }
 
 /// Take the watermark, aggregate counts, and bounded ordinary-id scan under
@@ -638,10 +888,12 @@ fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSn
         // First SELECT establishes the snapshot; subsequent reads see it.
         let counts = count_candidates(c, since)?;
         let ordinary_ids = load_ordinary_intent_ids(c, since, MAX_INTENTS + 1)?;
+        let lineage = build_lineage_snapshot(c)?;
         Ok(CohortSnapshot {
             watermark,
             counts,
             ordinary_ids,
+            lineage,
         })
     };
     if !conn.is_autocommit() {
@@ -673,6 +925,7 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         watermark,
         counts,
         ordinary_ids,
+        lineage,
     } = snap;
 
     let cohort = CohortDefinition {
@@ -694,9 +947,31 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         InclusionReason::EligibleTerminal
     };
 
-    let mut intents: Vec<IntentFacts> = Vec::with_capacity(ordinary_ids.len().min(MAX_INTENTS));
-    for id in ordinary_ids.iter().take(MAX_INTENTS).copied() {
-        intents.push(new_intent_facts(id, base_reason));
+    // Collapse ordinary cohort tasks into their canonical intent roots via
+    // durable lineage (graph membership, recovery-delivery provenance).
+    // Group by root_id in BTreeMap ordering for deterministic output.
+    let capped_ids: Vec<i64> = ordinary_ids.iter().take(MAX_INTENTS).copied().collect();
+    let mut groups: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for id in &capped_ids {
+        let root = canonical_root(*id, &lineage);
+        groups.entry(root).or_default().push(*id);
+    }
+
+    let mut intents: Vec<IntentFacts> = Vec::with_capacity(groups.len());
+    for (root, mut members) in groups {
+        members.sort();
+        let members_for_evidence = members.clone();
+        let evidence = build_lineage_evidence(root, &members_for_evidence, &lineage);
+        // Clip contributing task ids to the per-intent bound.
+        let contributing: Vec<i64> = members
+            .into_iter()
+            .take(MAX_CONTRIBUTING_TASKS_PER_INTENT)
+            .collect();
+        let mut intent = new_intent_facts(root, contributing, base_reason);
+        intent.lineage_root_task_id = Some(root);
+        intent.lineage_evidence = Some(evidence);
+        intent.coverage.lineage = true;
+        intents.push(intent);
     }
 
     let mut excluded_reasons: BTreeMap<String, i64> = BTreeMap::new();
@@ -718,7 +993,12 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         }
     }
 
-    let included_count = intents.len() as i64;
+    // `included` counts terminal cohort tasks that contributed to some
+    // emitted intent (either as root or as folded detail). With collapse it
+    // may exceed `intents.len()` — the intent count is available separately
+    // via `intents.len()`. For non-collapsed cohorts this preserves the
+    // historical `included == intents.len()` identity.
+    let included_count = capped_ids.len() as i64;
     let excluded_count = candidate_count - included_count;
 
     // Coverage summary: iterate each intent's flags and tally covered vs
@@ -1485,7 +1765,10 @@ mod tests {
     }
 
     #[test]
-    fn facts_all_evidence_null_and_coverage_false() {
+    fn facts_sibling_owned_evidence_null_and_coverage_false() {
+        // Lineage is owned by this file (populated on the collapsed intent);
+        // every other evidence field remains null with coverage.false until a
+        // sibling enrichment task fills it in.
         let (_d, mut c) = open_tmp();
         let tid = seed_ordinary(&mut c, 1600);
         seed_run(&c, tid, "opus-46", "high", 1001);
@@ -1494,9 +1777,11 @@ mod tests {
         let r = perf_facts(&c, false).unwrap();
         assert_eq!(r.intents.len(), 1);
         let i = &r.intents[0];
-        // Every evidence field remains null — enrichment is a sibling's job.
-        assert!(i.lineage_root_task_id.is_none());
-        assert!(i.lineage_evidence.is_none());
+        // Lineage is populated for a standalone intent — no durable relations.
+        assert_eq!(i.lineage_root_task_id, Some(tid));
+        assert!(i.lineage_evidence.is_some());
+        assert!(i.coverage.lineage, "standalone lineage is covered");
+        // Every other evidence field remains null — enrichment is a sibling's job.
         assert!(i.terminal_outcome.is_none());
         assert!(i.terminal_evidence.is_none());
         assert!(i.merge_provenance.is_none());
@@ -1513,14 +1798,23 @@ mod tests {
         assert!(i.replan_count.is_none());
         assert!(i.incident_count.is_none());
         assert!(i.review_quality.is_none());
-        // Every coverage flag stays false.
+        // Every coverage flag except lineage stays false.
         for (name, covered) in i.coverage.iter_named() {
-            assert!(!covered, "coverage.{name} must default to false");
+            if name == "lineage" {
+                assert!(covered, "coverage.lineage must be true for standalone");
+            } else {
+                assert!(!covered, "coverage.{name} must default to false");
+            }
         }
-        // Coverage summary reflects that: uncovered==1 for every field.
+        // Coverage summary reflects that: lineage covered==1, everything else uncovered==1.
         for (name, fc) in &r.coverage.fields {
-            assert_eq!(fc.covered, 0, "field {name} covered");
-            assert_eq!(fc.uncovered, 1, "field {name} uncovered");
+            if name == "lineage" {
+                assert_eq!(fc.covered, 1, "field {name} covered count");
+                assert_eq!(fc.uncovered, 0, "field {name} uncovered count");
+            } else {
+                assert_eq!(fc.covered, 0, "field {name} covered count");
+                assert_eq!(fc.uncovered, 1, "field {name} uncovered count");
+            }
         }
     }
 
@@ -1782,6 +2076,342 @@ mod tests {
             let s = v.as_str().expect("reason must serialize as a string");
             assert_eq!(s, r.as_str(), "wire form and as_str() must agree");
         }
+    }
+
+    // ── decomposition and recovery collapse (test proofs #4 and #5) ─────
+    //
+    // Sanitized fixture matrix, kept in tests, not production code:
+    //
+    //   proof #4 — decomposed graph:
+    //     source S (terminal ordinary) + generated children c1, c2 (both
+    //     linked as active graph_members of S's task_decompositions row).
+    //     Expectation: exactly one top-level intent whose contributing_task_ids
+    //     are [S, c1, c2] and whose lineage_evidence names the graph. The
+    //     children never appear as independent intents. If S itself is
+    //     non-terminal, the intent is still one and its members are only the
+    //     terminal children.
+    //
+    //   proof #5a — exact recovery adoption:
+    //     original X (terminal, refs.$.recovery_delivery names source_task=X,
+    //     recovery_task=Y) + recovery Y (terminal). Y collapses into X's
+    //     intent — one top-level intent, X and Y both attributable.
+    //
+    //   proof #5b — shared-PR / continuation without provenance:
+    //     tasks A and B share a PR reference (refs.$.pr = 42) or a
+    //     continuation link (refs.$.continue_pr = 42); NEITHER carries
+    //     refs.$.recovery_delivery. They stay as two independent intents.
+    //     Title/labels/matching PR/continue_pr never trigger collapse.
+
+    fn seed_decomposition(conn: &Connection, source_task_id: i64, plan_revision: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,\
+                 planned_source_revision,plan_revision,accepted_plan_revision,created_at,updated_at)\
+             VALUES (?1,'active',1,0,?2,?2,?2,1,1)",
+            rusqlite::params![source_task_id, plan_revision],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn seed_graph_member(
+        conn: &Connection,
+        graph_id: i64,
+        task_id: i64,
+        local_key: &str,
+        plan_revision: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)\
+             VALUES (?1,?2,?3,?4,1)",
+            rusqlite::params![graph_id, task_id, local_key, plan_revision],
+        )
+        .unwrap();
+    }
+
+    fn set_refs(conn: &Connection, task_id: i64, refs_json: &str) {
+        conn.execute(
+            "UPDATE tasks SET refs = ?2 WHERE id = ?1",
+            rusqlite::params![task_id, refs_json],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn facts_decomposed_source_and_children_collapse_to_one_intent() {
+        // Proof #4. Source S plus two generated children c1, c2 form one
+        // top-level intent. Neither child appears as an independent top-level
+        // intent. The decomposition parent (S) is folded into the collapsed
+        // intent — never emitted as its own separate row.
+        let (_d, mut c) = open_tmp();
+        let s = seed_ordinary(&mut c, 1600);
+        let c1 = seed_ordinary(&mut c, 1650);
+        let c2 = seed_ordinary(&mut c, 1700);
+        let graph_id = seed_decomposition(&c, s, 1);
+        seed_graph_member(&c, graph_id, c1, "child-a", 1);
+        seed_graph_member(&c, graph_id, c2, "child-b", 1);
+
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.intents.len(), 1, "one top-level intent for the graph");
+        let intent = &r.intents[0];
+        assert_eq!(intent.intent_id, format!("intent-{s}"));
+        assert_eq!(intent.contributing_task_ids, vec![s, c1, c2]);
+        assert_eq!(intent.lineage_root_task_id, Some(s));
+        assert!(intent.coverage.lineage);
+        let ev = intent.lineage_evidence.as_ref().unwrap();
+        assert_eq!(ev.get("kind").unwrap(), &serde_json::json!("decomposed"));
+        assert_eq!(ev.get("source_task_id").unwrap(), &serde_json::json!(s));
+        assert_eq!(
+            ev.get("generated_child_task_ids").unwrap(),
+            &serde_json::json!([c1, c2])
+        );
+        // All three terminal tasks contributed; nothing was excluded as
+        // "children folded away".
+        assert_eq!(r.counts.candidate, 3);
+        assert_eq!(r.counts.included, 3);
+        assert_eq!(r.counts.excluded, 0);
+        // No child id ever surfaces as an independent intent_id.
+        for i in &r.intents {
+            assert_ne!(i.intent_id, format!("intent-{c1}"));
+            assert_ne!(i.intent_id, format!("intent-{c2}"));
+        }
+    }
+
+    #[test]
+    fn facts_decomposition_parent_never_emitted_when_only_children_terminal() {
+        // Source S is still open (non-terminal); its two children are done.
+        // The decomposition parent must never be emitted as an independent
+        // row. Result: exactly one collapsed intent rooted at S, with the
+        // two terminal children as contributing detail.
+        let (_d, mut c) = open_tmp();
+        let s = {
+            let tx = crate::db::begin_immediate(&mut c).unwrap();
+            tx.execute(
+                "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
+                 created_at, updated_at, refs, depends_on, author, reviewer, rework_round, review_only) \
+                 VALUES ('src', NULL, 'working', 0, NULL, 'A', 'boss', 1000, 1600, NULL, NULL, 'A', NULL, 0, 0)",
+                [],
+            ).unwrap();
+            let id = tx.last_insert_rowid();
+            tx.commit().unwrap();
+            id
+        };
+        let c1 = seed_ordinary(&mut c, 1650);
+        let c2 = seed_ordinary(&mut c, 1700);
+        let graph_id = seed_decomposition(&c, s, 1);
+        seed_graph_member(&c, graph_id, c1, "child-a", 1);
+        seed_graph_member(&c, graph_id, c2, "child-b", 1);
+
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.intents.len(), 1);
+        let intent = &r.intents[0];
+        assert_eq!(intent.intent_id, format!("intent-{s}"));
+        // S itself is not in the terminal cohort — but children still fold to S.
+        assert_eq!(intent.contributing_task_ids, vec![c1, c2]);
+        assert_eq!(intent.lineage_root_task_id, Some(s));
+    }
+
+    #[test]
+    fn facts_exact_recovery_collapses_while_shared_pr_does_not() {
+        // Proof #5. Two lineages, both terminal, side by side:
+        //   (A) exact durable recovery adoption — X carries
+        //       refs.$.recovery_delivery = {source_task: X, recovery_task: Y}.
+        //       Y collapses into X's intent.
+        //   (B) shared-PR / continue_pr without provenance — A and B share
+        //       refs.$.pr / refs.$.continue_pr but neither carries
+        //       refs.$.recovery_delivery. They stay independent.
+        let (_d, mut c) = open_tmp();
+
+        // Lineage A: exact recovery adoption.
+        let orig_x = seed_ordinary(&mut c, 1600);
+        let recovery_y = seed_ordinary(&mut c, 1650);
+        let x_refs = serde_json::json!({
+            "recovery_delivery": {
+                "source_task": orig_x,
+                "recovery_task": recovery_y,
+                "pr": 42,
+                "merged_head_sha": "abc123",
+                "adopted_at": 1650,
+            }
+        })
+        .to_string();
+        set_refs(&c, orig_x, &x_refs);
+
+        // Lineage B: shared PR / continue_pr but no recovery_delivery.
+        let shared_a = seed_ordinary(&mut c, 1700);
+        let shared_b = seed_ordinary(&mut c, 1750);
+        let a_refs = serde_json::json!({ "pr": 99 }).to_string();
+        let b_refs = serde_json::json!({ "continue_pr": 99, "pr": 99 }).to_string();
+        set_refs(&c, shared_a, &a_refs);
+        set_refs(&c, shared_b, &b_refs);
+
+        let r = perf_facts(&c, false).unwrap();
+        // Expected intents: one collapsed (orig_x + recovery_y), and two
+        // independent (shared_a, shared_b) — total 3.
+        assert_eq!(r.intents.len(), 3, "recovery folds, shared-PR does not");
+        assert_eq!(r.counts.candidate, 4);
+        assert_eq!(r.counts.included, 4);
+        assert_eq!(r.counts.excluded, 0);
+
+        // Find each intent by intent_id.
+        let by_id: HashMap<&str, &IntentFacts> = r
+            .intents
+            .iter()
+            .map(|i| (i.intent_id.as_str(), i))
+            .collect();
+
+        // The collapsed recovery intent.
+        let collapsed_id = format!("intent-{orig_x}");
+        let collapsed = by_id.get(collapsed_id.as_str()).unwrap();
+        assert_eq!(collapsed.contributing_task_ids, vec![orig_x, recovery_y]);
+        assert_eq!(collapsed.lineage_root_task_id, Some(orig_x));
+        assert!(collapsed.coverage.lineage);
+        let ev = collapsed.lineage_evidence.as_ref().unwrap();
+        assert_eq!(ev.get("kind").unwrap(), &serde_json::json!("recovery"));
+        let pairs = ev.get("recovery_pairs").unwrap().as_array().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0].get("original_task_id").unwrap(),
+            &serde_json::json!(orig_x)
+        );
+        assert_eq!(
+            pairs[0].get("recovery_task_id").unwrap(),
+            &serde_json::json!(recovery_y)
+        );
+        assert_eq!(pairs[0].get("pr_number").unwrap(), &serde_json::json!(42));
+        assert_eq!(
+            pairs[0].get("merged_head_sha").unwrap(),
+            &serde_json::json!("abc123")
+        );
+
+        // The shared-PR / continuation tasks stay independent — never fold.
+        let shared_a_intent = by_id.get(format!("intent-{shared_a}").as_str()).unwrap();
+        let shared_b_intent = by_id.get(format!("intent-{shared_b}").as_str()).unwrap();
+        assert_eq!(shared_a_intent.contributing_task_ids, vec![shared_a]);
+        assert_eq!(shared_b_intent.contributing_task_ids, vec![shared_b]);
+        // Their lineage_evidence.kind is "standalone" — never inferred from
+        // the shared PR or the continue_pr link.
+        assert_eq!(
+            shared_a_intent
+                .lineage_evidence
+                .as_ref()
+                .unwrap()
+                .get("kind")
+                .unwrap(),
+            &serde_json::json!("standalone")
+        );
+        assert_eq!(
+            shared_b_intent
+                .lineage_evidence
+                .as_ref()
+                .unwrap()
+                .get("kind")
+                .unwrap(),
+            &serde_json::json!("standalone")
+        );
+
+        // The recovery task Y never appears as its own top-level intent.
+        assert!(
+            !by_id.contains_key(format!("intent-{recovery_y}").as_str()),
+            "recovery task must not surface as a top-level intent"
+        );
+    }
+
+    #[test]
+    fn facts_recovery_delivery_ignored_when_provenance_malformed() {
+        // A refs.$.recovery_delivery whose source_task disagrees with the row
+        // it lives on, or whose recovery_task is missing, must NOT be used
+        // to collapse anything — partial provenance is treated as unknown.
+        let (_d, mut c) = open_tmp();
+        let a = seed_ordinary(&mut c, 1600);
+        let b = seed_ordinary(&mut c, 1650);
+        // Row `a` claims a source_task other than itself — inconsistent.
+        let bogus = serde_json::json!({
+            "recovery_delivery": {
+                "source_task": 999_999,
+                "recovery_task": b,
+            }
+        })
+        .to_string();
+        set_refs(&c, a, &bogus);
+
+        let r = perf_facts(&c, false).unwrap();
+        // Neither task collapses — two independent top-level intents.
+        assert_eq!(r.intents.len(), 2);
+        let ids: Vec<i64> = r
+            .intents
+            .iter()
+            .map(|i| i.contributing_task_ids[0])
+            .collect();
+        assert_eq!(ids, vec![a, b]);
+    }
+
+    #[test]
+    fn facts_recovery_of_graph_child_folds_into_source_intent() {
+        // Chained lineage: recovery Y → original child X → source S.
+        // Both X and Y (and S itself) collapse into a single intent rooted
+        // at S. All members surface as attributable detail; none appear
+        // independently.
+        let (_d, mut c) = open_tmp();
+        let s = seed_ordinary(&mut c, 1600);
+        let x = seed_ordinary(&mut c, 1650); // generated child of S
+        let y = seed_ordinary(&mut c, 1700); // recovery for X
+        let graph_id = seed_decomposition(&c, s, 1);
+        seed_graph_member(&c, graph_id, x, "child-a", 1);
+        let x_refs = serde_json::json!({
+            "recovery_delivery": {
+                "source_task": x,
+                "recovery_task": y,
+                "pr": 7,
+                "merged_head_sha": "deadbeef",
+            }
+        })
+        .to_string();
+        set_refs(&c, x, &x_refs);
+
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.intents.len(), 1);
+        let intent = &r.intents[0];
+        assert_eq!(intent.intent_id, format!("intent-{s}"));
+        assert_eq!(intent.contributing_task_ids, vec![s, x, y]);
+        let ev = intent.lineage_evidence.as_ref().unwrap();
+        assert_eq!(
+            ev.get("kind").unwrap(),
+            &serde_json::json!("decomposed+recovery")
+        );
+        // Recovery pairs describe X→Y even though the root is S.
+        let pairs = ev.get("recovery_pairs").unwrap().as_array().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0].get("original_task_id").unwrap(),
+            &serde_json::json!(x)
+        );
+        assert_eq!(
+            pairs[0].get("recovery_task_id").unwrap(),
+            &serde_json::json!(y)
+        );
+    }
+
+    #[test]
+    fn facts_collapse_paths_do_not_write() {
+        // Real-SQLite proof that the collapse read paths (graph members and
+        // refs.$.recovery_delivery scans) leave the database unchanged.
+        let (_d, mut c) = open_tmp();
+        let s = seed_ordinary(&mut c, 1600);
+        let x = seed_ordinary(&mut c, 1650);
+        let y = seed_ordinary(&mut c, 1700);
+        let graph_id = seed_decomposition(&c, s, 1);
+        seed_graph_member(&c, graph_id, x, "child-a", 1);
+        let x_refs = serde_json::json!({
+            "recovery_delivery": { "source_task": x, "recovery_task": y }
+        })
+        .to_string();
+        set_refs(&c, x, &x_refs);
+
+        let before = snapshot_db_state(&c);
+        let _ = perf_facts(&c, false).unwrap();
+        let _ = perf_facts(&c, true).unwrap();
+        let after = snapshot_db_state(&c);
+        assert_eq!(before, after, "collapse reads must not write");
     }
 
     // Helper for cloning an IntentFacts in tests (Serialize/Deserialize is
