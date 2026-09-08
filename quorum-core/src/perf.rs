@@ -685,6 +685,16 @@ fn load_graph_members(conn: &Connection) -> Result<Vec<GraphChildInfo>> {
 /// disagrees with its own id, omits `recovery_task`, or points recovery
 /// at itself is discarded — collapse never fabricates lineage from a
 /// partial or malformed refs blob.
+///
+/// Gate on `completion_provenance = 'merged'`. That top-level column is
+/// CHECK-constrained to `('merged','manual')` and is only ever written
+/// from daemon-owned lifecycle paths (`tasks.rs` merge finalization and
+/// `decomposition::finalize_recovery_delivery`). Agent-writable task
+/// updates cannot forge this signal, so pairing it with a self-consistent
+/// `$.recovery_delivery` object rules out a working-agent-fabricated refs
+/// blob that would otherwise pass the shape check. `status='done'` is
+/// implied by the constraint that finalization only sets provenance while
+/// transitioning to done — asserted here defensively.
 fn load_recovery_deliveries(conn: &Connection) -> Result<Vec<RecoveryPairInfo>> {
     let mut stmt = conn.prepare(
         "SELECT id, \
@@ -694,6 +704,8 @@ fn load_recovery_deliveries(conn: &Connection) -> Result<Vec<RecoveryPairInfo>> 
                 json_extract(refs, '$.recovery_delivery.merged_head_sha') \
          FROM tasks \
          WHERE json_type(refs, '$.recovery_delivery') IS NOT NULL \
+           AND completion_provenance = 'merged' \
+           AND status = 'done' \
          ORDER BY id",
     )?;
     let mut out = Vec::new();
@@ -783,11 +795,19 @@ fn canonical_root(task_id: i64, lineage: &LineageSnapshot) -> i64 {
 /// Build the JSON evidence blob for a collapsed intent's lineage. `members`
 /// is the sorted list of terminal-cohort task ids that fold into `root`;
 /// every claim is backed by a durable relation captured in `lineage`.
+///
+/// Returns `None` when no durable collapse relation exists for `root`
+/// (no active graph children and no accepted recovery pairs touching the
+/// intent). Consumers must treat that as an explicit coverage gap — a
+/// standalone task, a shared-PR/continue_pr link without provenance, and a
+/// row whose `$.recovery_delivery` failed the daemon-owned adoption gate
+/// are all indistinguishable to this reader and none of them establishes
+/// lineage.
 fn build_lineage_evidence(
     root: i64,
     members: &[i64],
     lineage: &LineageSnapshot,
-) -> serde_json::Value {
+) -> Option<serde_json::Value> {
     let children = lineage.source_to_children.get(&root);
 
     // Gather all recovery pairs whose original is either the root itself
@@ -820,7 +840,9 @@ fn build_lineage_evidence(
         (true, true) => "decomposed+recovery",
         (true, false) => "decomposed",
         (false, true) => "recovery",
-        (false, false) => "standalone",
+        // Standalone / ambiguous / malformed provenance is an explicit
+        // coverage gap, not lineage evidence. Never fabricate a root.
+        (false, false) => return None,
     };
 
     let mut obj = serde_json::Map::new();
@@ -862,7 +884,7 @@ fn build_lineage_evidence(
         );
     }
 
-    serde_json::Value::Object(obj)
+    Some(serde_json::Value::Object(obj))
 }
 
 /// Materialized snapshot of the cohort reads plus durable lineage
@@ -968,9 +990,15 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
             .take(MAX_CONTRIBUTING_TASKS_PER_INTENT)
             .collect();
         let mut intent = new_intent_facts(root, contributing, base_reason);
-        intent.lineage_root_task_id = Some(root);
-        intent.lineage_evidence = Some(evidence);
-        intent.coverage.lineage = true;
+        // Populate lineage only when a durable collapse relation exists.
+        // Standalone / shared-PR-only / malformed provenance leaves
+        // lineage_evidence null and coverage.lineage false — an explicit
+        // coverage gap, distinguishable from a measured value.
+        if let Some(ev) = evidence {
+            intent.lineage_root_task_id = Some(root);
+            intent.lineage_evidence = Some(ev);
+            intent.coverage.lineage = true;
+        }
         intents.push(intent);
     }
 
@@ -1766,9 +1794,11 @@ mod tests {
 
     #[test]
     fn facts_sibling_owned_evidence_null_and_coverage_false() {
-        // Lineage is owned by this file (populated on the collapsed intent);
-        // every other evidence field remains null with coverage.false until a
-        // sibling enrichment task fills it in.
+        // A standalone task carries no durable collapse relation — its
+        // lineage_evidence must remain JSON null with coverage.lineage=false
+        // so consumers can distinguish an unavailable lineage from a
+        // measured one. Every other evidence field is null with its coverage
+        // flag false as well, awaiting sibling enrichment.
         let (_d, mut c) = open_tmp();
         let tid = seed_ordinary(&mut c, 1600);
         seed_run(&c, tid, "opus-46", "high", 1001);
@@ -1777,10 +1807,13 @@ mod tests {
         let r = perf_facts(&c, false).unwrap();
         assert_eq!(r.intents.len(), 1);
         let i = &r.intents[0];
-        // Lineage is populated for a standalone intent — no durable relations.
-        assert_eq!(i.lineage_root_task_id, Some(tid));
-        assert!(i.lineage_evidence.is_some());
-        assert!(i.coverage.lineage, "standalone lineage is covered");
+        // Standalone lineage is an explicit coverage gap.
+        assert!(i.lineage_root_task_id.is_none());
+        assert!(i.lineage_evidence.is_none());
+        assert!(
+            !i.coverage.lineage,
+            "standalone lineage must remain an explicit coverage gap"
+        );
         // Every other evidence field remains null — enrichment is a sibling's job.
         assert!(i.terminal_outcome.is_none());
         assert!(i.terminal_evidence.is_none());
@@ -1798,24 +1831,27 @@ mod tests {
         assert!(i.replan_count.is_none());
         assert!(i.incident_count.is_none());
         assert!(i.review_quality.is_none());
-        // Every coverage flag except lineage stays false.
+        // Every coverage flag stays false — nothing is covered on a standalone
+        // intent until sibling enrichment lands.
         for (name, covered) in i.coverage.iter_named() {
-            if name == "lineage" {
-                assert!(covered, "coverage.lineage must be true for standalone");
-            } else {
-                assert!(!covered, "coverage.{name} must default to false");
-            }
+            assert!(!covered, "coverage.{name} must default to false");
         }
-        // Coverage summary reflects that: lineage covered==1, everything else uncovered==1.
+        // Coverage summary reflects that: every field is uncovered==1.
         for (name, fc) in &r.coverage.fields {
-            if name == "lineage" {
-                assert_eq!(fc.covered, 1, "field {name} covered count");
-                assert_eq!(fc.uncovered, 0, "field {name} uncovered count");
-            } else {
-                assert_eq!(fc.covered, 0, "field {name} covered count");
-                assert_eq!(fc.uncovered, 1, "field {name} uncovered count");
-            }
+            assert_eq!(fc.covered, 0, "field {name} covered count");
+            assert_eq!(fc.uncovered, 1, "field {name} uncovered count");
         }
+        // Serialization proves null lineage is on the wire — enrichment
+        // consumers cannot mistake it for a measured value.
+        let wire = serde_json::to_value(i).unwrap();
+        assert_eq!(
+            wire.get("lineage_evidence").unwrap(),
+            &serde_json::Value::Null
+        );
+        assert_eq!(
+            wire.get("lineage_root_task_id").unwrap(),
+            &serde_json::Value::Null
+        );
     }
 
     #[test]
@@ -2093,14 +2129,25 @@ mod tests {
     //
     //   proof #5a — exact recovery adoption:
     //     original X (terminal, refs.$.recovery_delivery names source_task=X,
-    //     recovery_task=Y) + recovery Y (terminal). Y collapses into X's
-    //     intent — one top-level intent, X and Y both attributable.
+    //     recovery_task=Y, AND row carries the daemon-owned adoption stamp
+    //     status='done' + completion_provenance='merged') + recovery Y
+    //     (terminal). Y collapses into X's intent — one top-level intent,
+    //     X and Y both attributable. The daemon-owned column is what makes
+    //     the refs blob load-bearing; a self-consistent refs alone is not.
     //
     //   proof #5b — shared-PR / continuation without provenance:
     //     tasks A and B share a PR reference (refs.$.pr = 42) or a
     //     continuation link (refs.$.continue_pr = 42); NEITHER carries
-    //     refs.$.recovery_delivery. They stay as two independent intents.
+    //     refs.$.recovery_delivery. They stay as two independent intents
+    //     whose lineage evidence is JSON null (coverage.lineage=false).
     //     Title/labels/matching PR/continue_pr never trigger collapse.
+    //
+    //   proof #5c — forged refs without daemon adoption:
+    //     a self-consistent refs.$.recovery_delivery blob written on a row
+    //     whose completion_provenance is NULL (or 'manual') never triggers
+    //     collapse. Only the daemon's own finalization sets
+    //     completion_provenance='merged', so the gate distinguishes
+    //     daemon-attested lineage from agent-writable metadata.
 
     fn seed_decomposition(conn: &Connection, source_task_id: i64, plan_revision: i64) -> i64 {
         conn.execute(
@@ -2134,6 +2181,24 @@ mod tests {
             rusqlite::params![task_id, refs_json],
         )
         .unwrap();
+    }
+
+    /// Test-only helper: stamp the row with the exact daemon-owned adoption
+    /// signal (`completion_provenance = 'merged'`, `status = 'done'`) so
+    /// `$.recovery_delivery` reads pass the collapse gate. Sibling helper
+    /// `set_refs` seeds the refs blob; without this stamp collapse must not
+    /// happen — that is the negative path exercised by
+    /// `facts_recovery_delivery_without_daemon_provenance_does_not_collapse`.
+    fn stamp_daemon_recovery_adoption(conn: &Connection, task_id: i64) {
+        let changed = conn
+            .execute(
+                "UPDATE tasks \
+                 SET status = 'done', completion_provenance = 'merged' \
+                 WHERE id = ?1",
+                rusqlite::params![task_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "daemon adoption stamp must land on one row");
     }
 
     #[test]
@@ -2221,7 +2286,9 @@ mod tests {
         //       refs.$.recovery_delivery. They stay independent.
         let (_d, mut c) = open_tmp();
 
-        // Lineage A: exact recovery adoption.
+        // Lineage A: exact recovery adoption. Daemon has stamped the row
+        // `status='done'` with `completion_provenance='merged'` — that is the
+        // gate perf reads accept; agent-writable refs alone are never enough.
         let orig_x = seed_ordinary(&mut c, 1600);
         let recovery_y = seed_ordinary(&mut c, 1650);
         let x_refs = serde_json::json!({
@@ -2235,6 +2302,7 @@ mod tests {
         })
         .to_string();
         set_refs(&c, orig_x, &x_refs);
+        stamp_daemon_recovery_adoption(&c, orig_x);
 
         // Lineage B: shared PR / continue_pr but no recovery_delivery.
         let shared_a = seed_ordinary(&mut c, 1700);
@@ -2288,26 +2356,14 @@ mod tests {
         let shared_b_intent = by_id.get(format!("intent-{shared_b}").as_str()).unwrap();
         assert_eq!(shared_a_intent.contributing_task_ids, vec![shared_a]);
         assert_eq!(shared_b_intent.contributing_task_ids, vec![shared_b]);
-        // Their lineage_evidence.kind is "standalone" — never inferred from
-        // the shared PR or the continue_pr link.
-        assert_eq!(
-            shared_a_intent
-                .lineage_evidence
-                .as_ref()
-                .unwrap()
-                .get("kind")
-                .unwrap(),
-            &serde_json::json!("standalone")
-        );
-        assert_eq!(
-            shared_b_intent
-                .lineage_evidence
-                .as_ref()
-                .unwrap()
-                .get("kind")
-                .unwrap(),
-            &serde_json::json!("standalone")
-        );
+        // Their lineage is an explicit coverage gap — never inferred from a
+        // shared PR or a continue_pr link.
+        assert!(shared_a_intent.lineage_evidence.is_none());
+        assert!(shared_a_intent.lineage_root_task_id.is_none());
+        assert!(!shared_a_intent.coverage.lineage);
+        assert!(shared_b_intent.lineage_evidence.is_none());
+        assert!(shared_b_intent.lineage_root_task_id.is_none());
+        assert!(!shared_b_intent.coverage.lineage);
 
         // The recovery task Y never appears as its own top-level intent.
         assert!(
@@ -2320,7 +2376,9 @@ mod tests {
     fn facts_recovery_delivery_ignored_when_provenance_malformed() {
         // A refs.$.recovery_delivery whose source_task disagrees with the row
         // it lives on, or whose recovery_task is missing, must NOT be used
-        // to collapse anything — partial provenance is treated as unknown.
+        // to collapse anything — partial provenance is treated as unknown,
+        // never guessed. Even the daemon-owned adoption stamp cannot rescue
+        // a malformed blob: shape guards run first, so the row is discarded.
         let (_d, mut c) = open_tmp();
         let a = seed_ordinary(&mut c, 1600);
         let b = seed_ordinary(&mut c, 1650);
@@ -2333,9 +2391,13 @@ mod tests {
         })
         .to_string();
         set_refs(&c, a, &bogus);
+        // Even with the daemon adoption stamp present, the malformed blob is
+        // rejected by the shape guard — no collapse, no lineage evidence.
+        stamp_daemon_recovery_adoption(&c, a);
 
         let r = perf_facts(&c, false).unwrap();
-        // Neither task collapses — two independent top-level intents.
+        // Neither task collapses — two independent top-level intents, both
+        // with an explicit lineage coverage gap.
         assert_eq!(r.intents.len(), 2);
         let ids: Vec<i64> = r
             .intents
@@ -2343,6 +2405,99 @@ mod tests {
             .map(|i| i.contributing_task_ids[0])
             .collect();
         assert_eq!(ids, vec![a, b]);
+        for intent in &r.intents {
+            assert!(
+                intent.lineage_evidence.is_none(),
+                "malformed provenance must not surface as lineage"
+            );
+            assert!(intent.lineage_root_task_id.is_none());
+            assert!(!intent.coverage.lineage);
+        }
+    }
+
+    /// Negative-path proof for finding 1: an ordinary task that carries a
+    /// self-consistent `$.recovery_delivery` object but lacks the
+    /// daemon-owned adoption signal (`completion_provenance = 'merged'`) is
+    /// treated as unknown lineage, never as a collapse relation. Without the
+    /// gate a working-agent-writable refs blob could group any two
+    /// unrelated terminal tasks.
+    #[test]
+    fn facts_recovery_delivery_without_daemon_provenance_does_not_collapse() {
+        let (_d, mut c) = open_tmp();
+        let forger = seed_ordinary(&mut c, 1600);
+        let victim = seed_ordinary(&mut c, 1650);
+        // Self-consistent shape — but no daemon adoption stamp. The row
+        // stays at whatever the seed status is (`done`, but with
+        // `completion_provenance` NULL because the seed row never went
+        // through daemon finalization). An agent writing this refs blob
+        // must not induce a collapse.
+        let forged = serde_json::json!({
+            "recovery_delivery": {
+                "source_task": forger,
+                "recovery_task": victim,
+                "pr": 7,
+                "merged_head_sha": "deadbeef",
+            }
+        })
+        .to_string();
+        set_refs(&c, forger, &forged);
+        // Sanity check: the seed helper does not touch completion_provenance,
+        // so it is NULL — the row is not daemon-attested adoption.
+        let provenance: Option<String> = c
+            .query_row(
+                "SELECT completion_provenance FROM tasks WHERE id = ?1",
+                rusqlite::params![forger],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            provenance.is_none(),
+            "seed row must lack the daemon adoption stamp — the whole point of this test"
+        );
+
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            r.intents.len(),
+            2,
+            "agent-writable refs cannot forge collapse"
+        );
+        let ids: Vec<i64> = r
+            .intents
+            .iter()
+            .map(|i| i.contributing_task_ids[0])
+            .collect();
+        assert_eq!(ids, vec![forger, victim]);
+        for intent in &r.intents {
+            assert!(intent.lineage_evidence.is_none());
+            assert!(intent.lineage_root_task_id.is_none());
+            assert!(!intent.coverage.lineage);
+        }
+    }
+
+    /// The gate rejects `completion_provenance = 'manual'` — only the
+    /// daemon-owned merged-adoption path counts.
+    #[test]
+    fn facts_recovery_delivery_manual_provenance_does_not_collapse() {
+        let (_d, mut c) = open_tmp();
+        let a = seed_ordinary(&mut c, 1600);
+        let b = seed_ordinary(&mut c, 1650);
+        let refs_a = serde_json::json!({
+            "recovery_delivery": { "source_task": a, "recovery_task": b }
+        })
+        .to_string();
+        set_refs(&c, a, &refs_a);
+        c.execute(
+            "UPDATE tasks SET status='done', completion_provenance='manual' WHERE id=?1",
+            rusqlite::params![a],
+        )
+        .unwrap();
+
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.intents.len(), 2);
+        for intent in &r.intents {
+            assert!(intent.lineage_evidence.is_none());
+            assert!(!intent.coverage.lineage);
+        }
     }
 
     #[test]
@@ -2367,6 +2522,9 @@ mod tests {
         })
         .to_string();
         set_refs(&c, x, &x_refs);
+        // Daemon has adopted X's recovery Y — stamp the row so the gate
+        // treats the refs blob as durable evidence.
+        stamp_daemon_recovery_adoption(&c, x);
 
         let r = perf_facts(&c, false).unwrap();
         assert_eq!(r.intents.len(), 1);
@@ -2406,6 +2564,7 @@ mod tests {
         })
         .to_string();
         set_refs(&c, x, &x_refs);
+        stamp_daemon_recovery_adoption(&c, x);
 
         let before = snapshot_db_state(&c);
         let _ = perf_facts(&c, false).unwrap();
