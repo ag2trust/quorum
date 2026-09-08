@@ -571,7 +571,6 @@ struct FactsTaskRow {
     created_at: i64,
     updated_at: i64,
     rework_round: i64,
-    recovery_attempts: i64,
     completion_provenance: Option<String>,
     refs: Option<String>,
 }
@@ -586,7 +585,7 @@ fn load_facts_candidate_tasks(
 ) -> Result<Vec<FactsTaskRow>> {
     let since_val = since.unwrap_or(0);
     let mut stmt = conn.prepare(
-        "SELECT id,status,review_only,created_at,updated_at,rework_round,recovery_attempts,
+        "SELECT id,status,review_only,created_at,updated_at,rework_round,
                 completion_provenance,refs \
          FROM tasks \
          WHERE updated_at >= ?1 \
@@ -602,9 +601,8 @@ fn load_facts_candidate_tasks(
                 created_at: r.get(3)?,
                 updated_at: r.get(4)?,
                 rework_round: r.get(5)?,
-                recovery_attempts: r.get(6)?,
-                completion_provenance: r.get(7)?,
-                refs: r.get(8)?,
+                completion_provenance: r.get(6)?,
+                refs: r.get(7)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -623,7 +621,7 @@ fn load_facts_tasks_by_id(
     for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
         let placeholders = sql_placeholders(batch.len());
         let sql = format!(
-            "SELECT id,status,review_only,created_at,updated_at,rework_round,recovery_attempts,
+            "SELECT id,status,review_only,created_at,updated_at,rework_round,
                     completion_provenance,refs
              FROM tasks WHERE id IN ({placeholders})"
         );
@@ -637,9 +635,8 @@ fn load_facts_tasks_by_id(
                     created_at: row.get(3)?,
                     updated_at: row.get(4)?,
                     rework_round: row.get(5)?,
-                    recovery_attempts: row.get(6)?,
-                    completion_provenance: row.get(7)?,
-                    refs: row.get(8)?,
+                    completion_provenance: row.get(6)?,
+                    refs: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2247,14 +2244,21 @@ fn load_planning_incident_facts(
     task_ids: &[i64],
     snapshot: &mut AttributionSnapshot,
 ) -> Result<()> {
+    // The task_decompositions counters are current retry budgets. They reset
+    // when planning is retried, whereas decomposition_attempts retains every
+    // proposal/provider event across those generations.
     for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
         let placeholders = sql_placeholders(batch.len());
         let sql = format!(
-            "SELECT source_task_id,proposal_attempts,provider_failures,row_num FROM (
-                 SELECT source_task_id,proposal_attempts,provider_failures,
-                        ROW_NUMBER() OVER (PARTITION BY source_task_id ORDER BY id) AS row_num
-                 FROM task_decompositions
-                 WHERE source_task_id IN ({placeholders})
+            "SELECT source_task_id,kind,row_num FROM (
+                 SELECT graph.source_task_id,attempt.kind,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY graph.source_task_id ORDER BY attempt.id
+                        ) AS row_num
+                 FROM task_decompositions AS graph
+                 JOIN decomposition_attempts AS attempt ON attempt.graph_id=graph.id
+                 WHERE graph.source_task_id IN ({placeholders})
+                   AND attempt.kind IN ('proposal','provider')
              ) WHERE row_num <= ?
              ORDER BY source_task_id,row_num"
         );
@@ -2265,13 +2269,12 @@ fn load_planning_incident_facts(
             .query_map(params_from_iter(values), |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (task_id, replan_count, provider_failure_count, row_num) in rows {
+        for (task_id, kind, row_num) in rows {
             if row_num > MAX_PLANNING_INCIDENT_ROWS_PER_TASK as i64 {
                 snapshot.capped_planning_incident_task_ids.insert(task_id);
                 continue;
@@ -2280,23 +2283,20 @@ fn load_planning_incident_facts(
                 .planning_incidents_by_task
                 .entry(task_id)
                 .or_default();
-            match (
-                replan_count >= 0,
-                provider_failure_count >= 0,
-                current.replan_count.checked_add(replan_count),
-                current
-                    .provider_failure_count
-                    .checked_add(provider_failure_count),
-            ) {
-                (true, true, Some(replans), Some(provider_failures)) => {
-                    current.replan_count = replans;
-                    current.provider_failure_count = provider_failures;
-                }
+            let counter = match kind.as_str() {
+                "proposal" => &mut current.replan_count,
+                "provider" => &mut current.provider_failure_count,
                 _ => {
                     snapshot
                         .incomplete_planning_incident_task_ids
                         .insert(task_id);
+                    continue;
                 }
+            };
+            if !add_metric(counter, 1) {
+                snapshot
+                    .incomplete_planning_incident_task_ids
+                    .insert(task_id);
             }
         }
     }
@@ -2919,26 +2919,21 @@ fn populate_incident_facts(
     attribution: &AttributionSnapshot,
 ) {
     let mut rework_count = 0;
-    let mut recovery_count = 0;
     let mut replan_count = 0;
     let mut provider_failure_count = 0;
     let mut abnormal_runner_ending_count = 0;
-    let mut collector_failure_count = 0;
-    let mut task_counts_complete = true;
+    let mut rework_counts_complete = true;
     let mut planning_counts_complete = true;
     let mut abnormal_counts_complete = true;
-    let mut collector_counts_complete = true;
 
     for &task_id in members {
         let Some(task) = task_evidence_by_id.get(&task_id) else {
-            task_counts_complete = false;
+            rework_counts_complete = false;
             planning_counts_complete = false;
             abnormal_counts_complete = false;
-            collector_counts_complete = false;
             continue;
         };
-        task_counts_complete &= add_metric(&mut rework_count, task.rework_round);
-        task_counts_complete &= add_metric(&mut recovery_count, task.recovery_attempts);
+        rework_counts_complete &= add_metric(&mut rework_count, task.rework_round);
 
         if attribution
             .incomplete_planning_incident_task_ids
@@ -2979,34 +2974,11 @@ fn populate_incident_facts(
                 RunnerEnding::Unknown => abnormal_counts_complete = false,
             }
         }
-
-        if attribution
-            .capped_review_collection_task_ids
-            .contains(&task_id)
-        {
-            collector_counts_complete = false;
-        }
-        for collection in attribution
-            .review_collections_by_task
-            .get(&task_id)
-            .into_iter()
-            .flatten()
-        {
-            match collection.status.as_str() {
-                "success" => {}
-                "failed" => {
-                    collector_counts_complete &= add_metric(&mut collector_failure_count, 1);
-                }
-                _ => collector_counts_complete = false,
-            }
-        }
     }
 
-    if task_counts_complete {
+    if rework_counts_complete {
         intent.rework_count = Some(rework_count);
-        intent.recovery_count = Some(recovery_count);
         intent.coverage.rework = true;
-        intent.coverage.recovery = true;
     }
     if planning_counts_complete {
         intent.replan_count = Some(replan_count);
@@ -3018,10 +2990,14 @@ fn populate_incident_facts(
         intent.abnormal_runner_ending_count = Some(abnormal_runner_ending_count);
         intent.coverage.abnormal_runner_ending = true;
     }
-    if collector_counts_complete {
-        intent.collector_failure_count = Some(collector_failure_count);
-        intent.coverage.collector_failure = true;
-    }
+
+    // `tasks.recovery_attempts` is a resettable budget, not append-only
+    // recovery history. The recovery entries in decomposition_attempts cover
+    // only explicit delivery adoption and cannot establish all automatic
+    // crash/lease recoveries, so this aggregate deliberately remains a gap.
+    // Likewise review_collection_runs retains one overwriteable canonical PR
+    // result, not collector-attempt history. Neither may become a covered zero
+    // merely because a later success replaced a prior failure.
     if let (
         Some(rework),
         Some(recovery),
@@ -4906,8 +4882,9 @@ mod tests {
             "standalone lineage must remain an explicit coverage gap"
         );
         // Terminal evidence comes from the durable merged completion. The
-        // Token and active-model evidence is absent/incomplete, while task
-        // timestamps and durable zero-valued incident counters are measured.
+        // Token and active-model evidence is absent/incomplete. Task timestamps,
+        // rework, and the retained planning-attempt ledger can still measure
+        // zero; resettable recovery and collector histories cannot.
         assert_eq!(i.terminal_outcome.as_deref(), Some("done"));
         assert!(i.terminal_evidence.is_some());
         assert_eq!(i.merge_provenance.as_deref(), Some("merged"));
@@ -4920,11 +4897,11 @@ mod tests {
         assert!(i.active_model_secs.is_none());
         assert_eq!(i.wall_secs, Some(600));
         assert_eq!(i.rework_count, Some(0));
-        assert_eq!(i.recovery_count, Some(0));
+        assert!(i.recovery_count.is_none());
         assert_eq!(i.replan_count, Some(0));
         assert_eq!(i.provider_failure_count, Some(0));
         assert!(i.abnormal_runner_ending_count.is_none());
-        assert_eq!(i.collector_failure_count, Some(0));
+        assert!(i.collector_failure_count.is_none());
         assert!(i.incident_count.is_none());
         assert!(i.review_quality.is_none());
         // The unmanaged open run means an abnormal-ending count and total
@@ -4938,10 +4915,8 @@ mod tests {
                         | "merge_provenance"
                         | "wall_secs"
                         | "rework"
-                        | "recovery"
                         | "replan"
                         | "provider_failure"
-                        | "collector_failure"
                 ),
                 "coverage.{name}"
             );
@@ -4954,10 +4929,8 @@ mod tests {
                     | "merge_provenance"
                     | "wall_secs"
                     | "rework"
-                    | "recovery"
                     | "replan"
                     | "provider_failure"
-                    | "collector_failure"
             ));
             assert_eq!(fc.covered, expected_covered, "field {name} covered count");
             assert_eq!(
@@ -5000,17 +4973,14 @@ mod tests {
     }
 
     #[test]
-    fn facts_aggregate_rework_fallback_tokens_time_and_incidents() {
+    fn facts_aggregate_rework_fallback_tokens_time_and_retained_incidents() {
         // One task can retry in-place. Its first failed route and its fallback
         // route are both part of the same intent; neither queue time nor the
         // gap between routes is relabelled as model time.
         let (_d, mut c) = open_tmp();
         let task_id = seed_ordinary(&mut c, 1_600);
-        c.execute(
-            "UPDATE tasks SET rework_round=1,recovery_attempts=2 WHERE id=?1",
-            [task_id],
-        )
-        .unwrap();
+        c.execute("UPDATE tasks SET rework_round=1 WHERE id=?1", [task_id])
+            .unwrap();
         let assignment = seed_assignment(&c, task_id, "worker", None, None, "primary");
         let first_run = seed_attributed_run(
             &c,
@@ -5090,18 +5060,24 @@ mod tests {
             "INSERT INTO task_decompositions(
                  source_task_id,state,planned_source_revision,proposal_attempts,
                  provider_failures,created_at,updated_at)
-             VALUES (?1,'completed',1,3,4,1,2)",
+             VALUES (?1,'completed',1,0,0,1,2)",
             [task_id],
         )
         .unwrap();
-        c.execute(
-            "INSERT INTO review_collection_runs(
-                 pr_number,task_id,status,error,collector_model,collector_version,
-                 findings_count,attempted_at,completed_at)
-             VALUES (99,?1,'failed','collector unavailable','test','v1',0,300,301)",
-            [task_id],
-        )
-        .unwrap();
+        let graph_id = c.last_insert_rowid();
+        for (kind, count) in [("proposal", 3_i64), ("provider", 4_i64)] {
+            for ordinal in 1..=count {
+                let retry_generation = (ordinal - 1) / 2;
+                c.execute(
+                    "INSERT INTO decomposition_attempts(
+                         graph_id,source_revision,kind,ordinal,retry_generation,
+                         reason_code,summary,created_at)
+                     VALUES (?1,1,?2,?3,?4,'retained-attempt','test fixture',?3)",
+                    rusqlite::params![graph_id, kind, ordinal, retry_generation],
+                )
+                .unwrap();
+            }
+        }
 
         let before = snapshot_db_state(&c);
         let report = perf_facts(&c, false).unwrap();
@@ -5132,19 +5108,80 @@ mod tests {
         assert!(intent.coverage.wall_secs);
         assert_ne!(intent.active_model_secs, intent.wall_secs);
         assert_eq!(intent.rework_count, Some(1));
-        assert_eq!(intent.recovery_count, Some(2));
+        assert!(intent.recovery_count.is_none());
         assert_eq!(intent.replan_count, Some(3));
         assert_eq!(intent.provider_failure_count, Some(4));
         assert_eq!(intent.abnormal_runner_ending_count, Some(1));
-        assert_eq!(intent.collector_failure_count, Some(1));
-        assert_eq!(intent.incident_count, Some(12));
+        assert!(intent.collector_failure_count.is_none());
+        assert!(intent.incident_count.is_none());
         assert!(intent.coverage.rework);
-        assert!(intent.coverage.recovery);
+        assert!(!intent.coverage.recovery);
         assert!(intent.coverage.replan);
         assert!(intent.coverage.provider_failure);
         assert!(intent.coverage.abnormal_runner_ending);
-        assert!(intent.coverage.collector_failure);
-        assert!(intent.coverage.incident);
+        assert!(!intent.coverage.collector_failure);
+        assert!(!intent.coverage.incident);
+    }
+
+    #[test]
+    fn facts_retained_planning_attempts_survive_budget_reset() {
+        // retry_exhausted_planning resets the live budget but retains every
+        // attempt row. Exercise that real SQLite path, then make the source
+        // terminal so facts must credit the retained provider failures.
+        let (_d, mut c) = open_tmp();
+        let task_id = seed_task(&mut c, "failed", None, 0, None, 1_000, 1_600);
+        c.execute(
+            "INSERT INTO task_decompositions(
+             source_task_id,state,active,freeze_active,planned_source_revision,
+                 proposal_attempts,provider_failures,operator_retry_count,hold_code,
+                 created_at,updated_at)
+             VALUES (?1,'held',0,0,1,0,2,0,'provider-attempts-exhausted',1100,1200)",
+            [task_id],
+        )
+        .unwrap();
+        let graph_id = c.last_insert_rowid();
+        for ordinal in 1..=2_i64 {
+            c.execute(
+                "INSERT INTO decomposition_attempts(
+                     graph_id,source_revision,kind,ordinal,retry_generation,
+                     reason_code,summary,created_at)
+                 VALUES (?1,1,'provider',?2,0,'provider-failure','fixture',?2)",
+                rusqlite::params![graph_id, ordinal],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            crate::decomposition::retry_exhausted_planning(&mut c, task_id, "operator", 1_700)
+                .unwrap(),
+            crate::decomposition::PlanningRetryOutcome::Retried { .. }
+        ));
+        assert_eq!(
+            c.query_row(
+                "SELECT provider_failures FROM task_decompositions WHERE id=?1",
+                [graph_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "planning retry resets the current provider budget"
+        );
+        crate::tasks::close_after_merge_with_merge_commit_sha(
+            &mut c,
+            task_id,
+            "merged fixture",
+            &format!("{task_id:040x}"),
+            1_800,
+        )
+        .unwrap();
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent = &report.intents[0];
+        assert_eq!(intent.replan_count, Some(0));
+        assert!(intent.coverage.replan);
+        assert_eq!(intent.provider_failure_count, Some(2));
+        assert!(intent.coverage.provider_failure);
     }
 
     #[test]
@@ -5174,11 +5211,6 @@ mod tests {
         record_explicit_recovery_adoption(&c, graph_id, original, recovery);
         c.execute("UPDATE tasks SET rework_round=1 WHERE id=?1", [original])
             .unwrap();
-        c.execute(
-            "UPDATE tasks SET recovery_attempts=1 WHERE id=?1",
-            [recovery],
-        )
-        .unwrap();
         let original_assignment = seed_assignment(&c, original, "worker", None, None, "original");
         let original_run = seed_attributed_run(
             &c,
@@ -5246,9 +5278,129 @@ mod tests {
             33
         );
         assert_eq!(intent.rework_count, Some(1));
-        assert_eq!(intent.recovery_count, Some(1));
+        assert!(intent.recovery_count.is_none());
+        assert!(!intent.coverage.recovery);
         assert_eq!(intent.abnormal_runner_ending_count, Some(1));
-        assert_eq!(intent.incident_count, Some(3));
+        assert!(intent.incident_count.is_none());
+        assert!(!intent.coverage.incident);
+    }
+
+    #[test]
+    fn facts_resettable_recovery_and_collector_history_stay_uncovered() {
+        // Use the actual lifecycle reset and collector UPSERT paths on a real
+        // temporary SQLite database. A later clean handoff/collection must
+        // not turn overwritten prior incidents into measured zeroes.
+        let (_d, mut c) = open_tmp();
+        let refs = serde_json::json!({
+            "cx_est": 3,
+            "cx_size": "M",
+            "cx_size_reason": "facts fixture",
+            "cx_ready": true,
+            "cx_not_ready_reason": null,
+            "cx_by": "test:v2",
+        })
+        .to_string();
+        let task_id = crate::tasks::create(
+            &mut c,
+            "owner",
+            "resettable incident fixture",
+            None,
+            0,
+            None,
+            Some(&refs),
+            None,
+            None,
+            1_000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET recovery_attempts=2 WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        crate::tasks::claim(&mut c, "worker", Some(task_id), &[], 3_600, 1_001).unwrap();
+        crate::tasks::apply_event(
+            &mut c,
+            "worker",
+            task_id,
+            &crate::lifecycle::Event::SignaledDone { pr: "99".into() },
+            1_002,
+        )
+        .unwrap();
+        crate::tasks::close_after_merge_with_merge_commit_sha(
+            &mut c,
+            task_id,
+            "merged fixture",
+            &format!("{task_id:040x}"),
+            1_600,
+        )
+        .unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT recovery_attempts FROM tasks WHERE id=?1",
+                [task_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "normal handoff resets the current recovery budget"
+        );
+
+        let failed_collection = crate::review_findings::CollectionRun {
+            pr_number: 99,
+            task_id: Some(task_id),
+            status: crate::review_findings::RunStatus::Failed,
+            error: Some("collector unavailable".into()),
+            collector_model: "test".into(),
+            collector_provider: None,
+            collector_runner: None,
+            collector_effort: None,
+            collector_version: "v1".into(),
+            findings_count: 0,
+            attempted_at: 1_700,
+            completed_at: None,
+            role_assignment_id: None,
+        };
+        crate::review_findings::record_run(&c, &failed_collection).unwrap();
+        let successful_collection = crate::review_findings::CollectionRun {
+            status: crate::review_findings::RunStatus::Success,
+            error: None,
+            findings_count: 0,
+            attempted_at: 1_701,
+            completed_at: Some(1_702),
+            ..failed_collection
+        };
+        crate::review_findings::record_run(&c, &successful_collection).unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT COUNT(*) FROM review_collection_runs WHERE pr_number=99",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "collector retry overwrites its canonical PR row"
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT status FROM review_collection_runs WHERE pr_number=99",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "success"
+        );
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent = &report.intents[0];
+        assert!(intent.recovery_count.is_none());
+        assert!(!intent.coverage.recovery);
+        assert!(intent.collector_failure_count.is_none());
+        assert!(!intent.coverage.collector_failure);
+        assert!(intent.incident_count.is_none());
+        assert!(!intent.coverage.incident);
     }
 
     #[test]
