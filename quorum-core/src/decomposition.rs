@@ -285,8 +285,10 @@ struct RecoveryDelivery {
     source_revision: i64,
     pr_number: i64,
     merged_head_sha: String,
+    merge_commit_sha: String,
     legacy_prepublication: bool,
     modern_generated_child_failure: bool,
+    repair_only: bool,
     original_publication_branch: Option<String>,
     original_publication_sha: Option<String>,
 }
@@ -2206,7 +2208,8 @@ pub fn adopt_recovery_delivery(
         .query_row(
             &format!(
                 "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
-                    recovery_target.pr_number,recovery_target.head_sha
+                    recovery_target.pr_number,recovery_target.head_sha,
+                    json_extract(recovery.refs,'$.merge_commit_sha')
              FROM task_graph_members member
              JOIN task_decompositions graph ON graph.id=member.graph_id
              JOIN tasks source ON source.id=graph.source_task_id
@@ -2233,6 +2236,18 @@ pub fn adopt_recovery_delivery(
                AND json_valid(original.refs)
                AND json_type(original.refs,'$.pr')='integer'
                AND json_extract(original.refs,'$.pr')=original_target.pr_number
+               AND (
+                    json_type(original.refs,'$.merge_commit_sha') IS NULL
+                    OR (
+                        json_type(original.refs,'$.merge_commit_sha')='text'
+                        AND instr(json_extract(original.refs,'$.merge_commit_sha'),char(0))=0
+                        AND length(json_extract(original.refs,'$.merge_commit_sha')) IN (40,64)
+                        AND json_extract(original.refs,'$.merge_commit_sha')
+                            NOT GLOB '*[^0-9A-Fa-f]*'
+                        AND json_extract(original.refs,'$.merge_commit_sha')=
+                            json_extract(recovery.refs,'$.merge_commit_sha')
+                    )
+               )
                AND original_target.pr_number=recovery_target.pr_number
                AND original_target.head_ref!=''
                AND length(original_target.head_sha) IN (40,64)
@@ -2245,6 +2260,11 @@ pub fn adopt_recovery_delivery(
                AND json_type(recovery.refs,'$.source_task')='integer'
                AND json_extract(recovery.refs,'$.source_task')=original.id
                AND json_type(recovery.refs,'$.daemon_publication') IS NULL
+               AND json_type(recovery.refs,'$.merge_commit_sha')='text'
+               AND instr(json_extract(recovery.refs,'$.merge_commit_sha'),char(0))=0
+               AND length(json_extract(recovery.refs,'$.merge_commit_sha')) IN (40,64)
+               AND json_extract(recovery.refs,'$.merge_commit_sha')
+                   NOT GLOB '*[^0-9A-Fa-f]*'
                AND (
                     (json_type(original.refs,'$.repo') IS NULL
                      AND json_type(recovery.refs,'$.repo') IS NULL)
@@ -2310,8 +2330,10 @@ pub fn adopt_recovery_delivery(
                     source_revision: row.get(2)?,
                     pr_number: row.get(3)?,
                     merged_head_sha: row.get(4)?,
+                    merge_commit_sha: row.get(5)?,
                     legacy_prepublication: false,
                     modern_generated_child_failure: false,
+                    repair_only: false,
                     original_publication_branch: None,
                     original_publication_sha: None,
                 })
@@ -2379,6 +2401,7 @@ pub fn adopt_explicit_recovery_delivery(
             &format!(
                 "SELECT graph.id,graph.source_task_id,graph.planned_source_revision,
                     recovery_target.pr_number,recovery_target.head_sha,
+                    json_extract(recovery.refs,'$.merge_commit_sha'),
                     original.status='open',
                     json_extract(original.refs,'$.daemon_publication.branch'),
                     json_extract(original.refs,'$.daemon_publication.local_sha'),
@@ -2387,7 +2410,8 @@ pub fn adopt_explicit_recovery_delivery(
                               AND json_valid(graph.hold_summary)
                          THEN json_type(graph.hold_summary,'$.affected_task')='integer'
                               AND json_extract(graph.hold_summary,'$.affected_task')=original.id
-                         ELSE 0 END
+                         ELSE 0 END,
+                    original.status='done'
              FROM task_graph_members member
              JOIN task_decompositions graph ON graph.id=member.graph_id
              JOIN tasks source ON source.id=graph.source_task_id
@@ -2426,6 +2450,21 @@ pub fn adopt_explicit_recovery_delivery(
                         AND json_valid(original.refs)
                         AND json_type(original.refs,'$.pr')='integer'
                         AND json_extract(original.refs,'$.pr')=original_target.pr_number
+                        AND (
+                            json_type(original.refs,'$.merge_commit_sha') IS NULL
+                            OR (
+                                json_type(original.refs,'$.merge_commit_sha')='text'
+                                AND instr(
+                                    json_extract(original.refs,'$.merge_commit_sha'),char(0)
+                                )=0
+                                AND length(json_extract(original.refs,'$.merge_commit_sha'))
+                                    IN (40,64)
+                                AND json_extract(original.refs,'$.merge_commit_sha')
+                                    NOT GLOB '*[^0-9A-Fa-f]*'
+                                AND json_extract(original.refs,'$.merge_commit_sha')=
+                                    json_extract(recovery.refs,'$.merge_commit_sha')
+                            )
+                        )
                         AND original_target.pr_number=recovery_target.pr_number
                         AND original_target.head_ref!=''
                         AND original_target.head_ref=recovery_target.head_ref
@@ -2498,23 +2537,76 @@ pub fn adopt_explicit_recovery_delivery(
                         AND recovery.target_branch=source.target_branch
                         AND recovery.created_at>original.updated_at
                     )
+                    OR (
+                        original.status='done'
+                        AND original.assignee IS NULL AND original.reviewer IS NULL
+                        AND original.completion_provenance=?3
+                        AND json_valid(original.refs)
+                        AND json_type(original.refs,'$.merge_commit_sha') IS NULL
+                        AND json_type(original.refs,'$.recovery_delivery')='object'
+                        AND json_type(original.refs,'$.recovery_delivery.source_task')='integer'
+                        AND json_extract(original.refs,'$.recovery_delivery.source_task')=original.id
+                        AND json_type(original.refs,'$.recovery_delivery.recovery_task')='integer'
+                        AND json_extract(original.refs,'$.recovery_delivery.recovery_task')=recovery.id
+                        AND json_type(original.refs,'$.recovery_delivery.pr')='integer'
+                        AND json_extract(original.refs,'$.recovery_delivery.pr')=
+                            recovery_target.pr_number
+                        AND json_type(
+                            original.refs,'$.recovery_delivery.merged_head_sha'
+                        )='text'
+                        AND instr(json_extract(
+                            original.refs,'$.recovery_delivery.merged_head_sha'
+                        ),char(0))=0
+                        AND length(json_extract(
+                            original.refs,'$.recovery_delivery.merged_head_sha'
+                        )) IN (40,64)
+                        AND json_extract(original.refs,'$.recovery_delivery.merged_head_sha')
+                            NOT GLOB '*[^0-9A-Fa-f]*'
+                        AND json_extract(original.refs,'$.recovery_delivery.merged_head_sha')=
+                            recovery_target.head_sha
+                        AND (
+                            json_type(
+                                original.refs,'$.recovery_delivery.merge_commit_sha'
+                            ) IS NULL
+                            OR (
+                                json_type(
+                                    original.refs,'$.recovery_delivery.merge_commit_sha'
+                                )='text'
+                                AND instr(json_extract(
+                                    original.refs,'$.recovery_delivery.merge_commit_sha'
+                                ),char(0))=0
+                                AND length(json_extract(
+                                    original.refs,'$.recovery_delivery.merge_commit_sha'
+                                )) IN (40,64)
+                                AND json_extract(
+                                    original.refs,'$.recovery_delivery.merge_commit_sha'
+                                ) NOT GLOB '*[^0-9A-Fa-f]*'
+                                AND json_extract(
+                                    original.refs,'$.recovery_delivery.merge_commit_sha'
+                                )=json_extract(recovery.refs,'$.merge_commit_sha')
+                            )
+                        )
+                    )
                )
                AND source.status='decomposed'
                AND (
-                    NOT EXISTS (
-                        SELECT 1 FROM task_graph_members sibling
-                        JOIN tasks sibling_task ON sibling_task.id=sibling.task_id
-                        WHERE sibling.graph_id=graph.id AND sibling.active=1
-                          AND sibling.task_id!=original.id
-                          AND sibling_task.status!='done'
-                    )
+                    original.status='done'
                     OR (
-                        CASE WHEN graph.state='blocked'
-                                  AND graph.hold_code='generated-child-failed'
-                                  AND json_valid(graph.hold_summary)
-                             THEN json_type(graph.hold_summary,'$.affected_task')='integer'
-                                  AND json_extract(graph.hold_summary,'$.affected_task')=original.id
-                             ELSE 0 END
+                        NOT EXISTS (
+                            SELECT 1 FROM task_graph_members sibling
+                            JOIN tasks sibling_task ON sibling_task.id=sibling.task_id
+                            WHERE sibling.graph_id=graph.id AND sibling.active=1
+                              AND sibling.task_id!=original.id
+                              AND sibling_task.status!='done'
+                        )
+                        OR (
+                            CASE WHEN graph.state='blocked'
+                                      AND graph.hold_code='generated-child-failed'
+                                      AND json_valid(graph.hold_summary)
+                                 THEN json_type(graph.hold_summary,'$.affected_task')='integer'
+                                      AND json_extract(graph.hold_summary,'$.affected_task')=original.id
+                                 ELSE 0 END
+                        )
                     )
                )
                AND recovery.status='done' AND recovery.review_only=0
@@ -2531,6 +2623,11 @@ pub fn adopt_explicit_recovery_delivery(
                     )
                )
                AND json_type(recovery.refs,'$.daemon_publication') IS NULL
+               AND json_type(recovery.refs,'$.merge_commit_sha')='text'
+               AND instr(json_extract(recovery.refs,'$.merge_commit_sha'),char(0))=0
+               AND length(json_extract(recovery.refs,'$.merge_commit_sha')) IN (40,64)
+               AND json_extract(recovery.refs,'$.merge_commit_sha')
+                   NOT GLOB '*[^0-9A-Fa-f]*'
                AND (
                     (json_type(original.refs,'$.repo') IS NULL
                      AND json_type(recovery.refs,'$.repo') IS NULL)
@@ -2598,10 +2695,12 @@ pub fn adopt_explicit_recovery_delivery(
                     source_revision: row.get(2)?,
                     pr_number: row.get(3)?,
                     merged_head_sha: row.get(4)?,
-                    legacy_prepublication: row.get(5)?,
-                    original_publication_branch: row.get(6)?,
-                    original_publication_sha: row.get(7)?,
-                    modern_generated_child_failure: row.get(8)?,
+                    merge_commit_sha: row.get(5)?,
+                    legacy_prepublication: row.get(6)?,
+                    original_publication_branch: row.get(7)?,
+                    original_publication_sha: row.get(8)?,
+                    modern_generated_child_failure: row.get(9)?,
+                    repair_only: row.get(10)?,
                 })
             },
         )
@@ -2610,6 +2709,17 @@ pub fn adopt_explicit_recovery_delivery(
         tx.commit().map_err(map_sql_err)?;
         return Ok(false);
     };
+
+    if delivery.repair_only {
+        repair_recovery_merge_provenance(
+            &tx,
+            input.original_child_id,
+            input.recovery_task_id,
+            &delivery,
+        )?;
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(true);
+    }
 
     let ordinal: i64 = tx.query_row(
         "SELECT COALESCE(MAX(ordinal),0)+1 FROM decomposition_attempts
@@ -2625,6 +2735,7 @@ pub fn adopt_explicit_recovery_delivery(
         "recovery_task": input.recovery_task_id,
         "pr": delivery.pr_number,
         "merged_head_sha": delivery.merged_head_sha,
+        "merge_commit_sha": delivery.merge_commit_sha,
         "legacy_prepublication": delivery.legacy_prepublication,
         "modern_generated_child_failure": delivery.modern_generated_child_failure,
         "original_publication_branch": delivery.original_publication_branch,
@@ -2671,6 +2782,7 @@ fn finalize_recovery_delivery(
         "recovery_task": recovery_task_id,
         "pr": delivery.pr_number,
         "merged_head_sha": delivery.merged_head_sha,
+        "merge_commit_sha": delivery.merge_commit_sha,
         "adopted_at": now,
     });
     if let Some(authorized_by) = explicit_authority {
@@ -2701,15 +2813,18 @@ fn finalize_recovery_delivery(
                      '$.daemon_parked_reason',
                      '$.daemon_resume_status',
                      '$.daemon_publication'),
+                 '$.merge_commit_sha',
+                 ?5,
                  '$.recovery_delivery',
                  json(?4))
          WHERE id=?1
-           AND ((?5=0 AND status='failed') OR (?5=1 AND status='open'))",
+           AND ((?6=0 AND status='failed') OR (?6=1 AND status='open'))",
         params![
             original_child_id,
             now,
             crate::tasks::COMPLETION_PROVENANCE_MERGED,
             recovery_provenance,
+            delivery.merge_commit_sha,
             delivery.legacy_prepublication
         ],
     )?;
@@ -2738,6 +2853,53 @@ fn finalize_recovery_delivery(
         )?;
     } else {
         complete_graph_if_final_child(tx, original_child_id, now)?;
+    }
+    Ok(())
+}
+
+/// Repair the one omitted top-level merge SHA left by a pre-provenance
+/// recovery adoption. The query that selected this candidate holds the write
+/// transaction and has already revalidated the exact recovery-delivery pair;
+/// this guarded update intentionally avoids lifecycle, graph, and audit rows.
+fn repair_recovery_merge_provenance(
+    tx: &Transaction<'_>,
+    original_child_id: i64,
+    recovery_task_id: i64,
+    delivery: &RecoveryDelivery,
+) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(refs,'$.merge_commit_sha',?5)
+         WHERE id=?1
+           AND status='done' AND assignee IS NULL AND reviewer IS NULL
+           AND completion_provenance=?2
+           AND json_valid(refs)
+           AND json_type(refs,'$.merge_commit_sha') IS NULL
+           AND json_type(refs,'$.recovery_delivery.source_task')='integer'
+           AND json_extract(refs,'$.recovery_delivery.source_task')=?1
+           AND json_type(refs,'$.recovery_delivery.recovery_task')='integer'
+           AND json_extract(refs,'$.recovery_delivery.recovery_task')=?3
+           AND json_type(refs,'$.recovery_delivery.pr')='integer'
+           AND json_extract(refs,'$.recovery_delivery.pr')=?4
+           AND json_type(refs,'$.recovery_delivery.merged_head_sha')='text'
+           AND json_extract(refs,'$.recovery_delivery.merged_head_sha')=?6
+           AND (
+                json_type(refs,'$.recovery_delivery.merge_commit_sha') IS NULL
+                OR json_extract(refs,'$.recovery_delivery.merge_commit_sha')=?5
+           )",
+        params![
+            original_child_id,
+            crate::tasks::COMPLETION_PROVENANCE_MERGED,
+            recovery_task_id,
+            delivery.pr_number,
+            delivery.merge_commit_sha,
+            delivery.merged_head_sha,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(QuorumError::Io(
+            "recovery child changed during provenance repair transaction".into(),
+        ));
     }
     Ok(())
 }
@@ -3797,6 +3959,7 @@ mod tests {
     const RECOVERY_PR: i64 = 526;
     const ORIGINAL_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const RECOVERY_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const RECOVERY_MERGE: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
     struct RecoveryFixture {
         _dir: tempfile::TempDir,
@@ -3810,6 +3973,18 @@ mod tests {
     }
 
     type RecoveryEvidenceMutation = Box<dyn FnOnce(&mut RecoveryFixture)>;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DoneRepairState {
+        updated_at: i64,
+        graph_state: String,
+        graph_active: i64,
+        source_status: String,
+        done_events: i64,
+        graph_events: i64,
+        attempts: i64,
+        refs: String,
+    }
 
     impl RecoveryFixture {
         fn new() -> Self {
@@ -3875,7 +4050,8 @@ mod tests {
                 params![
                     serde_json::json!({
                         "pr": RECOVERY_PR,
-                        "source_task": original
+                        "source_task": original,
+                        "merge_commit_sha": RECOVERY_MERGE
                     })
                     .to_string(),
                     RECOVERY_PR
@@ -3986,6 +4162,27 @@ mod tests {
             adopt_recovery_delivery(&mut self.conn, self.original, self.recovery, 50).unwrap()
         }
 
+        fn set_recovery_merge_commit_sha(&mut self, merge_commit_sha: Option<&str>) {
+            match merge_commit_sha {
+                Some(merge_commit_sha) => self
+                    .conn
+                    .execute(
+                        "UPDATE tasks SET refs=json_set(refs,'$.merge_commit_sha',?2)
+                         WHERE id=?1",
+                        params![self.recovery, merge_commit_sha],
+                    )
+                    .unwrap(),
+                None => self
+                    .conn
+                    .execute(
+                        "UPDATE tasks SET refs=json_remove(refs,'$.merge_commit_sha')
+                         WHERE id=?1",
+                        [self.recovery],
+                    )
+                    .unwrap(),
+            };
+        }
+
         fn make_explicit_eligible(&mut self) {
             self.conn
                 .execute(
@@ -4002,6 +4199,104 @@ mod tests {
                     [self.recovery],
                 )
                 .unwrap();
+        }
+
+        fn make_explicit_repair_candidate(&mut self) {
+            self.make_explicit_eligible();
+            let blocked_sibling = self.siblings[0];
+            self.conn
+                .execute(
+                    "UPDATE tasks SET status='failed' WHERE id=?1",
+                    [blocked_sibling],
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "UPDATE task_decompositions
+                     SET state='blocked',active=1,hold_code='generated-child-failed',
+                         hold_summary=?2
+                     WHERE id=?1",
+                    params![
+                        self.graph,
+                        serde_json::json!({"affected_task": blocked_sibling}).to_string()
+                    ],
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET status='done',assignee=NULL,reviewer=NULL,
+                         completion_provenance=?2,refs=?3
+                     WHERE id=?1",
+                    params![
+                        self.original,
+                        crate::tasks::COMPLETION_PROVENANCE_MERGED,
+                        serde_json::json!({
+                            "pr": RECOVERY_PR,
+                            "recovery_delivery": {
+                                "source_task": self.original,
+                                "recovery_task": self.recovery,
+                                "pr": RECOVERY_PR,
+                                "merged_head_sha": RECOVERY_HEAD,
+                                "adopted_at": 50,
+                                "authority": "explicit-operator"
+                            }
+                        })
+                        .to_string()
+                    ],
+                )
+                .unwrap();
+            crate::events::emit(
+                &self.conn,
+                "task_done",
+                &format!("task#{}", self.original),
+                "historical recovery adoption",
+                50,
+            )
+            .unwrap();
+            self.conn
+                .execute(
+                    "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+                    params![
+                        self.dependent,
+                        serde_json::json!([self.original]).to_string()
+                    ],
+                )
+                .unwrap();
+        }
+
+        fn done_repair_state(&self) -> DoneRepairState {
+            self.conn
+                .query_row(
+                    "SELECT child.updated_at,graph.state,graph.active,source.status,
+                            (SELECT count(*) FROM events
+                             WHERE kind='task_done' AND subject='task#' || child.id),
+                            (SELECT count(*) FROM events
+                             WHERE kind IN ('task_graph_completed','task_graph_unblocked')
+                               AND subject='task#' || source.id),
+                            (SELECT count(*) FROM decomposition_attempts
+                             WHERE graph_id=graph.id AND kind='recovery'),
+                            child.refs
+                     FROM tasks child
+                     JOIN task_graph_members member ON member.task_id=child.id
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     JOIN tasks source ON source.id=graph.source_task_id
+                     WHERE child.id=?1",
+                    [self.original],
+                    |row| {
+                        Ok(DoneRepairState {
+                            updated_at: row.get(0)?,
+                            graph_state: row.get(1)?,
+                            graph_active: row.get(2)?,
+                            source_status: row.get(3)?,
+                            done_events: row.get(4)?,
+                            graph_events: row.get(5)?,
+                            attempts: row.get(6)?,
+                            refs: row.get(7)?,
+                        })
+                    },
+                )
+                .unwrap()
         }
 
         fn block_on_modern_generated_child_failure(&mut self) {
@@ -7213,6 +7508,16 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+                params![
+                    fixture.dependent,
+                    serde_json::json!([fixture.original]).to_string()
+                ],
+            )
+            .unwrap();
 
         assert!(fixture.adoption());
         assert_graph_completed(
@@ -7241,12 +7546,18 @@ mod tests {
             Some(crate::tasks::COMPLETION_PROVENANCE_MERGED)
         );
         assert_eq!(
+            original_refs[crate::tasks::MERGE_COMMIT_SHA_REF],
+            RECOVERY_MERGE,
+            "the adopted child must preserve the recovery merge commit for dependents"
+        );
+        assert_eq!(
             original_refs["recovery_delivery"],
             serde_json::json!({
                 "source_task": fixture.original,
                 "recovery_task": fixture.recovery,
                 "pr": RECOVERY_PR,
                 "merged_head_sha": RECOVERY_HEAD,
+                "merge_commit_sha": RECOVERY_MERGE,
                 "adopted_at": 50
             })
         );
@@ -7272,6 +7583,21 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .ready
+        );
+        assert_eq!(
+            crate::tasks::dependency_merge_commits(
+                &fixture.conn,
+                crate::tasks::get(&fixture.conn, fixture.dependent)
+                    .unwrap()
+                    .unwrap()
+                    .depends_on
+                    .as_deref(),
+            )
+            .unwrap(),
+            vec![crate::tasks::DependencyMergeCommit {
+                task_id: fixture.original,
+                merge_commit_sha: Some(RECOVERY_MERGE.into()),
+            }]
         );
         let events: (i64, i64) = fixture
             .conn
@@ -7401,6 +7727,12 @@ mod tests {
         );
         let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
         assert_eq!(refs["recovery_delivery"]["recovery_task"], fixture.recovery);
+        assert_eq!(refs[crate::tasks::MERGE_COMMIT_SHA_REF], RECOVERY_MERGE);
+        assert_eq!(refs["recovery_delivery"]["merged_head_sha"], RECOVERY_HEAD);
+        assert_eq!(
+            refs["recovery_delivery"]["merge_commit_sha"],
+            RECOVERY_MERGE
+        );
         let holds: (Option<String>, Option<String>) = fixture
             .conn
             .query_row(
@@ -8028,6 +8360,11 @@ mod tests {
         assert_eq!(refs["recovery_delivery"]["authorized_by"], "operator");
         assert_eq!(refs["recovery_delivery"]["decomposition_source"], 1);
         assert_eq!(refs["recovery_delivery"]["merged_head_sha"], RECOVERY_HEAD);
+        assert_eq!(refs[crate::tasks::MERGE_COMMIT_SHA_REF], RECOVERY_MERGE);
+        assert_eq!(
+            refs["recovery_delivery"]["merge_commit_sha"],
+            RECOVERY_MERGE
+        );
 
         let (reason, summary): (String, String) = fixture
             .conn
@@ -8057,6 +8394,162 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_count, 1, "replay must not duplicate provenance");
+    }
+
+    #[test]
+    fn explicit_recovery_repairs_exact_done_pair_missing_merge_provenance_without_lifecycle_mutation(
+    ) {
+        let mut fixture = RecoveryFixture::new();
+        fixture.make_explicit_repair_candidate();
+
+        let before = fixture.done_repair_state();
+        let before_refs: serde_json::Value = serde_json::from_str(&before.refs).unwrap();
+        let recovery_delivery = before_refs["recovery_delivery"].clone();
+        assert!(before_refs
+            .get(crate::tasks::MERGE_COMMIT_SHA_REF)
+            .is_none());
+
+        assert!(fixture.explicit_adoption(90_000));
+
+        let repaired = fixture.done_repair_state();
+        let refs: serde_json::Value = serde_json::from_str(&repaired.refs).unwrap();
+        assert_eq!(refs[crate::tasks::MERGE_COMMIT_SHA_REF], RECOVERY_MERGE);
+        assert_eq!(refs["recovery_delivery"], recovery_delivery);
+        assert_eq!(repaired.updated_at, before.updated_at);
+        assert_eq!(repaired.graph_state, before.graph_state);
+        assert_eq!(repaired.graph_active, before.graph_active);
+        assert_eq!(repaired.source_status, before.source_status);
+        assert_eq!(repaired.done_events, before.done_events);
+        assert_eq!(repaired.graph_events, before.graph_events);
+        assert_eq!(repaired.attempts, before.attempts);
+
+        let depends_on: String = fixture
+            .conn
+            .query_row(
+                "SELECT depends_on FROM tasks WHERE id=?1",
+                [fixture.dependent],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let commits =
+            crate::tasks::dependency_merge_commits(&fixture.conn, Some(&depends_on)).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].task_id, fixture.original);
+        assert_eq!(commits[0].merge_commit_sha.as_deref(), Some(RECOVERY_MERGE));
+
+        assert!(!fixture.explicit_adoption(90_001));
+        assert_eq!(fixture.done_repair_state(), repaired);
+    }
+
+    #[test]
+    fn explicit_recovery_done_pair_repair_rejects_mismatched_or_invalid_evidence_without_mutation()
+    {
+        let cases: Vec<(&str, RecoveryEvidenceMutation)> = vec![
+            (
+                "recovery delivery names another task",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(
+                                 refs,'$.recovery_delivery.recovery_task',?2
+                             ) WHERE id=?1",
+                            params![fixture.original, fixture.recovery + 1],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "recovery delivery names another approved head",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(
+                                 refs,'$.recovery_delivery.merged_head_sha',?2
+                             ) WHERE id=?1",
+                            params![fixture.original, ORIGINAL_HEAD],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "conflicting projected merge provenance",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(
+                                 refs,'$.recovery_delivery.merge_commit_sha',
+                                 'dddddddddddddddddddddddddddddddddddddddd'
+                             ) WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "malformed projected merge provenance",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(
+                                 refs,'$.recovery_delivery.merge_commit_sha','not-a-merge-commit'
+                             ) WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "conflicting top-level merge provenance",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(
+                                 refs,'$.merge_commit_sha',
+                                 'dddddddddddddddddddddddddddddddddddddddd'
+                             ) WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "missing recovery merge commit",
+                Box::new(|fixture| fixture.set_recovery_merge_commit_sha(None)),
+            ),
+            (
+                "malformed recovery merge commit",
+                Box::new(|fixture| {
+                    fixture.set_recovery_merge_commit_sha(Some("not-a-merge-commit"));
+                }),
+            ),
+            (
+                "recovery merge commit has an embedded NUL",
+                Box::new(|fixture| {
+                    fixture.set_recovery_merge_commit_sha(Some(&format!(
+                        "{RECOVERY_MERGE}\0trailing"
+                    )));
+                }),
+            ),
+        ];
+
+        for (name, mutate) in cases {
+            let mut fixture = RecoveryFixture::new();
+            fixture.make_explicit_repair_candidate();
+            mutate(&mut fixture);
+            let before = fixture.done_repair_state();
+
+            assert!(!fixture.explicit_adoption(90_000), "{name}");
+            assert_eq!(
+                fixture.done_repair_state(),
+                before,
+                "{name} partially repaired the child"
+            );
+        }
     }
 
     #[test]
@@ -8437,6 +8930,41 @@ mod tests {
                 }),
             ),
             (
+                "missing recovery merge commit",
+                Box::new(|fixture| fixture.set_recovery_merge_commit_sha(None)),
+            ),
+            (
+                "malformed recovery merge commit",
+                Box::new(|fixture| {
+                    fixture.set_recovery_merge_commit_sha(Some(
+                        "not-a-hex-git-commit-sha-not-a-hex-git-commit",
+                    ));
+                }),
+            ),
+            (
+                "recovery merge commit has an embedded NUL",
+                Box::new(|fixture| {
+                    fixture.set_recovery_merge_commit_sha(Some(&format!(
+                        "{RECOVERY_MERGE}\0trailing"
+                    )));
+                }),
+            ),
+            (
+                "conflicting original merge provenance",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(
+                                 refs,'$.merge_commit_sha',
+                                 'dddddddddddddddddddddddddddddddddddddddd'
+                             ) WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
                 "unfinished sibling",
                 Box::new(|fixture| {
                     fixture
@@ -8454,6 +8982,14 @@ mod tests {
             let mut fixture = RecoveryFixture::new();
             fixture.make_explicit_eligible();
             mutate(&mut fixture);
+            let child_status_before: String = fixture
+                .conn
+                .query_row(
+                    "SELECT status FROM tasks WHERE id=?1",
+                    [fixture.original],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert!(
                 !fixture.explicit_adoption(90_000),
                 "{name} unexpectedly adopted"
@@ -8474,6 +9010,10 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .unwrap();
+            assert_eq!(
+                state.0, child_status_before,
+                "{name} partially adopted the child"
+            );
             assert_eq!(state.1, "active", "{name} mutated graph state");
             assert_eq!(state.2, "decomposed", "{name} mutated source state");
             assert_eq!(state.3, 0, "{name} persisted recovery authority");
@@ -8690,6 +9230,51 @@ mod tests {
                         .execute(
                             "UPDATE tasks SET status='failed' WHERE id=?1",
                             [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "missing recovery merge commit",
+                Box::new(|fixture| fixture.set_recovery_merge_commit_sha(None)),
+            ),
+            (
+                "malformed recovery merge commit",
+                Box::new(|fixture| {
+                    fixture.set_recovery_merge_commit_sha(Some(
+                        "not-a-hex-git-commit-sha-not-a-hex-git-commit",
+                    ));
+                }),
+            ),
+            (
+                "recovery merge commit has an embedded NUL",
+                Box::new(|fixture| {
+                    fixture.set_recovery_merge_commit_sha(Some(&format!(
+                        "{RECOVERY_MERGE}\0trailing"
+                    )));
+                    let nul_position: i64 = fixture
+                        .conn
+                        .query_row(
+                            "SELECT instr(json_extract(refs,'$.merge_commit_sha'),char(0))
+                             FROM tasks WHERE id=?1",
+                            [fixture.recovery],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_ne!(nul_position, 0, "fixture must persist the merge SHA NUL");
+                }),
+            ),
+            (
+                "conflicting original merge provenance",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(
+                                 refs,'$.merge_commit_sha',
+                                 'dddddddddddddddddddddddddddddddddddddddd'
+                             ) WHERE id=?1",
+                            [fixture.original],
                         )
                         .unwrap();
                 }),
