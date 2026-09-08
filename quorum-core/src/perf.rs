@@ -5200,8 +5200,9 @@ mod tests {
     #[test]
     fn facts_aggregate_rework_fallback_tokens_time_and_retained_incidents() {
         // One task can retry in-place. Its first failed route and its fallback
-        // route are both part of the same intent; neither queue time nor the
-        // gap between routes is relabelled as model time.
+        // route are both part of the same intent. The retained planning turns
+        // have snapshots too, but no intervals, so their presence must not
+        // turn the worker-only duration into a partial active-model total.
         let (_d, mut c) = open_tmp();
         let task_id = seed_ordinary(&mut c, 1_600);
         c.execute("UPDATE tasks SET rework_round=1 WHERE id=?1", [task_id])
@@ -5291,14 +5292,41 @@ mod tests {
         .unwrap();
         let graph_id = c.last_insert_rowid();
         for (kind, count) in [("proposal", 3_i64), ("provider", 4_i64)] {
+            let reason_code = match kind {
+                "proposal" => "retained-proposal",
+                // These failure rows are written after a reaped planner turn,
+                // so their snapshots are required for token completeness.
+                "provider" => "planner-provider",
+                _ => unreachable!(),
+            };
             for ordinal in 1..=count {
                 let retry_generation = (ordinal - 1) / 2;
                 c.execute(
                     "INSERT INTO decomposition_attempts(
                          graph_id,source_revision,kind,ordinal,retry_generation,
                          reason_code,summary,created_at)
-                     VALUES (?1,1,?2,?3,?4,'retained-attempt','test fixture',?3)",
-                    rusqlite::params![graph_id, kind, ordinal, retry_generation],
+                     VALUES (?1,1,?2,?3,?4,?5,'test fixture',?3)",
+                    rusqlite::params![graph_id, kind, ordinal, retry_generation, reason_code],
+                )
+                .unwrap();
+            }
+        }
+        // A zero-valued durable snapshot is still a provider report. Preserve
+        // it as measured zero rather than letting the managed worker telemetry
+        // masquerade as complete planning/classifier coverage.
+        for (purpose, count) in [("classifier", 3_i64), ("planner", 4_i64)] {
+            for ordinal in 0..count {
+                crate::token_usage::record(
+                    &mut c,
+                    None,
+                    purpose,
+                    &[task_id],
+                    None,
+                    "codex",
+                    "test-model",
+                    "high",
+                    crate::token_usage::TokenUsage::default(),
+                    300 + ordinal,
                 )
                 .unwrap();
             }
@@ -5327,11 +5355,10 @@ mod tests {
         assert_eq!(tokens["coverage"]["provider_reported_cost_usd"], false);
         assert!(intent.coverage.role_tokens_usd);
 
-        assert_eq!(intent.active_model_secs, Some(45));
+        assert!(intent.active_model_secs.is_none());
         assert_eq!(intent.wall_secs, Some(600));
-        assert!(intent.coverage.active_model_secs);
+        assert!(!intent.coverage.active_model_secs);
         assert!(intent.coverage.wall_secs);
-        assert_ne!(intent.active_model_secs, intent.wall_secs);
         assert_eq!(intent.rework_count, Some(1));
         assert!(intent.recovery_count.is_none());
         assert_eq!(intent.replan_count, Some(3));
