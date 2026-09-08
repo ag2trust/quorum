@@ -5,6 +5,7 @@
 //! falling back to caller-supplied defaults for orphan tasks. Complexity derived from
 //! `complexity:*` labels.
 
+use crate::db::map_sql_err;
 use crate::error::Result;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
@@ -616,6 +617,42 @@ fn new_intent_facts(task_id: i64, reason: InclusionReason) -> IntentFacts {
     }
 }
 
+/// Materialized snapshot of the three cohort reads. Captured under one WAL
+/// read transaction so aggregate/scan/watermark all reflect the same
+/// database state.
+struct CohortSnapshot {
+    watermark: Option<i64>,
+    counts: CandidateCounts,
+    ordinary_ids: Vec<i64>,
+}
+
+/// Take the watermark, aggregate counts, and bounded ordinary-id scan under
+/// a single WAL read snapshot so their totals are internally consistent —
+/// even if a daemon lifecycle write commits between conceptual steps. If the
+/// caller already owns a transaction, its existing snapshot is reused
+/// instead of nesting a second.
+fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSnapshot> {
+    let read = |c: &Connection| -> Result<CohortSnapshot> {
+        let watermark = read_watermark(c)?;
+        let since = if include_all { None } else { watermark };
+        // First SELECT establishes the snapshot; subsequent reads see it.
+        let counts = count_candidates(c, since)?;
+        let ordinary_ids = load_ordinary_intent_ids(c, since, MAX_INTENTS + 1)?;
+        Ok(CohortSnapshot {
+            watermark,
+            counts,
+            ordinary_ids,
+        })
+    };
+    if !conn.is_autocommit() {
+        return read(conn);
+    }
+    let tx = conn.unchecked_transaction().map_err(map_sql_err)?;
+    let snap = read(&tx)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(snap)
+}
+
 /// Read-only facts surface for `quorum perf`. Returns a deterministic,
 /// bounded `FactsReport` with one intent per ordinary managed implementation
 /// task in the cohort. All evidence fields are initialized to JSON null; the
@@ -623,10 +660,21 @@ fn new_intent_facts(task_id: i64, reason: InclusionReason) -> IntentFacts {
 /// them.
 ///
 /// Cohort selection is prospective by default via `perf_watermark`;
-/// `include_all` bypasses that boundary. Performs no writes.
+/// `include_all` bypasses that boundary. All DB reads happen inside one
+/// short WAL read snapshot that ends before report construction — no
+/// transaction is held across allocation or serialization work. Performs
+/// no writes.
 pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
-    let watermark = read_watermark(conn)?;
-    let since = if include_all { None } else { watermark };
+    // Gather the three interdependent reads under one WAL snapshot, then let
+    // the transaction end before we build the report. Report construction
+    // touches no DB state.
+    let snap = read_cohort_snapshot(conn, include_all)?;
+    let CohortSnapshot {
+        watermark,
+        counts,
+        ordinary_ids,
+    } = snap;
+
     let cohort = CohortDefinition {
         prospective_only: !include_all,
         watermark,
@@ -637,16 +685,7 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         max_contributing_tasks_per_intent: MAX_CONTRIBUTING_TASKS_PER_INTENT,
     };
 
-    // Bounded aggregate counts over the whole cohort (one row read) — used
-    // to compute candidate/excluded accounting without unbounded allocation.
-    let counts = count_candidates(conn, since)?;
     let candidate_count = counts.ordinary + counts.review_only;
-
-    // Bounded fetch of ordinary intents only: LIMIT is dedicated to intent
-    // capacity so review-only rows can never displace ordinary tasks near
-    // the sentinel. The +1 sentinel lets us detect truncation without loading
-    // an unbounded row set.
-    let ordinary_ids = load_ordinary_intent_ids(conn, since, MAX_INTENTS + 1)?;
     let truncated = ordinary_ids.len() > MAX_INTENTS;
 
     let base_reason = if include_all {
@@ -1654,6 +1693,77 @@ mod tests {
         assert_eq!(included_ids, vec![o1, o2, o3]);
         // Silence unused-binding warnings for the review-only ids.
         let _ = (r1, r2, r3, r4);
+    }
+
+    /// Two-connection WAL regression: the three cohort reads (watermark,
+    /// aggregate, bounded id scan) must land in one snapshot so an
+    /// intervening daemon lifecycle write cannot produce internally
+    /// impossible candidate/included/excluded totals.
+    ///
+    /// Reader connection opens an unchecked transaction; a second connection
+    /// commits a new terminal task in between; `perf_facts` reuses the
+    /// caller's snapshot (its `is_autocommit()` path) and must see the
+    /// pre-write cohort. After the reader's snapshot ends, a fresh call
+    /// must observe the new task.
+    #[test]
+    fn facts_snapshot_isolates_from_intervening_lifecycle_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        // Reader and writer connections against the same WAL database.
+        let reader = crate::db::open(&path).unwrap();
+        let mut writer = crate::db::open(&path).unwrap();
+        // Reset watermark so both connections observe every seeded task.
+        reader
+            .execute("UPDATE perf_watermark SET watermark = 0 WHERE id = 1", [])
+            .unwrap();
+
+        // Pre-seed two ordinary terminal tasks via the writer.
+        seed_ordinary(&mut writer, 1600);
+        seed_ordinary(&mut writer, 1700);
+
+        // Reader opens a read snapshot; the first SELECT below pins it.
+        let tx = reader.unchecked_transaction().unwrap();
+        assert!(!tx.is_autocommit(), "read txn must be non-autocommit");
+
+        // Intervening lifecycle write from the writer connection while the
+        // reader's snapshot is held. Under WAL, the writer sees its own
+        // commit but the reader's snapshot must remain unchanged.
+        let injected_before = perf_facts(&tx, false).unwrap();
+        assert_eq!(
+            injected_before.counts.candidate, 2,
+            "snapshot must see two pre-write candidates"
+        );
+        seed_ordinary(&mut writer, 1800);
+
+        // Second call inside the same snapshot must return the same totals
+        // as the first — the caller txn is reused, no new snapshot is
+        // established, and the mid-flight write is invisible.
+        let after_injected_write = perf_facts(&tx, false).unwrap();
+        assert_eq!(
+            after_injected_write.counts.candidate, 2,
+            "snapshot must not observe the write committed on another connection"
+        );
+        assert_eq!(after_injected_write.counts.included, 2);
+        assert_eq!(after_injected_write.counts.excluded, 0);
+        assert_eq!(
+            after_injected_write.counts.included + after_injected_write.counts.excluded,
+            after_injected_write.counts.candidate,
+            "included + excluded must equal candidate"
+        );
+        assert_eq!(
+            after_injected_write.intents.len() as i64,
+            after_injected_write.counts.included,
+            "intent count must match included accounting"
+        );
+
+        // End the read snapshot.
+        tx.commit().unwrap();
+
+        // A fresh call outside any caller txn opens its own snapshot and
+        // now observes the intervening write.
+        let fresh = perf_facts(&reader, false).unwrap();
+        assert_eq!(fresh.counts.candidate, 3);
+        assert_eq!(fresh.counts.included, 3);
     }
 
     #[test]
