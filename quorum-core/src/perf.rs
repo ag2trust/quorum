@@ -862,10 +862,12 @@ fn resolve_intent(
     debug_assert!(!rows.is_empty());
 
     if rows.iter().any(|row| row.review_only) {
-        if rows
-            .iter()
-            .any(|row| !matches!(row.status.as_str(), "done" | "failed" | "cancelled"))
-        {
+        if rows.iter().any(|row| {
+            !matches!(row.status.as_str(), "done" | "failed" | "cancelled")
+                || recoverable_graph_task_ids.contains(&row.id)
+                || has_requested_continuation(row)
+                || parked_disposition(row) == ParkDisposition::Retryable
+        }) {
             return ResolvedIntent::nonterminal_with_reason(InclusionReason::ExcludedReviewOnly);
         }
         return ResolvedIntent::terminal(InclusionReason::ExcludedReviewOnly, "done", rows);
@@ -1332,6 +1334,25 @@ fn canonical_root(task_id: i64, lineage: &LineageSnapshot) -> i64 {
     current
 }
 
+/// A completed graph aggregate can establish delivery only after every
+/// accepted child is present in the bounded facts cohort. The lineage scan
+/// reads this small, daemon-capped member set even when one child lies just
+/// beyond the raw task cap, so never infer that the in-cap subset is complete.
+fn completed_graph_has_omitted_member(
+    root: i64,
+    cohort_tasks: &HashMap<i64, FactsTaskRow>,
+    lineage: &LineageSnapshot,
+) -> bool {
+    lineage
+        .source_to_children
+        .get(&root)
+        .is_some_and(|children| {
+            children
+                .iter()
+                .any(|child| !cohort_tasks.contains_key(&child.task_id))
+        })
+}
+
 /// Build the JSON evidence blob for a collapsed intent's lineage. `members`
 /// is the sorted list of terminal-cohort task ids that fold into `root`;
 /// every claim is backed by a durable relation captured in `lineage`.
@@ -1550,12 +1571,29 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
                     .expect("lineage groups are derived from capped candidate ids")
             })
             .collect();
-        let resolved = resolve_intent(
-            &member_rows,
-            &recoverable_graph_task_ids,
-            &completed_graph_source_task_ids,
-            &recovery_merge_witnesses,
-        );
+        let resolved = if completed_graph_source_task_ids.contains(&root)
+            && completed_graph_has_omitted_member(root, &tasks_by_id, &lineage)
+        {
+            // The source is a completed aggregate, but a durable accepted
+            // child is outside this facts cohort. Classify the partial graph
+            // explicitly as truncated/unknown rather than crediting only its
+            // in-cap merged children.
+            let reason = if truncated {
+                InclusionReason::ExcludedTruncated
+            } else {
+                // A child excluded by the prospective watermark is not a
+                // cap overflow, but it still leaves delivery incomplete.
+                InclusionReason::ExcludedUnknownDelivery
+            };
+            ResolvedIntent::terminal(reason, "unknown", &member_rows)
+        } else {
+            resolve_intent(
+                &member_rows,
+                &recoverable_graph_task_ids,
+                &completed_graph_source_task_ids,
+                &recovery_merge_witnesses,
+            )
+        };
         // Clip contributing task ids to the per-intent bound.
         let contributing: Vec<i64> = members
             .into_iter()
@@ -2817,6 +2855,45 @@ mod tests {
     }
 
     #[test]
+    fn facts_keeps_retryable_review_only_park_nonterminal() {
+        let (_d, mut c) = open_tmp();
+        let review = seed_review_only(&mut c, 1650);
+        c.execute(
+            "UPDATE tasks SET status='failed',refs=?2 WHERE id=?1",
+            rusqlite::params![
+                review,
+                r#"{"daemon_parked":true,"daemon_resume_status":"in-review"}"#
+            ],
+        )
+        .unwrap();
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 0,
+                excluded: 1,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![review]);
+        assert!(!intent.included);
+        assert_eq!(intent.reason, InclusionReason::ExcludedReviewOnly);
+        assert!(intent.terminal_outcome.is_none());
+        assert!(intent.terminal_evidence.is_none());
+        assert!(intent.merge_provenance.is_none());
+
+        // This is the lifecycle-compatible pre-review-CI park form, not a
+        // look-alike status: retry restores it to the review phase.
+        let retried =
+            crate::tasks::retry_parked(&mut c, review, "retry-owner", true, crate::clock::now())
+                .unwrap()
+                .unwrap();
+        assert_eq!(retried.status, "in-review");
+    }
+
+    #[test]
     fn facts_completed_decomposition_uses_merged_child_provenance() {
         let (_d, mut c) = open_tmp();
         let source = seed_task(&mut c, "decomposed", None, 0, None, 1000, 1600);
@@ -2873,6 +2950,107 @@ mod tests {
         assert_eq!(
             intent.terminal_evidence.as_ref().unwrap()["merge_commit_shas"],
             serde_json::json!([first_sha, final_sha])
+        );
+    }
+
+    #[test]
+    fn facts_completed_graph_with_overflow_member_is_not_credited_partially() {
+        let (_d, mut c) = open_tmp();
+        let source = seed_task(&mut c, "decomposed", None, 0, None, 1000, 1600);
+        let merged_child = seed_task(&mut c, "open", None, 0, None, 1000, 1610);
+
+        // Fill the raw facts cohort through MAX_INTENTS. The accepted manual
+        // child below then lands exactly in the overflow tail.
+        let tx = crate::db::begin_immediate(&mut c).unwrap();
+        for _ in 0..(MAX_INTENTS - 2) {
+            tx.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at) \
+                 VALUES ('filler','open','boss',1000,1620)",
+                [],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let manual_child = seed_task(&mut c, "open", None, 0, None, 1000, 1630);
+
+        let graph = seed_decomposition(&c, source, 1);
+        seed_graph_member(&c, graph, merged_child, "merged", 1);
+        seed_graph_member(&c, graph, manual_child, "manual-overflow", 1);
+        assert!(crate::tasks::close_manual(
+            &mut c,
+            "manual-owner",
+            manual_child,
+            "manual delivery fixture",
+            1640,
+        )
+        .unwrap()
+        .is_some());
+        let merged_sha = format!("{merged_child:040x}");
+        assert!(crate::tasks::close_after_merge_with_merge_commit_sha(
+            &mut c,
+            merged_child,
+            "merged child",
+            &merged_sha,
+            1650,
+        )
+        .unwrap());
+
+        let completion: (String, i64, String, Option<String>) = c
+            .query_row(
+                "SELECT d.state,d.active,t.status,t.completion_provenance
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(completion, ("completed".into(), 0, "done".into(), None));
+        let manual_provenance: String = c
+            .query_row(
+                "SELECT completion_provenance FROM tasks WHERE id=?1",
+                [manual_child],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            manual_provenance,
+            crate::tasks::COMPLETION_PROVENANCE_MANUAL
+        );
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: MAX_INTENTS as i64,
+                included: 0,
+                excluded: MAX_INTENTS as i64,
+            }
+        );
+        let graph_intent = report
+            .intents
+            .iter()
+            .find(|intent| intent.intent_id == format!("intent-{source}"))
+            .unwrap();
+        assert_eq!(
+            graph_intent.contributing_task_ids,
+            vec![source, merged_child]
+        );
+        assert!(!graph_intent.included);
+        assert_eq!(graph_intent.reason, InclusionReason::ExcludedTruncated);
+        assert_eq!(graph_intent.terminal_outcome.as_deref(), Some("unknown"));
+        assert!(graph_intent.terminal_evidence.is_some());
+        assert!(graph_intent.merge_provenance.is_none());
+        assert_eq!(
+            graph_intent.lineage_evidence.as_ref().unwrap()["generated_child_task_ids"],
+            serde_json::json!([merged_child, manual_child])
+        );
+        // One exclusion is the incomplete graph and one is its omitted raw
+        // candidate; neither is silently promoted to verified delivery.
+        assert_eq!(
+            report
+                .excluded_reasons
+                .get(InclusionReason::ExcludedTruncated.as_str()),
+            Some(&2)
         );
     }
 
