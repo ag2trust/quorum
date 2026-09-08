@@ -770,14 +770,10 @@ fn has_requested_continuation(row: &FactsTaskRow) -> bool {
     let Some(refs) = refs_object(row) else {
         return false;
     };
-    refs.get("runner_retry")
-        .and_then(|retry| retry.get("requested"))
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        || refs
-            .get("codex_retry_requested")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
+    // `runner_retry` is canonical when present; its neutral requested=false
+    // state must suppress stale legacy Codex bits. Reuse the daemon's shared
+    // compatibility predicate rather than OR-ing the two representations.
+    crate::runner_state::retry_requested(&serde_json::Value::Object(refs.clone()))
         || refs
             .get("daemon_rework_retry_requested")
             .and_then(serde_json::Value::as_bool)
@@ -3354,6 +3350,130 @@ mod tests {
         assert_eq!(intent.reason, InclusionReason::ExcludedNonTerminal);
         assert!(intent.terminal_outcome.is_none());
         assert!(intent.terminal_evidence.is_none());
+    }
+
+    #[test]
+    fn facts_includes_non_retryable_held_failure_with_neutral_canonical_retry() {
+        let (_d, mut c) = open_tmp();
+        let source = seed_task(&mut c, "open", None, 0, None, 1000, 1600);
+        let refs = r#"{"runner_retry":{"provider":"codex","model":"gpt-5","effort":"high","prompt":"finish","turn_kind":"rework","continuation_id":"thread-new","requested":false},"codex_retry_requested":true}"#;
+        set_refs(&c, source, refs);
+        let graph = crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "test-model",
+                frozen_base_sha: "0123456789abcdef0123456789abcdef01234567",
+                now: 1610,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // Exhaust the initial generation, then exhaust each lifecycle-issued
+        // operator retry. Planning never rewrites the canonical retry record.
+        let mut now = 1620;
+        for generation in 0..=crate::decomposition::MAX_OPERATOR_RETRIES {
+            if generation > 0 {
+                assert!(crate::decomposition::reacquire_freeze(&mut c, graph, now).unwrap());
+                now += 10;
+                assert!(crate::decomposition::set_frozen_phase(
+                    &mut c,
+                    graph,
+                    "freeze-requested",
+                    "planning",
+                    None,
+                    now,
+                )
+                .unwrap());
+                now += 10;
+            }
+            assert!(crate::decomposition::record_attempt(
+                &mut c,
+                graph,
+                "provider",
+                "test-timeout",
+                "bounded planner timeout",
+                now,
+            )
+            .unwrap()
+            .is_some());
+            now += 10;
+            assert!(crate::decomposition::reacquire_freeze(&mut c, graph, now).unwrap());
+            now += 10;
+            assert!(crate::decomposition::set_frozen_phase(
+                &mut c,
+                graph,
+                "freeze-requested",
+                "planning",
+                None,
+                now,
+            )
+            .unwrap());
+            now += 10;
+            assert!(crate::decomposition::record_attempt(
+                &mut c,
+                graph,
+                "provider",
+                "test-timeout",
+                "bounded planner timeout",
+                now,
+            )
+            .unwrap()
+            .is_some());
+            now += 10;
+            if generation < crate::decomposition::MAX_OPERATOR_RETRIES {
+                assert!(matches!(
+                    crate::decomposition::retry_exhausted_planning(
+                        &mut c,
+                        source,
+                        "operator",
+                        now,
+                    )
+                    .unwrap(),
+                    crate::decomposition::PlanningRetryOutcome::Retried { .. }
+                ));
+                now += 10;
+            }
+        }
+        assert!(!crate::decomposition::exhausted_planning_retry_is_eligible(
+            &c,
+            source,
+            crate::clock::now(),
+        )
+        .unwrap());
+        assert_eq!(
+            crate::decomposition::retry_exhausted_planning(&mut c, source, "operator", now)
+                .unwrap(),
+            crate::decomposition::PlanningRetryOutcome::RetryCapExhausted {
+                retry_count: crate::decomposition::MAX_OPERATOR_RETRIES,
+            }
+        );
+        let persisted_refs: String = c
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [source], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(persisted_refs, refs);
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 1,
+                excluded: 0,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![source]);
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedIrrecoverableFailure);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("failed"));
+        assert!(intent.terminal_evidence.is_some());
+        assert!(intent.merge_provenance.is_none());
     }
 
     #[test]
