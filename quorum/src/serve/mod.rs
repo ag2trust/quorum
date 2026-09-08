@@ -21886,6 +21886,62 @@ fn reviewer_fallback_pending_turn(slot: &SlotState) -> PendingTurn {
     }
 }
 
+/// The gated launch helper has reaped any wrapper before this runs. Retire the
+/// alternate reviewer capability and its exact pending marker so a failed
+/// route cannot be replayed after reviewer responsibility is settled.
+async fn settle_failed_reviewer_fallback(
+    config: &ServeConfig,
+    slot: &SlotState,
+    capability_run_id: &str,
+    session_id: &str,
+    worktree: &str,
+    provider: &str,
+    reason: &str,
+) -> Result<ReviewerFallbackActivation> {
+    let _ = dispose_managed_process_exit(
+        &config.db_path,
+        tasks::ManagedRunRole::Reviewer,
+        &slot.agent_name,
+        slot.task_id,
+        Some(capability_run_id),
+        reason,
+    )
+    .await;
+
+    let db_path = config.db_path.clone();
+    let agent = slot.agent_name.clone();
+    let task_id = slot.task_id;
+    let session_id = session_id.to_string();
+    let worktree = worktree.to_string();
+    let provider = provider.to_string();
+    let cleared = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        tx.execute(
+            "DELETE FROM journal
+             WHERE agent=?1 AND role='reviewer' AND task_id=?2 AND session_id=?3
+               AND worktree=?4 AND provider=?5 AND phase='fallback-pending'
+               AND continuation_id IS NULL",
+            rusqlite::params![agent, task_id, session_id, worktree, provider],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await;
+    match cleared {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!(
+            "reviewer {} fallback settlement could not clear its pending journal: {error}",
+            slot.agent_name
+        )),
+        Err(error) => log(&format!(
+            "reviewer {} fallback settlement journal cleanup join failed: {error}",
+            slot.agent_name
+        )),
+    }
+    Ok(ReviewerFallbackActivation::Settled)
+}
+
 /// Install and launch one reviewer fallback without crossing provider-session
 /// identity. The installer commits the failed-run retirement, alternate run,
 /// capability, and restart descriptor before this function invokes a provider.
@@ -22076,28 +22132,29 @@ async fn activate_reviewer_fallback(
                     "fallback intent provider '{}' does not match model '{}' resolved as '{kind}'",
                     intent.pending_turn.provider, intent.pending_turn.model
                 );
-                let _ = dispose_managed_process_exit(
-                    &config.db_path,
-                    tasks::ManagedRunRole::Reviewer,
-                    &slot.agent_name,
-                    slot.task_id,
-                    Some(&intent.capability_run_id),
+                return settle_failed_reviewer_fallback(
+                    config,
+                    slot,
+                    &intent.capability_run_id,
+                    &session_id,
+                    &intent.worktree,
+                    &intent.pending_turn.provider,
                     &error,
                 )
                 .await;
-                return Ok(ReviewerFallbackActivation::Settled);
             }
             Err(error) => {
-                let _ = dispose_managed_process_exit(
-                    &config.db_path,
-                    tasks::ManagedRunRole::Reviewer,
-                    &slot.agent_name,
-                    slot.task_id,
-                    Some(&intent.capability_run_id),
-                    &format!("reviewer fallback route is not executable: {error}"),
+                let reason = format!("reviewer fallback route is not executable: {error}");
+                return settle_failed_reviewer_fallback(
+                    config,
+                    slot,
+                    &intent.capability_run_id,
+                    &session_id,
+                    &intent.worktree,
+                    &intent.pending_turn.provider,
+                    &reason,
                 )
                 .await;
-                return Ok(ReviewerFallbackActivation::Settled);
             }
         };
     let environment = managed_run_environment(
@@ -22105,24 +22162,57 @@ async fn activate_reviewer_fallback(
         &slot.agent_name,
         Some(intent.capability_run_id.as_str()),
     );
-    let launched = runner::RunnerProc::launch(
-        &runner::LaunchRequest {
-            model: &intent.pending_turn.model,
-            effort: &intent.pending_turn.effort,
-            worktree: Path::new(&intent.worktree),
-            prompt: &intent.pending_turn.prompt,
-            environment: &environment,
-            mode: runner::LaunchMode::Normal,
-            // Cross-provider continuations are forbidden. The alternate gets
-            // the exact pending turn in a new provider session.
-            continuation_id: runner_continuation_id(alternate_kind, &session_id, None),
+    let session_started_at = now_unix();
+    let mut new_session_log = config.log_dir.as_ref().and_then(|log_dir| {
+        session_log::SessionLog::create(
+            log_dir,
+            &slot.agent_name,
+            "reviewer",
+            Some(slot.task_id),
+            &session_id,
+            &slot.branch,
+            session_started_at,
+        )
+        .ok()
+    });
+    let log_dir = new_session_log
+        .as_ref()
+        .map(|log| log.dir().to_string_lossy().into_owned());
+    let launch = runner::LaunchRequest {
+        model: &intent.pending_turn.model,
+        effort: &intent.pending_turn.effort,
+        worktree: Path::new(&intent.worktree),
+        prompt: &intent.pending_turn.prompt,
+        environment: &environment,
+        mode: runner::LaunchMode::Normal,
+        // Cross-provider continuations are forbidden. The alternate gets
+        // the exact pending turn in a new provider session.
+        continuation_id: runner_continuation_id(alternate_kind, &session_id, None),
+    };
+    let proc = match launch_and_commit_fallback(
+        config,
+        alternate_kind,
+        &launch,
+        None,
+        FallbackJournalPromotion {
+            db_path: &config.db_path,
+            agent: &slot.agent_name,
+            role: "reviewer",
+            task_id: slot.task_id,
+            session_id: &session_id,
+            worktree: &intent.worktree,
+            provider: &intent.pending_turn.provider,
+            working_phase: "reviewing",
+            log_dir: log_dir.as_deref(),
         },
-        &runner_adapter_config(config, agent_bin_for_kind(config, alternate_kind)),
     )
-    .await;
-    let proc = match launched {
+    .await
+    {
         Ok(proc) => proc,
         Err(error) => {
+            if let Some(log) = &mut new_session_log {
+                log.finalize(None);
+            }
             log(&format!(
                 "reviewer {} fallback process launch failed after durable installation: {error}",
                 slot.agent_name
@@ -22153,73 +22243,19 @@ async fn activate_reviewer_fallback(
                 ))
                 .await;
             }
-            let _ = dispose_managed_process_exit(
-                &config.db_path,
-                tasks::ManagedRunRole::Reviewer,
-                &slot.agent_name,
-                slot.task_id,
-                Some(&intent.capability_run_id),
-                &format!("reviewer fallback launch failed: {error}"),
+            let reason = format!("reviewer fallback launch failed: {error}");
+            return settle_failed_reviewer_fallback(
+                config,
+                slot,
+                &intent.capability_run_id,
+                &session_id,
+                &intent.worktree,
+                &intent.pending_turn.provider,
+                &reason,
             )
             .await;
-            return Ok(ReviewerFallbackActivation::Settled);
         }
     };
-
-    let session_started_at = now_unix();
-    let new_session_log = config.log_dir.as_ref().and_then(|log_dir| {
-        session_log::SessionLog::create(
-            log_dir,
-            &slot.agent_name,
-            "reviewer",
-            Some(slot.task_id),
-            &session_id,
-            &slot.branch,
-            session_started_at,
-        )
-        .ok()
-    });
-    let journal_entry = JournalEntry {
-        agent: slot.agent_name.clone(),
-        role: "reviewer".into(),
-        task_id: Some(slot.task_id),
-        session_id: session_id.clone(),
-        worktree: Some(intent.worktree.clone()),
-        branch: Some(slot.remote_branch.clone()),
-        phase: "reviewing".into(),
-        cost_tokens: 0,
-        agent_state: None,
-        cost_usd: 0.0,
-        log_dir: new_session_log
-            .as_ref()
-            .map(|log| log.dir().to_string_lossy().into()),
-        pid: proc.pid(),
-        pr: Some(pr),
-        rework_count: slot.rework_count as i32,
-        provider: Some(alternate_kind.to_string()),
-        continuation_id: None,
-        local_branch: Some(slot.branch.clone()),
-    };
-    let journal_path = config.db_path.clone();
-    if let Err(error) = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = quorum_core::db::open(&journal_path)?;
-        journal::upsert(&mut conn, &journal_entry)
-    })
-    .await
-    .map_err(|error| QuorumError::Io(format!("reviewer fallback journal join: {error}")))?
-    {
-        let _ = proc.kill_and_reap().await;
-        let _ = dispose_managed_process_exit(
-            &config.db_path,
-            tasks::ManagedRunRole::Reviewer,
-            &slot.agent_name,
-            slot.task_id,
-            Some(&intent.capability_run_id),
-            &format!("reviewer fallback journal failed: {error}"),
-        )
-        .await;
-        return Ok(ReviewerFallbackActivation::Settled);
-    }
 
     record_managed_usage_snapshot(
         &config.db_path,
@@ -28571,18 +28607,42 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn live_reviewer_fallback_requires_own_lease_and_swaps_authority() {
+    async fn live_reviewer_fallback_gates_launch_and_settles_release_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = tempfile::tempdir().unwrap();
         let worktree = root.path().join("reviewer-wt");
         std::fs::create_dir_all(&worktree).unwrap();
-        let runner_program = live_fallback_runner(root.path());
+        let started = root.path().join("reviewer-provider-started");
+        let runner_program = root.path().join("fallback-codex");
+        std::fs::write(
+            &runner_program,
+            format!(
+                "#!/bin/sh\nprintf started >> '{}'\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"fallback-thread\"}}'\nexec sleep 30\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner_program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let head_sha = "a".repeat(40);
-        let config = live_fallback_test_config(
+        let mut config = live_fallback_test_config(
             root.path().join("reviewer.db"),
             root.path(),
             &runner_program,
             Arc::new(FallbackHeadExecutor(head_sha.clone())),
         );
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.reviewer.values_mut() {
+            pool.insert("a-primary".into(), 25);
+            pool.insert("c-tertiary".into(), 25);
+        }
         let mut conn = quorum_core::db::open(&config.db_path).unwrap();
         let task_id = quorum_core::tasks::create(
             &mut conn,
@@ -28734,25 +28794,127 @@ mod tests {
         assert_eq!(slot.model, "gpt-5.6-terra");
         assert_ne!(slot.agent_run_id, Some(initial_run));
         assert_ne!(slot.cap_run_id.as_deref(), Some("initial-cap"));
+        let process_group_id = slot.pid().unwrap();
         let conn = quorum_core::db::open(&config.db_path).unwrap();
-        let (attempts, active_runs, active_caps, holder, phase):
-            (i64, i64, i64, String, String) = conn
+        let (attempts, active_runs, active_caps, holder, phase, pid):
+            (i64, i64, i64, String, String, i32) = conn
             .query_row(
                 "SELECT
                      (SELECT count(*) FROM routing_attempts WHERE responsibility_key=?1),
                      (SELECT count(*) FROM agent_runs WHERE task_id=?2 AND role='reviewer' AND ended_at IS NULL),
                      (SELECT count(*) FROM run_capabilities WHERE task_id=?2 AND role='reviewer' AND revoked_at IS NULL),
                      (SELECT holder FROM claims WHERE target=?3 AND active=1),
-                     phase FROM journal WHERE agent='Fallback-Reviewer'",
+                     phase,pid FROM journal WHERE agent='Fallback-Reviewer'",
                 rusqlite::params![responsibility, task_id, tasks::lease_target(task_id)],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!((attempts, active_runs, active_caps), (1, 1, 1));
         assert_eq!(holder, "Fallback-Reviewer");
         assert_eq!(phase, "reviewing");
+        assert_eq!(pid, process_group_id);
         drop(conn);
-        let _ = slot.kill_and_reap().await;
+        assert_provider_started_once(&started).await;
+
+        // A failed promotion occurs after release. The wrapper must be reaped
+        // and its installed reviewer responsibility must be settled, not left
+        // as either a live capability or a recoverable pending journal row.
+        let old = std::mem::replace(
+            &mut slot.proc,
+            SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+        );
+        let _ = old.kill_and_reap().await;
+        let second_currency = {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            load_reviewer_fallback_currency(&conn, &slot, now_unix()).unwrap()
+        };
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE failed_reviewer_fallback_groups(pgid INTEGER NOT NULL);
+             CREATE TRIGGER reject_live_reviewer_fallback_promotion
+             BEFORE UPDATE OF phase ON journal
+             WHEN NEW.phase='reviewing'
+             BEGIN SELECT RAISE(ABORT, 'promotion rejected'); END;
+             CREATE TRIGGER record_failed_reviewer_fallback_group
+             BEFORE DELETE ON journal
+             WHEN OLD.agent='Fallback-Reviewer' AND OLD.role='reviewer'
+                  AND OLD.phase='fallback-pending'
+             BEGIN INSERT INTO failed_reviewer_fallback_groups(pgid) VALUES (OLD.pid); END;",
+        )
+        .unwrap();
+        drop(conn);
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "alternate reviewer profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(
+            activate_reviewer_fallback(&config, &mut slot, &failure, &second_currency)
+                .await
+                .unwrap(),
+            ReviewerFallbackActivation::Settled
+        );
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (
+            ended_alternate_runs,
+            active_reviewer_runs,
+            revoked_alternate_capabilities,
+            active_reviewer_capabilities,
+            pending_markers,
+            failed_process_group_id,
+            reviewer,
+        ): (i64, i64, i64, i64, i64, i32, Option<String>) = conn
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM agent_runs
+                      WHERE task_id=?1 AND id != ?2 AND ended_at IS NOT NULL),
+                     (SELECT count(*) FROM agent_runs
+                      WHERE task_id=?1 AND role='reviewer' AND ended_at IS NULL),
+                     (SELECT count(*) FROM run_capabilities
+                      WHERE task_id=?1 AND agent_run_id != ?2 AND revoked_at IS NOT NULL),
+                     (SELECT count(*) FROM run_capabilities
+                      WHERE task_id=?1 AND role='reviewer' AND revoked_at IS NULL),
+                     (SELECT count(*) FROM journal
+                      WHERE agent='Fallback-Reviewer' AND role='reviewer' AND task_id=?1
+                        AND phase='fallback-pending'),
+                     (SELECT pgid FROM failed_reviewer_fallback_groups),
+                     (SELECT reviewer FROM tasks WHERE id=?1)",
+                rusqlite::params![task_id, initial_run],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        // Managed-exit disposal retains its telemetry row, but both alternate
+        // capabilities are revoked and the task has no current reviewer.
+        assert_eq!(ended_alternate_runs, 1);
+        assert_eq!(active_reviewer_runs, 1);
+        assert_eq!(revoked_alternate_capabilities, 2);
+        assert_eq!(active_reviewer_capabilities, 0);
+        assert_eq!(pending_markers, 0);
+        assert_eq!(reviewer, None);
+        drop(conn);
+        assert_process_group_reaped(failed_process_group_id).await;
     }
 
     #[cfg(unix)]
