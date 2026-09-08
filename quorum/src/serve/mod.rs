@@ -21553,6 +21553,50 @@ struct FallbackJournalPromotion<'a> {
 }
 
 impl FallbackJournalPromotion<'_> {
+    /// Retire only the recovered process group named by this exact pending
+    /// marker. Clearing the PID is the handoff that permits a replacement
+    /// gated launch to commit its own process-group identity.
+    async fn clear_reaped_process_group(&self, process_group_id: i32) -> Result<()> {
+        let db_path = self.db_path.to_path_buf();
+        let agent = self.agent.to_string();
+        let role = self.role.to_string();
+        let task_id = self.task_id;
+        let session_id = self.session_id.to_string();
+        let worktree = self.worktree.to_string();
+        let provider = self.provider.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&db_path)?;
+            let tx = quorum_core::db::begin_immediate(&mut conn)?;
+            let changed = tx.execute(
+                "UPDATE journal
+                 SET pid=NULL,updated_at=?1
+                 WHERE agent=?2 AND role=?3 AND task_id=?4 AND session_id=?5
+                   AND worktree=?6 AND provider=?7 AND phase='fallback-pending'
+                   AND pid=?8 AND continuation_id IS NULL",
+                rusqlite::params![
+                    now_unix(),
+                    agent,
+                    role,
+                    task_id,
+                    session_id,
+                    worktree,
+                    provider,
+                    process_group_id,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(QuorumError::Io(
+                    "fallback-pending journal identity changed before recovered process-group retirement"
+                        .into(),
+                ));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("fallback PID retirement join: {error}")))?
+    }
+
     /// Record the wrapper's process-group leader while it is still unable to
     /// execute its provider.  Recovery can therefore reap exactly this group
     /// if the daemon dies before the gate is released.
@@ -21648,6 +21692,71 @@ impl FallbackJournalPromotion<'_> {
         .await
         .map_err(|error| QuorumError::Io(format!("fallback promotion journal join: {error}")))?
     }
+}
+
+const FALLBACK_RECOVERY_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn recovered_process_group_is_alive(process_group_id: i32) -> Result<bool> {
+    if unsafe { libc::killpg(process_group_id, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(QuorumError::Io(format!(
+            "fallback recovery could not inspect process group {process_group_id}: {error}"
+        ))),
+    }
+}
+
+/// Kill a process group retained by a recovered fallback marker and refuse to
+/// make the marker launchable until the whole group is confirmed gone. A
+/// restarted daemon is normally not the wrapper's parent, but `waitpid`
+/// opportunistically reaps the leader in same-process restart tests and any
+/// equivalent supervised handoff where it is.
+async fn retire_recovered_fallback_process_group(
+    journal: &FallbackJournalPromotion<'_>,
+    process_group_id: i32,
+) -> Result<()> {
+    if process_group_id == unsafe { libc::getpgrp() } {
+        return Err(QuorumError::Io(format!(
+            "fallback recovery refused to kill its live daemon process group {process_group_id}"
+        )));
+    }
+    if unsafe { libc::killpg(process_group_id, libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(QuorumError::Io(format!(
+                "fallback recovery could not kill process group {process_group_id}: {error}"
+            )));
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + FALLBACK_RECOVERY_REAP_TIMEOUT;
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(process_group_id, &mut status, libc::WNOHANG) };
+        if waited == -1 {
+            let error = std::io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ECHILD | libc::EINTR)) {
+                return Err(QuorumError::Io(format!(
+                    "fallback recovery could not reap process {process_group_id}: {error}"
+                )));
+            }
+        }
+        if !recovered_process_group_is_alive(process_group_id)? {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(QuorumError::Io(format!(
+                "fallback recovery process group {process_group_id} remained alive after SIGKILL"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    journal.clear_reaped_process_group(process_group_id).await
 }
 
 fn fallback_launch_failure(detail: impl Into<String>) -> runner::RunnerFailure {
@@ -22844,6 +22953,24 @@ async fn resume_pending_fallbacks(
                 "fallback recovery cannot launch Grok for a non-initial worker turn".into(),
             ));
         }
+        let pending_journal = FallbackJournalPromotion {
+            db_path: &config.db_path,
+            agent: &agent_name,
+            role: &intent.role,
+            task_id: intent.task_id,
+            session_id: &entry.session_id,
+            worktree: &intent.worktree,
+            provider: &intent.pending_turn.provider,
+            working_phase: if intent.role == "worker" {
+                "working"
+            } else {
+                "reviewing"
+            },
+            log_dir: None,
+        };
+        if let Some(process_group_id) = entry.pid {
+            retire_recovered_fallback_process_group(&pending_journal, process_group_id).await?;
+        }
         let (assignment_id, sub_role): (i64, Option<String>) = {
             let conn = quorum_core::db::open(&config.db_path)?;
             conn.query_row(
@@ -22963,53 +23090,45 @@ async fn resume_pending_fallbacks(
             mode: runner::LaunchMode::Normal,
             continuation_id: runner_continuation_id(kind, &slot.session_id, None),
         };
-        let launched = if kind == runner::AgentKind::Grok && intent.role == "worker" {
-            runner::RunnerProc::launch_internal_worker(
-                &runner::RunnerRequest {
-                    launch,
-                    task_id: intent.task_id,
-                    role_assignment_id: assignment_id,
-                    responsibility_key: &intent.responsibility_key,
-                    agent: &slot.agent_name,
-                    role: "worker",
-                    pending_turn: PendingTurn {
-                        provider: intent.pending_turn.provider.clone(),
-                        model: intent.pending_turn.model.clone(),
-                        effort: intent.pending_turn.effort.clone(),
-                        prompt: intent.pending_turn.prompt.clone(),
-                        turn_kind: intent.pending_turn.turn_kind.clone(),
-                        continuation_id: None,
-                        requested: intent.pending_turn.requested,
-                    },
-                },
-                &runner_adapter_config(config, agent_bin_for_kind(config, kind)),
-            )
-            .await
-        } else {
-            runner::RunnerProc::launch(
-                &launch,
-                &runner_adapter_config(config, agent_bin_for_kind(config, kind)),
-            )
-            .await
+        let pending_turn = PendingTurn {
+            provider: intent.pending_turn.provider.clone(),
+            model: intent.pending_turn.model.clone(),
+            effort: intent.pending_turn.effort.clone(),
+            prompt: intent.pending_turn.prompt.clone(),
+            turn_kind: intent.pending_turn.turn_kind.clone(),
+            continuation_id: None,
+            requested: intent.pending_turn.requested,
         };
+        let grok_worker_request = (kind == runner::AgentKind::Grok && intent.role == "worker")
+            .then(|| runner::WorkerTurnRequest {
+                task_id: intent.task_id,
+                role_assignment_id: assignment_id,
+                responsibility_key: intent.responsibility_key.clone(),
+                agent: slot.agent_name.clone(),
+                role: "worker".into(),
+                provider: kind.to_string(),
+                runner: kind.to_string(),
+                model: intent.pending_turn.model.clone(),
+                effort: intent.pending_turn.effort.clone(),
+                pending_turn,
+            });
+        let log_dir = slot
+            .session_log
+            .as_ref()
+            .map(|log| log.dir().to_string_lossy().into_owned());
+        let launched = launch_and_commit_fallback(
+            config,
+            kind,
+            &launch,
+            grok_worker_request,
+            FallbackJournalPromotion {
+                log_dir: log_dir.as_deref(),
+                ..pending_journal
+            },
+        )
+        .await;
         match launched {
             Ok(proc) => {
-                let mut running_entry = entry.clone();
-                running_entry.phase = if intent.role == "worker" {
-                    "working".into()
-                } else {
-                    "reviewing".into()
-                };
-                running_entry.pid = proc.pid();
-                running_entry.log_dir = slot
-                    .session_log
-                    .as_ref()
-                    .map(|log| log.dir().to_string_lossy().into_owned());
-                let mut conn = quorum_core::db::open(&config.db_path)?;
-                if let Err(error) = journal::upsert(&mut conn, &running_entry) {
-                    let _ = proc.kill_and_reap().await;
-                    return Err(error);
-                }
                 slot.proc = SlotProcess::running(proc);
                 lifetime_roster.register(&slot.agent_name);
                 if intent.role == "worker" {
@@ -28757,7 +28876,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn restart_preserves_and_replays_committed_fallback_intent() {
+    async fn restart_reaps_pid_bearing_fallback_and_replays_exact_turn_once() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
         fn git(repo: &Path, args: &[&str]) {
             let output = std::process::Command::new("git")
                 .arg("-C")
@@ -28798,7 +28920,19 @@ mod tests {
             ],
         );
 
-        let runner_program = live_fallback_runner(root.path());
+        let provider_started = root.path().join("provider-started");
+        let replayed_args = root.path().join("replayed-args");
+        let runner_program = root.path().join("fallback-codex");
+        std::fs::write(
+            &runner_program,
+            format!(
+                "#!/bin/sh\nprintf started >> '{}'\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"fallback-thread\"}}'\nexec sleep 30\n",
+                provider_started.display(),
+                replayed_args.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner_program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = live_fallback_test_config(
             root.path().join("recovery.db"),
             &repo,
@@ -28947,6 +29081,33 @@ mod tests {
             installed,
             fallback::FallbackInstallOutcome::Installed(_)
         ));
+        let stale_process = std::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stale_process_group = stale_process.id() as i32;
+        conn.execute(
+            "UPDATE journal SET pid=?1 WHERE agent=?2 AND phase='fallback-pending'",
+            rusqlite::params![stale_process_group, agent_name],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE fallback_pid_transitions(
+                 old_pid INTEGER,
+                 new_pid INTEGER,
+                 old_phase TEXT NOT NULL,
+                 new_phase TEXT NOT NULL
+             );
+             CREATE TRIGGER record_fallback_pid_transition
+             AFTER UPDATE OF pid ON journal
+             WHEN OLD.agent='Fallback-Worker'
+             BEGIN
+                 INSERT INTO fallback_pid_transitions(old_pid,new_pid,old_phase,new_phase)
+                 VALUES (OLD.pid,NEW.pid,OLD.phase,NEW.phase);
+             END;",
+        )
+        .unwrap();
         let marker: (String, String, Option<i32>) = conn
             .query_row(
                 "SELECT phase,session_id,pid FROM journal WHERE agent=?1",
@@ -28956,33 +29117,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             marker,
-            ("fallback-pending".into(), "recovery-session".into(), None)
+            (
+                "fallback-pending".into(),
+                "recovery-session".into(),
+                Some(stale_process_group)
+            )
         );
         drop(conn);
 
         let wt_mgr = WorktreeManager::new();
         let mut name_pool = names::Pool::new_generated();
+        name_pool.acquire_named(&agent_name).unwrap();
         let mut workers = Vec::new();
         let mut reviewers = Vec::new();
         let mut roster = LifetimeRoster::new();
-        recovery::recover(&config, &wt_mgr, &mut name_pool, &mut workers, &mut roster)
-            .await
-            .unwrap();
-        let conn = quorum_core::db::open(&config.db_path).unwrap();
-        let (status, active_caps, marker_count): (String, i64, i64) = conn
-            .query_row(
-                "SELECT status,
-                        (SELECT count(*) FROM run_capabilities WHERE task_id=?1 AND revoked_at IS NULL),
-                        (SELECT count(*) FROM journal WHERE task_id=?1 AND phase='fallback-pending')
-                 FROM tasks WHERE id=?1",
-                [task_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(status, "working");
-        assert_eq!((active_caps, marker_count), (1, 1));
-        drop(conn);
-
         resume_pending_fallbacks(
             &config,
             &wt_mgr,
@@ -28996,19 +29144,96 @@ mod tests {
         assert_eq!(workers.len(), 1);
         assert!(reviewers.is_empty());
         assert_eq!(workers[0].model, "gpt-5.6-terra");
+        assert_eq!(workers[0].pending_prompt, "exact restart prompt");
+        assert_eq!(workers[0].pending_turn_kind, "initial");
         assert!(workers[0].pid().is_some());
+        assert_process_group_reaped(stale_process_group).await;
+        assert_provider_started_once(&provider_started).await;
+        let args = std::fs::read_to_string(&replayed_args).unwrap();
+        assert_eq!(
+            args.lines()
+                .filter(|arg| *arg == "exact restart prompt")
+                .count(),
+            1,
+            "the recovered pending turn must be passed to the provider exactly once"
+        );
         let conn = quorum_core::db::open(&config.db_path).unwrap();
-        let phase: String = conn
+        let (phase, replacement_pid): (String, i32) = conn
             .query_row(
-                "SELECT phase FROM journal WHERE agent='Fallback-Worker'",
+                "SELECT phase,pid FROM journal WHERE agent='Fallback-Worker'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(phase, "working");
+        assert_ne!(replacement_pid, stale_process_group);
+        let normalized: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM fallback_pid_transitions
+                 WHERE old_pid=?1 AND new_pid IS NULL
+                   AND old_phase='fallback-pending' AND new_phase='fallback-pending'",
+                [stale_process_group],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normalized, 1, "the dead recovered PID must clear once");
         drop(conn);
+
+        resume_pending_fallbacks(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+        assert_eq!(workers.len(), 1, "a completed replay must not launch again");
+        assert_eq!(
+            std::fs::read_to_string(&provider_started).unwrap(),
+            "started",
+            "the provider must execute the recovered turn exactly once"
+        );
         let worker = workers.pop().unwrap();
         let _ = worker.kill_and_reap().await;
+        drop(stale_process);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_recovered_fallback_group_refuses_replay_and_retains_pid() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let db_path = root.path().join("fallback.db");
+        seed_gated_fallback_journal(&db_path, &worktree);
+        let live_process_group = unsafe { libc::getpgrp() };
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE journal SET pid=?1 WHERE agent='Gated-Fallback'",
+            [live_process_group],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = retire_recovered_fallback_process_group(
+            &gated_fallback_journal(&db_path, &worktree),
+            live_process_group,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("refused to kill"), "{error}");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let marker: (String, i32) = conn
+            .query_row(
+                "SELECT phase,pid FROM journal WHERE agent='Gated-Fallback'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(marker, ("fallback-pending".into(), live_process_group));
     }
 
     #[tokio::test]
