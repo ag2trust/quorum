@@ -800,7 +800,11 @@ fn terminal_evidence(rows: &[&FactsTaskRow], merge_commit_shas: &[String]) -> se
 /// intentional: exclusions that establish non-delivery take precedence over a
 /// terminal-looking status, and ambiguous evidence is never promoted to a
 /// delivered or failed result.
-fn resolve_intent(rows: &[&FactsTaskRow], active_graph_task_ids: &HashSet<i64>) -> ResolvedIntent {
+fn resolve_intent(
+    rows: &[&FactsTaskRow],
+    recoverable_graph_task_ids: &HashSet<i64>,
+    completed_graph_source_task_ids: &HashSet<i64>,
+) -> ResolvedIntent {
     debug_assert!(!rows.is_empty());
 
     if rows.iter().any(|row| row.review_only) {
@@ -843,7 +847,7 @@ fn resolve_intent(rows: &[&FactsTaskRow], active_graph_task_ids: &HashSet<i64>) 
     }
     if rows.iter().any(|row| {
         !matches!(row.status.as_str(), "done" | "failed")
-            || active_graph_task_ids.contains(&row.id)
+            || recoverable_graph_task_ids.contains(&row.id)
             || has_requested_continuation(row)
             || parked_disposition(row) == ParkDisposition::Retryable
     }) {
@@ -874,9 +878,20 @@ fn resolve_intent(rows: &[&FactsTaskRow], active_graph_task_ids: &HashSet<i64>) 
         );
     }
 
-    let merge_commit_shas: Option<Vec<String>> =
-        rows.iter().map(|row| valid_merge_commit_sha(row)).collect();
-    if let Some(merge_commit_shas) = merge_commit_shas {
+    let merge_commit_shas: Option<Vec<String>> = rows
+        .iter()
+        .filter(|row| {
+            // A completed decomposition source is a daemon-owned aggregate,
+            // not a delivery-bearing task. Its `done` status is the durable
+            // graph-completion witness; each accepted child still needs its
+            // own merged completion and merge identifier below.
+            !(completed_graph_source_task_ids.contains(&row.id)
+                && row.status == "done"
+                && row.completion_provenance.is_none())
+        })
+        .map(|row| valid_merge_commit_sha(row))
+        .collect();
+    if let Some(merge_commit_shas) = merge_commit_shas.filter(|shas| !shas.is_empty()) {
         return ResolvedIntent {
             reason: InclusionReason::IncludedVerifiedMerge,
             terminal_outcome: Some("done".to_string()),
@@ -1169,13 +1184,16 @@ fn build_lineage_snapshot(conn: &Connection, cohort_ids: &[i64]) -> Result<Linea
     })
 }
 
-/// Find candidate tasks that still belong to an active decomposition graph.
-/// A graph's active sentinel is the lifecycle authority: either `active` or
-/// `blocked` state still leaves a supported recovery/continuation path, so a
-/// failed member must not be treated as irrecoverable. The query is batched
-/// and bounded by the capped facts cohort.
-fn load_active_graph_task_ids(conn: &Connection, task_ids: &[i64]) -> Result<HashSet<i64>> {
-    let mut active = HashSet::new();
+/// Find candidate tasks with a durable graph continuation path. Active and
+/// blocked graphs are live by their `active` sentinel. A held, pre-
+/// materialization source is also nonterminal only when it passes the exact
+/// bounded `task-retry` eligibility check; other held graphs stay terminal.
+fn load_recoverable_graph_task_ids(
+    conn: &Connection,
+    task_ids: &[i64],
+    now: i64,
+) -> Result<HashSet<i64>> {
+    let mut recoverable = HashSet::new();
     for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
         let placeholders = sql_placeholders(batch.len());
         let sql = format!(
@@ -1195,9 +1213,45 @@ fn load_active_graph_task_ids(conn: &Connection, task_ids: &[i64]) -> Result<Has
         params.push(batch.len().saturating_mul(2) as i64);
         let mut statement = conn.prepare(&sql)?;
         let rows = statement.query_map(params_from_iter(params), |row| row.get::<_, i64>(0))?;
-        active.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        recoverable.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
     }
-    Ok(active)
+    // Reuse the lifecycle predicate rather than approximating its hold code,
+    // attempt-history, and retry-budget evidence in this read-only report.
+    // The facts cohort is capped, and the predicate itself examines one graph
+    // with bounded attempt history, so this remains a bounded scan.
+    for &task_id in task_ids {
+        if crate::decomposition::exhausted_planning_retry_is_eligible(conn, task_id, now)? {
+            recoverable.insert(task_id);
+        }
+    }
+    Ok(recoverable)
+}
+
+/// A completed graph source is a durable aggregate completion, not an
+/// independent merge. Restrict this exception to sources with accepted live
+/// membership so a retained `done` row never becomes delivery evidence alone.
+fn load_completed_graph_source_task_ids(
+    conn: &Connection,
+    task_ids: &[i64],
+) -> Result<HashSet<i64>> {
+    let mut completed = HashSet::new();
+    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
+        let placeholders = sql_placeholders(batch.len());
+        let sql = format!(
+            "SELECT d.source_task_id \
+             FROM task_decompositions d \
+             WHERE d.source_task_id IN ({placeholders}) \
+               AND d.state='completed' AND d.active=0 AND d.freeze_active=0 \
+               AND EXISTS (SELECT 1 FROM task_graph_members m \
+                           WHERE m.graph_id=d.id AND m.active=1 \
+                             AND m.plan_revision=d.accepted_plan_revision)"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows =
+            statement.query_map(params_from_iter(batch.iter()), |row| row.get::<_, i64>(0))?;
+        completed.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+    }
+    Ok(completed)
 }
 
 /// Walk (recovery → original) then (child → source) until we reach a task
@@ -1327,7 +1381,8 @@ struct CohortSnapshot {
     candidate_count: i64,
     candidate_tasks: Vec<FactsTaskRow>,
     lineage: LineageSnapshot,
-    active_graph_task_ids: HashSet<i64>,
+    recoverable_graph_task_ids: HashSet<i64>,
+    completed_graph_source_task_ids: HashSet<i64>,
 }
 
 /// Take the watermark, aggregate counts, and bounded candidate scan under
@@ -1336,6 +1391,7 @@ struct CohortSnapshot {
 /// caller already owns a transaction, its existing snapshot is reused
 /// instead of nesting a second.
 fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSnapshot> {
+    let now = crate::clock::now();
     let read = |c: &Connection| -> Result<CohortSnapshot> {
         let watermark = read_watermark(c)?;
         let since = if include_all { None } else { watermark };
@@ -1350,13 +1406,15 @@ fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSn
             .map(|task| task.id)
             .collect();
         let lineage = build_lineage_snapshot(c, &capped_ids)?;
-        let active_graph_task_ids = load_active_graph_task_ids(c, &capped_ids)?;
+        let recoverable_graph_task_ids = load_recoverable_graph_task_ids(c, &capped_ids, now)?;
+        let completed_graph_source_task_ids = load_completed_graph_source_task_ids(c, &capped_ids)?;
         Ok(CohortSnapshot {
             watermark,
             candidate_count,
             candidate_tasks,
             lineage,
-            active_graph_task_ids,
+            recoverable_graph_task_ids,
+            completed_graph_source_task_ids,
         })
     };
     if !conn.is_autocommit() {
@@ -1389,7 +1447,8 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         candidate_count,
         candidate_tasks,
         lineage,
-        active_graph_task_ids,
+        recoverable_graph_task_ids,
+        completed_graph_source_task_ids,
     } = snap;
 
     let cohort = CohortDefinition {
@@ -1432,7 +1491,11 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
                     .expect("lineage groups are derived from capped candidate ids")
             })
             .collect();
-        let resolved = resolve_intent(&member_rows, &active_graph_task_ids);
+        let resolved = resolve_intent(
+            &member_rows,
+            &recoverable_graph_task_ids,
+            &completed_graph_source_task_ids,
+        );
         // Clip contributing task ids to the per-intent bound.
         let contributing: Vec<i64> = members
             .into_iter()
@@ -2650,6 +2713,137 @@ mod tests {
             assert!(intent.terminal_evidence.is_none());
             assert!(!intent.coverage.terminal);
         }
+    }
+
+    #[test]
+    fn facts_completed_decomposition_uses_merged_child_provenance() {
+        let (_d, mut c) = open_tmp();
+        let source = seed_task(&mut c, "decomposed", None, 0, None, 1000, 1600);
+        let first_child = seed_task(&mut c, "open", None, 0, None, 1000, 1610);
+        let final_child = seed_task(&mut c, "open", None, 0, None, 1000, 1620);
+        let graph = seed_decomposition(&c, source, 1);
+        seed_graph_member(&c, graph, first_child, "first", 1);
+        seed_graph_member(&c, graph, final_child, "final", 1);
+
+        let first_sha = format!("{first_child:040x}");
+        let final_sha = format!("{final_child:040x}");
+        assert!(crate::tasks::close_after_merge_with_merge_commit_sha(
+            &mut c,
+            first_child,
+            "first merged child",
+            &first_sha,
+            1630,
+        )
+        .unwrap());
+        assert!(crate::tasks::close_after_merge_with_merge_commit_sha(
+            &mut c,
+            final_child,
+            "final merged child",
+            &final_sha,
+            1640,
+        )
+        .unwrap());
+
+        let completed: (String, i64, String, Option<String>) = c
+            .query_row(
+                "SELECT d.state,d.active,t.status,t.completion_provenance
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+                 WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(completed, ("completed".into(), 0, "done".into(), None));
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 1,
+                excluded: 0,
+            }
+        );
+        let intent = &report.intents[0];
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedVerifiedMerge);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("done"));
+        assert_eq!(intent.merge_provenance.as_deref(), Some("merged"));
+        assert_eq!(
+            intent.terminal_evidence.as_ref().unwrap()["merge_commit_shas"],
+            serde_json::json!([first_sha, final_sha])
+        );
+    }
+
+    #[test]
+    fn facts_excludes_retry_eligible_held_planning_source_as_nonterminal() {
+        let (_d, mut c) = open_tmp();
+        let source = seed_task(&mut c, "open", None, 0, None, 1000, 1600);
+        let graph = crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "test-model",
+                frozen_base_sha: "0123456789abcdef0123456789abcdef01234567",
+                now: 1610,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(crate::decomposition::record_attempt(
+            &mut c,
+            graph,
+            "provider",
+            "test-timeout",
+            "first bounded planner timeout",
+            1620,
+        )
+        .unwrap()
+        .is_some());
+        assert!(crate::decomposition::reacquire_freeze(&mut c, graph, 1630).unwrap());
+        assert!(crate::decomposition::set_frozen_phase(
+            &mut c,
+            graph,
+            "freeze-requested",
+            "planning",
+            None,
+            1640,
+        )
+        .unwrap());
+        assert!(crate::decomposition::record_attempt(
+            &mut c,
+            graph,
+            "provider",
+            "test-timeout",
+            "second bounded planner timeout",
+            1650,
+        )
+        .unwrap()
+        .is_some());
+        assert!(crate::decomposition::exhausted_planning_retry_is_eligible(
+            &c,
+            source,
+            crate::clock::now(),
+        )
+        .unwrap());
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 0,
+                excluded: 1,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![source]);
+        assert!(!intent.included);
+        assert_eq!(intent.reason, InclusionReason::ExcludedNonTerminal);
+        assert!(intent.terminal_outcome.is_none());
+        assert!(intent.terminal_evidence.is_none());
     }
 
     #[test]
