@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 74;
+pub const SCHEMA_VERSION: i64 = 75;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1377,6 +1377,16 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 [],
             )?;
         }
+        // v75 indexes the durable planner submission lookup used by the facts
+        // reader. Without a graph_id-leading index, a source with no submission
+        // could scan retained submissions for unrelated graphs before its
+        // bounded prefix/probe LIMIT applies.
+        if current < 75 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS planner_submissions_graph_id
+                     ON planner_submissions(graph_id)",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1608,6 +1618,57 @@ mod tests {
         drop(migrated);
         let reopened = open(&path).unwrap();
         assert!(column_exists(&reopened, "decomposition_attempts", "plan_snapshot_json").unwrap());
+    }
+
+    /// A v74 database predates the planner graph lookup index. Upgrade it in
+    /// place without touching the durable planner submission history, and keep
+    /// the index present on the next ordinary open too.
+    #[test]
+    fn v74_to_v75_adds_planner_submission_graph_index_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v74-planner-submission-index.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "DROP INDEX planner_submissions_graph_id;
+                 PRAGMA user_version=74;",
+            )
+            .unwrap();
+        }
+
+        let migrated = open(&path).unwrap();
+        let index_exists: bool = migrated
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type='index' AND name='planner_submissions_graph_id'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert!(reopened
+            .query_row(
+                "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type='index' AND name='planner_submissions_graph_id'
+                     )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
     }
 
     #[test]

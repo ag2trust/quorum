@@ -2968,51 +2968,73 @@ enum RunnerEnding {
     Unknown,
 }
 
+// Keep this list synchronized with the literal end reasons emitted by managed
+// worker/reviewer teardown paths. A known controlled teardown is not a runner
+// incident merely because it occurs after a stale head, completed review, or
+// policy handoff. Unknown is deliberately reserved for persisted text outside
+// this producer vocabulary.
+const NORMAL_RUNNER_ENDINGS: &[&str] = &[
+    "submitted",
+    "awaiting_merge",
+    "completed",
+    "merged",
+    "done",
+    "approved",
+    "in-review",
+    "merging",
+    "turn-completed",
+    "verdict:approved",
+    "r2-pending",
+    "r2-provision-unavailable",
+    "r2-graph-held",
+    "r2-ci-pending",
+    "r2-ci-failed",
+    "r2-no-branch",
+    "codex_rereview",
+    "ownership_transferred",
+    "drain",
+    "shutdown",
+    "cancelled",
+    "stale-sha",
+    "stale-authority",
+    "merge-metadata-unavailable",
+    "approval-no-author",
+    "graph-blocker",
+    "remediation_lease_unavailable",
+    "rework_cap",
+    "parked",
+    "external",
+    "pr_closed",
+];
+
+// These literals are source-defined managed teardown failures. They are
+// durable abnormal runner endings, unlike a future literal which must keep
+// abnormal-ending coverage explicitly unknown.
+const ABNORMAL_RUNNER_ENDINGS: &[&str] = &[
+    "failed",
+    "crashed",
+    "agent_failed",
+    "idle_reaped",
+    "idle",
+    "killed",
+    "provider_blocked",
+    "provision-failed",
+    "journal-handoff-failed",
+    "terminal_handoff_failed",
+    "fallback-route-unavailable",
+    "fallback_launch_failed",
+    "attachment-failed",
+    "r2-spawn-error",
+    "verdict:none",
+    "daemon_push_failed",
+    "daemon_push_rejected",
+    "error_retries",
+];
+
 fn classify_runner_ending(reason: &str) -> RunnerEnding {
-    if matches!(
-        reason,
-        "submitted"
-            | "awaiting_merge"
-            | "completed"
-            | "merged"
-            | "done"
-            | "in-review"
-            | "merging"
-            | "turn-completed"
-            | "verdict:approved"
-            | "r2-pending"
-            | "r2-provision-unavailable"
-            | "ownership_transferred"
-            | "drain"
-            | "cancelled"
-    ) || reason.starts_with("verdict:changes")
-    {
+    if NORMAL_RUNNER_ENDINGS.contains(&reason) || reason.starts_with("verdict:changes") {
         RunnerEnding::Normal
-    } else if matches!(
-        reason,
-        // These are literal failure teardown reasons written by the managed
-        // worker/reviewer paths. Keep this closed: an unfamiliar persisted
-        // reason must remain an explicit coverage gap below.
-        "failed"
-            | "crashed"
-            | "agent_failed"
-            | "idle_reaped"
-            | "idle"
-            | "killed"
-            | "provider_blocked"
-            | "provision-failed"
-            | "journal-handoff-failed"
-            | "fallback-route-unavailable"
-            | "fallback_launch_failed"
-            | "attachment-failed"
-            | "graph-blocker"
-            | "r2-spawn-error"
-            | "verdict:none"
-            | "daemon_push_failed"
-            | "daemon_push_rejected"
-            | "error_retries"
-            | "remediation_lease_unavailable"
-    ) {
+    } else if ABNORMAL_RUNNER_ENDINGS.contains(&reason) {
         RunnerEnding::Abnormal
     } else {
         RunnerEnding::Unknown
@@ -5409,29 +5431,44 @@ mod tests {
     }
 
     #[test]
-    fn facts_no_verdict_reviewer_ending_is_abnormal_and_unknown_stays_a_gap() {
-        // The reviewer mailbox failure path durably closes its managed run
-        // with `verdict:none`. It is a known failure, unlike arbitrary future
-        // stored text, and both cases must remain distinguishable on SQLite.
+    fn facts_controlled_reviewer_endings_do_not_hide_abnormal_closes() {
+        // A stale-head rework and an R2 handoff are controlled reviewer
+        // teardowns; the no-verdict reviewer exit is a known abnormal close.
+        // Exercise all three with durable agent_runs rows on real SQLite so a
+        // completed later intent reports the measured abnormal count rather
+        // than an unknown gap.
         let (_d, mut c) = open_tmp();
         let task_id = seed_ordinary(&mut c, 1_600);
-        let reviewer_run = crate::agent_runs::insert_reviewer_with_launch(
-            &c,
-            task_id,
-            "reviewer",
-            "gpt-review",
-            "high",
-            "codex",
-            None,
-            1_100,
-            None,
-            "reviewer-cap",
-            99,
-            &format!("{task_id:040x}"),
-        )
-        .unwrap()
-        .unwrap();
-        crate::agent_runs::close(&c, reviewer_run, 1_130, "verdict:none").unwrap();
+        let mut no_verdict_run = None;
+        for (ordinal, agent, reason) in [
+            (0, "stale-head-reviewer", "stale-sha"),
+            (1, "stale-authority-reviewer", "stale-authority"),
+            (2, "r2-handoff-reviewer", "r2-no-branch"),
+            (3, "metadata-reviewer", "merge-metadata-unavailable"),
+            (4, "no-verdict-reviewer", "verdict:none"),
+        ] {
+            let reviewer_run = crate::agent_runs::insert_reviewer_with_launch(
+                &c,
+                task_id,
+                agent,
+                "gpt-review",
+                "high",
+                "codex",
+                None,
+                1_100 + ordinal,
+                None,
+                &format!("reviewer-cap-{ordinal}"),
+                99,
+                &format!("{task_id:040x}"),
+            )
+            .unwrap()
+            .unwrap();
+            crate::agent_runs::close(&c, reviewer_run, 1_130 + ordinal, reason).unwrap();
+            if reason == "verdict:none" {
+                no_verdict_run = Some(reviewer_run);
+            }
+        }
+        let reviewer_run = no_verdict_run.unwrap();
 
         let before = snapshot_db_state(&c);
         let report = perf_facts(&c, false).unwrap();
@@ -5451,6 +5488,30 @@ mod tests {
         let intent = &report.intents[0];
         assert!(intent.abnormal_runner_ending_count.is_none());
         assert!(!intent.coverage.abnormal_runner_ending);
+    }
+
+    #[test]
+    fn known_runner_ending_vocabulary_is_closed_and_future_text_is_a_gap() {
+        for reason in NORMAL_RUNNER_ENDINGS {
+            assert!(matches!(
+                classify_runner_ending(reason),
+                RunnerEnding::Normal
+            ));
+        }
+        for reason in ABNORMAL_RUNNER_ENDINGS {
+            assert!(matches!(
+                classify_runner_ending(reason),
+                RunnerEnding::Abnormal
+            ));
+        }
+        assert!(matches!(
+            classify_runner_ending("verdict:changes:rerun"),
+            RunnerEnding::Normal
+        ));
+        assert!(matches!(
+            classify_runner_ending("future-unrecognized-reason"),
+            RunnerEnding::Unknown
+        ));
     }
 
     #[test]
@@ -5674,6 +5735,65 @@ mod tests {
         // fabricate the planner's active interval from the worker or wall.
         assert!(intent.active_model_secs.is_none());
         assert!(!intent.coverage.active_model_secs);
+    }
+
+    #[test]
+    fn planner_invocation_probe_uses_graph_index_with_unrelated_history() {
+        // The facts snapshot asks by source task, then joins submissions by
+        // graph id. Retained planner rows for unrelated graphs must not turn
+        // that bounded prefix/probe into a full planner-history scan.
+        let (_d, mut c) = open_tmp();
+        let source_task = seed_ordinary(&mut c, 1_600);
+        let source_graph = seed_decomposition(&c, source_task, 1);
+        c.execute(
+            "INSERT INTO planner_submissions(run_id,graph_id,response_json,rejections,accepted_at)
+             VALUES ('planner-current',?1,'[]',0,1)",
+            [source_graph],
+        )
+        .unwrap();
+        for ordinal in 0..64 {
+            c.execute(
+                "INSERT INTO planner_submissions(run_id,graph_id,response_json,rejections,accepted_at)
+                 VALUES (?1,?2,'[]',0,1)",
+                rusqlite::params![format!("retained-unrelated-{ordinal}"), 10_000 + ordinal],
+            )
+            .unwrap();
+        }
+
+        let details = c
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT submission.run_id
+                 FROM task_decompositions AS graph
+                 JOIN planner_submissions AS submission ON submission.graph_id=graph.id
+                 WHERE graph.source_task_id=?1
+                 LIMIT ?2",
+            )
+            .unwrap()
+            .query_map(
+                rusqlite::params![source_task, (MAX_ATTRIBUTION_ATTEMPTS_PER_TASK + 1) as i64],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("planner_submissions_graph_id")),
+            "planner prefix/probe must use graph index: {details:?}"
+        );
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent = report
+            .intents
+            .iter()
+            .find(|intent| intent.contributing_task_ids == vec![source_task])
+            .unwrap();
+        assert!(intent.role_tokens_usd.is_none());
+        assert!(!intent.coverage.role_tokens_usd);
     }
 
     #[test]
