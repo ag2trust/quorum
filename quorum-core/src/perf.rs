@@ -774,14 +774,19 @@ fn has_requested_continuation(row: &FactsTaskRow) -> bool {
     // state must suppress stale legacy Codex bits. Reuse the daemon's shared
     // compatibility predicate rather than OR-ing the two representations.
     crate::runner_state::retry_requested(&serde_json::Value::Object(refs.clone()))
-        || refs
-            .get("daemon_rework_retry_requested")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        || refs
-            .get("ci_remediation_requested")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
+        // Both daemon remediation markers are admitted only from `rework`.
+        // In particular, `rework_approved_merge` can retain its marker after
+        // the lifecycle turns a merge conflict at the rework cap into
+        // `failed`; that stale retained fact is not an available recovery.
+        || (row.status == "rework"
+            && (refs
+                .get("daemon_rework_retry_requested")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                || refs
+                    .get("ci_remediation_requested")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)))
 }
 
 /// A cancelled dependency makes every parked retry/continuation path
@@ -829,6 +834,22 @@ fn terminal_evidence(rows: &[&FactsTaskRow], merge_commit_shas: &[String]) -> se
         evidence["merge_commit_shas"] = serde_json::json!(merge_commit_shas);
     }
     evidence
+}
+
+/// Preserve a terminal status only when every collapsed row agrees. A graph
+/// intent with mixed terminal statuses is durable but ambiguous, so facts must
+/// retain `unknown` rather than borrowing an outcome from an arbitrary row.
+fn shared_terminal_outcome(rows: &[&FactsTaskRow]) -> String {
+    let Some(outcome) = rows.first().map(|row| row.status.as_str()) else {
+        return "unknown".to_string();
+    };
+    if matches!(outcome, "done" | "failed" | "cancelled")
+        && rows.iter().all(|row| row.status == outcome)
+    {
+        outcome.to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 /// Return only merge witnesses that the immutable explicit-adoption ledger
@@ -898,7 +919,11 @@ fn resolve_intent(
         }) {
             return ResolvedIntent::nonterminal_with_reason(InclusionReason::ExcludedReviewOnly);
         }
-        return ResolvedIntent::terminal(InclusionReason::ExcludedReviewOnly, "done", rows);
+        return ResolvedIntent::terminal(
+            InclusionReason::ExcludedReviewOnly,
+            &shared_terminal_outcome(rows),
+            rows,
+        );
     }
     if rows
         .iter()
@@ -2982,6 +3007,123 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(retried.status, "in-review");
+    }
+
+    #[test]
+    fn facts_preserves_durable_terminal_review_only_outcomes() {
+        let (_d, mut c) = open_tmp();
+        let failed = seed_review_only(&mut c, 1650);
+        let cancelled = seed_review_only(&mut c, 1660);
+        c.execute(
+            "UPDATE tasks SET status='in-review' WHERE id IN (?1,?2)",
+            rusqlite::params![failed, cancelled],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::tasks::apply_event(
+                &mut c,
+                "daemon",
+                failed,
+                &crate::lifecycle::Event::PrFoundClosed,
+                1670,
+            )
+            .unwrap()
+            .task
+            .status,
+            "failed"
+        );
+        assert_eq!(
+            crate::tasks::apply_event(
+                &mut c,
+                "daemon",
+                cancelled,
+                &crate::lifecycle::Event::Cancelled {
+                    by: "test-owner".to_string(),
+                },
+                1680,
+            )
+            .unwrap()
+            .task
+            .status,
+            "cancelled"
+        );
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 2,
+                included: 0,
+                excluded: 2,
+            }
+        );
+        let by_task: HashMap<i64, &IntentFacts> = report
+            .intents
+            .iter()
+            .map(|intent| (intent.contributing_task_ids[0], intent))
+            .collect();
+        for (task_id, outcome) in [(failed, "failed"), (cancelled, "cancelled")] {
+            let intent = by_task[&task_id];
+            assert!(!intent.included);
+            assert_eq!(intent.reason, InclusionReason::ExcludedReviewOnly);
+            assert_eq!(intent.terminal_outcome.as_deref(), Some(outcome));
+            assert_eq!(
+                intent.terminal_evidence.as_ref().unwrap()["tasks"][0]["status"],
+                serde_json::json!(outcome)
+            );
+            assert!(intent.merge_provenance.is_none());
+        }
+    }
+
+    #[test]
+    fn facts_includes_merge_conflict_rework_cap_failure_with_stale_retry_marker() {
+        let (_d, mut c) = open_tmp();
+        let task = seed_task(
+            &mut c,
+            "merging",
+            None,
+            i64::from(crate::lifecycle::REWORK_CAP),
+            Some("reviewer"),
+            1000,
+            1650,
+        );
+        set_refs(&c, task, r#"{"pr":419,"daemon_merge_retry":"attempting"}"#);
+
+        // This durable path intentionally retains the marker after the
+        // transition reaches `failed`; only `rework` is lifecycle-admitted
+        // for its remediation retry.
+        let transition = crate::tasks::rework_approved_merge(
+            &mut c,
+            task,
+            419,
+            "merge conflict at rework cap",
+            1660,
+        )
+        .unwrap();
+        assert_eq!(transition.task.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(transition.task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_rework_retry_requested"], true);
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 1,
+                included: 1,
+                excluded: 0,
+            }
+        );
+        let intent = &report.intents[0];
+        assert_eq!(intent.contributing_task_ids, vec![task]);
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedIrrecoverableFailure);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("failed"));
+        assert_eq!(
+            intent.terminal_evidence.as_ref().unwrap()["tasks"][0]["status"],
+            serde_json::json!("failed")
+        );
+        assert!(intent.merge_provenance.is_none());
     }
 
     #[test]
